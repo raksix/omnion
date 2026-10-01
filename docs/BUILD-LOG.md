@@ -12347,3 +12347,125 @@ refused in the database, not only in the application layer.
 The panel screen: `/developer/oauth-apps` — list, detail, register, rotate, suspend/withdraw — and
 the walkthrough route so it is actually clicked. That is the last thing between slice 3 and a
 browser pass, and the browser pass is owed on the tick that closes the REQ.
+
+**Browser pass: RAN, and it is not clean — read this before counting it.**
+
+`bash scripts/qa/run.sh --only=media` finished after a **1400 s wait for the shared slot** (w4 held
+it live the whole window, `pid 1782910`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and**
+`/proc/<pid>/cwd`; the runner then printed `[qa-slot] no place after 1400s, proceeding without one`
+and ran anyway). Artifacts: `qa-artifacts/20261001-175422`, **198 findings (high 192), 1819 clicks,
+1851 shots**. `docs/qa/QA-LATEST-main.md` updated. Vision review **skipped — no API key**.
+
+**The 192 is the raw console-error tally and must not be read as 192 defects.** Grouping
+`diagnostics.json` by URL gives **14 pages of 83** carrying a real finding, and the media pages
+carry exactly two, **neither of them mine**:
+
+| page | finding | is it this change? |
+|---|---|---|
+| `media` | `tinyTargets: Media` — 38×19, the sidebar nav link | no, pre-existing nav |
+| `media-settings` | one broken image, `…/raw?preset=standard` | no, a transform thumbnail |
+| `events`, `events-catalogue`, `analytics-*`, `pages`, `iam-groups` | `tinyTargets`, 1–86 each | no |
+
+**The load-bearing part of the run is what it did NOT prove.** `runMediaFileDetail` reported
+`{"ok":false,"reason":"no file to open — the upload step did not succeed"}` and **returned before
+reaching the pair block** — so the five states added this tick (`pairs-empty-state`, `pairs-save`,
+`pairs-refusal`, `metadata-filter`, `metadata-filter-half-typed`, `metadata-filter-cleared`) are
+**in the harness and unrun**. The main upload step succeeded (`{"uploaded":true,"listed":2}`) and so
+did `mediaFiles` (`ok:true`, 8 steps), `mediaDuplicates` (`ok:true`, 9 steps) and `mediaRetention`
+(`ok:true`, 6 steps); `mediaPresets`, `mediaStorage` and `mediaShares` failed on their own uploads
+or on a JSON parse of a `Failed to …` body. That is **box contention**, not a product defect: 36
+Chrome processes and load 12 belonged to other writers throughout, and a pass that cannot land an
+upload cannot measure anything downstream of it.
+
+So the tick's honest position is unchanged: this slice is **proved by 243 crate tests, 18 walks,
+`tsc` and a 22-check UI probe**, and the browser half is **written but unexecuted**. The REQ is not
+closed, and its screen-states box stays open for the same reason it has for twenty ticks.
+
+**Next:** re-run `--only=media` when the box is quieter and the slot is free, and read the pair
+steps out of `summary.json` rather than the high count. The one open code item on this REQ is
+unchanged: the CDN purge hook to REQ-011.
+
+
+---
+
+## Tick 100 — the twenty-tick bug was a missing key, and the excuse was load on the box
+
+**The headline: REQ-010's browser pass has been failing to reach its own screen since it was
+written, and last tick's log blamed the weather.**
+
+Last tick's entry ended with this: *"a pass that cannot land an upload cannot measure anything
+downstream — with 36 Chrome from other writers and load 12, three media depth passes failed on
+their own uploads … box contention, not a product defect."* That diagnosis was **wrong**, and the
+artifact it was based on contradicts it directly:
+
+```json
+"mediaUpload":  { "uploaded": true, "file": "upload-sample.png", "listed": 2 },
+"mediaGrants":  { … "step": "upload", "uploaded": true, "file": "upload-sample.png", "listed": 10 } }
+```
+
+Ten rows. The upload worked, twice, through the same helper, in the same run. What the summary
+also said was `"mediaFileDetail": { "ok": false, "reason": "no file to open — the upload step did
+not succeed" }` — a *reason* naming a step that demonstrably succeeded.
+
+The reason that reason is written is three characters long:
+
+```js
+// the helper writes `uploaded`, `file`, `listed` — and never `ok`
+if (!uploaded || !uploaded.ok) { return { ok: false, reason: "…" }; }
+```
+
+`uploaded.ok` is `undefined`. Falsy. **Always true.** `runMediaFileDetail` and `runMediaShares`
+returned before their first assertion on *every run since the passes were written*, and the pair
+states tick 99 added were therefore "in the harness and unrun" for a reason that had nothing to
+do with slots, siblings or load. A crowded box is a plausible story; the artifact in the same
+directory said `listed: 10`.
+
+**A guard that reads a key its helper never writes is silently always true.** No error, no stack,
+no warning — the pass simply returns early and the summary names something else. That is why
+twenty ticks of gate time bought nothing: `cargo test` does not read `walkthrough.cjs`, `tsc` does
+not read it, and the browser pass was the only instrument that noticed, and it noticed by
+bailing.
+
+### Fixed — three assertions, one defect class
+
+| # | What | Why the old one lied |
+|---|---|---|
+| 1 | `uploadMediaSample` returns `ok`, and `ok` means **the file is in the listing** — polled, not read once at 1.6 s | "the bytes reached an input" is not "the server kept the file"; a rejected upload leaves no row |
+| 2 | grant removal waits on the row disappearing (`waitForFunction`, 15 s) | `onRemove` does DELETE + notice + a full reload; the third is a network round trip, so a fixed 2500 ms asserted against whichever finished first — `afterRemove: 1` read as a failed removal |
+| 3 | the preset probe content-type-guards and try-catches every `res.json()` | `await res.json()` on a proxy's HTML page threw `SyntaxError` out of `page.evaluate` → `steps: 0`, and the report blamed the *screen* for the harness's own throw |
+
+### A gate, because twenty ticks of QA bought nothing
+
+`scripts/qa/probe-helper-contract.cjs` reads the harness's own source and holds the invariant:
+**every key a call site branches on is a key the helper's body can return.** Milliseconds, no
+browser, no database, no slot.
+
+One correction worth recording, because the gate caught my own reasoning: its first version
+asserted "the guards must no longer read `uploaded.ok`". That is wrong — the defect was a
+*mismatch*, and the fix could go either way (drop the read, or write the key). This went the second
+way, so a check forbidding the read fails on the fix. It did; it was wrong. The invariant is the
+real thing, and it is asserted in both directions instead.
+
+**Proven to fail, both directions:** helper restored to its original shape → **9/15**, naming both
+broken call sites by line; guard changed to read `uploaded.landedInLibrary` → **13/15**. Restored
+to 15/15 after each.
+
+### Gates
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **243 passed**, 0 failed |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| syntax | `node --check scripts/qa/walkthrough.cjs` | clean |
+| contract | `node scripts/qa/probe-helper-contract.cjs` | **15/15** |
+
+**Browser pass: still has not run**, and the slot is still held live by `w7`
+(`pid 1200667`, `cwd=/mnt/apopic/omnion-w7`, verified with `kill -0` and `/proc/<pid>/cwd`; load
+16.6, 25 Chrome). So the six pair states and the whole file-detail screen remain **unproven by a
+browser** — but for the first time the reason is a slot rather than a guard that could never pass.
+The screen-states box stays open, and REQ-010 stays open.
+
+**Next:** re-run `--only=media` on a free slot and read `mediaFileDetail` out of `summary.json` —
+it should now be `ok: true` with the pair steps present. Then REQ-010's last open code item, the
+CDN purge hook to REQ-011 (the `media.version_created` emitter it subscribes to shipped in slice 2;
+REQ-011 itself is a wave-5 REQ and out of my waves, so this stays a note).
