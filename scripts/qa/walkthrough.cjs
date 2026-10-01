@@ -10318,6 +10318,15 @@ async function main() {
     { path: "/ai/guard/events", name: "ai-guard-events", area: "ai" },
     { path: "/ai/guard/tester", name: "ai-guard-tester", area: "ai" },
     { path: "/ai/guard/about", name: "ai-guard-about", area: "ai" },
+    // Local inference (REQ-106 slice 1) — two routes. The overview is where an endpoint is
+    // registered and where the *absence* of one has to read well, so it is walked with nothing
+    // registered as well as populated; the models table is where a pull's progress is claimed and
+    // polled, which is the half of the slice's acceptance criterion that no API walk can prove.
+    // The models route is walked by bare path and *driven* by the depth pass below with a real
+    // endpoint id in the query string, because a filter that no pass ever supplies proves nothing
+    // about the filtered branch.
+    { path: "/ai/local", name: "ai-local", area: "ai" },
+    { path: "/ai/local/models", name: "ai-local-models", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
