@@ -1166,6 +1166,20 @@ impl From<AiHubError> for ApiError {
                 "guard_configuration",
                 message,
             ),
+            // A refusal by policy is a `403` and not a `400`: nothing about the payload is
+            // malformed, so sending it again unchanged would be refused again, and the code has
+            // to be exactly `ai_guard_blocked` — the chat surface keys its "this was blocked by
+            // the data guard" banner off that string, and a generic `forbidden` would leave the
+            // user with no idea why their message never reached a model.
+            AiHubError::GuardBlocked {
+                label,
+                rule_key,
+                message,
+            } => Self::new(StatusCode::FORBIDDEN, "ai_guard_blocked", message)
+                .with_details(serde_json::json!({
+                    "label": label,
+                    "rule_key": rule_key,
+                })),
             // Approvals (REQ-101). The same three-way split, and for the same reason: an
             // `invalid_approval` is a field on the review or the policy form (a class nobody
             // has heard of, an expiry of zero, a rejection with no reason), an

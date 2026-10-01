@@ -238,6 +238,22 @@ pub enum AiHubError {
     /// is wrong.
     #[error("{0}")]
     GuardConfiguration(String),
+    /// The guard refused this call (REQ-105).
+    ///
+    /// A refusal is not a client mistake and not a server fault: the payload is well formed, the
+    /// platform answered correctly, and the *policy* said no. It carries the label and the rule
+    /// that fired, because the request is explicit that "naming the label and the rule is the
+    /// difference between a support ticket and a five-second fix" — a `403` that says only
+    /// "blocked" would be the ticket.
+    #[error("{message}")]
+    GuardBlocked {
+        /// The label that was detected.
+        label: String,
+        /// The rule key that refused the call.
+        rule_key: String,
+        /// The operator-facing sentence, naming both.
+        message: String,
+    },
     /// The provider answered, but refused the request.
     #[error("the AI provider answered with status {status}: {message}")]
     Upstream {
@@ -315,6 +331,7 @@ impl AiHubError {
             Self::GuardRuleConflict(_) => "guard_rule_conflict",
             Self::InvalidGuardExemption(_) => "invalid_guard_exemption",
             Self::GuardConfiguration(_) => "guard_configuration",
+            Self::GuardBlocked { .. } => "ai_guard_blocked",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::InvalidChatRequest(_) => "invalid_chat_request",
             Self::Transport(_) => "provider_unreachable",

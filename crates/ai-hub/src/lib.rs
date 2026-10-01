@@ -27,6 +27,7 @@ pub mod cost;
 pub mod decision_store;
 pub mod error;
 pub mod failover;
+pub mod guard_checkpoint;
 pub mod guard_data;
 pub mod guard_store;
 pub mod guardrails;

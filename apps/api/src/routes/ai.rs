@@ -1740,6 +1740,81 @@ pub async fn chat(
             omnion_ai_hub::require_capability(&resolved.model, capability)?;
         }
     }
+
+    // The data guard's outbound checkpoint (REQ-105 slice 1). Placed here — after the routing
+    // decision is settled and after the capability check, and before `ChatRequest` is built —
+    // for two reasons that both matter:
+    //
+    // 1. A refused payload must never reach a provider, and the last thing between the store and
+    //    `stream_chat` is the request itself. Whatever this returns *is* what the provider sees.
+    // 2. After the capabilities means the message names a real provider and a real model, so a
+    //    refusal can say which one was going to answer, and a rule scoped to a provider can be
+    //    evaluated against the provider that was actually chosen rather than the one requested.
+    //
+    // The messages are handed back **positionally**: a masked turn is replaced by its masked
+    // text and a blocked turn never gets that far, because `checkpoint_messages` raises the
+    // refusal. A `403 ai_guard_blocked` names the label and the rule, which is the difference
+    // between a support ticket and a five-second fix.
+    //
+    // A request from a user with **no organization** still passes through, against the platform
+    // rules only. That is a real case here rather than a hypothetical — the rest of this AI
+    // family treats the organization as optional for exactly this reason — and skipping the
+    // checkpoint for those users would make the guard's coverage depend on how the account was
+    // created, which is the kind of gap nobody notices until it matters. `load_guard` takes the
+    // nil id for such a call, which yields exactly the `organization_id is null` platform rows
+    // and no policy row: everything `allow`, which is the documented default.
+    let mut ctx =
+        omnion_ai_hub::guard_checkpoint::CheckpointContext::new(organization_id, Uuid::new_v4());
+    ctx.user_id = Some(current.user.id);
+    ctx.feature = body.feature.clone();
+    ctx.provider_id = Some(resolved.model.provider_id);
+
+    let guard = match omnion_ai_hub::guard_store::load_guard(
+        state.db().pool(),
+        organization_id.unwrap_or(Uuid::nil()),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        // A guard that cannot be built must not silently stop guarding. `load_guard` only fails
+        // on a configuration fault (the rule budget), and the alternative — skipping the
+        // checkpoint — would send exactly the traffic the operator installed the guard to stop,
+        // while the screen kept showing the rules as active.
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                organization_id = ?organization_id,
+                "the data guard could not be loaded; refusing the request instead of sending it unguarded"
+            );
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "guard_configuration",
+                "the data guard is misconfigured, so this request was not sent",
+            ));
+        }
+    };
+
+    let outbound_texts: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+    let (guarded, reports) = omnion_ai_hub::guard_checkpoint::checkpoint_messages(
+        state.db().pool(),
+        &guard,
+        &ctx,
+        &outbound_texts,
+        &omnion_ai_hub::guard_checkpoint::value_salt(organization_id.unwrap_or(Uuid::nil()), None),
+    )
+    .await?;
+    for failure in omnion_ai_hub::guard_checkpoint::audit_failures(&reports) {
+        // The verdict stands, but an operator reading the events screen must learn that the
+        // screen is behind. A `warn` here rather than an error: the request was answered.
+        tracing::warn!(
+            error = %failure,
+            organization_id = ?organization_id,
+            "the data guard could not write an audit row"
+        );
+    }
+    for (message, text) in messages.iter_mut().zip(guarded) {
+        message.content = text;
+    }
     let request = ChatRequest {
         model: resolved.model.model_key.clone(),
         messages,
