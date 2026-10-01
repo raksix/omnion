@@ -55,6 +55,19 @@ pub struct NewApproval {
     /// inbox read as though no proposal had produced it — the set a reviewer was deciding came
     /// from nowhere and the apply had nothing to walk back to.
     pub change_set_id: Option<Uuid>,
+    /// Which operation of that set this row is about, by the editor's own key.
+    ///
+    /// Slice 3c files one approval per gated operation, which is the right shape for the inbox
+    /// and left the pipeline unable to answer "which operation may run now?". `resource_id`
+    /// cannot answer it — a set may edit the same page twice (a rename and a publish in one
+    /// proposal) and both rows carry the same id, so "count the approvals for this page"
+    /// releases a delete somebody is still reading. The key survives reordering, dropping and
+    /// re-previewing, and it is the identifier the reviewer actually read.
+    ///
+    /// `None` for the single-call path, which parks on a run step and has no set. Migration
+    /// `0203` makes the pair a constraint: a row naming a set but no key cannot be joined back
+    /// to anything, and a release that treated it as decided is the hole this column closes.
+    pub operation_key: Option<String>,
     pub tool_key: String,
     /// The class, resolved by [`class_of_tool`]. Stored because the mapping can grow and a row
     /// that re-derived its class would change meaning under a deployment.
@@ -195,12 +208,12 @@ pub async fn request(pool: &PgPool, new: &NewApproval) -> Result<Requested> {
 
     let sql = format!(
         "insert into ai_approvals (organization_id, site_id, run_id, step_id, agent_id, \
-         identity_id, change_set_id, tool_key, tool_class, resource_type, resource_id, \
-         resource_label, risk, title, summary, operation_count, irreversible, \
+         identity_id, change_set_id, operation_key, tool_key, tool_class, resource_type, \
+         resource_id, resource_label, risk, title, summary, operation_count, irreversible, \
          requires_confirmation, confirmation_phrase, preview, preview_hash, base_revision, \
          status, requested_by, model_id, expires_at, created_at) \
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21, \
-         $22, 'pending',$23,$24,$25, now()) \
+         $22,$23, 'pending',$24,$25,$26, now()) \
          on conflict do nothing \
          returning {APPROVAL_COLUMNS}"
     );
@@ -212,6 +225,7 @@ pub async fn request(pool: &PgPool, new: &NewApproval) -> Result<Requested> {
         .bind(new.agent_id)
         .bind(new.identity_id)
         .bind(&new.change_set_id)
+        .bind(&new.operation_key)
         .bind(&new.tool_key)
         .bind(&new.tool_class)
         .bind(&new.resource_type)

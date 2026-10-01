@@ -35,6 +35,7 @@ use serde_json::json;
 
 use std::collections::BTreeSet;
 
+use omnion_ai_hub::change_sets;
 use omnion_ai_hub::approvals::DecisionOutcome;
 use omnion_ai_hub::approvals::PolicyView;
 use omnion_ai_hub::approvals::io::{
@@ -483,6 +484,58 @@ pub async fn apply(
         ));
     }
 
+    // # An approval that came out of a change set releases the SET, not one operation
+    //
+    // Slice 3c files one approval per gated operation, and left nothing to release the set
+    // when the answers arrived: the bridge parked, and no code path moved `pending →
+    // confirmed`. A set with a gated operation could therefore be approved, row by row, and
+    // then sit there forever — the pipeline the request asks for existed only in the
+    // direction that files work.
+    //
+    // So an apply on a **set-bound** row is a release, and it is a different code path from
+    // the single-operation one below, deliberately:
+    //
+    // - **Every** gated operation must be approved first (`release_gate`). Approving one row
+    //   of a three-page publish is not approving the set, and a bridge that released on the
+    //   first decision would be the "a second person releases it" promise answered by a
+    //   signature.
+    // - The writes go through `apply_confirmed`, so the set is applied by the **same**
+    //   all-or-nothing transaction a set applied through `/apply` uses. Two apply paths with
+    //   one write is a bug waiting for the version where one of them forgets a field.
+    let mut released_set: Option<change_sets::ChangeSet> = None;
+    if let Some(change_set_id) = approval.change_set_id {
+        let set = release_parked_set(&state, organization, actor, change_set_id).await?;
+        released_set = Some(set);
+    }
+
+    if released_set.is_some() {
+        io::mark_applied(state.db().pool(), organization, id, Some(actor))
+            .await
+            .map_err(ApiError::from)?;
+
+        bus::emit(
+            state.db().pool(),
+            NewEvent::new("ai.changeset.released")
+                .organization(organization)
+                .actor(actor)
+                .payload(json!({
+                    "approval_id": id,
+                    "change_set_id": approval.change_set_id,
+                })),
+        )
+        .await?;
+
+        let set = released_set.expect("checked above");
+        return Ok(Json(AppliedResult {
+            applied: true,
+            resource_type: set.operations[0].operation.resource_type.clone(),
+            resource_id: set.operations[0].operation.resource_id.clone(),
+            slug: set.operations[0].operation.resource_id.clone(),
+            status: set.status.clone(),
+            fields_written: set.operations.len(),
+        }));
+    }
+
     let plan = omnion_ai_hub::approvals::plan::Plan::from_preview(&approval.preview)
         .map_err(ApiError::from)?;
     let change = omnion_ai_hub::approvals::target::changes_for(&plan).map_err(ApiError::from)?;
@@ -533,6 +586,119 @@ pub async fn apply(
         status: page.status,
         fields_written: plan.diffs.len(),
     }))
+}
+
+/// Release a parked change set, once the inbox has answered **every** one of its gates.
+///
+/// Three refusals, each naming the row that caused it, because the screen's job here is to
+/// tell a reviewer what is still outstanding rather than to say "no":
+///
+/// - `409 change_set_gates_outstanding` — some gated operation has no approving decision. The
+///   message lists the keys, and the keys are what the inbox shows.
+/// - `409 not_confirmable` — the set moved on (applied, discarded or failed) since this
+///   approval was filed, so there is nothing to release.
+/// - `409 change_set_rejected` — a gate was answered with a rejection. A rejected set is
+///   **not** applied and not re-confirmed: the reviewer refused, and the correct outcome is a
+///   set somebody has to re-propose, not one that proceeds without its refused operation.
+///
+/// The transition is the same conditional `pending → confirmed` the store's other transitions
+/// use, so two people releasing the same set produce one winner and one conflict rather than
+/// two applies of the same operations.
+async fn release_parked_set(
+    state: &AppState,
+    organization: uuid::Uuid,
+    actor: uuid::Uuid,
+    change_set_id: uuid::Uuid,
+) -> Result<change_sets::ChangeSet, ApiError> {
+    let set = change_sets::store::read(state.db().pool(), organization, change_set_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "change_set_not_found",
+                format!("this approval belongs to change set {change_set_id}, which is gone"),
+            )
+        })?;
+
+    // A rejected gate ends the set rather than stalling it. Read **before** the gate check, so
+    // the message is the useful one: a reviewer looking at a refused delete should be told it
+    // was refused, not that "1 gate is outstanding" while a rejected row sits in the tab.
+    let refused = change_sets::store::rejected_operation_keys(
+        state.db().pool(),
+        organization,
+        change_set_id,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    if !refused.is_empty() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "change_set_rejected",
+            format!(
+                "this change set was rejected at {}; re-propose it rather than applying it",
+                refused.join(", ")
+            ),
+        ));
+    }
+
+    let approved =
+        change_sets::store::approved_operation_keys(state.db().pool(), organization, change_set_id)
+            .await
+            .map_err(ApiError::from)?;
+
+    match change_sets::release_gate(&set, &approved) {
+        change_sets::Gate::Blocked { outstanding } => Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "change_set_gates_outstanding",
+            format!(
+                "this change set still has {} gate(s) nobody answered: {}",
+                outstanding.len(),
+                outstanding.join(", ")
+            ),
+        )),
+        change_sets::Gate::Released => {
+            let confirmed = change_sets::store::transition(
+                state.db().pool(),
+                organization,
+                change_set_id,
+                "pending",
+                "confirmed",
+                None,
+            )
+            .await
+            .map_err(ApiError::from)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "not_confirmable",
+                    format!(
+                        "this change set is now `{}` and was released already",
+                        set.status
+                    ),
+                )
+            })?;
+
+            debug_assert_eq!(confirmed.status, "confirmed");
+
+            crate::routes::ai_change_sets::apply_set(state, organization, actor, change_set_id)
+                .await?;
+
+            // Re-read rather than deriving: the screen must not render a status the store did
+            // not commit, and this row's `applied` is the whole claim of the call.
+            change_sets::store::read(state.db().pool(), organization, change_set_id)
+                .await
+                .map_err(ApiError::from)?
+                .ok_or_else(|| {
+                    ApiError::new(
+                        axum::http::StatusCode::NOT_FOUND,
+                        "change_set_not_found",
+                        format!("change set {change_set_id} vanished while it was being applied"),
+                    )
+                })
+        }
+    }
 }
 
 /// What an apply answers.

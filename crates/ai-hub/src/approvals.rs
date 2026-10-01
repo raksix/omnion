@@ -58,7 +58,7 @@ use crate::error::{AiHubError, Result};
 /// Every column the store reads back, in one place so a write and a read cannot drift.
 /// Every column the store reads back, in the order `Approval` declares them.
 const APPROVAL_COLUMNS: &str = "id, organization_id, site_id, run_id, step_id, agent_id, \
-     identity_id, change_set_id, tool_key, tool_class, resource_type, resource_id, \
+     identity_id, change_set_id, operation_key, tool_key, tool_class, resource_type, resource_id, \
      resource_label, risk, title, summary, operation_count, irreversible, \
      requires_confirmation, confirmation_phrase, preview, preview_hash, base_revision, status, \
      requested_by, model_id, expires_at, decided_by, decided_at, decision_note, applied_at, \
@@ -297,6 +297,12 @@ pub struct Approval {
     pub agent_id: Option<Uuid>,
     pub identity_id: Option<Uuid>,
     pub change_set_id: Option<Uuid>,
+    /// Which operation of the set this row gates, by the editor's key (`0203`).
+    ///
+    /// `None` on the single-call path, which parks on a run step. The column is denormalised
+    /// on purpose: the operations live in one jsonb array on `ai_change_sets`, so joining back
+    /// to them would mean re-deriving the classification that filed the row.
+    pub operation_key: Option<String>,
     pub tool_key: String,
     pub tool_class: String,
     pub resource_type: Option<String>,
@@ -745,6 +751,10 @@ mod tests {
             agent_id: None,
             identity_id: None,
             change_set_id: None,
+            // `None` is the honest answer for a single-call approval: it did not come out of a
+            // change set, so it has no operation to name. The field is deliberately not `Some("")`
+            // — the migration says exactly that empty string is a key the editor could mint.
+            operation_key: None,
             tool_key: "content.publish".to_owned(),
             tool_class: "content_publish".to_owned(),
             resource_type: Some("page".to_owned()),

@@ -228,6 +228,59 @@ impl ChangeSet {
     }
 }
 
+/// Which of a parked set's gates the inbox has answered so far.
+///
+/// One approval per gated operation (slice 3c), so "the reviewer approved one row" and "the
+/// reviewer approved the set" are **different facts**, and a pipeline that treats them as one
+/// releases work a human never saw. This is the shape that names the difference: the set's
+/// own gated operation keys, against the ones whose approval has been decided in the
+/// approving direction.
+///
+/// Keys and not ids, because the caller holds a list of parked rows (each carrying the
+/// `operation_key` the confirm route stamped on it) and a set of uuids would ask it to join
+/// two vocabularies it does not have. A key is what the editor shows and what the reviewer
+/// read.
+#[must_use]
+pub fn release_gate(set: &ChangeSet, approved_keys: &[String]) -> Gate {
+    let gated: Vec<&str> = set
+        .gated_operations()
+        .iter()
+        .map(|(op, _)| op.key.as_str())
+        .collect();
+    let outstanding: Vec<&str> = gated
+        .iter()
+        .copied()
+        .filter(|key| !approved_keys.iter().any(|done| done == key))
+        .collect();
+
+    if outstanding.is_empty() {
+        Gate::Released
+    } else {
+        Gate::Blocked {
+            outstanding: outstanding.iter().map(|key| (*key).to_owned()).collect(),
+        }
+    }
+}
+
+/// Whether a parked set may be released, and what is still holding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gate {
+    /// Every gated operation has an approving decision. The set may move `pending → confirmed`
+    /// and be applied.
+    Released,
+    /// At least one gate is unanswered. `outstanding` names them, so the refusal can list the
+    /// rows the inbox still has to answer instead of a bare "not yet".
+    Blocked { outstanding: Vec<String> },
+}
+
+impl Gate {
+    /// `true` when the set may be released.
+    #[must_use]
+    pub fn is_released(&self) -> bool {
+        matches!(self, Gate::Released)
+    }
+}
+
 impl ChangeOp {
     /// The gated class this operation falls in, or `None` when nothing gates it.
     ///
@@ -997,6 +1050,72 @@ pub mod store {
 
         tx.commit().await?;
         Ok(applied)
+    }
+
+    /// The gated operations of a parked set that the inbox has already approved.
+    ///
+    /// The join is on **`operation_key`**, not on `resource_id` or `preview_hash`, and both of
+    /// those are wrong in a way that only shows up once a second person acts:
+    ///
+    /// - `resource_id` — a set may edit one page twice (a rename and a publish in the same
+    ///   proposal). Both approvals carry the same id, so an id-based release lets approving the
+    ///   rename approve the publish, which is precisely the operation nobody read.
+    /// - `preview_hash` — it names *what would be written*, and two operations with the same
+    ///   shape hash the same only if the effect is identical, which is not the same question
+    ///   as "which row did the reviewer answer".
+    ///
+    /// `approved` and **not** `decided`: a rejected row is decided too, and counting one as
+    /// released is how a refused delete turns into a delete. The refusal is read separately,
+    /// by [`rejected_operation_keys`](Self::rejected_operation_keys), before this one — so the
+    /// two functions answer different questions and neither has to know about the other. An
+    /// earlier draft listed `'rejected'` here as well, which made this primitive disagree with
+    /// its own contract: the route survived it, because it refuses on the rejection first, but
+    /// the walk that asserts "a rejected gate is not an approving one" read the pair directly
+    /// and correctly said no. `applied` is excluded as well, because a row that has already been
+    /// applied is not evidence about a *different* operation that happens to share a set.
+    ///
+    /// Empty for a set with no rows yet, which is the answer that keeps a fresh `pending` set
+    /// parked — the caller compares the count with the gated count rather than checking this
+    /// for emptiness, because "no rows" and "all rows" are both empty-looking.
+    pub async fn approved_operation_keys(
+        pool: &PgPool,
+        organization_id: Uuid,
+        change_set_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let keys: Vec<String> = sqlx::query_scalar(
+            "select operation_key from ai_approvals \
+             where organization_id = $1 and change_set_id = $2 \
+               and status = 'approved' and operation_key is not null",
+        )
+        .bind(organization_id)
+        .bind(change_set_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(keys)
+    }
+
+    /// The gated operations of a parked set that the inbox has **rejected**.
+    ///
+    /// The counterpart of [`approved_operation_keys`](Self::approved_operation_keys), and read
+    /// before it on purpose: a refused gate ends the set, so a set with one rejected and two
+    /// approved operations must not report "one outstanding" while a refusal sits in the tab.
+    /// A pipeline that only counted approvals would keep waiting for an answer that has
+    /// already been given, in the negative.
+    pub async fn rejected_operation_keys(
+        pool: &PgPool,
+        organization_id: Uuid,
+        change_set_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let keys: Vec<String> = sqlx::query_scalar(
+            "select operation_key from ai_approvals \
+             where organization_id = $1 and change_set_id = $2 \
+               and status = 'rejected' and operation_key is not null",
+        )
+        .bind(organization_id)
+        .bind(change_set_id)
+        .fetch_all(pool)
+        .await?;
+        Ok(keys)
     }
 
     /// Record that an apply did not happen, and why.
