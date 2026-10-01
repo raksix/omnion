@@ -10957,3 +10957,47 @@ multiset check**, not a line count.
 
 **Next.** The documents + reports half of slice 4, then the admin screens for both halves —
 **no screen exists for onboarding yet**, which is the same gap slice 1 had.
+
+## Tick 59 — REQ-055 slice 4b: the walks that never compiled, and the two screens that closed the gap
+
+**What.** Two things, in this order, and the order is the lesson. First: `apps/api/tests/hr_documents.rs`
+— 1,107 lines written at the end of tick 58 and **never compiled**. Second: the document index and
+the reports screen, which slice 4b had shipped an API, a module and a permission split for without
+a single route a person could open.
+
+**The half-written slice is the dangerous state.** The file's grant helper called
+`role_store::bind_role(&NewBinding { organization_id, subject_type, subject_id })`, and
+`omnion_permissions` moved to `bindings::grant(NewBinding { role_id, user_id, scope, granted_by,
+expires_at })` two slices earlier. **Every gate was green the whole time** — a file nothing
+compiles is not a red gate, it is invisible, and `git status` showing it as untracked for a tick is
+how it stays that way. So the first act of this tick was making it build, not adding to it. Three
+fixes, one defect class: an API from before a rename, pinned by nothing. Also `Date::now_utc` does
+not exist in `time` (an instant has `.date()`), and `TestResponse` is `Debug`, not `Display`.
+
+**Two name collisions that `tsc` caught and the eye would not.** `AbsenceRow` already existed in
+`lib/hr.ts` — the absence **calendar's** one-employee line — so the report's row is
+`AbsenceReportRow`; and the report union is what made a fourth table a compile error rather than a
+runtime blank. **When a client type name is already taken, the second definition silently wins at
+the import site**, and the symptom is a table rendering the *other* shape's fields as `undefined`.
+
+**Proof.**
+
+- `hr_documents` **16/16 green** in 331 s against the private PostgreSQL 17 on **5444**, one fresh
+  database per walk, each run by its own process (`run-walks.sh` hardcodes the shared 5433).
+- `omnion-module-hr` **130/130**.
+- `pnpm typecheck` clean: `node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit`.
+- Both screens added to the walkthrough inventory with `runHrDocumentsAndReports`, which presses
+  the expiry sweep and **requires its receipt**, switches **every report the served picker offers**
+  and asserts a table for each, and changes the date range and asserts the **period line moved**.
+
+**The three decisions worth carrying.** The header counts the **filtered** rows, because the server
+sends `totals` over the same query the table shows and a header counting the whole organization
+above a filtered table is a screen lying in the one place somebody looks for a number. Delete says
+it drops the **reference** — the bytes stay in the media pipeline, and the walk asserts the media
+row survives, because a button labelled "delete" on a screen of contracts is the moment somebody
+clicks it without reading. And the four reports share **one** period picker, because they answer
+four readings of the *same* period; four pages would mean a payroll run exporting four files
+covering four different months.
+
+**Next.** The **onboarding screen** — the last of slice 4 — then a QA pass over all three at once.
+`/hr/onboarding` still does not exist, which is the same gap slice 1 had.

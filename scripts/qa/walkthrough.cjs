@@ -1907,6 +1907,151 @@ async function runInventoryLedger(page, report) {
  *    checks it contains a `today is` clause, because a grid that computed its own "now" is a grid
  *    that marks the wrong day whenever the browser's clock and the server's disagree.
  */
+/**
+ * The document index and the reports screen (REQ-055, slice 4b).
+ *
+ * Driven rather than merely visited, and for three specific reasons rather than for coverage:
+ *
+ * 1. **The module shelf offers both.** A module reachable only by typing a URL does not exist for
+ *    anybody working in the panel, and both screens were added to the shelf in this slice — so the
+ *    shelf is part of what shipped, and it is the part most likely to regress.
+ * 2. **The reports picker is served, not hardcoded.** The pass switches every report the route
+ *    offers and asserts a table came back for each. A picker entry whose report 404s, or renders
+ *    an empty shell, is the failure this catches — and "the picker has four options" is not a
+ *    claim about the four reports.
+ * 3. **The date range is re-read, not assumed.** The period line under the picker has to change
+ *    when the dates do: the server defaults to the current calendar year, and a screen that shows
+ *    "covering <default>" under a range the user typed is reporting somebody else's period.
+ */
+async function runHrDocumentsAndReports(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "hr", action: "hr-documents-reports", ...step });
+  };
+
+  // --- the document index ----------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/hr/documents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  const indexRendered = (await page.locator("[data-qa-hr-documents]").count()) > 0;
+  note({ step: "index", rendered: indexRendered });
+  if (!indexRendered) {
+    return { ok: false, reason: "the document index did not render", steps };
+  }
+  await shot(page, "page-hr-documents");
+
+  // Either a table of rows or the empty state, and **one** of the two. A screen that renders
+  // neither — or both — is the state this assertion exists for: the earlier one hangs on the
+  // skeleton, the second duplicates the empty state under a header that says "0 documents".
+  const rows = await page.locator("[data-qa-hr-document-row]").count();
+  const empty = await page.locator("text=No documents yet").count();
+  const emptyFiltered = await page.locator("text=No documents match these filters").count();
+  note({ step: "documents-state", rows, empty, emptyFiltered });
+  if (rows === 0 && empty === 0 && emptyFiltered === 0) {
+    return {
+      ok: false,
+      reason: "the document index rendered neither rows nor an empty state — a table that is still loading reads the same as a broken one",
+      steps,
+    };
+  }
+
+  // The four counts are always present, even at zero: a header that only appears once there is
+  // something to count is a header that cannot answer "is anything expiring?".
+  const tiles = await page.locator("[data-qa-hr-documents-total]").count();
+  note({ step: "documents-totals", tiles });
+  if (tiles !== 4) {
+    return { ok: false, reason: `expected 4 document count tiles, found ${tiles}`, steps };
+  }
+
+  // The shelf offers the two new destinations.
+  const shelfDocuments = await page.locator('[data-qa-hr-module-link="documents"]').count();
+  const shelfReports = await page.locator('[data-qa-hr-module-link="reports"]').count();
+  note({ step: "module-nav", offersDocuments: shelfDocuments > 0, offersReports: shelfReports > 0 });
+  if (shelfDocuments === 0 || shelfReports === 0) {
+    return { ok: false, reason: "the HR module nav does not offer both new screens", steps };
+  }
+
+  // The expiry sweep is a button with a receipt, not a silent write. The pass presses it and
+  // requires the line that says what it considered — a sweep with no receipt is indistinguishable
+  // from a sweep that did nothing.
+  const sweepButton = await page.locator("[data-qa-hr-documents-sweep]").count();
+  note({ step: "sweep-button", present: sweepButton > 0 });
+  if (sweepButton === 0) {
+    return { ok: false, reason: "the document index has no expiry sweep action", steps };
+  }
+  await page.locator("[data-qa-hr-documents-sweep]").first().click().catch(() => {});
+  await page.waitForTimeout(1400);
+  const receipt = await page.locator("[data-qa-hr-documents-sweep-result], [data-qa-hr-documents-sweep-error]").count();
+  note({ step: "sweep-receipt", shown: receipt > 0 });
+  if (receipt === 0) {
+    return { ok: false, reason: "the expiry sweep reported nothing back to the operator", steps };
+  }
+  await shot(page, "page-hr-documents-swept");
+
+  // --- the reports screen ----------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/hr/reports`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  const reportsRendered = (await page.locator("[data-qa-hr-reports]").count()) > 0;
+  note({ step: "reports", rendered: reportsRendered });
+  if (!reportsRendered) {
+    return { ok: false, reason: "the reports screen did not render", steps };
+  }
+  await shot(page, "page-hr-reports");
+
+  // **Every option the picker offers must produce a table.** The picker is served by the route,
+  // so this reads the server's own list rather than a copy of it — a screen offering a report
+  // the route refuses answers 404 at the click, and that is the bug this catches.
+  const offered = await page.locator("[data-qa-hr-reports-picker] option").allTextContents();
+  note({ step: "reports-offered", offered: offered.length, names: offered });
+  if (offered.length === 0) {
+    return { ok: false, reason: "the report picker is empty", steps };
+  }
+
+  for (const label of offered) {
+    await page
+      .locator("[data-qa-hr-reports-picker]")
+      .selectOption({ label })
+      .catch(() => {});
+    await page.waitForTimeout(1100);
+    const table = await page.locator("[data-qa-hr-report-table]").count();
+    const noRows = await page.locator("text=No ").count();
+    const failed = await page.locator("[data-qa-hr-error-state], [role=alert]").count();
+    note({ step: `reports-open-${label}`, table, noRows, failed });
+    if (table === 0 && noRows === 0) {
+      return { ok: false, reason: `the ${label} report rendered neither a table nor an empty state`, steps };
+    }
+    if (failed > 0) {
+      return { ok: false, reason: `the ${label} report rendered an error panel`, steps };
+    }
+    await shot(page, `page-hr-reports-${label.toLowerCase().replace(/[^a-z]+/g, "-")}`);
+  }
+
+  // The period line must report the server's period, and must move when the range does. Without
+  // the second half this only proves a string exists.
+  const periodBefore = await page.locator("[data-qa-hr-reports] p").last().textContent();
+  await page.locator("[data-qa-hr-reports-from]").fill("2026-01-01").catch(() => {});
+  await page.locator("[data-qa-hr-reports-from]").dispatchEvent("change").catch(() => {});
+  await page.waitForTimeout(1400);
+  const periodAfter = await page.locator("[data-qa-hr-reports] p").last().textContent();
+  note({
+    step: "period",
+    before: periodBefore,
+    after: periodAfter,
+    moved: periodBefore !== periodAfter,
+  });
+  if (periodBefore === periodAfter) {
+    return {
+      ok: false,
+      reason: "changing the date range left the period line unchanged — the screen is reporting a period it was not asked for",
+      steps,
+    };
+  }
+
+  return { ok: true, steps };
+}
+
 async function runHrLeave(page, report) {
   const steps = [];
   const note = (step) => {
@@ -10412,6 +10557,13 @@ async function main() {
     { path: "/hr/me/attendance", name: "hr-me-attendance" },
     { path: "/hr/attendance", name: "hr-attendance-roster" },
     { path: "/hr/leave/types", name: "hr-leave-types" },
+    // Documents and reports (REQ-055, slice 4b). In the ordinary inventory list, not only inside
+    // a bespoke pass, for the same reason as every HR route above it: a screen the harness can
+    // reach only through a hand-written `page.goto` is a screen whose regressions nobody notices.
+    // Both were shipped with an API, walks and a full table of state before either had a route
+    // here — which is exactly how slice 1's gap survived two ticks with every gate green.
+    { path: "/hr/documents", name: "hr-documents" },
+    { path: "/hr/reports", name: "hr-reports" },
     // The security centre's five screens (REQ-012, slices 1–3). `runSecurityDepth` drives the
     // overview, the findings store and the header policy, but it never opened the last two —
     // and the same is true of the route list, so two screens that ship with rules, a policy
@@ -10645,6 +10797,17 @@ async function main() {
   if (!onlyGroup("hr")) {
     report.hrLeave = await runDepthPass("hr-leave", () => runHrLeave(page, report));
     log(`hr leave: ${JSON.stringify(report.hrLeave)}`);
+
+  // The document index and the reports screen (REQ-055, slice 4b). Driven rather than merely
+  // visited: the pass presses the expiry sweep and requires its receipt, then switches **every**
+  // report the served picker offers and asserts each one produced a table. Both screens shipped
+  // with an API and walks before either had a route in the inventory, so a pass that only opened
+  // them by URL would leave the shelf untested too.
+  if (!onlyGroup("hr")) {
+    report.hrDocumentsReports = await runDepthPass("hr-documents-reports", () =>
+      runHrDocumentsAndReports(page, report));
+    log(`hr documents+reports: ${JSON.stringify(report.hrDocumentsReports)}`);
+  }
   }
 
   // The self-service surfaces (REQ-055, slice 2c). Driven rather than merely visited: the pass
