@@ -333,3 +333,91 @@ The lifecycle pass sends SIGTERM while requests are in flight and asserts the re
 **Next.** (a) Re-run the private-stack pass when the box is below load 15 with 4 GB free; nothing in
 this request is missing a route or a binding, and the landing screen is already confirmed by
 screenshot. (b) Nothing else on this request is blocked — the remaining slices are code-complete.
+
+**Sixth close-gate tick: the six ticks of green depth passes were measuring thirteen screens no
+route walk had ever visited.** The blocker recorded above — a saturated box — was real and it was
+also not the reason the pass had never finished cleanly. Reading the harness instead of re-reading
+the last report turned up something the three "queue" ticks and the three "browser crash" ticks all
+missed.
+
+  **A merge deleted this request's entire route coverage, and nothing failed.**
+  `git log -S` puts all thirteen wave-5b entries (six `/secrets`, all seven `/observability`) in
+  `c0b3a58b`…`95656bb3`, and all thirteen are `-` deletions in merge **`8c6ab11d`**
+  ("merge(origin/main): wave 5b platform extras on top of the restore-jobs and qa-budget work").
+  That merge resolved a conflict in `walkthrough.cjs` by taking `origin/main`'s copy of the route
+  list wholesale; `origin/main`'s copy predated the platform-extras screens. The file still parses,
+  the depth passes still exist, and the merge is green in the history.
+
+  **A depth pass and a route entry are DIFFERENT lists, and that is what hid it.** Both halves of
+  the walkthrough's coverage for a screen are separate: the `wants()` block drives behaviour, the
+  `routes` entry is what collects `diagnostics()` and what the 390px pass iterates. The merge kept
+  the first and dropped the second, so every focused pass that named one of these screens reported
+  its own `matchedOnly` name as walked and exited green. **Six ticks of green depth passes sat on
+  screens with no overflow, offscreen, broken-image or console-error measurement, and not one of the
+  seven had ever been rendered at 390px.** A depth pass drives a screen; only a route entry proves
+  its layout.
+
+  **The second half was broken independently, in the opposite direction, and had been since
+  `c0b3a58b`:** `runObservabilityMetricsDepth` is 158 lines with fourteen `note()` checks and two
+  screenshots, exported at `module.exports`, and called from nowhere. `c0b3a58b` wrote the function
+  and the route entry but no `wants()` block, so `--only=observability-metrics` was a pass name
+  nothing answered to. The metric chart, the range change, the cap bar, the PromQL copy and its
+  390px layout had never run.
+
+  **Fixed** (`3cbbe56c`): the thirteen entries are back in the desktop list and in `mobileRoutes`;
+  `assertWave5bScreensWalked` refuses to start a pass in which any is missing; and the metric pass
+  answers to its own `--only` name instead of being folded into the trace pass it shares no screen
+  with. `scripts/qa/wave5b-route-coverage.test.cjs` holds it — 8 checks, 6/6 defect mutations
+  caught, 1/1 control green.
+
+  **The gate itself needed three attempts before it measured anything, and that is the part worth
+  keeping.** The first version stripped comments with `src.replace(/\/\*[\s\S]*?\*\//g, "")` and
+  then tested for `async function <name>(`. It reported the orphan check GREEN on a file where I had
+  reproduced the orphan exactly, because the stripper matched a `/*` inside a string, opened a
+  "comment" that ran four kilobytes, and deleted the definitions under test — so every pass read as
+  "not in this file", the `if (!defined) return false` short-circuit skipped all of them, and the
+  check passed on nothing. The mutation harness then spliced its failure list back into a shared
+  array before its own summary read it and printed **5/5 mutations caught** for two it had missed.
+  A comment stripper that cannot tell a `/*` in a comment from one in a string does not error when
+  it is wrong; it silently deletes the subject of the test. The anchors are structural and
+  line-anchored now, the mutation tally is its own accumulator, and a mutation that does not go red
+  fails the run separately from the source. A third pass added the guard's own body to the checks,
+  because a guard that is defined, called and empty passes every other check in the file — the
+  same "documented but unreachable" shape this request has produced five times, one level up.
+
+  **Proven load-bearing rather than asserted.** Deleting `{ path: "/observability/logs", … }` from a
+  copy of the real file and running it makes the guard throw `wave-5b screens missing from the
+  route list: /observability/logs`; the unmutated file passes it. All seven `scripts/qa/*.test.cjs`
+  green, `node --check` parses, `pnpm typecheck` 2/2, `omnion-telemetry` 179/179.
+
+  **The close gate stays UNTICKED.** This tick fixed the measurement, and a fixed measurement is not
+  a measurement: the browser pass over the restored screens is running on the private stack now, and
+  the box answers that question, not this file. Also unchanged and reported rather than edited —
+  `scripts/qa/release-manifest.sh` is red on one check (`themes/minimal/package.json` declares
+  0.1.1 against the workspace's 0.1.0). That is wave 2's file, it is identical at `HEAD~1`, and
+  this tick's diff touches two files, neither of them that one.
+
+  **The pass then ran, and it is 16/16 measured with 0 layout findings — the 215 "high" findings
+  are ONE root cause and it is not a defect list.** `QA_ONLY` over the thirteen restored screens plus
+  the three reliability ones: `focused pass coverage: 16 route/pass name(s) walked, 0 unmatched`,
+  399 clicks, 431 shots. **All 16 pages produced diagnostics** (no `unmeasured-page`), **13 mobile
+  screens at 390–443 px with no horizontal overflow**, and the findings that a restored route could
+  possibly cause — `overflow`, `offscreen`, `broken-image`, `unmeasured-page`, `empty-pass`,
+  `unknown-pass-name` — are **0**. Each screen's own `overflow=False broken=0 offscreen=0`.
+
+  The 215 highs are 98 `console-error` + 96 `request-failed` + 20 `click-error` + 1 `web-page`, and
+  they collapse to a single fact: **`crates/security`'s `sign_in` policy is `limit 10 per
+  window_seconds 300`** (`limiter.rs` `defaults()`). The pass performs a sign-in per depth pass and
+  its retries, and twenty `Sign in` presses inside five minutes walk straight into that wall — 44 of
+  the failing requests are `/api/v1/onboarding`, the rest spread across notifications, sites,
+  webhooks and devices. The 20 click-errors are nav links on pages whose data never loaded, which is
+  why they time out at 4500 ms rather than being mis-clicks.
+
+  So the honest reading is the one the count hides: **the limiter is working, the harness is the
+  thing that does not fit inside it.** A focused pass over sixteen screens must not need sixteen
+  sign-ins. Two things follow, and neither is done in this tick because both change harness
+  behaviour rather than product behaviour: sign in once and share the session across depth passes,
+  and have the pass recognise its own `sign_in` refusal as an environment refusal rather than
+  recording 96 `request-failed` highs. **Until that is fixed, a focused pass's high count is not a
+  defect count and must not be read as one** — the layout findings, of which there are none, are the
+  part a restored route can actually cause.
