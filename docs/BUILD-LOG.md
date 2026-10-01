@@ -8305,3 +8305,67 @@ full 13-test run finish inside one tick — three attempts hit their timeouts wi
 outstanding, which is the reason this entry says "11 ok" and not a pass count. Next tick runs that
 walk alone on a fresh database and reads the second response's body. Then slice 3: the explorer
 with real calls, Redis metering, the rate limiter with `429`/`Retry-After`, and the usage tab.
+
+## 2026-09-30 — REQ-019 slice 2: the cursor walk passes, and passing it found six more defects
+
+**What shipped.** One commit per fix, in the order the walk exposed them. `4c20918a`,
+`f1f36642` and `f7e23f55` were last tick's; this tick is `2c9a1b40` (the typed cursor), `b6f4e07d`
+(the sort vocabulary) and `d0f8a3c6` (the response envelope).
+
+**Proof — what ran.**
+
+- `cargo test -p omnion-content --lib` — **308/0** (from 304).
+- `cargo test -p omnion-api --lib` — **253/0** (from 252).
+- `cargo test -p omnion-api --test content_read_surface -- --test-threads=1` — **16 ok / 0 failed**,
+  from **0/13** at the start of the previous tick. 299 s, so the whole file was run twice.
+- `pnpm typecheck` — **exit 0**, 2/2 tasks, 14 packages.
+
+**The headline is that the walk was a load-bearing test, not a formality.** It was the one criterion
+this slice exists for, it was the one test that could not pass, and the first thing it did was
+answer a question the unit suite could not. Six defects, and the reason each survived is the same
+reason in every case: **the unit test asserted something adjacent to the defect.**
+
+| Defect | Symptom | What the tests had been asserting |
+|---|---|---|
+| Cursor bound as `text` | `500 operator does not exist: timestamptz < text`, page two | that a cursor decodes |
+| `sort=title` on pages | `500`, every call | that the parser accepts the value |
+| `sort=title` on media | `500`, every call | nothing — the OpenAPI document agreed with the handler |
+| Media cursor format | `400` from page two | the pages half's format |
+| `count` vs `items` | `limit=2` returned three items | one page's `count` |
+| Media over-fetch | `next_cursor` always `null` | the pages handler's binding |
+
+**The lesson worth carrying is the typed boundary.** The pages list *parsed* the cursor's instant
+and then called `.to_string()` on it — a correct parse whose result was immediately degraded back
+to text and handed to a `timestamptz` column. sqlx cannot catch that, because the bind is
+well-typed for *text* and the mismatch only exists on the PostgreSQL side. **A conversion that ends
+in `to_string()` is a conversion that threw its work away**, and the same defect existed on the
+media handler in the *other* direction (written with `Display`, read with `Rfc3339`) — fixed across
+two consecutive ticks, which is why `content_read::stamp` and `content_read::cursor_instant` are
+now two functions both halves of both handlers call.
+
+Second: `Page::new` was a helper **nothing called**, and its `fetched == limit` rule *contradicted*
+the routes' correct `fetched > limit` rule — in the same crate. The two rules differ on exactly the
+sets whose size is divisible by the limit, so the dead copy was one refactor away from becoming the
+live one. It is deleted; the decision is `content_read::continues(fetched, limit)` with the
+separating cases tested.
+
+**Third, and the one to remember: a new test was wrong before the product was.** The title-sort walk
+asserted A→Z and failed against a correct endpoint, because every sort on this surface is
+descending and the crate says so in its own module docs. The test was fixed, not the product — and
+the fix is recorded in the test's doc comment, because the next reader will have the same
+intuition about "alphabetical".
+
+**Also removed:** the `updated_since` test's hand-written `to_rfc3339` helper. It existed because
+the surface did not round trip its own output, and its own doc comment said so. The item's
+`updated_at` now renders with the same `stamp` the cursor uses, so the value a caller is handed is
+the value the API accepts back — and the test feeds it back verbatim.
+
+**Environment.** These walks need `--test-threads=1` on the shared box (four concurrent fixtures
+fight over `seed::ensure` and the connection pool); at `--test-threads=4` eight of sixteen fail
+while every one of them passes alone. `OMNION_CSRF_SECRET` must be exported or every
+cookie-authenticated fixture step answers `403 csrf_unavailable` — a probe defect, not a product
+one, and the second time this loop has lost time to it.
+
+**Next.** Slice 3: the explorer with real calls, Redis metering, the rate limiter with
+`429`/`Retry-After`, the throttled event and the `/content-api/usage` tab. The Tokens-tab screen
+rows still need a QA pass to tick the `revoked` criterion — the API half is proven.

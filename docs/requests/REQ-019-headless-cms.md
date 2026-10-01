@@ -1,38 +1,51 @@
 # REQ-019 — Headless CMS
 
-> **Status:** in-progress (slice 2's read surface is now MEASURED, and measuring it found
-> five product defects rather than confirming the slice). The suite that stood at 0/13 is at
-> **11 ok** with the cursor walk still failing, and `omnion-api --lib` went 248/4 -> **252/0**.
+> **Status:** in-progress (slice 2's read surface is **MEASURED and GREEN**: `content_read_surface`
+> is **16 ok / 0 failed**, from 0/13; `omnion-content --lib` **308/0** and `omnion-api --lib`
+> **253/0**. The cursor walk — the one criterion this REQ's second slice exists for — now passes,
+> and making it pass found **six more product defects**, five of them invisible to any
+> single-page assertion.
 >
-> **Defects found and fixed this tick** — `4c20918a`, `f1f36642`, `f7e23f55`:
-> 1. **No token ever authenticated.** `fresh_material` stores the *namespaced* prefix
->    (`omn_1a2b3c4d`, the form the `^omn_[0-9a-f]{8}$` check constraint is written against) while
->    `split_token` returns the *bare* 8 characters, and both lookups bound the bare form. Every
->    minted token answered `invalid_token` while every unit test was green, because each covered
->    one half and none made a round trip.
-> 2. **A site-scoped token could read the site it is not scoped to.** `site_filter` answered
->    out-of-scope with `Uuid::nil()` and both call sites stripped it with
->    `.filter(|site| *site != Uuid::nil())` before binding — turning "match nothing" into "no site
->    predicate". The other site's published pages came back with a `200`. `SITE_OUT_OF_SCOPE`
->    replaces the sentinel and the test now asserts the `ListRequest` field the query reads, not
->    the value `site_filter` returns.
-> 3. **Pagination never paged.** `fetch_limit` returned `self.limit` while the comment above it
->    promised the over-fetch, so `fetched > limit` was never true and every list response claimed
->    it was the last page.
-> 4. **A cursor's timestamp was written in one format and read in another** (`to_string()` on the
->    way out, `Rfc3339` on the way in), so every page after the first would have answered `400`.
-> 5. **`updated_since` refused the API's own `updated_at` rendering** — the surface does not round
->    trip its own output, which is an integrator trap and is now covered by a test.
+> **Defects found and fixed this tick:**
+> 1. **The cursor was bound as `text` into a `timestamptz` comparison.** The pages list parsed
+>    the cursor's instant correctly and then called `.to_string()` on it, so PostgreSQL answered
+>    `500 operator does not exist: timestamp with time zone < text` and **every walk died on
+>    page two**. Parsing and then re-stringifying threw away the type it had just recovered.
+> 2. **`?sort=title` was a `500` on every call.** The column name was a bare `title` and the
+>    query prefixed it with `p.`, producing `p.title` — a column that has never existed on
+>    `pages`, because the title is the *revision's*. `SortKey::expression(source)` now names the
+>    qualified expression per relation and the ORDER BY, the keyset predicate and the cursor all
+>    read that one field.
+> 3. **`?sort=title` on media was a `500` too, and the OpenAPI document promised it.** A file has
+>    no title, so `sort=title` is now a `400 invalid_parameter` naming `sort` and listing the two
+>    sorts media does have. A doc test reads the *handler's* accepted set and requires the
+>    document to match, because the document and the handler once agreed with each other and were
+>    both wrong.
+> 4. **The media cursor's writer and reader disagreed on the format** — `to_string()` out,
+>    `Rfc3339` in — so the media walk was a `400` from page two on. The same defect was fixed in
+>    the *other* direction last tick on the pages side, which is the proof that a format must be a
+>    function both halves call: `content_read::stamp` and `content_read::cursor_instant`.
+> 5. **`count` did not count the items sent.** `items` was rendered from `rows` (which includes
+>    the over-fetch row) while `count` and the cursor were taken from `visible` (which does not),
+>    so a `limit=2` call answered `count: 2` with **three** items. The walk saw it as seven slugs
+>    across four pages for five rows. `visible` is now the whole answer — items, count, cursor and
+>    ETag — so "what the caller is told" and "what the caller is sent" cannot disagree.
+> 6. **The media list over-fetched nothing**: it bound `request.limit` where the pages list bound
+>    `fetch_limit()`, so media's `next_cursor` was always `null` regardless of the set size.
 >
-> The `.map_err(|_| AuthFailure::Invalid)` that hid defect 1 is gone: a pool timeout, a closed
-> pool and a decode mismatch are `StoreUnavailable { source }`, the route answers `503` +
-> `Retry-After` for them and `401` only for credential problems. The content crate has no logger,
-> so returning the class was the only way to keep it.
+> Also: `Page::new` — a helper nothing called, whose `fetched == limit` rule **contradicts** the
+> routes' correct over-fetch rule — is gone, and the decision now lives in
+> `content_read::continues(fetched, limit)` with the exact cases that separate the two rules
+> tested. And the item's own `updated_at` is rendered with `stamp`, so **the surface round trips
+> its own output**: the `updated_since` test's hand-written `to_rfc3339` workaround is deleted and
+> the value is fed back verbatim.
 >
-> **Still open:** the cursor walk does not complete. `next_cursor` is now populated and the
-> round trip is closed, but the second request has not been observed to return a page, and the
-> suite is too slow on the shared box to prove it inside one tick (three runs hit their timeouts
-> with 1-2 tests outstanding). It is measured as failing, not as passing.
+> **The tests that would have caught all six** are now in place: `a_page_sends_the_limit_and_says_so`
+> (defect 5), `a_title_sort_pages_by_the_revision_title_descending` (2, 4), and
+> `a_sort_the_media_list_cannot_do_is_refused_by_name` (3, 6). One of them was **wrong when
+> written** — it asserted `sort=title` returns A→Z and failed against a correct endpoint, because
+> every sort on this surface is descending and the test's own expectation was the defect.
+
 
 ## Request
 
@@ -160,20 +173,27 @@ Migration `0014_content_api_tokens.sql` (number is a placeholder — renumber to
 
 ### Acceptance criteria
 
-- [ ] `GET /api/v1/content/pages` with a valid token returns only published pages of the token's site scope, newest first by `updated_at`, with `next_cursor`
-  present while more rows exist.
-- [ ] Walking the cursor returns each page exactly once across three pages of `limit=2`.
-- [ ] `fields=slug,title` returns only those keys plus the always-present identity keys, and an unknown field is refused with `400 invalid_parameter` naming the
-  parameter.
-- [ ] A request without a token answers `401 invalid_token`; a token for another organization's site answers `404 not_found` (never a cross-tenant leak).
-- [ ] A token without `media:read` calling `/api/v1/content/media` answers `403 insufficient_scope`.
+- [x] `GET /api/v1/content/pages` with a valid token returns only published pages of the token's site scope, newest first by `updated_at`, with `next_cursor`
+  present while more rows exist. *(only_published_pages_are_served_and_never_a_draft,
+  a_page_sends_the_limit_and_says_so)*
+- [x] Walking the cursor returns each page exactly once across three pages of `limit=2`.
+  *(the_cursor_walks_a_set_exactly_once — the test this slice exists for)*
+- [x] `fields=slug,title` returns only those keys plus the always-present identity keys, and an unknown field is refused with `400 invalid_parameter` naming the
+  parameter. *(a_projection_keeps_the_keys_a_caller_needs_to_keep_going, an_unknown_field_is_refused_by_name)*
+- [x] A request without a token answers `401 invalid_token`; a token for another organization's site answers `404 not_found` (never a cross-tenant leak).
+  *(a_missing_or_wrong_credential_is_refused_before_any_row_is_read, a_site_scope_is_a_filter_and_never_a_confirmation,
+  a_single_page_is_served_and_an_unpublished_one_is_not_found)*
+- [x] A token without `media:read` calling `/api/v1/content/media` answers `403 insufficient_scope`. *(media_is_its_own_power)*
 - [ ] A token with `expires_at` in the past answers `401 token_expired`, and the Tokens tab shows the row as `expired`.
 - [ ] Rotation invalidates the previous secret immediately (old secret → `401`) and returns a new plaintext exactly once.
-- [ ] Revoking a token answers `401` on the next call, and the panel row reads `revoked`.
+- [ ] Revoking a token answers `401` on the next call, and the panel row reads `revoked`. *(the API half is proven —
+  a_revoked_token_stops_reading_immediately — the panel row needs the QA pass)*
 - [ ] The 121st request inside a minute at the Standard tier answers `429` with a `Retry-After` header, and the usage table records one throttled request.
-- [ ] `etag` / `updated_since` let a caller fetch only changed items (proven by two sequential calls where only one item changed).
-- [ ] `GET /api/v1/content/openapi.json` returns a document that parses as valid JSON, declares `openapi: 3.1.0`, and contains every route in the API table with
-  its permission scope.
+- [x] `etag` / `updated_since` let a caller fetch only changed items (proven by two sequential calls where only one item changed).
+  *(updated_since_returns_only_what_changed — and the value is now fed back verbatim, the surface round trips its own output)*
+- [x] `GET /api/v1/content/openapi.json` returns a document that parses as valid JSON, declares `openapi: 3.1.0`, and contains every route in the API table with
+  its permission scope. *(the_openapi_document_is_valid_and_complete; the documented sorts are now checked
+  against the handler's accepted set)*
 - [ ] The Explorer executes a real call against the running API, shows status, headers and timing, and its cURL snippet reproduces the same response when pasted
   into a shell.
 - [ ] Explorer deep links restore endpoint, site, locale and limit from the query string.
