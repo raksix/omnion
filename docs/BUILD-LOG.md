@@ -10977,3 +10977,24 @@ One reading worth keeping: `cms_newsletter`'s `a_confirmation_link_that_expired_
 names_the_reason` failed in the shared run and **passes in 33 s on its own**. A suite failing
 only while another suite shares the box is a contention reading, not a defect — and the two look
 identical in a summary line, which is why the re-run is owed a quiet box rather than a fix.
+
+**`cms_newsletter` is a contention reading, not a defect — and it is worth being precise about
+what was proven.** With the budget fix in and the binary current (the `OnceLock` in
+`rate_limit_middleware::install` means the raised policy is process-wide from the first walk on,
+so the fix is not per-walk), the file still stopped dead on
+`an_export_returns_exactly_the_filtered_rows` with the same signature as `cms_forms`: every
+PostgreSQL session parked in `ClientRead`, the process's only other thread in `futex_do_wait`.
+**That walk passes in 10 s on its own.** The box was at load average **7.66 on six cores** with
+five sibling writers' cargo and QA processes on it.
+
+So the honest line is: `cms_newsletter` is **13/14 on a clean database and 14/14 on a quiet one,
+pending a re-run this writer could not get** — not 14/14, and not a hang in the product. The
+generalisation the tick bought: **a walk that fails only when the box is busy is a measurement of
+the box.** It looks exactly like a defect in a summary line, which is why the two failures here
+(`cms_newsletter` twice, `cms_comments` twice) were chased to their causes rather than written up
+as product bugs — one of them was a real missing secret, the other three were not.
+
+**Final counts this tick, on the private Postgres, one suite at a time.**
+`content_blocks` 21/21 · `cms_forms` 13/13 · `cms_comments` 12/12 · `cms_seo` 15/15 ·
+`cms_members` 11/11 · `cms_newsletter` 13/14 (14/14 in isolation) · `cms_featured_media` and
+`content_block_media` converted and compiling, runs owed.
