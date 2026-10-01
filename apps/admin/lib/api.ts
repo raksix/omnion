@@ -4737,6 +4737,187 @@ export function sweepAiApprovals(): Promise<{ expired: number }> {
   return request("/api/v1/ai/approvals/sweep", { method: "POST", body: JSON.stringify({}) });
 }
 
+// -------------------------------------------------------------------------------------------
+// The change-set editor (REQ-101 slice 3)
+// -------------------------------------------------------------------------------------------
+
+/** One operation of a proposed set, as the set stores it. */
+export type AiChangeOp = {
+  key: string;
+  kind: "create" | "update" | "delete";
+  resource_type: string;
+  resource_id: string;
+  args: Record<string, unknown>;
+};
+
+/** A change set row. */
+export type AiChangeSet = {
+  id: string;
+  organization_id: string;
+  site_id: string | null;
+  title: string;
+  status: "draft" | "pending" | "confirmed" | "applied" | "discarded" | "failed" | string;
+  operations: AiChangeOp[];
+  base_revisions: Record<string, string>;
+  /** sha256 over the operations and the revisions they were pinned to. */
+  content_hash: string;
+  created_by: string | null;
+  created_by_agent: string | null;
+  created_by_run: string | null;
+  updated_by: string | null;
+  confirmed_at: string | null;
+  applied_at: string | null;
+  discarded_reason: string | null;
+  created_at: string;
+  updated_at: string;
+  /** Whether the operation list may still be edited. Server-owned: it is the same list the
+   * PATCH's `where` clause runs as, so the panel cannot drift from what the API accepts. */
+  editable: boolean;
+  /** Whether confirming would park at least one operation for a second person. */
+  needs_approval: boolean;
+  /** Whether confirming demands a typed phrase — the set deletes content. */
+  irreversible: boolean;
+  /** The phrase itself: the set's title, which the server compares against. */
+  confirmation_phrase: string | null;
+};
+
+/** One field row of a resolved operation. */
+export type AiPlannedField = {
+  arg: string;
+  field: string;
+  before: unknown;
+  after: unknown;
+};
+
+/**
+ * One operation resolved against its target **as it is now**.
+ *
+ * This is what the editor renders instead of a client-side re-plan: `before` is read from the
+ * database, not from the operation's own arguments, and `cascades` is a count the server
+ * took. A browser cannot compute either.
+ */
+export type AiPlannedOp = {
+  key: string;
+  kind: string;
+  resource_type: string;
+  resource_id: string;
+  label: string;
+  diffs: AiPlannedField[];
+  cascades: string[];
+  base_revision: string;
+  gated_class: string | null;
+  no_op: boolean;
+};
+
+/** What a re-plan answers. */
+export type AiRePreviewed = AiChangeSet & {
+  planned: AiPlannedOp[];
+  drifted: string[];
+  needs_approval: boolean;
+};
+
+/** What a set list answers, with the decision keys the viewer holds. */
+export type AiChangeSetList = {
+  sets: AiChangeSet[];
+  viewer_permissions: string[];
+  /** The decision keys the viewer does NOT hold, named so a disabled control can explain
+   * itself. The same split the approval inbox makes, from the same helper. */
+  viewer_missing: string[];
+};
+
+/** What a confirm answers. */
+export type AiSetConfirmed = AiChangeSet & {
+  needs_approval: boolean;
+  approvals: { id: string; operation_key: string; class: string; status: string }[];
+  applied: boolean;
+};
+
+/**
+ * Resolve a set's operations against the targets as they are now.
+ *
+ * No body: the server rebuilds each operation from the stored one and reads the row itself, so
+ * a re-plan that accepted a client-supplied diff would be a diff nobody confirmed. The answer
+ * is the resolved operations, not a mutated set — a preview that re-pinned the revisions it
+ * observed would retire the staleness the confirm route enforces.
+ */
+export function replanAiChangeSet(id: string): Promise<AiRePreviewed> {
+  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}/preview`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/**
+ * Replace a set's operation list.
+ *
+ * The whole list is sent, not a patch: a set is a list the reviewer owns, and "move the third
+ * one to the top" has no vocabulary in a partial patch. `baseContentHash` is the hash the
+ * editor was looking at — a mismatch answers `409 content_moved` naming both, and nothing is
+ * written.
+ */
+export function updateAiChangeSet(
+  id: string,
+  body: {
+    title: string;
+    operations: AiChangeOp[];
+    baseRevisions?: Record<string, string>;
+    baseContentHash?: string;
+  },
+): Promise<AiChangeSet> {
+  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      title: body.title,
+      operations: body.operations,
+      base_revisions: body.baseRevisions ?? {},
+      // Withheld when absent rather than sent as null: a client that has not implemented the
+      // optimistic check keeps saving, and one that has gets it.
+      ...(body.baseContentHash ? { base_content_hash: body.baseContentHash } : {}),
+    }),
+  });
+}
+
+/**
+ * Confirm a set.
+ *
+ * `confirmationPhrase` is the set's own title and is sent **only** when the reviewer typed it —
+ * for the same reason `approveAiApproval` withholds an empty phrase. A set that deletes content
+ * is refused by the server without it, whatever the client rendered.
+ */
+export function confirmAiChangeSet(
+  id: string,
+  confirmationPhrase?: string,
+): Promise<AiSetConfirmed> {
+  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}/confirm`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(confirmationPhrase?.trim() ? { confirmation_phrase: confirmationPhrase.trim() } : {}),
+    }),
+  });
+}
+
+/** Drop a set. The reason is mandatory server-side; a blank one is refused there. */
+export function discardAiChangeSet(id: string, reason: string): Promise<AiChangeSet> {
+  return request(`/api/v1/ai/change-sets/${encodeURIComponent(id)}/discard`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/** The sets a person may see, newest first. */
+export async function fetchAiChangeSets(
+  query: { status?: string; q?: string; limit?: number } = {},
+): Promise<AiChangeSetList> {
+  const params = new URLSearchParams();
+  if (query.status && query.status !== "all") params.set("status", query.status);
+  if (query.q?.trim()) params.set("q", query.q.trim());
+  if (query.limit) params.set("limit", String(query.limit));
+  const suffix = params.toString();
+  return request(
+    suffix ? `/api/v1/ai/change-sets?${suffix}` : "/api/v1/ai/change-sets",
+  );
+}
+
 /** Replace one task's candidate list at a scope. */
 export async function putAiTaskMap(
   scope: AiRoutingScope,

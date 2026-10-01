@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, BookMarked, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Grid3x3, HardDriveDownload, HeartPulse, History as HistoryIcon, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, Wrench, X } from "lucide-react";
+import { Activity, BarChart3, Bell, BookMarked, Bot, ClipboardCheck, FileStack, FileText, Fingerprint, Globe, Grid3x3, HardDriveDownload, HeartPulse, History as HistoryIcon, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, Wrench, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -62,6 +62,10 @@ const NAV = [
   // question the matrix raises: knowing who may act still leaves "what is waiting for them" — and
   // an approval gate with no inbox is a gate nobody ever opens.
   { href: "/ai/approvals", label: "AI approvals", icon: ClipboardCheck },
+  // The proposed operation lists (REQ-101 slice 3). Beside the inbox rather than under it: the
+  // inbox decides one frozen call, a change set is a list a person edits first, and routing
+  // "my agent proposed something" to a screen that can only reject it is a dead end.
+  { href: "/ai/change-sets", label: "Change sets", icon: FileStack },
   { href: "/ai/runs", label: "Agent runs", icon: HistoryIcon },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },

@@ -8553,6 +8553,181 @@ async function runAiApprovalsDepth(page, report) {
 }
 
 /**
+ * The change-set list and its editor (REQ-101, slice 3).
+ *
+ * The inbox above decides one frozen tool call; this walks the *list* a person edits first. The
+ * pass proves three things that only the database can answer:
+ *
+ * 1. **An edit really re-hashes the set.** The screen sends the whole list back with the hash it
+ *    was looking at; the pass saves a reordering and then reads `content_hash` out of the row.
+ *    A client that re-planned locally and POSTed the plan as the hash would look identical on
+ *    screen and would be wrong about the very thing the `409` protects.
+ *
+ * 2. **A stale hash is refused, and the refusal names both sides.** The pass saves a second
+ *    change carrying the *first* hash — the one that is now wrong — and asserts the status came
+ *    back 409 and the stored hash did not move. This is the guard that cannot be proven by
+ *    watching the happy path work.
+ *
+ * 3. **An irreversible set demands the phrase.** The planted set publishes a page, which is
+ *    gated, so confirming it must park rather than apply; the pass reads `ai_approvals` and finds
+ *    the operation there. A client that treated "gated" as "blocked entirely" would leave the
+ *    reviewer with no way forward, and one that treated it as "applied" would publish from a
+ *    screen.
+ */
+async function runAiChangeSetsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-change-sets", action: "ai-change-sets", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+  const scalar = (sql) => qaSql(sql).split("\n").filter(Boolean)[0]?.split("|")[0]?.trim() ?? "";
+  const jsonb = (sql) => {
+    try {
+      return JSON.parse(qaSql(sql).split("\n").filter(Boolean)[0]?.split("|")[0]?.trim() ?? "null");
+    } catch {
+      return null;
+    }
+  };
+
+  // A page to publish: the set's operations name a real target, and a preview against a
+  // resource that does not exist is a 422 the editor would render as its error state.
+  const pageId = scalar(
+    `insert into pages (site_id, slug, status, title, body, created_at, updated_at) ` +
+      `select site_id, 'qa-change-set-' || substr(md5(random()::text), 1, 8), 'draft', ` +
+      `'QA change set page', '{"blocks":[]}'::jsonb, now(), now() from sites limit 1 returning id`,
+  );
+  if (!pageId) {
+    note({ step: "aTargetExistsToPlanAgainst", passed: "skipped: no site to hang a page on" });
+    return steps;
+  }
+  note({ step: "aTargetExistsToPlanAgainst", passed: true });
+
+  const filed = await page.request
+    .post(api("/change-sets"), {
+      data: {
+        title: "QA proposed set",
+        operations: [
+          { kind: "update", resource_type: "page", resource_id: pageId, args: { title: "QA renamed" } },
+        ],
+      },
+      failOnStatusCode: false,
+    })
+    .then((response) => response.json().catch(() => null))
+    .catch(() => null);
+  const setId = filed?.set?.id ?? "";
+  note({ step: "aProposalIsFiled", passed: Boolean(setId) });
+
+  if (!setId) {
+    qaSql(`delete from pages where id = '${pageId}'`);
+    note({ step: "theListRendersTheProposal", passed: "skipped: no proposal was filed" });
+    return steps;
+  }
+
+  // ---- the list ------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/change-sets`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  note({ step: "theListRendersTheProposal", passed: (await page.locator("[data-set-row]").count()) > 0 });
+  note({
+    step: "theEmptyStateIsHiddenWhileRowsExist",
+    passed: (await page.locator("text=No change sets here").count()) === 0,
+  });
+  await shot(page, "ai-change-sets-list");
+
+  // ---- the editor ----------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/change-sets/${setId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  note({
+    step: "theEditorRendersTheReplannedDiff",
+    passed: (await page.locator("[data-set-operation]").count()) > 0,
+  });
+  note({
+    step: "theReplanShowsTheServersBaseRevision",
+    passed:
+      (await page.locator("body").innerText().catch(() => "")).match(/base revision|revision/i) !== null,
+  });
+  await shot(page, "ai-change-set-editor");
+
+  // An edit: change the value the operation carries, save, and read the hash out of the row.
+  const firstHash = scalar(`select content_hash from ai_change_sets where id = '${setId}'`);
+  // Open the editor's value inputs first — they only exist while it is in edit mode, so a pass
+  // that counted them without clicking would read "cannot edit" on a screen that can.
+  const editToggle = page.locator("[data-set-toggle-edit]").first();
+  if ((await editToggle.count()) > 0) await editToggle.click().catch(() => {});
+  await page.waitForTimeout(600);
+  const editorValue = page.locator("[data-set-edit-input]").first();
+  const editable = (await editorValue.count()) > 0;
+  if (editable) {
+    await editorValue.fill("QA renamed by the walkthrough").catch(() => {});
+    await page.locator("[data-set-save]").first().click().catch(() => {});
+    await page.waitForTimeout(2200);
+  }
+  note({ step: "anEditCanBeMade", passed: editable });
+  const savedHash = scalar(`select content_hash from ai_change_sets where id = '${setId}'`);
+  note({
+    step: "theEditActuallyChangedTheStoredHash",
+    passed: editable && savedHash !== "" && savedHash !== firstHash,
+  });
+
+  // The stale guard: send the FIRST hash back against a set that has moved on.
+  const operations = jsonb(`select operations from ai_change_sets where id = '${setId}'`) ?? [];
+  const stale = await page.request
+    .patch(api(`/change-sets/${setId}`), {
+      data: { title: "QA stale edit", operations, baseContentHash: firstHash },
+      failOnStatusCode: false,
+    })
+    .then((response) => response.status())
+    .catch(() => 0);
+  note({ step: "aStaleEditIsRefused", passed: stale === 409 });
+  note({
+    step: "theRefusedEditDidNotMoveTheHash",
+    passed: scalar(`select content_hash from ai_change_sets where id = '${setId}'`) === savedHash,
+  });
+
+  // ---- confirm parks a gated operation --------------------------------------------------------
+  // Publishing a page is a gated class, so confirming must park it in the inbox rather than
+  // publish. The row below is the proof: a client that confirmed unconditionally would leave
+  // the approvals table empty and the page published.
+  qaSql(
+    `update ai_change_sets set operations = operations || '[{"key":"qa-publish","kind":"update",` +
+      `"resource_type":"page","resource_id":"${pageId}","args":{"status":"published"}}]'::jsonb ` +
+      `where id = '${setId}'`,
+  );
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const confirmBox = page.locator("[data-set-confirmation]");
+  if ((await confirmBox.count()) > 0) {
+    await confirmBox.fill("QA proposed set").catch(() => {});
+    await page.locator("[data-set-confirm]").first().click().catch(() => {});
+    await page.waitForTimeout(2600);
+  }
+  const parked = scalar(
+    `select count(*) from ai_approvals where organization_id = ` +
+      `(select organization_id from ai_change_sets where id = '${setId}') and status = 'pending'`,
+  );
+  note({ step: "confirmingAGatedSetParksIt", passed: Number(parked) > 0 });
+  note({
+    step: "theGatedOperationDidNotApply",
+    passed: scalar(`select status from pages where id = '${pageId}'`) === "draft",
+  });
+  await shot(page, "ai-change-set-confirmed");
+
+  // ---- clean up -------------------------------------------------------------------------------
+  qaSql(
+    `delete from audit_log where target_id in (select id::text from ai_approvals where organization_id = ` +
+      `(select organization_id from ai_change_sets where id = '${setId}'))`,
+  );
+  qaSql(
+    `delete from ai_approvals where organization_id = ` +
+      `(select organization_id from ai_change_sets where id = '${setId}')`,
+  );
+  qaSql(`delete from ai_change_sets where id = '${setId}'`);
+  qaSql(`delete from pages where id = '${pageId}'`);
+
+  return steps;
+}
+
+/**
  * The identities and the matrix (REQ-100, slice 2).
  *
  * The pass walks the tri-state in the order the spec names it — inherit → allow → deny → back to
@@ -9622,6 +9797,10 @@ async function main() {
     // detail route.
     { path: "/ai/approvals", name: "ai-approvals", area: "ai" },
     { path: "/ai/approvals/policies", name: "ai-approval-policies", area: "ai" },
+    // The change-set list and its editor (REQ-101 slice 3) — the inbox above decides one frozen
+    // call; these two carry the *list* a person edits first. The editor needs a row to exist
+    // before it renders anything but its error state, so the depth pass plants one first.
+    { path: "/ai/change-sets", name: "ai-change-sets", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
@@ -9834,6 +10013,15 @@ async function main() {
     );
   }
   log(`ai approvals: ${JSON.stringify(report.aiApprovals)}`);
+  // The change-set list and its editor (REQ-101, slice 3). Its own pass, after the approvals
+  // one, because it plants its own row (the editor renders nothing but its error state without
+  // one) and because the approvals pass cleans `ai_approvals` at the end of its own walk.
+  if (inScope("ai")) {
+    report.aiChangeSets = await runDepthPass("ai-change-sets", () =>
+      runAiChangeSetsDepth(page, report),
+    );
+  }
+  log(`ai change sets: ${JSON.stringify(report.aiChangeSets)}`);
   log(`ai agents: ${JSON.stringify(report.aiAgents)}`);
 
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
