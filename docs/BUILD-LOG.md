@@ -14876,3 +14876,65 @@ below the API), and the QA slot is held by a live w4 pass (holder pid 1782910,
 over `crm_leads`, which is a different question from this tick's; and the `escalated_at is null`
 filter in `due_breaches` is a plain `Filter:` on the index rather than part of it — the same
 shape, one column over.
+
+
+---
+
+## Tick 72 — wave8 (REQ-117, slices 40 and 40b)
+
+**What.** The SLA sweep's first read trusted a status list naming three of the four terminal
+statuses. `not_closed_statuses_sql` was `not in ('spam','rejected','duplicate')` while `is_open`
+calls `converted` terminal as well — and a converted lead is *permanently* unanswered, because
+neither conversion path writes `first_response_at` and `record_response` has one caller. So the
+sweep named every tenant holding one on every tick, and the inbox badge counted them as breached
+work. The list is now derived from `STATUSES`, migration `0229` rebuilds the SLA index against it,
+and the second half of the tick fixed a gate on this branch that had been red at 5/9 since the
+capture-time rule shipped.
+
+**RED first, and RED was a measurement.** The sweep named **10 tenants where 1 has work**;
+`count_breached` answered **13 over 4 real breaches**. After: 1 tenant, 4 breaches, and
+`Index Only Scan using crm_leads_sla_idx` — the gate asserts the *plan* survived the correction,
+because the four-status query implies the three-status partial predicate and that is something to
+measure rather than assume.
+
+**The lesson worth more than the fix: the fix killed last tick's gate, and the failure was dressed
+as the wrong thing.** Both gates recovered the predicate by regexing `vocabulary.rs` for the
+`format!` body — precisely what deriving the list removed. `run-crm-sla-sweep-plan.sh` printed
+"could not read not_closed_statuses_sql", which reads like a deleted function rather than a broken
+checker. **A checker that reads the code's TEXT stops working when the code stops being text-shaped,
+and it reports the failure in the vocabulary of the thing it checks.** Both now run
+`examples/predicates.rs`: ask the crate for its own answer, and refuse to guess, because a
+hand-recovered list is a second copy of the rule.
+
+**The blind test that was green.** `the_two_sql_predicates_partition_the_statuses_the_platform_knows`
+compares `is_open` against itself — both halves asked the same question — so it passes whatever they
+agree on and can never see a third implementation. It stayed green through the whole defect. The two
+new guards go red at 189/191 with `converted` named; that this one does not is the evidence that
+the new ones are not shadows of it.
+
+**Proof.** `run-crm-terminal-status` **7/7** (negative control = the pre-fix predicate read out of
+migration `0055`, which is frozen and therefore stays a control); `run-crm-sla-sweep-plan` **7/7**;
+module lib **191/191**; `run-crm-assign` **9/9 + 5/5** (was 5/9 and 4/5); phone-index 6/6, dedupe
+12/12, attribution 5/5, verdict-rows 7/7, binding-health 5/5, autoresponder 16/16; clippy
+`--all-targets` **0 errors**; `omnion-api` builds; admin `tsc --noEmit` exit 0.
+
+**A control that measures the harness instead of the defect.** The hand-over tests read
+`DATABASE_URL`, which the gate exports; a bare `cargo test` panics in `pool()` at 0.00 s and all
+nine "fail". I read that red count as a proof twice before checking the elapsed time. Run the
+control through the gate. With that fixed, forcing `assign_owner` to always write `assigned` gives
+**8/9 with exactly the hand-over test red** — which is the evidence that the reason-based filters
+repaired four assertions without weakening them.
+
+**Not claimed.** No browser pass: no screen changed (one derived function, one migration, three
+gates), and the QA slot is held by a live w4 pass (holder pid 1782910, `cwd=/mnt/apopic/omnion-w4`).
+
+**Not claimed, checked rather than deferred.** `run-crm-intake.sh` printed no line my regression
+sweep's `grep` matched, which read as the tick-68 "silent gate" shape — so it was run: **PASS**,
+including its own assertion that `crm_leads_sla_idx` exists, which is now the rebuilt one. **A gate
+you filtered instead of ran is a gate you did not run**, and on a branch where one gate had been
+silently red for ticks that distinction is the whole lesson of the second half.
+
+**Next.** The other three `crm_lead_events` writers are `append_event` calls that predate the claim
+pattern (`responded`, `status_changed`, `converted`, `received`); the SLA reminder is the only
+once-per-lead one and it has a unique index. Whether the *notification* side of a breach is
+once-only is the same question one layer up, and it has never been asked.
