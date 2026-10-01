@@ -198,3 +198,61 @@ export function payloadSource(
     null
   );
 }
+
+/** What the panel shows for one row, once the row's *own* state is read past its status. */
+export type CaptureViewKind = "captured" | "waiting" | "expired";
+
+/** One row, and what may honestly be said about it on screen. */
+export interface CaptureView {
+  kind: CaptureViewKind;
+  /** The row the payload or the countdown belongs to. */
+  row: ListenerRow;
+  /** The sentence under the heading — the event name, or why there is nothing yet. */
+  sentence: string;
+}
+
+/**
+ * What one listener row is *actually* showing, which its `status` alone does not say.
+ *
+ * **`status` is not the truth about a capture, and the panel believed it.** The armed row
+ * carries `payload: null` — it is a listener that has not heard anything yet, which is the
+ * only thing it can mean — and the render above it drew `CheckCircle2` and the word
+ * "Captured" for any row `payloadSource` returned, which includes the armed one it falls
+ * back to. So pressing *Listen for a real event* and waiting produced a green
+ * "Captured page.published" over a panel with no payload under it: the panel claimed the
+ * event the feature exists to show had arrived, and the criterion's own claim — that a
+ * real event shows up in the inspector — could not be measured, because the *uncaptured*
+ * state and the *captured* state were the same sentence.
+ *
+ * A listener is not captured because the matcher filled a row; it is captured when a
+ * payload came back with it. The three answers are exhaustive and mutually exclusive:
+ *
+ *  * **`captured`** — a payload is present. The one case that may say so, and the only
+ *    one that shows a payload.
+ *  * **`waiting`** — armed with time left. The countdown belongs here, under a heading
+ *    that says it is still listening. A payload is shown if one somehow arrived, but the
+ *    heading never claims it.
+ *  * **`expired`** — the window closed, or a row the server called captured that carried
+ *    no payload. The sentence says so; a timeout is not a capture and never reads as one.
+ *
+ * The third case is the one a status-driven render cannot express, and it is why this
+ * function exists rather than an `if` in the component: the row's own `status` and its
+ * `payload` disagree exactly once, and the disagreement is the whole defect.
+ */
+export function captureView(row: ListenerRow, now: number = Date.now()): CaptureView {
+  if (row.payload) {
+    return { kind: "captured", row, sentence: `Captured ${row.event_name}` };
+  }
+  if (row.status === "expired" || secondsLeft(row, now) <= 0) {
+    return {
+      kind: "expired",
+      row,
+      sentence: `The listener for ${row.event_name} expired with no event.`,
+    };
+  }
+  return {
+    kind: "waiting",
+    row,
+    sentence: `Listening for ${row.event_name} — ${formatDuration(secondsLeft(row, now))}`,
+  };
+}

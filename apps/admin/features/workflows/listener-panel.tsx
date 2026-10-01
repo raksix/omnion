@@ -31,6 +31,7 @@ import {
   type WorkflowListener,
 } from "@/lib/api";
 import {
+  captureView,
   formatDuration,
   payloadSource,
   secondsLeft,
@@ -99,6 +100,9 @@ export function ListenerPanel({
 
   const answer = startability(selected, rows, now);
   const captured = payloadSource(rows, now);
+  // The row's own view, not its status: an armed row has heard nothing yet, and saying
+  // otherwise is the defect this pairing exists to close.
+  const view = captured ? captureView(captured, now) : null;
   const summary = summarySentence(rows, now);
 
   const arm = useCallback(async () => {
@@ -176,20 +180,25 @@ export function ListenerPanel({
 
       {/* The captured payload. This is what the whole feature exists for: the shape of the
           event as it *actually* arrived, which is the only honest answer to a payload the
-          documentation got wrong. */}
+          documentation got wrong.
+
+          The heading reads the row's **capture view**, never its `status`. An armed row is a
+          listener that has not heard anything yet, and drawing "Captured" over it told the
+          author the event had arrived before it had — the one state this feature exists to
+          make visible was the state it could not show. */}
       {captured ? (
-        <div className="mt-2" data-listener-capture={captured.id}>
+        <div className="mt-2" data-listener-capture={captured.id} data-listener-capture-kind={view?.kind}>
           <p className="flex items-center gap-1 text-[11.5px]" data-listener-capture-status>
-            <CheckCircle2 className="h-3 w-3 text-emerald-600" aria-hidden="true" />
-            Captured {captured.event_name}
-            {captured.status === "expired" ? (
-              <span className="ml-1 inline-flex items-center gap-1 text-muted">
-                <TimerOff className="h-3 w-3" aria-hidden="true" />
-                {formatDuration(0)}
-              </span>
-            ) : null}
+            {view?.kind === "captured" ? (
+              <CheckCircle2 className="h-3 w-3 text-emerald-600" aria-hidden="true" />
+            ) : view?.kind === "expired" ? (
+              <TimerOff className="h-3 w-3 text-muted" aria-hidden="true" />
+            ) : (
+              <Radio className="h-3 w-3 text-muted" aria-hidden="true" />
+            )}
+            {view?.sentence ?? captured.event_name}
           </p>
-          {captured.status === "armed" ? (
+          {view?.kind === "waiting" ? (
             <p className="mt-0.5 text-[11.5px] text-muted" data-listener-countdown>
               {formatDuration(secondsLeft(captured, now))}
             </p>

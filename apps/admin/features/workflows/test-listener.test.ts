@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  captureView,
   describeType,
   formatDuration,
   isTriggerType,
@@ -194,6 +195,62 @@ describe("payloadSource", () => {
       payloadSource([row({ status: "expired", expires_at: at(-1) })], NOW),
       null,
     );
+  });
+});
+
+describe("captureView", () => {
+  it("calls a payload a capture — the only sentence allowed to use the word", () => {
+    const view = captureView(row({ status: "captured", payload: { a: 1 } }), NOW);
+    assert.equal(view.kind, "captured");
+    assert.match(view.sentence, /^Captured page\.published/);
+  });
+
+  it("calls an ARMED row waiting, not captured — the defect this whole function is for", () => {
+    // `status: "armed"` with `payload: null` is a listener that has heard nothing. The panel
+    // used to draw a green "Captured page.published" over exactly this row, so the state the
+    // feature exists to reveal was the one state it could not show.
+    const view = captureView(row(), NOW);
+    assert.equal(view.kind, "waiting");
+    assert.equal(
+      /Captured/.test(view.sentence),
+      false,
+      "an uncaptured listener must never be described as captured",
+    );
+    assert.match(view.sentence, /^Listening for page\.published/);
+  });
+
+  it("reads the armed row's countdown from the expiry instant, not a stored number", () => {
+    // The panel re-renders once a second, so the sentence has to move on its own.
+    const view = captureView(row({ expires_in_seconds: 900, expires_at: at(90) }), NOW);
+    assert.match(view.sentence, /1m 30s left$/);
+  });
+
+  it("calls a window that closed with no payload expired, and never a capture", () => {
+    // The disagreement this function exists for: a row still labelled `captured` by the
+    // server, or an armed row whose 15 minutes ran out. A timeout is not a capture.
+    const timedOut = captureView(row({ expires_at: at(-1) }), NOW);
+    assert.equal(timedOut.kind, "expired");
+    assert.equal(/Captured/.test(timedOut.sentence), false);
+    assert.match(timedOut.sentence, /expired with no event/);
+
+    // A `captured` status with no payload is the same lie arriving from the other side.
+    const payloadless = captureView(row({ status: "captured", payload: null }), NOW);
+    assert.equal(payloadless.kind, "waiting");
+    assert.equal(/Captured/.test(payloadless.sentence), false);
+  });
+
+  it("prefers the payload over a closed window, so a late-arriving capture is still shown", () => {
+    // A listener that caught the event as its window shut is the one case where the payload
+    // is the truer story, and a `secondsLeft <= 0` check placed first would hide it.
+    const view = captureView(
+      row({ status: "captured", payload: { late: true }, expires_at: at(-30) }),
+      NOW,
+    );
+    assert.equal(view.kind, "captured");
+  });
+
+  it("treats an unparseable expiry as nothing left rather than listening forever", () => {
+    assert.equal(captureView(row({ expires_at: "not-a-date" }), NOW).kind, "expired");
   });
 });
 
