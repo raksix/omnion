@@ -1,3 +1,75 @@
+## 2026-10-01 — omnion-w6 tick 55 — REQ-129 slice 3: the zero-downtime recipe on live traffic
+
+`3ae9c6e9` `f129dfed` `12436b36`. `scripts/qa/live-fixture-app.py` (the fixture server) +
+`scripts/qa/zero-downtime-recipe-proof.sh` (the proof), plus `.gitignore` for the bytecode the
+first one leaves behind. No Rust and no TypeScript changed, so the per-tick `cargo test` and
+`pnpm typecheck` gates are trivially satisfied by construction — the gate this tick is the proof
+itself.
+
+**The gap this fills.** REQ-129's recipe criterion — "add nullable → deploy dual read/write →
+backfill → constrain later, with no failed request throughout" — was untickable for four ticks,
+because every attempt needs a server serving traffic while the recipe runs. A `psql` loop has no
+request log, so "no failed request" has nothing to be asserted against and the claim quietly
+degrades into "the migration applied". `live-fixture-app.py` is a real HTTP server whose log is
+written on the failure path too, with the VERDICT rather than the status code: a 200 carrying a
+NULL total is a failed migration wearing a success status, and no HTTP-level check can see it.
+
+**Writes are in the load on purpose.** A SELECT-only generator cannot make the constraint
+migration wait for anybody, so the recipe would look zero-downtime because the fixture held no
+locks to contend with. Each write takes a short transaction on the table the DDL needs, which is
+what makes `lock_timeout = 3s` a bound rather than decoration.
+
+**The leg that makes it a proof rather than a demo.** `v2-naive` cuts over to the new column with
+no fallback, mid-backfill — the ordinary mistake. The proof RUNS it and REQUIRES the log to show
+the failures. A harness that passed the naive cut-over could not tell a safe cut-over from an
+unsafe one, which would make the whole exercise vacuous. The backfill is deliberately 40 rows
+against 400 so the window is wide enough to be caught inside.
+
+**Proof.** `bash scripts/qa/zero-downtime-recipe-proof.sh` → **30 checks, 0 failed**.
+**PROVEN TO FAIL**: removing `coalesce(new, old)` from v2's read → **3/30 red**, including the
+zero-failure claim itself (17 `NULL_TOTAL` lines).
+
+**Four defects the proof found in itself, all kept in the record.**
+
+1. A helper named `qfail` returned the opposite of what its name promised, so "the database must
+   refuse `set not null` while rows are unfilled" passed a genuine refusal as a defect. Renamed
+   `sql_refused`, which cannot be inverted by reading it. *A helper whose name could be read
+   backwards is a defect waiting for the next reader.*
+2. The batch counter read `is not null` AFTER the batch, which also counts the rows the dual write
+   had already filled — it reported "153 filled" against a requested 40 and named a correct batch
+   a failure. Now taken from `returning`, the rows the database actually changed.
+3. `is distinct from` counts a NULL row as DIFFERENT, which is correct PostgreSQL and wrong for a
+   mid-recipe assertion: it reported every un-backfilled row as a disagreement, so the check could
+   never pass exactly when the backfill was running. *A mid-recipe assertion must exclude the rows
+   that are legitimately mid-recipe.*
+4. The counter check read `total` and `filled` in two statements and raced the live writers into a
+   phantom `total=1095 filled=1077`. One `select` is one snapshot.
+
+**And the one that mattered most.** The first harness compared the served value against the string
+`"NULL"`. PostgreSQL renders `null::text` as an EMPTY field, so the comparison never fired: with the
+fallback removed by mutation, the run still reported 0 NULL totals. The detector was measuring a
+rendering convention rather than the value, and the zero-downtime claim it was backing was
+unverified. The sentinel is now built in SQL with `case when col is null`, which distinguishes the
+cases at the source.
+
+**The box was degraded, and the tick was spent outside the browser.** None of these are mine to fix,
+but they shape what could be run:
+
+- The QA slot holder has been ALIVE in a sibling worktree (w4, `/mnt/apopic/omnion-w4`) for the whole
+  tick, so the browser pass was not available for the third consecutive tick.
+- **Invariant 11 is violated by my own checkout**: `target` resolves to `/opt/omnion-w6-target`,
+  **15 G on the root filesystem, which is at 99% (1.7 G free)**; `/mnt/apopic` is at 94% (3.8 G free).
+  The invariant requires it to be a symlink into `/dev/shm`. A long build would have failed on a
+  full disk, which is exactly the recorded failure mode.
+- The shared `omnion-postgres` on 5433 has been replaying WAL since 12:48 with **zero log lines** and
+  answers `the database system is in recovery mode`; it is marked `unhealthy`. A sibling's database,
+  so it was left alone — and this tick stood up a **private** postgres (`omnion-pg-w6`,
+  127.0.0.1:5446, `postgres:17-alpine` already local, no pull) and proved the recipe against it.
+  Same move as w2/w4/w7, who each run a private postgres for the same reason.
+
+**Next.** The browser pass over slices 3 and 4's screens, then `docs/deployment/upgrade.md`'s recipe
+section — which now has executed steps to quote rather than assert.
+
 ## 2026-09-30 — omnion-w6 tick 41 — REQ-128 slice 3 third part: the environment bundle generator
 
 `2e7ee60f` `e303d0d6` `cc8e2b69`. `release/lib/bundle.py` + `release/tests/test_release_bundle.py` +
