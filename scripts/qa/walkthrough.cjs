@@ -2138,6 +2138,235 @@ async function runHrLeave(page, report) {
   return { ok: true, steps: steps.length };
 }
 
+/**
+ * The people core (REQ-055, slice 1).
+ *
+ * The slice-1 API has existed since the beginning — employees, departments, the org chart, the
+ * merge, the cycle refusals — and until this pass had **no screen at all**, so none of it had ever
+ * been rendered by a browser. A walkthrough that visits a route proves the route answers; it does
+ * not prove the *relationship* between two screens is real, which is the whole of slice 1's
+ * acceptance ("two employees in a parent/child department render in both the tree and the chart
+ * with correct counts").
+ *
+ * So the pass drives the chain rather than visiting pages:
+ *
+ * 1. **Create a department**, then a child of it, and assert the child's row is indented under the
+ *    parent with a non-zero count — the tree's nesting is the claim.
+ * 2. **Create two employees**, the second reporting to the first, and read the *server's* counts
+ *    off the department screen afterwards. Not "the rows I created are on screen" — the department
+ *    list's `member_count`, because the criterion says the chart and the department list agree.
+ * 3. **Open the org chart tab** and assert the manager node carries a report. A chart that renders
+ *    two isolated boxes satisfies "the org chart renders the tree" in the loosest possible way.
+ * 4. **Refuse the delete** of a department that now holds people, and assert the refusal is
+ *    *visible on the screen* with a count in it — a refusal swallowed by the catch block is the
+ *    single most common way a real product bug passes a click-through pass.
+ *
+ * The names are stamped so two passes cannot collide, which matters because the fixture database
+ * is shared by every writer on the box.
+ */
+async function runHrPeopleCore(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "hr", action: "hr-people-core", ...step });
+  };
+  const stamp = `QA${Date.now().toString().slice(-6)}`;
+  const parentName = `${stamp} Platform`;
+  const childName = `${stamp} Runtime`;
+
+  // --- the directory renders and the module shelf reaches it --------------------------------------
+  await page.goto(`${URL_ADMIN}/hr/employees`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const directoryLoaded =
+    (await page.locator("[data-qa-hr-employees-new]").count()) > 0 &&
+    (await page.locator("[data-qa-hr-employees-filters]").count()) > 0;
+  note({ step: "directory", loaded: directoryLoaded });
+  if (!directoryLoaded) {
+    return { ok: false, reason: "the employee directory did not render its filters and action", steps };
+  }
+  // The shelf must reach it: a module reachable only by typing a URL does not exist for anybody
+  // working in the panel.
+  const navOffersEmployees = await page.locator('[data-qa-hr-module-link="employees"]').count();
+  const navOffersDepartments = await page.locator('[data-qa-hr-module-link="departments"]').count();
+  note({ step: "module-nav", offersEmployees: navOffersEmployees > 0, offersDepartments: navOffersDepartments > 0 });
+  if (navOffersEmployees === 0 || navOffersDepartments === 0) {
+    return { ok: false, reason: "the HR module nav does not offer the people core screens", steps };
+  }
+  await shot(page, "page-hr-employees");
+
+  // --- the department tree, and a child under it --------------------------------------------------
+  await page.goto(`${URL_ADMIN}/hr/departments`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const treeLoaded = (await page.locator("[data-qa-hr-departments-new]").count()) > 0;
+  note({ step: "departments", loaded: treeLoaded });
+  if (!treeLoaded) {
+    return { ok: false, reason: "the departments screen did not render", steps };
+  }
+  await shot(page, "page-hr-departments");
+
+  // Create the parent. An organization seeds a root department on every tenant, so the list is
+  // never empty here — which means the empty state is *not* what this asserts.
+  await page.locator("[data-qa-hr-departments-new]").click().catch(() => {});
+  await page.waitForTimeout(700);
+  await page.locator("[data-qa-hr-department-name]").fill(parentName).catch(() => {});
+  await page.locator("[data-qa-hr-department-code]").fill(`${stamp}P`).catch(() => {});
+  await page.locator("[data-qa-hr-department-submit]").click().catch(() => {});
+  await page.waitForTimeout(1800);
+  const parentExists = (await page.locator(`[data-qa-hr-department-row="${parentName}"]`).count()) > 0;
+  note({ step: "create-parent", name: parentName, exists: parentExists });
+  if (!parentExists) {
+    return { ok: false, reason: `the department "${parentName}" did not appear after being created`, steps };
+  }
+
+  // Create the child under it. The parent picker only offers departments that exist, so this is
+  // also the assertion that the picker reads the loaded tree rather than a stale copy.
+  await page.locator("[data-qa-hr-departments-new]").click().catch(() => {});
+  await page.waitForTimeout(700);
+  await page.locator("[data-qa-hr-department-name]").fill(childName).catch(() => {});
+  const parentOption = await page.locator(`[data-qa-hr-department-parent] option[value]`).count();
+  await page
+    .locator("[data-qa-hr-department-parent]")
+    .selectOption({ label: parentName })
+    .catch(() => {});
+  await page.locator("[data-qa-hr-department-submit]").click().catch(() => {});
+  await page.waitForTimeout(1800);
+  const childExists = (await page.locator(`[data-qa-hr-department-row="${childName}"]`).count()) > 0;
+  const childDepth = await page
+    .locator(`[data-qa-hr-department-row="${childName}"] td:first-child span`)
+    .first()
+    .evaluate((node) => parseInt(node.style.paddingLeft || "0", 10))
+    .catch(() => 0);
+  note({ step: "create-child", name: childName, exists: childExists, parentOptions: parentOption, indentPx: childDepth });
+  if (!childExists) {
+    return { ok: false, reason: `the child department "${childName}" did not appear`, steps };
+  }
+  // Indentation is the tree's only claim to being a tree, and it is cheap to assert structurally.
+  if (!(childDepth > 0)) {
+    return { ok: false, reason: "the child department rendered at the root indent, so the tree is a flat list", steps };
+  }
+
+  // --- two employees, one reporting to the other ---------------------------------------------------
+  async function addEmployee(first, last, position, departmentLabel, managerLabel) {
+    await page.goto(`${URL_ADMIN}/hr/employees`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1400);
+    await page.locator("[data-qa-hr-employees-new]").click().catch(() => {});
+    await page.waitForTimeout(900);
+    await page.locator("[data-qa-hr-employee-first-name]").fill(first).catch(() => {});
+    await page.locator("[data-qa-hr-employee-last-name]").fill(last).catch(() => {});
+    await page.locator("[data-qa-hr-employee-work-email]").fill(`${stamp}-${first}@qa.invalid`).catch(() => {});
+    await page.locator("[data-qa-hr-employee-position]").fill(position).catch(() => {});
+    await page.locator("[data-qa-hr-employee-department]").selectOption({ label: departmentLabel }).catch(() => {});
+    if (managerLabel) {
+      await page.locator("[data-qa-hr-employee-manager]").selectOption({ label: managerLabel }).catch(() => {});
+    }
+    await page.locator("[data-qa-hr-employee-submit]").click().catch(() => {});
+    await page.waitForTimeout(1800);
+    const formStillOpen = (await page.locator("[data-qa-hr-employee-form]").count()) > 0;
+    const formError = (await page.locator("[data-qa-hr-employee-form-error]").count()) > 0;
+    return { formStillOpen, formError };
+  }
+
+  const managerResult = await addEmployee(`${stamp}Ada`, "Lovelace", "Head of Platform", parentName, "");
+  note({ step: "create-manager", ...managerResult });
+  if (managerResult.formStillOpen) {
+    // The refusal is rendered inside the form on purpose; the pass reports whether it *said*
+    // something rather than only that the form stayed open, because "the form did not close" is
+    // also what a silently swallowed network error looks like.
+    const message = (await page.locator("[data-qa-hr-employee-form-error]").first().textContent()) || "";
+    return {
+      ok: false,
+      reason: `the first employee was not saved and the form showed no reason (${message.trim()})`,
+      steps,
+    };
+  }
+
+  const managerFullName = `${stamp}Ada Lovelace`;
+  const reportResult = await addEmployee(`${stamp}Grace`, "Hopper", "Platform Engineer", childName, managerFullName);
+  note({ step: "create-report", ...reportResult });
+  if (reportResult.formStillOpen) {
+    const message = (await page.locator("[data-qa-hr-employee-form-error]").first().textContent()) || "";
+    return {
+      ok: false,
+      reason: `the reporting employee was not saved and the form showed no reason (${message.trim()})`,
+      steps,
+    };
+  }
+
+  // --- the counts the criterion is about -----------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/hr/departments`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const parentCount =
+    (await page.locator(`[data-qa-hr-department-members="${parentName}"]`).first().textContent()) || "";
+  const childCount =
+    (await page.locator(`[data-qa-hr-department-members="${childName}"]`).first().textContent()) || "";
+  note({ step: "counts", parent: parentCount.trim(), child: childCount.trim() });
+  // Each is asserted to be at least one, not to equal exactly one: the shared fixture database is
+  // written by other writers too, and a pass that failed because somebody else hired a second
+  // person would be measuring the wrong thing.
+  if (Number(parentCount.trim()) < 1 || Number(childCount.trim()) < 1) {
+    return {
+      ok: false,
+      reason: `a department created here reports no members (parent "${parentCount.trim()}", child "${childCount.trim()}")`,
+      steps,
+    };
+  }
+
+  // --- the chart: the manager carries a report ------------------------------------------------------
+  await page.locator("[data-qa-hr-departments-tab-chart]").click().catch(() => {});
+  await page.waitForTimeout(1400);
+  const chartRendered = (await page.locator("[data-qa-hr-org-chart]").count()) > 0;
+  const chartNodes = await page.locator("[data-qa-hr-chart-node]").count();
+  note({ step: "org-chart", rendered: chartRendered, nodes: chartNodes });
+  if (!chartRendered) {
+    return { ok: false, reason: "the org chart tab rendered nothing", steps };
+  }
+  if (chartNodes < 2) {
+    return {
+      ok: false,
+      reason: `the org chart drew ${chartNodes} nodes after two employees were created, so the reporting line is not in it`,
+      steps,
+    };
+  }
+  await shot(page, "page-hr-org-chart");
+
+  // --- the refusal is visible, with a count in it --------------------------------------------------
+  // Delete the parent, which now holds a member and a child. The store refuses and the screen has
+  // to *show* that refusal: a catch block that swallows it produces a button that silently does
+  // nothing, which is the bug this assertion exists for.
+  await page.locator("[data-qa-hr-departments-tab-tree]").click().catch(() => {});
+  await page.waitForTimeout(900);
+  await page.locator(`[data-qa-hr-department-delete="${parentName}"]`).click().catch(() => {});
+  await page.waitForTimeout(1600);
+  const refusalVisible = (await page.locator("[data-qa-hr-departments-error]").count()) > 0;
+  const refusalText = refusalVisible
+    ? (await page.locator("[data-qa-hr-departments-error]").first().textContent()) || ""
+    : "";
+  const parentStillThere =
+    (await page.locator(`[data-qa-hr-department-row="${parentName}"]`).count()) > 0;
+  note({ step: "delete-refusal", visible: refusalVisible, stillThere: parentStillThere });
+  if (!parentStillThere) {
+    // The stronger failure: the department holding a member was deleted anyway, which means the
+    // guard is not running at all rather than the screen hiding a message.
+    return { ok: false, reason: "a department holding a member was deleted", steps };
+  }
+  if (!refusalVisible) {
+    return { ok: false, reason: "the delete was refused by the server but the screen showed nothing", steps };
+  }
+  // The acceptance criterion asks for *both* counts in the refusal, so a bare "cannot delete"
+  // is not the sentence the operator can act on.
+  const hasCount = /\d/.test(refusalText);
+  note({ step: "refusal-detail", text: refusalText.trim(), hasCount });
+  if (!hasCount) {
+    return {
+      ok: false,
+      reason: `the delete refusal names no count, so the operator cannot tell how exposed the department is (${refusalText.trim()})`,
+      steps,
+    };
+  }
+
+  return { ok: true, steps: steps.length };
+}
+
 /** The self-service surfaces (REQ-055, slice 2c): profile, leave, documents and the request form. */
 async function runHrMe(page, report) {
   const steps = [];
@@ -10138,6 +10367,14 @@ async function main() {
     // harness can reach only through a bespoke `page.goto` is a screen whose presence in the
     // product is never checked. `/hr/leave/{id}` is deliberately NOT here — a placeholder id proves
     // the not-found state renders and nothing else — and `runHrLeave` opens a real request instead.
+    // The people core (REQ-055, slice 1). These two are in the ordinary route list for the same
+    // reason as the leave screens below: a screen the harness can reach only through a bespoke
+    // `page.goto` is a screen whose presence in the product is never checked. The org chart is a
+    // *tab* on `/hr/departments` rather than its own route, so `runHrPeopleCore` presses the tab
+    // rather than inventing an `/hr/org-chart` address the product does not have — a route in the
+    // inventory that 404s is worse than a screen missing from it.
+    { path: "/hr/employees", name: "hr-employees" },
+    { path: "/hr/departments", name: "hr-departments" },
     { path: "/hr/leave", name: "hr-leave" },
     { path: "/hr/leave/new", name: "hr-leave-new" },
     // The self-service surfaces (REQ-055, slice 2c). In the ordinary list, not only inside a
@@ -10370,6 +10607,15 @@ async function main() {
       () => runInventoryReports(page, report),
     );
     log(`inventory reports: ${JSON.stringify(report.inventoryReports)}`);
+  }
+
+  // The people core (REQ-055, slice 1). Driven rather than merely visited: the pass creates a
+  // department and a child of it, two employees with a reporting line between them, reads the
+  // counts back off the department screen, opens the org chart tab, and then proves the delete
+  // refusal is *visible* on a department that now holds people.
+  if (!onlyGroup("hr")) {
+    report.hrPeopleCore = await runDepthPass("hr-people-core", () => runHrPeopleCore(page, report));
+    log(`hr people core: ${JSON.stringify(report.hrPeopleCore)}`);
   }
 
   // The HR leave surfaces (REQ-055, slice 2b). Driven, not merely visited: the pass raises a
