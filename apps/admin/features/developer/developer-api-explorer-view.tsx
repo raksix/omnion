@@ -141,6 +141,11 @@ function bodyFrom(operation: ExplorerOperation, values: Record<string, string>):
 
 export function DeveloperApiExplorerView() {
   const [operations, setOperations] = useState<ExplorerOperation[] | null>(null);
+  // Whether this caller may send at all. The server decides; see the note on `can_send` in
+  // `ExplorerOperations`. The first derivation of it here compared the *selected operation's*
+  // permission against the run key, which is a different question and answered "no" for every
+  // operation — including the ones an owner can send, so the button was dead for everyone.
+  const [canSend, setCanSend] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
@@ -164,6 +169,7 @@ export function DeveloperApiExplorerView() {
     fetchExplorerOperations()
       .then((response) => {
         setOperations(response.operations);
+        setCanSend(response.can_send);
         // Land on something rather than an empty right-hand pane. The first operation in the
         // document is a read, so the screen's first paint is a form somebody can send.
         setSelectedId((current) => current ?? response.operations[0]?.id ?? null);
@@ -225,10 +231,11 @@ export function DeveloperApiExplorerView() {
     );
   }, [operations, search]);
 
-  const runnable = useMemo(
-    () => (selected?.permission ?? RUN_PERMISSION) === RUN_PERMISSION,
-    [selected],
-  );
+  // A send is possible when the server says this caller may send. The permission line under
+  // the operation title is *information* about the call, not a gate on the button — a reader
+  // may browse operations their role cannot act on, and hiding the browser from them would be
+  // hiding the answer to "why can I not".
+  const runnable = canSend;
 
   const send = useCallback(async () => {
     if (!selected || !draft || sending) {
@@ -629,9 +636,10 @@ export function DeveloperApiExplorerView() {
 
                   {!runnable ? (
                     <p className="text-[12px] text-caution">
-                      Your role does not hold <code>{RUN_PERMISSION}</code>, so the Send button is
-                      unavailable. Reading the reference is not the same permission as sending a
-                      call.
+                      Your role does not hold <code>{RUN_PERMISSION}</code>, so calls cannot be
+                      sent from this screen. The reference above is still yours to read —
+                      browsing the API and acting as the person at the screen are two different
+                      permissions, and a read-only developer role has the first.
                     </p>
                   ) : null}
 

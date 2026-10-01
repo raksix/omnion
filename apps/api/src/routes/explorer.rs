@@ -673,7 +673,20 @@ pub async fn list_operations(
     session: crate::auth::CurrentSession,
 ) -> Result<axum::Json<ExplorerOperations>, ApiError> {
     let operations = operations_for(&state, &session.user).await?;
-    Ok(axum::Json(ExplorerOperations { operations }))
+    // Whether the caller may *send* at all, resolved here rather than left to the panel.
+    //
+    // The panel cannot work it out: a role's permissions are not in the operations list, and a
+    // client that guessed would guess wrong in the one direction that matters — a Send button
+    // that is enabled and always `403` is worse than one that is honestly disabled, because it
+    // teaches that the Explorer is broken rather than that the role is read-only. And the
+    // reverse mistake is the one this replaces: comparing the *selected operation's*
+    // permission against the run key answers a different question entirely, and answers it
+    // "no" for every operation including the ones an owner can send.
+    let can_send = holds(&state, &session.user, "developer.explorer.run").await?;
+    Ok(axum::Json(ExplorerOperations {
+        operations,
+        can_send,
+    }))
 }
 
 /// The body of `GET /api/v1/dev/operations`.
@@ -681,6 +694,12 @@ pub async fn list_operations(
 pub struct ExplorerOperations {
     /// The operations the caller holds the permission for, in the document's own order.
     pub operations: Vec<Value>,
+    /// Whether the caller may send a call at all.
+    ///
+    /// Sent as a first-class field rather than derived by the panel from the operation list,
+    /// because "may I read the reference" and "may I act as the person at this screen" are two
+    /// different permissions and only this process can answer the second one.
+    pub can_send: bool,
 }
 
 /// `POST /api/v1/dev/explorer/requests` — run one call as the signed-in caller.
@@ -847,6 +866,41 @@ mod tests {
         // decides — the form's own select offers only the five the document knows.
         let resolved = prepare(&run("  get  ", "/api/v1/pages")).expect("a read is allowed");
         assert_eq!(resolved.method, Method::GET);
+    }
+
+    #[test]
+    fn the_operations_response_carries_whether_the_caller_may_send() {
+        // The contract the panel is built on: `can_send` is a *server* answer, not something
+        // the client derives. A client that derived it from the operation list got it wrong in
+        // the direction that matters -- a Send button that is enabled and always 403, which
+        // reads as "the Explorer is broken" rather than "this role is read-only".
+        //
+        // This cannot exercise the real resolution without a database, so what it holds is the
+        // shape: the field exists, it is a bool, and it is a sibling of the list rather than a
+        // field on each operation. A per-operation flag would invite the client to sum them,
+        // which is the derivation that was wrong.
+        let read = ExplorerOperations {
+            operations: Vec::new(),
+            can_send: true,
+        };
+        let body = serde_json::to_value(&read).expect("the response serialises");
+        assert_eq!(body["can_send"], serde_json::json!(true));
+        // A sibling of the list, never a field on each operation: a per-operation flag would
+        // invite the client to derive the answer by summing them, which is the derivation that
+        // was wrong in the first place.
+        assert!(
+            body.get("operations").is_some(),
+            "the list stays a field of its own"
+        );
+        let refused = ExplorerOperations {
+            operations: Vec::new(),
+            can_send: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&refused).expect("serialises")["can_send"],
+            serde_json::json!(false),
+            "a read-only role is told so, rather than being left to discover it"
+        );
     }
 
     #[test]

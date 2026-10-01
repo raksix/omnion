@@ -3596,8 +3596,18 @@ export type ExplorerOperation = {
   body: ExplorerSchema | null;
 };
 
-/** `GET /api/v1/dev/operations` — the operations this caller may see. */
-export type ExplorerOperations = { operations: ExplorerOperation[] };
+/**
+ * `GET /api/v1/dev/operations` — the operations this caller may see.
+ *
+ * `can_send` is a separate field rather than something the panel derives from the list. Reading
+ * the reference and *acting as the person at the screen* are two different permissions, and
+ * only the server can answer the second one: a client that guessed would guess wrong in the
+ * direction that matters, showing a Send button that is always `403`.
+ */
+export type ExplorerOperations = {
+  operations: ExplorerOperation[];
+  can_send: boolean;
+};
 
 /** What one Explorer call answered. */
 export type ExplorerResult = {
