@@ -296,7 +296,12 @@ impl ListQuery {
     }
 
     /// The filter list, in the order the placeholders are numbered.
-    fn filters(&self) -> Vec<Filter> {
+    ///
+    /// `Result` because a range an operator typed on two adjacent boxes can contradict itself, and
+    /// the honest answer to `min_bytes` above `max_bytes` is a message under the box — not an
+    /// empty library. The clamping stays: a *negative* size is a typo, not a contradiction, and
+    /// it is quietly read as zero.
+    fn filters(&self) -> Result<Vec<Filter>> {
         let mut filters = Vec::new();
         if let Some(id) = self.folder_id {
             filters.push(Filter::Folder {
@@ -321,6 +326,21 @@ impl ListQuery {
         if let Some(max_bytes) = self.max_bytes {
             filters.push(Filter::MaxBytes(max_bytes.max(0)));
         }
+        // The two size boxes are adjacent and typed independently, so the pair is checked
+        // together *after* clamping — `min=-5, max=3` is a 0..3 range, not a contradiction, and
+        // rejecting it would refuse a form a person can obviously mean.
+        if let (Some(min_bytes), Some(max_bytes)) = (self.min_bytes, self.max_bytes)
+            && min_bytes.max(0) > max_bytes.max(0)
+        {
+            return Err(MediaError::InvalidFilter {
+                field: "min_bytes".to_owned(),
+                reason: format!(
+                    "the smallest size cannot be above the largest ({} B > {} B)",
+                    min_bytes.max(0),
+                    max_bytes.max(0)
+                ),
+            });
+        }
         if let Some(user) = self.uploaded_by {
             filters.push(Filter::UploadedBy(user));
         }
@@ -329,6 +349,18 @@ impl ListQuery {
         }
         if let Some(before) = self.created_before {
             filters.push(Filter::CreatedBefore(before));
+        }
+        // Same rule for the two date boxes, and the same reason: an operator who picks a start
+        // after the end meant the pair the other way round, and an empty listing says neither.
+        if let (Some(after), Some(before)) = (self.created_after, self.created_before)
+            && after > before
+        {
+            return Err(MediaError::InvalidFilter {
+                field: "created_after".to_owned(),
+                reason: format!(
+                    "the earliest date cannot be after the latest date ({after} > {before})"
+                ),
+            });
         }
         if let Some(tag) = self.tag.as_deref().filter(|v| !v.is_empty()) {
             filters.push(Filter::Tag(tag.to_owned()));
@@ -347,8 +379,61 @@ impl ListQuery {
         {
             filters.push(Filter::MetadataPair { key, value });
         }
-        filters
+        Ok(filters)
     }
+}
+
+/// One account that appears in a site's library as an uploader.
+///
+/// The uploader filter needs a list of *candidates*, and the obvious source is `GET
+/// /api/v1/iam/users` — which is guarded by `users.read`, a key a media operator does not
+/// hold. A toolbar that calls it would render its filter behind a `403` for exactly the people
+/// who run the library. So the list is derived from the library itself: an account that uploaded
+/// nothing is not a candidate for a filter, and every account that did is, by definition, one
+/// this module already reads.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct Uploader {
+    /// The account id, the value the filter binds.
+    pub id: Uuid,
+    /// Their display name, falling back to their address (see [`list_uploaders`]).
+    pub label: String,
+    /// How many live files of this site they uploaded.
+    pub files: i64,
+}
+
+/// The accounts that uploaded into a site's live library, most prolific first.
+///
+/// Left-joined over `users` so a row whose account has since been deleted still appears — its
+/// files are still in the library, and a listing that silently omits them because the person left
+/// is how a filter "loses" a file. `display_name` is coalesced onto `email` for the same reason:
+/// the column is `not null default ''`, so a name is never null, but it is *empty* for every
+/// account created before it was filled in, and an empty dropdown label is worse than an address.
+pub async fn list_uploaders(pool: &PgPool, site_id: Uuid) -> Result<Vec<Uploader>> {
+    // Two PostgreSQL rules, each found by the walk rather than by reading, and both of which
+    // answer `500: column "label" does not exist`:
+    //
+    // 1. An output alias is visible to `order by` **only when it is the whole expression**. Wrap
+    //    it — `lower(label)` — and the lookup falls through to the input columns, where there is
+    //    no `label`. The escape is to repeat the expression; the other one, a positional
+    //    reference, is worse, because `lower(2)` is `lower(integer)` and the hint names a missing
+    //    function rather than a missing column.
+    // 2. `group by` never sees an output alias at all, so it groups by **position** here. That is
+    //    also the property the count needs: grouping by exactly what is selected keeps two
+    //    accounts that share a display name as two rows instead of collapsing them into one
+    //    combined count, which would show a name twice and count the files once between them.
+    let uploaders = sqlx::query_as::<_, Uploader>(
+        "select m.created_by as id, \
+                coalesce(nullif(u.display_name, ''), u.email, 'someone') as label, \
+                count(*) as files \
+         from media m left join users u on u.id = m.created_by \
+         where m.site_id = $1 and m.deleted_at is null \
+         group by 1, 2 \
+         order by files desc, lower(coalesce(nullif(u.display_name, ''), u.email, 'someone')), 1",
+    )
+    .bind(site_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(uploaders)
 }
 
 /// Escape the wildcards of a user-supplied search term.
@@ -395,7 +480,7 @@ pub async fn list_files(
     // The clause and the binds are generated by ONE loop over ONE filter list, so the `$n` in a
     // clause and the value pushed after it can never drift apart — the failure mode that makes a
     // count disagree with the page it counts.
-    push_filters(&mut builder, query, site_id);
+    push_filters(&mut builder, query, site_id)?;
     // `limit`/`offset` need their keywords: the two values are pushed back to back, and
     // without `offset` in between PostgreSQL parses `limit $n $n+1` as a syntax error. The
     // clause is built here rather than in `Sort::order_by` so the keyword cannot be lost
@@ -421,20 +506,30 @@ pub async fn list_files(
 /// One loop over ONE filter list, and each filter writes its own clause *and* its own values, so
 /// a placeholder can only exist where the value beside it was pushed. `count_files` runs the same
 /// function, which is what makes the count and the page it counts unable to disagree.
-fn push_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &ListQuery, site_id: Uuid) {
+///
+/// The `Result` is the range check in [`ListQuery::filters`]. It has to be able to refuse *before*
+/// the builder is half-written, which is why the filter list is built first and then written: a
+/// builder holding a clause for `size_bytes >= $n` and no `size_bytes <= $n` is a statement that
+/// is syntactically fine and answers the wrong question.
+fn push_filters(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    query: &ListQuery,
+    site_id: Uuid,
+) -> Result<()> {
     builder.push("media.site_id = ");
     builder.push_bind(site_id);
     builder.push(" and media.deleted_at is null");
-    for filter in query.filters() {
+    for filter in query.filters()? {
         builder.push(" and ");
         filter.push(builder);
     }
+    Ok(())
 }
 
 /// How many rows a filter matches, with the same predicate as [`list_files`].
 pub async fn count_files(pool: &PgPool, site_id: Uuid, query: &ListQuery) -> Result<i64> {
     let mut builder = QueryBuilder::<Postgres>::new("select count(*) from media where ");
-    push_filters(&mut builder, query, site_id);
+    push_filters(&mut builder, query, site_id)?;
     let total: i64 = builder.build_query_scalar().fetch_one(pool).await?;
     Ok(total)
 }
@@ -682,11 +777,10 @@ mod tests {
         assert_eq!(escape_like("100%"), "100\\%");
         assert_eq!(escape_like("a_b"), "a\\_b");
         // Without the escape a search for `100%` would return every file in the library.
-        let filters = ListQuery {
+        let filters = built(&ListQuery {
             search: Some("100%".to_owned()),
             ..ListQuery::new()
-        }
-        .filters();
+        });
         assert!(
             matches!(filters.first(), Some(Filter::NameContains(pattern)) if pattern == "%100\\%%")
         );
@@ -694,13 +788,12 @@ mod tests {
 
     #[test]
     fn blank_filters_are_not_built() {
-        let filters = ListQuery {
+        let filters = built(&ListQuery {
             search: Some("   ".to_owned()),
             kind: Some(String::new()),
             tag: Some(String::new()),
             ..ListQuery::new()
-        }
-        .filters();
+        });
         assert!(
             filters.is_empty(),
             "blank filters are not filters: {filters:?}"
@@ -712,17 +805,145 @@ mod tests {
         // A trashed file never appears in the browser listing, whatever the filters say: the
         // clause is written once in `push_filters` and both statements go through it.
         let mut builder = QueryBuilder::<Postgres>::new("select count(*) from media where ");
-        push_filters(&mut builder, &query(), Uuid::nil());
+        push_filters(&mut builder, &query(), Uuid::nil()).expect("an empty query is a valid one");
         let sql = builder.sql().to_owned();
         assert!(sql.contains("media.site_id = $1"), "{sql}");
         assert!(sql.contains("media.deleted_at is null"), "{sql}");
     }
 
+    /// The filter list of a query that must be accepted.
+    ///
+    /// Every caller below hands it a query it believes is valid, so a refusal is a test that has
+    /// lost the case it was written for. The tests that want a refusal call `filters()` and match
+    /// on the error themselves — the two must not share a helper, or the refusal tests would be
+    /// asserting against a `panic`.
+    fn built(query: &ListQuery) -> Vec<Filter> {
+        query
+            .filters()
+            .unwrap_or_else(|error| panic!("a valid query must build: {error}"))
+    }
+
     /// Build the statement a listing would send, so the assertions can look at the SQL itself.
+    ///
+    /// `panic` rather than `unwrap`: every caller below hands it a *valid* query, so a refusal
+    /// here is a test that has lost the case it was written for, not a test to route around.
     fn statement(query: &ListQuery) -> String {
         let mut builder = QueryBuilder::<Postgres>::new("select 1 from media where ");
-        push_filters(&mut builder, query, Uuid::nil());
+        push_filters(&mut builder, query, Uuid::nil())
+            .unwrap_or_else(|error| panic!("a valid query must build: {error}"));
         builder.sql().to_owned()
+    }
+
+    #[test]
+    fn a_size_range_wider_than_itself_is_refused_by_name() {
+        // The two size boxes sit next to each other and are typed independently, so this is a
+        // thing an operator does. PostgreSQL's own answer is zero rows, which the panel renders
+        // as "no files match these filters" — a statement about the library rather than about
+        // the two boxes that disagree. The refusal has to name the box.
+        let error = ListQuery {
+            min_bytes: Some(4096),
+            max_bytes: Some(1024),
+            ..ListQuery::new()
+        }
+        .filters()
+        .expect_err("min above max is not a range");
+        assert!(
+            matches!(&error, MediaError::InvalidFilter { field, .. } if field == "min_bytes"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("4096"), "{error}");
+    }
+
+    #[test]
+    fn a_date_range_wider_than_itself_is_refused_by_name() {
+        let after = OffsetDateTime::UNIX_EPOCH + time::Duration::days(20);
+        let before = OffsetDateTime::UNIX_EPOCH + time::Duration::days(10);
+        let error = ListQuery {
+            created_after: Some(after),
+            created_before: Some(before),
+            ..ListQuery::new()
+        }
+        .filters()
+        .expect_err("an earliest date after the latest is not a range");
+        assert!(
+            matches!(&error, MediaError::InvalidFilter { field, .. } if field == "created_after"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn one_sided_ranges_and_negative_sizes_are_not_contradictions() {
+        // Half a range is a range, and a negative size is a typo rather than a disagreement with
+        // the other box. Both must build, or the refusal above starts refusing forms a person
+        // can obviously mean.
+        assert!(
+            !built(&ListQuery {
+                min_bytes: Some(4096),
+                ..ListQuery::new()
+            })
+            .is_empty()
+        );
+        assert!(
+            !built(&ListQuery {
+                max_bytes: Some(1024),
+                ..ListQuery::new()
+            })
+            .is_empty()
+        );
+        // -5 clamps to 0, which is below 3, so this is a 0..3 range and not a contradiction.
+        let filters = built(&ListQuery {
+            min_bytes: Some(-5),
+            max_bytes: Some(3),
+            ..ListQuery::new()
+        });
+        assert!(
+            matches!(filters.first(), Some(Filter::MinBytes(0))),
+            "{filters:?}"
+        );
+        assert!(
+            matches!(filters.get(1), Some(Filter::MaxBytes(3))),
+            "{filters:?}"
+        );
+    }
+
+    #[test]
+    fn a_range_is_refused_before_the_statement_is_built() {
+        // Not "the statement still runs and returns nothing" — the builder must be left alone,
+        // so a caller can never send a half-written statement that answers the wrong question.
+        let query = ListQuery {
+            kind: Some("image".to_owned()),
+            min_bytes: Some(9000),
+            max_bytes: Some(10),
+            ..ListQuery::new()
+        };
+        let mut builder = QueryBuilder::<Postgres>::new("select 1 from media where ");
+        let error = push_filters(&mut builder, &query, Uuid::nil())
+            .expect_err("the range is contradictory");
+        assert!(
+            matches!(error, MediaError::InvalidFilter { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn the_size_and_date_filters_reach_the_statement() {
+        // The toolbar shipped after the store, so this is the test that would have caught the
+        // six months in which `min_bytes` had a filter, a store clause and no input.
+        let after = OffsetDateTime::UNIX_EPOCH;
+        let before = OffsetDateTime::UNIX_EPOCH + time::Duration::days(365);
+        let sql = statement(&ListQuery {
+            min_bytes: Some(1024),
+            max_bytes: Some(2048),
+            created_after: Some(after),
+            created_before: Some(before),
+            uploaded_by: Some(Uuid::nil()),
+            ..ListQuery::new()
+        });
+        assert!(sql.contains("size_bytes >= $"), "{sql}");
+        assert!(sql.contains("size_bytes <= $"), "{sql}");
+        assert!(sql.contains("created_at >= $"), "{sql}");
+        assert!(sql.contains("created_at < $"), "{sql}");
+        assert!(sql.contains("created_by = $"), "{sql}");
     }
 
     #[test]
@@ -846,11 +1067,10 @@ mod tests {
         // narrow nothing rather than match every row or none: a listing that changes while the
         // word is being typed is a listing nobody trusts.
         for term in ["", "   ", "campaign", "campaign=", "=spring", "  =  "] {
-            let filters = ListQuery {
+            let filters = built(&ListQuery {
                 metadata: Some(term.to_owned()),
                 ..ListQuery::new()
-            }
-            .filters();
+            });
             assert!(
                 !filters
                     .iter()
@@ -880,11 +1100,10 @@ mod tests {
     fn a_metadata_pair_keeps_an_equals_sign_inside_its_value() {
         // Splitting on the *first* `=` is what makes `note=width=3px` addressable; splitting on
         // the last, or on every one, would truncate the value into something that never matches.
-        let filters = ListQuery {
+        let filters = built(&ListQuery {
             metadata: Some("note=width=3px".to_owned()),
             ..ListQuery::new()
-        }
-        .filters();
+        });
         let Some(Filter::MetadataPair { key, value }) = filters.first() else {
             panic!("expected one metadata filter: {filters:?}");
         };
