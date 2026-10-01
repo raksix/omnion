@@ -464,6 +464,24 @@ pub async fn revoke_session(
     Path(session_id): Path<Uuid>,
     client: ClientAddress,
 ) -> Result<Json<SessionBody>, ApiError> {
+    // Revoking the session you are calling from ends the caller's own sign-in mid-request: the
+    // row is stamped before the response is written, so every later request in the walk — and
+    // every later request the operator makes — is answered `401 invalid_session`. The sessions
+    // screen offers this button on a `revocable` row and `revocable` only says "not already
+    // revoked", so the row that says `current` was still offered and still clickable. The walk
+    // proved it by revoking the walk's own session: sixteen routes then measured the login
+    // screen and every depth pass after it reported an empty one, which reads as a defect on the
+    // screens it never reached. `current` is the field that answers "is this me", and it is the
+    // field the guard has to read. Sign-out-all is the supported way to end your own session;
+    // this endpoint exists for the other rows in the table.
+    if session_id == current.session.id {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "cannot_revoke_current_session",
+            "this is the session you are signed in with — use Sign out everywhere to end it",
+        ));
+    }
+
     let revoked = sessions::revoke_session_by_id(
         state.db().pool(),
         session_id,
@@ -1387,4 +1405,120 @@ pub async fn verify_mfa_login(
         );
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod self_revoke_tests {
+    /// The revoke guard and the walk that found it.
+    ///
+    /// The refusal in `revoke_session` is the product half. This is the half that keeps it honest
+    /// on the harness side, and it exists because of how the defect was found: the walk revoked
+    /// `table [data-session-revoke]`'s **first** row, which is the browser's own session as often
+    /// as any other, and every screen it measured afterwards was the login screen. Sixteen routes
+    /// answered `3 elements`, the palette and the command centre reported
+    /// `url: http://127.0.0.1:3102/login`, and all of it was filed as a defect on screens that
+    /// were never opened — the exact reading this repo's own notes keep warning about, produced by
+    /// the walk itself.
+    ///
+    /// A `walkthrough.cjs` guard is the only place this can be caught: the pass is JavaScript,
+    /// nothing compiles it, and the row it clicks is chosen by *position* rather than by the one
+    /// field that says "this session is mine". The general rule is the one `crates/workflows` keeps
+    /// re-learning: **a rule restated in a file nothing compiles is a rule with no compiler** — so
+    /// this asserts the selection, not the sentence around it. The path is written out rather than
+    /// discovered, because a guard that silently reads a different file than the pass runs is
+    /// worse than no guard at all.
+    #[test]
+    fn the_walkthrough_never_revokes_the_session_it_is_walking_on() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above apps/api");
+        let source = std::fs::read_to_string(repo_root.join("scripts/qa/walkthrough.cjs"))
+            .unwrap_or_else(|e| panic!("the walkthrough is the thing being guarded: {e}"));
+
+        // The selection must be made by the field that names the walk's own session. A row count
+        // alone is not enough either: a table whose only revocable row is the walk's own still
+        // satisfies `revokeCount > 0` and still ends the run, so the `current` count has to be
+        // part of the decision rather than a note beside it.
+        assert!(
+            source.contains("ownRows < revokeCount"),
+            "the sessions pass must not revoke a row that says `current`; it clicks \
+             `revokeButtons.first()` and the list is not ordered by anything the walk controls, \
+             which is how the walk revoked its own session and then measured the login screen"
+        );
+
+        // The decision must live in the condition, not in the comment above it — otherwise the
+        // assertion above could be satisfied by prose that outlives the guard losing its `if`.
+        assert!(
+            !source.contains(r#"if (revokeCount > 0) {"#),
+            "the sessions pass decides on the row count alone again — the click lands on whichever \
+             row is first, which can be this browser's own session"
+        );
+    }
+
+    /// The route is the guard: this fails when the refusal disappears from the handler rather than
+    /// leaving a test that guards nothing.
+    ///
+    /// **The first draft of this test was a false green, and it is worth recording why.** It read
+    /// the route's *source* for `cannot_revoke_current_session` — and disabling the guard with
+    /// `if false && session_id == current.session.id` left that string in the file, so the test
+    /// stayed green against a route that would happily revoke the caller's own session. A guard
+    /// that reads text proves the text is there; it does not prove the code runs. So this one
+    /// asserts the *shape* instead: the refusal has to be the first thing the handler does, before
+    /// the row is ever touched, and it has to be keyed on the caller's own id with nothing in
+    /// front of it. Disabling the guard — with `false &&`, a comment, or by moving the check down
+    /// — changes that shape and fails here. The walkthrough guard above has the same weakness by
+    /// construction and is kept only because its subject is JavaScript, where there is no
+    /// alternative; the route guard is Rust, so it is held to the stronger standard.
+    #[test]
+    fn the_refusal_is_still_in_the_route() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above apps/api");
+        let source =
+            std::fs::read_to_string(repo_root.join("apps/api/src/routes/iam_security.rs"))
+                .unwrap_or_else(|e| panic!("the route is the thing being guarded: {e}"));
+
+        let start = source
+            .find("pub async fn revoke_session(")
+            .expect("the revoke route must exist for this guard to mean anything");
+        // The slice ends at the NEXT handler. Without this bound it runs on into this test module,
+        // and a guard that reads its own assertions is a guard that can be satisfied by its own
+        // source — which is how the `false &&` mutation slipped past the first draft.
+        let body = match source[start..].find("\npub async fn ") {
+            Some(offset) => &source[start..start + offset],
+            None => &source[start..],
+        };
+
+        let refusal = body
+            .find("cannot_revoke_current_session")
+            .expect("the self-revocation refusal disappeared from the route");
+        let writes = body
+            .find("revoke_session_by_id(")
+            .expect("the revoke write must still be there");
+        assert!(
+            refusal < writes,
+            "the refusal has to run BEFORE the row is stamped — the defect was that the write \
+             happened and the operator's own sign-in ended mid-request"
+        );
+
+        // And the check must be the plain comparison on the caller's own id, with nothing short-
+        // circuiting it in front of the `if`.
+        assert!(
+            body.contains("if session_id == current.session.id {"),
+            "the refusal is no longer a bare comparison on the caller's own session id; a guard \
+             wrapped in anything (a flag, a `false &&`, a helper that is never called) reads the \
+             same as one that runs"
+        );
+
+        // The comparison must sit immediately inside the handler: between the signature and the
+        // `if` there may be bindings, but nothing that could return early and skip the guard.
+        let between = &body[..body.find("if session_id == current.session.id {").expect("checked")];
+        assert!(
+            !between.contains("return Err"),
+            "something returns before the self-revocation guard, so the refusal is unreachable on \
+             at least one path"
+        );
+    }
 }
