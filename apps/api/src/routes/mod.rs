@@ -73,6 +73,7 @@ pub mod ai;
 pub mod ai_agents;
 pub mod ai_agent_workspace;
 pub mod ai_approvals;
+pub mod ai_change_sets;
 pub mod ai_decisions;
 pub mod ai_identities;
 pub mod ai_routing;
@@ -1040,6 +1041,22 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "ai.policies.manage")),
         );
 
+    // Change sets (REQ-101 slice 3). The permission split is the design: filing and editing
+    // a proposal is `read`, because a draft is a description of work and the person who
+    // writes it is the person who will read it; only confirming and discarding are `act`,
+    // because only those two can cause something to happen. Gating the whole lifecycle on
+    // `act` would leave a reader with no way to *ask* for something.
+    let ai_change_sets = get(ai_change_sets::list)
+        .layer(guards::require(&state, "ai.approvals.read"));
+    let ai_change_set_create = post(ai_change_sets::create)
+        .layer(guards::require(&state, "ai.approvals.read"));
+    let ai_change_set_update = axum::routing::patch(ai_change_sets::update)
+        .layer(guards::require(&state, "ai.approvals.read"));
+    let ai_change_set_confirm = post(ai_change_sets::confirm)
+        .layer(guards::require(&state, "ai.approvals.act"));
+    let ai_change_set_discard = post(ai_change_sets::discard)
+        .layer(guards::require(&state, "ai.approvals.act"));
+
     let ai_runs = get(ai_agents::list_runs_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run = get(ai_agents::get_run_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run_steps = get(ai_agents::get_run_steps).layer(guards::require(&state, "ai.agents.read"));
@@ -1986,6 +2003,14 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/approvals/{id}/reject", ai_approval_reject)
         .route("/ai/approvals/{id}/apply", ai_approval_apply)
         .route("/ai/approvals/{id}/preview", ai_approval_repreview)
+        // The change-set editor (REQ-101 slice 3). `/ai/change-sets` is a distinct prefix
+        // rather than a sub-path of the approvals inbox: a set is a *draft* while an approval
+        // is a *request*, and the two have different lifecycles, different permissions and
+        // different screens.
+        .route("/ai/change-sets", ai_change_sets.merge(ai_change_set_create))
+        .route("/ai/change-sets/{id}", ai_change_set_update)
+        .route("/ai/change-sets/{id}/confirm", ai_change_set_confirm)
+        .route("/ai/change-sets/{id}/discard", ai_change_set_discard)
         .route("/ai/agents/{id}/tools", ai_agent_tool_set)
         .route("/ai/agents/{id}/skills", ai_agent_skills)
         .route("/ai/agents/{id}/skills/{key}", ai_agent_skill)

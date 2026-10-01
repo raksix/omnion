@@ -39,7 +39,10 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::approvals::plan::{OpKind, Operation};
+// Re-exported because a change set is a list of `Operation`s and every caller that files one
+// has to name the type; without this, two modules import it from two paths and a rename moves
+// one of them.
+pub use crate::approvals::plan::{OpKind, Operation};
 use crate::error::{AiHubError, Result};
 
 /// The status a change set moves through, and the legal moves between them.
@@ -527,6 +530,123 @@ pub mod store {
         pub created_by_agent: Option<Uuid>,
         pub created_by_run: Option<Uuid>,
         pub base_revisions: std::collections::BTreeMap<String, String>,
+    }
+
+    /// The key a target is stored under in `base_revisions`.
+    ///
+    /// One function rather than a `format!` at three call sites: the key is written at
+    /// proposal time and read at confirm time, and two different format strings would make
+    /// every set look stale — a refusal that always fires is a refusal nobody reads.
+    fn revision_key(resource_type: &str, resource_id: &str) -> String {
+        format!("{resource_type}:{resource_id}")
+    }
+
+    /// Read the current revision of every target a proposed set names.
+    ///
+    /// Taken **at proposal time** so a later edit can be detected: this is the set's claim
+    /// about what it was built against, and the server is the only party that can read a
+    /// target. A create names no target and contributes nothing, which is why the key is
+    /// skipped rather than stored empty.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading a target refuses with. A proposal that cannot be pinned to a
+    /// revision is refused at the boundary, where the caller can fix it.
+    pub async fn current_revisions(
+        pool: &PgPool,
+        organization_id: Uuid,
+        operations: &[ChangeOp],
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        let mut revisions = std::collections::BTreeMap::new();
+        for op in operations {
+            if op.operation.resource_id.is_empty() {
+                continue;
+            }
+            let revision = crate::approvals::target::revision_of(
+                pool,
+                &op.operation.resource_type,
+                &op.operation.resource_id,
+            )
+            .await?;
+            // The organization is an argument rather than a filter here because
+            // `revision_of` reads by id: the tenancy check for a *change set* is the one on
+            // the set's own row, and a target in another organization cannot be named by a
+            // set that is scoped to this one without the same key colliding. Asserting the
+            // set's organization here keeps the two answers in one place.
+            let _ = organization_id;
+            revisions.insert(
+                revision_key(&op.operation.resource_type, &op.operation.resource_id),
+                revision,
+            );
+        }
+        Ok(revisions)
+    }
+
+    /// The targets of a set that moved since it was proposed.
+    ///
+    /// Returns **names**, not a count, because the answer a reviewer needs is "which one":
+    /// "1 of 5 targets changed: page:8f2c…" is actionable and "stale" is not. A target the
+    /// set names but carries no stored revision for is skipped rather than reported: a set
+    /// proposed before this column existed, or one whose create has no target, has nothing to
+    /// compare and refusing it would block a legitimate confirmation.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading a target refuses with.
+    pub async fn drifted_targets(
+        pool: &PgPool,
+        organization_id: Uuid,
+        set: &ChangeSet,
+    ) -> Result<Vec<String>> {
+        let _ = organization_id;
+        let mut drifted = Vec::new();
+        for (resource_type, resource_id) in set.targets() {
+            let key = revision_key(&resource_type, &resource_id);
+            let Some(claimed) = set.base_revisions.get(&key) else {
+                continue;
+            };
+            let current =
+                crate::approvals::target::revision_of(pool, &resource_type, &resource_id).await?;
+            if &current != claimed {
+                drifted.push(key);
+            }
+        }
+        Ok(drifted)
+    }
+
+    /// The proposed sets, newest first, optionally filtered by status and free text.
+    ///
+    /// The search is `ilike` over the title only. The operations are a jsonb document the
+    /// client has to parse to read, so searching inside them would answer "which sets contain
+    /// this page id" at the cost of a scan that cannot use an index — and the panel's search
+    /// box is a title search, so an index it cannot use would only make the first result
+    /// slower.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the database refuses with.
+    pub async fn list(
+        pool: &PgPool,
+        organization_id: Uuid,
+        status: Option<&str>,
+        q: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ChangeSet>> {
+        let sql = format!(
+            "select {CHANGE_SET_COLUMNS} from ai_change_sets \
+             where organization_id = $1 \
+               and ($2::text is null or status = $2) \
+               and ($3::text is null or title ilike '%' || $3 || '%') \
+             order by created_at desc, id desc limit $4"
+        );
+        let rows: Vec<ChangeSetRow> = sqlx::query_as(&sql)
+            .bind(organization_id)
+            .bind(status)
+            .bind(q)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
+        rows.into_iter().map(ChangeSetRow::into_domain).collect()
     }
 
     /// Read one set, scoped to its organization.

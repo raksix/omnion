@@ -1154,6 +1154,19 @@ impl From<AiHubError> for ApiError {
                 "approval_not_found",
                 format!("no approval `{id}` in this organization"),
             ),
+            // The change-set pair (REQ-101 slice 3). Same shapes as the approval pair and for
+            // the same reason: a set that breaks its own rules is a `400` whose message names
+            // the operation, and a set id that is not in this organization is a `404` — never
+            // a 403, or the editor becomes an existence oracle for every proposal in the
+            // installation.
+            AiHubError::InvalidChangeSet(message) => {
+                Self::bad_request("invalid_change_set", message)
+            }
+            AiHubError::ChangeSetNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "change_set_not_found",
+                format!("no change set `{id}` in this organization"),
+            ),
             // A model that cannot do what the request needs is a `400` and not a `409`: nothing
             // about the installation is in conflict, the caller asked for a capability this
             // model does not claim, and the fix is a flag edit or a different model. The code
