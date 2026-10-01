@@ -128,10 +128,19 @@ impl FromRequestParts<AppState> for ContentToken {
         // were read, while `uri.path()` would create a row per slug and make the usage tab
         // unusable for the one integration it exists to describe. Read here rather than in a
         // response layer because a layer that is mounted on the router cannot see the template.
+        //
+        // **The `/api/v1` prefix is stripped, and it has to be.** `MatchedPath` is absolute from
+        // the application's root, so the row was keyed `/api/v1/content/pages` while the OpenAPI
+        // document, the panel's copy button and the explorer's own snippet all say
+        // `/content/pages`. One endpoint under two spellings means two rows in the usage table
+        // and a caller reading the chart cannot tell which of them is the endpoint they call —
+        // and the bug is invisible in the response, because the response never mentions either.
+        // The rule is a *named constant* rather than a slice-and-hope: the prefix belongs to the
+        // v1 tree's mount point, and the test below is what says the two agree.
         let route = parts
             .extensions
             .get::<MatchedPath>()
-            .map(|path| path.as_str().to_owned());
+            .map(|path| surface_route(path.as_str()));
 
         let raw = bearer_token(&parts.headers)
             .map_err(|error| error)
@@ -239,6 +248,26 @@ pub fn rate_limited(verdict: &content_meter::Verdict, route: &str) -> ApiError {
         "endpoint": route,
     }))
     .with_retry_after(retry_after as i64)
+}
+
+/// The mount point the whole v1 tree hangs from, and the prefix every surface path carries.
+pub const API_PREFIX: &str = "/api/v1";
+
+/// The route a caller calls, with the API's own mount point removed.
+///
+/// A prefix that is right today and wrong after a version bump is a silent corruption of the
+/// usage table's keys: the rows keep the old prefix, the flush keeps writing them, and the chart
+/// quietly splits one endpoint in two. So the rule is one function, the constant it strips is
+/// named, and the test at the bottom of this file fails if the mount point ever stops matching.
+#[must_use]
+pub fn surface_route(matched: &str) -> String {
+    match matched.strip_prefix(API_PREFIX) {
+        Some(route) if route.starts_with('/') => route.to_owned(),
+        // Either the router was mounted somewhere else (a test, a sub-application) or the path is
+        // exactly the prefix. Both are answered as-is rather than guessed at, so the row a reader
+        // sees is the row the router really matched.
+        _ => matched.to_owned(),
+    }
 }
 
 /// What one content request spent, handed to the handler by the extractor.
@@ -1454,6 +1483,50 @@ mod tests {
         // A stray percent is kept rather than dropped: a mangled token fails authentication,
         // which is the honest outcome, and a silently-truncated one might not.
         assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn a_recorded_route_is_the_one_the_caller_typed() {
+        // The defect this test exists for: `MatchedPath` is absolute from the application root,
+        // so the usage row was keyed `/api/v1/content/pages` while the OpenAPI document, the
+        // panel's copy button and the explorer's snippet all say `/content/pages`. The response
+        // never mentions either, so nothing above the meter could tell — the chart simply grew
+        // two rows for one endpoint.
+        assert_eq!(surface_route("/api/v1/content/pages"), "/content/pages");
+        assert_eq!(
+            surface_route("/api/v1/content/pages/{slug}"),
+            "/content/pages/{slug}",
+            "the template keeps its braces: a slug is not its own row"
+        );
+        assert_eq!(surface_route("/api/v1/content/media"), "/content/media");
+    }
+
+    #[test]
+    fn the_stripped_prefix_is_the_one_the_router_is_actually_mounted_at() {
+        // The constant and the mount point are two pieces of the same fact, and a version bump
+        // that moves the tree would leave the stripper removing a prefix nothing carries — at
+        // which point every row keeps `/api/v2/...` and the chart splits again, silently. The
+        // mount point is read out of the source rather than restated here, so a change to one
+        // without the other is a compile-visible mismatch instead of a quiet data corruption.
+        let source = include_str!("mod.rs");
+        let needle = format!(".nest(\"{API_PREFIX}\"");
+        assert!(
+            source.contains(&needle),
+            "the v1 tree is no longer mounted at {API_PREFIX} — update the constant the usage \
+             rows are keyed against, or the chart will split every endpoint in two"
+        );
+    }
+
+    #[test]
+    fn a_path_that_is_not_under_the_api_prefix_is_answered_as_it_matched() {
+        // A handler called outside the v1 tree — a test, a sub-application — has a matched path
+        // with no prefix to remove. Guessing (prepending, or stripping the first segment) would
+        // write a row under a route the router never matched, which is the same split this
+        // function exists to prevent.
+        assert_eq!(surface_route("/content/pages"), "/content/pages");
+        assert_eq!(surface_route("/api/v1"), "/api/v1", "the bare prefix is not a route");
+        // And a near-miss prefix is not stripped: `/api/v10/...` must keep its own name.
+        assert_eq!(surface_route("/api/v10/content/pages"), "/api/v10/content/pages");
     }
 
     #[test]

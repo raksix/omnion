@@ -8989,3 +8989,53 @@ cargo test -p omnion-core --lib   62 passed; 0 failed
 against, the `/notifications/settings` device block (three device API functions in
 `api.ts` still have **zero UI callers**), and `prune_endpoints`/`prune_stale` — which still
 have **zero call sites anywhere**, so a revoked endpoint is not yet pruned. Next tick.
+
+### Tick 45 — REQ-019 slice 3a: the budget, metered in the same round trip that records the call
+
+**What.** The per-token budget, the usage counter and `GET /api/v1/content-api/usage`. The three
+halves exist because they must not exist separately: **one Lua script over two keys** increments
+the budget and records the call, because a limiter that counts in one key and a usage tab that
+counts in another is a chart that disagrees with the platform, and that disagreement is invisible
+from either side. A `GET` then an `INCR` would also let N concurrent callers all read "119 of 120"
+and all be allowed.
+
+**Proof.**
+
+```
+cargo test -p omnion-content --lib    314 passed; 0 failed   (was 308 — 6 new)
+cargo test -p omnion-api --lib        288 passed; 0 failed   (was 274 — 14 new)
+cargo test -p omnion-api --test content_api_metering -- --test-threads=1
+                                       6 passed; 0 failed    (new suite, live stack)
+pnpm typecheck                        2/2
+```
+
+**Four defects, three of them invisible to any single assertion.**
+
+1. **A bad rate tier was reported with `field: "name"`.** `validate_rate_limit` returned
+   `InvalidText`, which the API maps to a 400 naming `"name"` — so a caller who submitted a bad
+   *tier* was told their token's **name** was wrong, and the create dialog highlights the field the
+   error names. The operator edits the name, the dialog saves, and the limit stays wrong. Its own
+   `ContentError::InvalidRateTier`, and the exhaustive `code()` match made the omission a compile
+   error rather than a silently wrong field.
+2. **`MatchedPath` is absolute from the application root**, so every usage row was keyed
+   `/api/v1/content/pages` while the OpenAPI document and the explorer's own snippet say
+   `/content/pages` — one endpoint, two rows, and nothing in the response mentions either.
+   `surface_route()` strips a named constant, and a test reads the mount point out of `mod.rs`.
+3. **A spare `.arg(1)` in the `EVAL` call recorded every request as an error.** The script reads
+   `ARGV[2]` as `errors`; the leftover argument shifted it, so `errors` tracked `requests` exactly
+   and the chart showed a 100% error rate on an installation serving only `200`s. Not a type error,
+   not a runtime error, invisible in every response — found only by a test that read the **raw Redis
+   hash** rather than trusting the route's own account of itself. A test now compares the script's
+   highest `ARGV` against the call's argument count.
+4. **The tier list was two constants, which made the criterion untestable.** Proving "the 121st
+   request" means firing 120 requests when the minimum is 120 — a minute-long test nobody writes.
+   `RATE_TIERS = [10, 120, 600]` with labels, and the error message names all three.
+
+**And one test that was wrong, twice.** The exact countdown failed about once a minute: a burst
+that straddles 12:00:59 → 12:01:00 legitimately lands in a fresh window with a whole budget. That
+is the *documented contract*, so the test was wrong, and `wait_for_fresh_window` is the fix. Then
+the same test asserted a per-token total that its own sentinel row was part of — a probe that
+changes the number it measures.
+
+**Next.** The Explorer and the two panel tabs (`/content-api/explorer`, `/content-api/usage`), which
+is the rest of slice 3.

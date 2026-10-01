@@ -47,6 +47,16 @@ pub enum ContentError {
     /// A content read query parameter is not one this surface accepts (REQ-019 slice 2).
     #[error("invalid query: {0}")]
     InvalidQuery(String),
+    /// A content API token's rate tier is not one the platform offers (REQ-019 slice 3).
+    ///
+    /// **Its own variant rather than [`ContentError::InvalidText`],** and the reason is the
+    /// defect writing this suite found: `InvalidText` maps to a `400` whose `details.field` is
+    /// `"name"`, so a caller who submitted a bad *tier* was told the **name** was wrong. The
+    /// create dialog highlights the field the error names, so an operator fixing a rate limit
+    /// would go and edit the token's name — a screen that then saves, so the mistake looks
+    /// accepted and the limit stays wrong.
+    #[error("invalid rate tier: {0}")]
+    InvalidRateTier(String),
     /// A lifecycle state is not one of the documented values.
     #[error("invalid status: {0}")]
     InvalidStatus(String),
@@ -434,6 +444,10 @@ impl ContentError {
             // the offending input — the Explorer highlights that field rather than printing a
             // sentence the caller has to parse.
             Self::InvalidQuery(_) => "invalid_parameter",
+            // A rate tier the store does not offer. Same code as any other bad field, but the
+            // variant is what lets the API put the message on the *tier* field: this match being
+            // exhaustive is the whole reason a bad tier cannot again be reported as a bad name.
+            Self::InvalidRateTier(_) => "invalid_parameter",
         }
     }
 }

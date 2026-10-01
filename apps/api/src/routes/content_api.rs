@@ -581,6 +581,16 @@ fn map_token_error(error: omnion_content::ContentError) -> ApiError {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_parameter", message)
                 .with_details(json!({ "field": "name" }))
         }
+        // The tier, not the name — the defect this slice's own suite found. `InvalidText` shares
+        // the arm above and carries `field: "name"`, so a caller who submitted a bad rate limit
+        // was told the *name* was wrong. The create dialog highlights the field the error names,
+        // so the operator edits the name, the dialog saves, and the limit stays wrong: a
+        // field-level message pointing at the wrong field is worse than no field at all, because
+        // it sends someone to fix something that was never broken.
+        ContentError::InvalidRateTier(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_parameter", message)
+                .with_details(json!({ "field": "rate_limit_per_minute" }))
+        }
         other => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",

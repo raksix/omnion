@@ -59,10 +59,34 @@ pub const SCOPES: [&str; 3] = ["content:read", "media:read", "content:write"];
 /// The longest accepted display name.
 pub const MAX_NAME_LENGTH: usize = 64;
 
-/// Rate-limit tiers offered by the create dialog.
+/// The tier the create dialog offers by default.
 pub const RATE_TIER_STANDARD: i32 = 120;
-/// Elevated tier, guarded by the manage permission because it is 5x the shared budget.
+/// The elevated tier, guarded by the manage permission because it is 5x the standard budget.
 pub const RATE_TIER_ELEVATED: i32 = 600;
+/// The smallest budget the column accepts, and therefore the smallest the store accepts.
+pub const RATE_TIER_MINIMUM: i32 = 10;
+
+/// Every tier the create dialog offers, cheapest first.
+///
+/// **A list and not two constants**, because the acceptance criterion for this slice is about
+/// *the request after the tier* — and a store that accepts only two hard-coded values makes that
+/// criterion untestable without firing 120 requests, which is a test that takes a minute and is
+/// therefore a test nobody writes. A developer tier exists for exactly that reason and for a real
+/// one: a staging frontend that is not a production integration should not have to pretend to be
+/// one. It is `RATE_TIER_MINIMUM`, which is the column's own floor, so nothing here can name a
+/// budget the database will refuse.
+pub const RATE_TIERS: [i32; 3] = [RATE_TIER_MINIMUM, RATE_TIER_STANDARD, RATE_TIER_ELEVATED];
+
+/// The tier's human name, for the panel's picker and the error message.
+#[must_use]
+pub fn rate_tier_label(value: i32) -> &'static str {
+    match value {
+        RATE_TIER_MINIMUM => "Development",
+        RATE_TIER_STANDARD => "Standard",
+        RATE_TIER_ELEVATED => "Elevated",
+        _ => "Custom",
+    }
+}
 
 /// A token as the panel's list shows it. Never carries the secret.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -288,12 +312,20 @@ pub fn is_valid_origin(candidate: &str) -> bool {
 
 /// Validate a rate-limit tier.
 pub fn validate_rate_limit(value: i32) -> Result<i32> {
-    match value {
-        RATE_TIER_STANDARD | RATE_TIER_ELEVATED => Ok(value),
-        other => Err(ContentError::InvalidText(format!(
-            "rate limit must be {RATE_TIER_STANDARD} or {RATE_TIER_ELEVATED}, got {other}"
-        ))),
+    if RATE_TIERS.contains(&value) {
+        return Ok(value);
     }
+    // The message names every tier **and** what each one is called, because the numbers alone do
+    // not tell a person which picker entry to choose — and it is the number that goes in the
+    // API, so a person who cannot map "600" to a label cannot use the API at all.
+    let offered: Vec<String> = RATE_TIERS
+        .iter()
+        .map(|tier| format!("{} ({})", rate_tier_label(*tier), tier))
+        .collect();
+    Err(ContentError::InvalidRateTier(format!(
+        "rate limit must be one of: {} — got {value}",
+        offered.join(", ")
+    )))
 }
 
 /// The expiry for a preset, `None` for "never".
@@ -882,6 +914,48 @@ mod tests {
         // implementation does not need a migration, and it must be the *route* that refuses.
         let scopes = validate_scopes(&["content:write".to_string()]).expect("reserved by name");
         assert_eq!(scopes, vec!["content:write".to_string()]);
+    }
+
+    #[test]
+    fn every_offered_tier_is_one_the_column_accepts() {
+        // The tiers are named in the store and *also* bounded by the column's own check
+        // (`rate_limit_per_minute between 10 and 600`). A tier outside that range would be
+        // accepted here and refused by PostgreSQL, and the person who chose it would be told
+        // their *name* was wrong. The column's floor is asserted, not assumed.
+        for tier in RATE_TIERS {
+            assert!(
+                (10..=600).contains(&tier),
+                "the column refuses {tier}, so the store must not offer it"
+            );
+            assert_eq!(
+                validate_rate_limit(tier).expect("an offered tier is accepted"),
+                tier,
+                "{tier} is offered, so it must be accepted"
+            );
+        }
+        assert_eq!(
+            RATE_TIERS[0], RATE_TIER_MINIMUM,
+            "the floor is a tier, not a bound only"
+        );
+    }
+
+    #[test]
+    fn a_tier_off_the_list_names_every_tier_and_what_it_is_called() {
+        // The message exists so a person using the API can find the number in the picker, and a
+        // message that only says "must be 10, 120 or 600" does not do that — three bare numbers
+        // is a puzzle, three labelled ones is a menu.
+        let error = validate_rate_limit(7).expect_err("7 is not a tier");
+        let message = error.to_string();
+        for tier in RATE_TIERS {
+            assert!(
+                message.contains(&tier.to_string()),
+                "{tier} is missing: {message}"
+            );
+            assert!(
+                message.contains(rate_tier_label(tier)),
+                "the label for {tier} is missing: {message}"
+            );
+        }
     }
 
     #[test]

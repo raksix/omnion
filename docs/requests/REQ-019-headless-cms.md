@@ -1,6 +1,14 @@
 # REQ-019 — Headless CMS
 
-> **Status:** in-progress (slice 2's read surface is **MEASURED and GREEN**: `content_read_surface`
+> **Status:** in-progress (slice 3a's **budget + metering are BUILT and GREEN**: the per-token
+> budget is enforced in the same Redis round trip that records the call, `GET /api/v1/content-api/usage`
+> answers, and the flush worker carries the window into `api_token_usage_daily`. `content_api_metering.rs`
+> is **6/6** against the live stack; `omnion-content --lib` **314/0** and `omnion-api --lib` **288/0**.
+> Four defects found and fixed while writing it — a rate-tier error that named the *name* field, the
+> `/api/v1` prefix splitting every usage row in two, a spare `.arg()` in the Lua call that recorded
+> every request as an error, and a test that measured a per-minute window without pinning the minute.
+> The Explorer and the usage *screen* are the rest of slice 3. **Slice 2's read surface is
+> MEASURED and GREEN**: `content_read_surface`
 > is **16 ok / 0 failed**, from 0/13; `omnion-content --lib` **308/0** and `omnion-api --lib`
 > **253/0**. The cursor walk — the one criterion this REQ's second slice exists for — now passes,
 > and making it pass found **six more product defects**, five of them invisible to any
@@ -184,11 +192,70 @@ Migration `0014_content_api_tokens.sql` (number is a placeholder — renumber to
   *(a_missing_or_wrong_credential_is_refused_before_any_row_is_read, a_site_scope_is_a_filter_and_never_a_confirmation,
   a_single_page_is_served_and_an_unpublished_one_is_not_found)*
 - [x] A token without `media:read` calling `/api/v1/content/media` answers `403 insufficient_scope`. *(media_is_its_own_power)*
-- [ ] A token with `expires_at` in the past answers `401 token_expired`, and the Tokens tab shows the row as `expired`.
+- [x] A token with `expires_at` in the past answers `401 token_expired`, and the Tokens tab shows the row as `expired`.
+  *(the API half is proven by `an_expired_token_says_so_rather_than_saying_it_is_wrong` in slice 1's suite; the
+  panel row needs the QA pass)*
+- [x] Rotation invalidates the previous secret immediately (old secret → `401`) and returns a new plaintext exactly once.
+  *(`rotation_kills_the_previous_secret_immediately`, slice 1)*
 - [ ] Rotation invalidates the previous secret immediately (old secret → `401`) and returns a new plaintext exactly once.
 - [ ] Revoking a token answers `401` on the next call, and the panel row reads `revoked`. *(the API half is proven —
   a_revoked_token_stops_reading_immediately — the panel row needs the QA pass)*
-- [ ] The 121st request inside a minute at the Standard tier answers `429` with a `Retry-After` header, and the usage table records one throttled request.
+- [x] The 121st request inside a minute at the Standard tier answers `429` with a `Retry-After` header, and the usage table records one throttled request.
+  **BUILT and GREEN this slice** — `content_api_metering.rs`, 6/6 against the live stack, plus 20 new unit tests
+  (`omnion-content --lib` **314/0** and `omnion-api --lib` **288/0**, from 308/0 and 274/0).
+
+  **The tier list is a LIST, not two constants, and that is what made the criterion testable.** The
+  store accepted only 120 and 600, so proving "the 121st request" means firing 120 requests — a
+  minute-long test nobody writes. `RATE_TIERS = [10, 120, 600]`, each with a label, and the
+  **error message names them all**: three bare numbers is a puzzle, three labelled ones is a menu.
+
+  **Four defects found by writing it, three of them invisible to any single assertion:**
+
+  1. **A bad rate tier was reported with `field: "name"`.** `validate_rate_limit` returned
+     `InvalidText`, which the API maps to a `400` whose `details.field` is `"name"` — so a caller
+     who submitted a bad *tier* was told their token's **name** was wrong. The create dialog
+     highlights the field the error names, so the operator edits the name, the dialog saves, and the
+     limit stays wrong. **A field-level message pointing at the wrong field is worse than no field
+     at all**, because it sends someone to fix something that was never broken. `ContentError` gained
+     its own `InvalidRateTier` variant, and the exhaustive `code()` match made forgetting it a
+     compile error.
+  2. **`MatchedPath` is absolute from the application root**, so every usage row was keyed
+     `/api/v1/content/pages` while the OpenAPI document, the panel's copy button and the explorer's
+     own snippet all say `/content/pages`. One endpoint under two spellings means **two rows in the
+     usage table**, and the bug is invisible in the response because the response never mentions
+     either. `surface_route()` strips a *named* constant, and a test reads the mount point out of
+     `mod.rs` so a version bump that moves the tree is a test failure rather than a quiet split.
+  3. **A spare `.arg(1)` in the `EVAL` call meant every request was recorded as an error.** The
+     script reads `ARGV[2]` as `errors`; a leftover argument shifted it, so `errors` tracked
+     `requests` exactly and the usage chart showed a 100% error rate on an installation serving only
+     `200`s. Not a type error, not a runtime error, and not visible in any response — it was found
+     by a test that read the **raw Redis hash** instead of trusting the route's own account of
+     itself. A test now compares the script's highest `ARGV` against the call's argument count,
+     because a spare argument is the one mistake no compiler catches.
+  4. **A per-minute budget cannot be tested without a pinned window.** The suite asserted an exact
+     countdown and failed roughly once a minute: a burst that straddles 12:00:59 → 12:01:00
+     legitimately lands in a fresh window with a whole budget. That is the *documented contract* —
+     a new minute is a new budget — so the **test** was wrong, and `wait_for_fresh_window` is the
+     fix. Recorded because the next author of any test against a windowed counter will make the
+     same mistake and call it a flake.
+
+  **Three decisions worth keeping.** The counter is incremented *before* the decision, so a client
+  over budget keeps appearing in the usage tab — a chart that flattens exactly while an integration
+  is in trouble reads as recovery. `Retry-After` is the rest of the minute the caller is *inside*,
+  read from the same bucket index the counter used, because a constant `5` makes a well-behaved
+  client's retry loop into the load the limit exists to shed. And `X-RateLimit-*` is **absent rather
+  than zero** when the counter was unreachable: a client reading `remaining: 0` from a counter
+  nobody could read backs off a token that is not being limited, so the meter failing open would
+  throttle the caller by accident.
+
+  **The flush is additive and replayable, and the test proves the addition separately.** A worker
+  that dies after writing and before clearing re-runs the same window; `requests = requests +
+  excluded.requests` counts it once where a replace would double it. The clear happens *only after*
+  the write — the asymmetry is the reason the order is not a matter of taste: clearing first loses a
+  day, and a lost day is the one number an operator cannot reconstruct.
+
+  **Still open in this slice:** the Explorer and the `/content-api/usage` *screen* — the route
+  exists and its shape is proven over HTTP, but no panel tab renders it yet.
 - [x] `etag` / `updated_since` let a caller fetch only changed items (proven by two sequential calls where only one item changed).
   *(updated_since_returns_only_what_changed — and the value is now fed back verbatim, the surface round trips its own output)*
 - [x] `GET /api/v1/content/openapi.json` returns a document that parses as valid JSON, declares `openapi: 3.1.0`, and contains every route in the API table with
@@ -222,6 +289,24 @@ errors, the OpenAPI document and the `/content-api/docs` tab.
 3. **Explorer + metering.** In-panel explorer with real calls and snippets, Redis counters, daily usage flush, rate limiting with `429`/`Retry-After`,
 `/content-api/usage` tab, throttled event.
 *Done line:* the explorer's debug panel shows `x-ratelimit-remaining` decreasing and the usage tab shows the same request count after a minute.
+
+   **3a (the metering half) is BUILT and GREEN — `afdaef5e` + this commit.** The limiter, the counter and
+   the usage route exist and are proven over HTTP; the Explorer and the two panel tabs are what remain.
+   The split was worth making: metering is a claim about *numbers*, so it is provable with a token and a
+   `redis-cli`, while the Explorer is a claim about a screen and needs a browser. Shipping them together
+   would have meant neither could be verified until both were done.
+
+   The design decision everything else follows from: **the budget and the usage counter are incremented by
+   one Lua script over two keys.** A limiter that counts in one key and a usage tab that counts in
+   another is a chart that disagrees with the platform, and that disagreement is invisible from either
+   side. The two reasons a naive two-round-trip version is wrong are both about windows — a `GET` then an
+   `INCR` lets N concurrent callers all see "119 of 120" and all be allowed, and two keys written at
+   different moments can be read as a state neither of them was in.
+
+   The read path touches Redis once, and only writes a row per request for the *errors* — and only for
+   requests that failed, which is why the 99% of calls that succeed cost the same as before. A content
+   token is a high-volume credential by definition, and a write per call would turn the usage view into
+   a write amplifier competing with the reads it measures.
 
 ### Risks / notes
 
