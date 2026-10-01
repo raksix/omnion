@@ -11001,3 +11001,18 @@ covering four different months.
 
 **Next.** The **onboarding screen** — the last of slice 4 — then a QA pass over all three at once.
 `/hr/onboarding` still does not exist, which is the same gap slice 1 had.
+
+**Not done this tick, and not claimed: the QA pass.** It was queued the whole tick behind a
+**live** sibling holder — `/tmp/omnion-qa-slot-holders/*` held pid 252267, verified with `kill -0`
+*and* `readlink /proc/252267/cwd` → `/mnt/apopic/omnion-w6`, not by age (the place file read as
+hours stale). Twenty-four minutes of waiting produced an empty artifact directory. The box
+serialises browser passes globally (`QA_SLOTS=1`, `QA_SLOT_WAIT=3600`), and reclaiming a live
+holder would drop w6's pass, so the wait was the right answer and killing my own queued run at the
+tick boundary was the right answer too — a `run.sh` killed mid-migration leaves PostgreSQL
+connections behind for the next tick.
+
+So **REQ-055 stays `in-progress`.** Three screens are committed and every fast gate is green
+(16/16 walks, 130/130 module, 71/71 permissions, `pnpm typecheck` clean, `node --check` clean on
+the harness), but a screen is not *accepted* until the browser pass opens it, and this tick did not
+get to prove that. The first act of tick 60 is the pass, not new work — the same way this tick's
+first act was making a half-written file build rather than adding to it.
