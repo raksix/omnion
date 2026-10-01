@@ -1278,6 +1278,12 @@ pub fn router(state: AppState) -> Router {
         get(theme_settings::read_settings).layer(guards::require(&state, "themes.read"));
     let theme_settings_save = put(theme_settings::save_settings)
         .layer(guards::require(&state, "themes.customize"));
+    // The dry run is gated on `themes.read`, not on `themes.customize`: it writes nothing, so
+    // the power it needs is the power to READ the draft it measures. Gating a measurement on
+    // the edit permission would answer "your palette is fine" with a 403 to a viewer, which
+    // reads as "your palette is broken".
+    let theme_settings_contrast_check = post(theme_settings::check_contrast)
+        .layer(guards::require(&state, "themes.read"));
     let theme_settings_publish = post(theme_settings::publish_settings)
         .layer(guards::require(&state, "themes.customize"));
     let theme_settings_revisions = get(theme_settings::list_revisions)
@@ -2253,6 +2259,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sites/{site_id}/theme/rollback", theme_rollback)
         .route("/sites/{site_id}/theme-settings", theme_settings_read)
         .route("/sites/{site_id}/theme-settings", theme_settings_save)
+        .route(
+            "/sites/{site_id}/theme-settings/contrast-check",
+            theme_settings_contrast_check,
+        )
         .route(
             "/sites/{site_id}/theme-settings/publish",
             theme_settings_publish,

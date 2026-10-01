@@ -97,6 +97,73 @@ async fn branding_limits_for(state: &AppState, site_id: Uuid) -> BrandingLimits 
     BrandingLimits::for_theme(&manifest_for(state, &theme_key).await)
 }
 
+/// `POST /theme-settings/contrast-check` — the body is the palette being edited.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContrastCheckBody {
+    /// The theme whose defaults sit under the submitted overrides.
+    ///
+    /// Read from the body rather than from the site's live theme, for the same reason
+    /// `save_settings` reads `body.theme_key`: the palette on screen belongs to the theme the
+    /// form is editing, which may not be the one the site has activated.
+    #[serde(default)]
+    pub theme_key: String,
+    /// The draft's token overrides, exactly as the form holds them.
+    #[serde(default)]
+    pub tokens: serde_json::Value,
+}
+
+/// The contrast findings for a palette that has not been saved.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContrastCheck {
+    /// The findings, measured on `merge_over(defaults, tokens)` — the palette the site will
+    /// actually paint, not the overrides alone.
+    pub findings: Vec<theme_settings::ContrastFinding>,
+    /// The theme the measurement was taken against, so the panel can say which defaults it
+    /// measured under instead of leaving the operator to guess.
+    pub theme_key: String,
+}
+
+/// `POST /api/v1/sites/{site_id}/theme-settings/contrast-check` — measure a draft.
+///
+/// **This route exists because the panel was measuring the wrong palette.** The screen kept
+/// `form` (what the operator is editing) and `view` (the last server read) side by side and
+/// printed `view.contrast` next to a live preview of `form`. An operator who edited the accent
+/// into a failing pair was told "every text/background pair in this draft meets WCAG AA" while
+/// the preview beside them showed the failing colours — and the publish refusal, whose entire
+/// instruction is "read the contrast panel, then publish again", pointed them at that all-clear.
+///
+/// The measurement is the server's for the reason it is the server's everywhere else: a ratio
+/// computed in the browser differs in colour-space rounding and in the large-text threshold, and
+/// a badge that disagrees with the 422 is worse than no badge. So the panel asks, and this
+/// answers — on the merged palette, because a token the draft does not set is still painted
+/// from the theme, and measuring the bare overrides would report a palette the site never
+/// renders.
+///
+/// It writes nothing. It is called on every edit, and a route that cannot be called on every
+/// edit is not a measurement but a save.
+pub async fn check_contrast(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(site_id): Path<Uuid>,
+    Json(body): Json<ContrastCheckBody>,
+) -> Result<Json<ContrastCheck>, ApiError> {
+    let site = site_in_scope(&state, &current, site_id).await?;
+    let theme_key = if body.theme_key.trim().is_empty() {
+        themes::active_theme_key(state.db().pool(), site.id)
+            .await
+            .unwrap_or_default()
+    } else {
+        body.theme_key
+    };
+    let defaults = default_tokens_for(&state, &theme_key).await;
+    Ok(Json(ContrastCheck {
+        findings: contrast_report(&merge_over(defaults, body.tokens)),
+        theme_key,
+    }))
+}
+
 /// `PUT /api/v1/sites/{site_id}/theme-settings` — save a draft.
 pub async fn save_settings(
     State(state): State<AppState>,
