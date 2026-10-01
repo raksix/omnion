@@ -406,6 +406,13 @@ pub struct LeadBody {
     pub quote_id: Option<Uuid>,
     /// Who owns it.
     pub owner_user_id: Option<Uuid>,
+    /// The policy whose clock is running on it.
+    ///
+    /// Sent for the same reason `sla_state` is: the panel used to compute the clock itself and
+    /// needed the window to do it, and the window belongs to the policy rather than to the
+    /// lead. A client that wants to explain *why* a lead is at risk has to show the target it
+    /// was measured against, and an id alone would make it fetch the policies screen.
+    pub sla_policy_id: Option<Uuid>,
     /// Given name.
     pub first_name: Option<String>,
     /// Family name.
@@ -460,6 +467,23 @@ pub struct LeadBody {
     pub converted_at: Option<String>,
     /// Whether a first response is still outstanding.
     pub sla_running: bool,
+    /// The first-response clock's state, computed by the module's own rule.
+    ///
+    /// **The server is the only thing that answers this, and the panel used to answer it a
+    /// second time.** The client had its own `slaState` deriving the same four states from a
+    /// hard-coded 60-minute "due soon", because the API sent no state and the function's own
+    /// doc said *"slice 2 attaches one … when slice 2 lands it takes over this function
+    /// rather than the screens"*. Slice 2 landed and did not, so for three ticks the module
+    /// and the panel disagreed by construction: `at_risk` is a **quarter of the policy's own
+    /// window** floored at 15 minutes, so a 15-minute policy with 5 minutes left is at risk
+    /// where a fixed hour called it on track and then breached it unannounced — and a lead
+    /// answered after its deadline is `met` in the module while the client kept showing
+    /// `breached` for ever.
+    ///
+    /// Resolved from `first_response_minutes` of the policy the lead was assigned under; a
+    /// lead with no policy, or a no longer resolvable one, reports `none` rather than a state
+    /// nobody is promising.
+    pub sla_state: &'static str,
 }
 
 impl From<Lead> for LeadBody {
@@ -481,6 +505,7 @@ impl From<Lead> for LeadBody {
             deal_id: value.deal_id,
             quote_id: value.quote_id,
             owner_user_id: value.owner_user_id,
+            sla_policy_id: value.sla_policy_id,
             first_name: value.first_name,
             last_name: value.last_name,
             email: value.email,
@@ -504,8 +529,92 @@ impl From<Lead> for LeadBody {
             received_at: value.received_at.to_string(),
             converted_at: value.converted_at.map(|at| at.to_string()),
             sla_running,
+            // **A placeholder the caller must overwrite, not an answer.** `From<Lead>` is
+            // pure and the window it needs lives in another table, so the honest value here
+            // is the one thing that cannot be wrong — and every read path replaces it through
+            // `stamp_sla_states` before the struct is serialized. A default that looked like
+            // a real answer is how the second implementation survived in the first place.
+            sla_state: "none",
         }
     }
+}
+
+/// Fill in every lead's `sla_state` from the policies the leads name.
+///
+/// **One read for the whole page, not one per lead.** The window is a property of the policy
+/// and a page of twenty leads shares maybe two of them, so this asks for the windows once and
+/// then answers per lead in Rust — the same shape as `due_reminders`, which cannot narrow its
+/// reminder predicate in SQL for the same reason.
+///
+/// A lead whose policy is absent from the map is reported **`none`**, and that is the honest
+/// answer rather than a fallback window: the client renders "No target", and a lead whose
+/// policy was deleted has no target to be at risk against. Substituting the seeded default
+/// window would instead mark such a lead `on_track` forever, which is a green badge on a row
+/// nobody is measuring.
+async fn stamp_sla_states(
+    pool: &sqlx::PgPool,
+    organization_id: uuid::Uuid,
+    bodies: &mut [LeadBody],
+) -> Result<(), ApiError> {
+    let policy_ids: Vec<uuid::Uuid> = bodies
+        .iter()
+        .filter_map(|body| body.sla_policy_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let windows = omnion_module_crm_intake::assignment_store::policy_windows(
+        pool,
+        organization_id,
+        &policy_ids,
+    )
+    .await
+    .map_err(map_store)?;
+
+    let now = time::OffsetDateTime::now_utc();
+    for body in bodies.iter_mut() {
+        // **Infallible on the way out, not on the way in.** These instants were just
+        // serialized by `LeadBody::from` from typed columns, so a parse failure is not a
+        // request error — it is a lead with an unreadable clock, and the honest reading of
+        // that is the same as a lead with no clock. `parse_instant` (the *query* parser that
+        // answers 400 with the field named) is deliberately not used here: a stored value
+        // that failed to parse must not fail the whole inbox.
+        let due = body
+            .first_response_due_at
+            .as_deref()
+            .and_then(|raw| OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok());
+        let met = body
+            .first_response_at
+            .as_deref()
+            .and_then(|raw| OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok());
+        let window = body
+            .sla_policy_id
+            .and_then(|id| windows.get(&id).copied());
+        body.sla_state = match window {
+            // **No window, no clock.** The panel's own wording for this is "No target", and
+            // it is different from "on track" on purpose: a green badge on a lead with no
+            // policy claims a promise nobody made.
+            None => "none",
+            Some(minutes) => {
+                omnion_module_crm_intake::assignment::SlaState::of(met, due, now, minutes)
+                    .as_str()
+            }
+        };
+    }
+    Ok(())
+}
+
+/// Stamp a single lead's clock, for the paths that answer with one row rather than a page.
+///
+/// The two shapes exist because a list wants one read for the whole page and a single-row
+/// answer wants a call that reads like the call that produced it. Both funnel into
+/// `stamp_sla_states`, so there is one definition of "no policy ⇒ `none`" and one
+/// `SlaState::of` call in the file.
+async fn stamp_sla_state(
+    pool: &sqlx::PgPool,
+    organization_id: uuid::Uuid,
+    body: &mut LeadBody,
+) -> Result<(), ApiError> {
+    stamp_sla_states(pool, organization_id, std::slice::from_mut(body)).await
 }
 
 /// The attribution split into the two panels the lead detail draws.
@@ -947,15 +1056,22 @@ pub async fn list_leads(
     session: CurrentSession,
     Query(params): Query<LeadsQuery>,
 ) -> Result<Json<InboxBody>, ApiError> {
+    let organization_id = organization_of(&session)?;
     let query = build_lead_query(&params, session.user.id)?;
-    let page = store::list_leads(state.db().pool(), organization_of(&session)?, &query)
+    let page = store::list_leads(state.db().pool(), organization_id, &query)
         .await
         .map_err(map_store)?;
+
+    // **Stamped here and not in `From<Lead>`**, which is pure and cannot read the policy
+    // table. Every read path that returns a lead to a human goes through this one call, so
+    // "the clock's state" has exactly one definition and no caller can skip it.
+    let mut leads: Vec<LeadBody> = page.leads.into_iter().map(LeadBody::from).collect();
+    stamp_sla_states(state.db().pool(), organization_id, &mut leads).await?;
 
     Ok(Json(InboxBody {
         next_before: page.next_before.map(|at| at.to_string()),
         metrics: page.metrics,
-        leads: page.leads.into_iter().map(LeadBody::from).collect(),
+        leads,
     }))
 }
 
@@ -996,8 +1112,10 @@ pub async fn duplicate_decision(
     if let Some(reason) = &resolution.refused {
         // A refusal is a `409`, not an error page: the request was well-formed and the answer
         // is "not this row" — the same shape as the conversion path's partial success.
+        let mut lead = LeadBody::from(resolution.lead);
+        stamp_sla_state(pool, organization_id, &mut lead).await?;
         return Ok(Json(DuplicateDecisionBodyOut {
-            lead: LeadBody::from(resolution.lead),
+            lead,
             contact_id: None,
             applied: false,
             reason: Some(reason.clone()),
@@ -1017,8 +1135,10 @@ pub async fn duplicate_decision(
     )
     .await;
 
+    let mut body = LeadBody::from(resolution.lead);
+    stamp_sla_state(pool, organization_id, &mut body).await?;
     Ok(Json(DuplicateDecisionBodyOut {
-        lead: LeadBody::from(resolution.lead),
+        lead: body,
         contact_id: resolution.contact_id,
         applied: true,
         reason: None,
@@ -1058,10 +1178,13 @@ pub async fn duplicates(
     State(state): State<AppState>,
     session: CurrentSession,
 ) -> Result<Json<Vec<LeadBody>>, ApiError> {
-    let rows = store::list_duplicates(state.db().pool(), organization_of(&session)?, 100)
+    let organization_id = organization_of(&session)?;
+    let rows = store::list_duplicates(state.db().pool(), organization_id, 100)
         .await
         .map_err(map_store)?;
-    Ok(Json(rows.into_iter().map(LeadBody::from).collect()))
+    let mut rows: Vec<LeadBody> = rows.into_iter().map(LeadBody::from).collect();
+    stamp_sla_states(state.db().pool(), organization_id, &mut rows).await?;
+    Ok(Json(rows))
 }
 
 /// `GET /api/v1/crm/leads/{id}` — one lead with its payload and its trail.
@@ -1102,6 +1225,11 @@ pub async fn get_lead(
     let mut detail = LeadDetailBody::from(lead);
     detail.timeline = timeline;
     detail.steps = steps;
+    // The detail and the inbox are the two screens the badge appears on, and they read the
+    // same field — so a detail that skipped the stamp would show "No target" beside an inbox
+    // row showing "Breached" for the very same lead, which is the disagreement this whole
+    // slice exists to remove.
+    stamp_sla_state(pool, organization_id, &mut detail.lead).await?;
     Ok(Json(detail))
 }
 
@@ -1139,7 +1267,13 @@ pub async fn patch_lead(
     )
     .await;
 
-    Ok(Json(LeadBody::from(updated)))
+    // The clock is stamped on the answer as well as on the read: `respond` and `set_terminal`
+    // are the two writes that *change* what the state would say, and an answer that still
+    // carried the pre-write state would tell the panel the lead is still waiting after the
+    // operator just answered it.
+    let mut body = LeadBody::from(updated);
+    stamp_sla_state(pool, organization_id, &mut body).await?;
+    Ok(Json(body))
 }
 
 /// `POST /api/v1/crm/leads/{id}/assign` — hand a lead to a person, or put it back in the queue.
@@ -1212,7 +1346,13 @@ pub async fn assign(
         tracing::warn!(error = %error, "crm.lead.assigned could not be recorded");
     }
 
-    Ok(Json(LeadBody::from(updated)))
+    // The clock is stamped on the answer as well as on the read: `respond` and `set_terminal`
+    // are the two writes that *change* what the state would say, and an answer that still
+    // carried the pre-write state would tell the panel the lead is still waiting after the
+    // operator just answered it.
+    let mut body = LeadBody::from(updated);
+    stamp_sla_state(state.db().pool(), organization_id, &mut body).await?;
+    Ok(Json(body))
 }
 
 /// `POST /api/v1/crm/leads/{id}/respond` — record the first response.
@@ -1259,7 +1399,13 @@ pub async fn respond(
         tracing::warn!(error = %error, "crm.lead.responded could not be recorded");
     }
 
-    Ok(Json(LeadBody::from(updated)))
+    // The clock is stamped on the answer as well as on the read: `respond` and `set_terminal`
+    // are the two writes that *change* what the state would say, and an answer that still
+    // carried the pre-write state would tell the panel the lead is still waiting after the
+    // operator just answered it.
+    let mut body = LeadBody::from(updated);
+    stamp_sla_state(pool, organization_id, &mut body).await?;
+    Ok(Json(body))
 }
 
 /// `POST /api/v1/crm/leads/{id}/reject` — refuse the lead, keeping the row and the reason.
@@ -1324,7 +1470,13 @@ async fn set_terminal(
     )
     .await;
 
-    Ok(Json(LeadBody::from(updated)))
+    // The clock is stamped on the answer as well as on the read: `respond` and `set_terminal`
+    // are the two writes that *change* what the state would say, and an answer that still
+    // carried the pre-write state would tell the panel the lead is still waiting after the
+    // operator just answered it.
+    let mut body = LeadBody::from(updated);
+    stamp_sla_state(pool, organization_id, &mut body).await?;
+    Ok(Json(body))
 }
 
 /// `DELETE /api/v1/crm/leads/{id}` — delete a lead's data, audited.
@@ -1496,8 +1648,11 @@ pub async fn convert(
         tracing::warn!(error = %error, "crm.lead.converted could not be recorded");
     }
 
+    let mut body = LeadBody::from(lead);
+    stamp_sla_state(pool, organization_id, &mut body).await?;
+
     Ok(Json(ConversionBody {
-        lead: LeadBody::from(lead),
+        lead: body,
         contact_id: report.contact_id,
         contact_created: report.contact_created,
         deal_id: report.deal_id,
