@@ -332,11 +332,21 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
       button is pressed**. An applied plan's checkbox is deliberately left enabled: a control
       that silently does nothing on the one row a reviewer most needs to know about is a
       control they learn to mistrust on every row.
-      **Still owed: the browser pass.** `omnion-w4` holds the shared QA slot (pid 1857610,
-      `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd` — never by
-      the age of the placeholder file) and `/mnt/apopic` sits at 99% with 821 MB free, so the
-      walkthrough section that now drives this control (`scripts/qa/walkthrough.cjs`) has not
-      been executed end to end. The box is ticked on the wire proof, and the record says so.
+      **Browser pass: run, and it agrees.** `QA_STACK=w3` (ports 18082/3102/3202, db
+      `omnion_qa_w3`) measured **59 pages**; the `/app-builder` route pass came back clean on
+      every diagnostic the harness records — no horizontal overflow, no broken images, no empty
+      interactives, no unlabelled inputs, no duplicate ids, no low contrast, no tiny targets, one
+      `h1`. The only `console-error` on this page is `409 /api/v1/app-builder/generate`, which is
+      **the no-provider case, not a defect**: the QA box has no AI provider key, the composer is
+      supposed to refuse there, and `a_refused_prompt_writes_no_plan_and_a_missing_provider_is_a_409`
+      already asserts the same `409` on the wire. It is present in the previous run's
+      `clicks.jsonl` too, so it predates this slice.
+      **The depth pass — which drives the new bulk bar — did not run.** `appBuilderConsole` reads
+      `skippedForDeadBrowser`: the browser process died part-way through the route list (load
+      average 21 on six cores with several writers), and every depth pass after that point is
+      `undefined`. **This is the shared-resource failure, not a red finding, and the REQ is not
+      closed on it** — the console's *behaviour* is proven on the wire and the console's *screen
+      states* are still owed a focused pass.
 - [ ] Apply requires explicit confirmation, the keyboard flow works, and mobile keeps actions reachable at 390 px.
 - [x] Keys `appbuilder.read` / `appbuilder.generate` / `appbuilder.review` / `appbuilder.apply` exist in the catalogue. —
       **MEASURED (slice 2, `65bdf683`):** `the_app_builder_family_is_catalogued_and_apply_is_its

@@ -9627,11 +9627,25 @@ from 45 changed lines to **+9, mine only**. A feature commit that carries a refo
 wave's file is a diff nobody can review, and the byte-equivalence check is what let me revert
 without risking anybody's work.
 
-**Browser pass: queued, not run.** `omnion-w4` holds the shared QA slot (pid 1857610,
-`cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd` — never by the age
-of the placeholder file), and `/mnt/apopic` is at **99%** with 821 MB free. The acceptance box is
-ticked on the wire proof and the record says the pass is owed; the screen states of the new bulk
-bar are unmeasured.
+**Browser pass: the slot freed mid-tick, so it ran — and it agrees where it got to.** `omnion-w4`'s
+holder (pid 1857610) died between the commit and the run, which is why this entry exists at all: the
+reaper freed the place and the pass took it. **59 pages measured**; `/app-builder` is clean on every
+diagnostic the harness records (no overflow, no broken images, no empty interactives, no unlabelled
+inputs, no duplicate ids, no low contrast, no tiny targets, one `h1`). The single `console-error` on
+this page is `409 /api/v1/app-builder/generate` — **the no-provider case, not a defect**: the QA box
+has no provider key, the composer is *supposed* to refuse, and
+`a_refused_prompt_writes_no_plan_and_a_missing_provider_is_a_409` asserts the same `409` on the wire.
+It is in the **previous** run's `clicks.jsonl` as well, so it predates this slice — which is the
+whole reason to check the older artifact rather than reason about a fresh red row.
+
+**The depth pass never ran: `skippedForDeadBrowser`.** The browser process died part-way through the
+route list (load average **21** on six cores, several writers live) and every depth pass after that
+point is `undefined` — `iamPolicies`, `automations`, `workflowBuilder`, and mine. That is the
+shared-resource failure this box produces under load, **not a red finding and not a REQ close**; the
+pass's own convention is to record it and move on. The consequence is honest and worth stating: the
+**bulk bar's screen states are still unmeasured**, so the REQ's box is ticked on the wire proof and
+the record says exactly which half is owed. A `skippedForDeadBrowser` is the absence of evidence,
+and absence of evidence is not evidence either way.
 
 **Next:** REQ-045's remaining work is blocked on a table this wave does not own — the apply
 pipeline's first step writes the generated entity and REQ-026's `entities` / `entity_fields` exist
