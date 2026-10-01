@@ -46,6 +46,7 @@ pub mod document;
 pub mod error;
 pub mod limits;
 pub mod parity;
+pub mod persisted;
 pub mod schema;
 pub mod settings;
 

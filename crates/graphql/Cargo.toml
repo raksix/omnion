@@ -14,3 +14,8 @@ publish = false
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# The document hash (`persisted::DocumentId`). The SAME workspace digest the media library and
+# the backup crate hash with, so "the same document hashes the same way" is not a property of this
+# crate's choice of algorithm: a client that hashes a query to compare against the manager gets an
+# answer from anywhere in the platform that hashes bytes.
+sha2.workspace = true
