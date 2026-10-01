@@ -128,6 +128,16 @@ enum Filter {
     ScanStatus(String),
     /// `version_count > 1` — no value.
     HasVersions,
+    /// `metadata -> $n = $n+1` — the pair exists with exactly this value.
+    ///
+    /// Built from the **pair path** rather than a containment operator. `@>` would be the obvious
+    /// choice and it is wrong here for three reasons: `metadata @> '{"k":"v"}'` is false when the
+    /// stored value is the *number* `v`, it is false for any row that also carries other pairs
+    /// only in the `?` variants, and — the real one — a jsonb equality test cannot use the
+    /// default `jsonb_ops` GIN opclass efficiently, so the index built in 0025 was never on the
+    /// path this filter would have used. `->` with `=` compares one key against one value and is
+    /// the form the index was created for.
+    MetadataPair { key: String, value: String },
 }
 
 impl Filter {
@@ -207,6 +217,21 @@ impl Filter {
                 // number, so there is nothing to bind.
                 builder.push("version_count > 1");
             }
+            Self::MetadataPair { key, value } => {
+                // `->` takes the key as its right operand, so the key is bound FIRST and the
+                // operator is written after the bind — the same ordering rule `Filter::Tag`
+                // records for `$n = any(tags)`. Writing the text first and binding after would
+                // read `$n = any(tags)`, which PostgreSQL rejects when it plans the query.
+                //
+                // `->>` extracts the value as **text**, which is what makes the comparison work
+                // for every row: the pairs are stored as jsonb strings, and `->` returns jsonb,
+                // so `-> = $n` against a jsonb bind would be a jsonb-to-jsonb equality that a
+                // number in the row silently fails. `->> = $n` compares text to text.
+                builder.push("metadata ->> ");
+                builder.push_bind(key.clone());
+                builder.push(" = ");
+                builder.push_bind(value.clone());
+            }
         }
     }
 
@@ -247,6 +272,13 @@ pub struct ListQuery {
     pub scan_status: Option<String>,
     /// Only files with more than one version.
     pub has_versions: bool,
+    /// Only files whose custom pairs carry this `key=value`; `None` is no metadata filter.
+    ///
+    /// One pair, not a query language. A `jsonpath` or an operator grammar here would let a
+    /// listing take a fragment of SQL out of a URL, and the browser's own toolbar has one field
+    /// for one pair. `metadata_pairs::filter_clause` is what decides whether a typed term is a
+    /// filter at all.
+    pub metadata: Option<String>,
     /// How many rows to return (1–500).
     pub limit: i64,
     /// How many rows to skip.
@@ -306,6 +338,14 @@ impl ListQuery {
         }
         if self.has_versions {
             filters.push(Filter::HasVersions);
+        }
+        // The one place a metadata term becomes a filter. A half-typed `campaign=` is not a
+        // filter, so it narrows nothing — a toolbar field that has not been finished yet must not
+        // change the listing out from under the person typing it.
+        if let Some(term) = self.metadata.as_deref()
+            && let Some((key, value)) = crate::metadata_pairs::filter_clause(term)
+        {
+            filters.push(Filter::MetadataPair { key, value });
         }
         filters
     }
@@ -735,6 +775,13 @@ mod tests {
                 },
             ),
             (
+                "metadata",
+                ListQuery {
+                    metadata: Some("campaign=spring".to_owned()),
+                    ..ListQuery::new()
+                },
+            ),
+            (
                 "everything",
                 ListQuery {
                     folder_id: Some(Uuid::nil()),
@@ -771,6 +818,79 @@ mod tests {
                 let _ = index;
             }
         }
+    }
+
+
+    #[test]
+    fn a_metadata_filter_binds_its_key_before_the_operator_writes_itself() {
+        // The defect this guards: the clause pushed `metadata -> $2 = $3` as *text* and then
+        // bound two more values, so every metadata-filtered listing sent `$2` for the key and
+        // PostgreSQL refused the statement. An unfiltered listing still worked, which is why no
+        // earlier test saw it — the same shape as the `$$` defect this suite already holds.
+        let sql = statement(&ListQuery {
+            metadata: Some("campaign=spring".to_owned()),
+            ..ListQuery::new()
+        });
+        assert!(sql.contains("metadata ->> $2 = $3"), "{sql}");
+        assert!(!sql.contains("$2$"), "{sql}");
+        // `->>` (text) rather than `->` (jsonb): the stored values are jsonb strings, and a
+        // jsonb equality against a text bind is false for every row holding a number.
+        assert!(
+            !sql.contains("metadata -> $"),
+            "must extract as text: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_half_typed_metadata_term_is_not_a_filter_at_all() {
+        // The toolbar field is free text and is re-read on every keystroke. `campaign=` must
+        // narrow nothing rather than match every row or none: a listing that changes while the
+        // word is being typed is a listing nobody trusts.
+        for term in ["", "   ", "campaign", "campaign=", "=spring", "  =  "] {
+            let filters = ListQuery {
+                metadata: Some(term.to_owned()),
+                ..ListQuery::new()
+            }
+            .filters();
+            assert!(
+                !filters
+                    .iter()
+                    .any(|filter| matches!(filter, Filter::MetadataPair { .. })),
+                "[{term:?}] must not build a metadata filter: {filters:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_metadata_filter_goes_through_the_same_builder_as_every_other_filter() {
+        // `count_files` runs the same `push_filters` over the same list, which is what makes the
+        // "Showing N of TOTAL" footer unable to disagree with the rows it counts. A filter built
+        // on a second path would reintroduce exactly that drift, so the assertion is on the
+        // statement the *count* sends, not on the rows it returns.
+        let sql = statement(&ListQuery {
+            metadata: Some("campaign=spring".to_owned()),
+            tag: Some("hero".to_owned()),
+            ..ListQuery::new()
+        });
+        assert!(sql.contains("= any(tags)"), "{sql}");
+        assert!(sql.contains("metadata ->> $"), "{sql}");
+        assert!(sql.contains("deleted_at is null"), "{sql}");
+    }
+
+    #[test]
+    fn a_metadata_pair_keeps_an_equals_sign_inside_its_value() {
+        // Splitting on the *first* `=` is what makes `note=width=3px` addressable; splitting on
+        // the last, or on every one, would truncate the value into something that never matches.
+        let filters = ListQuery {
+            metadata: Some("note=width=3px".to_owned()),
+            ..ListQuery::new()
+        }
+        .filters();
+        let Some(Filter::MetadataPair { key, value }) = filters.first() else {
+            panic!("expected one metadata filter: {filters:?}");
+        };
+        assert_eq!(key, "note");
+        assert_eq!(value, "width=3px");
     }
 
     #[test]
