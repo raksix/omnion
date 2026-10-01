@@ -7473,3 +7473,29 @@ pairing can see a history that should not be there. Then `reload-rebase`'s REDO 
 still far from close: run-from-here needs a real prefix, the pill row needs
 `paintedButNotInRun` empty, the plugin row stays BLOCKED on REQ-121, and the 50-step depth
 claim is still answered by the constant `HISTORY_LIMIT = 100` and by nothing else.
+
+
+## Tick 51 — the gesture key named the action, so two gestures shared one undo press
+
+**What.** REQ-004, undo/redo criterion. `record` merges two entries when their coalesce keys
+match inside `COALESCE_MS` and keeps the first `before` with the second `after` — right for a
+drag, wrong for two different actions. Half the call sites named their subject and half named
+only the action, and the history's own tests only used subject-bearing keys, so both conventions
+were green. Nudge a card then the next (two arrow presses, inside the window) and one undo
+reversed both; connect `a→b` then `b→c` and one undo removed both edges. `gesture-key.ts` owns
+every key, `dragKey` delegates to `moveKey`, and a structural guard fails any bare literal.
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **273 passed**
+(259 before, +14) · `pnpm typecheck` → 2/2 successful · `cargo test -p omnion-workflows --lib` →
+**157 unchanged** · `node --check scripts/qa/walkthrough.cjs` clean. Five mutations red:
+nudge call site reverted (1), edge-add call sites reverted (1), `dragKey` restated (1), a new
+gesture with a bare key (2), key functions inlined back (2).
+
+**No browser pass.** The slot's holder is a dead two-pid file (reapable), but three live passes
+hold 30 Chrome and the box has 0 free RAM with 24G of 31G swap — worse than tick 50, so no
+second pass was forced.
+
+**Next.** Press 50 distinct gestures of all five kinds and walk them back — the depth claim is
+still the constant `HISTORY_LIMIT = 100` and nothing else, and a test of 50 adds would re-derive
+the tick-48 mistake of measuring one thing for a claim about another. Then `undo-selection`, then
+the REDO half of `reload-rebase`.
