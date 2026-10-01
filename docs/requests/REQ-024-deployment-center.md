@@ -1,6 +1,6 @@
 # REQ-024 — Deployment Center
 
-> **Status:** in-progress (`6f20f516`, `0e22b88b`; tick 96 — **slice 2 is now whole: the job write side (create, step advance, append-only log, the runner) and the deploy wizard's three steps ship together, and the API half is tested.** What is not yet proved is still the browser pass: the tick-96 pass was started against a build from *before* these commits, so it measures slice 1's five screens and cannot see the wizard. Gates that are real: 51 crate tests, 315 api-lib tests, clippy clean on all three new files, `tsc` clean, and the one-active-per- environment refusal validated against the `0211` index's own constraint name.)
+> **Status:** in-progress (`d2ced888`, `4ca9609a`, `34661bce`, `a24c452a`; tick 97 — **slice 3 is now shipped as code: rollback with its mandatory reason and pre-backup, the maintenance window's screen, the `503` enforcement, and a Rollback button that is no longer a dead span.** Slice 2 remains open on one thing only — the browser pass that can see the wizard — and the tick-97 pass over this build is what will close it. Gates that are real: 68 crate tests, 325 api-lib tests, `tsc` clean, `node --check` clean, and six window/rollback properties proved against the live `omnion_qa_w5` database by their own constraint names.)
 > · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
@@ -137,9 +137,9 @@ Migration: `database/migrations/0014_deployments.sql` (next free number at build
 - [x] A second deploy for the same environment while a job runs is refused with `409`. *(the `0211` partial unique index is the guard; `create_job` matches the refusal on the constraint name and answers with the blocking job's id.)*
 - [x] Cancel is available before the migrate step and refused after it starts, with a message.
 - [ ] A failed step marks the deployment `failed` and offers rollback from the result banner.
-- [ ] Rollback requires a reason, takes a backup first, and produces a history entry.
+- [x] Rollback requires a reason, takes a backup first, and produces a history entry. *(server + unit + live: a `rollback` row without a reason is refused by `deployments_rollback_needs_a_reason`; the route refuses an empty one with a `400` before it writes anything, and the dialog refuses it client-side in the same words. The plan is `backup → deploy → verify` — **not** the deploy's four — because the older binary reads the append-only schema and `may_cancel` treats a plan with no migrate step as cancellable throughout. Proved on the live database: three step rows in that order, zero `migrate` rows.)*
 - [x] History filters by environment, kind, result and window; rows expand to the step list.
-- [ ] Maintenance mode blocks write routes with `503` plus the message, shows the banner, and leaves reads and probes working.
+- [ ] Maintenance mode blocks write routes with `503` plus the message, shows the banner, and leaves reads and probes working. *(the API half is proved — the deploy route asks the window before the pre-flight and answers `503` with the operator's own message, and the three form rules are `422`s with their reasons. **Not yet ticked:** the browser half. The banner is not in the shell and the driven pass that would catch a window stuck open has never run over this build.)*
 - [ ] The cluster panel renders only when a cluster is reported, with real replicas, CPU and memory.
 - [ ] Workload restart requires confirmation and `deployment.manage`.
 - [ ] A single-instance deployment shows the alternative card with a working restart action.
@@ -216,6 +216,29 @@ Visual check should see: a health indicator that is unmistakable with text (not 
    the button, and a `409` on a busy environment carries the blocking job's id in `details` so the
    operator is not hunting through history for which deploy is in the way.
 3. **Rollback + maintenance.** Rollback with reason and pre-backup, failure-path rollback entry point, maintenance enforcement and banner. *Done when:* a rollback returns the instance to the previous version and a window visibly blocks writes.
+   *Status:* **the code is whole and green (`d2ced888`, `4ca9609a`, `34661bce`, `a24c452a`); the
+   browser pass that closes it is still owed, and one part of it is not built yet.**
+   The window's three decisions are in the crate, which is the point: `is_active` needs three
+   conditions and the third is the one a naive check drops — *ending* a window is what leaves
+   `enabled = true` in the table, so a check that only reads the toggle blocks writes for ever
+   after the window closes. That is proved on the live database rather than asserted: an ended
+   window reports `enabled=t, started=t, not_ended=f` and the enforcement query returns `0`.
+   The scope is a checkbox that decides who is refused, and the difference is the difference
+   between "the site is down for customers" and "I am changing settings, do not fight me" — so
+   an `admin` window refuses the panel write and **not** the public one.
+   The `503` carries the operator's own sentence and carries **no `Retry-After`**: a window is
+   open-ended by default, and a header that counts down to nothing teaches a client to retry on
+   a timer for ever. A client that got a generic "service unavailable" could not tell a planned
+   window from an outage, which is the distinction that decides whether it waits or pages.
+   A deploy now asks the window **before the pre-flight**, not after it: a deploy refused for a
+   window must not have taken a backup or written an audit row claiming it started.
+   **The two things this slice still owes, named rather than implied.** The shell banner is not
+   in the app shell yet — the API computes `active` and the screen uses it, but every admin
+   session has no banner, and the spec asks for one in every session. And the driven pass that
+   would catch a window stuck open has never run: `a24c452a` is what that pass is, and it needs
+   a pass over this build to have produced a verdict. The screen's own catch-block behaviour is
+   untested in the way that matters — a form that swallows its own refusal and shows nothing is
+   indistinguishable from a save that worked until you look at the database.
 4. **Cluster panel.** Cluster detection, live replica/CPU/memory read, metric sampling for the sparkline, conditional route, workload restart with confirmation. *Done when:* a cluster-backed environment shows real numbers and restart works, while a single-instance environment shows the alternative card with no empty cluster shell.
 
 ### Risks / notes

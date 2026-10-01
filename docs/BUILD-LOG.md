@@ -10872,3 +10872,77 @@ wizard, then slice 3 — rollback with its reason and pre-backup, and the mainte
 screenshots off the disk that fills up. Neither is optional at this level, and neither is mine
 alone to fix.
 
+
+## Tick 97 — REQ-024 slice 3: rollback, and the maintenance window
+
+**What.** The crate's window decisions (`maintenance.rs`), the two routes that use them
+(`deployment_ops.rs`), the rollback runner, the maintenance screen, a rollback dialog, and a
+`Rollback` button on the environment card that is no longer a span with a tooltip reading "the
+flow arrives with slice 3". Four commits: `d2ced888`, `4ca9609a`, `34661bce`, `a24c452a`.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-deployment --features store` | **68/68** (51 before, 17 new) |
+| `cargo test -p omnion-api --lib` | **325/325** (315 before, 10 new) |
+| `cargo build -p omnion-api` | clean, no new warnings |
+| `tsc --noEmit` (admin) | clean |
+| `node --check scripts/qa/walkthrough.cjs` | clean, 11 800 → 11 893 lines |
+| six window/rollback properties, against the **live** `omnion_qa_w5` | all six hold — below |
+| `git status` | clean; four commits pushed to `wave5` |
+
+**The six properties, proved by their own constraint names.** A mock proves that a route *asks*
+for something; only the database proves the constraint answers.
+
+| # | Property | Result |
+| --- | --- | --- |
+| 1 | a banner message of 281 characters is refused | `ERROR: … maintenance_windows_message_length` |
+| 2 | the same at exactly 280 is accepted | `INSERT 0 1` |
+| 3 | an end before its start is refused | `ERROR: … maintenance_windows_end_after_start` |
+| 4 | an unknown scope is refused | `ERROR: … maintenance_windows_scope_known` |
+| 5 | an unknown environment is refused | `ERROR: … maintenance_windows_environment_known` |
+| 6 | a rollback with no reason is refused | `ERROR: … deployments_rollback_needs_a_reason` |
+
+And the one that is the whole reason the window is in the crate rather than in a handler: a
+window that has **ended** still reports `enabled = t, started = t, not_ended = f`, and the
+enforcement query over it returns **`0` blockers**. Ending a window is what leaves `enabled =
+true` in the table, so a check that only reads the toggle blocks writes for ever after the
+window closes. A rollback's plan came back as three rows in order — `backup`, `deploy`,
+`verify` — and `count(*) where name = 'migrate'` on a rollback is **0**, which is what makes the
+cancel rule treat a rollback as stoppable throughout.
+
+**Where the obvious version is wrong, in three places worth writing down.**
+
+* **`Retry-After` is deliberately absent from the `503`.** A window is open-ended by default, so
+  a header that counted down to a time the server does not have would teach every client to
+  retry on a timer for ever. The operator's own message travels instead, because a client that
+  got "service unavailable" cannot tell a planned window from an outage — and that is exactly
+  the distinction that decides whether it waits or pages somebody.
+* **The scope decides who is refused, and it is a checkbox.** An `admin` window refuses the panel
+  write and not the public one, because that is the entire reason the scope exists: a window
+  scoped to the admin is an operator saying "I am changing settings, do not fight me", and a
+  content editor publishing through the public API in that window is the traffic a window is
+  normally opened *for*. A route that got this backwards is a production outage caused by a
+  dropdown.
+* **A deploy asks the window before the pre-flight, not after.** A deploy refused for a window
+  must not have taken a backup or written an audit row claiming it started.
+
+**Two things this tick did not do, named rather than implied.** The shell banner is not in the
+app shell yet: the API computes `active` and the screen renders it, but no admin *session* shows
+a banner, and the spec asks for one in every session. And `a24c452a` — the driven pass that
+turns the toggle on with an empty message, saves, and then switches it off and asserts the state
+line — has never run over this build, so the screen's catch-block behaviour is unproved. A form
+that swallows its own refusal and shows nothing looks identical to a save that worked until you
+read the database.
+
+**The box is under strain again.** `/mnt/apopic` is at 93% and `/dev/shm` at 62% with five
+writers on six cores and a load average of 25. One build of mine died mid-run with
+`could not write output … No such file or directory` — the signature of a sibling deleting
+`target/`, not a full disk — and `CARGO_TARGET_DIR=/dev/shm/w5-target` is what made the next
+build succeed. The tick-96 pass is still running (it cannot see any of this) and holds the w5
+stack, so the pass over these commits waits behind it.
+
+**Next.** A pass over `a24c452a`, which is the only thing that can close slice 2's browser gate
+and tell the truth about the window's three states. Then the shell banner, which is the one part
+of slice 3 with no code yet.
