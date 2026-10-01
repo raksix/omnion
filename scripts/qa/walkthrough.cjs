@@ -11510,18 +11510,175 @@ async function runWorkflowBuilderDepth(page, report) {
   //
   // The selection is read too, because it is the second half of the same defect: an inspector
   // holding a node the loaded graph does not contain is a panel that can be aimed at nothing.
-  const reloadNote = await page
-    .evaluate(() => {
-      const undo = document.querySelector("[data-testid='builder-undo']");
-      return {
-        undoPresent: Boolean(undo),
-        // The attribute is present on a disabled <button>, so presence means disabled.
-        undoDisabled: undo?.hasAttribute("disabled") ?? null,
-        selectedInDom: document.querySelectorAll("[data-node-id][data-selected='true']").length,
+  //
+  // **THIS ROW USED TO MEASURE NOTHING, AND THE SHAPE OF THAT IS WORTH WRITING DOWN.** It read
+  // the button and the selection straight after `drag-undo` had pressed Ctrl+Z, so the only
+  // thing it observed was the state `drag-undo` left behind. It never caused a conflict, never
+  // clicked Reload, and never re-read the button — so it returned `undoDisabled` for a page on
+  // which no reload had happened at all, and it would have returned the identical value against
+  // a `rebaseAfterReload` that had been deleted outright. A row that cannot go red is not a
+  // conservative reading, it is an absent one.
+  //
+  // Worse, its selection selector was `[data-selected='true']` and the cards write
+  // `data-node-selected` — so `selectedInDom` was a hardcoded zero that no product could move.
+  // The wrong answer here is not "plausible", it is a constant, which is why a green pass said
+  // nothing.
+  //
+  // So this row now CAUSES the state it measures, in the order the defect needs:
+  //   1. a second tab saves a graph that DELETES this tab's selected card, so the adoption is
+  //      observable — a reload that left a card selected would be showing a node the graph does
+  //      not contain, and a reload that cleared the selection when the card survived would be
+  //      discarding the author's place. One fixture, both halves;
+  //   2. this tab makes an edit and lets its own debounced autosave produce the 409;
+  //   3. the Reload button is clicked — the exit under test, not a re-render;
+  //   4. the Undo button and the selection are read AFTER it.
+  //
+  // Step 1 deletes the card through the API rather than through the canvas so the delete is not
+  // itself a history entry here: the point is what the *reload* does to a history this tab
+  // built, and a second undoable edit in the same tab would make the two indistinguishable.
+  const rebaseTab = await page.context().newPage();
+  let rebaseNote = { attempted: false, reason: "not run" };
+  try {
+    await rebaseTab
+      .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await rebaseTab.waitForSelector("[data-builder-palette]", { timeout: 20000 }).catch(() => {});
+    await rebaseTab.waitForTimeout(800);
+
+    // The card this tab will have selected. Added through the palette, because that gesture
+    // ends in `setSelection(selectNode(node.id))` — the product's own selection, not a
+    // synthetic one a probe can arrange but an author cannot reach.
+    await page.locator("[data-builder-palette]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.locator("[data-palette-node='transform']").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    const mine = await page.evaluate(() => {
+      const card = document.querySelector("[data-node-id][data-node-selected='true']");
+      return card?.getAttribute("data-node-id") ?? null;
+    });
+    // The Undo button must be live at this point or the row measures nothing: the history
+    // needs an entry for the reload to have something to destroy.
+    const undoBeforeRebase = await page
+      .locator("[data-testid='builder-undo']")
+      .first()
+      .getAttribute("disabled")
+      .catch(() => null);
+
+    if (!mine) {
+      rebaseNote = { attempted: true, reason: "the palette add selected nothing to lose" };
+    } else {
+      // The CSRF header, for the reason the `switch-not-executable` leg above states: a
+      // cookie-authenticated PUT without `x-omnion-csrf` is refused with `csrf_failed` before
+      // the handler runs, and the fixture would then delete nothing while the row reported a
+      // clean adoption.
+      const tabTwoDeleted = await rebaseTab.evaluate(
+        async ([id, victim]) => {
+          const csrf = document.cookie
+            .split(";")
+            .map((pair) => pair.split("="))
+            .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+            ?.trim();
+          const current = await (
+            await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+          ).json();
+          const graph = structuredClone(current.graph);
+          const before = graph.nodes.length;
+          graph.nodes = graph.nodes.filter((node) => node.id !== victim);
+          graph.edges = graph.edges.filter(
+            (edge) => edge.source !== victim && edge.target !== victim,
+          );
+          const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+            method: "PUT",
+            credentials: "same-origin",
+            headers: {
+              "content-type": "application/json",
+              ...(csrf ? { "x-omnion-csrf": csrf } : {}),
+            },
+            body: JSON.stringify({ graph, graph_version: current.graph_version }),
+          });
+          return { status: response.status, before, after: graph.nodes.length };
+        },
+        [workflowId, mine],
+      );
+
+      // This tab now edits, so its own autosave quotes a version the store has moved past.
+      // The palette click is the same gesture the acceptance pass uses, and the 409 is the
+      // thing being produced, not a defect — registered so the roll-up reports it under
+      // `expectedRefusals` rather than as a high finding.
+      expectRefusal(
+        `${URL_ADMIN}/api/v1/workflows/`,
+        "the reload fixture needs a refused stale save so the Reload exit appears",
+      );
+      await page.locator("[data-builder-palette]").first().click({ timeout: 5000 }).catch(() => {});
+      await page.locator("[data-palette-node='wait']").first().click({ timeout: 8000 }).catch(() => {});
+      let banner = "";
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        banner =
+          (await page.locator("[data-save-state]").first().getAttribute("data-save-state").catch(() => "")) ?? "";
+        if (banner === "conflict" || banner === "saved" || banner === "error") break;
+        await page.waitForTimeout(400);
+      }
+
+      // The exit under test. Everything above only makes the button exist; this click is the
+      // reload, and a row that measured without pressing it measured the state it started in.
+      await page.locator("[data-save-reload]").first().click({ timeout: 8000 }).catch(() => {});
+      // Long enough for the fetch and the two state writes: the rebase and the node swap land
+      // in the same `load`, so a shorter wait could read the OLD selection off a canvas that
+      // has not repainted yet.
+      await page.waitForTimeout(2500);
+
+      const after = await page
+        .evaluate((victim) => {
+          const undo = document.querySelector("[data-testid='builder-undo']");
+          return {
+            // The attribute is present on a disabled <button>, so presence means disabled.
+            undoDisabled: undo?.hasAttribute("disabled") ?? null,
+            // `data-node-selected` is the marker the cards write; `data-selected` is a marker
+            // nothing emits, which is what the first version of this row counted.
+            selectedInDom: document.querySelectorAll("[data-node-id][data-node-selected='true']")
+              .length,
+            survivorStillDrawn: Boolean(
+              document.querySelector("[data-builder-canvas] [data-node-id]"),
+            ),
+            victimStillDrawn: Boolean(
+              document.querySelector(`[data-node-id="${CSS.escape(victim ?? "")}"]`),
+            ),
+            // The status bar states the selection in words, so a selection the canvas no
+            // longer draws is visible in two places rather than only in a CSS class.
+            selectionText: (() => {
+              const el = document.querySelector("[data-builder-selection]");
+              return el ? (el.textContent ?? "").trim() : null;
+            })(),
+          };
+        }, mine)
+        .catch(() => ({ readFailed: true }));
+
+      rebaseNote = {
+        attempted: true,
+        // The fixture has to have landed, or the three readings below are about a graph
+        // nobody else changed.
+        tabTwoStatus: tabTwoDeleted.status,
+        fixtureDeletedACard: tabTwoDeleted.before > tabTwoDeleted.after,
+        // The precondition: the author had an undoable edit before the reload.
+        undoWasEnabledBefore: undoBeforeRebase === null,
+        conflictRaised: banner === "conflict",
+        reloadOffered: true,
+        // THE ASSERTION. A history that describes the discarded graph must not be offering
+        // a press that writes it back.
+        undoDisabled: after.undoDisabled === true,
+        // The other half, and the reason the fixture deletes a card: the deleted card must
+        // not still be drawn as selected, and a surviving card must not have been invented.
+        selectionPruned: after.victimStillDrawn === false,
+        selectedCount: after.selectedInDom,
+        selectionText: after.selectionText,
+        survivorStillDrawn: after.survivorStillDrawn,
       };
-    })
-    .catch(() => ({ undoPresent: false }));
-  note({ step: "reload-rebase", ...reloadNote });
+    }
+  } catch (error) {
+    rebaseNote = { attempted: true, reason: String(error).slice(0, 160) };
+  } finally {
+    await rebaseTab.close().catch(() => {});
+  }
+  note({ step: "reload-rebase", ...rebaseNote });
 
   // The connection gesture: press an output port, press a target node, and the server's edge
   // count rises. The refusal is the half that matters — a port the source does not export has
