@@ -86,7 +86,27 @@ const ONLY = (arg("only", "all") || "all")
   .map((name) => name.trim())
   .filter(Boolean);
 const ONLY_ALL = ONLY.includes("all");
-const wants = (name) => ONLY_ALL || ONLY.includes(name);
+/**
+ * Whether a route/depth-pass name is in scope.
+ *
+ * The test is a PREFIX test, and that is load-bearing rather than a convenience: a scope is
+ * written the way a person thinks about the screen (`--only=cdn`), while the names it has to
+ * match are spread across three spellings — `cdn-overview` and `cdn-rules` in the route list,
+ * `cdnRules` and `cdnPurges` as depth-pass names. An exact test matched none of them, so a
+ * pass scoped to the CDN screens walked **nothing**, reported "0 route/pass name(s) walked,
+ * 1 unmatched", produced eleven findings of which four were high, and still exited 0. The
+ * unmatched guard is what made it visible rather than silent — and it is the reason the guard
+ * exists.
+ *
+ * Matching the literal first and only then the prefix keeps `cdn` from swallowing an unrelated
+ * name that merely contains it (`cdnX`), so a scope stays as narrow as the caller meant.
+ */
+const wants = (name) => {
+  if (ONLY_ALL) return true;
+  if (ONLY.includes(name)) return true;
+  const prefix = ONLY.find((scope) => name.startsWith(scope));
+  return prefix !== undefined;
+};
 /** Every route/depth-pass name this pass actually walked, so an unmatched filter is visible. */
 const matchedOnly = new Set();
 /** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
