@@ -8134,3 +8134,46 @@ failure again.
 
 **Next:** the browser pass over the seven deployment screens including `/deployment/exports`, and
 then REQ-128's two container-image acceptance lines, which need a registry to push to.
+
+## Tick 59 · wave6 · REQ-126 close gate · `3cbbe56c`, `28f2eb8c`
+
+**What.** Six ticks of REQ-126 closed on "re-run the pass when the box is calmer". The box was
+saturated; it was also not why the pass had never finished cleanly. `git log -S 'path:
+"/observability'` put the entries in `c0b3a58b`…`95656bb3` and showed all thirteen wave-5b route
+entries (6 secrets + 7 observability) as `-` deletions in merge **`8c6ab11d`**, which resolved a
+`walkthrough.cjs` conflict by taking `origin/main`'s copy of the route list wholesale. Nothing
+failed: the file parses, the depth passes exist, the commit is green. A depth pass and a route entry
+are different lists — the `wants()` block drives behaviour, the `routes` entry collects
+`diagnostics()` and feeds `mobileRoutes` — so six ticks of green depth passes sat on screens with no
+layout measurement and none ever rendered at 390 px. Independently and since `c0b3a58b`,
+`runObservabilityMetricsDepth` (158 lines, 14 checks, 2 screenshots) had **no caller at all**.
+
+**Proof.**
+
+- `scripts/qa/wave5b-route-coverage.test.cjs` — **8/8 checks, 6/6 defect mutations caught, 1/1
+  control green**. Deleting `/observability/logs` from a copy of the real file makes
+  `assertWave5bScreensWalked` throw; the unmutated file passes it. Run on the real file, not a
+  fixture.
+- All seven `scripts/qa/*.test.cjs` PASS · `node --check` parses · `pnpm typecheck` 2/2 ·
+  `cargo test -p omnion-telemetry` **179/179** (with `OMNION_DATABASE_URL` pointed at
+  `omnion_w6_dev`; unset, it falls back to the main writer's `omnion` DB and the run lies).
+- Private-stack pass, `QA_STACK=w6`, focused on the 13 restored screens + 3 reliability:
+  **16/16 walked, 0 unmatched**, 399 clicks, 431 shots, **all 16 pages produced diagnostics**,
+  **13 mobile screens at 390–443 px, zero horizontal overflow**, and **0 findings** in every kind a
+  restored route can cause.
+
+**The 215 "high" findings are one root cause, and reading them as 215 defects is the mistake this
+tick is built around.** `crates/security`'s `sign_in` policy is `limit 10 / window 300s`
+(`limiter.rs::defaults()`); the pass signs in once per depth pass plus retries, so twenty presses
+inside five minutes hit the wall — 44 failing requests are `/api/v1/onboarding`, and the 20
+click-errors are nav links on pages whose data never loaded. The limiter is working. **A focused
+pass's high count is not a defect count until the harness fits inside its own limiter.**
+
+**Gate note, not edited:** `scripts/qa/release-manifest.sh` is red on one check —
+`themes/minimal/package.json` declares 0.1.1 against the workspace's 0.1.0. Wave 2's file,
+identical at `HEAD~1`, not in this diff.
+
+**Next.** (a) The sign-in session sharing in the harness, and the `sign_in` refusal recognised as an
+environment refusal — both harness behaviour, both worth their own tick. (b) Then the REQ-126 close
+box can be ticked on a pass whose high count means something. (c) REQ-127/128/129 remain open on the
+same unticked gate; this tick's fix is the precondition for all four.
