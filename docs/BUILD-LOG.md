@@ -15421,3 +15421,85 @@ directory`), which is the harness, not the code.
 
 **Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps out
 of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+## Tick 77 — REQ-021 SLICE 7 · the screen published a retention window nothing enforced
+
+**What.** Tick 76 left an open question: `prune_deliveries` / `prune_stale` take no
+`organization_id` — deliberate retention, or a third spelling of the same tenancy question? The
+answer was worse than either. **Both had zero call sites in the repository.** `push::
+OUTBOX_RETENTION_DAYS` has been published to the panel since the outbox screen shipped —
+`notification-outbox.tsx` renders "The log goes back 60 days" from the constant the route sends —
+and the only two readers of that constant were two `pub` re-exports nothing called. There was no
+sweep at all, so the question had nothing to be asked of.
+
+**The clock moved, and that is the substantive fix.** `created_at` is written once by `enqueue`
+and never updated, so a delivery queued on day 1 and settled on day 59 was swept on day 60 *for
+being sixty days old*. The guarantee was measured from the wrong end, and a row that spent a month
+retrying lost its history the day after it finally arrived. `settled_at` is stamped by the
+functions that settle a row and **cleared by `retry_delivery`**, which un-settles one.
+
+**No status list, because the old one is why the failure log grew.** The dead statement read
+`status in ('sent','skipped')` — so a `failed` row, the one an administrator opens the outbox to
+find, was never swept at all. The predicate is now `coalesce(settled_at, created_at)` alone: no
+third spelling of "settled" beside `mark_sent`'s own `status = 'pending'` guard, and the fallback
+term is what sweeps an **abandoned** row rather than pinning its own history for ever.
+
+**The guard is the claim, and the status guard looked equivalent and was not.** The sweep first
+shipped `status <> 'pending'` — "a row the runner is working on". A `pending` row is *unsettled by
+definition*, which is exactly the population the clock's fallback exists to sweep. The clause
+deleted the sweep's own abandoned-row case, `coalesce` became dead code, and the growth problem
+was worst on precisely the installations that already had a stuck queue. Now `claimed_at` being
+recent, using the **same lease window** `claim_due` and `settle_not_ready` use.
+
+**Proof.**
+
+| gate | result |
+|---|---|
+| `bash scripts/qa/run-notification-retention.sh` | **13/13** over a real PostgreSQL |
+| the same with the pre-fix clock **and** the pre-fix status list restored | **PROVEN TO FAIL at 7/13** — exactly the six clock/tenancy walks; the seven tenancy-free neighbours stay green |
+| `cargo test -p omnion-notifications --lib` | **135** (was 117, +18) |
+| `cargo test -p omnion-api --lib` | **327** |
+| `cargo clippy -p omnion-notifications -p omnion-core -p omnion-api --all-targets` | **0 errors** |
+| `apps/admin` `tsc --noEmit` | exit 0 |
+
+**Three defects of my own, and the first is the finding.**
+
+1. **The guard, caught by the gate returning zero.** Eleven of thirteen walks stayed green while
+   every row that should have gone survived — a defect only one population notices, which is
+   what `status <> 'pending'` was. Fixed to the claim guard; the six walks are the evidence.
+2. **The gate's premise check was wrong twice, and both failures looked like a product defect.**
+   It matched `timestamp` when `information_schema` reports `timestamp with time zone`, and then
+   required an order that the query's own `order by column_name` guarantees it never has — so
+   against a database that had both columns it reported one missing. **A premise check that can
+   report a false negative is worse than no check**: it sends the reader into the migration
+   instead of into the two lines they just wrote, with the confidence of a gate.
+3. **Two fixture defects, one of which I "repaired" in the worst possible way.** The bounded
+   sweep's first draft built five rows on one notification with one channel — refused by
+   `notification_deliveries_unique`, a constraint this crate's own migration documents — and I
+   papered over it with a dead first loop and a `rows.clear()`, so the fixture *read* as though it
+   built five rows and in fact built one. The other created a tenant and no notification, then
+   asserted a run row: `work_list` walks organizations **that have notifications**, so the sweep
+   was right not to visit it. "An empty pass" and "nothing exists" are different states, and only
+   the second one is not a run row's business.
+
+**The source-text reader, and why it strips comments but not literals.** The settle clock, the
+absent status list and the claim guard are properties the right and the wrong implementation
+*share* — both answer the query the same way, so a test that drives the function proves nothing.
+`crates/notifications/src/testing.rs` reads the statements. Its first version stripped string
+literals too, on the argument that a gate scanning its own file finds its own explanation — and
+that broke the four assertions that matter, because **the SQL under test is a literal**:
+stripping literals made them unsatisfiable, which is worse than no assertion because it reads as
+a failing gate rather than an impossible one. Comments are the half that genuinely must go; this
+crate's docs quote the statements they replaced on purpose.
+
+**Browser pass: not run, and none claimed.** No screen changed. `/mnt/apopic` is at **96 %
+(2.3 G free)**; `/dev/shm` hit **100 %** mid-tick and `rustc` died with `IO failure on output
+stream: No space left on device` — which produces no `error[]` line at all and reads as a missing
+symbol. Reclaimed my own `/dev/shm/w8build` (1.8 G, six hours stale, zero open fds); the disk
+guard's globs (`omnion*/target`, `/dev/shm/*-target`) do not match that name, so it will not rescue
+it either.
+
+**Next.** The outbox's *read* side is scoped by `push::OutboxScope`; the sweep is scoped by
+`organizations.notification_retention_days`. Nothing reads that column back yet — no
+organizations screen shows the window and no route changes it, so the sweep is correct and
+invisible. Ask whether that is slice 3 of this screen or another tick's.
