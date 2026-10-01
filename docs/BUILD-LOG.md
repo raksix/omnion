@@ -14191,3 +14191,76 @@ changed - the fix is entirely below the API - so the pass would have measured no
 **Next.** The unit guard asserts the SHAPE of `PHONE_DIGITS_SQL`, not what `regexp_replace`
 returns, and says so in its own doc comment. The gate is what proves the answer; do not let the
 millisecond test be read as the proof it explicitly is not.
+
+## Tick 68 - REQ-117 slice 36: the claim was deleted before the module saw it
+
+**What.** Two functions decided what a caller's submission id means, and they disagreed about
+the *answer* while both writing the number `128`:
+
+```
+apps/api  idempotency_key()   ->  None  when the id is longer than 128   (REFUSE)
+module    claims::normalize() ->  the first 128 characters                (CAP)
+```
+
+`normalize`'s own test states the intent - "capping, not refusing: the caller supplied an id,
+the submission is real, and a 200-character id is not a reason to lose the lead" - and the
+API's runs **first** (`crm_intake.rs:882` builds the `Submission`). So a 129-character key
+became `submission_id: None`, `claims::take` was never reached, **no claim row was written**,
+and every retry of that one submission wrote another lead. Migration 0150 exists to make
+"one submission, one lead" a fact of the data; a caller whose key was one character too long
+got the exact outcome it prevents.
+
+**Two more sites were the same defect, found by grepping the binds rather than reading the
+code.** `lead_of_claim` and `find_lead_by_submission` both bound `submission.submission_id`
+**raw** while `claims::take` writes the **normalized** key, and `insert_lead` wrote the raw
+value into the `received` trail that `find_lead_by_submission` reads. For any id that needed
+trimming or capping, the mapping-health note went nowhere and the open-claim fallback
+answered "no such submission" for a submission that was being written.
+
+**Why nothing saw it.** Sixteenth variation of the branch's signature class and the third
+about two implementations of ONE rule (SLA clock, phone arm, this) - and the first where the
+**already-correct** half is the module. A reader auditing `claims::normalize` would have
+concluded it was right, and it was. The unit test could not see it either, and worse: the
+existing `an_idempotency_key_is_trimmed_capped_and_optional` ended with a 129-character header
+and asserted `None` - **the defect, written down as the specification**, so the next reader
+fixing it would see a red test and conclude they broke something.
+
+**The fix.** All four sites call `claims::normalize`, which is now the single place the rule
+exists; `MAX_SUBMISSION_ID` is exported so the comparison has something to compare.
+
+**Proof.** `scripts/qa/run-crm-submission-id.sh` **9/9 and PROVEN TO FAIL at 7/9** with the
+API's body reduced to the pre-fix one and nothing else changed - the two length assertions go
+red quoting the value, while the three blank/absent-header cases stay green. RED ran before a
+line of product code was touched. `omnion-api` lib **325 passed / 0 failed**, module lib
+**186**, clippy **0 errors**, admin `tsc --noEmit` **exit 0**.
+
+**The gate's own first run was a silent pass, and that is the part worth keeping.** It used
+short test names with `--exact`; cargo answered `0 passed; 325 filtered out` for both, and
+**exit code 0 is identical to success** to anything reading an exit code. `run_named` now
+fails on a zero count. A second defect in the same function: `out="$(cargo test ...)"` under
+`set -e` killed the script *inside* the substitution, so the negative control produced a
+two-line log with every test name lost - the proof that the gate fails for the right reason
+was unreadable on the one run that mattered most. `|| status=$?` keeps both.
+
+**A fixture defect of mine, caught by the RED run against correct code.** The first draft
+compared `"\t\n"` and a run of `ş`; `HeaderValue::from_str` rejects both with
+`InvalidHeaderValue`. A test that fails against the *fixed* code is worse than a wrong
+assertion, because a negative control built on it would have passed for entirely the wrong
+reason. Visible ASCII only, and the multi-byte cap stays covered in `claims.rs` where a
+`&str` exists to be capped.
+
+**Measured, not claimed.** The first draft of this box said "10/10 and PROVEN TO FAIL at
+8/10" before either run existed; the gate runs 3 API tests + 6 module claims tests, so the
+sentences were corrected to 9/9 and 7/9 after reading the logs. An estimated count in a
+proof line is a defect wearing a proof's clothes.
+
+**Not claimed.** No browser pass: the QA slot is held by a live w7 pass (holder pid 3602963,
+`cwd=/mnt/apopic/omnion-w7`, verified with `kill -0` and `/proc/<pid>/cwd`). No screen changed.
+
+**Next.** The DB half of the gate is written but was not run this tick (`QA_CLAIMS_DB` unset):
+a long-keyed submission sent twice must leave one claim row. That is the sentence the
+acceptance box actually promises, and it needs the row, not the function.
+
+**BOX:** `/mnt/apopic` hit 100% between two calls in this tick; a `cp` failed with ENOSPC and
+the negative control could not start. Disk state read at the start of a tick is stale by the
+end of it - re-check `df` immediately before any write that must land, not once at tick start.
