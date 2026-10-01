@@ -8983,3 +8983,45 @@ is the lever that actually works.
 
 **Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps
 out of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+## 2026-10-01 — the "deadlock" was the box, and the shared database was the lie under three red suites
+
+**What.** `cargo test --workspace` on wave6 died with `ld terminated with signal 7 [Bus error]` and
+`rustc-LLVM ERROR: IO failure on output stream: No space left on device` — `/` at 100%. Reclaimed
+8.9 G from this worker's own stale `deps/` (124 executables >40 M plus `.tmp*` leftovers from the
+killed link); `/` went to 93% and the same tree compiled. Then the real result: **every scoped suite
+this request names was failing because `OMNION_DATABASE_URL` was unset**, so the walks asserted
+against the shared `omnion` database where migration 19 is `cms blocks` against this tree's
+`0019_secret_hierarchy.sql`.
+
+**Proof.** `omnion_w6_dev` answers `19 = secret hierarchy`; the shared DB answers `19 = cms blocks`;
+one pair of queries settles what `walk_state`'s panic text insists in bold is "a repository defect,
+not a missing environment". With the URL exported and nothing else changed: `exporter_flush`
+0/5 → 5/5, `observability_traces` 1/8 → 8/8, `observability_metrics` 4/11 → 11/11,
+`observability_permissions` 4/4, `observability_logs` 3/3, `omnion-telemetry` 188/188,
+`omnion-secrets` 54/54, `omnion-events` 49/49, `pnpm typecheck` 2/2.
+
+**And one real harness defect, which was hiding behind the database.** `observability_alerts` took
+`get(SET_COOKIE)` and then the first cookie out of it, so each walk held `omnion_session` alone
+while the mutation layer also requires `omnion_csrf` — five walks answered `403 csrf_failed`, an
+error that names CSRF rather than the cookie the harness dropped. Fixed in `6b7eac32`, together with
+the missing `seed::ensure` in its `sign_in`: **3 passed / 5 failed → 8 passed / 0 failed in 78 s.**
+
+**What was NOT a defect.** `observability_traces` appeared to deadlock under the default test
+parallelism. It is not reproducible: `--test-threads=1` 8/8 in 113 s, one walk alone 18.5 s, four
+threads 49 s, eight threads 33 s, and three consecutive default runs with zero slow markers. It
+hangs when the box is saturated — load average 15 → 17 → **36.75**, `nproc` 6 with six writers
+building — and passes when the box breathes. A `std::sync::Mutex` serialising the global sampling
+ratio was written to "fix" it and REVERTED: held across `.await` it blocks the runtime and
+deadlocks harder than the thing it targeted. Two hours went into a defect that was the box; the two
+fixes that survived it are real regardless.
+
+**Left open, deliberately.** The browser pass is the one leg of the REQ-126 close gate still
+unticked. w3 held the QA slot live across this tick (pid 2044951 for 25 min, then 2914377 five
+minutes later) and `/mnt/apopic` reached 100% between two checks. A box at load 36 that ran out of
+disk mid-tick is the wrong instrument for a three-boot pass; a report measured under it is evidence
+about a slower build, not about this request.
+
+**Next.** The pass, when the slot is free and the box is under load ~8. Then REQ-130 slice 1's
+read-back walk for the `graphql_query_logs` row, then slice 2's persisted documents store and the
+four `/developer/graphql/*` screens — the first screen this request would have for a walk to visit.
