@@ -97,6 +97,14 @@ if [ "${QA_SLOTS:-1}" != "0" ]; then
   # original regresses, which is exactly the thing it exists to catch.
   step "testing the --only filter"
   node "$(dirname "${BASH_SOURCE[0]}")/test-only-filter.cjs" || echo "[qa] --only filter test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The disk guard's tmpfs reading, for the same reason and because this box runs out of RAM
+  # before it runs out of disk: /dev/shm is a real tmpfs and every writer's CARGO_TARGET_DIR
+  # lands in it, so a guard that misreads how full it is leaves the box one build away from
+  # the OOM that took out the shared Postgres on 29 September. It shipped having reported the
+  # INVERSE of the truth ("free 98%" over a filesystem 98% full), which is the failure mode a
+  # test has to catch by asserting direction rather than by snapshotting the output.
+  step "testing the disk guard's tmpfs reading"
+  bash "$(dirname "${BASH_SOURCE[0]}")/test-disk-guard-shm.sh" || echo "[qa] disk-guard tmpfs test reported failures (continuing: a broken test is not a reason to skip a pass)"
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
   # QA_SLOT_OWNER_PID is THIS shell's pid, so the slot can tell a place whose pass is still alive
   # from one whose pass was killed without running its EXIT trap. Without it the holder is the
