@@ -114,6 +114,26 @@ queued_exit() {
 trap queued_exit EXIT INT TERM
 
 QA_SLOT_PID=""
+# A typo in the focused-pass filter costs a WHOLE TICK if it is discovered at the end.
+#
+# `--only` takes route and depth-pass NAMES (`observability-traces`), not paths and not the plural
+# group (`observability`), so the obvious spelling of "all the observability screens" matches
+# nothing. `walkthrough.cjs` does report that — as `empty-pass` / `unknown-pass-name` findings —
+# but from its report roll-up, which runs LAST. By then this pass has queued for the box's single
+# QA slot (up to 25 min), reset a QA database and booted three servers, and has walked no route at
+# all: a green-looking artifact directory that proves nothing, with the slot held the whole time.
+# On a box where seven writers queue for one pass, that is the most expensive possible place to
+# discover a typo. This check runs against the same source file, one second, no slot.
+if [ -n "${QA_ONLY:-}" ]; then
+  step "validating the focused-pass filter (--only=$QA_ONLY)"
+  if ! node "$(dirname "${BASH_SOURCE[0]}")/check-only-filter.cjs" "$QA_ONLY"; then
+    echo "[qa] refusing to start: the focused-pass filter matches no route and no depth pass." >&2
+    echo "[qa] route and depth-pass names are hyphenated; run:" >&2
+    echo "[qa]   grep -oE 'name: \"[a-z0-9-]+\"' scripts/qa/walkthrough.cjs | sort -u" >&2
+    exit 2
+  fi
+fi
+
 # Free the place whenever this pass ends, however it ends.
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
