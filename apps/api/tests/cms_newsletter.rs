@@ -144,7 +144,14 @@ fn test_storage() -> omnion_storage::Storage {
 }
 
 async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    // **The secret this file signs with has to be installed in the state as well.** It
+    // already derives every CSRF token from `CSRF_SECRET` -- and never set the config, so
+    // the deployment it built had no secret at all, and sign-in answered with no token.
+    // Every authenticated write was then refused `csrf_unavailable`, a code whose message
+    // names a *deployment* problem rather than this suite's omission. The walks that were
+    // green were the ones that never wrote.
+    config.csrf = omnion_core::config::CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
     let isolated = IsolatedDb::open(&config.database.url, 4, "cms_newsletter")
         .await
         .expect("the throwaway database must open");
