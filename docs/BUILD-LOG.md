@@ -9107,3 +9107,61 @@ walkthrough. A third browser pass into that is the documented 29-September failu
 passes OOM-killing each other), and killing a sibling's pass to make room for mine trades one
 loop's evidence for another's. The boxes that name a screen stay unticked until a tick finds the
 box idle, which is the same condition `run.sh`'s own `flock` was added to protect.
+
+
+## w7 · tick 58 · REQ-105 slice 5 — the lapse that announced its own inverse
+
+**What.** The two criteria that had been carried open since slice 3, closed on the backend, plus
+the residual-risk screen. Nine atomic commits, pushed. `GET /ai/guard/about` serves **the same
+`LABELS` constants the detector is compiled from** rather than a second copy of them (`c63e9db0`);
+the panels disable their write controls with the missing key **named**, taken from the API's
+`viewer_missing` rather than guessed from a role (`5046d110`); the screen itself is `7a85d2ba` and
+the walkthrough assertions are `a4c93d99`.
+
+**The bug, which the walk found on its way in.** `lapsed_exemptions` filtered `expires_at > $2` —
+a plain future filter. The function named for lapsed rows returned the **exact inverse of its own
+name**, of its doc, and of the event it exists to announce. A caller announcing "an exemption
+expired" from that list would have announced every exemption **still running**, forever, and never
+the one that actually lapsed: the control would have been loudest precisely when it had nothing to
+report, and silent on the lapse it exists for. Fixed at `87038885`, with `now()` evaluated by the
+database so a caller cannot be a tick late and call a future row lapsed.
+
+This is the third defect in this REQ with the same shape — `action` for `verdict` in slice 4,
+`action == "blocked"` for `Action::Block` before it — and the third time the walk caught it, so the
+pattern is worth more than the fix: **a predicate that reads plausibly is not a predicate that was
+checked against its name.** `expires_at > $2` looks correct beside a doc comment that says "lapsed".
+
+**Announcement design, and the cost named rather than buried.** Two questions on two clocks: "is
+this exemption still in force" is read per request, "has this lapse been announced" once per lapse.
+So the de-duplication is a **claim** (`on conflict do nothing`, announce only on
+`rows_affected() == 1`), not a check-then-write — that shape has a window between the two statements
+in which a second process inserts its own and both announce. The sweep runs **off traffic**
+(`fb52edb1`) rather than off a scheduler: a third runner would be a second thing to configure,
+deploy and monitor before a single expiry is announced, and a control whose reporting depends on a
+background process is a control that silently stops reporting when that process dies. The price is
+stated in the module docs rather than left to be discovered: the announcement is late by up to one
+request, and since nothing about the request's outcome depends on it, being late cannot make the
+guard permissive.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-ai-hub --quiet` | 587 passed, 0 failed |
+| `cargo test -p omnion-api --test ai_guard` | **12 passed**, 0 failed (was 10; +2) |
+| `cargo test -p omnion-api --test ai_guard_outbound` | 8 passed, 0 failed |
+| `apps/admin` `tsc --noEmit` | exit 0, empty log |
+| `0218` applied **twice** to a live database | exit 0 both times (both statements guarded) |
+| `0218` vs every sibling worktree | uniquely mine — no collision on the shared ledger |
+
+**Not run, recorded rather than skipped silently.** The **browser pass has NOT run.** The QA slot
+is held by a *live* w3 walkthrough — verified by the holder pid's `/proc/<pid>/cwd`
+(`/mnt/apopic/omnion-w3`), not by the place file, which is stale and names a dead pid. The box was
+also wrong: load 14.7 on 6 cores and 6G free of 32. A third browser pass into that is the
+documented 29-September OOM failure. So **no screen of this REQ is claimed verified**, and the two
+half-proved boxes are left unticked with the missing half written out rather than quietly ticked.
+
+**Next.** REQ-105 slice 5 is code-complete. What is owed is the browser pass over five screens
+(`/ai/guard`, `/rules`, `/events`, `/tester`, `/about`) plus `pnpm build`, and then the status line
+can close. REQ-106 (local and air-gapped AI) is the next pending item; REQ-099/100/101 remain
+blocked on the same single pass, so they close in the same pass or not at all.

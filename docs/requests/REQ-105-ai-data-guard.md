@@ -39,9 +39,25 @@
 > from, narrows the check in `0215` and drops the two names the database accepted that nothing in the
 > build could produce (`flagged`, `remapped`), validates `?action=` so a stale filter is a `400` rather
 > than an empty table, and removes the two filter options that could only ever return nothing. The
-> pre-existing red walk (`a_blocked_turn…`) is now green: 8/8 outbound walks pass. **Still open and NOT
-> claimed:** the browser pass over the four screens (the QA slot is held by a live w6 walkthrough),
-> the permission-gated screen (403 named), `ai.guard.exemption.expired`, and `/ai/guard/about`. ·
+> pre-existing red walk (`a_blocked_turn…`) is now green: 8/8 outbound walks pass. ·
+> slice 5 — the **lapse announcement and the disclosure**. `lapsed_exemptions` filtered
+> `expires_at > $2`, a plain future filter: the function named for lapsed rows returned the exact
+> inverse of its name and of the event it exists to announce, so a caller announcing "an exemption
+> expired" would have announced every exemption *still running* and never the one that lapsed —
+> fixed at `87038885`, and the walk written to catch it found it. De-duplication is a **claim**
+> (`16615bac`), not a check-then-write, so two processes racing emit one event. The sweep runs off
+> traffic rather than a scheduler (`fb52edb1`), because a control whose reporting depends on a
+> background process is a control that silently stops reporting when that process dies; the cost is
+> named rather than hidden (the announcement is late by up to one request, and nothing about the
+> request's outcome depends on it). `GET /ai/guard/about` serves **the same `LABELS` constants the
+> detector is built from** rather than a second copy (`c63e9db0`) — a hand-written about page
+> drifts the moment a rule changes, and a screen that under-reports risk documents it as covered.
+> The panels disable their write controls with the missing key **named**, from the API's
+> `viewer_missing`, so the promise is one the write paths keep with a 403. The screen and its
+> nav link ship in `7a85d2ba`, the walkthrough assertions in `a4c93d99`. **Still open and NOT
+> claimed:** the browser pass (the QA slot is held by a *live* w3 walkthrough — verified by the
+> holder's `/proc/<pid>/cwd`, not by the place file, which is stale), and the final
+> `cargo test --workspace` + `pnpm build` box. ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
@@ -190,7 +206,7 @@ refuses to start in the guard (the API answers a configuration error) rather tha
   (shared conversation, admin) sees the placeholder, not the original (asserted with two readers on
   the same message).
 - [x] An exemption for one label and one feature allows that label through for that feature only; another feature with the same label stays masked.
-- [ ] An expired exemption stops applying on the next request and emits `ai.guard.exemption.expired`.
+- [x] An expired exemption stops applying on the next request and emits `ai.guard.exemption.expired`. — **proved in `apps/api/tests/ai_guard.rs`** (`an_expired_exemption_stops_applying_and_is_announced_exactly_once`). Liveness is asserted by *moving the clock on the row* rather than by sleeping: a test that waited for a real expiry would be slow, non-deterministic, and blind to a predicate that is right about "now" and wrong about "later". The announcement is asserted **at the `events` table**, not against the sweep's return value — checking only the list passes against a sweep that computes the right rows and emits nothing, which is the defect this criterion exists to catch. The sweep runs twice and the count must stay at 1, because a lapse is a permanent fact and any caller that re-reads it re-announces it. **This walk found a real bug on the way in**: `lapsed_exemptions` filtered `expires_at > $2`, i.e. a plain future filter, so the function returned the inverse of its own name and would have announced every exemption *still running* and never the one that lapsed.
 - [x] Saving an invalid regex is refused with a field error and stores nothing; the validate endpoint returns the same message.
 - [x] The tester returns matches with labels and spans, the masked text and the verdict, and performs no provider call (stub provider records zero calls). — **proved in `apps/api/tests/ai_guard_outbound.rs`**: the walk runs a payload carrying an e-mail *and* a Luhn-valid card through `POST /ai/guard/test`, reads the `blocked` verdict, the `card` label, the eight running rules and the matches, and asserts the stub recorded **zero** calls. It also asserts two things the criterion does not name and the screen depends on: a blocked verdict carries **no** outbound text (so no caller can mistake a half-masked body for something that was sent), and no match carries the value — only its salted hash.
 - [x] The payload never appears in `ai_guard_events`, in the audit log or in the API response of the events endpoints — asserted by a test that greps the stored row text for the original value.
@@ -205,8 +221,8 @@ refuses to start in the guard (the API answers a configuration error) rather tha
   insert** with a message naming the vocabulary it wanted. A walk that passed a `flagged` expectation
   is what forced the finding that **there is no `flagged` verdict**: `Action::Flag` yields `Allowed`,
   so two of the five names `0210` allowed were producible by nothing.
-- [ ] A caller without `ai.guard.manage` sees Rule actions and the tester disabled with the missing permission named; the API answers 403.
-- [ ] `/ai/guard/about` states the residual risk, and no other guard screen claims detection is complete.
+- [ ] A caller without `ai.guard.manage` sees Rule actions and the tester disabled with the missing permission named; the API answers 403. — **half proved, half not, so not ticked.** Proved (`a_guard_reader_is_told_the_key_it_is_missing`): `missing_guard_keys` is computed from the **real** `effective_permissions`, not from a hand-built "missing" array, and all three states are checked — a reader is missing `manage`, a manager is missing nothing, and `read` is never reported missing (a screen that renders itself read-only to everybody looks broken). The `403`s are enforced by the existing `guards::require` write paths. **Not proved:** that the buttons are visibly disabled and the key visibly named, which needs the browser pass.
+- [ ] `/ai/guard/about` states the residual risk, and no other guard screen claims detection is complete. — **half proved, half not, so not ticked.** Proved: the endpoint serves the detector's own `LABELS` constants with a measured `labels_disabled`, `apps/admin/features/ai/guard-about.tsx` leads each row with `misses`, and the walkthrough asserts the misses text exists and that every served label carries a non-empty `misses` (a screen rendering an empty column would satisfy every other check). **Not proved:** the second half — that no *other* guard screen overstates detection — is a statement about four screens at once and only the browser pass can make it.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
 ### QA plan
