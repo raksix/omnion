@@ -12029,3 +12029,41 @@ closed, and its screen-states box stays open for the same reason it has for twen
 **Next:** re-run `--only=media` when the box is quieter and the slot is free, and read the pair
 steps out of `summary.json` rather than the high count. The one open code item on this REQ is
 unchanged: the CDN purge hook to REQ-011.
+
+### The CRM suite's hang is the filesystem, and it is now reproducible (2026-10-01, w4 tick 68)
+
+Tick 67 killed this suite at 24 min and could not say which test it died in, because the run was
+piped. Run **unbuffered to a file**, it got further and **named the hang**:
+`a_rule_on_a_deal_stage_change_runs_exactly_once`, 10 passed / 0 failed ahead of it.
+
+The far more useful result is that the hang is now **reproducible on demand and is not the tests**:
+
+| run | result |
+|---|---|
+| full suite, `/mnt/apopic` at 99% (466 MB free) | hang at `a_logged_activity_…` (3 ok) |
+| that walk **alone** | 13.78 s, ok |
+| `a_contact_round_trip…` → `a_logged_activity…` | **hang** (exit 124) |
+| `a_contact_event_carries…` → `a_logged_activity…` | 2 ok |
+| `a_deal_of_another_organization…` → `a_logged_activity…` | 2 ok |
+| the same pair in **reverse order** | 2 ok, 22.56 s |
+| the "bad" pair again, **disk at 3.1 GB free** | 2 ok, **46.63 s** |
+
+The same two walks hang and pass with no code change. **Free space on `/mnt/apopic` is the variable** —
+that volume also holds `pg-w4`'s data (`/mnt/apopic/pg-w4/data`). On a recovered disk the suite
+reached **15 passed / 0 failed** twice, including past the walk that stopped tick 67.
+
+Every database-side theory was measured and is **false**: during the hang there are **zero**
+backends in `Lock`, **zero** ungranted locks and **zero** advisory locks (so not sqlx's per-fixture
+`db.migrate()` lock, the first and wrong theory), Redis answers in 0.23 ms, `max_connections` is
+100 with 13 in use, and the database is 35 MB with 8 214 rows in its largest table. At the hang the
+main thread sits in `futex_do_wait` while the only runtime worker parks in `epoll_wait` with nothing
+to run, under `us=82` across **six** cores from six sibling writers and `io full avg60=5.76`.
+
+**Gates:** `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm typecheck` **2/2** ·
+`node --check scripts/qa/walkthrough.cjs` clean. **No acceptance box is ticked** — the three open
+boxes are browser-only and the QA slot was live-held by w3 (pid 2914377, `cwd=/mnt/apopic/omnion-w3`)
+for the whole tick.
+
+**Next:** run the suite only with several GB free, and record a **completed** run before anything
+claims this suite is green. The three browser boxes still need a free slot:
+`QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh --only=crm`.
