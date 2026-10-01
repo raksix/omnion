@@ -8332,3 +8332,51 @@ points into it (14 G). Every sibling that can, keeps its target in `/dev/shm` in
 this tick: `/dev/shm` holds 17 G of live sibling targets on a box with 13 G available, and
 swapping a 14 G build directory between filesystems mid-tick is a bigger risk than the 1.6 G it
 buys. Flagged for the owner alongside the next disk pass.
+
+## Tick 61 — the 503 storm was a pool, and the pool was mine (REQ-126)
+
+**What.** `request_log` wrote the request's log line and its trace index **inline**, on the
+request's own task, holding one of the request's own pooled connections while it did. Under pool
+pressure each of the two writes waited out the pool's `acquire_timeout` — **5 s**, the constant every
+*request* uses — and was then discarded anyway. The module comment above `store::write` called this
+"a request path never blocks on telemetry", justified by there being no queue to drain. **That was
+the wrong reason: the absence of a queue was not a protection, it WAS the stall.**
+
+**How it was found.** The previous tick read a pass's `netFailures` as a lost session and shipped
+the fix that turns a lost screen into a red finding. That fix is right and it stayed — but the same
+pass carried a second signal nobody read: a 429 storm, then a 503 storm, then
+`ERR_CONNECTION_REFUSED` against **my own** w6 API. A lost session does not produce 503s. The API's
+stderr named the cause on 295 lines inside the pass window, and `grep` on the error log — not the
+report — is what turned "the screen is clean" into "the line was never written".
+
+**Fix** (`63429aa0`). `omnion_telemetry::sink`: a bounded queue, oldest-first eviction, a drain task
+that owns its own connections in batches of 256, and a declared
+`omnion_telemetry_writes_dropped_total{kind}` family so a gap is visible on a scrape. The payload is
+a `Payload` enum — the first draft round-tripped a `TraceRecord` through `LogEntry`, which cannot
+work, so every trace would have been dropped and the trace index left write-only.
+`TracingGuard::finish_offline` takes the same `status`/`duration_ms` as the synchronous `finish`,
+because a queued row and a written row must be the same row.
+
+**Proof.**
+
+| gate | result |
+| --- | --- |
+| `cargo test -p omnion-telemetry --lib` | **188 passed** (was 179, +9) |
+| `cargo test -p omnion-api --lib` | **357 passed** |
+| `observability_sink` | **1/1**, and **FAILS on the pre-fix middleware** |
+| `observability_traces` / `logs` / `metrics` / `permissions` | 8/8 · 3/3 · 11/11 · 4/4 |
+| `pnpm typecheck` | 2/2 |
+| 8 existing QA gates | all PASS — not a trade |
+
+Two pre-existing failures were **measured** against a stashed baseline rather than assumed mine:
+`observability_alerts` (3/8, identical without this change) and `observability_retention` (6/7,
+identical) both fail the same way on `HEAD` without the commit — the former is the CSRF harness
+defect the request's status line already names, the latter a `log_rows: 0` sweep.
+
+**Next.** The close box, when the QA slot is free — `--only=observability,secrets` now walks the
+thirteen screens against an API that no longer spends five seconds per request on its own log.
+
+**Reported, not edited.** `/` is at **100% (71 M free)** and this worktree's 14 G `target` symlink
+resolves into `/opt` on it. Reclaimed this tick: this writer's own `target/debug/incremental`
+(276 M). Not touched: `/dev/shm` holds 19 G of live sibling targets. A sibling's cargo
+(`omnion-w3`) was running against `/opt/omnion-w6-target/debug/deps` while this tick built.
