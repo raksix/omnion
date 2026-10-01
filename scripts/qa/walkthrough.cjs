@@ -12696,15 +12696,57 @@ note({
     // asserting on that would prove the panel has an empty-state message rather than that
     // it opens the step.
     {
-      const paintedNodeId = painted.painted.find((entry) => entry.status !== "skipped")?.nodeId
-        ?? null;
+      // **THE TARGET COMES FROM THE RUN, NEVER FROM THE CANVAS PILL READ.** This is the
+      // tick-57/58/59 defect for the fourth time and the fourth instance is the worst of
+      // them, because here the row's target was derived from the row's own SUBJECT.
+      //
+      // `paintedNodeId` used to be `painted.painted.find(e => e.status !== "skipped")?.nodeId
+      // ?? null` — the status pill this same criterion is about. So a regression in the pill
+      // (the thing `run-from-here` exists to measure) does not make THIS row red: it makes it
+      // VOID. No card carries a pill, so the id is `null`, no click is issued, the inspector
+      // never mounts, `trace` is `null`, `stepsShown` is 0, and then
+      //
+      //     stepsWithoutBothSides: []   (an empty list is read as "no step lost a side")
+      //     stepsInRunButNotShown: []   (runStepNos is filtered by a null id, so it is empty)
+      //     stepsWithParams === stepsWithOutput === stepsTotal > 0   (read off the wire)
+      //
+      // — all three gates GREEN, with the panel shut and not one step rendered. `panelFound`
+      // and `stepsShown` are in the note and neither is in the conjunction, so the conjunction
+      // in the next tick's own instructions passes on a panel that never opened. A gate that
+      // a defect can make invisible is worse than a missing one.
+      //
+      // The run is the independent witness and it is already in hand, so the target is taken
+      // from it: the first node the run touched that is not a skipped prefix row and that is
+      // actually on the canvas. A pill regression now surfaces where it belongs — as
+      // `pillsPainted: 0` / `inRunButNotPainted` on the `run-from-here` row above, which is
+      // the row that measures it — while this row still opens a real panel and can still go
+      // red about the panel itself.
+      const runCandidateIds = (after?.steps ?? [])
+        .filter((step) => typeof step.node_id === "string" && step.status !== "skipped")
+        .map((step) => step.node_id);
+      const canvasIds = cardOrder.map((card) => card.id);
+      const paintedNodeId = runCandidateIds.find((id) => canvasIds.includes(id)) ?? null;
+      // What the pill read WOULD have chosen, kept as EVIDENCE rather than as the target: a
+      // red `paintedOnTarget: false` beside a green panel now says "the pill is the defect",
+      // which is the opposite of what the same note said last time (everything green).
+      const pillChosenNodeId =
+        painted.painted.find((entry) => entry.status !== "skipped")?.nodeId ?? null;
       if (paintedNodeId) {
         await page
           .locator(`[data-node-id="${paintedNodeId}"]`)
           .first()
           .click({ timeout: 8000 })
           .catch(() => {});
-        await page.waitForTimeout(500);
+        // Wait for the MARKER, not for a delay. `waitForTimeout(500)` is a guess about mount
+        // time and is the quiet form of the same race the `table-save-survives` row was fixed
+        // for: a page that has not drawn is green for every assertion below, and only on a
+        // slow machine. The panel's own attribute is the condition, and `StepTracePanel`
+        // writes it unconditionally at its root (builder-view.tsx:3507) for all three of its
+        // states — no-run, node-absent and steps — so waiting on it cannot be satisfied by
+        // nothing and cannot time out on a panel that opened without a step in it.
+        await page
+          .waitForSelector(`[data-step-trace="${paintedNodeId}"]`, { timeout: 8000 })
+          .catch(() => {});
       }
 
       // Per STEP, not per panel. The panel renders one Inputs/Output pair inside every
@@ -12803,6 +12845,28 @@ note({
         step: "step-trace",
         clickedNode: paintedNodeId,
         panelFound: trace !== null,
+        // **THE PRECONDITION OF EVERY CONJUNCTION BELOW.** Three fields in this note are
+        // empty lists or a healthy count when the panel never opened: the steps list is
+        // empty, so `stepsWithoutBothSides` is empty, and `runStepNos` is filtered by a null
+        // node id, so `stepsInRunButNotShown` is empty too. Both read as PASS. So a reading
+        // of this row is only a verdict at all when the panel opened and rendered at least
+        // one step — and that is one field, not three conditions, so nobody has to re-derive
+        // it under time pressure. `rowIsMeasurable` is that single switch.
+        rowIsMeasurable: trace !== null && (trace?.steps.length ?? 0) > 0,
+        // The target came from the RUN, and this says whether the canvas agreed it was a
+        // card. `null` target with a non-empty run is "the run named a node the canvas does
+        // not have" — a graph/canvas divergence, which is a real defect and is reported as
+        // one rather than as a panel that failed to open.
+        targetFromRun: paintedNodeId !== null,
+        // What the PILL read would have chosen. When these two disagree, the pill is what
+        // moved — and the pill is `run-from-here`'s subject, so the note points at that row
+        // instead of blaming a panel that opened correctly.
+        pillChosenNode: pillChosenNodeId,
+        pillChoseSameAsRun: pillChosenNodeId === paintedNodeId,
+        // The pill must be ON the clicked node for "clicking the node opens that step" to
+        // have been exercised: a panel opened for a node the canvas shows no status on is
+        // the pill's row failing, not this one.
+        paintedOnTarget: painted.painted.some((entry) => entry.nodeId === paintedNodeId),
         kind: trace?.kind ?? null,
         // Both halves rendered: the panel opened a step at all…
         stepsShown: trace?.steps.length ?? 0,
