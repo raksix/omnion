@@ -400,7 +400,13 @@ export function SessionsView() {
                     </td>
                     <td className="px-3 py-2">
                       <div className="flex items-center justify-end gap-1.5">
-                        {session.revocable ? (
+                        {/* `revocable` only says "not revoked yet" — the server refuses to end the
+                            session you are calling from (409 `cannot_revoke_current_session`),
+                            because the row is stamped before the response is written and the
+                            operator loses the sign-in mid-click. Offering the button there is a
+                            control that cannot work, so the row that says `current` shows
+                            "Sign out all" alone. */}
+                        {session.revocable && !session.current ? (
                           <button
                             type="button"
                             disabled={busy}
@@ -459,7 +465,7 @@ export function SessionsView() {
                   {session.last_seen_at ? new Date(session.last_seen_at).toLocaleString() : "never"}
                 </span>
                 <div className="flex items-center gap-2">
-                  {session.revocable ? (
+                  {session.revocable && !session.current ? (
                     <button
                       type="button"
                       disabled={busy}
