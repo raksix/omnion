@@ -307,7 +307,7 @@ pub async fn drift_input(pool: &PgPool) -> Result<Vec<(String, String, String)>>
 /// is already in the ledger has been applied once and must not gain a second row, but its
 /// duration and actor must not be rewritten either — that would destroy the record of who
 /// applied it the first time, which is the record the column exists for.
-pub async fn record(pool: &PgPool, row: &NewLedgerRow) -> Result<()> {
+pub async fn record(pool: PgPool, row: NewLedgerRow) -> Result<()> {
     sqlx::query(
         "insert into schema_migrations \
              (version, name, checksum, duration_ms, statement_count, actor, source, has_down, \
@@ -315,16 +315,16 @@ pub async fn record(pool: &PgPool, row: &NewLedgerRow) -> Result<()> {
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          on conflict (version) do nothing",
     )
-    .bind(&row.version)
-    .bind(&row.name)
-    .bind(&row.checksum)
+    .bind(row.version)
+    .bind(row.name)
+    .bind(row.checksum)
     .bind(row.duration_ms)
     .bind(row.statement_count)
-    .bind(&row.actor)
-    .bind(&row.source)
+    .bind(row.actor)
+    .bind(row.source)
     .bind(row.has_down)
-    .bind(&row.waiver_reason)
-    .execute(pool)
+    .bind(row.waiver_reason)
+    .execute(&pool)
     .await?;
     Ok(())
 }
@@ -336,20 +336,20 @@ pub async fn record(pool: &PgPool, row: &NewLedgerRow) -> Result<()> {
 /// be a state a query can read back. This is the ONLY way either column gets a value — there is
 /// no API that sets one alone, which is the mechanism behind the crate's
 /// "a publisher's claim is not a verification" rule.
-pub async fn mark_down_verified(pool: &PgPool, version: &str, by: &str) -> Result<()> {
+pub async fn mark_down_verified(pool: PgPool, version: &str, by: &str) -> Result<()> {
     let affected = sqlx::query(
         "update schema_migrations set down_verified_at = now(), down_verified_by = $2 \
          where version = $1 and down_verified_at is null",
     )
     .bind(version)
     .bind(by)
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     if affected.rows_affected() == 0 {
         // Either the version is unknown or somebody already verified it. The two are not the
         // same answer, so the row is read back and the caller decides which message it prints.
-        let existing = read(pool, version).await?;
+        let existing = read(&pool, version).await?;
         return match existing {
             None => Err(MigrationSafetyError::UnknownMigration {
                 version: version.to_owned(),

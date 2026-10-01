@@ -464,12 +464,12 @@ pub fn statements_without_down(sql: &str) -> Vec<String> {
 /// a plan that shows default timeouts on an installation that changed them is the same class of
 /// defect as a checksum recomputed at read time.
 pub async fn plan(
-    pool: &PgPool,
+    pool: PgPool,
     migrator: &'static sqlx::migrate::Migrator,
     policy: Policy,
 ) -> Result<Plan> {
     let files = embedded_files(migrator);
-    let applied: std::collections::HashSet<i64> = applied_versions(pool).await?;
+    let applied: std::collections::HashSet<i64> = applied_versions(&pool).await?;
 
     let pending: Vec<PendingMigration> = files
         .iter()
@@ -594,7 +594,7 @@ pub async fn applied_versions(pool: &PgPool) -> Result<std::collections::HashSet
 ///
 /// `if not exists` throughout, and the whole statement is one round trip, so two runners racing
 /// here cannot both fail.
-pub async fn ensure_sqlx_table(pool: &PgPool) -> Result<()> {
+pub async fn ensure_sqlx_table(pool: PgPool) -> Result<()> {
     sqlx::query(
         "create table if not exists _sqlx_migrations ( \
             version bigint primary key, \
@@ -605,7 +605,7 @@ pub async fn ensure_sqlx_table(pool: &PgPool) -> Result<()> {
             execution_time bigint not null \
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
     Ok(())
 }
@@ -727,6 +727,10 @@ pub async fn apply(
     // Whatever happens below, the lock is released on this path and not on the success path
     // alone: a refused run that keeps the lock is the one bug that turns a bad deploy into an
     // outage, because the next runner is then refused for a reason that no longer exists.
+    //
+    // `apply_locked` takes a CLONE rather than `&pool`: a borrow of the local that lives across its
+    // await is what stops this future from being `Send`, and an HTTP handler cannot be a handler
+    // without `Send`. `PgPool` is an `Arc`, so the clone is one atomic increment.
     let result = apply_locked(pool.clone(), migrator, policy, actor).await;
     lock::release(&pool).await;
     result
@@ -747,9 +751,9 @@ async fn apply_locked(
 
     let files = embedded_files(migrator);
     check_drift(pool.clone(), &files).await?;
-    ensure_sqlx_table(&pool).await?;
+    ensure_sqlx_table(pool.clone()).await?;
 
-    let plan = plan(&pool, migrator, policy.clone()).await?;
+    let plan = plan(pool.clone(), migrator, policy.clone()).await?;
     check_policy(pool.clone(), &plan).await?;
 
     if plan.pending.is_empty() {
@@ -876,8 +880,8 @@ async fn apply_locked(
                 }
                 finish_run(pool.clone(), run_id, "succeeded".to_owned(), duration_ms, None).await?;
                 match ledger::record(
-                    &pool,
-                    &NewLedgerRow {
+                    pool.clone(),
+                    NewLedgerRow {
                         version: entry.version.clone(),
                         name: entry.name.clone(),
                         checksum: file.checksum.clone(),
@@ -1172,7 +1176,7 @@ pub async fn verify_down(
         Ok(_) => {
             let after = table_names(scratch).await?;
             finish_run(ledger_pool.clone(), Some(run_id), "succeeded".to_owned(), duration_ms, None).await?;
-            ledger::mark_down_verified(ledger_pool, version, by).await?;
+            ledger::mark_down_verified(ledger_pool.clone(), version, by).await?;
             // The verdict is computed BEFORE the report is built, not from the report's own
             // fields afterwards: `restored` is the claim and the two lists are the evidence, so
             // deriving the flag from the fields would let a reordering turn a failed rehearsal
