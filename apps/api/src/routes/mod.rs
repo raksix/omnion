@@ -84,6 +84,7 @@ pub mod comments;
 pub mod content;
 pub mod content_api;
 pub mod content_usage;
+pub mod content_explorer;
 pub mod content_openapi;
 pub mod content_read;
 pub mod featured_media;
@@ -1118,10 +1119,20 @@ pub fn router(state: AppState) -> Router {
     let content_api_usage = get(content_usage::usage)
         .layer(guards::require(&state, "content.api.read"));
 
+    // The Explorer's dispatcher (REQ-019, slice 3). `content.api.read`, not `manage`: making a
+    // call spends the *token's* budget and reads what that token may read, and a reader of this
+    // section can already mint such a token — so a `manage` requirement here would refuse an
+    // operator who may legitimately try out a token without letting them break one they do not
+    // own. The escalation argument is the scope list: `media:read` is what a call needs, and the
+    // route answers `403 insufficient_scope` naming it, which is the surface's own behaviour.
+    let content_api_explorer = post(content_explorer::explorer_call)
+        .layer(guards::require(&state, "content.api.read"));
+
     // The token surface itself. Declared as its own router so the six routes read as one unit
     // next to their permission layer, and merged into the v1 tree below.
     let content_api = Router::new()
         .route("/content-api/usage", content_api_usage)
+        .route("/content-api/explorer", content_api_explorer)
         .route("/content-api/tokens", content_api_tokens_list)
         .route("/content-api/tokens", content_api_token_create)
         .route("/content-api/tokens/vocabulary", content_api_vocabulary)

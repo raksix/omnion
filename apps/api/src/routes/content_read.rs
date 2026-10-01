@@ -50,6 +50,14 @@ use crate::state::AppState;
 /// An extractor rather than a middleware so that the token is a value the handler can ask
 /// questions of: a handler that needs `media:read` says so, and a handler that only reads pages
 /// never has to know that scope exists.
+///
+/// **`Clone` because it travels through `http::Extensions`.** The Explorer's dispatcher
+/// (REQ-019, slice 3) builds one of these and puts it into the request it sends through the real
+/// router, and `Extensions::insert` requires the value to be cloneable. It is a plain wrapper
+/// around an `AuthenticatedToken` that is already `Clone`, so the derive costs one shallow copy
+/// of a small record and buys the dispatcher the ability to be the real request rather than a
+/// parallel implementation of one.
+#[derive(Debug, Clone)]
 pub struct ContentToken(pub AuthenticatedToken);
 
 impl ContentToken {
@@ -141,6 +149,21 @@ impl FromRequestParts<AppState> for ContentToken {
             .extensions
             .get::<MatchedPath>()
             .map(|path| surface_route(path.as_str()));
+
+        // **A pre-authenticated token in the extensions wins, and this is the only thing that
+        // check is for.** The Explorer's dispatcher (REQ-019, slice 3) builds the `ContentToken`
+        // itself, from a row it loaded under a panel session, and puts it here — because a
+        // token's plaintext is stored as a digest and cannot be replayed as a header on a second
+        // request. Without this early return the extractor reads the placeholder header the
+        // dispatcher sent, refuses it, and every call answers `401 invalid_token` — a screen that
+        // looks wired up and dispatches nothing.
+        //
+        // It is deliberately a **get**, not an insert: an extractor that wrote its own value back
+        // would make "the token came from the header" and "the token came from the row"
+        // indistinguishable downstream, and this branch is the only place that knows which.
+        if let Some(existing) = parts.extensions.get::<ContentToken>() {
+            return Ok(existing.clone());
+        }
 
         let raw = bearer_token(&parts.headers)
             .map_err(|error| error)

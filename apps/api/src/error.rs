@@ -150,6 +150,16 @@ impl ApiError {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// The structured explanation, when the refusal carries one.
+    ///
+    /// Read-only and borrowed so a caller can branch on `details.field` without cloning the
+    /// value — the Explorer's form highlights the offending input from that field, and a
+    /// `to_owned()` accessor would make every such check an allocation for no gain. `None` on
+    /// an error that explains itself in its message, which is most of them.
+    pub fn details(&self) -> Option<&Value> {
+        self.details.as_ref()
+    }
 }
 
 /// The code and the message, and never the details.

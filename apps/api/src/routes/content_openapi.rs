@@ -22,6 +22,11 @@ use serde_json::{Value, json};
 pub const OPENAPI_VERSION: &str = "3.1.0";
 
 /// One documented endpoint: its path, its method, its scope and what it is for.
+///
+/// `Debug` because the Explorer's dispatcher (REQ-019, slice 3) hands one to `Result::expect_err`
+/// in its own tests, and a type that cannot be printed cannot be asserted on — the failure mode
+/// is a test that cannot say what it got.
+#[derive(Debug)]
 pub struct Endpoint {
     /// A stable operation id, also used as the Explorer's dropdown key.
     pub id: &'static str,
