@@ -1777,6 +1777,123 @@ export type IpTestResult = {
   normalised: string;
 };
 
+// -- REQ-012 slice 4: the security-event timeline -----------------------------------------
+
+/** One row of `/security/events`, as the server sends it. */
+export type SecurityEvent = {
+  /** `"<source>:<id>"` — unique across both source tables. */
+  id: string;
+  /**
+   * Which table the row came from. Rendered rather than hidden: a merged list whose rows do not
+   * say where they came from is a list nobody can reason about during an incident.
+   */
+  source: "audit" | "sign_in";
+  occurred_at: string;
+  /** The stable action name, or the sign-in outcome word. */
+  action: string;
+  /** The screen's category. Served by the API rather than hard-coded in the panel. */
+  category: string;
+  /**
+   * Who acted — **null on a sign-in attempt**, and null there is a fact: nobody was
+   * authenticated. Rendering it as a blank cell would read as a rendering fault.
+   */
+  actor: string | null;
+  /** The account an action was *about*. Not the actor: a lockout names its subject. */
+  subject_user_id: string | null;
+  client_ip: string | null;
+  user_agent: string | null;
+  /** One line an operator reads instead of parsing the action name. */
+  outcome: string;
+  /**
+   * A key-level digest of the audit metadata — `csp_mode=set, directive_count=2` — never the
+   * metadata itself, because a security event is the row most likely to be forwarded out of the
+   * platform.
+   */
+  detail: string | null;
+  /** Whether this row is a refusal worth looking at. */
+  refused: boolean;
+};
+
+/** One page of the timeline, plus the counters the header shows. */
+export type SecurityEventsPage = {
+  events: SecurityEvent[];
+  /** How many rows the filter matched in total — the screen says "50 of 312" with this. */
+  total: number;
+  audit_count: number;
+  sign_in_count: number;
+  /** Whether the returned page is shorter than the total. */
+  truncated: boolean;
+  /** The categories the filter offers, served from the server's own registry. */
+  categories: string[];
+};
+
+/**
+ * One row of the secret inventory.
+ *
+ * There is deliberately no `value`, `secret`, `ciphertext`, `hash` or `preview` field, and the
+ * API is walked to keep it that way. The screen shows a *name* and what the platform can say
+ * about it; an operator who needs the value is rotating it in the environment, not reading it
+ * here. A type that could hold one would make "the panel shows no secrets" a rendering promise
+ * rather than a structural fact.
+ */
+export type SecretReference = {
+  /** `source:name` — unique across sources, because two sources may name the same thing. */
+  key: string;
+  /** The reference: an environment variable name or a secret-store key. */
+  name: string;
+  /** Which of the sources it came from. */
+  source: string;
+  /** What the reference is scoped to — a provider slug, an endpoint, or the platform. */
+  scope: string;
+  /**
+   * The best rotation timestamp the platform can observe, which is the reference row's own
+   * timestamp. `evidence` says whether it was edited or merely created, because a date an
+   * operator reads as "rotated on" when it only means "registered on" is worse than no date.
+   */
+  rotated_at: string | null;
+  evidence: "reference_changed" | "reference_created" | "unknown";
+  /** Days since `rotated_at`, when there is one. */
+  age_days: number | null;
+  /**
+   * How many rows hold real material behind this reference. A **count**, never the material —
+   * this number is what replaced the value.
+   */
+  material_count: number;
+  expired: boolean;
+  /**
+   * What the platform can honestly say. There is no `healthy`: the platform can see that a
+   * reference exists and can read nothing about the value behind it.
+   */
+  state: "unverifiable" | "missing" | "expired";
+  /** The reason behind the state, shown in the row. */
+  note: string;
+};
+
+/** The inventory as the screen receives it. */
+export type SecretInventory = {
+  secrets: SecretReference[];
+  total: number;
+  missing: number;
+  unverifiable: number;
+  /** The source vocabulary, served rather than hard-coded so a dead filter cannot appear. */
+  sources: string[];
+  /** Every state the vocabulary can produce — the screen's legend, served from the server. */
+  states: string[];
+  /** What this screen cannot see. Rendered as a permanent note. */
+  limitation: string;
+};
+
+/** The security-event filter, as the screen holds it. Every field is sent only when set. */
+export type SecurityEventsFilter = {
+  /** Free text over the action, the outcome or the account an attempt was made against. */
+  q?: string;
+  category?: string;
+  source?: "audit" | "sign_in";
+  since?: string;
+  until?: string;
+  limit?: number;
+};
+
 /** The directives this build recognises, in render order — the form's own dropdown. */
 export const CSP_DIRECTIVE_NAMES = [
   "default-src",

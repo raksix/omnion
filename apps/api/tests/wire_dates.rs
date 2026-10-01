@@ -80,7 +80,9 @@ fn assert_null_wire(value: &Value, field: &str, owner: &str) {
         Some(&Value::Null),
         "{owner}.{field} should be null when the instant has not happened; it is {}. \
          A missing key is not the same as a null one — the panel distinguishes them.",
-        value.get(field).unwrap_or(&Value::String("<absent>".to_owned()))
+        value
+            .get(field)
+            .unwrap_or(&Value::String("<absent>".to_owned()))
     );
 }
 
@@ -356,7 +358,10 @@ fn a_query_struct_accepts_both_the_instant_a_client_sends_and_its_absence() {
     let bad = serde_json::from_value::<routes::backups::ListQuery>(serde_json::json!({
         "created_after": "last tuesday",
     }));
-    assert!(bad.is_err(), "a nonsense instant must not parse into a filter");
+    assert!(
+        bad.is_err(),
+        "a nonsense instant must not parse into a filter"
+    );
 }
 
 /// The gate for the gate. A bare instant compiles, passes `tsc` and renders a dash, so the

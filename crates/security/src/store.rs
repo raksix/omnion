@@ -178,6 +178,26 @@ pub async fn upsert_finding(
     draft: &NewFinding,
 ) -> Result<(Finding, bool)> {
     let built = draft.clone().build()?;
+    // `xmax = 0` is Postgres' way of saying "this insert did not collide" — the row came from
+    // the DO UPDATE branch. It is asked for in the SAME statement's `returning`, which is how
+    // one statement answers created-or-refreshed without a second query that could see a
+    // *different* row after a concurrent delete.
+    //
+    // Two things about how it is asked for, and both of them are this function having been
+    // wrong in a way nothing could see:
+    //
+    // * **`xmax` is `xid`, so `coalesce(xmax, 0)` does not type-check.** Postgres raises
+    //   `COALESCE types xid and integer cannot be matched` — on every version, not only a new
+    //   one. The bare comparison `xmax = 0` is the form that works, and `xmax` is never NULL
+    //   for a row the transaction can see, so the `coalesce` was guarding nothing. It sat in a
+    //   second `select`, the answer was `.unwrap_or(true)`, and **every ingest since the
+    //   function was written has reported every finding as newly created** — which is what
+    //   made the acceptance criterion "re-ingesting does not duplicate" pass in the panel's
+    //   favour: the duplicate count was never actually tested, because the code that would
+    //   have reported it had been answering a question the database refused to answer.
+    // * The error was swallowed, so the wrong answer was indistinguishable from the right one
+    //   in every log the product keeps. `created` now rides the statement that already ran,
+    //   where a failure surfaces as the store error it is.
     let sql = format!(
         "insert into security_findings \
          (organization_id, source, severity, title, description, component, component_version, \
@@ -188,9 +208,15 @@ pub async fn upsert_finding(
                        severity = excluded.severity, \
                        description = excluded.description, \
                        fixed_in = excluded.fixed_in \
-         returning {FINDING_COLUMNS}"
+         returning {FINDING_COLUMNS}, (xmax = 0) as was_created"
     );
-    let row = sqlx::query_as::<_, Finding>(&sql)
+    #[derive(sqlx::FromRow)]
+    struct Upserted {
+        #[sqlx(flatten)]
+        finding: Finding,
+        was_created: bool,
+    }
+    let row: Upserted = sqlx::query_as::<_, Upserted>(&sql)
         .bind(organization_id)
         .bind(&built.source)
         .bind(&built.severity)
@@ -202,17 +228,7 @@ pub async fn upsert_finding(
         .bind(&built.fingerprint)
         .fetch_one(pool)
         .await?;
-    // `xmax = 0` is Postgres' way of saying "this insert did not collide" — the row came from
-    // the DO UPDATE branch. Reading it is how one statement answers created-or-refreshed
-    // without a second query, which is a second query that could see a *different* row after a
-    // concurrent delete.
-    let created: bool =
-        sqlx::query_scalar("select coalesce(xmax, 0) = 0 from security_findings where id = $1")
-            .bind(row.id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(true);
-    Ok((row, created))
+    Ok((row.finding, row.was_created))
 }
 
 /// Move a finding to a new status.

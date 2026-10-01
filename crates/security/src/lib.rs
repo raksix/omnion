@@ -26,6 +26,9 @@ pub mod csrf;
 pub mod csv;
 pub mod enforce;
 pub mod error;
+pub mod events;
+pub mod events_csv;
+pub mod events_store;
 pub mod header_store;
 pub mod headers;
 pub mod ip_rules;
@@ -36,6 +39,8 @@ pub mod limiter_store;
 pub mod lockout;
 pub mod model;
 pub mod posture;
+pub mod secrets;
+pub mod secrets_store;
 pub mod store;
 pub mod vocabulary;
 
@@ -43,6 +48,16 @@ pub use csrf::{CSRF_COOKIE, CSRF_HEADER, derive_token as derive_csrf_token, toke
 pub use csv::{COLUMNS as EXPORT_COLUMNS, MAX_EXPORT_ROWS, render as render_findings_csv};
 pub use enforce::{EnforcedLockout, resolve as resolve_lockout};
 pub use error::{Result, SecurityError};
+pub use events::{
+    EVENT_COLUMNS as SECURITY_EVENT_COLUMNS, EventCategory, EventPage, EventQuery, EventSource,
+    MAX_EXPORT_ROWS as MAX_EVENT_EXPORT_ROWS, SecurityEvent,
+};
+pub use events::{
+    describe_outcome, event_id, is_refusal, is_sensitive_key, page_size as event_page_size,
+    search_term as event_search_term, summarise_metadata as summarise_event_metadata,
+};
+pub use events_csv::render as render_events_csv;
+pub use events_store::{export_rows as export_security_events, list as list_security_events};
 pub use header_store::{
     HeaderChange, StoredHeaders, header_history, history_count, load_headers, save_headers,
 };
@@ -80,6 +95,13 @@ pub use model::{
 pub use posture::{
     CHECKS, Check, CheckOutcome, Environment, Probe, evaluate_all, find, keys, to_overview,
     unevaluated_state,
+};
+pub use secrets::{
+    INVENTORY_COLUMNS as SECRET_INVENTORY_COLUMNS, RotationEvidence, SecretInventory, SecretRef,
+    SecretSource, SecretState, environment_names, environment_row,
+};
+pub use secrets_store::{
+    NEVER_SELECTED_COLUMNS as SECRET_NEVER_SELECTED, inventory as secret_inventory,
 };
 pub use store::{
     BulkReport, bulk_set_status, count_findings, export_findings, find_finding, last_run_at,

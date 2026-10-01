@@ -224,7 +224,9 @@ async fn the_limiter_migration_lands_a_row_that_is_usable_without_it() {
         return;
     };
     let db = connect(name).await;
-    db.migrate().await.expect("the limiter migration applies cleanly");
+    db.migrate()
+        .await
+        .expect("the limiter migration applies cleanly");
 
     let applied: bool = sqlx::query_scalar(
         "select exists(select 1 from _sqlx_migrations where version = $1 and success)",
@@ -250,8 +252,14 @@ async fn the_limiter_migration_lands_a_row_that_is_usable_without_it() {
             .fetch_one(db.pool())
             .await
             .expect("read the two documents back");
-    assert_eq!(rate_shape, "array", "the limiter document is a list of scopes");
-    assert_eq!(lockout_shape, "object", "the lockout document is one object");
+    assert_eq!(
+        rate_shape, "array",
+        "the limiter document is a list of scopes"
+    );
+    assert_eq!(
+        lockout_shape, "object",
+        "the lockout document is one object"
+    );
 
     // The partial index behind "which accounts are locked right now". Its predicate is the
     // point: an index over a nullable timestamp without it is a sequential read of every
@@ -279,7 +287,9 @@ async fn the_limiter_migration_refuses_a_document_of_the_wrong_shape() {
         return;
     };
     let db = connect(name).await;
-    db.migrate().await.expect("the limiter migration applies cleanly");
+    db.migrate()
+        .await
+        .expect("the limiter migration applies cleanly");
     sqlx::query("insert into security_settings (id) values (1) on conflict (id) do nothing")
         .execute(db.pool())
         .await
@@ -288,23 +298,29 @@ async fn the_limiter_migration_refuses_a_document_of_the_wrong_shape() {
     // An object where a list belongs. `merge_with_defaults` iterates; an object iterates too,
     // in a way that produces zero scopes and therefore "allow everything" — the exact failure
     // this whole feature exists to remove, arriving through a type that is merely the wrong one.
-    let wrong_rate = sqlx::query("update security_settings set rate_limits = '{}'::jsonb where id = 1")
-        .execute(db.pool())
-        .await
-        .expect_err("an object in a column the code treats as a list must be refused");
+    let wrong_rate =
+        sqlx::query("update security_settings set rate_limits = '{}'::jsonb where id = 1")
+            .execute(db.pool())
+            .await
+            .expect_err("an object in a column the code treats as a list must be refused");
     assert!(
-        wrong_rate.to_string().contains("security_settings_rate_limits_array"),
+        wrong_rate
+            .to_string()
+            .contains("security_settings_rate_limits_array"),
         "the refusal must name the constraint: {wrong_rate}"
     );
 
     // And the mirror: a list where an object belongs, so the field lookups in `lockout.rs`
     // find nothing and a missing field silently means "no lockout at all".
-    let wrong_lockout = sqlx::query("update security_settings set lockout = '[]'::jsonb where id = 1")
-        .execute(db.pool())
-        .await
-        .expect_err("an array in a column the code treats as an object must be refused");
+    let wrong_lockout =
+        sqlx::query("update security_settings set lockout = '[]'::jsonb where id = 1")
+            .execute(db.pool())
+            .await
+            .expect_err("an array in a column the code treats as an object must be refused");
     assert!(
-        wrong_lockout.to_string().contains("security_settings_lockout_object"),
+        wrong_lockout
+            .to_string()
+            .contains("security_settings_lockout_object"),
         "the refusal must name the constraint: {wrong_lockout}"
     );
 

@@ -474,6 +474,37 @@ catalogue! {
     "security.lockout.triggered", "security", Live,
     "An account reached its brute-force threshold and is now locked out.",
     [("user_id", Uuid, req), ("attempts", Integer, req), ("lockout_minutes", Integer, opt)];
+    // A finding that *opens* is the one security fact an operator wires to a third party, so
+    // this is the name REQ-012's Events section promises them. Two payload decisions, and both
+    // are about the same thing — **the scan's content must not travel**:
+    //
+    // * `title` and `description` are absent. A dependency title is a package name and a
+    //   description is whatever the CI vendor wrote, which is attacker-influenced free text
+    //   being copied to every receiver the operator has. The finding is *identifiable* from
+    //   `finding_id` alone, because the panel reads it back with the same guard it protects.
+    // * `evidence` is absent for the same reason with more force: it is the raw report entry,
+    //   and the ingest path's own heuristic for "this document carries a credential" is a
+    //   heuristic. A bus is not the place to test it again.
+    //
+    // `severity` IS carried, because the receiver's decision is "page me or file a ticket",
+    // and that decision is unreadable from a finding id alone.
+    "security.finding.opened", "security", Live,
+    "A new finding was raised — a check that found something, or a report that was ingested.",
+    [("finding_id", Uuid, req), ("severity", String, req), ("source", String, req),
+     ("component", String, opt), ("component_version", String, opt), ("fixed_in", String, opt)];
+    // `action` is what makes this one event rather than two: a receiver that has to infer
+    // whether a network was opened or closed from a diff of `cidr` lists is reimplementing this
+    // module. `note` is the operator's own free text and is deliberately absent for the same
+    // reason a finding's title is — this one fans out to third-party receivers.
+    //
+    // This row was MISSING while slice 4(a) shipped, and `every_emitted_name_is_in_the_catalogue`
+    // is what said so: an emitter whose name is not in the catalogue records an event no
+    // endpoint can subscribe to, so the rule an operator believes they are running applies to
+    // nobody. It went unnoticed because nothing in the workspace asserts that gate is green on
+    // the branch it was written on.
+    "security.ip_rule.changed", "security", Live,
+    "An IP access rule was added or removed, and the next request is judged by the new set.",
+    [("action", String, req), ("rule_id", Uuid, req), ("kind", String, req), ("cidr", String, req)];
 
     // ---- Tenancy -------------------------------------------------------------------------------
     "site.created", "tenancy", Live,

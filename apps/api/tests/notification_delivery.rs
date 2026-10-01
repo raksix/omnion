@@ -1122,10 +1122,7 @@ async fn a_notification_written_by_the_producer_path_arrives_with_its_deliveries
         report.queued, 4,
         "the three transport channels plus in_app; the report and the table must agree"
     );
-    assert_eq!(
-        report.skipped, 1,
-        "chat is skipped, and nothing else is"
-    );
+    assert_eq!(report.skipped, 1, "chat is skipped, and nothing else is");
 
     harness.dispose().await;
 }
