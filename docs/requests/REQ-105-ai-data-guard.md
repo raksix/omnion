@@ -6,7 +6,16 @@
 > blocked payload is refused with `403 ai_guard_blocked` before any provider is dialled; the
 > **stub-provider walk that proves it on the wire** — `96232f63`, which replaces the detector-in-
 > the-test proof with a real provider at the other end of `POST /ai/chat`, so a masked turn is
-> observed leaving as `[EMAIL_1]` and a blocked turn is observed never being dialled) ·
+> observed leaving as `[EMAIL_1]` and a blocked turn is observed never being dialled; the **four
+> screens** — `/ai/guard` policy, `/ai/guard/rules`, `/ai/guard/events`, `/ai/guard/tester` —
+> `a79cf3f2`, with `lib/guard-api.ts`, the nav entries and the walkthrough depth pass. **The
+> browser pass over those four screens has NOT run**: `omnion-postgres` (the shared QA database
+> on 5433) has been in crash recovery since the disk hit 100%, with its startup process in
+> uninterruptible `D` state, so the pass cannot start a server. `D` ignores SIGKILL, and the
+> instance is shared infrastructure belonging to no single writer, so it is reported rather than
+> restarted. **No screen of this REQ is claimed as verified in a browser until it has been.**
+> The three outbound walks last tick flagged as needing a re-run are still blocked on the same
+> outage. ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 

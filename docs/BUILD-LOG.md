@@ -8686,3 +8686,95 @@ note in this ledger: a measurement that cannot be taken is reported as a **throw
 which kills the pass and takes every later measurement with it, rather than being recorded as an
 absent measurement. The mobile legs for REQ-021 are therefore still unmeasured — and this time the
 cause is in the file that is supposed to be measuring them.
+
+## 2026-10-01 — REQ-105 slice 1 (screens) · four routes, one fetch path, and a pass that cannot start yet
+
+feat(admin): the data guard's policy panel, rules table, event log and tester, plus
+`lib/guard-api.ts`, the nav entries and the walkthrough depth pass — `a79cf3f2`.
+
+Slice 1 built the detector, the migration, the store and the API. What it did not build was any
+way for a person to look at any of it, which makes an entire API invisible. This slice adds the
+four screens the request's own spec names, with the full CRUD surface on each.
+
+**The save button is one, not one per row.** A per-row `PUT` that fires when a select loses focus
+makes a mis-click a durable, silent change — and for a control that is the expensive direction to
+fail in, because nothing errors and the next person simply inherits the wrong policy. The panel
+therefore holds a draft, computes `dirty` against the loaded policy rather than tracking a flag,
+and offers "Discard changes" as a real button. The walk asserts the Save is *disabled before* a
+change and enabled after, because an always-enabled Save is a button that lies about its own
+state.
+
+**Built-in rows lose the Delete button rather than greying it out.** A disabled Delete teaches an
+operator the screen is stale; a 403 after the click teaches the same thing more slowly and with a
+worse first impression of the product. The row says `builtin` before the buttons, so nobody
+discovers the rule by being refused. The walk asserts Delete is absent on a built-in **and**
+present on a custom row — a screen that hid Delete from every row would pass "Delete is absent"
+while offering no way to remove anything.
+
+**A local pattern check is a convenience, not the authority.** The form compiles the expression as
+the operator types so the failure is legible instead of a red toast. That is worth having and worth
+naming for what it is: the walk submits a malformed pattern straight to `POST /ai/guard/rules` and
+asserts the server refuses it *and* stored nothing. A pass that only ever submits valid patterns
+cannot tell the local check from the server's authority — it measures the thing it shipped.
+
+**The probe runs before the save, and it runs on the server.** The form's "Test this rule" panel
+posts to the same `/ai/guard/test` endpoint the tester screen uses, rather than re-implementing the
+pattern in the browser. The tempting version is instant and free, and it is also a second
+implementation of the guard: for a `mask` action it would show the operator the plaintext address
+where the guard would have sent `[EMAIL_1]`. Same reasoning for the tester screen's `masked_text`,
+which is printed exactly as the server returned it.
+
+**`lib/guard-api.ts` is its own module, and that is the point.** `api.ts` is 7800 lines; 300 more
+would make "which calls does this screen make" a question about grep. The split also means a
+future field that starts carrying payload text would have to be added *deliberately* to a module
+whose header says no payload exists. It reuses `api.ts`'s single `request` rather than writing a
+second fetch path — the only change to `api.ts` is exporting it, because a local `fetch` has to
+remember CSRF, credentials and the JSON-content-type rule on its own, and every one of those is a
+`PUT` the server silently refuses when it is missing.
+
+**Three distinct exemption empty states, because they are three different facts.** "None
+configured", "the list could not be loaded" and "they have all lapsed" read identically to an
+operator deciding whether their exemption still applies. The first draft of this screen rendered a
+count of live exemptions with **no list at all** beside it, and told the reader the list was not
+loaded — which is a feature that lies: the exemption the operator had just created appeared to do
+nothing, because the row proving it existed was missing. A `loaded` flag separate from
+`exemptions.length` is the minimum that keeps a failed fetch from printing "No exemptions" about a
+list that was never read.
+
+**A generic `applyFilter(key, value)` is a hole TypeScript correctly reported.** The union version
+made every setter accept `string | boolean`. Six explicit setters read the same at the call site
+and have no such hole.
+
+Proof for what ran:
+
+```
+omnion-ai-hub --lib              575 passed; 0 failed
+admin tsc --noEmit               exit 0
+node --check walkthrough.cjs     syntax ok
+```
+
+**BLOCKER, and it is not mine.** `omnion-postgres` — the shared QA database on `0.0.0.0:5433`,
+used by every writer's pass — has been in crash recovery since `/mnt/apopic` hit 100% during a
+previous tick. Its startup process sits in uninterruptible **`D` (disk sleep)**, which ignores
+SIGKILL: it cannot be restarted from inside, and it is shared infrastructure that belongs to no
+single writer. It is therefore reported rather than touched. `pg_isready` says "rejecting
+connections" and the real error under it is `FATAL: the database system is in recovery mode`.
+
+The consequences, stated plainly:
+
+- **The w7 browser pass has not run.** `/ai/guard`, `/ai/guard/rules`, `/ai/guard/events` and
+  `/ai/guard/tester` are written, typecheck clean, registered in the walkthrough routes list and
+  driven by `runAiGuardDepth` — and **none of it is verified in a browser**. The range switch, the
+  create/edit/delete cycle, the masked-text assertion and the 390 px layout are all unproven.
+- **The three outbound walks last tick flagged for a re-run are still blocked** on the same
+  outage, so they have still not been re-verified since the member/owner correction.
+- `/mnt/apopic` is at 97% again. My worktree's own footprint is small (`node_modules` 454 M,
+  `apps` 194 M, `.next` 185 M combined); the build target lives on `/dev/shm`. The space is
+  siblings', and the disk guard is a cron that owns it.
+
+**NEXT.** Run the w7 pass the moment PostgreSQL leaves recovery:
+`QA_STACK=w7 QA_API_PORT=18086 QA_ADMIN_PORT=3106 QA_WEB_PORT=3206 bash scripts/qa/run.sh`. It
+must return 0 high findings and `runAiGuardDepth` must report its steps, including
+`maskedTextHasNoAddress` — that leg is the one that proves the screen is describing a guard that
+exists. Then slice 2: response re-mapping (criteria 2, 3 and 4 — the answer coming back coherent,
+the streaming placeholder, the second reader).
