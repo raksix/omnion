@@ -1,104 +1,4 @@
-## 2026-10-01 — the two halves of a submission id agreed on every key any fixture used, and the first-touch lookup was still reading the phone column the wrong way round
-
-test(crm-intake): the capped submission id as a row. fix(crm-intake): merge_attribution's stored-side phone normalization.
-
-**This tick closed the half of last tick's gate that was written but never run (`QA_CLAIMS_DB`
-unset), and the very next question — what does the *row* say for an id that had to be capped —
-turned out to have no test anywhere.**
-
-### What the acceptance box says, and what each gate actually measured
-
-The box says **one submission, one lead, no duplicates**. Two gates sat next to it and neither
-measured that sentence:
-
-- `run-crm-submission-id.sh` proves the API's `idempotency_key` and the module's
-  `claims::normalize` return the **same answer** — which was the sentence that was broken.
-- `run-crm-claims.sh` proves the claim table has a **primary key** on `(source_id,
-  submission_id)`.
-
-Both are true and neither is the box. The row is. And every fixture in the claims gate uses a
-two-word id, so for every identity any test had ever written the two halves agreed by
-construction — the disagreement only exists **past the cap**.
-
-`a_key_longer_than_the_cap_still_leaves_one_claim_and_one_lead` therefore states the box as a
-row: an over-long key delivered twice leaves **one claim, one lead, the same lead**, the stored
-key is the **normalized** one, and `claims::lead_of` finds that lead from the caller's **raw**
-spelling. The last two are the four read paths that used to bind the value raw, and they are the
-half a lead count cannot see.
-
-**RED ran before a line of product code was touched**, and the negative control is the reason to
-believe it: with `claims::normalize` reduced to its pre-fix shape (refuse over the cap rather
-than cap it), the gate is **7/8** — exactly this test goes red on the first delivery and the
-seven short-keyed tests stay green. **That is the mechanism, stated plainly: every fixture in the
-file used an id short enough that the bug could not show.** A gate whose fixtures all take the
-same branch measures one branch, however many of them there are.
-
-### The second defect was one function away from last tick's, and the first fix made it findable
-
-`fetch_candidates` was given `dedupe::PHONE_DIGITS_SQL` on tick 67 because it normalized the
-**stored** phone in SQL (`regexp_replace`, which strips the `+`) while the key came from
-`normalize_phone` (which keeps it) — the phone arm could never match. `merge_attribution` reads
-**the same column**, was not part of that fix, and hand-wrote its own normalization:
-
-```text
-dedupe_key(mapped)                                       -> "+905****2233"   (keeps the +)
-and (lower(email) = $3 or lower(coalesce(phone, '')) = $3)
-where the phone column holds                            -> "+90 555 111 22 33" (mapped, VERBATIM)
-```
-
-`insert_lead` binds `mapped.get("phone")` verbatim, so the column holds whatever the operator's
-mapping produced. The two sides agree **only** when the source happens to map the field through
-`e164_lite`; without it the comparison is false for ever, so a phone-identified visitor lost their
-first touch on every submission after the first — the second visit **overwrote the campaign that
-brought them in**, which is precisely what acceptance 6 forbids.
-
-The gate hid it, and the reason is the useful half: its one phone fixture
-(`a_visitor_identified_by_phone_keeps_their_first_touch`) maps through `e164_lite`, so the stored
-column is pre-normalized and the comparison is trivially true. **A fixture that applies the
-transform hides the disagreement rather than fixing it** — and the transform is *optional* on the
-operator's form, so a source without it is the ordinary case.
-
-The stored side is now `dedupe::PHONE_DIGITS_SQL`, the same named expression. The e-mail arm keeps
-`lower()`: e-mails have case and no punctuation to strip, a phone number has neither — which is
-why `PHONE_DIGITS_SQL`'s own unit guard asserts the expression contains no `lower(`.
-
-**RED before the fix** (`left: "autumn-sale"`, `right: "spring-sale"` — the second visit stored
-over the first), then **5/5**, then **PROVEN TO FAIL at 4/5** with the pre-fix spelling restored:
-only the new test goes red.
-
-### Two things worth keeping from the mechanics
-
-**A revert script that removes the control can remove the line it replaced.** The control replaced
-`let stored_phone = PHONE_DIGITS_SQL…`, and deleting the control's own text took the real line
-with it — `E0425: cannot find value 'stored_phone' in this scope`, in a function that had compiled
-minutes earlier. **A negative control that overwrites production code needs its revert to restore
-the original string, not just delete its own.** The compile caught it immediately and the gate was
-re-run green before anything was committed, but a control that is only ever *added* is a much
-safer shape.
-
-**A `python` edit whose `assert count == 1` fails leaves the tree untouched** — which is why the
-second control run reported a clean 5/5 while no control had been applied. The assertion is not
-ceremony; it is the difference between "the negative control failed as designed" and "the negative
-control never ran and the green is meaningless". Read the patch step's own exit code, not the
-cargo exit code at the end of the chain.
-
-### Proof
-
-- `run-crm-submission-id.sh` with the DB half (`QA_CLAIMS_DB=omnion_qa_w8_subid`): cross-boundary
-  **9/9**, DB half **7/7 before this tick's test, 8/8 after**; **PROVEN TO FAIL at 7/8**.
-- `run-crm-attribution.sh` **5/5**, **PROVEN TO FAIL at 4/5**.
-- Regressions: module lib **186/186**, `run-crm-dedupe.sh` **12/12**, `run-crm-claims.sh` **8/8**.
-- Commits `77de49b2` (test) and `041e7ac8` (fix), both pushed to `wave8`.
-
-**Not claimed.** No browser pass: no screen changed (both defects are below the API), and the QA
-slot is held by a live **w5** pass — holder pid 1269373, alive, `cwd=/mnt/apopic/omnion-w5`,
-checked with `kill -0` and `/proc/<pid>/cwd` rather than read off the placeholder's name.
-
-**Next.** The audit that found the second defect is the standing method rather than a one-off:
-`PHONE_DIGITS_SQL` now has **two** call sites, so the remaining question is whether any *third*
-query over `crm_leads.phone` or `.email` still hand-writes its own normalization — `grep` the
-`.bind(`s and the `=`-comparisons rather than the functions, which is what found the other three
-sites of last tick's class.## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
+## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
 
 test(events): revive the whole suite. feat(events): catalogue four names the drift gate
 found already on the bus.
@@ -6898,6 +6798,375 @@ turn on a pass that has not run**, and the definition of done forbids closing a 
 
 **Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
 a free slot.
+
+## Tick 96 — the `security.finding.opened` webhook, and a store bug behind it
+
+**Picked:** REQ-012 slice 4(d), the last of four. Slices 1–3 and 4(a)–(c) were already
+code-complete, so this was the only piece standing between slice 4 and a REQ whose sole
+remaining work is the browser pass.
+
+**What shipped.** `security.finding.opened` in the catalogue (`e15d1880`), the emitter in the
+import path (`73e890b6`), the walk (`25306c7b`), and the store fix the walk forced (`d6c26218`).
+
+**The payload is an identity, never a content.** This is the first security payload on the
+platform that fans out to a receiver outside the operator's own infrastructure by default, and
+the fields it does *not* carry are the whole design:
+
+- `title`, `description`, `evidence` — all three are content that arrived from outside (a CI
+  vendor's package name, its prose, the raw entry), and the ingest path's credential heuristic
+  is a heuristic on *key names*. A bus is not the place to bet on a heuristic holding.
+- `note` — included in the walk's literals deliberately, because it is the field a future editor
+  would plausibly add without thinking, and no receiver needs it.
+- Carried instead: `finding_id`, `severity`, `source` and the package triple. Severity is the one
+  thing a receiver genuinely cannot compute from an id — its whole decision is *page or file a
+  ticket*. And `finding_id` is enough to act on, because the panel reads the row back through
+  `security.read`, the same guard that protects it.
+
+**The walk found the defect on its first run, and it was not in the new code.**
+
+`upsert_finding` asked `coalesce(xmax, 0)` whether the upsert inserted or updated. `xmax` is an
+`xid`, so Postgres raises `COALESCE types xid and integer cannot be matched` — on every version,
+not a new one. The answer sat in a **second** `select` with `.unwrap_or(true)`, so the error was
+swallowed and **every ingest since the function was written reported every finding as newly
+created.** Verified directly against the box's PostgreSQL 17.11 before touching the code.
+
+The consequence reaches the panel: the findings screen's re-ingest protection has been showing
+`created: N` instead of `created: 0, refreshed: N`, so a nightly CI job re-uploading the same
+report announced every known finding as a new one. And the acceptance criterion *"re-ingesting the
+same report does not duplicate them"* was ticked on 2026-10-01 on a return value that had never
+answered the question — the rows were never duplicated (the fingerprint and unique index do
+that), but the half of the box that reads created-or-refreshed was measuring a constant.
+
+`xmax = 0` now rides the same statement's `RETURNING` clause: one round trip, no second query
+that could see a different row after a concurrent delete, and a failure surfaces as the store
+error it is instead of a plausible-looking `true`.
+
+**Eleventh instance of this REQ's defect class, and the catalogue caught one more thing.**
+`security.ip_rule.changed` shipped in slice 4(a) **with no catalogue row** — the drift gate
+(`every_emitted_name_is_in_the_catalogue`) named it here. An emitter whose name is unlisted
+records an event no endpoint can subscribe to, so the IP rule an operator believes they are
+running applies to nobody. It is green now; nothing in this workspace had asserted that gate on
+the branch it was written on.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-security --quiet` | **208 passed**, 0 failed |
+| catalogue | `cargo test -p omnion-events --quiet` | **49 passed**, 0 failed |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **11/11** (the 10th of last tick's dispose() flake did not recur) |
+| drift | `cargo test -p omnion-api --test events every_emitted_name_is_in_the_catalogue` | **passed** |
+| types | `pnpm typecheck` | **0 errors** (admin + web) |
+
+**The walk's second half is the part containment cannot supply.** Asserting the literals are
+absent is satisfied by an emitter that fires nothing, so the same report is ingested twice and
+the delivery count must stay at **1**. A nightly CI job re-ingests every morning; an endpoint
+that paged on all of those would be muted by the second run, which is the outcome a webhook that
+works perfectly well has silently produced.
+
+**Two process notes.**
+
+* `cargo fmt -p <crate>` sweeps the whole crate's module tree, so it reformatmed three
+  `crates/events` files unrelated to this work. They were committed separately (`a8367bda`) after
+  a `git diff -w` check confirmed they were whitespace-only — the token-level check comes before
+  the style commit, not after.
+* `/mnt/apopic` hit **100%** mid-tick again (`No space left on device` in the linker). Reclaiming
+  only this worktree — `target/debug/incremental` (1.1 GiB) plus the newest-of-each group in
+  `target/debug/deps` (1 239 MiB of stale artifacts) — returned it to 97% with 2.1 GiB free. No
+  sibling held live cargo, confirmed by reading `/proc/<pid>/cwd` rather than by age.
+
+**Browser pass: still owed, now six screen boxes.** The slot was held live by `w4`
+(`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd`,
+not by the age of the placeholder) for the whole tick, with 45 Chrome processes and load 13.
+
+**Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
+REQ-012 can close.
+
+## Tick 97 — REQ-012 migration box: "fresh" was the easy half
+
+**What.** Closed the migration acceptance criterion of the security centre by proving the half
+nobody had: `0151` and `0217` applied to a database that already holds somebody's data.
+
+The criterion said "fresh **and populated**" and only the first word had ever been walked. The
+gap between those two words is the entire criterion — a migration applied to an empty database
+only proves it can create a table, and none of the failures that stop a platform from booting
+are of that kind. `0151` runs three `alter table` statements against a row that already carries
+an operator's saved header policy; `0217` hangs foreign keys off `users` rows that already
+exist. Both are invisible to a fresh-database test.
+
+**The walk.** `apps/api/tests/migration_gap.rs::the_security_migrations_apply_to_a_populated_database`
+migrates the whole tree, seeds a tenant, an account, **locks that account**, saves
+`{"hsts": true}` and records a finding and a check result — then rolls back *only* versions 151
+and 217 in the ledger and drops their objects by hand, so the two files run against that data.
+Rolling back "everything from 151 on" would have re-run the ~40 migrations between them and
+proved sibling writers' work instead of this criterion.
+
+Assertions: the locked account is **still present and still locked**; the saved policy survived
+the alters with its document intact; `0054`'s two tables kept their rows untouched by a migration
+added beside them; `0217`'s rule keeps its `created_by`. Each is one an empty table cannot
+produce.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| migration walk | `cargo test -p omnion-api --test migration_gap -- --test-threads=1` | **5 passed**, 0 failed |
+| crate | `cargo test -p omnion-security --quiet` | **208 passed** |
+| events | `cargo test -p omnion-events --quiet` | **49 passed** |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed** |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **11/11** |
+| drift | `cargo test -p omnion-api --test events every_emitted_name_is_in_the_catalogue` | **passed** |
+| types | `pnpm typecheck` | **0 errors** |
+
+**Proven to fail twice, because both halves of that setup can silently no-op — which is the
+general hazard here.** An assertion in a walk you built yourself is worth exactly as much as the
+setup is capable of failing.
+
+* Neutralising the ledger rollback means the migration never runs, and the read dies on
+  `column "rate_limits" does not exist`. A green run therefore genuinely required the migrations
+  to have executed — and this is the trap this file is full of: a rollback helper that deleted
+  nothing, or a `drop table if exists` that matched no name, would leave a test that passes
+  against migrations that never executed.
+* A `0151` sabotaged into `update security_settings set headers = '{}'` fails on precisely the
+  assertion written for it: *the upgrade must not revert a policy an operator had already
+  saved: {}*. That is the production disaster this criterion is written against, and **on a fresh
+  database it is undetectable** — `0135` inserts that row itself with `{}`, so "the document
+  survived the upgrade" and "the document is the default" are indistinguishable there.
+
+That second point is the finding worth carrying forward: the fresh-database test was green, and
+it *could not have been otherwise*. A green test on the wrong starting state is not weak
+evidence, it is evidence about nothing.
+
+**Note for the next writer, recorded so it is not re-found.** `cargo fmt -p omnion-api` sweeps
+the crate's whole module tree. It was run this tick and `git diff -w` was checked afterwards to
+confirm it touched nothing but `migration_gap.rs` — the token-level check comes *before* the
+style commit, not after.
+
+**Browser pass: still owed, and still not startable.** The slot is held live by `w8`
+(`pid 3591518`, `cwd=/mnt/apopic/omnion-w8`, verified with `kill -0` **and**
+`/proc/<pid>/cwd` — not by the age of the placeholder file), 25 Chrome processes, load 17. Six
+screen boxes on this REQ still turn on it.
+
+**Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
+REQ-012 can close.
+## 2026-10-01 — the two halves of a submission id agreed on every key any fixture used, and the first-touch lookup was still reading the phone column the wrong way round
+
+test(crm-intake): the capped submission id as a row. fix(crm-intake): merge_attribution's stored-side phone normalization.
+
+**This tick closed the half of last tick's gate that was written but never run (`QA_CLAIMS_DB`
+unset), and the very next question — what does the *row* say for an id that had to be capped —
+turned out to have no test anywhere.**
+
+### What the acceptance box says, and what each gate actually measured
+
+The box says **one submission, one lead, no duplicates**. Two gates sat next to it and neither
+measured that sentence:
+
+- `run-crm-submission-id.sh` proves the API's `idempotency_key` and the module's
+  `claims::normalize` return the **same answer** — which was the sentence that was broken.
+- `run-crm-claims.sh` proves the claim table has a **primary key** on `(source_id,
+  submission_id)`.
+
+Both are true and neither is the box. The row is. And every fixture in the claims gate uses a
+two-word id, so for every identity any test had ever written the two halves agreed by
+construction — the disagreement only exists **past the cap**.
+
+`a_key_longer_than_the_cap_still_leaves_one_claim_and_one_lead` therefore states the box as a
+row: an over-long key delivered twice leaves **one claim, one lead, the same lead**, the stored
+key is the **normalized** one, and `claims::lead_of` finds that lead from the caller's **raw**
+spelling. The last two are the four read paths that used to bind the value raw, and they are the
+half a lead count cannot see.
+
+**RED ran before a line of product code was touched**, and the negative control is the reason to
+believe it: with `claims::normalize` reduced to its pre-fix shape (refuse over the cap rather
+than cap it), the gate is **7/8** — exactly this test goes red on the first delivery and the
+seven short-keyed tests stay green. **That is the mechanism, stated plainly: every fixture in the
+file used an id short enough that the bug could not show.** A gate whose fixtures all take the
+same branch measures one branch, however many of them there are.
+
+### The second defect was one function away from last tick's, and the first fix made it findable
+
+`fetch_candidates` was given `dedupe::PHONE_DIGITS_SQL` on tick 67 because it normalized the
+**stored** phone in SQL (`regexp_replace`, which strips the `+`) while the key came from
+`normalize_phone` (which keeps it) — the phone arm could never match. `merge_attribution` reads
+**the same column**, was not part of that fix, and hand-wrote its own normalization:
+
+```text
+dedupe_key(mapped)                                       -> "+905****2233"   (keeps the +)
+and (lower(email) = $3 or lower(coalesce(phone, '')) = $3)
+where the phone column holds                            -> "+90 555 111 22 33" (mapped, VERBATIM)
+```
+
+`insert_lead` binds `mapped.get("phone")` verbatim, so the column holds whatever the operator's
+mapping produced. The two sides agree **only** when the source happens to map the field through
+`e164_lite`; without it the comparison is false for ever, so a phone-identified visitor lost their
+first touch on every submission after the first — the second visit **overwrote the campaign that
+brought them in**, which is precisely what acceptance 6 forbids.
+
+The gate hid it, and the reason is the useful half: its one phone fixture
+(`a_visitor_identified_by_phone_keeps_their_first_touch`) maps through `e164_lite`, so the stored
+column is pre-normalized and the comparison is trivially true. **A fixture that applies the
+transform hides the disagreement rather than fixing it** — and the transform is *optional* on the
+operator's form, so a source without it is the ordinary case.
+
+The stored side is now `dedupe::PHONE_DIGITS_SQL`, the same named expression. The e-mail arm keeps
+`lower()`: e-mails have case and no punctuation to strip, a phone number has neither — which is
+why `PHONE_DIGITS_SQL`'s own unit guard asserts the expression contains no `lower(`.
+
+**RED before the fix** (`left: "autumn-sale"`, `right: "spring-sale"` — the second visit stored
+over the first), then **5/5**, then **PROVEN TO FAIL at 4/5** with the pre-fix spelling restored:
+only the new test goes red.
+
+### Two things worth keeping from the mechanics
+
+**A revert script that removes the control can remove the line it replaced.** The control replaced
+`let stored_phone = PHONE_DIGITS_SQL…`, and deleting the control's own text took the real line
+with it — `E0425: cannot find value 'stored_phone' in this scope`, in a function that had compiled
+minutes earlier. **A negative control that overwrites production code needs its revert to restore
+the original string, not just delete its own.** The compile caught it immediately and the gate was
+re-run green before anything was committed, but a control that is only ever *added* is a much
+safer shape.
+
+**A `python` edit whose `assert count == 1` fails leaves the tree untouched** — which is why the
+second control run reported a clean 5/5 while no control had been applied. The assertion is not
+ceremony; it is the difference between "the negative control failed as designed" and "the negative
+control never ran and the green is meaningless". Read the patch step's own exit code, not the
+cargo exit code at the end of the chain.
+
+### Proof
+
+- `run-crm-submission-id.sh` with the DB half (`QA_CLAIMS_DB=omnion_qa_w8_subid`): cross-boundary
+  **9/9**, DB half **7/7 before this tick's test, 8/8 after**; **PROVEN TO FAIL at 7/8**.
+- `run-crm-attribution.sh` **5/5**, **PROVEN TO FAIL at 4/5**.
+- Regressions: module lib **186/186**, `run-crm-dedupe.sh` **12/12**, `run-crm-claims.sh` **8/8**.
+- Commits `77de49b2` (test) and `041e7ac8` (fix), both pushed to `wave8`.
+
+**Not claimed.** No browser pass: no screen changed (both defects are below the API), and the QA
+slot is held by a live **w5** pass — holder pid 1269373, alive, `cwd=/mnt/apopic/omnion-w5`,
+checked with `kill -0` and `/proc/<pid>/cwd` rather than read off the placeholder's name.
+
+**Next.** The audit that found the second defect is the standing method rather than a one-off:
+`PHONE_DIGITS_SQL` now has **two** call sites, so the remaining question is whether any *third*
+query over `crm_leads.phone` or `.email` still hand-writes its own normalization — `grep` the
+`.bind(`s and the `=`-comparisons rather than the functions, which is what found the other three
+sites of last tick's class.## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
+
+test(events): revive the whole suite. feat(events): catalogue four names the drift gate
+found already on the bus.
+
+**This tick started as two open REQ-016 boxes about a delivery row's `duration_ms` and the
+retry ladder's `next_attempt_at`, and turned into the discovery that the file which was
+supposed to prove them had not run a single assertion for twenty ticks.**
+
+I went looking for the two boxes because they name claims no walk measured: the main bus walk
+asserts `delivered`, `attempts == 1`, `response_status == 200` and a readable terminal error, and
+nothing anywhere asserted that a *successful* delivery carries a duration or that the retries are
+**increasingly spaced**. The second is not assertable by a walk that waits a fixed sleep between
+ticks — such a walk cannot tell "the ladder backed off" from "the runner happened to tick again
+later" — so it needed a walk of its own. Writing it meant running the suite, and the suite
+reported:
+
+```text
+1 passed; 10 failed          # every failure: 403 csrf_unavailable / csrf_failed
+```
+
+**Ten of eleven walks were re-proving one refusal, and none of them was testing the event bus.**
+
+### The root cause: a fixture that could not present a credential
+
+Tick 59 made the session cookie *ambient* authority. A cookie-authenticated **write** must now
+present a double-submit token beside it, and sign-in is the only place the product issues one.
+This suite never had either half of what it needed:
+
+1. it built its `Config` from the environment and **never set a CSRF secret**, so
+   `refuse_if_needed` returned `csrf_unavailable` — *"a test process has no
+   `OMNION_CSRF_SECRET`"*, and
+2. it minted sessions straight through `sessions::create_session` rather than signing in, so
+   **no token was ever issued**, which turns the same refusal into `csrf_failed` — *"this
+   request carries no CSRF token"*.
+
+Both refusals are the **product working correctly**. The defect was the fixture, and it was
+total: with no credential in hand, every `POST /webhooks`, every page publish, every delivery
+tick was refused before `crates/events` saw a request. `support::walk_auth` already lifts this
+shape for every other suite and its own doc comment records this exact failure — *"a red suite
+that blames the product is the most expensive kind of red"* — and `--test media` had already
+been repaired. This suite was simply never migrated.
+
+The fix is the mechanical one that helper prescribes: `with_csrf_secret(&mut config)` on the
+fixture, `account()` deriving each session's token with
+`omnion_security::derive_csrf_token(secret, session_id)` and **packing** it beside the session
+id, and `request()` calling `apply_credential` so the cookie and the `x-omnion-csrf` header are
+set together. Packing is why the twenty-odd call sites did not change: a walk's `token` argument
+never became a pair.
+
+```text
+cargo test -p omnion-api --test events -- --test-threads=1   11 passed  (was 1 passed, 10 failed)
+cargo test -p omnion-events --lib                             49 passed
+cargo test -p omnion-api --lib                               258 passed
+tsc -p apps/admin/tsconfig.json --noEmit                     clean
+```
+
+### The walk the two boxes needed
+
+`a_delivery_row_measures_its_own_duration_and_its_backoff_grows` reads its rows **out of the HTTP
+body**, because that is the path the screen takes: `duration_ms` and `next_attempt_at` are both
+columns on the deliveries table, so a value present in PostgreSQL but dropped by
+`DeliveryBody::build` would be invisible to an operator while every crate test stayed green. The
+ladder is climbed one attempt at a time — each reschedule strictly later than the one before it,
+and the gaps asserted **exponential** rather than merely monotone. A measured run:
+
+```text
+attempt 1 → +112 ms · attempt 2 → +197 ms · attempt 3 → +358 ms     (retry_base 40 ms)
+```
+
+**The assertion I wrote first was wrong and the ladder was right.** "The schedule is in the
+future" read *after* the walk has slept through the delay is asserting that the test slept long
+enough: with a 40 ms base and an HTTP round trip inside the tick, every collected timestamp is
+legitimately due by the time it is checked. Two earlier versions of that check failed while the
+backoff was doubling perfectly. The distance between consecutive schedules is the deterministic
+measurement of the same fact, and it is what the walk asserts.
+
+### Four blind spots in the drift gate, each pointing the registry the wrong way
+
+With the suite alive, its two pre-existing source-scan failures became visible — and both had the
+same shape as the notification queue defect from tick 88: **a measurement that cannot see what it
+is measuring, whose only "fix" is to make the registry lie in the other direction.** Three of the
+four were in the gate; one was a real gap in the table.
+
+| what the gate could not see | what it then claimed | the honest fix |
+|---|---|---|
+| a **doc comment** quoting `NewEvent::new("health.service.degraded")` as the *wrong* implementation | a name `health.service` was emitted that nothing emits | strip `//` before matching — a false emission would push a row for a sentence |
+| `Announcement::new(…)`, REQ-014's emitter, which **cannot** call `NewEvent::new` (health is platform-level and fans out per listening tenant) | 5 live names with no emitter | teach the gate the second constructor |
+| a name on the **next line** (`json!(…)` payloads) or three lines down (`if hold { … } else { … }`) | `health.*` and `media.hold_released` unbacked | a three-line lookahead, reading *every* line in the window for the marker |
+| a **dotted name inside `#[cfg(test)]`** (`health.service.exploded`, built to prove the catalogue check refuses it) | a catalogue row demanded for a name nothing emits | skip `#[cfg(test)]` modules — granting that row is a **lie** in the registry |
+
+Every one of those four pushes toward demoting real, working events to `Reserved`, which makes
+the picker say "a module ships this" about events the platform already emits. **The gate was not
+protecting the registry from drift; it was demanding the registry stop telling the truth.**
+
+The one real gap it did find: `backup.restored`, `notification.delivery.succeeded`,
+`media.hold_placed` and `media.hold_released` were all **Live facts on the bus that no operator
+could subscribe to**, because the picker reads this table and the table had never heard of them.
+`8d6b5b21` adds the four rows. `notification.delivery.succeeded` requires `test` rather than
+offering it — a receiver that read "succeeded" as a production delivery and paged somebody for a
+message a person deliberately asked the platform to send is the worst outcome of that row — and
+both `media.hold_*` require `reason`, because a retention decision nobody can defend later is not
+a retention decision.
+
+### Not done this tick
+
+The browser pass. `scripts/qa/run.sh` was queued behind live siblings for the whole tick — w4
+first, then w3 — and `QA_SLOT_WAIT=3600` held it rather than letting it collide, which is what
+that limit is for. **It then died at its own 2400 s timeout still queued** (the log's last line is
+`waiting for a QA slot`), so this tick has **no** browser pass and every screen-leg box below
+stays open. That is two consecutive ticks now, and the queue behind a single shared slot is long
+enough that the next tick should not assume it will get one either. So REQ-016's screen legs (the
+endpoint form's field messages, the payload inspector's clipboard contents, and the walkthrough
+inventory line) remain unticked with the reason in the box, and REQ-021's keyboard and mobile legs
+are still written-but-unmeasured.
+
+Next: the QA pass, then the remaining REQ-016 screen legs, then REQ-021's.
 
 ## Tick 96 — the `security.finding.opened` webhook, and a store bug behind it
 
@@ -13923,90 +14192,6 @@ turn on a pass that has not run**, and the definition of done forbids closing a 
 **Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
 a free slot.
 
-## Tick 96 — the `security.finding.opened` webhook, and a store bug behind it
-
-**Picked:** REQ-012 slice 4(d), the last of four. Slices 1–3 and 4(a)–(c) were already
-code-complete, so this was the only piece standing between slice 4 and a REQ whose sole
-remaining work is the browser pass.
-
-**What shipped.** `security.finding.opened` in the catalogue (`e15d1880`), the emitter in the
-import path (`73e890b6`), the walk (`25306c7b`), and the store fix the walk forced (`d6c26218`).
-
-**The payload is an identity, never a content.** This is the first security payload on the
-platform that fans out to a receiver outside the operator's own infrastructure by default, and
-the fields it does *not* carry are the whole design:
-
-- `title`, `description`, `evidence` — all three are content that arrived from outside (a CI
-  vendor's package name, its prose, the raw entry), and the ingest path's credential heuristic
-  is a heuristic on *key names*. A bus is not the place to bet on a heuristic holding.
-- `note` — included in the walk's literals deliberately, because it is the field a future editor
-  would plausibly add without thinking, and no receiver needs it.
-- Carried instead: `finding_id`, `severity`, `source` and the package triple. Severity is the one
-  thing a receiver genuinely cannot compute from an id — its whole decision is *page or file a
-  ticket*. And `finding_id` is enough to act on, because the panel reads the row back through
-  `security.read`, the same guard that protects it.
-
-**The walk found the defect on its first run, and it was not in the new code.**
-
-`upsert_finding` asked `coalesce(xmax, 0)` whether the upsert inserted or updated. `xmax` is an
-`xid`, so Postgres raises `COALESCE types xid and integer cannot be matched` — on every version,
-not a new one. The answer sat in a **second** `select` with `.unwrap_or(true)`, so the error was
-swallowed and **every ingest since the function was written reported every finding as newly
-created.** Verified directly against the box's PostgreSQL 17.11 before touching the code.
-
-The consequence reaches the panel: the findings screen's re-ingest protection has been showing
-`created: N` instead of `created: 0, refreshed: N`, so a nightly CI job re-uploading the same
-report announced every known finding as a new one. And the acceptance criterion *"re-ingesting the
-same report does not duplicate them"* was ticked on 2026-10-01 on a return value that had never
-answered the question — the rows were never duplicated (the fingerprint and unique index do
-that), but the half of the box that reads created-or-refreshed was measuring a constant.
-
-`xmax = 0` now rides the same statement's `RETURNING` clause: one round trip, no second query
-that could see a different row after a concurrent delete, and a failure surfaces as the store
-error it is instead of a plausible-looking `true`.
-
-**Eleventh instance of this REQ's defect class, and the catalogue caught one more thing.**
-`security.ip_rule.changed` shipped in slice 4(a) **with no catalogue row** — the drift gate
-(`every_emitted_name_is_in_the_catalogue`) named it here. An emitter whose name is unlisted
-records an event no endpoint can subscribe to, so the IP rule an operator believes they are
-running applies to nobody. It is green now; nothing in this workspace had asserted that gate on
-the branch it was written on.
-
-**Proof.**
-
-| Gate | Command | Result |
-|---|---|---|
-| crate | `cargo test -p omnion-security --quiet` | **208 passed**, 0 failed |
-| catalogue | `cargo test -p omnion-events --quiet` | **49 passed**, 0 failed |
-| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
-| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **11/11** (the 10th of last tick's dispose() flake did not recur) |
-| drift | `cargo test -p omnion-api --test events every_emitted_name_is_in_the_catalogue` | **passed** |
-| types | `pnpm typecheck` | **0 errors** (admin + web) |
-
-**The walk's second half is the part containment cannot supply.** Asserting the literals are
-absent is satisfied by an emitter that fires nothing, so the same report is ingested twice and
-the delivery count must stay at **1**. A nightly CI job re-ingests every morning; an endpoint
-that paged on all of those would be muted by the second run, which is the outcome a webhook that
-works perfectly well has silently produced.
-
-**Two process notes.**
-
-* `cargo fmt -p <crate>` sweeps the whole crate's module tree, so it reformatmed three
-  `crates/events` files unrelated to this work. They were committed separately (`a8367bda`) after
-  a `git diff -w` check confirmed they were whitespace-only — the token-level check comes before
-  the style commit, not after.
-* `/mnt/apopic` hit **100%** mid-tick again (`No space left on device` in the linker). Reclaiming
-  only this worktree — `target/debug/incremental` (1.1 GiB) plus the newest-of-each group in
-  `target/debug/deps` (1 239 MiB of stale artifacts) — returned it to 97% with 2.1 GiB free. No
-  sibling held live cargo, confirmed by reading `/proc/<pid>/cwd` rather than by age.
-
-**Browser pass: still owed, now six screen boxes.** The slot was held live by `w4`
-(`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd`,
-not by the age of the placeholder) for the whole tick, with 45 Chrome processes and load 13.
-
-**Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
-REQ-012 can close.
-
 ## Tick 66 - every timestamp the CRM sent was a string no browser can parse, and the walkthrough had been recording the proof on every pass since the screen shipped
 
 **What.** `OffsetDateTime::to_string()` is a `Display` impl, and it renders
@@ -14364,3 +14549,214 @@ acceptance box actually promises, and it needs the row, not the function.
 **BOX:** `/mnt/apopic` hit 100% between two calls in this tick; a `cp` failed with ENOSPC and
 the negative control could not start. Disk state read at the start of a tick is stale by the
 end of it - re-check `df` immediately before any write that must land, not once at tick start.
+## Tick 97 — REQ-012 migration box: "fresh" was the easy half
+
+**What.** Closed the migration acceptance criterion of the security centre by proving the half
+nobody had: `0151` and `0217` applied to a database that already holds somebody's data.
+
+The criterion said "fresh **and populated**" and only the first word had ever been walked. The
+gap between those two words is the entire criterion — a migration applied to an empty database
+only proves it can create a table, and none of the failures that stop a platform from booting
+are of that kind. `0151` runs three `alter table` statements against a row that already carries
+an operator's saved header policy; `0217` hangs foreign keys off `users` rows that already
+exist. Both are invisible to a fresh-database test.
+
+**The walk.** `apps/api/tests/migration_gap.rs::the_security_migrations_apply_to_a_populated_database`
+migrates the whole tree, seeds a tenant, an account, **locks that account**, saves
+`{"hsts": true}` and records a finding and a check result — then rolls back *only* versions 151
+and 217 in the ledger and drops their objects by hand, so the two files run against that data.
+Rolling back "everything from 151 on" would have re-run the ~40 migrations between them and
+proved sibling writers' work instead of this criterion.
+
+Assertions: the locked account is **still present and still locked**; the saved policy survived
+the alters with its document intact; `0054`'s two tables kept their rows untouched by a migration
+added beside them; `0217`'s rule keeps its `created_by`. Each is one an empty table cannot
+produce.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| migration walk | `cargo test -p omnion-api --test migration_gap -- --test-threads=1` | **5 passed**, 0 failed |
+| crate | `cargo test -p omnion-security --quiet` | **208 passed** |
+| events | `cargo test -p omnion-events --quiet` | **49 passed** |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed** |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **11/11** |
+| drift | `cargo test -p omnion-api --test events every_emitted_name_is_in_the_catalogue` | **passed** |
+| types | `pnpm typecheck` | **0 errors** |
+
+**Proven to fail twice, because both halves of that setup can silently no-op — which is the
+general hazard here.** An assertion in a walk you built yourself is worth exactly as much as the
+setup is capable of failing.
+
+* Neutralising the ledger rollback means the migration never runs, and the read dies on
+  `column "rate_limits" does not exist`. A green run therefore genuinely required the migrations
+  to have executed — and this is the trap this file is full of: a rollback helper that deleted
+  nothing, or a `drop table if exists` that matched no name, would leave a test that passes
+  against migrations that never executed.
+* A `0151` sabotaged into `update security_settings set headers = '{}'` fails on precisely the
+  assertion written for it: *the upgrade must not revert a policy an operator had already
+  saved: {}*. That is the production disaster this criterion is written against, and **on a fresh
+  database it is undetectable** — `0135` inserts that row itself with `{}`, so "the document
+  survived the upgrade" and "the document is the default" are indistinguishable there.
+
+That second point is the finding worth carrying forward: the fresh-database test was green, and
+it *could not have been otherwise*. A green test on the wrong starting state is not weak
+evidence, it is evidence about nothing.
+
+**Note for the next writer, recorded so it is not re-found.** `cargo fmt -p omnion-api` sweeps
+the crate's whole module tree. It was run this tick and `git diff -w` was checked afterwards to
+confirm it touched nothing but `migration_gap.rs` — the token-level check comes *before* the
+style commit, not after.
+
+**Browser pass: still owed, and still not startable.** The slot is held live by `w8`
+(`pid 3591518`, `cwd=/mnt/apopic/omnion-w8`, verified with `kill -0` **and**
+`/proc/<pid>/cwd` — not by the age of the placeholder file), 25 Chrome processes, load 17. Six
+screen boxes on this REQ still turn on it.
+
+**Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
+REQ-012 can close.
+
+## Tick 98 — the media serve path had no validator at all
+
+**What.** `crates/media/src/validators.rs` (new, 20 tests) plus the four media serve paths, so a
+`GET` can say "I already hold these bytes" and be told `304`. The ETag is the row's `checksum`,
+which `append_version` rewrites in the same statement that moves `storage_key`.
+
+**The defect, and why nothing had caught it.** The serve path set `private, max-age=300` at a URL
+that **names the file rather than its contents**, and the tree carried no `ETag` and no
+`If-None-Match` handling anywhere — `grep -rn 'IF_NONE_MATCH\|NOT_MODIFIED\|ETAG' apps/ crates/`
+returned one unrelated SCIM line. Two facts therefore held at once and neither was visible: every
+repeat request pulled the whole object off the store, and a **replace changed the bytes behind an
+address that had promised they had not changed**. A visitor, the panel or a CDN honouring that
+`max-age` saw the previous photograph for five minutes after an operator corrected it. It is the
+uncalled `prune_candidates` defect class again, one module over: a TTL and a URL that together
+describe a promise nothing on the request path keeps.
+
+**Three decisions that are not decoration.**
+
+1. **The validator is the checksum, not a timestamp.** `updated_at` is stamped by a rename, a tag
+   edit and a folder move, so it changes when the bytes did not and fails to describe the one
+   change that did. The checksum is the identity of the pixels, and the walk asserts a validator
+   built from anything else cannot pass.
+2. **A version validates against its own checksum.** `serve_bytes` used the version row; had it
+   borrowed the file's validator it would answer `304` for a historical version the caller has
+   never seen.
+3. **The check happens before the body is read.** Reading first and deciding afterwards costs what
+   an unconditional `200` costs, which defeats the entire point.
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **219 passed**, 0 failed (was 179) |
+| walk | `cargo test -p omnion-api --test media -- --test-threads=1` | **16 passed**, 0 failed |
+| types | `apps/admin` `tsc --noEmit` | **0 errors** |
+
+The crate's 20 new tests, and the full 16-test walk suite green against a fresh database on port
+5433 (`omnion_cond`) — including the three walks this change touches: the range walk, the replace
+walk and the new conditional one. The walk
+`a_conditional_get_is_answered_from_the_bytes_and_a_replace_moves_the_validator` drives the real
+router over live PostgreSQL: upload, read the validator, revalidate to a `304` with an **empty
+body**, `*`, the date fallback, then **replace** — and assert the stale validator is answered
+`200` with the *new* bytes, that the new validator then settles, that version 1 revalidates against
+itself and is **not** answered by the file's current validator, and that an unparseable validator
+gets the representation rather than a `304`.
+
+**Proven to fail twice, because both halves of a self-written suite can no-op.**
+
+* The weak marker removed (`const WEAK = ""`) → the quoting test fails. A validator that stops
+  being weak is one that claims a byte-for-byte uniqueness the platform cannot promise.
+* The date comparison replaced by `true` → **two** tests fail. That is the bug this tick nearly
+  shipped: a shadowed `since` binding in the first draft made `If-Modified-Since` match *anything*,
+  which would have sent a `304` for every client that sent a date. The suite caught it.
+
+One test of mine was **wrong, not the code**: it asserted a client dated *after* the resource gets
+the bytes. A client cannot be right about the future, so `304` is correct and the test was fixed —
+the direction of that comparison is the whole content of the case.
+
+**Note for the next writer.** `cargo fmt -p omnion-media` sweeps the crate's whole module tree —
+it reformatted `duplicates.rs`, `grants.rs`, `retention.rs`, `scanning.rs`, `shares.rs`,
+`storage_settings.rs` and `usage.rs`, none of them mine. Revert them (`git checkout --`) rather
+than committing a sibling's reformat into this tick. Related: `/mnt/apopic` hit **100%** mid-tick
+(482 MB free) and an `open(...).write()` on `apps/api/tests/media.rs` died with `ENOSPC` **after
+truncating the file to 1862 lines**. The file was recovered with `git checkout --` and re-applied
+through `/dev/shm`. On this box, write a file to `/dev/shm` first and copy it into place.
+
+**Browser pass: still owed, and still not startable.** The slot is held live by `w6`
+(`pid 2904616`, `cwd=/mnt/apopic/omnion-w6`, verified with `kill -0` **and** `/proc/<pid>/cwd`),
+45 Chrome processes, load 27. REQ-010's screen-state box and this REQ's five screen boxes turn on it.
+
+**Next:** `bash scripts/qa/run.sh --only=media` on a free slot.
+
+---
+
+## Tick 99 — the custom metadata pairs nobody ever wrote (REQ-010)
+
+The `media.metadata` column has carried a `jsonb` value and a **GIN index** since `0025`, and
+`UpdateFileBody` has had a `metadata` field since the first draft of the file route. A search of
+`apps/` and `crates/` found **no writer and no reader**: every row in every installation was `{}`,
+the index scanned an empty object per row, and the REQ's own scope line — "custom key/value pairs
+(`metadata jsonb` with a GIN index)" and "a metadata filter in the browser" — was satisfied by a
+column. It is the uncalled-column defect class one level up from the uncalled `prune_candidates`
+function, and it survived 98 ticks because **nothing in the tree was broken**: the code compiled,
+every test was green, and the column was there.
+
+Shipped as `crates/media/src/metadata_pairs.rs`, `Filter::MetadataPair` in the browser builder,
+the validation on `PATCH /api/v1/media/files/{id}`, and `features/media/metadata-pairs.tsx` with
+the `Custom pair` field on the browser toolbar.
+
+**Five decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **Values are text, never arbitrary jsonb.** A nested object or a list is a `400` naming the
+   key, not `[object Object]` or `1,2,3`. A flattened structure is searchable and uninterpretable
+   at the same time; a container also has no single meaning for the containment test the GIN index
+   serves, and a numeric value makes a `-> 'k' = 'v'` comparison false for a value that *is* `v`.
+2. **The filter is `metadata ->> $n = $n+1`, not `@>`.** Containment is false for a stored number
+   compared against a string, and a jsonb equality is not the form the 0025 index was built for.
+3. **The set is replaced whole, never merged.** A partial merge lets a caller who does not know
+   the current set drop every pair it did not send — how a licence number disappears during a
+   caption edit. `{}` clears; an omitted field does not.
+4. **A half-typed `key=` is not a filter.** The toolbar field is re-read on every keystroke.
+5. **The editor is a block with its own save button.** The pairs are facts about *this library's
+   copy*, not facts the file carries — listing them beside the dimensions would claim they were
+   extracted — and one `Save metadata` that also rewrote the pairs would let a caption edit empty a
+   licence field.
+
+Caps: 40 pairs, 60-byte keys, 500-byte values, 8 kB total, each refused with the key **named**
+rather than truncated. The total cap is load-bearing — 40 × 500 are individually legal and together
+are a row every listing drags along.
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **243 passed**, 0 failed (was 219) |
+| crate | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walk | `cargo test -p omnion-api --test media -- --test-threads=1` | **18 passed**, 0 failed (was 16) |
+| types | `apps/admin` `tsc --noEmit` | **0 errors** |
+| ui | `/tmp/probe-pairs.cjs` | **22/22** |
+
+**Proven to fail, three times.** Removing the validation from the route fails the walk on the
+stored jsonb's *type*. Swapping `->>` for `->` fails two crate tests. Making a half-typed term
+default to `campaign=` fails one. Plus a fourth, on the UI: removing the row mapping fails the
+probe's check.
+
+**Three of the four failures were my own mistakes, and the first is the one worth keeping.** The
+walk filtered `/api/v1/media` — the **flat core** endpoint that answers `{"media": [...]}` with no
+count — rather than `/media/files`, the browser listing the toolbar actually talks to. The endpoint
+whose name looks like the file manager is not the one the panel uses; that is the same lesson
+`raw_with_preset` taught two ticks ago, and it is now the second time. The other two: the error
+envelope is `{"error": {...}}`, so `body["code"]` reads `null` and looks like a missing field
+rather than a wrong address; and `member_token` holds *no* media permission in this fixture, so an
+assertion that a member can list failed `403` while the fixture's own doc comment says so.
+
+**Note for the next writer.** `cargo fmt -p omnion-media` reports diffs in nine files of which two
+are mine — `duplicates.rs`, `grants.rs`, `retention.rs`, `scanning.rs`, `shares.rs`,
+`storage_settings.rs` and `usage.rs` are pre-existing. Run `rustfmt --edition 2024 <file>` on the
+files you actually touched. And `/mnt/apopic` swung between 95% and 100% during this tick: write to
+`/dev/shm` first, then copy into place.
+
+**Browser pass: queued, not yet run.** `scripts/qa/run.sh --only=media` is waiting on the shared
+slot — `w4` holds it live (`pid 1782910`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0`
+**and** `/proc/<pid>/cwd`, not the placeholder's age). This REQ still rests on it for its screen
+states, and it is not closed on tests alone.
+
+**Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
+hook to REQ-011.

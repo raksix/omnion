@@ -109,6 +109,7 @@ export function MediaView() {
   const [search, setSearch] = useState("");
   const [kind, setKind] = useState("");
   const [scanStatus, setScanStatus] = useState("");
+  const [metadataTerm, setMetadataTerm] = useState("");
   const [hasVersions, setHasVersions] = useState(false);
   const [recursive, setRecursive] = useState(true);
   const [showFilters, setShowFilters] = useState(false);
@@ -129,11 +130,12 @@ export function MediaView() {
       search: search.trim() || undefined,
       kind: kind || undefined,
       scan_status: scanStatus || undefined,
+      metadata: metadataTerm || undefined,
       has_versions: hasVersions || undefined,
       sort,
       limit: 200,
     }),
-    [folderId, recursive, search, kind, scanStatus, hasVersions, sort],
+    [folderId, recursive, search, kind, scanStatus, metadataTerm, hasVersions, sort],
   );
 
   const reload = useCallback(() => {
@@ -197,7 +199,7 @@ export function MediaView() {
     // `reloadToken.current` is a ref, so it is read rather than watched; `reload` bumps it.
   }, [siteId, filters, reloadToken.current]);
 
-  const activeFilters = [kind, scanStatus, hasVersions ? "versions" : "", search.trim()].filter(
+  const activeFilters = [kind, scanStatus, metadataTerm, hasVersions ? "versions" : "", search.trim()].filter(
     Boolean,
   ).length;
 
@@ -777,6 +779,26 @@ export function MediaView() {
                 ))}
               </select>
             </div>
+            <div>
+              <label
+                htmlFor="media-metadata"
+                className="mb-1 block text-[11.5px] font-medium text-muted"
+              >
+                Custom pair
+              </label>
+              <input
+                id="media-metadata"
+                data-testid="media-metadata-filter"
+                value={metadataTerm}
+                placeholder="campaign=spring-2026"
+                onChange={(event) => setMetadataTerm(event.target.value)}
+                className="w-56 rounded-lg border border-line bg-surface px-2 py-1.5 font-mono text-[12.5px]"
+              />
+              <p className="mt-1 text-[11px] text-muted">
+                One pair, exactly. A half-typed <code className="font-mono">key=</code> filters
+                nothing until it is finished.
+              </p>
+            </div>
             <label className="flex items-center gap-1.5 text-[12.5px]">
               <input
                 type="checkbox"
@@ -802,6 +824,7 @@ export function MediaView() {
                   setSearch("");
                   setKind("");
                   setScanStatus("");
+                  setMetadataTerm("");
                   setHasVersions(false);
                 }}
                 className="rounded-lg border border-line px-2.5 py-1.5 text-[12px] transition hover:bg-surface"
@@ -852,6 +875,7 @@ export function MediaView() {
                     setSearch("");
                     setKind("");
                     setScanStatus("");
+                    setMetadataTerm("");
                     setHasVersions(false);
                   }}
                   className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
