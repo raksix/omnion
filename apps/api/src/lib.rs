@@ -20,6 +20,7 @@ pub mod dto;
 pub mod error;
 pub mod event_retention_runner;
 pub mod event_runner;
+pub mod guard_announce;
 pub mod guards;
 pub mod health_events;
 pub mod health_runner;

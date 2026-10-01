@@ -1816,6 +1816,16 @@ pub async fn chat(
         &omnion_ai_hub::guard_checkpoint::value_salt(organization_id.unwrap_or(Uuid::nil()), None),
     )
     .await?;
+    // REQ-105: an exemption that lapsed stops applying on the **next** request, and that lapse is
+    // announced. The announcement runs here, off traffic, rather than off a scheduler — see
+    // `crate::guard_announce` for why that is the deliberate trade. It is placed *after* the
+    // checkpoint because the checkpoint is what read liveness: by the time this runs, the guard
+    // above has already decided this request without the lapsed exemption, which is the
+    // behaviour the criterion asks for. Doing it before would announce a lapse that had not yet
+    // affected anything.
+    if let Some(tenant) = organization_id {
+        crate::guard_announce::announce_lapsed_exemptions(state.db().pool(), tenant).await;
+    }
     for failure in omnion_ai_hub::guard_checkpoint::audit_failures(&reports) {
         // The verdict stands, but an operator reading the events screen must learn that the
         // screen is behind. A `warn` here rather than an error: the request was answered.
