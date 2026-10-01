@@ -6651,3 +6651,11 @@ tests green and the screen a lie again. The harness was wrong, not the product.
 
 **Next.** REQ-012's browser pass is still owed for the boxes that name a screen
 (`/security`, `/security/events`, the locked-accounts table and its unlock). Slices 4 and 5 follow.
+**Browser pass deliberately not started this tick (recorded, not skipped silently).** Tick 93 is
+not a REQ-close tick, and the box this tick proved is a backend walk rather than a screen box. The
+slot was free — the holder PID is dead, so the place file is stale — but the box was not: load 7.15
+on 6 cores, swap 23.5G of 32G used, 35 Chrome processes and two sibling passes (w5, w8) mid
+walkthrough. A third browser pass into that is the documented 29-September failure (consecutive
+passes OOM-killing each other), and killing a sibling's pass to make room for mine trades one
+loop's evidence for another's. The boxes that name a screen stay unticked until a tick finds the
+box idle, which is the same condition `run.sh`'s own `flock` was added to protect.
