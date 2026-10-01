@@ -70,6 +70,27 @@ export function MaintenanceWindowBanner() {
     return () => window.clearInterval(timer);
   }, [load]);
 
+  // The strip also re-reads the moment this tab regains focus, because a strict interval can only
+  // answer "how stale is this on average" — never "how stale is this now". A poll landing at
+  // t=29.9s and one at t=0.1s are the same loop, so the operator who closes a window and looks
+  // straight back can be looking at a banner up to a full interval *older* than the one they were
+  // promised. That is the exact failure this strip must not have: every write succeeds again and
+  // the panel keeps claiming otherwise until somebody believes it. One request for a tab that
+  // returns to the foreground, and none for the thirty that do not.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        void load();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, [load]);
+
   if (windows.length === 0) {
     return null;
   }
