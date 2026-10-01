@@ -20,11 +20,13 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod generate;
 pub mod model;
 pub mod store;
 pub mod validate;
 
 pub use error::{AppBuilderError, BlockedArtifact, Result, describe_blocker};
+pub use generate::{Generated, kind_rank, missing_required_kinds, normalize, schema_prompt};
 pub use model::{
     ARTIFACT_STATUSES, AppBuilderApplication, AppBuilderApplicationStep, AppBuilderArtifact,
     AppBuilderPlan, EditedArtifact, KINDS, MAX_PROMPT_LEN, MIN_PROMPT_LEN, NEW_PLAN_STATUS,
