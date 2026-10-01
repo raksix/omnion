@@ -6157,7 +6157,14 @@ async function runCdnPurgeDepth(page, report) {
   // message — the whole reason the screen exists.
   await page.goto(`${URL_ADMIN}/cdn/purges`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1600);
-  steps.rows = await page.locator("[data-cdn-purge-row]").count();
+  // Count only the rows a person can actually see. The panel renders the purge history twice —
+  // a table from `md` up and cards below it — and BOTH carry `data-cdn-purge-row`, so a plain
+  // count reads 4 where the header says "Showing 2 of 2" and the three-way comparison reports a
+  // mismatch that does not exist. The hooks are deliberately shared (a hook in only one rendering
+  // halves what a depth pass can drive), which is exactly why the count has to disambiguate the
+  // other way: Playwright's `:visible` matches what the viewport shows, so the two renderings
+  // contribute one row each instead of two.
+  steps.rows = await page.locator("[data-cdn-purge-row]:visible").count();
   steps.failedBanner = (await page.locator("[data-cdn-purge-failed-banner]").count()) > 0;
   steps.pageTotal = (
     await page.locator("header p").first().innerText().catch(() => "")
@@ -6311,7 +6318,8 @@ async function runCdnRulesDepth(page, report) {
 
   await page.goto(`${URL_ADMIN}/cdn/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1600);
-  steps.rows = await page.locator("[data-cdn-rule-row]").count();
+  // Same dual-rendering count as the purge history: table plus mobile cards, one shared hook.
+  steps.rows = await page.locator("[data-cdn-rule-row]:visible").count();
   steps.pageTotal = (
     await page.locator("[data-cdn-rule-count]").innerText().catch(() => "")
   )
@@ -6439,8 +6447,13 @@ async function runCdnRulesDepth(page, report) {
   // on a control the pass has not first proved is moveable is how a green step measures
   // nothing.
   const mover = before[before.length - 1] ?? "";
-  const moverRow = page.locator(`[data-cdn-rule-row="${mover}"]`);
-  const moverUp = page.locator(`[data-cdn-rule-up="${mover}"]`);
+  // `:visible` on both. The hook exists in the desktop table AND the mobile card list — that is
+  // deliberate, so a depth pass can drive either layout — but it means a bare attribute locator
+  // resolves to TWO elements and `click()` dies on strict mode before the panel is ever asked to
+  // move anything. The pass reported this as `cdnRules.ok: false, steps: 0`, which reads as a
+  // broken reorder control when nothing had been attempted.
+  const moverRow = page.locator(`[data-cdn-rule-row="${mover}"]:visible`);
+  const moverUp = page.locator(`[data-cdn-rule-up="${mover}"]:visible`);
   steps.moverExists = (await moverRow.count()) > 0;
   steps.moverUpEnabled = await moverUp.isEnabled().catch(() => false);
   await moverUp.click({ timeout: 5000 });
@@ -6475,7 +6488,7 @@ async function runCdnRulesDepth(page, report) {
 
   // The toggle and the duplicate, because a table whose rows can only be created is half a
   // screen. Both are read back through the API.
-  await page.locator(`[data-cdn-rule-toggle="${secondId}"]`).click({ timeout: 5000 }).catch(() => {});
+  await page.locator(`[data-cdn-rule-toggle="${secondId}"]:visible`).click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(1600);
   steps.toggled = await page.evaluate(
     async ([siteId, id]) => {
@@ -6487,7 +6500,7 @@ async function runCdnRulesDepth(page, report) {
     },
     [site, secondId],
   );
-  await page.locator(`[data-cdn-rule-duplicate="${created?.id ?? ""}"]`).click({ timeout: 5000 }).catch(() => {});
+  await page.locator(`[data-cdn-rule-duplicate="${created?.id ?? ""}"]:visible`).click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(1800);
   steps.duplicated = await page.evaluate(
     async ([siteId, name]) => {
@@ -10102,7 +10115,14 @@ async function main() {
   // from a pass that proved nothing because it was pointed at nothing. The count is also
   // printed in the log line above, so a reader can tell how much of the panel was covered.
   if (!ONLY_ALL) {
-    const unmatched = ONLY.filter((name) => !matchedOnly.has(name) && !MOBILE_NAMES.has(name));
+    // "Did this scope match anything?" has to be asked with the SAME test `wants()` uses.
+    // The rollup asked `matchedOnly.has(name)` — an exact test — so a scope that legitimately
+    // matched by prefix (`--only=cdn` against `cdn-overview` and `cdnRules`) was reported as
+    // `unknown-pass-name` even while the pass walked every screen it named. A guard that fires
+    // on a scope the pass just honoured is worse than no guard: it teaches the reader to ignore
+    // the line that exists to catch a pass pointed at nothing.
+    const matchedByScope = (name) => [...matchedOnly].some((walked) => walked === name || walked.startsWith(name));
+    const unmatched = ONLY.filter((name) => !matchedByScope(name) && !MOBILE_NAMES.has(name));
     if (matchedOnly.size === 0) {
       pushFindings(
         "high",
