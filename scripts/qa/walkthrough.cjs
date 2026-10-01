@@ -6722,6 +6722,179 @@ async function runContentApiDepth(page, report) {
   await page.selectOption("[data-content-api-usage-window]", "30").catch(() => {});
   await page.waitForTimeout(1200);
 
+  // ------------------------------------------------------------------ the Explorer
+  // Opened AFTER the usage tab on purpose: the Explorer's calls are what the usage tab reports,
+  // so running it first would make the usage assertions above depend on a click that might fail.
+  const explorerTokenId = usageToken?.token?.id ?? "";
+  await page
+    .goto(
+      `${URL_ADMIN}/content-api/explorer?endpoint=pages.list&token=${explorerTokenId}&limit=3`,
+      { waitUntil: "domcontentloaded" },
+    )
+    .catch(() => {});
+  await page.waitForTimeout(2500);
+
+  steps.explorerScreenReady = (await page.locator("[data-content-api-explorer]").count()) > 0;
+  steps.explorerScreenHasNoErrorStrip =
+    (await page.locator("[data-content-api-explorer-error]").count()) === 0;
+  steps.explorerTabIsLinked =
+    (await page.locator("[data-content-api-explorer-tab], [data-content-api-tab=\"explorer\"]").count()) > 0;
+  // The picker is generated from the OpenAPI document, so "every documented operation has a row"
+  // is checked against the SERVER's ids rather than a hand-written list — the list that would
+  // silently stop matching the day a seventh route was documented.
+  const documentedOps = await page
+    .request.get(`${URL_API}/api/v1/content-api/openapi.json`)
+    .then((response) => response.json().catch(() => ({})))
+    .then((doc) =>
+      Array.from(
+        new Set(
+          Object.values(doc.paths ?? {}).flatMap((methods) =>
+            Object.values(methods ?? {})
+              .map((operation) => operation?.operationId)
+              .filter(Boolean),
+          ),
+        ),
+      ),
+    )
+    .catch(() => []);
+  steps.explorerListsEveryDocumentedOperation =
+    documentedOps.length > 0 &&
+    (await page.locator("[data-content-api-explorer-endpoint]").count()) ===
+      documentedOps.length;
+  // The deep link must restore the parameter, not just the screen: a tab that renders and then
+  // ignores `?limit=3` is a link you cannot put in a runbook.
+  steps.explorerRestoresTheDeepLinkedParameter =
+    (await page
+      .locator("[data-content-api-explorer-field=\"limit\"] input")
+      .inputValue()
+      .catch(() => "")) === "3";
+
+  await shot(page, "content-api-explorer");
+
+  // Leg one: a real call. TWO sends, because the interesting claim is not "the button works" but
+  // "the second call costs budget the first one spent" — one call cannot tell a limiter from a
+  // counter that always answers the tier.
+  const sendAndRead = async () => {
+    await page.locator("[data-content-api-explorer-send]").click().catch(() => {});
+    await page.waitForTimeout(2200);
+    return {
+      status: await page
+        .locator("[data-content-api-explorer-status]")
+        .first()
+        .getAttribute("data-content-api-explorer-status")
+        .catch(() => null),
+      remaining: await page
+        .locator("[data-content-api-explorer-remaining]")
+        .first()
+        .getAttribute("data-content-api-explorer-remaining")
+        .catch(() => null),
+      metered: await page
+        .locator("[data-content-api-explorer-metered]")
+        .first()
+        .getAttribute("data-content-api-explorer-metered")
+        .catch(() => null),
+    };
+  };
+
+  const first = await sendAndRead();
+  steps.explorerCallIsServed = first.status === "200";
+  steps.explorerShowsTheResolvedUrl = (
+    (await page
+      .locator("[data-content-api-explorer-url]")
+      .first()
+      .innerText()
+      .catch(() => "")) || ""
+  ).includes("/api/v1/content/pages");
+  // **The metered route is the TEMPLATE.** One logical endpoint is one row on the Usage tab's
+  // leaderboard however many slugs were walked; a resolved path would split `pages` into one row
+  // per slug and make the leaderboard useless for the one integration it describes.
+  steps.explorerMetersTheTemplateNotTheResolvedPath = first.metered === "/content/pages";
+  steps.explorerShowsTheRateLimitHeader =
+    first.remaining !== null && /\d+/.test(first.remaining);
+  steps.explorerShowsTheResponseBody =
+    (await page.locator("[data-content-api-explorer-body]").count()) === 1;
+  await shot(page, "content-api-explorer-answer");
+
+  const second = await sendAndRead();
+  // `unknown` is a real state — the meter fails open, so the header is ABSENT rather than zero —
+  // and it is accepted as such. Asserting a number there would be asserting Redis was up, which
+  // is a claim about the environment and not about this screen.
+  steps.theRemainingHeaderDecreases =
+    first.remaining === "unknown" || second.remaining === "unknown"
+      ? true
+      : Number(second.remaining) < Number(first.remaining);
+
+  // Leg two: the snippet. It must name the variable and never a credential — the panel cannot
+  // produce a plaintext, so a snippet carrying one would be a lie an integrator pastes into a
+  // shell, where it lands in their history.
+  const snippet = await page
+    .locator("[data-content-api-explorer-snippet]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.theSnippetNamesTheTokenVariable = snippet.includes("OMNION_TOKEN");
+  steps.theSnippetCarriesNoCredential = !snippet.includes("omn_");
+  steps.theSnippetReproducesTheUrl = snippet.includes("/api/v1/content/pages");
+  await page
+    .locator("[data-content-api-explorer-snippet=\"python\"]")
+    .click()
+    .catch(() => {});
+  await page.waitForTimeout(400);
+  steps.snippetLanguageSwitchIsReal = (
+    (await page
+      .locator("[data-content-api-explorer-snippet]")
+      .first()
+      .innerText()
+      .catch(() => "")) || ""
+  ).includes("requests");
+  await shot(page, "content-api-explorer-python");
+
+  // Leg three: a missing path parameter must be refused by NAME and the field highlighted,
+  // because a form that says "invalid parameter" without pointing at one is a form everybody works
+  // around by guessing.
+  await page
+    .locator("[data-content-api-explorer-endpoint=\"pages.read\"]")
+    .click()
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.theItemEndpointDemandsItsSlug =
+    (await page.locator("[data-content-api-explorer-field=\"slug\"] input").count()) === 1;
+  await page.locator("[data-content-api-explorer-send]").click().catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.aMissingPathParameterIsRefused =
+    (await page.locator("[data-content-api-explorer-error]").count()) > 0;
+  steps.theRefusalHighlightsTheOffendingField =
+    (await page
+      .locator("[data-content-api-explorer-field=\"slug\"][data-offender=\"true\"]")
+      .count()) === 1;
+
+  // A token that cannot authenticate is refused with the surface's OWN code, so an operator reads
+  // "this token is revoked" rather than "the content API is broken".
+  const revokedCall = await page
+    .request.post(`${URL_API}/api/v1/content-api/explorer`, {
+      data: { token_id: tokenId, operation_id: "pages.list", params: {} },
+    })
+    .then((response) => response.json().catch(() => ({})))
+    .catch(() => ({}));
+  steps.aRevokedTokenIsRefusedWithItsOwnCode =
+    revokedCall?.error?.code === "token_revoked";
+
+  // A parameter the document never declared must be refused rather than dropped: silently
+  // ignoring `limitt=5` tells the caller their filter worked.
+  const typoCall = await page
+    .request.post(`${URL_API}/api/v1/content-api/explorer`, {
+      data: {
+        token_id: explorerTokenId,
+        operation_id: "pages.list",
+        params: { limitt: "5" },
+      },
+    })
+    .then((response) => response.json().catch(() => ({})))
+    .catch(() => ({}));
+  steps.anUndeclaredParameterIsRefusedAndNamed =
+    typoCall?.error?.code === "invalid_parameter" &&
+    typoCall?.error?.details?.field === "limitt";
+
   // ------------------------------------------------------------------ the mobile layout
   // Measured on BOTH screens, and the docs one is measured first: the Docs tab's own overflow is
   // asserted by the steps above, and the Usage tab's mobile claim is a *different* layout (a table
@@ -11508,6 +11681,16 @@ async function main() {
       "aBadFormatIsRefusedWithItsField", "revokeSucceeded",
       "aRevokedTokenStopsReadingImmediately", "theRefusalSaysRevokedNotWrong",
       "theRevokedRowStaysVisible", "noHorizontalScrollAt390",
+      "explorerScreenReady", "explorerScreenHasNoErrorStrip", "explorerTabIsLinked",
+      "explorerListsEveryDocumentedOperation", "explorerRestoresTheDeepLinkedParameter",
+      "explorerCallIsServed", "explorerShowsTheResolvedUrl",
+      "explorerMetersTheTemplateNotTheResolvedPath", "explorerShowsTheRateLimitHeader",
+      "explorerShowsTheResponseBody", "theRemainingHeaderDecreases",
+      "theSnippetNamesTheTokenVariable", "theSnippetCarriesNoCredential",
+      "theSnippetReproducesTheUrl", "snippetLanguageSwitchIsReal",
+      "theItemEndpointDemandsItsSlug", "aMissingPathParameterIsRefused",
+      "theRefusalHighlightsTheOffendingField", "aRevokedTokenIsRefusedWithItsOwnCode",
+      "anUndeclaredParameterIsRefusedAndNamed",
     ];
     const apiSteps = report.contentApi || {};
     const missing = required.filter((key) => apiSteps[key] === undefined);
@@ -11910,6 +12093,11 @@ async function main() {
     // screen's own mobile claim is a card list next to a table that is `sm:hidden`/`hidden`, and
     // measuring the overflow on the table layout would be measuring the wrong layout.
     { path: "/content-api/usage", name: "content-api-usage" },
+    // The Explorer (REQ-019, slice 3) — in BOTH inventories, because its desktop claim is a
+    // two-column grid (picker + form) and its mobile claim is a single column; a 390 px pass that
+    // never opened it would leave both unmeasured, and the deep link (`?endpoint=…&token=…`) is
+    // the thing somebody pastes into a bug report.
+    { path: "/content-api/explorer", name: "content-api-explorer" },
     // The theme gallery (REQ-062, slice 1) — walked here so the screen is in the inventory,
     // and driven by `runThemesDepth` below, which activates a theme, reads the badge, restores
     // the previous one and requires the button to disappear when there is nothing to restore.
@@ -12419,7 +12607,7 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/members", name: "members" }, { path: "/members/settings", name: "member-settings" }, { path: "/content-api", name: "content-api" }, { path: "/content-api/docs", name: "content-api-docs" }, { path: "/content-api/usage", name: "content-api-usage" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/members", name: "members" }, { path: "/members/settings", name: "member-settings" }, { path: "/content-api", name: "content-api" }, { path: "/content-api/docs", name: "content-api-docs" }, { path: "/content-api/usage", name: "content-api-usage" }, { path: "/content-api/explorer", name: "content-api-explorer" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
