@@ -11508,3 +11508,63 @@ not by the age of the placeholder) for the whole tick, with 45 Chrome processes 
 
 **Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
 REQ-012 can close.
+
+## Tick 64 — the HR visibility levels were implemented and unreachable (wave 4, REQ-055)
+
+Two defects, one walk. The walk is the interesting part: every HR walk in the suite granted an
+**organization**-scoped role, so `scope_of` computed `All` on every request and **no narrowing
+branch of the HR SQL had ever executed**. A narrowing that silently widens passes every test that
+never narrows.
+
+**`c191c07e` — the guard refused the very grant the level lives in.** `require()` authorizes
+against an organization-wide `ResourceContext`; `Scope::Department::applies_to` compares
+`resource_id` against `context.department`, which nothing in the plain request path populates. A
+role holding `hr.employees.read` on a department binding therefore counted zero of one bindings
+and was refused `403` — one layer *before* the handler that implements the level. Since an HR
+visibility level is granted as a department binding, the only way to hold one at all was an
+organization grant: exactly the level the level exists to stop somebody being given.
+`require_department_scoped` tries the organization context first, then each department the
+caller's own bindings name, so organization-scoped roles behave identically.
+
+**`67a89931` — `team` compared two different id spaces.** The clause bound `scope.user_id` (a
+platform **account** uuid) against `manager_id`, a foreign key to `hr_employees(id)`. The
+predicate was true only for the row whose id happened to equal the caller's account uuid, and no
+direct report was ever in it: a manager's team list came back as the manager alone — which on
+screen reads as "this manager has no staff" rather than as a broken join. `get_employee` had the
+same pair in the same shape. Both now bind `scope.employee_id`.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| walks | `cargo test -p omnion-api --test hr -- --test-threads=1` | **10/10**, 133 s (was 9 — this walk is the tenth) |
+| proven-to-fail (a) | revert `routes/mod.rs`, same walk | **red**, `403` at `hr.rs:1371` |
+| proven-to-fail (b) | revert `modules/hr/src/employees.rs`, same walk | **red**, team = manager alone |
+| module | `cargo test -p omnion-module-hr --quiet` | **132 passed**, 0 failed |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **352 passed**, 0 failed |
+| types | `pnpm typecheck` | **2/2** |
+
+Both reverts are the *same* walk going red, which is the only claim worth making about a
+regression test: one that has never failed is a test that cannot fail.
+
+**A walk helper that measured its own leftovers.** The first run of the new walk failed on `team`
+with `own` sitting in the database — `scope_of` takes the **narrowest** level across every
+department binding a caller holds, and `bind_visibility` only ever granted, so `own` → `team` → `all`
+all answered `own`. The helper now revokes first. Worth writing down because the symptom pointed
+at the module: the failing assertion was "the manager's direct report is missing", and the cause
+was in the fixture.
+
+**Process notes.**
+
+* The build target here is `.tmp-target` (4.2 GiB), **not** `target/` — the box-wide disk guard
+  spares a per-worktree target and the worktree has no `target/` at all. A bare `cargo test`
+  without `CARGO_TARGET_DIR` writes to a fresh `./target`, dies on a **96%-full `/mnt/apopic`**
+  with `could not write output to ...rcgu.o: No such file or directory`, and never prints an
+  `error[]` line. Reclaimed `.tmp-target/debug/incremental` (1.7 GiB) after `pgrep`/`/proc/<pid>/cwd`
+  showed no live cargo in this worktree — the live ones belonged to w2 and w8.
+* The loop state directory is `/root/.hermes/loops/omnion-w4`; the job prompt's
+  `omnion-wave4` path 404s every tick.
+
+**Next:** the browser pass on a free slot — `--only=hr` now actually drives the HR depth passes
+after tick 63's `runsSection` fix — and REQ-055's four browser-only criteria are tickable against
+it. The REQ stays `in-progress`.
