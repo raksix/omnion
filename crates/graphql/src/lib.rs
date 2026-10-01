@@ -11,6 +11,8 @@
 //!   with its own error code, because a client must branch precisely.
 //! * [`cost`] — the weights, with the reason each one costs what it does. An unpriced field is
 //!   refused rather than free.
+//! * [`parity`] — the **closed** permission vocabulary this surface may name. Not an internal
+//!   detail: it is what stops a field from being gated on a permission the platform does not ship.
 //! * [`schema`] — the per-caller schema composition, and the cache key that keeps one role's
 //!   schema from being served to another.
 //! * [`settings`] — what an operator may change, and the validation the playground's cost meter
@@ -24,6 +26,18 @@
 //! *"the playground refuses over-budget queries and explains the top cost contributors"* provable
 //! without a browser, and it is why slice 2's persistence lives in its own module rather than
 //! threaded through these functions.
+//!
+//! ## The one check this crate cannot perform, and where it lives instead
+//!
+//! [`parity`] closes the permission vocabulary, so a typo like `"content.read"` is a compile
+//! error. It does **not** stop a *fabrication*: a new variant whose string nobody checked would
+//! compile, and — measured, not assumed — one was added during development (`"billing.read"`) and
+//! all of this crate's own tests stayed green, because nothing here can read the platform's
+//! catalogue to disagree.
+//!
+//! So the gate that actually catches it lives in `apps/api/tests/graphql_parity.rs`, in a crate
+//! that links both sides. That is the same split as above applied to a test: keep the decision
+//! pure, keep the cross-boundary check where both halves are visible.
 
 #![forbid(unsafe_code)]
 
@@ -31,6 +45,7 @@ pub mod cost;
 pub mod document;
 pub mod error;
 pub mod limits;
+pub mod parity;
 pub mod schema;
 pub mod settings;
 
@@ -41,6 +56,7 @@ pub use document::{
 };
 pub use error::{Code, Error, Result};
 pub use limits::{CONTRIBUTOR_COUNT, Limits, Measurement, check, measure_operation};
+pub use parity::{ALL as KNOWN_PERMISSIONS, Known, PermissionSet, VARIANT_COUNT};
 pub use schema::{CacheKey, ComposedSchema, SchemaCatalogue, TypeDefinition};
 pub use settings::Settings;
 
