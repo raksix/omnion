@@ -762,6 +762,33 @@ impl From<DeveloperError> for ApiError {
                     "no API key with that id exists in this organization",
                 )
             }
+            // Slice 4. Each names the input it came from, which is the whole reason this match
+            // exists: `ScaffoldRefused` already carries its own `code`, so the panel can switch
+            // on it without the API having to know which rule was broken -- but it cannot put
+            // the message under a field unless the field is named here.
+            DeveloperError::UnknownScaffoldKind(_) => api.with_details(json!({ "field": "kind" })),
+            DeveloperError::UnknownScaffoldTarget(_) => {
+                api.with_details(json!({ "field": "target" }))
+            }
+            // The rule carries its own stable code (`invalid_scaffold_name`), so it is forwarded
+            // rather than replaced: a name rule that grows a reason keeps the reason.
+            DeveloperError::ScaffoldRefused { code, .. } => {
+                api.with_details(json!({ "field": "name", "rule": code }))
+            }
+            DeveloperError::ScaffoldNotFound => ApiError::new(
+                StatusCode::NOT_FOUND,
+                "scaffold_not_found",
+                "no such scaffold in this organization",
+            ),
+            // The device-code refusals carry no field: they are answers about a *code*, and the
+            // panel has one input for that. `InvalidDeviceCode` stays a `400` rather than a
+            // `404` on purpose -- it is the same answer for a code that never existed, one that
+            // has expired and one that was already spent, and a `404` would tell a prober which
+            // of the three it hit.
+            DeveloperError::InvalidDeviceCode
+            | DeveloperError::DeviceCodePending
+            | DeveloperError::DeviceCodeSlowDown { .. }
+            | DeveloperError::DeviceCodeApprovalRefused => api,
             _ => api,
         }
     }

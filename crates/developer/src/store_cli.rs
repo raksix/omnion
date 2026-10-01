@@ -37,7 +37,11 @@ use crate::model::Environment;
 use crate::secret;
 
 /// The columns every code read returns, in one place.
-const CODE_COLUMNS: &str = "id, organization_id, device_code_hash, user_code, approved_by, \
+///
+/// `pub` because the API's poll handler reads a row directly — it needs the *unclaimed* row to
+/// decide what to answer, and going through a store function that returns a decision would put
+/// the poll rule inside the store where the status codes cannot be expressed.
+pub const CODE_COLUMNS: &str = "id, organization_id, device_code_hash, user_code, approved_by, \
      approved_at, client_name, client_uri, scopes, interval_seconds, last_polled_at, expires_at";
 
 /// A stored device code, as the poll and approval paths see it.
@@ -71,7 +75,16 @@ pub struct DeviceRow {
 
 impl DeviceRow {
     /// Turn a row into this shape.
-    async fn from_row(row: sqlx::postgres::PgRow) -> Result<Self> {
+    ///
+    /// Not `async` in substance — it reads no database — but `sqlx`'s row decoders are fallible,
+    /// and a `try_get` chain that could fail cannot be a plain constructor without the Result.
+    pub fn from_row(row: sqlx::postgres::PgRow) -> Result<Self> {
+        // The body is synchronous; this split exists so the public signature does not imply an
+        // await that is not there.
+        Self::from_row_sync(row)
+    }
+
+    fn from_row_sync(row: sqlx::postgres::PgRow) -> Result<Self> {
         let scopes: serde_json::Value = row.try_get("scopes")?;
         let interval_seconds: i32 = row.try_get("interval_seconds")?;
         Ok(Self {
@@ -238,7 +251,7 @@ pub async fn find_for_approval(
     .fetch_optional(pool)
     .await?
     .ok_or(DeveloperError::InvalidDeviceCode)?;
-    DeviceRow::from_row(row).await
+    DeviceRow::from_row(row)
 }
 
 /// Approve a code, binding it to the user who approved it.
@@ -266,7 +279,7 @@ pub async fn approve(
     .await?
     .ok_or(DeveloperError::InvalidDeviceCode)?;
 
-    let updated = DeviceRow::from_row(row).await?;
+    let updated = DeviceRow::from_row(row)?;
     let now = OffsetDateTime::now_utc();
     // The rules run against the row as it now stands, so an expired code is refused *here*
     // rather than minting a token that the terminal will find dead.
@@ -376,7 +389,7 @@ pub async fn exchange(
     .await?
     .ok_or(DeveloperError::InvalidDeviceCode)?;
 
-    let device = DeviceRow::from_row(row).await?;
+    let device = DeviceRow::from_row(row)?;
     let scopes = if device.scopes.is_empty() {
         cli_scopes()
     } else {
@@ -408,6 +421,67 @@ pub async fn exchange(
         scopes,
         expires_at: token_expiry,
     })
+}
+
+/// One poll, decided.
+///
+/// The whole decision lives here rather than in the route for two reasons. The first is that the
+/// status codes cannot be expressed here: `Pending` is a `202` and `SlowDown` is a `428`, and the
+/// crate has no opinion about HTTP. The second is the one that matters — a route that reads the
+/// row itself needs a raw `sqlx::Error` mapping, and `ApiError` has no blanket `From` for it, so
+/// the first version of the handler either leaked a database error into a `500` body or grew a
+/// conversion nobody reviewed. One function that answers the question keeps the query and the
+/// decision in the same place.
+pub async fn poll(pool: &PgPool, device_code: &str, now: OffsetDateTime) -> Result<PollResult> {
+    let hash = secret::hash(device_code);
+    let row = sqlx::query(&format!(
+        "select {CODE_COLUMNS} from cli_device_codes \
+         where device_code_hash = $1 and expires_at > $2"
+    ))
+    .bind(&hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?
+    // One answer for "never existed", "already exchanged" and "expired". A `404` or a distinct
+    // code per case would tell a prober which of the three it hit, and a code is short-lived
+    // enough that guessing is the whole attack.
+    .ok_or(DeveloperError::InvalidDeviceCode)?;
+
+    let device = DeviceRow::from_row(row)?;
+
+    match record_poll(pool, &device, now).await? {
+        PollOutcome::Pending => Ok(PollResult::Pending {
+            interval_seconds: u64::try_from(device.interval_seconds)
+                .unwrap_or(POLL_INTERVAL_SECONDS),
+        }),
+        PollOutcome::SlowDown { seconds } => Ok(PollResult::SlowDown { seconds }),
+        PollOutcome::Approved { .. } => {
+            // The single-use exchange: the code is claimed by deleting it, so a second poll of
+            // the same code finds nothing and is answered `InvalidDeviceCode`.
+            let token = exchange(pool, device_code, now).await?;
+            Ok(PollResult::Approved { token })
+        }
+    }
+}
+
+/// What one poll decided, with the token when there is one.
+#[derive(Debug)]
+pub enum PollResult {
+    /// Nobody has approved it. A `202` to the client, because this is the normal case.
+    Pending {
+        /// The interval the client must wait.
+        interval_seconds: u64,
+    },
+    /// Polled too fast. A `428`: the poll interval was not satisfied.
+    SlowDown {
+        /// Seconds the client must now wait.
+        seconds: u64,
+    },
+    /// Approved and exchanged. The token, once.
+    Approved {
+        /// The minted token.
+        token: DeviceToken,
+    },
 }
 
 /// How long a CLI token lives.

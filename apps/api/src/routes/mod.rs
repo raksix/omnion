@@ -85,6 +85,7 @@ pub mod deployment_ops;
 pub mod deployment_run;
 pub mod developer;
 pub mod developer_oauth;
+pub mod developer_sdks;
 pub mod environments;
 pub mod explorer;
 pub mod health;
@@ -1241,6 +1242,43 @@ pub fn router(state: AppState) -> Router {
     let oauth_token = post(oauth_flow::token);
     let oauth_introspect = get(oauth_flow::introspect);
 
+    // SDK scaffolds and the CLI (REQ-033, slice 4). Five routes, and the split is the point:
+    // **generating** a starter writes a file into a bucket, so it is `developer.sdks.scaffold`
+    // and not the read key -- a read-only developer must not be able to produce an artifact.
+    // **Validating** a manifest and **listing** the templates are pure reads and ride
+    // `developer.read`, the same key the API Explorer's document browsing does: both answer
+    // "what can I build here".
+    let dev_scaffold =
+        post(developer_sdks::scaffold).layer(guards::require(&state, "developer.sdks.scaffold"));
+    let dev_manifest_validate = post(developer_sdks::validate_manifest_endpoint)
+        .layer(guards::require(&state, "developer.read"));
+    let dev_sdk_templates =
+        get(developer_sdks::templates).layer(guards::require(&state, "developer.read"));
+
+    // The CLI device-code flow, and the permission split is the phishing defence rather than a
+    // data-visibility question:
+    //
+    // * `start` is a *read* of the tenant's CLI state, so `developer.read`. It mints a code but
+    //   mints nothing usable: the token only exists once a human approves.
+    // * `approve` is `developer.keys.manage`, exactly as the request's own API table says. A
+    //   session that cannot mint a key cannot mint a CLI token, and the token is a credential for
+    //   the same tenant. This is the permission that makes approving somebody else's login a
+    //   privileged act.
+    // * `poll` carries **no guard and no session**, and that is not an oversight: the device
+    //   code *is* the credential for this endpoint, it is worthless until approved, and a
+    //   terminal cannot hold a cookie. The route's own doc says where the security is.
+    let cli_device_start =
+        post(developer_sdks::device_start).layer(guards::require(&state, "developer.read"));
+    let cli_device_approve = post(developer_sdks::device_approve)
+        .layer(guards::require(&state, "developer.keys.manage"));
+    let cli_device_poll = post(developer_sdks::device_poll);
+    // The lookup is a *read* of a pending code -- it shows a person what they are about to
+    // approve -- so it rides the read key rather than the manage one. Requiring manage here would
+    // mean a developer who cannot approve could not even look at what a code wants, which is the
+    // opposite of the useful half.
+    let cli_device_lookup =
+        get(developer_sdks::device_lookup).layer(guards::require(&state, "developer.read"));
+
     // The deployment centre (REQ-024, slice 1). Six reads and one write, and the write is
     // `deployment.manage` because "check for updates now" reaches out to the network and
     // rewrites the release cache — it is not a read even though it answers a question.
@@ -2268,6 +2306,22 @@ pub fn router(state: AppState) -> Router {
         .route("/oauth/consent", oauth_consent)
         .route("/oauth/token", oauth_token)
         .route("/oauth/introspect", oauth_introspect)
+        // SDK scaffolds (REQ-033, slice 4). `/dev/sdks/templates` is a literal sibling of
+        // `/dev/sdks/scaffold` rather than a child: axum ranks `{id}` segments below literal
+        // ones, and a `scaffold` verb that were a child of `templates` would read as a template
+        // named "scaffold". Same reason `/dev/openapi.json` sits beside
+        // `/dev/explorer/requests`.
+        .route("/dev/sdks/templates", dev_sdk_templates)
+        .route("/dev/sdks/scaffold", dev_scaffold)
+        .route("/dev/manifests/validate", dev_manifest_validate)
+        // The device-code flow. `poll` and `approve` are separate segments rather than two
+        // methods on one path, for the `Overlapping method route` reason the OAuth block above
+        // records: axum builds its router at runtime, so a collision there is a startup panic
+        // that `cargo check` and every passing test cannot see.
+        .route("/dev/cli/device-code", cli_device_start)
+        .route("/dev/cli/device-code/approve", cli_device_approve)
+        .route("/dev/cli/device-code/poll", cli_device_poll)
+        .route("/dev/cli/device-code/{user_code}", cli_device_lookup)
         .route("/cdn/status", cdn_status)
         .route("/cdn/purges", cdn_purges)
         .route("/cdn/purges/{id}", cdn_purge_one)

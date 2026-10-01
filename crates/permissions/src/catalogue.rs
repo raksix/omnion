@@ -507,6 +507,26 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "developer",
         description: "Register OAuth applications and rotate client secrets",
     },
+    // SDK scaffolds and the CLI (docs/requests/REQ-033, slice 4). One key, and the split is
+    // against adding a second.
+    //
+    // * Generating a starter writes an archive into a bucket. That is a *write* with a cost and
+    //   a quota, so it is its own power rather than riding `developer.read`.
+    // * Validating a manifest and listing the templates are pure reads and ride `developer.read`
+    //   with the rest of the "what can I build here" surface -- the API Explorer's document
+    //   browsing included.
+    //
+    // The CLI device-code flow deliberately adds **no key of its own**. `start` is a read of the
+    // tenant's CLI state, so `developer.read`; `approve` is `developer.keys.manage`, because
+    // the token it authorises is a credential for the same tenant and an account that cannot mint
+    // a key must not be able to mint a CLI token by approving somebody else's login. A fourth
+    // key here would have been one more place for the two halves to disagree about who may log
+    // a machine in.
+    PermissionDef {
+        key: "developer.sdks.scaffold",
+        category: "developer",
+        description: "Generate plugin, theme and workflow starter archives",
+    },
     // Notifications (docs/requests/REQ-021). Four powers, split by *who is affected* rather
     // than by what the button does:
     //
@@ -854,6 +874,7 @@ mod tests {
             "developer.explorer.run",
             "developer.oauth.read",
             "developer.oauth.manage",
+            "developer.sdks.scaffold",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
