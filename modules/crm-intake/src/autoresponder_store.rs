@@ -390,6 +390,21 @@ pub struct DueReservation {
 /// Ordered by the instant the message came due, so a lead that waited a week is answered
 /// before one that waited a minute, and bounded by `limit` so one tick cannot pick up ten
 /// thousand reservations and hold the pool for the length of ten thousand mailers.
+///
+/// ## Every row this function drops is also *released*
+///
+/// Four arms can drop a row — no lead, no source, a source that is no longer configured, and
+/// a `deliver` that declines — and all four release the claim, which is the only thing that
+/// removes the row from this sweep's WHERE clause. The two "nothing is left" arms used to
+/// `continue` and nothing else, on the reasoning that a reservation whose lead or source was
+/// deleted "is not an error". That was a statement about the *return value* being right while
+/// the *row* stayed exactly where the next pass would find it — and because an orphan is the
+/// oldest row in the table, it is also the one that most reliably fills the `limit` and hides
+/// the live work behind it. See the comment at the loop head for the measurement.
+///
+/// The rule, then: **this function returns rows to send, and it has no way to say "skip this
+/// one" to anything downstream — so any row it does not return must be one it has ended.**
+#[allow(clippy::too_many_lines)]
 pub async fn due_reservations(
     pool: &PgPool,
     now: OffsetDateTime,
@@ -422,15 +437,51 @@ pub async fn due_reservations(
 
     let mut due = Vec::with_capacity(rows.len());
     for (lead_id, detail) in rows {
-        // A reservation whose lead or source is gone is not an error. The trail outlives
-        // both — a deleted lead keeps its lines for the audit export — and a sweep that
-        // refused to move on would retry the same dead row on every tick for ever.
+        // The recipient the claim was taken for, read **before** anything can drop this row.
+        // A release is only allowed to remove *that* claim — the same rule `release_claim`
+        // itself enforces, read here so all four arms below cannot disagree about whose row
+        // they are giving back.
+        let claimed_to = detail
+            .get("to")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        // A reservation whose lead or source is gone is not an error — the trail outlives
+        // both, and a deleted lead keeps its lines for the audit export. But "not an error" is
+        // a statement about the *return value*, not about the row, and this is the third arm
+        // of the sweep to get that wrong in the same direction.
+        //
+        // These two `continue`s used to leave the claim exactly as the sweep found it: `sent:
+        // false`, `due_at` in the past — which is **this sweep's own WHERE clause**. So a
+        // reservation whose source was deleted stayed permanently due, was re-read and
+        // re-skipped once a minute for ever, and — the part that matters — stayed in the
+        // batch. The sweep is `order by due_at asc, id asc limit $3`, and an orphan is the
+        // *oldest* thing in the table by construction: it has been due longer than anything
+        // live. So orphans sort to the front of every batch and spend its budget on rows the
+        // worker cannot send. The gate measures it: five orphaned reservations ahead of one
+        // live lead and `limit 5` returns **zero** rows — the live lead is not offered, on
+        // every tick, for ever, while the worker logs that it sent nothing.
+        //
+        // The shape is not exotic. `crm_leads.source_id` is `on delete set null` (0055), so
+        // `DELETE /crm/intake/sources/{id}` — a button the panel has, and the ordinary way an
+        // operator retires a form — nulls it and the reservation outlives its source. Deleting
+        // one source silently disabled the autoresponder for every lead that had a pending
+        // reservation on it, and starved the ones behind it.
+        //
+        // Both arms therefore **release**, which is what actually ends a reservation. No note
+        // is written here and that is deliberate in the other direction too: there is no
+        // source left to name, and a line saying "we did not answer a lead whose source you
+        // deleted" is a fact the operator produced themselves and can read by deleting
+        // nothing.
         let Some(lead) = find_lead_any_org(pool, lead_id).await? else {
-            tracing::debug!(lead_id = %lead_id, "a due autoresponder has no lead left");
+            tracing::debug!(lead_id = %lead_id, "a due autoresponder has no lead left — releasing");
+            release_claim(pool, lead_id, &claimed_to).await?;
             continue;
         };
         let Some(source) = source_of(pool, lead.source_id).await? else {
-            tracing::debug!(lead_id = %lead_id, "a due autoresponder has no source left");
+            tracing::debug!(lead_id = %lead_id, "a due autoresponder has no source left — releasing");
+            release_claim(pool, lead_id, &claimed_to).await?;
             continue;
         };
 
@@ -441,15 +492,6 @@ pub async fn due_reservations(
         // to them. Re-rendering costs one thing — a template edited inside the delay sends
         // the new wording — and buys the other: a source that was *switched off* inside the
         // delay stops answering, which is what an operator who turned it off asked for.
-        // The recipient the claim was taken for. A release is only allowed to remove *that*
-        // claim — the same rule `release_claim` itself enforces, read here so both decline
-        // paths below cannot disagree about whose row they are giving back.
-        let claimed_to = detail
-            .get("to")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-
         let autoresponder = Autoresponder::from_json(&source.autoresponder);
         if !autoresponder.is_configured() {
             tracing::info!(
