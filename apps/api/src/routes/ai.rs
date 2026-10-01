@@ -1494,6 +1494,27 @@ enum Frame {
         chars: usize,
         usage: Option<omnion_ai_hub::ChatUsage>,
     },
+    /// The answer proposed a change set that could not be filed (REQ-101, slice 3g).
+    ///
+    /// Its own frame rather than `Failed`, and the reason is the client's contract: the `error`
+    /// event makes the chat helper **throw**, and a thrown stream means "the answer failed".
+    /// The answer did not — it is complete and on the screen. What failed is the bookkeeping
+    /// that follows it, and reporting that as a failed answer would replace a good reply with
+    /// an error message and hide the proposal the person was reading about.
+    ProposalInvalid { message: String },
+    /// The answer proposed a change set and it was filed (REQ-101, slice 3g).
+    ///
+    /// Its own frame rather than a field on `done`, because the client renders it as a
+    /// different thing: an answer is text, a filed set is a **row in another screen**. Carried
+    /// on `done` a client would have to re-read the whole payload to find out whether the chat
+    /// it just rendered has somewhere to send the reviewer, and a client that forgot would
+    /// show a proposal nobody can open — a described action with no way to take it.
+    Proposal {
+        change_set_id: uuid::Uuid,
+        title: String,
+        operations: usize,
+        needs_approval: bool,
+    },
     /// The answer failed; `code` is stable, `message` is for a person.
     Failed { code: &'static str, message: String },
 }
@@ -1528,6 +1549,27 @@ impl Frame {
                 })
                 .to_string(),
             ),
+            Self::Proposal {
+                change_set_id,
+                title,
+                operations,
+                needs_approval,
+            } => Event::default().event("proposal").data(
+                json!({
+                    "change_set_id": change_set_id,
+                    "title": title,
+                    "operations": operations,
+                    "needs_approval": needs_approval,
+                })
+                .to_string(),
+            ),
+            Self::ProposalInvalid { message } => Event::default().event("proposal_error").data(
+                json!({
+                    "code": "ai.changeset.proposal_invalid",
+                    "message": message,
+                })
+                .to_string(),
+            ),
             Self::Failed { code, message } => Event::default()
                 .event("error")
                 .data(json!({ "code": code, "message": message }).to_string()),
@@ -1535,6 +1577,40 @@ impl Frame {
 
         Ok(event)
     }
+}
+
+/// `GET /api/v1/ai/chat/proposal-instruction` — the instruction that makes proposals possible.
+///
+/// **Served, not sent by the client.** The parser reads a fenced block with one exact tag and
+/// one exact shape, and the instruction that describes it lives in the crate beside the parser
+/// ([`omnion_ai_hub::proposal::system_instruction`]). A panel that carried its own copy of that
+/// sentence would be right until the format changed, and then the screen would keep working
+/// perfectly while never once filing a set — a feature that looks built and does nothing.
+///
+/// The client cannot learn the instruction from the stream: the stream is the answer to a
+/// request that is **sent** with the instruction already in it, so it is a message before the
+/// first byte, and this is a normal GET.
+///
+/// # Errors
+///
+/// Never: the only failure would be a body write, and the answer is a constant.
+pub async fn proposal_instruction() -> Result<Json<ProposalInstruction>, ApiError> {
+    Ok(Json(ProposalInstruction {
+        instruction: omnion_ai_hub::proposal::system_instruction(),
+        fence_tag: omnion_ai_hub::proposal::FENCE_TAG,
+        max_operations: omnion_ai_hub::change_sets::MAX_OPERATIONS,
+    }))
+}
+
+/// What [`proposal_instruction`] answers with.
+#[derive(Debug, Serialize)]
+pub struct ProposalInstruction {
+    /// The system message to send with a chat that may propose changes.
+    pub instruction: String,
+    /// The fence tag the parser reads, so a client can show it and never has to repeat it.
+    pub fence_tag: &'static str,
+    /// The ceiling, which the instruction states and the parser enforces.
+    pub max_operations: usize,
 }
 
 /// `POST /api/v1/ai/chat` — a streamed answer.
@@ -1548,6 +1624,13 @@ pub async fn chat(
     address: ClientAddress,
     Json(body): Json<ChatBody>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    // Read before the loop consumes `body.messages`, and carried into the task so a filed
+    // proposal is linked to the run it came out of (REQ-101 slice 3g). The loop below moves
+    // the messages out of `body`, so a `body.run_id` read afterwards would not compile — and
+    // the fix that *does* compile, reading it from a body that is already moved, is a borrow
+    // error at best. Read it once, here, where the value is obviously still whole.
+    let body_run_id = body.run_id;
+
     let mut messages = Vec::with_capacity(body.messages.len());
     for message in body.messages {
         let role = ChatRole::parse(&message.role)?;
@@ -1689,6 +1772,12 @@ pub async fn chat(
     let user_id = current.user.id;
     let organization_id = current.user.organization_id;
     let ip_address = address.as_text();
+    // The proposal entry point (REQ-101 slice 3g) files the set from **inside** the task,
+    // because the answer only exists there — and an `AppState` is an `Arc`, so carrying one
+    // into the task costs a pointer. The alternative, filing after the task returns, would
+    // read the answer off a channel the task owns, which is the shape where the file happens
+    // whether or not the client is still listening.
+    let proposal_state = state.clone();
 
     let (frames, receiver) = mpsc::channel::<Frame>(STREAM_BUFFER);
 
@@ -1881,6 +1970,72 @@ pub async fn chat(
                 "total_tokens": usage.total_tokens,
             })),
         });
+
+        // REQ-101 slice 3g: a chat answer that proposed a change set **files it**, so the
+        // reviewer finds it in the same inbox every other request lands in. This is the whole
+        // criterion -- "a change set confirmed from the chat reply lands in the same inbox
+        // (one pipeline, one screen)" -- and the alternative, printing a block of JSON and
+        // hoping somebody copies it into the editor, is a proposal nobody reviews.
+        //
+        // It happens after `done`, and the frame goes out whether or not the file succeeded:
+        // the answer is already on the caller's screen, and swallowing it because the *file*
+        // failed would be a lie about work that did happen. A failure is logged and travels as
+        // its own frame, because "the answer is here but the proposal was lost" is the one
+        // thing the person reading the screen must be told.
+        // A set is organization-scoped, and the chat route is not: its decision log writes with
+        // `current.user.organization_id`, which is `None` for an installation account. There
+        // is no organization to file such a proposal into, and inventing one is not an option —
+        // so the answer is kept, the proposal is not, and the log says which happened and why.
+        // Branching here rather than passing `Option<Uuid>` into the helper keeps `Ok(None)`
+        // meaning "this answer proposed nothing" and nothing else; a helper that returned `None`
+        // for both would make the two indistinguishable to the caller and to its tests.
+        let proposal = match organization_id {
+            Some(organization) => {
+                crate::routes::ai_change_sets::file_from_chat(
+                    &proposal_state,
+                    organization,
+                    user_id,
+                    None,
+                    body_run_id,
+                    &answer.content,
+                )
+                .await
+            }
+            None => {
+                tracing::debug!(
+                    "the answer was kept but its proposal was not filed: this account has no \
+                     primary organization, and a change set is organization-scoped"
+                );
+                Ok(None)
+            }
+        };
+
+        match proposal {
+            Ok(Some(set)) => {
+                let _ = frames
+                    .send(Frame::Proposal {
+                        change_set_id: set.set.id,
+                        title: set.set.title.clone(),
+                        operations: set.set.operations.len(),
+                        // The view already computed it, from the same `has_gated_operations` the
+                        // confirm route calls — re-deriving it here would be a second answer
+                        // about whether a set needs a second person.
+                        needs_approval: set.needs_approval,
+                    })
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "a chat answer proposed a change set that could not be filed");
+                let _ = frames
+                    .send(Frame::ProposalInvalid {
+                        message: format!(
+                            "the answer described changes the platform could not turn into a change set: {error}"
+                        ),
+                    })
+                    .await;
+            }
+        }
 
         let frame = Frame::Done {
             finish_reason: answer.finish_reason,

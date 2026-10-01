@@ -802,6 +802,11 @@ pub fn router(state: AppState) -> Router {
         );
 
     let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
+    // The instruction a chat sends to be able to propose changes (REQ-101 slice 3g). `read`,
+    // not `chat`: asking the platform how to phrase a request is not asking it to make one,
+    // and a screen that renders the format has to be able to fetch it before the user can type.
+    let ai_chat_proposal_instruction =
+        get(ai::proposal_instruction).layer(guards::require(&state, "ai.chat"));
 
     // Task routing and feature overrides (REQ-098 slice 2). Reading a route map is the same
     // knowledge as the provider list — which models exist and what they can do — so it is
@@ -1952,6 +1957,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)
+        .route("/ai/chat/proposal-instruction", ai_chat_proposal_instruction)
         .route("/ai/routing", ai_routing)
         .route("/ai/routing/overrides", ai_routing_overrides)
         .route("/ai/routing/preview", ai_routing_preview)

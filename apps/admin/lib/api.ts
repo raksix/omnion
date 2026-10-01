@@ -1557,6 +1557,22 @@ export type ChatMessageInput = {
   content: string;
 };
 
+/**
+ * A change set the answer proposed, filed for review (REQ-101, slice 3g).
+ *
+ * The platform files it, not the client: a proposal read out of model text is a **claim**, so
+ * it becomes a `draft` in the same inbox every other request lands in, and the reviewer edits
+ * and confirms it there. A client that rendered its own "here are the changes" block would be
+ * describing work the platform has no record of.
+ */
+export type ChatProposal = {
+  change_set_id: string;
+  title: string;
+  operations: number;
+  /** `true` when confirming this set would park at least one operation for a second person. */
+  needs_approval: boolean;
+};
+
 /** What a finished chat stream reported. */
 export type ChatDone = {
   finish_reason: string | null;
@@ -1963,12 +1979,31 @@ export function updateAiModel(
  * provider that refuses after the stream opened arrives as that `error` frame, which this helper
  * raises as an `ApiError` so the caller handles one shape either way.
  */
+/**
+ * The instruction a chat sends so the model can propose changes (REQ-101, slice 3g).
+ *
+ * Read from the API rather than written here on purpose: the parser has one exact fence tag
+ * and one exact shape, and a copy of the sentence in the panel is a copy that goes stale
+ * quietly — the screen keeps working and never once files a set.
+ */
+export type ChatProposalInstruction = {
+  instruction: string;
+  fence_tag: string;
+  max_operations: number;
+};
+
+export function fetchChatProposalInstruction(): Promise<ChatProposalInstruction> {
+  return request<ChatProposalInstruction>("/api/v1/ai/chat/proposal-instruction");
+}
+
 export async function streamChat(
   input: { model?: string; messages: ChatMessageInput[] },
   handlers: {
     onStart?: (info: { provider: string; model: string; protocol: string }) => void;
     onDelta?: (content: string) => void;
     onDone?: (done: ChatDone) => void;
+    onProposal?: (proposal: ChatProposal) => void;
+    onProposalError?: (message: string) => void;
   } = {},
 ): Promise<void> {
   const response = await fetch("/api/v1/ai/chat", {
@@ -2025,6 +2060,14 @@ export async function streamChat(
         handlers.onStart?.(payload as { provider: string; model: string; protocol: string });
       } else if (event === "delta") {
         handlers.onDelta?.(String(payload.content ?? ""));
+      } else if (event === "proposal") {
+        handlers.onProposal?.(payload as unknown as ChatProposal);
+      } else if (event === "proposal_error") {
+        // **Not** the `error` branch. That one throws, which the screen renders as a failed
+        // answer — but the answer is complete and on screen; only the follow-up failed.
+        // Throwing here would replace a good reply with an error and hide the proposal the
+        // person was reading about.
+        handlers.onProposalError?.(String(payload.message ?? "The proposal could not be filed."));
       } else if (event === "done") {
         handlers.onDone?.(payload as unknown as ChatDone);
       } else if (event === "error") {

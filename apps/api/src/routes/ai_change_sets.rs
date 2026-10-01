@@ -201,6 +201,80 @@ pub async fn create(
     }))
 }
 
+/// File the change set a chat answer proposed, if it proposed one (REQ-101, slice 3g).
+///
+/// The **same** [`store::append`] and the **same** `ai.changeset.proposed` event
+/// [`create`] writes, called from the chat route rather than from a screen — which is the
+/// point of the criterion "a change set confirmed from the chat reply lands in the same
+/// inbox (one pipeline, one screen)". A second `insert` here would be a second pipeline, and
+/// the two would agree only until the first one changed.
+///
+/// Returns `None` for an answer that proposed nothing, which is most answers. An answer that
+/// *claimed* to propose something unusable is a different case and comes back as an `Err`
+/// carrying the reason: a set that is filed and lost is worse than one that is refused with
+/// something to act on, because the reviewer is looking at a plan that no longer exists.
+///
+/// # Errors
+///
+/// Whatever the parser, the store or the event bus refuses with. The caller decides what a
+/// bad proposal does to a chat answer that was otherwise fine.
+pub async fn file_from_chat(
+    state: &AppState,
+    organization: uuid::Uuid,
+    actor: uuid::Uuid,
+    site_id: Option<uuid::Uuid>,
+    run_id: Option<uuid::Uuid>,
+    answer: &str,
+) -> Result<Option<SetView>, ApiError> {
+    let Some(proposal) = omnion_ai_hub::proposal::parse(answer).map_err(ApiError::from)? else {
+        return Ok(None);
+    };
+
+    // Pinned at proposal time, exactly as a hand-filed set is: the editor's staleness check
+    // asks whether a target moved since the set was filed, and a set whose pins are empty
+    // answers "no" to everything — the reviewer would never be asked to look at a target that
+    // had changed underneath the proposal.
+    let base_revisions = change_sets::store::current_revisions(
+        state.db().pool(),
+        organization,
+        &proposal.operations,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    let set = change_sets::store::append(
+        state.db().pool(),
+        &NewChangeSet {
+            organization_id: organization,
+            site_id,
+            title: proposal.title,
+            operations: proposal.operations,
+            created_by: Some(actor),
+            created_by_agent: None,
+            created_by_run: run_id,
+            base_revisions,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("ai.changeset.proposed")
+            .organization(organization)
+            .actor(actor)
+            .payload(serde_json::json!({
+                "change_set_id": set.id,
+                "title": set.title,
+                "operations": set.operations.len(),
+                "source": "chat",
+            })),
+    )
+    .await?;
+
+    Ok(Some(SetView::of(set)))
+}
+
 /// `PATCH /ai/change-sets/{id}` — edit the draft.
 ///
 /// The whole list is replaced, not patched in place: a set is a **list** the reviewer owns, and

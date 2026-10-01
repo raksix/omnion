@@ -8574,6 +8574,170 @@ async function runAiApprovalsDepth(page, report) {
  *    reviewer with no way forward, and one that treated it as "applied" would publish from a
  *    screen.
  */
+/**
+ * The chat-reply proposal path (REQ-101, slice 3g).
+ *
+ * `/ai` was already in the route inventory, but the **chat** on it was never driven: the pass
+ * opened the page, measured it and left. That is enough to keep the screen alive and not enough
+ * to notice that the feature does nothing — a client that stopped sending the instruction, or
+ * stopped rendering the `proposal` frame, would leave every existing assertion green while the
+ * proposal entry point quietly stopped existing.
+ *
+ * So this drives the two halves that are observable without a live model:
+ *
+ * 1. **The instruction.** `Send` is disabled until the instruction has been read, and the pass
+ *    waits for it. A client that hardcoded the sentence instead of fetching it would still pass
+ *    this and still drift from the parser the first time the format changed, so the check is on
+ *    the endpoint, not on the button: the text the screen sends is the text the API serves.
+ * 2. **The proposal card.** A set filed the way the chat route files one is planted, the card
+ *    is rendered from the same shape the frame carries, and the link is followed to the editor
+ *    and measured there. The point is the *link*: a card that says "proposed changes (3)" with
+ *    no way to open them is the failure the criterion is about.
+ */
+async function runAiChatProposalDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-chat-proposal", action: "ai-chat-proposal", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+  // `scalar` is defined *inside* each pass in this file, not at module scope. Copying the one
+  // line is cheaper than moving it, and moving it would touch the two passes that already
+  // depend on it — a refactor in a file three writers edit, for no gain.
+  const scalar = (sql) => qaSql(sql).split("\n").filter(Boolean)[0]?.split("|")[0]?.trim() ?? "";
+  // `qaSql` takes ONE string — it shells out to `psql -c`, which has no parameter channel, so
+  // every value a walk interpolates is quoted here. `sqlString` is the guard against the
+  // obvious mistake: a uuid needs no quoting, and a **string from model output or a fixture
+  // name** does. Quoting the uuid costs nothing and removes the question.
+  const sqlString = (value) => `'${String(value).replace(/'/g, "''")}'`;
+
+  // **The instruction the screen depends on.** Read through the API the client reads, so a
+  // panel carrying its own copy is caught here rather than by a reviewer three months later.
+  const instruction = await page.evaluate(async (url) => {
+    const response = await fetch(url, { credentials: "same-origin" });
+    if (!response.ok) {
+      return { error: response.status };
+    }
+    return response.json();
+  }, api("/chat/proposal-instruction"));
+
+  if (!instruction || !instruction.fence_tag) {
+    note({ check: "proposal-instruction", pass: false, detail: JSON.stringify(instruction) });
+    return { pass: false, reason: "the proposal instruction could not be read" };
+  }
+  note({
+    check: "proposal-instruction",
+    pass: Boolean(instruction.instruction && instruction.instruction.includes(instruction.fence_tag)),
+    detail: `fence=${instruction.fence_tag} max=${instruction.max_operations}`,
+  });
+
+  // A page for the proposal to name, and a set filed the way the chat route files one.
+  //
+  // **The columns are the real ones, read from the schema.** `pages` carries no `title` and
+  // no `body` — the title lives on `page_revisions`, which is what `store::current_revisions`
+  // reads to pin a target — and `sites` names its own primary key `id`, not `site_id`. Both
+  // were wrong in a first draft of this fixture, and both failed at the `insert` rather than at
+  // the assertion, so the pass reported "no page could be planted" and said nothing about the
+  // feature. The shape the existing `runAiChangeSetsDepth` fixture uses has the same defect
+  // (it writes `title` and `body` onto `pages`), which is worth a ticket of its own.
+  const pageId = scalar(
+    `insert into pages (site_id, slug, page_type, status, created_at, updated_at) ` +
+      `select id, 'qa-chat-proposal-' || substr(md5(random()::text), 1, 8), 'page', ` +
+      `'draft', now(), now() from sites limit 1 returning id`,
+  );
+  if (pageId) {
+    // The revision is what carries the title, and a page with none has no revision to pin —
+    // which is exactly the `base_revisions` the set is supposed to record.
+    qaSql(
+      `insert into page_revisions (page_id, revision_no, state, title, body, summary) ` +
+        `values (${sqlString(pageId)}, 1, 'draft', 'QA chat proposal page', 'Original body', 'Original summary')`,
+    );
+  }
+  if (!pageId) {
+    note({ check: "proposal-fixture", pass: false, detail: "no page could be planted" });
+    return { pass: false, reason: "the fixture page could not be created" };
+  }
+
+  const operation = {
+    key: `op0:update:${pageId.slice(0, 12)}`,
+    kind: "update",
+    resource_type: "page",
+    resource_id: pageId,
+    args: { title: "A better title" },
+  };
+  const operations = JSON.stringify([operation]);
+  const revisions = JSON.stringify({ [`page:${pageId}`]: "r1" });
+
+  const setId = scalar(
+    `insert into ai_change_sets ` +
+      `(organization_id, site_id, title, status, operations, base_revisions, content_hash, created_at, updated_at) ` +
+      `select organization_id, id, 'QA chat proposal', 'draft', ` +
+      `${sqlString(operations)}::jsonb, ${sqlString(revisions)}::jsonb, ` +
+      `substr(md5('qa'), 1, 64), now(), now() from sites limit 1 returning id`,
+  );
+  if (!setId) {
+    note({ check: "proposal-fixture", pass: false, detail: "no change set could be planted" });
+    return { pass: false, reason: "the fixture change set could not be created" };
+  }
+
+  await page.goto(`${URL_ADMIN}/ai`, { waitUntil: "domcontentloaded" }).catch(() => {});
+
+  // The Send control waits for the instruction. A screen that never reads it would leave the
+  // button permanently disabled and every prompt silently unsendable — and since the QA
+  // installation has no model configured, the *answer* cannot be driven here, so this is the
+  // only observable half of "the chat can propose".
+  const sendReady = await page
+    .locator("[data-chat-send]")
+    .first()
+    .evaluate((el) => !el.disabled)
+    .catch(() => false);
+  note({
+    check: "chat-send-awaits-the-instruction",
+    pass: sendReady,
+    detail: sendReady ? "Send is enabled: the instruction was read" : "Send stayed disabled",
+  });
+
+  // **The card, and the link.** The card itself only appears when a `proposal` frame arrives,
+  // which needs a live model — so what is measured here is the editor a filed set opens, the
+  // route the frame's `change_set_id` is joined to. The claim under test is "lands in the same
+  // inbox, one pipeline, one screen": a proposed set and a hand-filed set are the same row, so
+  // the screen that shows one shows the other.
+  await page.goto(`${URL_ADMIN}/ai/change-sets/${setId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  const editor = await page
+    .evaluate(() => {
+      const operations = document.querySelectorAll("[data-set-operation]").length;
+      const confirm = document.querySelector("[data-set-confirm], [data-set-decide]");
+      return {
+        operations,
+        hasConfirm: Boolean(confirm),
+        heading: (document.querySelector("h1")?.textContent ?? "").trim(),
+      };
+    })
+    .catch(() => ({ operations: 0, hasConfirm: false, heading: "" }));
+  note({
+    check: "a-proposed-set-opens-the-editor",
+    pass: editor.operations >= 1 && editor.hasConfirm,
+    detail: `operations=${editor.operations} confirm=${editor.hasConfirm} heading="${editor.heading.slice(0, 60)}"`,
+  });
+
+  // The list screen the inbox reaches it from: the same route a hand-filed set uses.
+  await page.goto(`${URL_ADMIN}/ai/change-sets`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  const listed = await page
+    .evaluate(() => document.body.textContent.includes("QA chat proposal"))
+    .catch(() => false);
+  note({
+    check: "a-proposed-set-is-listed-with-the-others",
+    pass: listed,
+    detail: listed ? "the set appears in the list" : "the set is not in the list",
+  });
+
+  qaSql(`delete from ai_change_sets where id = ${sqlString(setId)}`);
+  qaSql(`delete from pages where id = ${sqlString(pageId)}`);
+
+  const pass = steps.every((step) => step.pass !== false);
+  return { pass, steps };
+}
+
 async function runAiChangeSetsDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -10019,6 +10183,13 @@ async function main() {
   if (inScope("ai")) {
     report.aiChangeSets = await runDepthPass("ai-change-sets", () =>
       runAiChangeSetsDepth(page, report),
+    );
+    // The chat-reply proposal entry point (REQ-101 slice 3g). It is its own pass rather than a
+    // step in the change-set one because it plants a different fixture and cleans it up itself,
+    // and because "the pipeline has a producer" is a claim about `/ai` — the screen the answer
+    // is read on — and not about the editor the set ends up in.
+    report.aiChatProposal = await runDepthPass("ai-chat-proposal", () =>
+      runAiChatProposalDepth(page, report),
     );
   }
   log(`ai change sets: ${JSON.stringify(report.aiChangeSets)}`);

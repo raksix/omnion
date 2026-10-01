@@ -14,8 +14,10 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  ArrowRight,
   CircleCheck,
   CircleSlash,
+  ClipboardList,
   Download,
   Loader2,
   Plus,
@@ -27,6 +29,7 @@ import {
   TriangleAlert,
   X,
 } from "lucide-react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
@@ -43,10 +46,12 @@ import {
   type AiProviderKind,
   type AiTestReport,
   type AiTestStep,
+  type ChatProposal,
   applyAiProviderDiscovery,
   connectAiProvider,
   discoverAiProviderModels,
   fetchAiModels,
+  fetchChatProposalInstruction,
   fetchAiProtocols,
   fetchAiProviders,
   removeAiProvider,
@@ -453,6 +458,24 @@ export function AiView() {
 
   // The chat.
   const [chatModel, setChatModel] = useState("");
+  /** A change set the answer proposed and the platform filed (REQ-101, slice 3g). */
+  const [chatProposal, setChatProposal] = useState<ChatProposal | null>(null);
+  /**
+   * The instruction that makes proposals possible, read from the API once.
+   *
+   * `null` means it has not arrived, and `send()` refuses rather than sending the question
+   * alone: a chat with no instruction still answers, and the panel would look completely
+   * healthy while never once filing a set. Failing loudly is the better of two quiet options.
+   */
+  const [proposalInstruction, setProposalInstruction] = useState<string | null>(null);
+  /** Why the instruction is missing, so the panel says so rather than offering a dead Send. */
+  const [proposalInstructionError, setProposalInstructionError] = useState<string | null>(null);
+  /**
+   * A proposal the platform could not file. Kept beside the answer rather than raised as an
+   * error: the answer is complete and on screen, and the one thing the reader must be told is
+   * that the changes they were shown do not exist anywhere a person could review them.
+   */
+  const [chatProposalError, setChatProposalError] = useState<string | null>(null);
   // A prompt handed over by the palette's `Ask AI` row arrives in the URL; the reader still
   // presses Send themselves — nothing is asked on their behalf.
   const [prompt, setPrompt] = useState(() => searchParams.get("q") ?? "");
@@ -462,6 +485,33 @@ export function AiView() {
   const [streaming, setStreaming] = useState(false);
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
+
+  // The proposal instruction, read once and kept. It cannot change while the build is the same
+  // build, so it is not on `reloadToken` — putting it there would refetch it on every provider
+  // save for a constant, and the failure mode of *that* is a chat that stops being able to
+  // propose because somebody renamed a provider.
+  useEffect(() => {
+    let cancelled = false;
+    fetchChatProposalInstruction()
+      .then((payload) => {
+        if (!cancelled) {
+          setProposalInstruction(payload.instruction);
+        }
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) {
+          setProposalInstruction(null);
+          setProposalInstructionError(
+            cause instanceof ApiError
+              ? cause.message
+              : "The proposal instruction could not be read.",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -674,19 +724,46 @@ export function AiView() {
     if (!prompt.trim() || streaming) {
       return;
     }
+    // The instruction is not optional. Without it the model is never told the format, so it
+    // never proposes, and every walk a reviewer could do on this screen would report the
+    // feature working. Say so instead.
+    if (!proposalInstruction) {
+      setError(
+        "The proposal instruction could not be read, so a prompt sent now could not propose changes.",
+      );
+      return;
+    }
     setStreaming(true);
     setError(null);
     setNotice(null);
     setAnswer("");
     setChatRoute(null);
     setChatUsage(null);
+    setChatProposal(null);
+    setChatProposalError(null);
 
     try {
       await streamChat(
-        { model: chatModel || undefined, messages: [{ role: "user", content: prompt }] },
+        {
+          model: chatModel || undefined,
+          // The instruction is sent, not merely hoped for. Slice 3g's parser reads a fenced
+          // `change-set` block, and a model that was never told the format will never write one
+          // — the screen would then work perfectly and never once file a set, which is a
+          // feature that looks built and does nothing. The text is the same sentence the API
+          // documents in `proposal::system_instruction`, and `GET /ai/chat` is the one place
+          // the two can be compared.
+          messages: [
+            ...(proposalInstruction
+              ? [{ role: "system" as const, content: proposalInstruction }]
+              : []),
+            { role: "user" as const, content: prompt },
+          ],
+        },
         {
           onStart: (info) => setChatRoute(`${info.provider} · ${info.model} · ${info.protocol}`),
           onDelta: (content) => setAnswer((current) => current + content),
+          onProposal: (filed) => setChatProposal(filed),
+          onProposalError: (message) => setChatProposalError(message),
           onDone: (done) => {
             const usage = done.usage?.total_tokens;
             setChatUsage(
@@ -1463,7 +1540,17 @@ export function AiView() {
             <button
               type="button"
               onClick={() => void send()}
-              disabled={streaming || !prompt.trim() || enabledModels.length === 0}
+              disabled={
+                streaming ||
+                !prompt.trim() ||
+                enabledModels.length === 0 ||
+                proposalInstruction === null
+              }
+              title={
+                proposalInstruction === null
+                  ? "Waiting for the proposal instruction — without it an answer can never propose changes."
+                  : undefined
+              }
               data-chat-send
               className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-quiet-soft disabled:text-muted"
             >
@@ -1488,6 +1575,59 @@ export function AiView() {
           {chatUsage ? (
             <p data-chat-usage className="text-[11.5px] text-muted">
               {chatUsage}
+            </p>
+          ) : null}
+
+          {/* The proposal, as something a person can go to. An answer that describes changes
+              and gives no way to review them is a described action, not a feature — so this
+              is a link into the same editor a hand-filed set lands in, not a summary. */}
+          {chatProposal ? (
+            <div
+              data-chat-proposal={chatProposal.change_set_id}
+              data-chat-proposal-gated={chatProposal.needs_approval ? "true" : "false"}
+              className="flex flex-wrap items-center gap-2 rounded-lg border border-line bg-canvas px-3 py-2"
+            >
+              <ClipboardList className="size-3.5 shrink-0 text-muted" aria-hidden />
+              <span className="text-[12.5px] font-medium">
+                Proposed changes ({chatProposal.operations})
+              </span>
+              <span className="truncate text-[12px] text-muted">{chatProposal.title}</span>
+              {chatProposal.needs_approval ? (
+                <span
+                  data-chat-proposal-note
+                  className="inline-flex items-center gap-1 rounded-full bg-caution-soft px-2 py-0.5 text-[10.5px] font-medium text-caution"
+                >
+                  at least one needs approval
+                </span>
+              ) : null}
+              <Link
+                href={`/ai/change-sets/${chatProposal.change_set_id}`}
+                data-chat-proposal-open
+                className="ml-auto inline-flex items-center gap-1 rounded-lg border border-line px-2.5 py-1 text-[12px] font-medium transition hover:bg-quiet-soft"
+              >
+                Review and confirm
+                <ArrowRight className="size-3.5" aria-hidden />
+              </Link>
+            </div>
+          ) : null}
+
+          {/* The answer is fine; the filing was not. Shown beside it, not instead of it. */}
+          {chatProposalError ? (
+            <p
+              data-chat-proposal-error
+              className="rounded-lg bg-danger-soft px-3 py-2 text-[12px] text-danger"
+            >
+              {chatProposalError} The answer above is complete, but the changes it describes were
+              not saved as a change set.
+            </p>
+          ) : null}
+          {proposalInstructionError && !chatProposal && !chatProposalError ? (
+            <p
+              data-chat-proposal-instruction-error
+              className="rounded-lg bg-caution-soft px-3 py-2 text-[12px] text-caution"
+            >
+              {proposalInstructionError} Until it can be read, a prompt sent from here cannot
+              propose changes — the model would never be told the format.
             </p>
           ) : null}
         </div>
