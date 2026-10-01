@@ -42,7 +42,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Doctor { json }) => doctor::run(json).await,
-        Ok(Command::Migrate) => migrate::run().await,
+        Ok(Command::Migrate(options)) => migrate::run(&options).await,
         Ok(Command::Setup(options)) => setup::run(*options).await,
         Ok(Command::Secret(options)) => match secret::run(*options, api_url()).await {
             Ok(code) => code,

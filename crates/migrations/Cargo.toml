@@ -6,6 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dev-dependencies]
+# The crate takes a `&Migrator` as an argument rather than embedding its own bundle, so the ONLY
+# place it needs `omnion-core` is the test that reads the REAL bundle — which is the point of that
+# test: a fixture shaped like a migration agrees with the parser by construction, and the whole
+# class of bug this slice found was exactly that.
+omnion-core = { path = "../core" }
+
 [dependencies]
 # Infrastructure like `omnion-deployment` and `omnion-telemetry`: it knows what a migration is,
 # whether its reversal has been rehearsed, and what a policy forbids — and nothing about any one

@@ -1533,6 +1533,7 @@ version = "0.1.0"
 dependencies = [
  "omnion-core",
  "omnion-identity",
+ "omnion-migrations",
  "omnion-onboarding",
  "omnion-storage",
  "rpassword",
@@ -1666,6 +1667,7 @@ name = "omnion-migrations"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "omnion-core",
  "serde",
  "serde_json",
  "sha2",

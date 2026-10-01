@@ -15,8 +15,8 @@ pub enum Command {
         /// Print the checks as JSON instead of a table.
         json: bool,
     },
-    /// `omnion migrate`.
-    Migrate,
+    /// `omnion migrate [up|status|plan|verify-down]`.
+    Migrate(Box<MigrateOptions>),
     /// `omnion setup …`.
     Setup(Box<SetupOptions>),
     /// `omnion secret …` — the loopback credential helper (REQ-125, slice 3).
@@ -40,6 +40,29 @@ pub struct SecretOptions {
     pub token_file: Option<String>,
     /// Check a redemption works, printing no value.
     pub check: bool,
+}
+
+/// Everything `omnion migrate` accepts on the command line.
+///
+/// A struct rather than the bare `Migrate` it used to be, because the sub-actions differ in what
+/// they need: `status` and `plan` need nothing, `apply` needs an actor and a source, and
+/// `verify-down` needs a version and a scratch database URL. Encoding the sub-action in the
+/// variant would give four variants of one command, and the help text would have to be written
+/// four times.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MigrateOptions {
+    /// The sub-action: `up` (the default), `status`, `plan`, `verify-down`.
+    pub action: Option<String>,
+    /// Who the run is recorded as (`--actor`).
+    pub actor: Option<String>,
+    /// Which source the journal records (`--source`), one of `cli`, `deploy`, `ci`, `boot`.
+    pub source: Option<String>,
+    /// The migration version (`--version`).
+    pub version: Option<String>,
+    /// The scratch database the rehearsal runs against (`--scratch`). Required by `verify-down`:
+    /// the runner cannot derive it, and a rehearsal on the live database is the accident the
+    /// request spends a whole risk note on.
+    pub scratch: Option<String>,
 }
 
 /// Everything `omnion setup` accepts on the command line.
@@ -108,13 +131,8 @@ impl Command {
                 Ok(Self::Doctor { json })
             }
             "migrate" => {
-                if let Some((flag, inline)) = cursor.next() {
-                    return Err(match inline {
-                        Some(_) => format!("`omnion migrate` takes no options, got {flag:?}"),
-                        None => format!("unknown option {flag:?} for `omnion migrate`"),
-                    });
-                }
-                Ok(Self::Migrate)
+                let options = parse_migrate(&mut cursor)?;
+                Ok(Self::Migrate(Box::new(options)))
             }
             "setup" => {
                 let options = parse_setup(&mut cursor)?;
@@ -161,6 +179,48 @@ fn parse_setup(cursor: &mut Cursor<'_>) -> Result<SetupOptions, String> {
                 options.skip_migrations = true;
             }
             other => return Err(format!("unknown option {other:?} for `omnion setup`")),
+        }
+    }
+
+    Ok(options)
+}
+
+/// Parse the options of `omnion migrate`.
+///
+/// The first bare word is the sub-action, exactly as in `omnion secret`: the actions are
+/// positional in every real invocation (`omnion migrate verify-down --version 0207`) and a flag
+/// would be a worse answer that looks more flexible.
+fn parse_migrate(cursor: &mut Cursor<'_>) -> Result<MigrateOptions, String> {
+    let mut options = MigrateOptions::default();
+
+    while let Some((flag, inline)) = cursor.next() {
+        if !flag.starts_with('-') {
+            // A bare word with an `=` in it is a mistyped flag, never a sub-action: the four
+            // actions are `up`, `status`, `plan`, `verify-down` and none contains `=`. Catching it
+            // here means exit code 2 (usage) rather than an "unknown sub-action" at exit 1, which
+            // is the difference between a pipeline that reports a bad command line and one that
+            // reports a failed migration check.
+            if flag.contains('=') {
+                return Err(format!(
+                    "unknown option {flag:?} for `omnion migrate`: a sub-action is a bare word \
+                     (up, status, plan, verify-down)"
+                ));
+            }
+            if options.action.is_none() {
+                options.action = Some(flag.to_owned());
+                no_value(flag, inline)?;
+                continue;
+            }
+            return Err(format!(
+                "`omnion migrate` takes one sub-action; {flag:?} is a second one"
+            ));
+        }
+        match flag {
+            "--actor" => options.actor = Some(cursor.value(flag, inline)?),
+            "--source" => options.source = Some(cursor.value(flag, inline)?),
+            "--version" | "-V" => options.version = Some(cursor.value(flag, inline)?),
+            "--scratch" => options.scratch = Some(cursor.value(flag, inline)?),
+            other => return Err(format!("unknown option {other:?} for `omnion migrate`")),
         }
     }
 
@@ -223,7 +283,7 @@ USAGE
 COMMANDS
     setup      First-run setup: owner account, organization, first site, theme.
     doctor     Check the environment: configuration, database, migrations, redis, storage.
-    migrate    Apply pending database migrations.
+    migrate    Apply, plan, inspect or rehearse database migrations.
     secret     Redeem a credential lease for a child process (never prints a value).
     help       Show this text (also -h, --help).
     version    Show the version (also -V, --version).
@@ -241,6 +301,18 @@ SETUP OPTIONS
     --theme <key>            Theme key (default: {theme}).
     --non-interactive, --yes Never prompt; missing values are errors.
     --skip-migrations        Do not touch the schema before setting up.
+
+MIGRATE ACTIONS
+    up                 Apply every pending migration (the default).
+      --actor <name>     Who the journal records (default: the OS user).
+      --source <kind>    cli, deploy, ci or boot (default: cli).
+    status              The ledger: applied, pending, checksum drift, lock holder.
+    plan                What a run would do. Executes nothing, takes no lock.
+    verify-down         Rehearse a migration's reversal on a SCRATCH database.
+      --version <NNNN>   The migration to rehearse.
+      --scratch <url>    The scratch database. Required: this runner cannot
+                         derive it, and rehearsing on the live one is the
+                         accident this command exists to make hard to commit.
 
 SECRET OPTIONS
     The loopback helper that hands a leased value to a child process. It refuses to print a
@@ -266,6 +338,9 @@ ENVIRONMENT
     (OMNION_DATABASE_URL, OMNION_REDIS_URL, …). See docs/02-ARCHITECTURE.md.
 
 EXAMPLES
+    omnion migrate status
+    omnion migrate plan
+    omnion migrate verify-down --version 0207 --scratch postgres://…/scratch
     omnion doctor
     OMNION_DEPLOYMENT_KEY=omnion_dk_… OMNION_LEASE_TOKEN=… omnion secret redeem \
         --lease 6f1c… --as STRIPE_KEY -- node deploy.js
@@ -371,12 +446,45 @@ mod tests {
     }
 
     #[test]
-    fn migrate_takes_nothing() {
+    fn migrate_defaults_to_the_forward_direction_and_names_its_actor() {
+        // A bare `omnion migrate` is still the thing the deploy job runs, so it has to keep
+        // parsing to the up direction with no flags — the change here adds sub-actions, it does
+        // not move the default.
         assert_eq!(
             Command::parse(&argv("migrate")).expect("parses"),
-            Command::Migrate
+            Command::Migrate(Box::new(MigrateOptions {
+                action: None,
+                actor: None,
+                source: None,
+                version: None,
+                scratch: None,
+            }))
+        );
+        let parsed = Command::parse(&argv(
+            "migrate apply --actor ci-bot --source ci --version=0207",
+        ))
+        .expect("parses");
+        let Command::Migrate(options) = parsed else {
+            panic!("expected migrate options");
+        };
+        assert_eq!(options.action.as_deref(), Some("apply"));
+        assert_eq!(options.actor.as_deref(), Some("ci-bot"));
+        assert_eq!(options.source.as_deref(), Some("ci"));
+        assert_eq!(options.version.as_deref(), Some("0207"));
+    }
+
+    #[test]
+    fn migrate_refuses_a_second_sub_action_and_an_unknown_flag() {
+        assert!(
+            Command::parse(&argv("migrate up down")).is_err(),
+            "two actions is an ambiguous invocation"
         );
         assert!(Command::parse(&argv("migrate --force")).is_err());
+        let err = Command::parse(&argv("migrate up=yes")).unwrap_err();
+        assert!(
+            err.contains("up, status, plan, verify-down"),
+            "the refusal lists the actions: {err}"
+        );
     }
 
     #[test]

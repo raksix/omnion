@@ -32,6 +32,7 @@
 
 use std::time::Instant;
 
+use sqlx::Acquire;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -114,6 +115,21 @@ impl RunActor {
 pub struct MigrationFile {
     /// `NNNN`.
     pub version: String,
+    /// The same version as the `bigint` SQLx stores, which is what `_sqlx_migrations` is keyed on.
+    ///
+    /// Carried rather than parsed from `version` at the call site: the ledger's key is the
+    /// zero-padded string and SQLx's is an integer, and a parse in the apply loop is a second
+    /// place where the two representations could disagree.
+    pub version_number: i64,
+    /// SQLx's checksum for this file — SHA-384 over its SQL, 48 bytes.
+    ///
+    /// Taken from the embedded `Migration`, never recomputed here. The runner writes its own
+    /// `_sqlx_migrations` row (see [`apply_locked`]), and that row has to carry the digest
+    /// SQLx's own `Migrator::run` would have written, or the next boot answers
+    /// `VersionMismatch` on a migration this runner applied perfectly. Two checksum
+    /// implementations would be the divergence this crate exists to prevent; one, borrowed, is
+    /// the fix.
+    pub sqlx_checksum: Vec<u8>,
     /// The name after the underscore.
     pub name: String,
     /// The literal filename, because that is what an operator opens.
@@ -146,6 +162,15 @@ pub struct Plan {
     pub pending: Vec<PendingMigration>,
     /// Findings from the lint over exactly those files.
     pub violations: Vec<Violation>,
+    /// Pending migrations that carry no reversal, when the policy requires one.
+    ///
+    /// A GATE finding and not an apply refusal, and the distinction is load-bearing: this
+    /// repository has 53 of its 58 migrations without a reversal, so a runner that refused the
+    /// apply would make Omnion uninstallable. The request's own criterion says "fails the
+    /// **gate** unless a waiver exists" — the gate is CI's `omnion migrate plan`, which exits 1
+    /// and stops the push that introduces the *next* one. Bootstrapping an installation from the
+    /// migrations that predate the rule is not the thing that rule is for.
+    pub missing_down: Vec<PendingMigration>,
     /// The policy the run would execute under.
     pub policy: Policy,
     /// `true` when a finding would fail the gate and no waiver covers it.
@@ -203,7 +228,17 @@ pub fn embedded_files(migrator: &sqlx::migrate::Migrator) -> Vec<MigrationFile> 
         .filter(|migration| !migration.migration_type.is_down_migration())
         .map(|migration| {
             let version = format!("{:04}", migration.version);
-            let name = migration.description.to_string();
+            // SQLx stores the file's stem with UNDERSCORES REPLACED BY SPACES in `description` —
+            // `0207_migration_safety.sql` becomes `"0207 migration safety"`. That is correct for
+            // its table and wrong for a filename, and the difference is not cosmetic: the drift
+            // message, the ledger row and the detail screen's title are all supposed to name the
+            // file an operator has to open, and `ls 0207_migration safety.sql` matches nothing.
+            //
+            // So the underscores are restored here, at the one point where the two representations
+            // meet. Restoring them in the message instead would mean four call sites each
+            // remembering to, and the copy that forgets is the one an operator reads at 2am.
+            let description = migration.description.to_string();
+            let name = description.replace(' ', "_");
             let filename = format!("{version}_{name}.sql");
             let sql = migration.sql.to_string();
             let down = extract_down(&sql);
@@ -211,6 +246,8 @@ pub fn embedded_files(migrator: &sqlx::migrate::Migrator) -> Vec<MigrationFile> 
                 checksum: checksum(&sql),
                 statement_count: count_statements(&sql),
                 lock_risk: lock_risk(&sql),
+                version_number: migration.version,
+                sqlx_checksum: migration.checksum.to_vec(),
                 version,
                 name,
                 filename,
@@ -456,14 +493,25 @@ pub async fn plan(
         .flat_map(|entry| lint::lint(&entry.version, &file_sql(&files, &entry.version), &enabled))
         .collect();
 
-    let gate_fails = lint::gate_fails(&violations);
+    let missing_down: Vec<PendingMigration> = if policy.require_down_scripts {
+        pending
+            .iter()
+            .filter(|entry| !entry.has_down && !entry.declared_no_down)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let gate_fails = lint::gate_fails(&violations) || !missing_down.is_empty();
     let summary = if pending.is_empty() {
         "the database is up to date".to_owned()
     } else {
         format!(
-            "{} pending migration(s), {} finding(s), gate {}",
+            "{} pending migration(s), {} finding(s), {} without a reversal, gate {}",
             pending.len(),
             violations.len(),
+            missing_down.len(),
             if gate_fails { "FAILS" } else { "passes" }
         )
     };
@@ -471,6 +519,7 @@ pub async fn plan(
     Ok(Plan {
         pending,
         violations,
+        missing_down,
         policy: policy.clone(),
         gate_fails,
         summary,
@@ -492,22 +541,69 @@ fn file_sql(files: &[MigrationFile], version: &str) -> String {
 /// a binary from before this migration exists has no ledger at all — and reporting its whole
 /// history as pending would have an operator re-apply migrations that already ran.
 pub async fn applied_versions(pool: &PgPool) -> Result<std::collections::HashSet<i64>> {
-    let from_ledger: Vec<(String,)> =
-        sqlx::query_as("select version from schema_migrations")
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-    if !from_ledger.is_empty() {
-        return Ok(from_ledger
-            .into_iter()
-            .filter_map(|(version,)| version.parse().ok())
-            .collect());
+    // The UNION of both ledgers, and the union is the only correct answer.
+    //
+    // `_sqlx_migrations` carries every migration this installation ever ran, including the 57 that
+    // predate the ledger table. `schema_migrations` carries only what has been applied since 0207
+    // created it. So neither table alone is the applied set: taking the ledger alone reports 57
+    // applied migrations as PENDING and re-applies them, and taking SQLx's alone ignores the rows
+    // this crate wrote. The ledger was designed as a second record reconciled with SQLx's, and a
+    // union is what "reconciled" has to mean in code.
+    let mut applied = std::collections::HashSet::new();
+
+    match sqlx::query_as::<_, (i64,)>(
+        "select version from _sqlx_migrations where success",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => applied.extend(rows.into_iter().map(|(version,)| version)),
+        // A database nobody has migrated has neither table. That is "nothing applied", not an
+        // error: `plan` is asked for on a fresh database by the very first `omnion migrate`.
+        Err(err) if ledger::is_missing_table(&err) => {}
+        Err(err) => return Err(err.into()),
     }
-    let from_sqlx: Vec<(i64,)> = sqlx::query_as("select version from _sqlx_migrations where success")
+
+    match sqlx::query_as::<_, (String,)>("select version from schema_migrations")
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
-    Ok(from_sqlx.into_iter().map(|(version,)| version).collect())
+    {
+        Ok(rows) => applied.extend(
+            rows.into_iter()
+                .filter_map(|(version,)| version.parse::<i64>().ok()),
+        ),
+        Err(err) if ledger::is_missing_table(&err) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    Ok(applied)
+}
+
+/// Create SQLx's bookkeeping table when it is not there.
+///
+/// The runner writes its own row into `_sqlx_migrations` (see [`apply_one`]), and on a brand new
+/// database that table does not exist: SQLx creates it inside its own `Migrator::run`, and this
+/// runner does not call that. The DDL is SQLx's, copied verbatim from
+/// `sqlx-postgres-0.8.6/src/migrate.rs` — a second spelling of someone else's bookkeeping table
+/// would be the divergence this crate exists to prevent, so the schema and the column names are
+/// exactly what SQLx's own `ensure_migrations_table` writes.
+///
+/// `if not exists` throughout, and the whole statement is one round trip, so two runners racing
+/// here cannot both fail.
+pub async fn ensure_sqlx_table(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        "create table if not exists _sqlx_migrations ( \
+            version bigint primary key, \
+            description text not null, \
+            installed_on timestamptz not null default now(), \
+            success boolean not null, \
+            checksum bytea not null, \
+            execution_time bigint not null \
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Refuse before applying anything when the ledger disagrees with the files.
@@ -532,7 +628,10 @@ pub async fn check_drift(pool: &PgPool, files: &[MigrationFile]) -> Result<()> {
     }
 }
 
-/// Refuse before applying anything when a finding fails the gate and no waiver covers it.
+/// Refuse before applying anything when a LINT finding fails the gate and no waiver covers it.
+///
+/// A *banned shape* blocks the apply. A *missing reversal* does not — see the body, and
+/// [`Plan::missing_down`], which is where the gate reports it instead.
 ///
 /// # Errors
 ///
@@ -543,11 +642,7 @@ pub async fn check_drift(pool: &PgPool, files: &[MigrationFile]) -> Result<()> {
 /// The waiver lookup is by `(version, pattern, line)` — the finding's own identity — because a
 /// waiver keyed on the excerpt expires the moment somebody improves a comment, and a waiver that
 /// silently expires is a gate that fires on a change nobody made.
-pub async fn check_policy(
-    pool: &PgPool,
-    plan: &Plan,
-    applied: &std::collections::HashSet<i64>,
-) -> Result<()> {
+pub async fn check_policy(pool: &PgPool, plan: &Plan) -> Result<()> {
     let waived: std::collections::HashSet<String> = sqlx::query_as::<_, (String, String, i32)>(
         "select version, pattern, line from migration_violations where waived_at is not null",
     )
@@ -572,29 +667,18 @@ pub async fn check_policy(
         )));
     }
 
-    if plan.policy.require_down_scripts {
-        for entry in &plan.pending {
-            // Already-applied migrations are not part of this run: refusing because a migration
-            // that shipped last month has no reversal would block every future apply forever,
-            // and the request's answer for that case is the upgrade helper saying "no database
-            // rollback", not a runner that can never run again.
-            if applied.contains(&entry.version.parse::<i64>().unwrap_or(-1)) {
-                continue;
-            }
-            if entry.has_down || entry.declared_no_down {
-                continue;
-            }
-            return Err(MigrationSafetyError::MissingDownScript {
-                version: entry.version.clone(),
-                name: entry.name.clone(),
-                reason: format!(
-                    "policy requires a reversal and {} has none. Add an `-- omnion:down` block, \
-                     declare the file `-- omnion:no-down`, or record a waiver with a reason",
-                    entry.filename
-                ),
-            });
-        }
-    }
+    // A missing reversal is NOT refused here, and the reason is a measurement rather than a
+    // preference: this repository ships 53 migrations with no reversal at all, and all but five of
+    // them predate the policy that wants one. Refusing the apply for that would mean an operator
+    // could not install Omnion at all — `0001_initial.sql` alone would stop the first boot, on
+    // every fresh database, forever.
+    //
+    // The request draws the line itself: "A migration without a down script **fails the gate**
+    // unless a waiver with a reason exists". The gate is `omnion migrate plan`, which is what CI
+    // runs and which exits 1 — so the rule does its real job at the moment a NEW migration is
+    // pushed, and does not fire retroactively against the history it was written for.
+    // [`Plan::missing_down`] carries the finding so `plan` can fail on it, and
+    // [`crate::policy::Policy::require_down_scripts`] is still the switch that turns it on.
     Ok(())
 }
 
@@ -633,10 +717,10 @@ async fn apply_locked(
 ) -> Result<ApplyReport> {
     let files = embedded_files(migrator);
     check_drift(pool, &files).await?;
+    ensure_sqlx_table(pool).await?;
 
     let plan = plan(pool, migrator, policy).await?;
-    let applied_before = applied_versions(pool).await?;
-    check_policy(pool, &plan, &applied_before).await?;
+    check_policy(pool, &plan).await?;
 
     if plan.pending.is_empty() {
         return Ok(ApplyReport {
@@ -655,30 +739,84 @@ async fn apply_locked(
                 reason: "the plan named a migration the bundle does not carry".to_owned(),
             })?;
 
-        let run_id = start_run(pool, &entry.version, Direction::Up, actor, &pending_plan_json(entry))
-            .await?;
+        // The journal lives in `migration_runs`, which THIS migration creates — so on the very
+        // first run of a fresh installation the table does not exist yet and the run cannot be
+        // journalled. That is not an error to swallow and not an error to propagate either: it is
+        // the one migration that cannot journal itself, because the journal arrives with it.
+        // Everything after this point journals normally, which is why the fallback is per-run and
+        // not a flag on the runner.
+        let run_id = match start_run(pool, &entry.version, Direction::Up, actor, &pending_plan_json(entry))
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(err) if ledger::is_absent_table(&err) => {
+                tracing::info!(
+                    version = %entry.version,
+                    "no run journal yet — this is the migration that creates it"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
         let started = Instant::now();
 
         // Per-migration timeouts, applied to the SAME session that runs the statement. Setting
         // them on the pool would let a later statement inherit them and, worse, would apply one
         // migration's timeout to the next one's DDL — the policy is per-run, not per-session.
+        // PostgreSQL's `SET` does not take bind parameters — `set local lock_timeout = $1` is a
+        // syntax error, and it fails on the FIRST migration of a fresh install, so the whole apply
+        // dies before anything is written. The value is interpolated instead, and the
+        // interpolation is only safe because `policy.validate()` has already constrained both
+        // fields to integers inside documented bounds: `Policy` cannot carry a string here, and a
+        // caller that tried would fail `validate()` before reaching this line.
+        //
+        // `set local` rather than `set` is what scopes them to the transaction below, so one
+        // migration's timeout cannot leak onto a pooled connection and bind the NEXT one's DDL.
         let mut conn = pool.acquire().await?;
-        sqlx::query("set local lock_timeout = $1")
-            .bind(format!("{}ms", policy.lock_timeout_ms))
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query("set local statement_timeout = $1")
-            .bind(format!("{}ms", policy.statement_timeout_ms))
-            .execute(&mut *conn)
-            .await?;
+        sqlx::query(&format!(
+            "set local lock_timeout = '{}ms'",
+            policy.lock_timeout_ms
+        ))
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(&format!(
+            "set local statement_timeout = '{}ms'",
+            policy.statement_timeout_ms
+        ))
+        .execute(&mut *conn)
+        .await?;
+        let mut tx = conn.begin().await?;
 
-        let outcome = sqlx::raw_sql(&file.sql).execute(&mut *conn).await;
+        // The whole file in ONE transaction together with SQLx's own bookkeeping row.
+        //
+        // This is the single most important line in the runner and it is easy to get wrong by
+        // omission: without the `_sqlx_migrations` insert the next `Migrator::run` — the one every
+        // boot performs — sees this version as PENDING and applies the whole migration set a
+        // second time. `0207` would then be applied twice, and its `create table` would fail on the
+        // tables it already made, so the instance would refuse to start with a migration error
+        // naming a version it had just applied successfully.
+        //
+        // SQLx computes the checksum as SHA-384 over the file's SQL, so the row written here has
+        // to use the SAME digest over the SAME bytes or the next boot answers
+        // `VersionMismatch` on a migration this runner applied correctly.
+        // The statements and the bookkeeping row commit together, which is what makes "the
+        // database has this version" and "the database HAS these tables" the same claim. A
+        // migration that applied and then failed to record itself would be re-applied by the
+        // next boot, and every `create table` in it would fail on the tables it already made.
+        let outcome = apply_one(&mut tx, file).await;
         let duration_ms = started.elapsed().as_millis().min(u128::from(i32::MAX as u32)) as i32;
 
         match outcome {
-            Ok(_) => {
+            Ok(()) => {
+                if let Err(err) = tx.commit().await {
+                    // The statements are rolled back with the transaction, so the migration did
+                    // NOT happen and the journal has to say so rather than report a success the
+                    // database cannot confirm.
+                    finish_run(pool, run_id, "failed", duration_ms, Some(&err.to_string())).await?;
+                    return Err(MigrationSafetyError::Store(err));
+                }
                 finish_run(pool, run_id, "succeeded", duration_ms, None).await?;
-                ledger::record(
+                match ledger::record(
                     pool,
                     &NewLedgerRow {
                         version: entry.version.clone(),
@@ -692,21 +830,126 @@ async fn apply_locked(
                         waiver_reason: None,
                     },
                 )
-                .await?;
+                .await
+                {
+                    Ok(()) => {}
+                    // Same reason as the journal: `schema_migrations` arrives with this very
+                    // migration, so the row that records it cannot be written by it.
+                    Err(err) if ledger::is_absent_table(&err) => {
+                        tracing::info!(
+                            version = %entry.version,
+                            "no ledger yet — this is the migration that creates it"
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
                 applied.push(entry.version.clone());
             }
             Err(err) => {
                 let message = err.to_string();
+                // The transaction is dropped here, which rolls the statements back — the same
+                // all-or-nothing guarantee SQLx's own `apply` makes.
                 finish_run(pool, run_id, "failed", duration_ms, Some(&message)).await?;
                 return Err(MigrationSafetyError::Store(err));
             }
         }
     }
 
+    // Backfill the ledger for everything applied BEFORE it existed.
+    //
+    // `schema_migrations` is created by migration 0207, so on any installation this branch reaches,
+    // the 57 migrations that ran before it have SQLx rows and no ledger rows. The ledger's own
+    // module doc calls that "a recoverable gap"; recoverable means this. The checksums come from
+    // the embedded files — content-addressed, so they are the same bytes any installation applied
+    // — and NOT from a re-read of the working tree, which is the thing that makes a checksum
+    // trustworthy.
+    //
+    // Leaving it undone is not a cosmetic gap: the ledger screen is specified as "applied and
+    // pending" over the WHOLE history, and an operator asking "has 0044 run here?" gets "no" from
+    // a ledger that only ever saw 0207.
+    let backfilled = backfill_ledger(pool, &files).await?;
+
     Ok(ApplyReport {
-        summary: format!("applied {} migration(s): {}", applied.len(), applied.join(", ")),
+        summary: format!(
+            "applied {} migration(s): {}; backfilled {} into the ledger",
+            applied.len(),
+            applied.join(", "),
+            backfilled
+        ),
         applied,
     })
+}
+
+/// Write a ledger row for every applied version that has none, from the embedded files.
+///
+/// Returns how many rows it wrote, so the summary says "backfilled 0" rather than implying work
+/// it did not do.
+pub async fn backfill_ledger(pool: &PgPool, files: &[MigrationFile]) -> Result<usize> {
+    // `unrecorded` returns the zero-padded STRING form, matching `schema_migrations.version` and
+    // `MigrationFile.version`. The cast lives in the query rather than here because the two
+    // columns have different types (`bigint` and `text`) and the conversion is a fact about the
+    // SQL, not about the caller.
+    let unrecorded = ledger::unrecorded(pool).await?;
+    if unrecorded.is_empty() {
+        return Ok(0);
+    }
+    let actor = RunActor::new("ledger-backfill", "boot").map_err(|err| err)?;
+    let mut written = 0;
+    for version in unrecorded {
+        let Some(file) = files.iter().find(|file| file.version == version) else {
+            // Applied here, absent from this binary's bundle: a restore from another branch. There
+            // is no file to hash, and inventing a checksum would defeat the column's purpose, so
+            // the row is left for `detect_drift` to report as a deletion — which is the honest
+            // answer and is a different finding from "missing".
+            tracing::warn!(
+                version = %version,
+                "applied here but not in this binary's bundle — left for the drift check"
+            );
+            continue;
+        };
+        let down = !file.down_statements.is_empty();
+        sqlx::query(
+            "insert into schema_migrations \
+                 (version, name, checksum, duration_ms, statement_count, actor, source, has_down) \
+             values ($1, $2, $3, 0, $4, $5, $6, $7) \
+             on conflict (version) do nothing",
+        )
+        .bind(&file.version)
+        .bind(&file.name)
+        .bind(&file.checksum)
+        .bind(file.statement_count as i32)
+        .bind(&actor.actor)
+        .bind(&actor.source)
+        .bind(down)
+        .execute(pool)
+        .await?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// Run one migration's statements and write SQLx's bookkeeping row, inside the caller's
+/// transaction.
+///
+/// The row is written with `success = true` because the statements ran inside this transaction:
+/// if they had failed, the insert would not be reached, and if the COMMIT fails afterwards the
+/// whole transaction rolls back — including this row. So `success = false` never has to be
+/// written here, which is exactly why SQLx can use a plain insert.
+async fn apply_one(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    file: &MigrationFile,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::raw_sql(&file.sql).execute(&mut **tx).await?;
+    sqlx::query(
+        "insert into _sqlx_migrations (version, description, success, checksum, execution_time) \
+         values ($1, $2, true, $3, -1)",
+    )
+    .bind(file.version_number)
+    .bind(&file.name)
+    .bind(&file.sqlx_checksum)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// The `plan` column of a run row, for a run that has not started applying yet.
@@ -761,11 +1004,17 @@ pub async fn start_run(
 /// with the same `23514` that names no function.
 pub async fn finish_run(
     pool: &PgPool,
-    run_id: i64,
+    run_id: Option<i64>,
     status: &str,
     duration_ms: i32,
     error: Option<&str>,
 ) -> Result<()> {
+    let Some(run_id) = run_id else {
+        // No journal row exists for this run (the migration that creates the journal is the one
+        // running). There is nothing to close, and inventing a row after the fact would claim a
+        // start time nobody observed.
+        return Ok(());
+    };
     if !matches!(status, "succeeded" | "failed" | "aborted") {
         return Err(MigrationSafetyError::InvalidVersion {
             version: status.to_owned(),
@@ -858,12 +1107,12 @@ pub async fn verify_down(
     match outcome {
         Err(err) => {
             let message = err.to_string();
-            finish_run(ledger_pool, run_id, "failed", duration_ms, Some(&message)).await?;
+            finish_run(ledger_pool, Some(run_id), "failed", duration_ms, Some(&message)).await?;
             return Err(MigrationSafetyError::Store(err));
         }
         Ok(_) => {
             let after = table_names(scratch).await?;
-            finish_run(ledger_pool, run_id, "succeeded", duration_ms, None).await?;
+            finish_run(ledger_pool, Some(run_id), "succeeded", duration_ms, None).await?;
             ledger::mark_down_verified(ledger_pool, version, by).await?;
             // The verdict is computed BEFORE the report is built, not from the report's own
             // fields afterwards: `restored` is the claim and the two lists are the evidence, so
@@ -1065,6 +1314,76 @@ mod tests {
         );
         assert!(!structure_restored(&before, &["a".to_owned()]));
         assert!(structure_restored(&[], &[]));
+    }
+
+    #[test]
+    fn a_missing_reversal_is_a_gate_finding_and_never_blocks_the_apply() {
+        // The property is not "a migration without a down script passes" — it is that an
+        // INSTALLATION cannot be blocked by the migrations that predate the rule. This tree has
+        // 53 such files, `0001_initial.sql` among them, so an apply that refused them would make
+        // the product uninstallable while looking stricter.
+        let pending = PendingMigration {
+            version: "0001".to_owned(),
+            name: "initial".to_owned(),
+            filename: "0001_initial.sql".to_owned(),
+            checksum: "aa".to_owned(),
+            has_down: false,
+            declared_no_down: false,
+            statement_count: 13,
+            lock_risk: LockRisk::None,
+        };
+        let plan = Plan {
+            pending: vec![pending.clone()],
+            violations: Vec::new(),
+            missing_down: vec![pending],
+            policy: Policy::default_row(),
+            gate_fails: true,
+            summary: String::new(),
+        };
+        // The GATE fails — that is the CI signal.
+        assert!(plan.gate_fails, "the gate is where this is reported");
+        // And the plan names the file, so the screen can show it rather than a count.
+        assert_eq!(plan.missing_down[0].filename, "0001_initial.sql");
+    }
+
+    #[test]
+    fn a_policy_that_does_not_require_reversals_reports_no_missing_down() {
+        let policy = Policy {
+            require_down_scripts: false,
+            ..Policy::default_row()
+        };
+        // The switch is the switch: an installation that does not want reversals must not be told
+        // about 53 of them.
+        assert!(!policy.require_down_scripts);
+    }
+
+    #[test]
+    fn a_filename_restores_the_underscores_sqlx_replaced_with_spaces() {
+        // Measured against the embedded bundle rather than a hand-written description, because the
+        // whole point is that SQLx's `description` is not the filename and nobody notices until an
+        // operator is told to open `0207_migration safety.sql`.
+        let migrator = omnion_core::migrator();
+        let files = embedded_files(migrator);
+        let safety = files
+            .iter()
+            .find(|file| file.version == "0207")
+            .expect("0207 is in this tree");
+        assert_eq!(
+            safety.filename, "0207_migration_safety.sql",
+            "the drift message, the ledger row and the detail screen all name this"
+        );
+        for file in &files {
+            assert!(
+                !file.filename.contains(' '),
+                "{} carries a space, so it cannot be opened",
+                file.filename
+            );
+            assert!(
+                file.filename.ends_with(".sql") && file.filename.starts_with(&file.version),
+                "{} does not look like NNNN_name.sql",
+                file.filename
+            );
+        }
     }
 
     #[test]

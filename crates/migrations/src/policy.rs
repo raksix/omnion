@@ -216,7 +216,11 @@ pub async fn read(pool: &PgPool) -> Result<Policy> {
          from migration_policy where id = 1",
     )
     .fetch_optional(pool)
-    .await?;
+    .await
+    // An installation whose binary predates 0207 has no table and no row; both mean "the
+    // defaults apply", and refusing here would make the runner unusable on exactly the
+    // installations that most need it.
+    .or_else(|err| if crate::ledger::is_missing_table(&err) { Ok(None) } else { Err(err) })?;
 
     Ok(match row {
         None => Policy::default_row(),

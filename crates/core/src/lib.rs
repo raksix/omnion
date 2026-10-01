@@ -21,8 +21,12 @@ pub mod telemetry;
 pub mod vapid;
 
 pub use config::{Config, WorkflowConfig};
-pub use db::{Db, MigrationStatus};
+pub use db::{Db, MigrationStatus, migrator, same_server_url};
 pub use error::{ConfigError, CoreError, Result};
+// Re-exported so a consumer that only holds a pool does not have to declare `sqlx` itself just to
+// name the type in a signature. The alternative — every binary adding the dependency to pass a
+// `&PgPool` it did not create — is how a workspace ends up with two sqlx versions.
+pub use sqlx::PgPool;
 pub use redis_client::RedisClient;
 pub use telemetry::Telemetry;
 

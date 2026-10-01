@@ -12,15 +12,40 @@
 //! reverses, and **this module is the only thing that reads it**. That is what makes "has a down
 //! script" a question with an answer rather than a grep somebody ran once.
 //!
-//! ## The block is recognised by a marker, not by a heading
+//! ## The block is recognised by a heading AND a marker, and one of them is the convention
 //!
-//! A heading is prose. `0199_deployment_tooling.sql` contains the words "Down script" in its
-//! leading comment explaining *why* the reversal is commented out, and it contains the reversed
-//! `drop table` statements, and it is entirely correct. A parser that looked for the phrase
-//! "Down script" would find that paragraph and then have to guess whether the lines after it were
-//! the reversal or more explanation.
+//! My first version keyed the block on a line that cannot occur in prose -- the `omnion:down`
+//! marker -- and **zero of this repository's 58 migrations used it**, including the two files
+//! that document the convention most carefully. The convention that actually exists is a headed
+//! block:
 //!
-//! The marker is therefore a line that cannot occur in prose:
+//! ```text
+//! -- ---------------------------------------------------------------------------
+//! -- Down script (docs/05-VERSIONING.md)
+//! -- ---------------------------------------------------------------------------
+//! ```
+//!
+//! So the marker is still supported -- a future migration may prefer it and a file carrying it
+//! must keep working -- but it is the SECOND way in, not the only one. A parser that reads the
+//! marker alone is not stricter, it is broken: it reports `has_down = false` for every file in
+//! the tree, and the gate consuming that answer refuses to apply any of them.
+//!
+//! ### Why the heading is matched tightly
+//!
+//! "Down script" appears in prose all over this repository: `0207_migration_safety.sql` says
+//! "no down script was found in the file" inside a `create table`, and `0035` explains why the
+//! reversal is a comment. A substring search for the phrase opens a block in the middle of a
+//! column comment and then treats every indented comment after it as the reversal.
+//!
+//! So a heading must be the WHOLE comment line -- optionally `##`-prefixed and optionally followed
+//! by a parenthesised reference. That excludes "no down script was found" and includes
+//! `-- ## Down script`, which two files use. It is still a phrase match and that is stated rather
+//! than hidden: a heading only ever OPENS a block, and the block ends at the first statement that
+//! is not part of one.
+//!
+//! The original argument for the marker is preserved below, because the conclusion it reached is
+//! the one that matters:
+
 //!
 //! ```text
 //! -- omnion:down
@@ -41,7 +66,11 @@
 //! whose block is all commentary therefore reports `has_down = false`, which routes it through the
 //! policy check and the upgrade helper — both of which treat it as "take the backup".
 
-/// The marker that opens (and closes) a reversal block. A line, not a phrase.
+/// The explicit marker that opens (and closes) a reversal block.
+///
+/// One of the two ways in; see the module doc for why the heading is the convention and this is
+/// the opt-in. A file carrying the marker and a file carrying the heading both parse, which is
+/// what lets this crate ship without touching 58 files that predate it.
 pub const DOWN_MARKER: &str = "omnion:down";
 
 /// The marker a maintainer puts in a file that has no reversal and says so on purpose.
@@ -95,17 +124,43 @@ impl DownScript {
 /// "this file has no reversal" already means something precise.
 #[must_use]
 pub fn extract_down(content: &str) -> DownScript {
-    let mut script = DownScript {
+    // The marker wins over the heading, and the order is a decision rather than an accident.
+    //
+    // A file may legitimately carry BOTH: `0199_deployment_tooling.sql` explains the convention in
+    // prose with a `## Down script` heading near the top and then writes the real reversal under an
+    // explicit marker further down. A single pass would open at the *first* thing it recognised —
+    // the explanatory heading — and either close on the marker (yielding nothing) or read the
+    // marker's own line as the block's first statement. Two passes with a priority make the answer
+    // depend on which form is more explicit rather than on which appears first, and the
+    // marker-vs-heading question then has exactly one answer per file.
+    //
+    // The fallback condition is "produced no statements", not "no marker present": a marker block
+    // that is all commentary is prose, and a file with a prose marker AND a headed reversal should
+    // still report the headed one.
+    let marked = scan(content, |body| body.trim() == DOWN_MARKER);
+    if marked.has_statements() {
+        return DownScript {
+            declared_no_down: declares_no_down(content),
+            ..marked
+        };
+    }
+    let headed = scan(content, is_down_heading);
+    DownScript {
         declared_no_down: declares_no_down(content),
-        ..DownScript::default()
-    };
+        ..headed
+    }
+}
+
+/// One pass for one way in. `opens` decides whether a comment line starts a block.
+fn scan(content: &str, opens: fn(&str) -> bool) -> DownScript {
+    let mut script = DownScript::default();
 
     let mut inside = false;
     for (index, line) in content.lines().enumerate() {
         if let Some(body) = comment_body(line) {
-            if body.trim() == DOWN_MARKER {
+            if opens(body) {
                 if inside {
-                    break; // the closing marker ends the block; nothing after it is a statement
+                    break; // a second opener ends the block; nothing after it is a statement
                 }
                 inside = true;
                 script.block_start = Some(index + 1);
@@ -128,6 +183,39 @@ pub fn extract_down(content: &str) -> DownScript {
     }
     script
 }
+
+/// `true` when a comment line is a down-script heading rather than prose mentioning one.
+///
+/// Accepted shapes, and nothing else:
+///   * `-- Down script`
+///   * `-- Down script (docs/05-VERSIONING.md)`
+///   * `-- ## Down script`
+///
+/// Rejected, and each for a reason that is a real file in this tree:
+///   * `-- the down script exists as a comment because …` — a sentence, not a heading
+///     (`0035_observability_logs.sql`).
+///   * `-- `false` means "no down script was found in the file"` — a column comment inside a
+///     `create table` (`0207_migration_safety.sql`).
+///   * `-- Reverse order, children before parents` — the line AFTER the heading, which mentions
+///     neither the phrase nor a marker and is therefore commentary.
+///
+/// The match is on the trimmed body with a leading `##` stripped, so the rule above is exact:
+/// nothing matches unless the heading word is the entire content.
+#[must_use]
+pub fn is_down_heading(body: &str) -> bool {
+    let body = body.trim();
+    let body = body.strip_prefix("##").map(str::trim_start).unwrap_or(body);
+    let Some(rest) = body.strip_prefix(DOWN_HEADING).map(str::trim) else {
+        return false;
+    };
+    // Whatever follows must be empty or a parenthesised reference — `(docs/05-VERSIONING.md)`.
+    // A sentence does not match, and neither does a second word.
+    rest.is_empty()
+        || (rest.starts_with('(') && rest.ends_with(')'))
+}
+
+/// The heading phrase, without the comment marker.
+pub const DOWN_HEADING: &str = "Down script";
 
 /// The text after `--`, or `None` when the line is not a SQL comment.
 ///
@@ -183,6 +271,151 @@ create table release_manifests (version text primary key);
 
 -- Commented out, like every other migration in this tree.
 "#;
+
+    /// The shape this repository actually writes, taken from `0162_reliability.sql` verbatim.
+    const HEADED_SHAPED: &str = r#"
+-- ---------------------------------------------------------------------------
+-- Down script (docs/05-VERSIONING.md)
+-- ---------------------------------------------------------------------------
+-- Reverse order, children before parents, so no foreign key is left pointing at a dropped
+-- table. `if exists` throughout.
+
+--   drop table if exists intake_rejections;
+--   drop table if exists intake_endpoints;
+
+-- Commented out, like every other migration in this tree, because the up half is run by
+-- `Db::migrate` and a reversal written as live statements would be executed by it too.
+"#;
+
+    #[test]
+    fn a_headed_block_yields_its_indented_statements() {
+        // This is the load-bearing shape: the marker variant is what the module doc argued for and
+        // NO file in this tree uses it. A parser that reads only the marker reports `has_down =
+        // false` for all 58 migrations, and the gate that trusts it refuses to apply any of them.
+        let script = extract_down(HEADED_SHAPED);
+        assert_eq!(
+            script.statements,
+            vec![
+                "drop table if exists intake_rejections;",
+                "drop table if exists intake_endpoints;"
+            ],
+            "the indented comment lines after the heading are the statements"
+        );
+        assert!(script.has_statements());
+        assert_eq!(script.block_start, Some(3), "1-based, the heading line");
+    }
+
+    #[test]
+    fn a_double_hash_heading_is_the_same_heading() {
+        // `0037_metric_catalog.sql` and `0040_observability_tracing.sql` write `-- ## Down script`.
+        assert_eq!(
+            extract_down("-- ## Down script\n--   drop table a;").statements,
+            vec!["drop table a;"]
+        );
+    }
+
+    #[test]
+    fn prose_that_mentions_a_down_script_does_not_open_a_block() {
+        // Every one of these is a real line in this repository, and each of them would open a block
+        // under a substring match — which then swallows every later indented comment in the file,
+        // including another section's explanation.
+        let prose = [
+            // `0035_observability_logs.sql`
+            "-- The down script exists as a comment rather than as a second file because the \
+             migration runner",
+            // `0207_migration_safety.sql`, inside a `create table`
+            "    -- `false` means \"no down script was found in the file\", which is NOT the same as \
+             \"the down",
+            // A sentence that ends with the phrase
+            "-- read docs/05-VERSIONING.md: Down script",
+        ];
+        for line in prose {
+            assert!(
+                !is_down_heading(line.trim_start_matches('-')),
+                "prose must not open a block: {line}"
+            );
+            let script = extract_down(&format!("{line}\n--   drop table a;\n"));
+            assert!(
+                script.statements.is_empty(),
+                "no statements were claimed from prose: {line} -> {script:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heading_with_a_trailing_sentence_is_not_a_heading() {
+        assert!(!is_down_heading("Down script, but written live"));
+        assert!(!is_down_heading("Down scripts"));
+        assert!(is_down_heading("Down script"));
+        assert!(is_down_heading("Down script (docs/05-VERSIONING.md)"));
+        assert!(is_down_heading("## Down script"));
+    }
+
+    /// The test that decides this crate's central claim.
+    ///
+    /// The module doc asserts that the parser reads the reversals this repository actually
+    /// writes. That is a claim about FILES, and the file that proves it is not a fixture: a
+    /// hand-written fixture shaped like `0162_reliability.sql` agrees with the parser by
+    /// construction, which is exactly the "documented but unreachable" failure this request is
+    /// written against. So the real files are read, and the assertion is a COUNT.
+    #[test]
+    fn the_trees_own_migrations_are_read_as_they_are_written() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../database/migrations");
+        let mut files = std::fs::read_dir(&dir)
+            .expect("the migrations directory is embedded, so it is on disk")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect::<Vec<_>>();
+        files.sort();
+        assert!(
+            files.len() > 50,
+            "the tree grew: the assertion is about the whole set, not a fixture ({} files)",
+            files.len()
+        );
+
+        let mut with_reversal = 0;
+        let mut headings_without_statements: Vec<String> = Vec::new();
+        for path in &files {
+            let content = std::fs::read_to_string(path).expect("readable");
+            let script = extract_down(&content);
+            if script.has_statements() {
+                with_reversal += 1;
+            } else if content
+                .lines()
+                .any(|line| comment_body(line).is_some_and(is_down_heading))
+            {
+                // A heading with no statement under it is a half-written reversal. Naming the
+                // files is the point: this list is short and every entry is a real defect.
+                headings_without_statements.push(
+                    path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                );
+            }
+        }
+
+        assert!(
+            headings_without_statements.is_empty(),
+            "a down-script heading with no statements under it is a reversal nobody can run: \
+             {headings_without_statements:?}"
+        );
+        // FIVE is the measured truth, and the number is the point rather than a threshold to be
+        // relaxed until the suite is green: an independent scan of the same 58 files (heading or
+        // marker, then indented comment lines) finds exactly these five with these statement
+        // counts — `0037`, `0040`, `0162`, `0199` and `0207`. A parser that reads only its own
+        // marker finds ZERO, and a parser that opened on any line mentioning "down script" finds
+        // nine blocks, four of which are prose.
+        //
+        // The other 53 migrations have no reversal at all, which is a fact about the repository
+        // and not about this parser. It is also exactly why the policy's answer for them is a
+        // WAIVER and not a pass: a migration with no reversal is "take the backup".
+        assert_eq!(
+            with_reversal, 5,
+            "the parser must read exactly the files that carry a reversal; it read {with_reversal} \
+             of {total} files. New migration with a reversal? Raise this number WITH the file.",
+            total = files.len()
+        );
+    }
 
     #[test]
     fn a_marked_block_yields_its_indented_statements() {

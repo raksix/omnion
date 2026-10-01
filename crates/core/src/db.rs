@@ -15,6 +15,27 @@ use crate::error::{CoreError, Result};
 /// without shipping the SQL files next to it (docs/04-MONOREPO.md: `database/migrations`).
 static MIGRATOR: Migrator = sqlx::migrate!("../../database/migrations");
 
+/// The migration bundle this binary embeds.
+///
+/// Public so the CLI, the deploy job and the panel all read the SAME set the runner applies —
+/// a second copy of this `static` would be a second answer to "which migrations does this binary
+/// carry", and the divergence would show up as a plan preview describing statements no deploy will
+/// ever run.
+pub fn migrator() -> &'static Migrator {
+    &MIGRATOR
+}
+
+/// A [`DatabaseConfig`] pointing at `name` on the same server as this one.
+///
+/// Built from the existing config rather than parsed from a flag so a scratch database inherits
+/// the operator's credentials, pool size and host — and so `--scratch` can carry a bare database
+/// name as easily as a full URL. `url` is required to be a real PostgreSQL URL, so this is a
+/// *different database on the same server*, never a different server.
+pub fn same_server_url(url: &str, name: &str) -> Option<String> {
+    let cut = url.rfind('/')?;
+    Some(format!("{}/{name}", &url[..cut]))
+}
+
 /// Upper bound for a health ping so readiness probes answer quickly.
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 

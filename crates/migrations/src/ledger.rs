@@ -35,6 +35,34 @@ use time::OffsetDateTime;
 
 use crate::error::{MigrationSafetyError, Result};
 
+/// `true` when PostgreSQL answered `undefined_table` (`42P01`).
+///
+/// Every reader in this module needs it, because "this installation has never run migration 0207"
+/// is the normal state of a database nobody has migrated — and it must read as an EMPTY ledger,
+/// not as an error. A `select` that propagates `42P01` makes `omnion migrate plan` fail on a fresh
+/// database, which is the one moment a new operator runs it.
+#[must_use]
+pub fn is_missing_table(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01")
+    )
+}
+
+/// [`is_missing_table`] for the error a caller of this crate actually receives.
+///
+/// The two exist because the crate's own functions wrap sqlx errors in
+/// [`MigrationSafetyError::Store`], so a caller holding one has a `Store` and a caller holding a
+/// raw sqlx error has the other — and neither should have to match a two-level enum to ask "is
+/// the table just not there yet".
+#[must_use]
+pub fn is_absent_table(error: &MigrationSafetyError) -> bool {
+    match error {
+        MigrationSafetyError::Store(inner) => is_missing_table(inner),
+        _ => false,
+    }
+}
+
 /// Where a migration run was started from. Mirrors the `source` check constraint on
 /// `migration_runs`; the duplicate list is the price of not letting the database be the schema
 /// definition for a Rust enum, and the walk proves the two agree by inserting every variant.
@@ -226,13 +254,18 @@ pub fn validate_version(version: &str) -> Result<()> {
 /// which the caller reports as "no ledger yet" rather than as an empty ledger. The distinction
 /// matters — an empty ledger and a ledger that could not be read render the same screen.
 pub async fn list(pool: &PgPool) -> Result<Vec<LedgerRow>> {
-    let rows = sqlx::query_as::<_, LedgerRow>(
+    let rows = match sqlx::query_as::<_, LedgerRow>(
         "select version, name, checksum, applied_at, duration_ms, statement_count, actor, \
                  source, has_down, down_verified_at, down_verified_by, waiver_reason \
          from schema_migrations order by version",
     )
     .fetch_all(pool)
-    .await?;
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) if is_missing_table(&err) => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
     Ok(rows)
 }
 
@@ -251,11 +284,16 @@ pub async fn read(pool: &PgPool, version: &str) -> Result<Option<LedgerRow>> {
 
 /// The `(version, name, checksum)` triples the ledger holds, for [`detect_drift`].
 pub async fn drift_input(pool: &PgPool) -> Result<Vec<(String, String, String)>> {
-    let rows = sqlx::query_as::<_, (String, String, String)>(
+    let rows = match sqlx::query_as::<_, (String, String, String)>(
         "select version, name, checksum from schema_migrations order by version",
     )
     .fetch_all(pool)
-    .await?;
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) if is_missing_table(&err) => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
     Ok(rows)
 }
 
@@ -333,12 +371,28 @@ pub async fn mark_down_verified(pool: &PgPool, version: &str, by: &str) -> Resul
 /// ledger write did not (a crash between the two, or a binary from before this table existed).
 /// The caller seeds these rows from the embedded files rather than inventing checksums.
 pub async fn unrecorded(pool: &PgPool) -> Result<Vec<String>> {
-    let rows = sqlx::query_as::<_, (String,)>(
-        "select version from _sqlx_migrations where success \
-           and version::text not in (select version from schema_migrations) order by version",
+    // Both tables can be absent on a fresh database, and both absences mean "nothing applied", so
+    // the query is dropped rather than reported: the caller has a second source of truth for
+    // "what ran" and this is only the reconciliation gap between two ledgers.
+    let rows = match sqlx::query_as::<_, (String,)>(
+        // `lpad` is load-bearing on BOTH sides of the comparison and it was the third defect in
+        // this function. `_sqlx_migrations.version` is a `bigint`, so `version::text` yields
+        // `"207"`; `schema_migrations.version` is the zero-padded `"0207"`. Unpadded, the `not in`
+        // comparison reports EVERY migration as unrecorded (it is a text comparison against
+        // different text), and the caller then looks up `"207"` among files named `"0207_…"`,
+        // finds nothing, and skips all of them. The result is a backfill that reports "0 written"
+        // on a database with 57 unrecorded versions — the silent, wrong answer.
+        "select lpad(version::text, 4, '0') from _sqlx_migrations where success \
+           and lpad(version::text, 4, '0') \
+               not in (select version from schema_migrations) order by version",
     )
     .fetch_all(pool)
-    .await?;
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) if is_missing_table(&err) => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
     Ok(rows.into_iter().map(|(version,)| version).collect())
 }
 

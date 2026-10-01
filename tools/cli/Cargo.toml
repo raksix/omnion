@@ -18,4 +18,5 @@ tokio = { workspace = true, features = ["io-util", "net"] }
 omnion-core = { path = "../../crates/core" }
 omnion-identity = { path = "../../crates/identity" }
 omnion-onboarding = { path = "../../crates/onboarding" }
+omnion-migrations = { path = "../../crates/migrations" }
 omnion-storage = { path = "../../crates/storage" }
