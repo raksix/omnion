@@ -122,12 +122,21 @@ export const SOURCE_KIND_LABEL: Record<string, string> = {
 };
 
 /**
- * The first-response clock's state, derived from three fields the API sends.
+ * The first-response clock's state, as the **server** answers it.
  *
- * The platform's SLA policies are slice 2, so there is no `sla_state` column to read: this
- * derives the same four states from the deadline, the instant it was met and whether the clock
- * is still running. When slice 2 lands it takes over this function rather than the screens, so
- * nothing here has to change.
+ * This used to be a second implementation. It derived the same four states from the deadline,
+ * the instant it was met and a hard-coded `AT_RISK_MINUTES = 60`, and its own doc said slice 2
+ * would "take over this function rather than the screens, so nothing here has to change" —
+ * slice 2 landed and nothing changed, so for three ticks the panel and the module disagreed by
+ * construction. The module warns at a quarter of the **policy's own window**, floored at 15
+ * minutes, so on a 15-minute policy a lead with 5 minutes left is `at_risk` where this called
+ * it `on_track`; and a lead answered *after* its deadline is `met` in the module while this
+ * showed `breached` for ever.
+ *
+ * It is now a pass-through, and that is the point: the only rule left here is the *shape* of
+ * the answer, and the badge reads whatever the server said. There is deliberately no fallback
+ * arithmetic — a client that "helpfully" recomputes when the field is missing is the second
+ * implementation this change exists to delete.
  */
 export type SlaState = "on_track" | "at_risk" | "breached" | "met" | "none";
 
@@ -149,56 +158,20 @@ export const SLA_STATE_TONE: Record<SlaState, string> = {
   none: "bg-quiet-soft text-muted",
 };
 
-/** How close to the deadline counts as "due soon". */
-const AT_RISK_MINUTES = 60;
-
 /**
- * The clock state of one lead.
+ * The clock state of one lead, read from the server's answer.
  *
- * `dueAt` null means the source has no SLA policy attached yet (slice 2 attaches one), and the
- * honest answer there is "No target" rather than a green `On track` that claims a promise
- * nothing made.
+ * `sla_state` is `none` when the lead has no SLA policy attached, and the panel renders that
+ * as "No target" rather than a green `On track` — a badge claiming a promise nobody made is
+ * the failure this replaced, so it is not reintroduced as a default. An unrecognised word
+ * degrades to `none` rather than throwing: a state the server adds later must render as
+ * "nothing to say", never as a blank screen or a crash.
  */
-export function slaState(lead: {
-  first_response_due_at: string | null;
-  first_response_at: string | null;
-  is_open: boolean;
-  status: string;
-}): SlaState {
-  if (lead.first_response_at) {
-    // Responding after the deadline keeps the breach recorded: the deadline passed, and the
-    // report that measures the breach has to keep seeing it.
-    const due = lead.first_response_due_at ? Date.parse(lead.first_response_due_at) : null;
-    const met = Date.parse(lead.first_response_at);
-    if (due !== null && met > due) {
-      return "breached";
-    }
-    return "met";
-  }
-  // The clock only runs while somebody still has to answer it, so the OPEN half
-  // decides whether there is a state at all. `is_open` from the server is the
-  // module's own answer; the panel asks its own question the same way rather
-  // than trusting one of the two to carry the other.
-  if (!isOpenLeadStatus(lead.status)) {
-    return "none";
-  }
-  if (!lead.is_open) {
-    return "none";
-  }
-  if (!lead.first_response_due_at) {
-    return "none";
-  }
-  const due = Date.parse(lead.first_response_due_at);
-  if (!Number.isFinite(due)) {
-    return "none";
-  }
-  if (due < Date.now()) {
-    return "breached";
-  }
-  if (due - Date.now() <= AT_RISK_MINUTES * 60_000) {
-    return "at_risk";
-  }
-  return "on_track";
+export function slaState(lead: { sla_state?: string }): SlaState {
+  const value = lead.sla_state;
+  return value === "on_track" || value === "at_risk" || value === "breached" || value === "met"
+    ? value
+    : "none";
 }
 
 /** A countdown in words — "in 2h 15m", "2h 04m late" — or `null` without a deadline. */

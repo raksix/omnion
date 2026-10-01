@@ -82,6 +82,17 @@ export type Lead = {
   received_at: string;
   converted_at: string | null;
   sla_running: boolean;
+  /**
+   * The clock's state, computed by the module's own rule on the server.
+   *
+   * Typed as a union rather than `string` so a server that adds a fifth state is a **type
+   * error in the client**, which is the point: the panel used to derive this itself from a
+   * fixed threshold, and the two silently disagreed on every short-window policy. The union
+   * plus the pass-through `slaState` means the badge can only ever show what the module said.
+   */
+  sla_state: "on_track" | "at_risk" | "breached" | "met" | "none";
+  /** The policy the clock runs on — `null` when the source carried no SLA policy. */
+  sla_policy_id: string | null;
 };
 
 /** One line of a lead's trail. */
