@@ -2010,6 +2010,52 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
             name.starts_with(&format!("{group}.")),
             "{name} claims group {group}, which does not prefix it"
         );
+
+        // The schema and the sample (REQ-033, slice 3d). Three claims, all on the wire rather
+        // than in the crate, because a crate test cannot catch a handler that forgot to pass
+        // them: this is the shape a subscriber's tooling actually receives.
+        let schema = &entry["payload_schema"];
+        assert_eq!(
+            schema["type"], "object",
+            "{name} must ship a schema, not an absent one"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{name} must close its payload's field set, or a receiver cannot tell a typo from \
+             a field the platform has not shipped"
+        );
+        assert!(
+            schema["$id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("urn:omnion:event:")),
+            "{name} must carry a $id, and it must be a name rather than a fetchable URL"
+        );
+
+        // The schema declares exactly the fields the entry lists. A schema that described a
+        // different payload than `payload_fields` would be two sources of truth, and the drift
+        // would be found by a subscriber rather than by a gate.
+        let declared = schema["properties"]
+            .as_object()
+            .expect("properties is an object")
+            .len();
+        assert_eq!(
+            declared,
+            fields_of(entry).len(),
+            "{name}: the schema declares {declared} properties and the field list has {}",
+            fields_of(entry).len()
+        );
+
+        // And the acceptance criterion itself: the sample validates against its own schema.
+        // `omnion_events::schema::validate` is the subset the crate documents; running it here
+        // means the wire answer is proved, not just the in-memory pair.
+        let sample = &entry["sample"];
+        let problems = omnion_events::schema::validate(schema, sample);
+        assert!(
+            problems.is_empty(),
+            "the sample {name} serves does not validate against the schema it serves beside: \
+             {problems:#?}"
+        );
     }
 
     // The published page event is described with the fields it actually carries — this is the
