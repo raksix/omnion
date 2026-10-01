@@ -11566,10 +11566,12 @@ async function runWorkflowBuilderDepth(page, report) {
     if (!mine) {
       rebaseNote = { attempted: true, reason: "the palette add selected nothing to lose" };
     } else {
-      // The CSRF header, for the reason the `switch-not-executable` leg above states: a
-      // cookie-authenticated PUT without `x-omnion-csrf` is refused with `csrf_failed` before
-      // the handler runs, and the fixture would then delete nothing while the row reported a
-      // clean adoption.
+      // The CSRF header. `presented_token` DOES fall back to the `omnion_csrf` cookie, so
+      // this header is not what makes the request legal — the cookie alone would verify. It is
+      // sent because the header is the explicit intention and the cookie is the fallback
+      // (csrf.rs reads the header first precisely so a page with both is believed), and because
+      // a fixture whose only defence is a cookie a later change might make unreadable would be
+      // a fixture that silently stops working.
       const tabTwoDeleted = await rebaseTab.evaluate(
         async ([id, victim]) => {
           const csrf = document.cookie

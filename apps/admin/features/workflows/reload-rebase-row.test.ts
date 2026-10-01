@@ -99,9 +99,11 @@ test("the reload row creates the conflict whose banner carries the Reload button
     "the fixture has to move the version; a PUT quoting the version it just read is not a conflict",
   );
   assert.ok(
-    /x-omnion-csrf/.test(RELOAD_ROW),
-    "the fixture's PUT is cookie-authenticated and needs the CSRF header or it is refused " +
-      "before the handler runs -- the fixture would delete nothing and the row would report a clean adoption",
+    /x-omnion-csrf/.test(RELOAD_ROW_CODE),
+    "the fixture's PUT sends the explicit CSRF header. It is not what makes the request legal " +
+      "-- `presented_token` falls back to the cookie -- so this is a statement about the " +
+      "fixture's intent, and dropping the header should be a deliberate decision, not an edit " +
+      "that leaves a delete of the author's card resting on a cookie fallback",
   );
   assert.ok(
     /=== "conflict"/.test(RELOAD_ROW),
