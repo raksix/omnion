@@ -80,6 +80,7 @@ import {
   type HistorySnapshot,
 } from "./builder-history";
 import { endDrag, beginDrag, type DragOrigin } from "./drag-history";
+import { addKey, duplicateKey, editKey, edgeKey, layoutKey, moveKey, pasteKey, removeKey } from "./gesture-key";
 import { decideConnection } from "./connect-edge";
 import { readVersionFrom, resolveConflict } from "./conflict";
 import { arbitrateSave } from "./save-arbitration";
@@ -781,7 +782,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       // The graph ref is written directly as well as through state: `pushHistory` reads the
       // ref, and a ref updated in a render body would be one render behind the change.
       graphRef.current = { nodes: [...graphRef.current.nodes, node], edges: graphRef.current.edges };
-      pushHistory(`add:${node.id}`, before);
+      pushHistory(addKey(node.id), before);
       queueSave();
     },
     [currentSnapshot, nodes, pushHistory, queueSave, viewport],
@@ -813,7 +814,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       params: { ...source.params },
     };
     const nextNodes = [...nodes, copy];
-    commit(`duplicate:${copy.id}`, before, nextNodes, edges);
+    commit(duplicateKey(copy.id), before, nextNodes, edges);
     setSelection(selectNode(copy.id));
   }, [commit, currentSnapshot, edges, nodes, selected]);
 
@@ -876,7 +877,11 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         target: target_id,
       });
     }
-    commit("paste", before, nextNodes, nextEdges);
+    // Anchored on the first pasted id rather than a bare `"paste"`: the ids are minted during
+    // the paste, so this is the only anchor available, and it is stable for the gesture and
+    // distinct for the next one. Two pastes inside the window are two presses of undo, not one
+    // press that empties the canvas of both.
+    commit(pasteKey([...remap.values()][0]), before, nextNodes, nextEdges);
     const first = [...remap.values()][0];
     // The pasted group is selected as a group, not collapsed onto its first member: a paste
     // that highlights one card leaves the rest of the copy looking like it did not land.
@@ -938,9 +943,10 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       const before = currentSnapshot();
       const nextNodes = nodes.map((node) => (node.id === id ? { ...node, ...patch } : node));
       // A re-type is one gesture: the same node and the same field, so it coalesces with the
-      // keystrokes before it instead of costing a press of undo per character.
-      const fields = Object.keys(patch).sort().join(",");
-      commit(`edit:${id}:${fields}`, before, nextNodes, edges);
+      // keystrokes before it instead of costing a press of undo per character. The key carries
+      // the field set, so editing `label` and then `url` in one inspector visit is two presses
+      // and holding a key down in `label` is one.
+      commit(editKey(id, Object.keys(patch)), before, nextNodes, edges);
     },
     [commit, currentSnapshot, edges, nodes],
   );
@@ -994,7 +1000,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         },
       };
     });
-    commit("auto-layout", before, nextNodes, edges);
+    commit(layoutKey(nextNodes.map((n) => n.id)), before, nextNodes, edges);
   }, [commit, currentSnapshot, edges, nodes]);
 
   /**
@@ -1020,7 +1026,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         (edge) => !doomed.has(edge.source) && !doomed.has(edge.target),
       );
       commit(
-        ids.length === 1 ? `remove:${ids[0]}` : `remove:${[...doomed].sort().join(",")}`,
+        removeKey([...doomed]),
         before,
         nextNodes,
         nextEdges,
@@ -1061,8 +1067,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       // Routed through `commit` like every other change, so a connection is one undoable
       // step. The criteria ask undo to "restore add, move, connect, delete …"; an edge added
       // behind the history's back is the one case that could not be undone.
+      //
+      // The key names the *endpoints*: `"edge-add"` said only "an edge was added", so wiring
+      // `a → b` and then `b → c` inside the coalesce window merged into one entry and a single
+      // undo removed BOTH, leaving a `b` nothing connects to. The chain is built one connection
+      // at a time, so this is not an exotic timing — it is how a rule gets wired.
       commit(
-        "edge-add",
+        edgeKey("add", decision.edge.source, decision.edge.source_port, decision.edge.target),
         currentSnapshot(),
         graphRef.current.nodes,
         [...graphRef.current.edges, decision.edge],
@@ -1085,7 +1096,16 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         return;
       }
       setSelection((current) => (current.edge === id ? clearSelection() : current));
-      commit("edge-remove", before, graphRef.current.nodes, nextEdges);
+      // Anchored on the endpoints, and deliberately a *different* key from the add of that
+      // same connection: connect then delete leaves the graph exactly as it was, so one undo
+      // claiming to reverse both would be describing a change nobody made.
+      const removed = graphRef.current.edges.find((edge) => edge.id === id);
+      commit(
+        edgeKey("remove", removed?.source ?? "", removed?.source_port ?? "", removed?.target ?? id),
+        before,
+        graphRef.current.nodes,
+        nextEdges,
+      );
     },
     [commit],
   );
@@ -1638,9 +1658,11 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               // Routed through `commit`, not `setEdges`, so a keyboard connection is one
               // undoable step like a pointer one — the criteria ask undo to "restore
               // add, move, connect, delete" and an edge added behind the history's back
-              // is the one case that would not be.
+              // is the one case that would not be. Same endpoints-in-the-key rule as the
+              // pointer path: a keyboard author wiring a chain two connections at a time
+              // must not lose both to one undo.
               commit(
-                "edge-add",
+                edgeKey("add", done.edge.source, done.edge.source_port, done.edge.target),
                 currentSnapshot(),
                 graphRef.current.nodes,
                 [...graphRef.current.edges, done.edge],
@@ -1761,7 +1783,11 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
             }
           : node,
       );
-      commit("nudge", before, nextNodes, edges);
+      // The key names the cards that moved, not the mechanism. `"nudge"` said only "something
+      // was nudged", so nudging one card and then the next inside `COALESCE_MS` merged into a
+      // single entry and one press of undo reversed both — from a key the author never pressed.
+      // This is the keyboard-reachable shape of the same class `dragKey` already got right.
+      commit(moveKey([...moving]), before, nextNodes, edges);
     },
     [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, filteredTypes, focusInspector, focusPaletteItem, keyConnect, locked, nodeTypes, nodes, pasteClipboard, removeEdge, removeNodes, saveNow, selected, selection, selectionCount],
   );

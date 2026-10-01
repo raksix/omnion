@@ -37,6 +37,7 @@
  * with a hole in it. `endDrag` seals first, so every release ends its own group.
  */
 import { COALESCE_MS, record, sealGroup, type History, type HistorySnapshot } from "./builder-history.ts";
+import { moveKey } from "./gesture-key.ts";
 
 /** What `pointerdown` takes and `pointerup` spends. */
 export interface DragOrigin {
@@ -46,9 +47,17 @@ export interface DragOrigin {
   ids: string[];
 }
 
-/** The coalescing key for a gesture moving exactly this set of nodes. */
+/**
+ * The coalescing key for a gesture moving exactly this set of nodes.
+ *
+ * Delegates to `moveKey` rather than restating it, so the drag and the arrow-key nudge share
+ * ONE definition of "a move of this set". That matters because a drag of `[a, b]` and a nudge
+ * of `[a, b]` are the same subject, and a nudge of `[a]` followed by a nudge of `[b]` is not:
+ * before the nudge adopted this key it said `"nudge"` for both, and two nudges on two cards
+ * merged into one entry — one press of undo reversing both, from a key nobody pressed.
+ */
 export function dragKey(ids: string[]): string {
-  return `move:${[...ids].sort().join(",")}`;
+  return moveKey(ids);
 }
 
 /**
