@@ -10875,3 +10875,14 @@ The same harness defect is worth sweeping across the other suites that run again
 database; `event_retention` and the health suites already do it correctly and are the model.
 
 ---
+
+**Addendum (same tick).** The per-walk database leaked on a panic, and six failing runs left
+**41** `omnion_themes_*` databases on the shared cluster. Four cleanup shapes were tried and
+measured: `catch_unwind` (needs `futures`, which this workspace does not carry), `tokio::spawn`ing
+the body (`Box<dyn Error>` is not `Send`), a `Drop` guard (a panic inside `#[tokio::test]` unwinds
+the runtime task, so the guard never runs) and a detached `handle.spawn` (not polled before the
+process exits). What survives a panic is the next run's work, so `Harness::fresh` sweeps stale
+`omnion_themes_%` databases before taking a new name. Measured: three seeded stale databases in,
+zero left after a run; a panicking run leaks one and the next run removes it. The `LIKE` pattern is
+a raw string because escaping the backslash for both Rust and SQL in a normal literal matches
+nothing — silently, which is indistinguishable from "there is nothing to clean".
