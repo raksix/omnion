@@ -10025,6 +10025,16 @@ async function main() {
     // the webhook detail is not walked by id: a route opened with a placeholder id only proves
     // the not-found state renders.
     { path: "/environments", name: "environments" },
+    // The deployment centre (REQ-024, slice 1). Five screens, all walked: the card grid is
+    // the brief's four lines, and a screen whose only job is to say which version is
+    // installed and which one is on offer has to be *rendered* to count as tested.
+    // `/deployment/checks` is here for the same reason as the health centre: the update
+    // check's own state is a product surface, and no other screen shows whether the
+    // release feed is being read at all.
+    { path: "/deployment", name: "deployment-overview" },
+    { path: "/deployment/releases", name: "deployment-releases" },
+    { path: "/deployment/history", name: "deployment-history" },
+    { path: "/deployment/checks", name: "deployment-checks" },
     // The security centre's five screens (REQ-012, slices 1-3). `runSecurityDepth` drives the
     // overview, the findings store and the header policy, but it never opened the last two --
     // and the same is true of the route list, so two screens that ship with rules, a policy
@@ -10462,6 +10472,12 @@ async function main() {
     // that produced it.
     { path: "/environments", name: "environments" },
     { path: "/environments?wizard=1", name: "environments-wizard", expect: "[data-env-wizard]" },
+    // The deployment centre at 390px. The spec calls the card grid's phone layout out by
+    // name ("cards stack"), so the stacking is what this measures; the history route is
+    // walked too, because it is a horizontal-scroll table on purpose and the assertion that
+    // matters is that the scroll lives *inside* the table rather than on the page.
+    { path: "/deployment", name: "deployment-overview" },
+    { path: "/deployment/history", name: "deployment-history" },
   ];
   for (const r of mobileTenantRoutes) MOBILE_NAMES.add(r.name);
   for (const route of (ONLY_ALL

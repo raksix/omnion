@@ -54,6 +54,22 @@ import type {
   SignInProtectionDocument,
   SignInProtectionSave,
   SignInProtectionSaved,
+  DeploymentAvailability,
+  DeploymentCheckRow,
+  DeploymentCheckRunResponse,
+  DeploymentChecksResponse,
+  DeploymentEnvironmentCard,
+  DeploymentEnvironmentDetail,
+  DeploymentEnvironmentsResponse,
+  DeploymentHistoryFilters,
+  DeploymentHistoryResponse,
+  DeploymentHistoryRow,
+  DeploymentRelease,
+  DeploymentReleaseDetail,
+  DeploymentReleasesResponse,
+  DeploymentRollbackOffer,
+  DeploymentStep,
+  DeploymentVersion,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   WebhookEndpoint,
@@ -6515,4 +6531,91 @@ export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
   return request<void>(`/api/v1/health/maintenance-windows/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The deployment centre (REQ-024, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The build metadata, also read by the shell footer.
+ *
+ * Answers even when the release feed is down and the cache is empty, because a footer that
+ * fails when a publisher's CDN wobbles is worse than a footer that shows a version and says
+ * nothing about updates.
+ */
+export async function fetchDeploymentVersion(): Promise<{ version: DeploymentVersion }> {
+  return request<{ version: DeploymentVersion }>("/api/v1/deployment/version");
+}
+
+/** The environment cards, with the version block they were computed from. */
+export async function fetchDeploymentEnvironments(): Promise<DeploymentEnvironmentsResponse> {
+  return request<DeploymentEnvironmentsResponse>("/api/v1/deployment/environments");
+}
+
+/** One card with its recent history. */
+export async function fetchDeploymentEnvironment(
+  environment: string,
+): Promise<DeploymentEnvironmentDetail> {
+  return request<DeploymentEnvironmentDetail>(
+    `/api/v1/deployment/environments/${encodeURIComponent(environment)}`,
+  );
+}
+
+/** The release browser for a channel. */
+export async function fetchDeploymentReleases(filters: {
+  channel?: string;
+  limit?: number;
+} = {}): Promise<DeploymentReleasesResponse> {
+  const query = new URLSearchParams();
+  if (filters.channel) query.set("channel", filters.channel);
+  if (filters.limit) query.set("limit", String(filters.limit));
+  const suffix = query.toString();
+  return request<DeploymentReleasesResponse>(
+    `/api/v1/deployment/releases${suffix ? `?${suffix}` : ""}`,
+  );
+}
+
+/** `View Changes`: one release with the version block beside it. */
+export async function fetchDeploymentRelease(
+  version: string,
+  channel?: string,
+): Promise<DeploymentReleaseDetail> {
+  const query = channel ? `?channel=${encodeURIComponent(channel)}` : "";
+  return request<DeploymentReleaseDetail>(
+    `/api/v1/deployment/releases/${encodeURIComponent(version)}${query}`,
+  );
+}
+
+/** The deploy / rollback / restart history, with the applied filter echoed back. */
+export async function fetchDeploymentHistory(
+  filters: DeploymentHistoryFilters = {},
+): Promise<DeploymentHistoryResponse> {
+  const query = new URLSearchParams();
+  if (filters.environment) query.set("environment", filters.environment);
+  if (filters.kind) query.set("kind", filters.kind);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.window) query.set("window", filters.window);
+  if (filters.limit) query.set("limit", String(filters.limit));
+  if (filters.offset) query.set("offset", String(filters.offset));
+  const suffix = query.toString();
+  return request<DeploymentHistoryResponse>(
+    `/api/v1/deployment/history${suffix ? `?${suffix}` : ""}`,
+  );
+}
+
+/** The update check's own state: last run, next run, what it announced. */
+export async function fetchDeploymentChecks(): Promise<DeploymentChecksResponse> {
+  return request<DeploymentChecksResponse>("/api/v1/deployment/checks");
+}
+
+/**
+ * Run an update check now, and wait for it.
+ *
+ * Synchronous on the wire on purpose: an operator presses this immediately before a deploy and
+ * needs the answer before the wizard's pre-flight, not a spinner and a re-poll. The response
+ * carries *this* run's result, never the previous run's.
+ */
+export async function runDeploymentCheck(): Promise<DeploymentCheckRunResponse> {
+  return request<DeploymentCheckRunResponse>("/api/v1/deployment/checks/run", { method: "POST" });
 }

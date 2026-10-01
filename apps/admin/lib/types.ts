@@ -2886,3 +2886,200 @@ export type HealthSettings = {
 
 /** What `PATCH /health/incidents/{id}` accepts. */
 export type HealthIncidentAction = "acknowledge" | "resolve";
+
+/* ---------------------------------------------------------------------------------------------
+ * The deployment centre (REQ-024, slice 1).
+ *
+ * `DeploymentAvailability` is the one shape worth reading twice. The API sends the card's second
+ * line three ways — an upgrade on offer, nothing newer, or a newer release that may NOT be
+ * offered and the reason why — and the panel renders all three. A single `available: string`
+ * would make the third case a sentence the panel has to parse, and the panel parsing a sentence
+ * is how "2.6.0 — needs core 2.6 or newer" ends up on a card as just "2.6.0".
+ * ---------------------------------------------------------------------------------------------
+ */
+
+/** What the card's `Available` line says, as the three states it can be in. */
+export type DeploymentAvailability =
+  | { state: "upgrade"; version: string; breaking: boolean }
+  | { state: "up-to-date" }
+  | { state: "blocked"; candidate: string; reason: string };
+
+/** `GET /api/v1/deployment/version`. */
+export type DeploymentVersion = {
+  version: string;
+  service: string;
+  channel: string;
+  /** Whether the API understood the configured channel string. */
+  channel_understood: boolean;
+  core: string | null;
+  /** The rendered line. Never an empty string. */
+  available: string;
+  availability: DeploymentAvailability;
+  upgrade_available: boolean;
+};
+
+/** The version block, repeated on several responses so the panel never re-derives it. */
+export type DeploymentVersionSummary = {
+  current: string;
+  available: string;
+  availability: DeploymentAvailability;
+  /** The cached-data banner, or null. Rendered verbatim — the wording is a product surface. */
+  stale_banner: string | null;
+};
+
+/** What a card offers as a rollback. */
+export type DeploymentRollbackOffer = {
+  to_version: string;
+  /** Whether that version is in the cache with notes. */
+  known: boolean;
+};
+
+/** One environment card (`GET /api/v1/deployment/environments`). */
+export type DeploymentEnvironmentCard = {
+  environment: string;
+  name: string;
+  /** `healthy`, `degraded` or `unreachable`. */
+  health: string;
+  version: string | null;
+  checked_at: string | null;
+  /** The failing probe, when degraded. The tooltip's second line. */
+  failing_probe: string | null;
+  available: string;
+  availability: DeploymentAvailability;
+  deployable: boolean;
+  /** Why not, when it may not. A disabled button with no reason is a dead control. */
+  blocked_reason: string | null;
+  rollback: DeploymentRollbackOffer | null;
+  last_deploy: DeploymentHistoryRow | null;
+};
+
+/** `GET /api/v1/deployment/environments`. */
+export type DeploymentEnvironmentsResponse = {
+  environments: DeploymentEnvironmentCard[];
+  summary: DeploymentVersionSummary;
+};
+
+/** `GET /api/v1/deployment/environments/{environment}`. */
+export type DeploymentEnvironmentDetail = {
+  environment: DeploymentEnvironmentCard;
+  history: DeploymentHistoryRow[];
+};
+
+/** One release in the browser. */
+export type DeploymentRelease = {
+  version: string;
+  channel: string;
+  released_at: string | null;
+  notes: string;
+  breaking: boolean;
+  migrations: string[];
+  core_min: string | null;
+  artifact_checksum: string | null;
+  checked_at: string;
+  is_available: boolean;
+};
+
+/** `GET /api/v1/deployment/releases`. */
+export type DeploymentReleasesResponse = {
+  channel: string;
+  releases: DeploymentRelease[];
+  stale_banner: string | null;
+  /** True when the channel is genuinely empty, so the panel can say so in words. */
+  empty: boolean;
+};
+
+/** `GET /api/v1/deployment/releases/{version}` — the `View Changes` screen. */
+export type DeploymentReleaseDetail = {
+  release: DeploymentRelease;
+  summary: DeploymentVersionSummary;
+  /** Set only when this release is the card's offer — an older version opens without a deploy. */
+  upgrade_from: string | null;
+};
+
+/** One step of a run. */
+export type DeploymentStep = {
+  position: number;
+  name: string;
+  status: string;
+  output: string;
+  started_at: string | null;
+  finished_at: string | null;
+};
+
+/** One history row. */
+export type DeploymentHistoryRow = {
+  id: string;
+  environment: string;
+  kind: string;
+  from_version: string | null;
+  to_version: string | null;
+  status: string;
+  strategy: string;
+  started_by: string | null;
+  reason: string | null;
+  error: string | null;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number | null;
+  steps: DeploymentStep[];
+};
+
+/** The filter the API applied, echoed. The chips read this rather than their own state. */
+export type DeploymentHistoryFilter = {
+  environment: string | null;
+  kind: string | null;
+  status: string | null;
+  window: string;
+};
+
+/** `GET /api/v1/deployment/history`. */
+export type DeploymentHistoryResponse = {
+  rows: DeploymentHistoryRow[];
+  total: number;
+  filter: DeploymentHistoryFilter;
+};
+
+/** The filter chips the history screen offers. */
+export type DeploymentHistoryFilters = {
+  environment?: string;
+  kind?: string;
+  status?: string;
+  window?: string;
+  limit?: number;
+  offset?: number;
+};
+
+/** One check row, in the wizard's own vocabulary. */
+export type DeploymentCheckRow = {
+  check: string;
+  title: string;
+  state: "pass" | "warn" | "fail" | "unknown";
+  detail: string;
+  suggestion: string | null;
+};
+
+/** `GET /api/v1/deployment/checks`. */
+export type DeploymentChecksResponse = {
+  channel: string;
+  last_run_at: string | null;
+  last_finished_at: string | null;
+  last_status: "completed" | "failed" | null;
+  last_error: string | null;
+  last_seen: number | null;
+  last_announced: string[];
+  stale_banner: string | null;
+  next_run_at: string | null;
+  due_in_seconds: number | null;
+  announced_total: number;
+  rows: DeploymentCheckRow[];
+};
+
+/** `POST /api/v1/deployment/checks/run`. */
+export type DeploymentCheckRunResponse = {
+  result:
+    | { state: "completed"; announced: string[]; seen: number }
+    | { state: "failed"; reason: string };
+  summary: DeploymentVersionSummary;
+  announced: string[];
+  checks: DeploymentChecksResponse;
+};

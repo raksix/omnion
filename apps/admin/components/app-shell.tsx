@@ -6,7 +6,7 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, Layers, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X, type LucideIcon } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, Layers, LayoutDashboard, LockKeyhole, LogOut, Menu, Rocket, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -56,6 +56,11 @@ const NAV: readonly NavItem[] = [
   // copy of a site's content is a fact about the site, and an operator who is editing pages wants
   // "which copy am I editing" one click from the pages, not four levels down.
   { href: "/environments", label: "Environments", icon: Layers },
+  // The deployment centre (REQ-024). Beside Environments rather than under Settings, and for
+  // the same reason: "which version is running, and may it be upgraded" is the question an
+  // operator opens the panel to answer, and burying it four levels down is how a deployment
+  // screen becomes the thing nobody looks at.
+  { href: "/deployment", label: "Deployment", icon: Rocket },
   // The endpoints and their delivery history (REQ-016, slice 2). It sits next to Events
   // rather than under Settings because the two are the same investigation from both ends:
   // the feed says what happened, this says who was told and whether they got it.
