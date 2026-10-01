@@ -102,7 +102,7 @@ impl ProposedOp {
 #[derive(Debug, Clone, Serialize)]
 pub struct SetCreated {
     #[serde(flatten)]
-    pub set: ChangeSet,
+    pub set: SetView,
     /// The keys the store ended up with, echoed so the client can address an operation
     /// without re-deriving them.
     pub keys: Vec<String>,
@@ -193,10 +193,11 @@ pub async fn create(
     )
     .await?;
 
+    let keys = set.operations.iter().map(|op| op.key.clone()).collect();
     Ok(Json(SetCreated {
         needs_approval: set.has_gated_operations(),
-        keys: set.operations.iter().map(|op| op.key.clone()).collect(),
-        set,
+        keys,
+        set: SetView::of(set),
     }))
 }
 
@@ -215,7 +216,7 @@ pub async fn update(
     Query(scope): Query<OrgQuery>,
     Path(id): Path<uuid::Uuid>,
     Json(body): Json<UpdateBody>,
-) -> Result<Json<ChangeSet>, ApiError> {
+) -> Result<Json<SetView>, ApiError> {
     let organization = resolve_organization(&current, scope.organization_id)?;
     let actor = current.user.id;
 
@@ -265,7 +266,7 @@ pub async fn update(
     .map_err(ApiError::from)?;
 
     match stored {
-        Ok(set) => Ok(Json(set)),
+        Ok(set) => Ok(Json(SetView::of(set))),
         Err(change_sets::store::EditRefusal::NotFound) => Err(ApiError::new(
             axum::http::StatusCode::NOT_FOUND,
             "change_set_not_found",
@@ -296,6 +297,213 @@ pub async fn update(
             "current_content_hash": existing.content_hash,
         }))),
     }
+}
+
+/// The store's `ChangeSet` is the database shape: every column. This is the screen shape, and
+/// it makes exactly two additions of its own — both questions about what a person may *do*.
+///
+/// They are not the client's to answer. `editable` is the same [`change_sets::EDITABLE`] list
+/// the `PATCH`'s `where` clause runs as, and `needs_approval` is the same
+/// `gated_operations()` the confirm route parks on: a panel that re-derives either from a
+/// status list it holds is a panel that drifts the first time a status is added, and the drift
+/// shows as a button the API refuses rather than as a compile error.
+#[derive(Debug, Clone, Serialize)]
+pub struct SetView {
+    #[serde(flatten)]
+    pub set: ChangeSet,
+    /// Whether the operation list may still be edited.
+    pub editable: bool,
+    /// Whether confirming this set would park at least one operation for a second person.
+    ///
+    /// The editor shows this **before** the reviewer confirms, because a set that needs
+    /// another person should not be discoverable only at the confirmation step.
+    pub needs_approval: bool,
+    /// Whether confirming it demands a typed phrase — it deletes content.
+    pub irreversible: bool,
+    /// The phrase itself: the set's title, which the confirm route compares against.
+    pub confirmation_phrase: Option<String>,
+}
+
+impl SetView {
+    fn of(set: ChangeSet) -> Self {
+        let irreversible = set.is_irreversible();
+        let title = set.title.trim().to_owned();
+        Self {
+            editable: set.is_editable(),
+            needs_approval: set.has_gated_operations(),
+            irreversible,
+            confirmation_phrase: irreversible.then_some(title),
+            set,
+        }
+    }
+}
+
+/// One operation of a set, resolved against the target as it is **now**.
+///
+/// This is what the editor renders. The alternative — and what the sheet did until this
+/// route existed — is to re-derive the diff in the browser from `args`, which is a second
+/// implementation of the preview rule: it cannot read the target's current values, it cannot
+/// coerce an argument for its field, and it cannot know a delete's cascade count. A reviewer
+/// looking at a client-computed OLD column is looking at a value nobody read from the
+/// database, and the apply would then write through the server's own plan — so the sheet and
+/// the write would disagree exactly when it matters.
+///
+/// `diffs` is the same [`FieldDiff`] list [`plan::Plan`] produces, so the renderer is the
+/// review screen's renderer and not a second one.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlannedOp {
+    /// Stable across edits, drops and reorders — the same key the set stores.
+    pub key: String,
+    /// `create`, `update` or `delete`.
+    pub kind: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    /// The target's name as it reads today, empty for a create.
+    pub label: String,
+    pub diffs: Vec<PlannedField>,
+    /// What a delete would take with it, in plain language.
+    pub cascades: Vec<String>,
+    /// The revision this plan was computed against. Its disagreement with the set's stored
+    /// `base_revisions` is what the editor's "these targets moved" banner reads.
+    pub base_revision: String,
+    /// Whether confirming this operation would park it for a second person, and the class
+    /// that does. `None` for an operation the policies let through.
+    pub gated_class: Option<&'static str>,
+    /// `true` when the operation writes nothing — every value already matches the target.
+    ///
+    /// Surfaced rather than hidden because a set may legitimately carry one after an edit,
+    /// and "no changes" in a card is very different from a card that silently vanished.
+    pub no_op: bool,
+}
+
+/// One field row of a resolved operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlannedField {
+    /// The tool argument the value came from.
+    pub arg: String,
+    /// The column it lands in, taken from the mapping.
+    pub field: String,
+    pub before: Option<serde_json::Value>,
+    pub after: Option<serde_json::Value>,
+}
+
+/// What a re-preview answers.
+#[derive(Debug, Clone, Serialize)]
+pub struct RePreviewed {
+    #[serde(flatten)]
+    pub set: SetView,
+    /// The resolved operations, in the set's order.
+    pub planned: Vec<PlannedOp>,
+    /// The targets whose current revision no longer matches the set's stored base revision,
+    /// as `resource_type:resource_id`. Non-empty means the editor must re-plan before the
+    /// set may be confirmed — which the confirm route refuses anyway, so this is a *message*,
+    /// not a second gate.
+    pub drifted: Vec<String>,
+    /// `true` when at least one operation would park for approval. Read from the same
+    /// `gated_operations` the confirm route reads, so the editor's warning and the gate
+    /// cannot disagree about a set.
+    pub needs_approval: bool,
+}
+
+/// `POST /ai/change-sets/{id}/preview` — resolve the set's operations against the targets
+/// **as they are now**.
+///
+/// `ai.approvals.read`, exactly like the single-approval re-preview it mirrors: recomputing
+/// a diff changes nothing, and a reader must be able to see what they are about to decide on
+/// without being able to make it happen.
+///
+/// This writes nothing. The set's operations, its `base_revisions` and its `content_hash` are
+/// left exactly as they are — a preview that re-pinned the revisions would silently retire
+/// the staleness check the confirm route performs, and the reviewer would no longer be asked
+/// to look at a target that had moved since the set was proposed.
+pub async fn preview(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<RePreviewed>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    // A set nobody may read is a set that does not exist, exactly as in the inbox.
+    let set = change_sets::store::read(state.db().pool(), organization, id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "change_set_not_found",
+                format!("no change set `{id}` in this organization"),
+            )
+        })?;
+
+    let mut planned = Vec::with_capacity(set.operations.len());
+    for op in &set.operations {
+        let mapping = omnion_ai_hub::approvals::target::mapping_for(&op.operation.resource_type)
+            .map_err(ApiError::from)?;
+        let plan = omnion_ai_hub::approvals::target::preview_including_no_ops(
+            state.db().pool(),
+            mapping,
+            &op.operation,
+        )
+        .await
+        .map_err(|err| {
+            ApiError::new(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "operation_unpreviewable",
+                format!(
+                    "operation `{}` could not be resolved against its target: {err}",
+                    op.key
+                ),
+            )
+            .with_details(serde_json::json!({
+                "operation_key": op.key,
+                "resource_type": op.operation.resource_type,
+                "resource_id": op.operation.resource_id,
+            }))
+        })?;
+
+        planned.push(PlannedOp {
+            key: op.key.clone(),
+            kind: op.operation.kind.label().to_owned(),
+            resource_type: plan.resource_type.clone(),
+            resource_id: plan.resource_id.clone(),
+            label: plan.label.clone(),
+            cascades: plan
+                .cascades
+                .iter()
+                .filter(|cascade| cascade.count > 0)
+                .map(|cascade| format!("{} {}", cascade.count, cascade.label))
+                .collect(),
+            diffs: plan
+                .diffs
+                .iter()
+                .map(|diff| PlannedField {
+                    arg: diff.arg.clone(),
+                    field: diff.field.clone(),
+                    before: diff.before.clone(),
+                    after: diff.after.clone(),
+                })
+                .collect(),
+            base_revision: plan.base_revision.clone(),
+            gated_class: op.gated_class(),
+            no_op: !plan
+                .diffs
+                .iter()
+                .any(omnion_ai_hub::approvals::plan::FieldDiff::changes),
+        });
+    }
+
+    // Re-read through the store's own comparator, so "these targets moved" is one sentence
+    // with the confirm route rather than a second rule about the same fact.
+    let drifted = change_sets::store::drifted_targets(state.db().pool(), organization, &set)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(RePreviewed {
+        needs_approval: set.has_gated_operations(),
+        planned,
+        drifted,
+        set: SetView::of(set),
+    }))
 }
 
 /// The first twelve characters of a hash, for a message a person reads.
@@ -454,7 +662,7 @@ pub async fn confirm(
     // clone would let the two answers describe different instants.
     let confirmed_gated = confirmed.has_gated_operations();
     Ok(Json(Confirmed {
-        set: confirmed,
+        set: SetView::of(confirmed),
         needs_approval: confirmed_gated,
         approvals: parked,
         applied: false,
@@ -591,7 +799,7 @@ pub struct ParkedApproval {
 #[derive(Debug, Clone, Serialize)]
 pub struct Confirmed {
     #[serde(flatten)]
-    pub set: ChangeSet,
+    pub set: SetView,
     /// `true` when at least one operation is gated and has parked for a human. The screen
     /// routes the reviewer to the inbox rather than pretending the work is done.
     pub needs_approval: bool,
@@ -621,7 +829,7 @@ pub async fn discard(
     Query(scope): Query<OrgQuery>,
     Path(id): Path<uuid::Uuid>,
     Json(body): Json<DiscardBody>,
-) -> Result<Json<ChangeSet>, ApiError> {
+) -> Result<Json<SetView>, ApiError> {
     let organization = resolve_organization(&current, scope.organization_id)?;
     let actor = current.user.id;
 
@@ -655,7 +863,7 @@ pub async fn discard(
     )
     .await?;
 
-    Ok(Json(discarded))
+    Ok(Json(SetView::of(discarded)))
 }
 
 /// What a discard carries.
@@ -735,18 +943,23 @@ pub async fn apply(
     )
     .await?;
 
+    // Re-read rather than reusing the row the apply started from: the apply moved the status
+    // inside its own transaction, so the pre-apply row would answer `confirmed` to a screen
+    // that just wrote the content. The read is what makes "it is applied" true.
+    let settled = change_sets::store::read(state.db().pool(), organization, id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "change_set_not_found",
+                format!("no change set `{id}` in this organization"),
+            )
+        })?;
+
     Ok(Json(AppliedSet {
         applied: true,
-        set: change_sets::store::read(state.db().pool(), organization, id)
-            .await
-            .map_err(ApiError::from)?
-            .ok_or_else(|| {
-                ApiError::new(
-                    axum::http::StatusCode::NOT_FOUND,
-                    "change_set_not_found",
-                    format!("no change set `{id}` in this organization"),
-                )
-            })?,
+        set: SetView::of(settled),
         operations: applied,
     }))
 }
@@ -999,7 +1212,7 @@ fn page_id_of(op: &ChangeOp) -> Result<uuid::Uuid, omnion_ai_hub::error::AiHubEr
 pub struct AppliedSet {
     pub applied: bool,
     #[serde(flatten)]
-    pub set: ChangeSet,
+    pub set: SetView,
     /// One row per operation, in the order they were applied.
     pub operations: Vec<AppliedOp>,
 }
@@ -1018,8 +1231,10 @@ pub struct ListQuery {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SetList {
-    pub sets: Vec<ChangeSet>,
+    pub sets: Vec<SetView>,
     pub viewer_permissions: BTreeSet<String>,
+    /// The decision keys this viewer does **not** hold.
+    pub viewer_missing: BTreeSet<String>,
 }
 
 pub async fn list(
@@ -1054,15 +1269,28 @@ pub async fn list(
         crate::guards::scope_of(&current.user),
     )
     .await?;
-    let viewer_permissions = DECISION_KEYS
+    let viewer_permissions: BTreeSet<String> = DECISION_KEYS
         .iter()
         .filter(|key| effective.allows(**key))
         .map(|key| (*key).to_string())
         .collect();
+    // The complement, for the same reason the approval inbox sends it: a control disabled with
+    // no explanation reads as a bug, and one that names the key it wants is a control the
+    // person can go and get. Both lists come from the same `effective` read, so they cannot
+    // describe two different people.
+    let viewer_missing: BTreeSet<String> = DECISION_KEYS
+        .iter()
+        .filter(|key| !effective.allows(**key))
+        .map(|key| (*key).to_string())
+        .collect();
 
     Ok(Json(SetList {
-        sets,
+        // The list carries the same `editable` / `needs_approval` the detail screen does, so a
+        // reviewer deciding from the list is not shown a Confirm on a set the API would
+        // refuse — the same split the approval inbox makes with `viewer_permissions`.
+        sets: sets.into_iter().map(SetView::of).collect(),
         viewer_permissions,
+        viewer_missing,
     }))
 }
 

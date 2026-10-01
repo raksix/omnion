@@ -1663,3 +1663,262 @@ async fn an_edit_that_does_not_validate_is_refused_and_writes_nothing() {
 
     store.dispose().await;
 }
+
+// -------------------------------------------------------------------------------------------
+// The editor's re-plan (slice 3f) — `POST /ai/change-sets/{id}/preview`
+// -------------------------------------------------------------------------------------------
+
+/// The route's per-operation resolution, driven directly.
+///
+/// The route is a loop over [`omnion_ai_hub::approvals::target::preview`] and a read through
+/// [`store::drifted_targets`], and both halves are the crate's, so a walk that re-drives them
+/// is testing the same code the route runs rather than a copy of it. What it does **not**
+/// exercise is the route's own guard chain and `resolve_organization` — the walkthrough pass
+/// is what covers those, and saying so is better than a second applier that drifts.
+///
+/// The shape it returns is deliberately the one the screen renders: per operation, a kind, a
+/// label, the field diffs and the cascades, plus the drifted-target list.
+async fn replan(
+    pool: &PgPool,
+    organization_id: Uuid,
+    set: &change_sets::ChangeSet,
+) -> (Vec<Planned>, Vec<String>) {
+    let mut planned = Vec::with_capacity(set.operations.len());
+    for op in &set.operations {
+        let mapping = omnion_ai_hub::approvals::target::mapping_for(&op.operation.resource_type)
+            .expect("pages have a mapping");
+        // The *list* policy, not the single-approval one: this walk asserts a no-op comes
+        // back as "writes nothing" rather than as a refusal, which is the whole reason the
+        // editor has a `no_op` column at all.
+        let plan = omnion_ai_hub::approvals::target::preview_including_no_ops(
+            pool,
+            mapping,
+            &op.operation,
+        )
+        .await
+        .expect("the operation must resolve against its target");
+        planned.push(Planned {
+            key: op.key.clone(),
+            kind: op.operation.kind,
+            label: plan.label.clone(),
+            diffs: plan
+                .diffs
+                .iter()
+                .map(|diff| (diff.field.clone(), diff.before.clone(), diff.after.clone()))
+                .collect(),
+            cascades: plan
+                .cascades
+                .iter()
+                .filter(|cascade| cascade.count > 0)
+                .map(|cascade| format!("{} {}", cascade.count, cascade.label))
+                .collect(),
+            base_revision: plan.base_revision.clone(),
+            no_op: !plan
+                .diffs
+                .iter()
+                .any(omnion_ai_hub::approvals::plan::FieldDiff::changes),
+        });
+    }
+    let drifted = store::drifted_targets(pool, organization_id, set)
+        .await
+        .expect("the drift comparison must answer");
+    (planned, drifted)
+}
+
+/// What one resolved operation looks like to the screen.
+struct Planned {
+    key: String,
+    kind: omnion_ai_hub::approvals::plan::OpKind,
+    label: String,
+    diffs: Vec<(String, Option<serde_json::Value>, Option<serde_json::Value>)>,
+    cascades: Vec<String>,
+    base_revision: String,
+    no_op: bool,
+}
+
+/// The re-plan reads the target's **current** value, and not the value the set was filed with.
+///
+/// This is the whole reason the route exists. Until slice 3f the editor sheet re-derived the
+/// OLD column in the browser from the operation's own `args`, which is a value the *proposal*
+/// carried — so a page somebody renamed after the set was filed showed the reviewer the
+/// proposal's idea of "before" while the apply would write through the server's own plan read
+/// from the database. The two disagree exactly when it matters, and nothing warned anybody.
+///
+/// The walk therefore renames a page through the **content layer** (the real writer) after the
+/// set is filed, and asserts the re-plan's OLD column is the new title rather than the one the
+/// set carries in its arguments. A client-side re-plan could not produce this value at all: it
+/// has no reader.
+#[tokio::test]
+async fn the_editor_re_plan_reads_the_targets_current_values() {
+    let store = gate!();
+    let page = store.page("replan-current", "Title at proposal time").await;
+    let filed = store
+        .draft_set(
+            "Re-plan reads now",
+            vec![update("a", page, "Title the agent proposed")],
+        )
+        .await;
+
+    // Somebody else edits the page after the set was filed. The content layer is the one
+    // writer, so the revision moves the same way a real edit would move it.
+    let (_, _) = store.latest(page).await;
+    sqlx::query(
+        "update page_revisions set title = 'Title after the proposal' \
+         where page_id = $1 and revision_no = 1",
+    )
+    .bind(page)
+    .execute(&store.pool)
+    .await
+    .expect("the rival edit must be writable");
+
+    let set = store::read(&store.pool, store.organization_id, filed)
+        .await
+        .expect("the read must answer")
+        .expect("the set must be there");
+    let (planned, drifted) = replan(&store.pool, store.organization_id, &set).await;
+
+    assert_eq!(planned.len(), 1, "one operation resolved");
+    let title = planned[0]
+        .diffs
+        .iter()
+        .find(|(field, _, _)| field == "title")
+        .map(|(_, before, _)| before.clone())
+        .flatten()
+        .expect("the title must appear in the diff");
+    assert_eq!(
+        title,
+        serde_json::json!("Title after the proposal"),
+        "OLD is the value on the target NOW — not the one the set's arguments carry"
+    );
+    // The label is the page's **slug**, not its title — which is the point: a page whose
+    // title was edited still identifies by the same slug, and the set's arguments carry no
+    // label at all. A client-side re-plan had no reader and so had nothing to put here.
+    assert_eq!(
+        planned[0].label, "replan-current",
+        "and the label is read from the target row, not from the proposal"
+    );
+
+    // The re-plan itself writes nothing. If it re-pinned `base_revisions` the reviewer would
+    // stop being asked to look at a target that had moved since the set was proposed — the
+    // staleness the confirm route enforces would be retired by a read.
+    assert_eq!(
+        drifted.len(),
+        1,
+        "the target moved since it was pinned, and the re-plan says so instead of hiding it"
+    );
+    let after = store::read(&store.pool, store.organization_id, filed)
+        .await
+        .expect("the read must answer")
+        .expect("the set must be there");
+    assert_eq!(
+        after.base_revisions, set.base_revisions,
+        "a preview must not re-pin the revisions it observed"
+    );
+    assert_eq!(
+        after.content_hash, set.content_hash,
+        "and must not re-hash a set it did not edit"
+    );
+    assert_eq!(
+        after.operations, set.operations,
+        "nor rewrite the operations"
+    );
+
+    store.dispose().await;
+}
+
+/// A delete resolves to its cascade line, and a rename that is already true resolves to
+/// nothing to write.
+///
+/// Both halves are the same claim seen from two directions: the screen must be able to say
+/// "this removes 1 page, 3 revisions" and "this would write nothing" rather than rendering a
+/// card that either lies or crashes. The no-op half matters because the editor is *where*
+/// no-ops are found — a set proposed against values somebody already applied is not an error,
+/// and hiding the operation would leave the reviewer unable to drop it with confidence.
+#[tokio::test]
+async fn a_delete_carries_its_cascades_and_an_applied_edit_resolves_to_nothing() {
+    let store = gate!();
+    let doomed = store.page("replan-delete", "Doomed").await;
+    // The content crate's one writer, NOT hand-written `insert into page_revisions`. The first
+    // draft of this walk inserted rows itself and died on `page_revisions_draft_key` — the
+    // table keeps one draft per page, and a fixture that reaches around the writer to build
+    // state it is asserting about is a fixture testing its own shortcut.
+    for body in ["Second", "Third"] {
+        omnion_content::pages::update_page(
+            &store.pool,
+            doomed,
+            &omnion_content::model::PageChanges {
+                body: Some(body.to_owned()),
+                slug: None,
+                title: None,
+                summary: None,
+            },
+            None,
+        )
+        .await
+        .expect("each fixture edit appends a revision");
+    }
+    let already = store.page("replan-noop", "Already applied").await;
+
+    let filed = store
+        .draft_set(
+            "Cascades and a no-op",
+            vec![
+                ChangeOp {
+                    key: "del".to_owned(),
+                    operation: omnion_ai_hub::approvals::plan::Operation {
+                        kind: omnion_ai_hub::approvals::plan::OpKind::Delete,
+                        resource_type: "page".to_owned(),
+                        resource_id: doomed.to_string(),
+                        args: json!({}),
+                    },
+                },
+                // The proposal asks for the title the page ALREADY carries, so the resolved
+                // operation writes nothing.
+                update("noop", already, "Already applied"),
+            ],
+        )
+        .await;
+
+    let set = store::read(&store.pool, store.organization_id, filed)
+        .await
+        .expect("the read must answer")
+        .expect("the set must be there");
+    let (planned, drifted) = replan(&store.pool, store.organization_id, &set).await;
+    assert_eq!(planned.len(), 2, "both operations resolve");
+    assert!(drifted.is_empty(), "neither target moved");
+
+    let delete = planned
+        .iter()
+        .find(|op| op.key == "del")
+        .expect("the delete resolves");
+    assert_eq!(
+        delete.kind,
+        omnion_ai_hub::approvals::plan::OpKind::Delete,
+        "a delete stays a delete"
+    );
+    assert!(
+        delete.diffs.is_empty(),
+        "a delete writes no fields — its diff IS the target going away"
+    );
+    assert_eq!(
+        delete.cascades,
+        vec!["3 page revisions".to_owned()],
+        "the cascade count is read from the target, not assembled by the client"
+    );
+
+    let no_op = planned
+        .iter()
+        .find(|op| op.key == "noop")
+        .expect("the no-op resolves");
+    assert!(no_op.no_op, "an edit that changes nothing says so");
+    assert!(
+        no_op.diffs.iter().all(|(field, before, after)| {
+            // The field is still shown — a card that vanished would leave the reviewer no way
+            // to drop the operation with confidence — but it is marked as writing nothing.
+            field == "title" && before == after
+        }),
+        "and the field is rendered as unchanged rather than as a write"
+    );
+
+    store.dispose().await;
+}

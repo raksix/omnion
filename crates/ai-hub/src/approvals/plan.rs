@@ -287,6 +287,40 @@ impl Plan {
     }
 }
 
+/// [`plan`], but a no-op comes back as a plan rather than a refusal.
+///
+/// `cascades` is taken and **kept**, not dropped. That was the first draft's reasoning — "a no-op
+/// is an update or a create, and neither reads cascades" — and it is wrong for the case the
+/// function exists to serve: a `delete` writes no field by construction, so **every** delete
+/// looks like a no-op to [`changes_anything`], and the no-op path is therefore exactly the path
+/// a delete takes. Passing `Vec::new()` here silently emptied a delete's cascade list, and the
+/// walk that caught it (`a_delete_previews_its_cascades_and_writes_no_field`) reads the value
+/// back out of the plan. A preview that drops the consequence of an operation is worse than one
+/// that refuses it.
+pub fn plan_allowing_no_op(
+    mapping: Mapping,
+    op: &Operation,
+    current: &Value,
+    label: &str,
+    base_revision: &str,
+    cascades: Vec<Cascade>,
+) -> Result<Plan> {
+    plan_with_diffs(mapping, op, current, label, base_revision, cascades)
+}
+
+/// Whether these diffs write anything.
+///
+/// The single answer to "is this operation a no-op?", and it exists as a function because two
+/// callers need the fact and only one of them may act on it: [`plan`] refuses (a lone no-op
+/// approval is a decision nobody can meaningfully make), while the change-set editor previews
+/// a whole *list* and must be able to show a reviewer "this one writes nothing" so they can
+/// drop it deliberately. Neither may re-derive it from the diffs — that is how the editor
+/// ended up with a `no_op` flag the server could never set to true.
+#[must_use]
+pub fn changes_anything(diffs: &[FieldDiff]) -> bool {
+    diffs.iter().any(FieldDiff::changes)
+}
+
 /// Resolve one operation against the target's current values.
 ///
 /// `current` is the target as it is now, keyed by the mapping's **field** names (build it with
@@ -301,6 +335,46 @@ impl Plan {
 /// names a field the mapping does not have, or when the operation changes nothing at all — a
 /// no-op approval is a decision a reviewer cannot meaningfully make.
 pub fn plan(
+    mapping: Mapping,
+    op: &Operation,
+    current: &Value,
+    label: &str,
+    base_revision: &str,
+    cascades: Vec<Cascade>,
+) -> Result<Plan> {
+    let plan = plan_with_diffs(mapping, op, current, label, base_revision, cascades)?;
+    // A delete is exempt, and the exemption is the whole reason the check lives here rather
+    // than where it used to. A delete writes no field **by construction**, so
+    // `changes_anything(&plan.diffs)` is `false` for every delete ever built — testing it
+    // would make the check refuse the one operation class that legitimately changes something
+    // (the target, and everything that cascades from it). The check moved out of
+    // `plan_with_diffs` when the editor's list policy was added, and moving it *out* of the
+    // delete's early return on the way is how that became a regression: two of this repo's own
+    // walks went red on the first execution (`a_delete_previews_its_cascades_…` unit-side and
+    // `approving_every_parked_row_…` walk-side) and the walk's message — "`page` changes
+    // nothing" naming a **page** while parking a *delete* — is the tell.
+    //
+    // The predicate is therefore about "an update whose values already match", not about
+    // "the diff list is empty", and it is written that way so the next reader does not have to
+    // rediscover that a delete is a legitimate way to write no fields.
+    if op.kind != OpKind::Delete && !changes_anything(&plan.diffs) {
+        return Err(AiHubError::InvalidApproval(format!(
+            "`{}` changes nothing — every value already matches",
+            op.resource_type
+        )));
+    }
+    Ok(plan)
+}
+
+/// The shared body of both policies: build the plan, in every case, and let the caller decide
+/// what a no-op means.
+///
+/// Splitting it this way is the whole point — the diffs, their order and the hash are one
+/// computation, and the difference between "refuse" and "show it" is a single check on the
+/// finished list. Doing the check inline (as it was) meant the only way to get a no-op plan
+/// was to re-run the whole function, and the caller that needed it — the change-set editor —
+/// ended up rendering a `no_op` column the server could never fill.
+pub fn plan_with_diffs(
     mapping: Mapping,
     op: &Operation,
     current: &Value,
@@ -382,13 +456,6 @@ pub fn plan(
         };
         rank(a).cmp(&rank(b)).then_with(|| a.arg.cmp(&b.arg))
     });
-
-    if !diffs.iter().any(FieldDiff::changes) {
-        return Err(AiHubError::InvalidApproval(format!(
-            "`{}` changes nothing — every value already matches",
-            op.resource_type
-        )));
-    }
 
     Ok(Plan {
         kind: op.kind,
@@ -1325,10 +1392,18 @@ mod tests {
         // *different* edit from the frozen one and the reviewer would be asked to approve
         // something the request never proposed.
         let original = ok_plan(json!({ "title": "About our team", "summary": "a short line" }));
-        let args = original.arguments(PAGE_UPDATE).expect("the arguments are readable");
-        let replayed =
-            plan(PAGE_UPDATE, &update(args), &current(), "About us", "r7", Vec::new())
-                .expect("the replayed plan resolves");
+        let args = original
+            .arguments(PAGE_UPDATE)
+            .expect("the arguments are readable");
+        let replayed = plan(
+            PAGE_UPDATE,
+            &update(args),
+            &current(),
+            "About us",
+            "r7",
+            Vec::new(),
+        )
+        .expect("the replayed plan resolves");
         assert_eq!(
             replayed.diffs, original.diffs,
             "the replay must write exactly the fields the frozen preview wrote"
@@ -1403,10 +1478,14 @@ mod tests {
             base_revision: "r7".to_owned(),
             hash: "h".to_owned(),
         };
-        let operation = plan.operation(PAGE_UPDATE).expect("a delete carries no arguments");
+        let operation = plan
+            .operation(PAGE_UPDATE)
+            .expect("a delete carries no arguments");
         assert_eq!(operation.kind, OpKind::Delete);
-        assert_eq!(operation.resource_id, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(
+            operation.resource_id,
+            "22222222-2222-2222-2222-222222222222"
+        );
         assert_eq!(operation.resource_type, "page");
     }
-
 }

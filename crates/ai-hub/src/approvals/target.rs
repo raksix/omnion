@@ -349,16 +349,53 @@ pub async fn preview(pool: &PgPool, mapping: Mapping, op: &Operation) -> Result<
     preview_on(&mut connection, mapping, op).await
 }
 
-/// [`preview`] on a connection the caller owns.
+/// [`preview`], but a no-op comes back as a plan rather than a refusal.
 ///
-/// The same one-writer rule as [`read_target_on`]. It exists for the change-set applier, where
-/// the preview and the write must be computed from **one** snapshot: a preview read outside
-/// the transaction is a preview of a state that may already have moved, and the resulting
-/// `change` would describe a diff nobody ever approved.
+/// # Why the second policy exists
+///
+/// [`preview`] is right to refuse a no-op for the *single* approval it serves: "approve this
+/// call" against values that already match is a decision nobody can meaningfully make, and
+/// filing it would put a meaningless row in somebody's inbox.
+///
+/// A change set is a different question. The reviewer is looking at a **list** an agent
+/// proposed, and one entry of that list may be an operation that has since been applied
+/// elsewhere — a proposal that raced reality, or a duplicate inside the same set. That is not
+/// an error to be hidden: it is the one entry the reviewer most needs to see, because "this
+/// writes nothing" is the reason to **drop** it, and a screen that refuses to render it leaves
+/// the reviewer with a set that cannot be fixed by any action they can take.
+///
+/// So the same two snapshots produce the same diffs and the same hash either way, and only the
+/// decision on a no-op differs. The refusal has to be lifted here, at the boundary, rather than
+/// re-implemented in the route — a route that filtered no-ops out, or that recomputed the
+/// check, would be the third statement of the same fact.
+pub async fn preview_including_no_ops(
+    pool: &PgPool,
+    mapping: Mapping,
+    op: &Operation,
+) -> Result<Plan> {
+    let mut connection = pool.acquire().await?;
+    preview_on_inner(&mut connection, mapping, op, true).await
+}
+
+/// [`preview`] on a connection the caller owns, with the no-op policy spelled out.
+///
+/// This is the one the change-set **applier** must not use: a plan that writes nothing is
+/// still refused there, because a set whose operation is a no-op is one whose confirm would
+/// silently do nothing while reporting success.
 pub async fn preview_on(
     connection: &mut sqlx::PgConnection,
     mapping: Mapping,
     op: &Operation,
+) -> Result<Plan> {
+    preview_on_inner(connection, mapping, op, false).await
+}
+
+/// The shared body of both previews; `allow_no_op` is the whole difference.
+async fn preview_on_inner(
+    connection: &mut sqlx::PgConnection,
+    mapping: Mapping,
+    op: &Operation,
+    allow_no_op: bool,
 ) -> Result<Plan> {
     // `&mut`, and not a generic `Executor`, for a reason that cost a compile cycle to find:
     // sqlx implements `Executor` for `&mut PgConnection` and **not** for `&PgConnection`, so
@@ -393,7 +430,31 @@ pub async fn preview_on(
         (current, label, cascades)
     };
     let base_revision = revision_of_snapshot(mapping, &current);
-    plan::plan(mapping, op, &current, &label, &base_revision, cascades)
+    match plan::plan(
+        mapping,
+        op,
+        &current,
+        &label,
+        &base_revision,
+        cascades.clone(),
+    ) {
+        // `plan` refuses a no-op. When the caller is the list editor, that refusal is the
+        // wrong answer and the diffs behind it are exactly what it needs — so they are
+        // recomputed here with the *same* mapping, in the same order, and the same hash. The
+        // recomputation is not a second opinion: `plan` got to the refusal only after
+        // building this list, and every value it would have produced is reproducible from
+        // `current` and `op` alone. What changes is the decision, not the fact.
+        //
+        // The clone is on the **first** call, not the second. `Cascade` is not `Copy`, so a
+        // clone in the retry arm is an `E0382` — the value was already moved into the call
+        // that refused. A delete is a no-op by construction and therefore *always* takes this
+        // arm, which is the operation whose cascade line the reviewer reads to decide
+        // anything at all, so it is the one value that must survive the round trip.
+        Err(AiHubError::InvalidApproval(_)) if allow_no_op => {
+            plan::plan_allowing_no_op(mapping, op, &current, &label, &base_revision, cascades)
+        }
+        other => other,
+    }
 }
 
 /// The content crate's own change type, built from a plan's writes.

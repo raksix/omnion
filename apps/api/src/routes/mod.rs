@@ -1052,6 +1052,12 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "ai.approvals.read"));
     let ai_change_set_update = axum::routing::patch(ai_change_sets::update)
         .layer(guards::require(&state, "ai.approvals.read"));
+    // The editor's re-plan. `read`, not `act`, exactly like the single-approval re-preview it
+    // mirrors: recomputing a diff writes nothing, and a reader must be able to see what they
+    // are about to decide on without being able to make it happen. The permission that matters
+    // is the one on the confirm, and that one is `act`.
+    let ai_change_set_preview = post(ai_change_sets::preview)
+        .layer(guards::require(&state, "ai.approvals.read"));
     let ai_change_set_confirm = post(ai_change_sets::confirm)
         .layer(guards::require(&state, "ai.approvals.act"));
     let ai_change_set_discard = post(ai_change_sets::discard)
@@ -2022,6 +2028,7 @@ pub fn router(state: AppState) -> Router {
         // different screens.
         .route("/ai/change-sets", ai_change_sets.merge(ai_change_set_create))
         .route("/ai/change-sets/{id}", ai_change_set_update)
+        .route("/ai/change-sets/{id}/preview", ai_change_set_preview)
         .route("/ai/change-sets/{id}/confirm", ai_change_set_confirm)
         .route("/ai/change-sets/{id}/discard", ai_change_set_discard)
         .route("/ai/change-sets/{id}/apply", ai_change_set_apply)

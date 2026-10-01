@@ -190,6 +190,18 @@ pub struct ChangeSet {
 }
 
 impl ChangeSet {
+    /// Whether a person may still edit the operation list.
+    ///
+    /// The question belongs to the crate rather than to a client, for the same reason
+    /// [`crate::approvals::Approval::is_decidable`] does: a panel that re-derives it from a
+    /// status list is a panel that disagrees with the `where` clause the write actually runs
+    /// as soon as a status is added. The two share [`EDITABLE`], so a new editable status
+    /// changes both or neither.
+    #[must_use]
+    pub fn is_editable(&self) -> bool {
+        EDITABLE.contains(&self.status.as_str())
+    }
+
     /// The targets this set names, in first-seen order and without duplicates.
     ///
     /// Deduplicated because the staleness check asks about *targets*, while a set may name the
