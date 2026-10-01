@@ -6054,3 +6054,15 @@ work substitutes. The walkthrough gained legs for the three states a headless pa
 reach (no key on the installation, no device registered, and the `serviceWorker.ready`
 rejection), because that is what distinguishes a block that renders nothing from a block that
 was never wired up — which is how this slice found that three API functions had no callers.
+
+**The QA pass did not run: the slot was held for the whole tick.** Not a stale holder — a
+*live* one. `scripts/qa/run.sh` logged `waiting for a QA slot (max 1 concurrent pass)` for
+eleven minutes and the holder changed pids twice underneath it, which is a sibling loop
+(`/mnt/apopic/omnion-w5`, `QA_STACK=w5`) running back-to-back passes. `QA_SLOT_WAIT=3600` in
+`/etc/profile.d/omnion-qa-limits.sh` queued mine rather than letting it collide, which is the
+behaviour that limit exists for, so the pass is *running and waiting*, not failed. The legs
+for the device block are written and unrun; they are recorded here as **written, not
+measured**, because a screenshot is not a leg and an unrun assertion is not a proof.
+
+Next tick runs the pass first — it is the cheapest outstanding work and everything else in
+slice 6 is already committed, tested and pushed.
