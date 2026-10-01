@@ -41,7 +41,6 @@ use omnion_ai_hub::guard_store::{
 use omnion_core::config::{Config, DatabaseConfig};
 use omnion_core::Db;
 use sqlx::PgPool;
-use sqlx::Row;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -858,6 +857,206 @@ async fn an_exemption_never_releases_a_block() {
     store.dispose().await;
 }
 
+/// An expired exemption stops applying on the next request and is announced exactly once.
+///
+/// Two claims in one walk, because they are the two halves of one criterion and either alone
+/// would pass against a broken implementation:
+///
+/// 1. **It stops applying.** The policy reads liveness fresh per request, so an exemption whose
+///    `expires_at` is in the past must not exempt anything — the label goes back to whatever the
+///    policy says for it. Asserted by *moving the clock on the row*, not by waiting: the walk
+///    sets the expiry into the past after the row was created, because a test that slept until a
+///    real expiry would be both slow and non-deterministic, and would never catch a predicate
+///    that is right about "now" but wrong about "later".
+/// 2. **It is announced, once.** Read through the real store function (`lapsed_exemptions`) and
+///    the real claim (`claim_exemption_announcement`), then asserted against the `events` table
+///    the announcement actually writes. A walk that only checked the list would pass against a
+///    sweep that computed the right rows and never emitted anything — which is the defect this
+///    criterion was written to catch, so it has to be checked at the event table, not above it.
+///
+/// The "once" half is the part a first implementation gets wrong: a lapse is a permanent fact, so
+/// re-reading it announces it again. The walk therefore calls the sweep path twice and requires
+/// the event count to stay at one.
+#[tokio::test]
+async fn an_expired_exemption_stops_applying_and_is_announced_exactly_once() {
+    let store = guard!();
+
+    guard_store::save_policy(
+        &store.pool,
+        store.organization_id,
+        None,
+        PolicyChanges {
+            label_defaults: Some([("email".to_owned(), Action::Mask)].into_iter().collect()),
+            mask_style: Some(MaskStyle::Numbered),
+            allow_user_override: Some(false),
+        },
+    )
+    .await
+    .expect("the policy must save");
+
+    let exemption = guard_store::create_exemption(
+        &store.pool,
+        store.organization_id,
+        None,
+        NewExemption {
+            label: "email".to_owned(),
+            providers: Vec::new(),
+            features: vec!["support_reply".to_owned()],
+            reason: "the customer's own address is the subject of the reply".to_owned(),
+            // Created in the future, then aged below: the row's own history is a live exemption
+            // that later lapses, which is the only way to get "was live, now is not" without a
+            // clock the test controls.
+            expires_at: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+        },
+    )
+    .await
+    .expect("the exemption must be created");
+
+    let payload = "write to someone@example.com please";
+
+    // While it is live, the exempted feature passes and nothing is announced.
+    let live = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+    let live_finding = live.detector.inspect(
+        payload,
+        Some("openai"),
+        Some("support_reply"),
+        &live.policy,
+        "salt",
+    );
+    assert_eq!(
+        live_finding.action,
+        Action::Allow,
+        "a live exemption must still exempt its feature"
+    );
+    let early = guard_store::lapsed_exemptions(
+        &store.pool,
+        store.organization_id,
+        OffsetDateTime::now_utc() - time::Duration::hours(24),
+    )
+    .await
+    .expect("the lapsed read must run");
+    assert!(
+        early.is_empty(),
+        "an exemption that has not lapsed yet must not be reported as lapsed — the original \
+         predicate (`expires_at > $2`) returned exactly this list, so it named every running \
+         exemption as expired. Got {early:?}"
+    );
+
+    // Age the row: the lapse has now happened.
+    //
+    // `created_at` moves with it, and that detail is the whole difference between this setup and
+    // an illegal one. `ai_guard_exemptions` carries a CHECK that `expires_at` is after
+    // `created_at`, which exists for a good reason: an exemption born already expired is a row
+    // that exempts nothing and reads as if it does. So the first version of this walk aged
+    // `expires_at` alone and the database refused it — correctly. Ageing both columns describes
+    // a state the system genuinely reaches on its own, an exemption created two hours ago that
+    // lapsed an hour ago, instead of a row whose history has been rewritten to be impossible.
+    sqlx::query(
+        "update ai_guard_exemptions \
+           set created_at = now() - interval '2 hours', expires_at = now() - interval '1 minute' \
+         where id = $1",
+    )
+    .bind(exemption.id)
+    .execute(&store.pool)
+    .await
+    .expect("the exemption must be aged into a lapsed state that the schema accepts");
+
+    // 1. It stops applying on the next read of the policy.
+    let after = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+    let after_finding = after
+        .detector
+        .inspect(payload, Some("openai"), Some("support_reply"), &after.policy, "salt");
+    assert_eq!(
+        after_finding.action,
+        Action::Mask,
+        "a lapsed exemption must stop applying on the next request — the policy reads liveness \
+         fresh, so the same feature that was just allowed is masked again"
+    );
+    assert!(
+        after_finding.text.contains("[EMAIL_1]"),
+        "and the placeholder must be back, got: {}",
+        after_finding.text
+    );
+
+    // 2. It is announced — read through the claim, then observed in the `events` table.
+    let lapsed = guard_store::lapsed_exemptions(
+        &store.pool,
+        store.organization_id,
+        OffsetDateTime::now_utc() - time::Duration::hours(24),
+    )
+    .await
+    .expect("the lapsed read must run");
+    assert_eq!(
+        lapsed.len(),
+        1,
+        "exactly the aged exemption is lapsed, got {lapsed:?}"
+    );
+    assert_eq!(lapsed[0].id, exemption.id, "and it is the one this walk aged");
+
+    let won = guard_store::claim_exemption_announcement(
+        &store.pool,
+        store.organization_id,
+        &lapsed[0],
+    )
+    .await
+    .expect("the claim must run");
+    assert!(
+        won,
+        "the first caller to announce a lapse must win the claim"
+    );
+
+    let event = omnion_events::NewEvent::new("ai.guard.exemption.expired")
+        .organization(store.organization_id)
+        .payload(serde_json::json!({ "exemption_id": exemption.id, "label": "email" }));
+    omnion_events::bus::emit(&store.pool, event)
+        .await
+        .expect("the announcement must publish");
+
+    // The "once" half: a second sweep over the same window finds the row again — the read is a
+    // lookback, not a cursor — and must NOT be able to announce it a second time.
+    let again = guard_store::lapsed_exemptions(
+        &store.pool,
+        store.organization_id,
+        OffsetDateTime::now_utc() - time::Duration::hours(24),
+    )
+    .await
+    .expect("the second lapsed read must run");
+    assert_eq!(
+        again.len(),
+        1,
+        "the read is a lookback, so the same lapse is still returned — that is the case a \
+         duplicate announcement would come from"
+    );
+    let second = guard_store::claim_exemption_announcement(
+        &store.pool,
+        store.organization_id,
+        &again[0],
+    )
+    .await
+    .expect("the second claim must run");
+    assert!(
+        !second,
+        "a lapse that has already been announced must not be claimable again — without this \
+         marker every request after the expiry would re-announce the same event"
+    );
+
+    let announcements: i64 =
+        sqlx::query_scalar("select count(*) from events where name = 'ai.guard.exemption.expired'")
+            .fetch_one(&store.pool)
+            .await
+            .expect("the events table must be readable");
+    assert_eq!(
+        announcements, 1,
+        "exactly one `ai.guard.exemption.expired` event must exist for one lapse"
+    );
+
+    store.dispose().await;
+}
+
 #[tokio::test]
 async fn the_events_screen_filters_by_label_and_blocked_without_a_payload_column() {
     let store = guard!();
@@ -1033,3 +1232,210 @@ async fn a_duplicate_key_is_a_conflict_and_a_bad_key_is_a_field_error() {
     store.dispose().await;
 }
 
+/// A caller with `ai.guard.read` but not `ai.guard.manage` is named, not guessed.
+///
+/// The criterion has two halves and they are checked against **the real evaluator**: the API's
+/// write paths enforce `ai.guard.manage` through `guards::require`, so the screen's promise is only
+/// worth anything if it is computed the same way the guard computes it. A test that hand-built a
+/// "missing" array would prove the array renders and nothing about the two agreeing.
+///
+/// So this walk builds an actual role holding exactly `ai.guard.read`, binds an actual user to it,
+/// and asks the **real** `effective_permissions` what that user holds. Three states are checked,
+/// because each one is a different bug:
+///   * a reader is missing `manage`      — otherwise every auditor gets a live Save button
+///   * a manager is missing nothing      — otherwise the control is dead for the operator
+///   * `read` is never reported missing  — the screen would then render itself read-only to
+///                                        everybody, including the owner, and look broken
+#[tokio::test]
+async fn a_guard_reader_is_told_the_key_it_is_missing() {
+    let store = guard!();
+
+    // The catalogue has to exist before a grant can reference it: `role_permissions.permission_key`
+    // is a foreign key onto `permissions`, so a walk that inserts a grant without seeding the
+    // catalogue fails on the fixture rather than on the claim. Seeding is idempotent and is what
+    // the API does on boot, so this is the same state the screens run against — not a bespoke
+    // one-row insert of the two keys, which would let the test pass on a build whose catalogue had
+    // lost them.
+    omnion_permissions::seed::ensure(&store.pool)
+        .await
+        .expect("the permission catalogue must seed");
+
+    // The role: exactly one permission, so nothing about the outcome comes from an inherited
+    // grant. `effect` is written explicitly rather than relying on a default.
+    let role_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into roles (id, organization_id, key, name, description, priority, \
+         inherit_permissions, is_system) \
+         values ($1, $2, $3, $4, $5, 0, false, false)",
+    )
+    .bind(role_id)
+    .bind(store.organization_id)
+    .bind(format!("guard-reader-{}", Uuid::new_v4().simple()))
+    .bind("Guard reader")
+    .bind("reads the guard and cannot change it")
+    .execute(&store.pool)
+    .await
+    .expect("the reader role must be created");
+
+    sqlx::query(
+        "insert into role_permissions (role_id, permission_key, effect) values ($1, $2, 'allow')",
+    )
+    .bind(role_id)
+    .bind("ai.guard.read")
+    .execute(&store.pool)
+    .await
+    .expect("the reader grant must be created");
+
+    // The account, bound to that role in this organization only.
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into users (id, organization_id, email, display_name, status, mfa_enforced, \
+         failed_sign_in_count, attributes) \
+         values ($1, $2, $3, $4, 'active', false, 0, '{}'::jsonb)",
+    )
+    .bind(user_id)
+    .bind(store.organization_id)
+    .bind(format!("reader-{}@example.test", Uuid::new_v4().simple()))
+    .bind("Guard reader")
+    .execute(&store.pool)
+    .await
+    .expect("the reader account must be created");
+
+    sqlx::query(
+        "insert into role_bindings \
+           (id, role_id, user_id, subject_id, subject_type, scope_type, organization_id) \
+         values ($1, $2, $3, $3, 'user', 'organization', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(role_id)
+    .bind(user_id)
+    .bind(store.organization_id)
+    .execute(&store.pool)
+    .await
+    .expect("the binding must be created");
+
+    let scope = omnion_permissions::model::Scope::Organization {
+        organization_id: store.organization_id,
+    };
+    let effective = omnion_permissions::effective_permissions(&store.pool, user_id, scope.clone())
+        .await
+        .expect("effective permissions must resolve");
+
+    assert!(
+        effective.allows("ai.guard.read"),
+        "the fixture role grants exactly ai.guard.read, so the reader must hold it — otherwise \
+         this walk is measuring a fixture that never bound"
+    );
+    assert!(
+        !effective.allows("ai.guard.manage"),
+        "the fixture role grants nothing else, so manage must be absent; if this fails the role \
+         graph is granting a permission nobody listed, and every read-only assertion below is void"
+    );
+
+    // The **product's own** predicate, not a retyped copy of it. This is the point of the walk:
+    // a filter written out again here would prove the retyped filter, and the screen reads the
+    // real one, so the two could disagree exactly when it matters.
+    let missing = omnion_api::routes::ai_guard::missing_guard_keys(&effective);
+    let missing: Vec<&str> = missing.iter().map(String::as_str).collect();
+    assert_eq!(
+        missing,
+        vec!["ai.guard.manage"],
+        "the screen names the keys it will refuse on, so the list must be exactly the manage key: \
+         naming read as well would render a working screen read-only to its own audience"
+    );
+
+    // And the manager half, because the read-only predicate has two failure modes and a test
+    // that only checks the first cannot see the second. The same predicate over an account holding
+    // BOTH keys must report nothing missing, or every control would be permanently disabled for
+    // the operator who is supposed to have them — a screen that is read-only for everyone reads
+    // as broken, and nobody reports a broken screen as a permission bug.
+    let manager_role = Uuid::new_v4();
+    sqlx::query(
+        "insert into roles (id, organization_id, key, name, description, priority, \
+         inherit_permissions, is_system) \
+         values ($1, $2, $3, $4, $5, 0, false, false)",
+    )
+    .bind(manager_role)
+    .bind(store.organization_id)
+    .bind(format!("guard-manager-{}", Uuid::new_v4().simple()))
+    .bind("Guard manager")
+    .bind("reads and writes the guard")
+    .execute(&store.pool)
+    .await
+    .expect("the manager role must be created");
+    for key in ["ai.guard.read", "ai.guard.manage"] {
+        sqlx::query(
+            "insert into role_permissions (role_id, permission_key, effect) \
+             values ($1, $2, 'allow')",
+        )
+        .bind(manager_role)
+        .bind(key)
+        .execute(&store.pool)
+        .await
+        .expect("the manager grant must be created");
+    }
+
+    let manager_id = Uuid::new_v4();
+    sqlx::query(
+        "insert into users (id, organization_id, email, display_name, status, mfa_enforced, \
+         failed_sign_in_count, attributes) \
+         values ($1, $2, $3, $4, 'active', false, 0, '{}'::jsonb)",
+    )
+    .bind(manager_id)
+    .bind(store.organization_id)
+    .bind(format!("manager-{}@example.test", Uuid::new_v4().simple()))
+    .bind("Guard manager")
+    .execute(&store.pool)
+    .await
+    .expect("the manager account must be created");
+    sqlx::query(
+        "insert into role_bindings \
+           (id, role_id, user_id, subject_id, subject_type, scope_type, organization_id) \
+         values ($1, $2, $3, $3, 'user', 'organization', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(manager_role)
+    .bind(manager_id)
+    .bind(store.organization_id)
+    .execute(&store.pool)
+    .await
+    .expect("the manager binding must be created");
+
+    let manager_effective =
+        omnion_permissions::effective_permissions(&store.pool, manager_id, scope.clone())
+            .await
+            .expect("the manager's effective permissions must resolve");
+    let manager_missing: Vec<String> = omnion_api::routes::ai_guard::missing_guard_keys(&manager_effective)
+        .into_iter()
+        .collect();
+    assert!(
+        manager_missing.is_empty(),
+        "a caller holding both keys must be missing none, or the guard's own administrator sees \
+         every control disabled with no way to say why: {manager_missing:?}"
+    );
+
+    // Clean-up. Bindings first (they reference both), then the roles (they reference the
+    // grants), then the accounts — a throwaway database is dropped anyway, but a walk that leaves
+    // rows behind makes the next run's counts depend on this one.
+    for account in [user_id, manager_id] {
+        sqlx::query("delete from role_bindings where user_id = $1")
+            .bind(account)
+            .execute(&store.pool)
+            .await
+            .expect("binding cleanup must run");
+        sqlx::query("delete from users where id = $1")
+            .bind(account)
+            .execute(&store.pool)
+            .await
+            .expect("account cleanup must run");
+    }
+    for role in [role_id, manager_role] {
+        sqlx::query("delete from roles where id = $1")
+            .bind(role)
+            .execute(&store.pool)
+            .await
+            .expect("role cleanup must run");
+    }
+
+    store.dispose().await;
+}
