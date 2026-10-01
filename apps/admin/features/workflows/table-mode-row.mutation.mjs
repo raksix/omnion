@@ -27,16 +27,27 @@ const MUTATIONS = [
     name: "M1 the reverse read goes back to fetching the server",
     // The defect this whole file was written for. Reverting the canvas read to the fetch the
     // row used before must turn tests 1 AND 2 red.
-    from: /const canvasRead = await page\.evaluate\(\(value\) => \{[\s\S]*?\}, "qa\.table\.edited"\);/,
-    to: `const canvasRead = await page.evaluate(async (value) => {
+    //
+    // The anchor moved in tick 59 and this harness was not updated with it, so **M1 has not
+    // run for two ticks** — the three "MUTATION DID NOT APPLY" lines in its own output are
+    // the only thing that ever said so, and a harness prints them next to real failures. The
+    // row's reduction is now `const holder = perNode.find(…)`; the read above it is the
+    // per-card `page.evaluate` that walks the cards. Anchoring on the reduction's own name
+    // and rewriting the *whole* read is deliberately avoided here: a broad regex is how this
+    // file's harness once edited a different row and reported an honest result for a test it
+    // never touched. So M1 replaces the per-card evaluate's *body* — the fetch is the thing
+    // being restored, and the body is a single expression.
+    from: /const read = await page\n\s*\.evaluate\(\n\s*\(\{ id, value \}\) => \{[\s\S]*?\n\s*\{ id: nodeId, value: "qa\.table\.edited" \},\n\s*\)/,
+    to: `const read = await page.evaluate(async ({ id, value }) => {
     const current = await (await fetch(\`/api/v1/workflows/\${id}/graph\`, { credentials: "same-origin" })).json();
     return {
-      cards: 0, inspected: 0, nodeShowingValue: null, inspectedIds: [],
-      builderSeesTableEdit: Object.values(current.graph.nodes ?? {}).some((n) =>
+      mounted: true,
+      found: Object.values(current.graph.nodes ?? {}).some((n) =>
         Object.values(n.params ?? {}).includes(value),
       ),
+      fields: [],
     };
-  }, "qa.table.edited");`,
+  }, { id: nodeId, value: "qa.table.edited" })`,
   },
   {
     name: "M2 the read counts any parameter rather than the committed value",
@@ -49,15 +60,21 @@ const MUTATIONS = [
     name: "M3 the read looks for the field marker but not the panel",
     // `data-inspector` is a PREFIX of `data-inspector-field`, so a read that scans every field
     // on the page satisfies an assertion about the panel. The prefix trap in its purest form.
-    from: 'const panel = document.querySelector(`[data-inspector="${nodeId}"]`);',
+    //
+    // The `panel` variable is what carries the scoping; a read that dropped it and used
+    // `document` directly would satisfy an assertion about the panel page-wide. Anchored on
+    // the declaration so the replacement keeps the variable alive and the assertions about
+    // `panel.querySelectorAll` still have something to bite on.
+    from: 'const panel = document.querySelector(`[data-inspector="${id}"]`);',
     to: 'const panel = document;',
   },
   {
     name: "M4 the wait for the inspector is dropped for a fixed delay",
     // Every assertion below the read is green against a page that has not drawn. The delay is
-    // the quiet version of the tick-57 race.
-    from: 'await page.waitForSelector("[data-inspector]", { timeout: 20000 }).catch(() => {});',
-    to: 'await page.waitForTimeout(1500);',
+    // the quiet version of the tick-57 race. The wait is now per-card (the row clicks each
+    // card in turn), so the anchor is the per-card wait and not the old page-wide one.
+    from: 'await page.waitForSelector(`[data-inspector="${nodeId}"]`, { timeout: 4000 }).catch(() => {});',
+    to: "await page.waitForTimeout(1500);",
   },
   {
     name: "M5 the forward direction is read off the graph instead of the table",
