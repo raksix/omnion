@@ -101,6 +101,7 @@ pub mod crm_leads;
 pub mod crm_views;
 pub mod hr;
 pub mod hr_leave;
+pub mod hr_me;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -1516,6 +1517,44 @@ pub fn router(state: AppState) -> Router {
         .route("/hr/leave/types/{id}", patch(hr_leave::update_leave_type))
         .route_layer(guards::require(&state, "hr.leave.manage"));
 
+    // The self-service surface (REQ-055 slice 2c), and the **only** router in this file with no
+    // `route_layer` at all. That is the point of it rather than a gap in the guards: an employee
+    // with no HR role must still be able to read their own record, ask for leave, withdraw it and
+    // open their contract. Every `/hr/*` route above is behind an `hr.*` key, which is exactly
+    // what makes them unusable for the person they exist for.
+    //
+    // What replaces the permission check is not "nothing":
+    //
+    // * `CurrentSession` is the extractor, so an anonymous caller is refused `401` by the platform
+    //   rather than reaching a handler that would answer an empty page.
+    // * `organization_of` resolves the caller's own tenant, so no request may name another one.
+    // * The **subject** is resolved from `user_id` through the module on every request. There is
+    //   no `employee_id` path or query parameter in `hr_me`, and that absence is the security
+    //   property: a self-service route that accepted one would be a directory read for anyone who
+    //   can edit a URL.
+    //
+    // An account with no employee row answers `404` naming the *employee*, not `403` — an account
+    // created before HR, or one belonging to a service integration, is a real state of a real
+    // platform and not a permission problem.
+    let hr_me = Router::new()
+        .route("/hr/me", get(hr_me::get_me))
+        .route("/hr/me/leave", get(hr_me::my_leave))
+        .route("/hr/me/leave/types", get(hr_me::my_leave_types))
+        .route(
+            "/hr/me/leave/requests",
+            post(hr_me::create_my_leave_request),
+        )
+        .route(
+            "/hr/me/leave/requests/{id}",
+            get(hr_me::my_leave_request),
+        )
+        .route(
+            "/hr/me/leave/requests/{id}/cancel",
+            post(hr_me::cancel_my_leave_request),
+        )
+        .route("/hr/me/leave/preview", get(hr_me::my_leave_preview))
+        .route("/hr/me/documents", get(hr_me::my_documents));
+
     // Activities and the merged timeline. Reading the feed and reading one record's history are
     // the same exposure, so they share `crm.activities.read` — a separate "timeline" key would
     // let a caller read a contact's history through a deal screen while being refused on the
@@ -1593,6 +1632,7 @@ pub fn router(state: AppState) -> Router {
         .merge(hr_leave_request)
         .merge(hr_leave_approve)
         .merge(hr_leave_manage)
+        .merge(hr_me)
         .merge(crm_create)
         .merge(crm_update)
         .merge(crm_archive)

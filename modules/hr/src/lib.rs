@@ -27,6 +27,7 @@ pub mod departments;
 pub mod employees;
 pub mod error;
 pub mod leave;
+pub mod me;
 pub mod model;
 pub mod requests;
 pub mod store;
