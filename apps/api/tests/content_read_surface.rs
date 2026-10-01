@@ -82,9 +82,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
             .get_all(header::SET_COOKIE)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .map(|value| {
-                value.split(';').next().unwrap_or(value).trim().to_owned()
-            })
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
             .collect();
         (!values.is_empty()).then(|| values.join("; "))
     };
@@ -243,7 +241,9 @@ async fn login(state: &AppState, email: &str) -> String {
         }
     }
     assert!(
-        cookies.iter().any(|cookie| cookie.starts_with("omnion_session=")),
+        cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("omnion_session=")),
         "login must set the session cookie: {header}"
     );
     cookies.join("; ")
@@ -410,6 +410,24 @@ impl Fixture {
     /// to tick. The published revision is written in the same transaction so the row the
     /// endpoint joins to exists.
     async fn seed_page(&self, site: Uuid, slug: &str, status: &str, minutes_ago: i64) -> Uuid {
+        self.seed_page_inner(site, slug, status, minutes_ago, None)
+            .await
+    }
+
+    /// The body of [`Self::seed_page`], with the revision's title as a parameter.
+    ///
+    /// `None` derives the title from the slug, which is what every fixture that does not care
+    /// about ordering wants. It is derived rather than blank so the alphabetical and the
+    /// timestamp orders stay *different* for a default fixture: a title-sort test that reused
+    /// `seed_page` would pass against a query that ignored `sort` entirely.
+    async fn seed_page_inner(
+        &self,
+        site: Uuid,
+        slug: &str,
+        status: &str,
+        minutes_ago: i64,
+        title: Option<&str>,
+    ) -> Uuid {
         let page_id = Uuid::new_v4();
         let revision_id = Uuid::new_v4();
         let stamp = time::OffsetDateTime::now_utc() - time::Duration::minutes(minutes_ago);
@@ -421,7 +439,12 @@ impl Fixture {
         // has the same shape and solves it the same way: insert the page, insert the revision,
         // then point the page at the revision, all inside one transaction so the intermediate
         // state is never visible.
-        let mut tx = self.db.pool().begin().await.expect("a transaction must open");
+        let mut tx = self
+            .db
+            .pool()
+            .begin()
+            .await
+            .expect("a transaction must open");
         sqlx::query(
             "insert into pages (id, site_id, slug, page_type, status, created_at, updated_at) \
              values ($1, $2, $3, 'page', $4, $5, $5)",
@@ -443,7 +466,7 @@ impl Fixture {
         .bind(revision_id)
         .bind(page_id)
         .bind(if published { "published" } else { "draft" })
-        .bind(format!("Title of {slug}"))
+        .bind(title.map_or_else(|| format!("Title of {slug}"), str::to_owned))
         .bind(format!("Body of {slug}"))
         .bind(Some(format!("Summary of {slug}")))
         .bind(stamp)
@@ -455,17 +478,34 @@ impl Fixture {
         // Only a published page points at a revision. A draft carrying one is precisely the row
         // the read surface must refuse, and leaving this `NULL` is what makes the
         // "only published pages are served" walk a test rather than a test of the status column.
-        sqlx::query(
-            "update pages set published_revision_id = $2 where id = $1",
-        )
-        .bind(page_id)
-        .bind(published.then_some(revision_id))
-        .execute(&mut *tx)
-        .await
-        .expect("the publication pointer must be set");
+        sqlx::query("update pages set published_revision_id = $2 where id = $1")
+            .bind(page_id)
+            .bind(published.then_some(revision_id))
+            .execute(&mut *tx)
+            .await
+            .expect("the publication pointer must be set");
 
         tx.commit().await.expect("the fixture must commit");
         page_id
+    }
+
+    /// [`Self::seed_page`] with a chosen revision title.
+    ///
+    /// The title is a property of the *revision*, not of the page — which is precisely the fact
+    /// `?sort=title` needs, and the reason the pages query orders by `r.title` and not by a
+    /// `title` on `pages`. A fixture that could not choose a title would let a query that sorted
+    /// by the *wrong* thing still look alphabetical, because every fixture title is derived from
+    /// its slug and a slug-ordered list and a title-ordered list would then coincide.
+    async fn seed_page_title(
+        &self,
+        site: Uuid,
+        slug: &str,
+        status: &str,
+        minutes_ago: i64,
+        title: &str,
+    ) -> Uuid {
+        self.seed_page_inner(site, slug, status, minutes_ago, Some(title))
+            .await
     }
 
     /// Mint a content token and return its plaintext.
@@ -628,6 +668,237 @@ async fn the_cursor_walks_a_set_exactly_once() {
         copy
     };
     assert_eq!(unique.len(), 5, "no page was served twice: {seen:?}");
+}
+
+/// `count` must count the items actually sent, not the items the query asked for.
+///
+/// This is its own test because the walk above passes with a broken `count`: a walk that
+/// concatenates `items` never consults `count`, so a response that says `count: 2` while carrying
+/// three items walks perfectly and tells a *different* client it lost one. The over-fetch row
+/// used to be rendered into `items` and excluded from `count`, which is exactly that shape.
+#[tokio::test]
+async fn a_page_sends_the_limit_and_says_so() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture
+        .mint(
+            &fixture.curator().await,
+            "Counter",
+            Some(fixture.site),
+            &["content:read"],
+        )
+        .await;
+    let prefix = &Uuid::new_v4().simple().to_string()[..8];
+    // Five rows, so `limit=2` is a page that is *full* AND has more behind it — the only shape
+    // where the over-fetch row exists to be either shown or hidden.
+    for index in 0..5 {
+        fixture
+            .seed_page(
+                fixture.site,
+                &format!("{prefix}-c{index}"),
+                "published",
+                20 - index,
+            )
+            .await;
+    }
+
+    let response = fixture
+        .get(
+            &format!("/api/v1/content/pages?site={}&limit=2", fixture.site),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    let items = response.body["items"]
+        .as_array()
+        .expect("items must be an array")
+        .len();
+    let count = response.body["count"]
+        .as_u64()
+        .expect("count must be a number");
+    assert_eq!(items, 2, "a limit of two is two items: {}", response.body);
+    assert_eq!(
+        count as usize, items,
+        "`count` counts what is sent: {items} sent, {count} said"
+    );
+    assert!(
+        response.body["next_cursor"].is_string(),
+        "and a full page with rows behind it continues: {}",
+        response.body
+    );
+
+    // The last page: one row, no cursor, and `count` of one.
+    let mut cursor = response.body["next_cursor"]
+        .as_str()
+        .expect("cursor")
+        .to_owned();
+    let mut last = None;
+    for _ in 0..4 {
+        let uri = format!(
+            "/api/v1/content/pages?site={}&limit=2&cursor={}",
+            fixture.site,
+            urlencode(&cursor)
+        );
+        let page = fixture.get(&uri, Some(&token)).await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        if page.body["next_cursor"].is_null() {
+            last = Some(page.body.clone());
+            break;
+        }
+        cursor = page.body["next_cursor"]
+            .as_str()
+            .expect("cursor")
+            .to_owned();
+    }
+    let last = last.expect("the walk must reach a last page");
+    assert_eq!(
+        last["items"].as_array().expect("items").len(),
+        1,
+        "five rows at two per page ends with one: {last}"
+    );
+    assert_eq!(last["count"].as_u64(), Some(1), "{last}");
+}
+
+/// `sort=title` is a documented parameter and it has to page.
+///
+/// It is on its own because the two failure modes are indistinguishable from the outside: the
+/// pages query built `p.title`, a column that has never existed on `pages` (the title is the
+/// *revision's*), so a title walk was a `500` on the first page and nobody had called it with a
+/// cursor to see the second. The title is compared as text, so the cursor's value is a string
+/// here — the one sort whose key is not an instant, which is why the two bind paths differ.
+///
+/// **Descending, like every other sort.** The crate documents one direction for the whole
+/// surface ("sorting is newest-first and the keyset must match the sort"), and a keyset walk
+/// carries its direction in the comparison, so ascending would be a different cursor format
+/// rather than a different flag. The first version of this test asserted alphabetical order and
+/// failed against a correct endpoint: `sort=title` is Z→A, and the test's own expectation was the
+/// thing that was wrong.
+#[tokio::test]
+async fn a_title_sort_pages_by_the_revision_title_descending() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture
+        .mint(
+            &fixture.curator().await,
+            "Titled",
+            Some(fixture.site),
+            &["content:read"],
+        )
+        .await;
+    let prefix = &Uuid::new_v4().simple().to_string()[..8];
+    // Titles that make the alphabetical order obviously not the timestamp order, so a query that
+    // silently ignored `sort` and served newest-first could not pass.
+    for (index, title) in ["alpha", "bravo", "charlie"].iter().enumerate() {
+        fixture
+            .seed_page_title(
+                fixture.site,
+                &format!("{prefix}-t{index}"),
+                "published",
+                30 - index as i64,
+                &format!("{prefix} {title}"),
+            )
+            .await;
+    }
+
+    let mut uri = format!(
+        "/api/v1/content/pages?site={}&limit=2&sort=title",
+        fixture.site
+    );
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..4 {
+        let response = fixture.get(&uri, Some(&token)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "sort=title must be answered, not refused by a missing column: {}",
+            response.body
+        );
+        for item in response.body["items"]
+            .as_array()
+            .expect("items must be an array")
+        {
+            seen.push(item["title"].as_str().expect("title").to_owned());
+        }
+        if response.body["next_cursor"].is_null() {
+            break;
+        }
+        uri = format!(
+            "/api/v1/content/pages?site={}&limit=2&sort=title&cursor={}",
+            fixture.site,
+            urlencode(response.body["next_cursor"].as_str().expect("cursor"))
+        );
+    }
+    let mut expected = vec![
+        format!("{prefix} alpha"),
+        format!("{prefix} bravo"),
+        format!("{prefix} charlie"),
+    ];
+    // Z→A, and *not* the seeding order (alpha, bravo, charlie) — the timestamps run the other
+    // way, so a query that ignored `sort` would produce exactly that and fail here.
+    expected.sort_by(|left, right| right.cmp(left));
+    assert_eq!(
+        seen, expected,
+        "a title walk is descending, alphabetical and complete: {seen:?}"
+    );
+}
+
+/// A sort a relation does not have is refused by name, not by a `500` about a missing column.
+///
+/// `media` has no title, and the media list used to accept `?sort=title` and build `m.title` — a
+/// documented parameter whose every call was an `internal_error`. The refusal has to be a `400`
+/// naming `sort`, because a `500` is not a contract change: the caller cannot act on it.
+#[tokio::test]
+async fn a_sort_the_media_list_cannot_do_is_refused_by_name() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture
+        .mint(
+            &fixture.curator().await,
+            "MediaSorter",
+            Some(fixture.site),
+            &["media:read"],
+        )
+        .await;
+
+    let response = fixture
+        .get(
+            &format!("/api/v1/content/media?site={}&sort=title", fixture.site),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "a file has no title to sort by: {}",
+        response.body
+    );
+    assert_eq!(response.body["error"]["code"], "invalid_parameter");
+    let message = response.body["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_owned();
+    assert!(
+        message.contains("title"),
+        "it names the parameter: {message}"
+    );
+    assert!(
+        message.contains("updated_at") && message.contains("created_at"),
+        "and lists what this endpoint does offer: {message}"
+    );
+
+    // The two it does offer still work, so the refusal is a vocabulary answer and not a ban.
+    for sort in ["updated_at", "created_at"] {
+        let ok = fixture
+            .get(
+                &format!("/api/v1/content/media?site={}&sort={sort}", fixture.site),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(ok.status, StatusCode::OK, "sort={sort}: {}", ok.body);
+    }
 }
 
 #[tokio::test]
@@ -932,17 +1203,21 @@ async fn updated_since_returns_only_what_changed() {
         )
         .await;
     assert_eq!(slugs(&all.body).len(), 2);
-    // `updated_at` is serialized with the driver's own `Display`, which is
-    // `2026-09-30 21:53:21.509904 +00:00:00` — NOT the RFC 3339 the query parameter demands.
-    // Feeding the response's own value back verbatim is the obvious thing to write and it is
-    // refused by `parse_updated_since` for a reason worth reading twice: the API does not round
-    // trip its own output. So the watermark is converted to RFC 3339 here, which is also the
-    // only way this test proves a real integrator's call, because one has to do the same.
-    let newest = to_rfc3339(
-        all.body["items"][0]["updated_at"]
-            .as_str()
-            .expect("an updated_at"),
-    );
+    // **The response's own `updated_at`, fed back verbatim.** This line used to run the value
+    // through a hand-written `to_rfc3339` helper, and the helper existed because the API did not
+    // round trip its own output: the item carried the driver's `Display`
+    // (`2026-09-30 21:53:21.509904 +00:00:00`) while `updated_since` accepts only RFC 3339. A test
+    // that carries a conversion function is a test *documenting* a defect, and the comment above
+    // the helper said so in as many words.
+    //
+    // A test that formats the watermark with the very parser it is testing would have proven
+    // nothing, so the conversion was written out by hand — which is exactly what made the trap
+    // visible. The fix keeps the assertion honest and drops the conversion: the value the caller
+    // is handed is now the value the API accepts back.
+    let newest = all.body["items"][0]["updated_at"]
+        .as_str()
+        .expect("an updated_at")
+        .to_owned();
 
     let changed = fixture
         .get(
@@ -962,34 +1237,6 @@ async fn updated_since_returns_only_what_changed() {
         !since.contains(&format!("{prefix}-old")),
         "a page older than the watermark must not be returned: {since:?}"
     );
-}
-
-/// Convert the API's own `updated_at` rendering into the RFC 3339 the query parameter demands.
-///
-/// The response serializes a timestamp with the driver's `Display`
-/// (`2026-09-30 21:53:21.509904 +00:00:00`) while `parse_updated_since` accepts only RFC 3339
-/// (`2026-09-30T21:53:21.509904Z`). Both are defensible on their own; the gap is that **the API
-/// does not round trip its own output**, which is a genuine integrator trap — read a page, take
-/// its `updated_at`, ask for changes since it, get a `400`.
-///
-/// This helper is the conversion, written out rather than imported from the crate under test:
-/// a test that formats the watermark with the very parser it is testing proves only that the
-/// parser agrees with itself. The transformation here is mechanical — replace the two
-/// separators and fold the microseconds into the fraction the standard allows — and a
-/// mechanical transformation can be checked by reading it.
-fn to_rfc3339(driver_display: &str) -> String {
-    // `2026-09-30 21:53:21.509904 +00:00:00` -> date, `T`, clock, offset.
-    let (date, rest) = driver_display
-        .split_once(' ')
-        .unwrap_or((driver_display, ""));
-    let (clock, offset) = rest.split_once(' ').unwrap_or((rest, "+00:00:00"));
-    // The offset is `+00:00:00`; RFC 3339 wants `Z` for UTC and `+HH:MM` otherwise.
-    let zone = if offset.starts_with("+00:00") {
-        "Z".to_owned()
-    } else {
-        offset.chars().take(6).collect()
-    };
-    format!("{date}T{clock}{zone}")
 }
 
 /// Percent-encode a value for use in a query string.
