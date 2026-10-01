@@ -1117,6 +1117,15 @@ pub async fn delete_exemption(
 /// its own evidence would make the events screen unable to answer "was this ever exempt?".
 /// Liveness is read from `expires_at`, so a lapsed row needs no housekeeping at all — which is
 /// also why the announcement can be emitted by a caller that runs often, harmlessly, forever.
+///
+/// The predicate is `expires_at > $2 AND expires_at <= now()`. Both halves matter and the
+/// original had the first one **backwards**: `expires_at > $2` on its own is a plain future
+/// filter, so the function returned the exemptions that had *not* yet lapsed — the exact inverse
+/// of its name, its doc and the event it exists to announce. A caller announcing "an exemption
+/// expired" using that list would announce every exemption that is still running, forever, and
+/// never the one that actually lapsed. `since` is the announcement watermark (announce each
+/// lapse once); `now()` is what makes the row *lapsed* at all, so it is evaluated by the database
+/// rather than passed in — the caller cannot be a tick late and call a future row lapsed.
 pub async fn lapsed_exemptions(
     pool: &PgPool,
     organization_id: Uuid,
@@ -1124,7 +1133,8 @@ pub async fn lapsed_exemptions(
 ) -> Result<Vec<ExemptionRow>> {
     let sql = "select id, organization_id, label, providers, features, reason, created_by, \
                created_at, expires_at from ai_guard_exemptions \
-               where organization_id = $1 and expires_at is not null and expires_at > $2 \
+               where organization_id = $1 and expires_at is not null \
+                 and expires_at > $2 and expires_at <= now() \
                order by expires_at, id";
     let rows: Vec<ExemptionRow> = sqlx::query_as(sql)
         .bind(organization_id)
@@ -1132,6 +1142,48 @@ pub async fn lapsed_exemptions(
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+/// Claim the right to announce one exemption's lapse; `true` for the caller that wins it.
+///
+/// This is the de-duplication the event needs, and it is deliberately a **claim** rather than a
+/// check-then-write. The obvious implementation — `select` the marker, and insert if absent —
+/// has a window between the two statements in which a second process (another API instance, a
+/// retried request, a request that ran the sweep twice) reads the same absent row and inserts its
+/// own, and both announce. `on conflict do nothing` closes that window in the database: of the
+/// racing callers exactly one gets `rows_affected() == 1`, and that is the one that emits.
+///
+/// The caller announces on `true` and says nothing on `false`. It is the same shape as
+/// `claim_next_run` in the agent queue for the same reason — a queue's correctness is decided by
+/// which writer won the claim, not by who checked last.
+///
+/// The marker cascades with its exemption, so deleting an exemption removes its announcement
+/// history. That is the lesser of the two costs: the marker exists to stop a duplicate event, and
+/// an exemption that no longer exists has no lapse left to announce.
+#[must_use]
+pub async fn claim_exemption_announcement(
+    pool: &PgPool,
+    organization_id: Uuid,
+    row: &ExemptionRow,
+) -> Result<bool> {
+    // A row with no expiry has no lapse to announce. Claiming one would create a marker whose
+    // `expires_at` the schema refuses, and would mean deciding here what `lapsed_exemptions`
+    // already decided.
+    let Some(expires_at) = row.expires_at else {
+        return Ok(false);
+    };
+    let inserted = sqlx::query(
+        "insert into ai_guard_exemption_announced \
+           (exemption_id, organization_id, label, expires_at) \
+         values ($1, $2, $3, $4) on conflict (exemption_id) do nothing",
+    )
+    .bind(row.id)
+    .bind(organization_id)
+    .bind(&row.label)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(inserted.rows_affected() == 1)
 }
 
 // -------------------------------------------------------------------------------------------
