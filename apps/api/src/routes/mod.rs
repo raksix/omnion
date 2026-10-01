@@ -527,10 +527,30 @@ pub fn router(state: AppState) -> Router {
     // The version history (REQ-010, slice 2). Reading a version is `media.read`; replacing the
     // bytes and restoring an old one are `media.upload` / `media.update`, the same power an
     // ordinary upload carries — a restore *is* an upload of bytes that already exist.
+    //
+    // The replace route carries the same body limit as the upload route, and without it it does
+    // not: axum's `DefaultBodyLimit` is 2 MB, so a replacement larger than that is refused
+    // `413 payload_too_large` **before** `create_version` is ever entered. The library's own
+    // limit is `MAX_UPLOAD_BYTES` (25 MB) and the settings screen lets an operator raise it, so
+    // without this line the panel could store a 20 MB file and then be unable to replace it — and
+    // the handler's own size check, which names the real limit and its own number, was unreachable
+    // for every file above 2 MB. Two limits for one operation, and the smaller one is neither
+    // documented nor intentional.
+    let media_version_create = Router::new()
+        // The path is the **full** one, because this router is merged into `v1` and not nested
+        // under `/media/{id}/versions`. `media_upload` above is mounted the same way for the same
+        // reason; a bare `/` here registers the handler at the v1 root and the replace answers
+        // `405` for its own path, which reads as "the route is gone" rather than "the route is
+        // mounted one level too high".
+        .route(
+            "/media/{id}/versions",
+            post(media_versions::create_version).layer(guards::require(&state, "media.upload")),
+        )
+        .layer(DefaultBodyLimit::max(
+            omnion_media::MAX_UPLOAD_BYTES as usize + media::UPLOAD_BODY_SLACK,
+        ));
     let media_versions =
         get(media_versions::list_versions).layer(guards::require(&state, "media.read"));
-    let media_version_create =
-        post(media_versions::create_version).layer(guards::require(&state, "media.upload"));
     let media_version_restore =
         post(media_versions::restore_version).layer(guards::require(&state, "media.update"));
     let media_version_raw =
@@ -2286,7 +2306,7 @@ pub fn router(state: AppState) -> Router {
         .route("/media/trash/empty", media_trash_empty)
         .route("/media/bulk", media_bulk)
         .route("/media/{id}/versions", media_versions)
-        .route("/media/{id}/versions", media_version_create)
+        .merge(media_version_create)
         .route(
             "/media/{id}/versions/{version}/restore",
             media_version_restore,
