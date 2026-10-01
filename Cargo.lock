@@ -1449,6 +1449,7 @@ dependencies = [
  "omnion-health",
  "omnion-identity",
  "omnion-media",
+ "omnion-migrations",
  "omnion-module-analytics",
  "omnion-notifications",
  "omnion-onboarding",

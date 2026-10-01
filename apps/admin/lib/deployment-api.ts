@@ -363,3 +363,277 @@ export function acknowledgeUpgradePlan(planId: string, verdict: string): Promise
     body: JSON.stringify({ verdict: `${planId}@${verdict}` }),
   });
 }
+
+// -------------------------------------------------------------------------------------------
+// The migration ledger (REQ-129, slice 1)
+// -------------------------------------------------------------------------------------------
+
+/** One migration the ledger has a row for. */
+export type AppliedMigration = {
+  state: "applied";
+  version: string;
+  name: string;
+  checksum: string;
+  applied_at: string;
+  duration_ms: number;
+  statement_count: number;
+  actor: string;
+  source: string;
+  has_down: boolean;
+  /** `null` means *never rehearsed* — which is not the same as "rehearsed and failed". */
+  down_verified_at: string | null;
+  down_verified_by: string | null;
+  waiver_reason: string | null;
+};
+
+/** One migration this binary ships that the database has not applied. */
+export type PendingMigration = {
+  state: "pending";
+  version: string;
+  name: string;
+  filename: string;
+  checksum: string;
+  statement_count: number;
+  has_down: boolean;
+  declared_no_down: boolean;
+  /** `none`, `brief` or `rewrites_table`. */
+  lock_risk: string;
+};
+
+/** A file whose checksum disagrees with what the ledger recorded. */
+export type MigrationDrift = {
+  version: string;
+  name: string;
+  /** What the ledger recorded when the file was applied. */
+  recorded: string;
+  /** What the file hashes to now. */
+  current: string;
+};
+
+/** A banned-shape finding over a shipped migration file. */
+export type MigrationViolation = {
+  version: string;
+  pattern: string;
+  line: number;
+  excerpt: string;
+  /** `true` when the finding fails the gate. */
+  blocking?: boolean;
+  commented?: boolean;
+};
+
+/** The current migration lock, with the queries waiting behind it. */
+export type MigrationLock = {
+  held: boolean;
+  version: string | null;
+  direction: string | null;
+  actor: string | null;
+  source: string | null;
+  started_at: string | null;
+  age_seconds: number | null;
+  /** Rendered as `<number> (omnionmg)` so it can be found in `pg_locks`. */
+  lock_key: string;
+  blocked: { pid: number; age_seconds: number; query: string; application: string | null }[];
+};
+
+/** The policy a run would execute under. */
+export type MigrationPolicy = {
+  require_down_scripts: boolean;
+  lock_timeout_ms: number;
+  statement_timeout_ms: number;
+  banned_patterns: Record<string, boolean>;
+  backfill_batch_size: number;
+  backfill_rate_per_second: number;
+  require_approval_for_destructive: boolean;
+  updated_by: string | null;
+  updated_at: string | null;
+};
+
+/** `GET /api/v1/deployment/migrations`. */
+export type MigrationLedger = {
+  applied: AppliedMigration[];
+  pending: PendingMigration[];
+  drift: MigrationDrift[];
+  violations: MigrationViolation[];
+  missing_down: PendingMigration[];
+  policy: MigrationPolicy;
+  lock: MigrationLock;
+  gate_fails: boolean;
+  summary: string;
+  total: number;
+};
+
+/** `GET /api/v1/deployment/migrations` — applied, pending and drift in one answer. */
+export function fetchMigrationLedger(version?: string): Promise<MigrationLedger> {
+  const query = version ? `?version=${encodeURIComponent(version)}` : "";
+  return request(`/api/v1/deployment/migrations${query}`);
+}
+
+/** One run of one migration, as the journal recorded it. */
+export type MigrationRun = {
+  id: number;
+  direction: string;
+  status: "running" | "succeeded" | "failed" | "aborted";
+  actor: string;
+  plan: unknown;
+  started_at: string;
+};
+
+/** `GET /api/v1/deployment/migrations/{version}` — one migration in full. */
+export type MigrationDetail = {
+  version: string;
+  state: "applied" | "pending";
+  name: string | null;
+  filename: string | null;
+  checksum: string | null;
+  sql: string | null;
+  statements: string[];
+  statement_count: number | null;
+  down_statements: string[];
+  has_down: boolean;
+  declared_no_down: boolean;
+  lock_risk: string | null;
+  ledger: AppliedMigration | null;
+  runs: MigrationRun[];
+};
+
+export function fetchMigration(version: string): Promise<MigrationDetail> {
+  return request(`/api/v1/deployment/migrations/${encodeURIComponent(version)}`);
+}
+
+/** The plan preview. The API answers this without writing anything. */
+export type MigrationPlan = {
+  pending: PendingMigration[];
+  violations: MigrationViolation[];
+  missing_down: PendingMigration[];
+  policy: MigrationPolicy;
+  gate_fails: boolean;
+  summary: string;
+};
+
+/** `POST /api/v1/deployment/migrations/plan` — a dry run over the whole pending set. */
+export function previewMigrationPlan(disabledPatterns: string[] = []): Promise<MigrationPlan> {
+  return request("/api/v1/deployment/migrations/plan", {
+    method: "POST",
+    body: JSON.stringify({ disabled_patterns: disabledPatterns }),
+  });
+}
+
+/** `POST /api/v1/deployment/migrations` — apply the pending set. Refused on production. */
+export function applyMigrations(): Promise<{ applied: string[]; summary: string }> {
+  return request("/api/v1/deployment/migrations", { method: "POST" });
+}
+
+/** `GET /api/v1/deployment/migrations/lock`. */
+export function fetchMigrationLock(): Promise<{ lock: MigrationLock }> {
+  return request("/api/v1/deployment/migrations/lock");
+}
+
+/** One banned-shape rule, with the plain-language reason the policy screen shows. */
+export type LintPattern = {
+  key: string;
+  why: string;
+  blocking: boolean;
+  enabled?: boolean;
+};
+
+/** `GET /api/v1/deployment/migrations/violations` — findings and the closed rule vocabulary. */
+export type ViolationsResponse = {
+  findings: (MigrationViolation & {
+    id: number | null;
+    severity: "error" | "warning";
+    waived_by: string | null;
+    waived_at: string | null;
+    waiver_reason: string | null;
+  })[];
+  patterns: LintPattern[];
+  total: number;
+};
+
+export function fetchViolations(): Promise<ViolationsResponse> {
+  return request("/api/v1/deployment/migrations/violations");
+}
+
+/**
+ * `POST /api/v1/deployment/migrations/violations/{id}/waive`.
+ *
+ * The `line` is part of the call because the waiver's key is the finding's own identity
+ * `(version, pattern, line)` — a waiver keyed on the excerpt would expire the moment somebody
+ * improved a comment, and a waiver that silently expires is a gate firing on a change nobody made.
+ */
+export function waiveViolation(
+  id: number,
+  input: { line: number; reason: string; pattern?: string },
+): Promise<{ id: number; version: string; pattern: string; line: number }> {
+  return request(`/api/v1/deployment/migrations/violations/${id}/waive`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** The bounds the policy may not leave, so the form can refuse before the round trip. */
+export type PolicyBounds = {
+  min_lock_timeout_ms: number;
+  max_lock_timeout_ms: number;
+  min_statement_timeout_ms: number;
+  max_statement_timeout_ms: number;
+  min_backfill_batch: number;
+  max_backfill_batch: number;
+};
+
+export type PolicyWaiver = {
+  version: string;
+  pattern: string;
+  line: number;
+  excerpt: string;
+  waived_by: string;
+  waiver_reason: string;
+};
+
+/** `GET /api/v1/deployment/migrations/policy`. */
+export type PolicyResponse = {
+  policy: MigrationPolicy;
+  bounds: PolicyBounds;
+  patterns: LintPattern[];
+  waivers: PolicyWaiver[];
+};
+
+export function fetchMigrationPolicy(): Promise<PolicyResponse> {
+  return request("/api/v1/deployment/migrations/policy");
+}
+
+/** `PUT /api/v1/deployment/migrations/policy` — the bounds are enforced before the write. */
+export function saveMigrationPolicy(policy: MigrationPolicy): Promise<{ policy: MigrationPolicy }> {
+  return request("/api/v1/deployment/migrations/policy", {
+    method: "PUT",
+    body: JSON.stringify(policy),
+  });
+}
+
+/** What a reversal rehearsal proved, against a throwaway copy of the schema. */
+export type VerifyReport = {
+  version: string;
+  filename: string;
+  statements: number;
+  duration_ms: number;
+  tables_before: string[];
+  tables_after: string[];
+  /** `true` only when the structure came back exactly. */
+  restored: boolean;
+};
+
+/**
+ * `POST /api/v1/deployment/migrations/{version}/verify-down`.
+ *
+ * `scratch` is a database NAME on this server, not a URL. The API derives the connection string
+ * from this installation's own configuration, so a rehearsal can never be aimed at another server
+ * — and the API refuses a name that is the live database.
+ */
+export function rehearseReversal(
+  version: string,
+  scratch: string,
+): Promise<{ report: VerifyReport; scratch: string }> {
+  return request(`/api/v1/deployment/migrations/${encodeURIComponent(version)}/verify-down`, {
+    method: "POST",
+    body: JSON.stringify({ scratch }),
+  });
+}

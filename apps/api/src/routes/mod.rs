@@ -86,6 +86,7 @@ pub mod restore_jobs;
 // Deployment tooling (REQ-128, slice 4). The release cache, the artifact list, the bundle
 // generator and the upgrade plan.
 pub mod deployment;
+pub mod migrations;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -1254,6 +1255,72 @@ pub fn router(state: AppState) -> Router {
             "/deployment/upgrade-plan/acknowledge",
             post(deployment::acknowledge_upgrade_plan)
                 .layer(guards::require(&state, "deployment.deploy")),
+        )
+        // The migration ledger (REQ-129, slice 1). Three powers, and the split is the one the
+        // request draws:
+        //
+        // * `migrations.read` — the ledger, one migration's SQL, the lint findings, the policy and
+        //   the lock state. All of it is derived from files and rows this installation already has,
+        //   so it carries nothing a release reviewer should not see.
+        // * `migrations.apply` — DDL, and NOT `deployment.deploy`. A key that both ships an image
+        //   and writes the schema cannot answer "who changed the database?" after an incident,
+        //   and every unit test in `omnion-permissions` would still be green with the guard on
+        //   either key because none of them builds a router. The integration walk proves the split
+        //   over the real one.
+        // * `migrations.verify` — rehearsing a reversal against a scratch database. Its own key
+        //   because it is the only write here that EXECUTES SQL, and because it is the write that
+        //   turns a release's rollback path from `unknown` into `reversible`.
+        //
+        // `/deployment/migrations/{version}` is registered AFTER `/deployment/migrations/lock`,
+        // `/policy` and `/violations` would ever shadow it — axum prefers a literal segment over a
+        // capture, so the order is documentation rather than a requirement, and this says so
+        // instead of implying the position matters.
+        .route(
+            "/deployment/migrations",
+            get(migrations::list_migrations)
+                .layer(guards::require(&state, "deployment.migrations.read"))
+                .merge(
+                    post(migrations::apply_migrations)
+                        .layer(guards::require(&state, "deployment.migrations.apply")),
+                ),
+        )
+        .route(
+            "/deployment/migrations/plan",
+            post(migrations::plan_migrations)
+                .layer(guards::require(&state, "deployment.migrations.read")),
+        )
+        .route(
+            "/deployment/migrations/lock",
+            get(migrations::read_lock).layer(guards::require(&state, "deployment.migrations.read")),
+        )
+        .route(
+            "/deployment/migrations/violations",
+            get(migrations::read_violations)
+                .layer(guards::require(&state, "deployment.migrations.read")),
+        )
+        .route(
+            "/deployment/migrations/violations/{id}/waive",
+            post(migrations::waive_violation)
+                .layer(guards::require(&state, "deployment.migrations.apply")),
+        )
+        .route(
+            "/deployment/migrations/policy",
+            get(migrations::read_policy)
+                .layer(guards::require(&state, "deployment.migrations.read"))
+                .merge(
+                    put(migrations::save_policy)
+                        .layer(guards::require(&state, "deployment.migrations.apply")),
+                ),
+        )
+        .route(
+            "/deployment/migrations/{version}",
+            get(migrations::read_migration)
+                .layer(guards::require(&state, "deployment.migrations.read")),
+        )
+        .route(
+            "/deployment/migrations/{version}/verify-down",
+            post(migrations::rehearse_reversal)
+                .layer(guards::require(&state, "deployment.migrations.verify")),
         )
         .route(
             "/security/overview",

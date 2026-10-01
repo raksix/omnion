@@ -47,6 +47,12 @@ omnion-health = { path = "../../crates/health" }
 omnion-identity = { path = "../../crates/identity" }
 omnion-backup = { path = "../../crates/backup" }
 omnion-media = { path = "../../crates/media" }
+# Migration safety (REQ-129): the ledger, the runner, the advisory lock and the lint. Its own crate
+# because the CLI, the deploy job, the CI gate and this panel all have to reach the same answers
+# from processes that do not link each other — a second "what is pending" implementation in the
+# HTTP layer would be a second answer, and the divergence would show up as a panel promising a
+# clean deploy while `omnion migrate plan` exits 1.
+omnion-migrations = { path = "../../crates/migrations" }
 omnion-notifications = { path = "../../crates/notifications" }
 omnion-security = { path = "../../crates/security" }
 omnion-module-analytics = { path = "../../modules/analytics" }
