@@ -420,6 +420,31 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
    intention was passing on a count that included a phantom. Writing the acceptance walk made the
    discrepancy visible, and fixing the source fixed a test nobody had opened.
 
+**Tick 58 — the walks were not walking.** The suite above ran its 21 walks in whatever
+`OMNION_DATABASE_URL` named, which on a writer's box is the shared QA database every other
+stack points at. `seed::ensure` binds the built-in Owner role to the *earliest user in the
+database*, so these walks inherited whichever walk inserted first — and a walk asserting a
+permission refusal could pass on the writer whose walk landed first and fail on every other.
+`apps/api/tests/support/isolated_db.rs` now opens a throwaway database per walk, sweeps what a
+panicking run left behind (a `Drop` guard cannot survive a panic in `#[tokio::test]` — the
+unwind passes through the runtime *task*, not the awaited future), and counts its own skips so
+`no_walk_in_this_file_skipped` turns any of them red. Cargo reports a skipped walk as `ok` and
+captures the message that said so.
+
+**And the database was hiding the second defect.** `call()` read `headers().get(SET_COOKIE)`,
+which returns **one** value, while sign-in sets **two** — the session and the CSRF token beside
+it. Every cookie-authenticated write in this file was refused with `csrf_failed`: **nineteen of
+the twenty-one walks**. It read as green before because the environment had no CSRF secret,
+which turns the same request into a *different* refusal, and the walks that survived were the
+ones that never wrote. So criteria 1–16 of this REQ were standing on walks that asserted the
+product rather than exercising it. The credential is packed at sign-in and applied by
+`support::walk_auth`, which sets the session cookie, the CSRF cookie and the header in one
+place, so a helper can no longer drop the token by forgetting it exists.
+
+Proof: `content_blocks` **21/21** on real PostgreSQL in **93 s**, against 16 passed / 5 failed
+in 313 s before. The 3× is the other half of the finding: a walk that spends its time waiting
+for a refusal is a walk that measured nothing.
+
 ### Risks / notes
 
 - The revision model must not be weakened: blocks live on the draft revision and publishing still freezes a revision. Any "save in place" shortcut would break compare/restore and is explicitly forbidden.

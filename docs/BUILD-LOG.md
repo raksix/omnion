@@ -10886,3 +10886,53 @@ process exits). What survives a panic is the next run's work, so `Harness::fresh
 zero left after a run; a panicking run leaks one and the next run removes it. The `LIKE` pattern is
 a raw string because escaping the backslash for both Rust and SQL in a normal literal matches
 nothing — silently, which is indistinguishable from "there is nothing to clean".
+
+
+---
+
+## Tick 58 — wave 2 · REQ-063 (the walks were not walking)
+
+**What.** Swept the shared-database harness defect the last tick flagged, and it turned out to
+be hiding a second one underneath.
+
+`apps/api/tests/support/isolated_db.rs` gives a walk a throwaway database and counts its own
+skips, so a walk that declined to do anything is red instead of a green line. Eleven suites in
+this wave carried the same copy of the broken helper; `scripts/qa/convert_suite.py` moves them
+and **refuses** on a shape it does not recognise rather than writing a half-migrated file.
+`content_blocks`, `cms_forms`, `cms_comments`, `cms_menus`, `cms_newsletter`, `cms_seo`,
+`cms_featured_media`, `cms_members`, `content`, `content_block_media`, `cms_theme_layouts` and
+`cms_theme_settings` now declare it; seven are converted and proven, five are converted and
+awaiting their run.
+
+**The second defect.** `call()` read `headers().get(SET_COOKIE)`, which returns **one** value,
+and sign-in sets **two** — the session and the CSRF token beside it. Every cookie-authenticated
+write in `content_blocks` was refused with `csrf_failed`: **19 of its 21 walks**. It read as
+green before because the environment had no CSRF secret, which answers the same request with a
+*different* refusal; the walks that survived were the ones that never wrote. REQ-063's criteria
+1–16 were standing on walks that asserted the product instead of exercising it. The credential is
+now packed at sign-in and applied by `support::walk_auth`.
+
+**Proof.**
+- `cargo test -p omnion-api --test content_blocks` → **21 passed, 0 failed** in **93 s** against
+  16 passed / 5 failed in **313 s** before. The 3× speedup is the finding, not a perk: a walk
+  blocked on a refusal is a walk that measured nothing.
+- `no_walk_in_this_file_skipped` **ok** — and it was the first thing to go red when the volume
+  filled mid-run (10 walks skipped, reported as passes).
+- `cargo test --test {cms_forms,cms_comments,cms_menus,cms_newsletter,cms_seo} --no-run` → 0 errors.
+- Leaked `omnion_blocks_*` databases after a clean run: **0**.
+
+**Ops.** The QA Postgres on 5433 (shared, all writers) went into crash recovery at 878 MB free
+and was still recovering 90 s after `/mnt/apopic` came back; this writer's own
+`omnion-postgres-w2` on **5449** stayed healthy and is what the runs above used. Reclaimed 3.5 GB
+from this worktree's own `debug/{deps,build,.fingerprint}` (keeping `debug/omnion-api`, which the
+QA stack runs): 878 MB free → 13 GB.
+
+**One walk had no cleanup at all** and leaked an organization row into every suite that ran after
+it. With a database per walk that class of leak is gone rather than merely fixed — and the
+conversion removed the per-row cleanup the other twenty walks each carried.
+
+**Next.** Finish the CSRF-cookie fix on the five suites whose login helper still takes
+`.split(';').next()` of the first `Set-Cookie` (`content_patterns`, `cms_menus`, `content`,
+`cms_featured_media`, `cms_members`, `content_block_media`), then run them. REQ-062 acceptance
+1/3/16 and REQ-063 acceptance 17 remain browser measurements owed a pass — the slot is held live
+by w4 (holder alive in `/mnt/apopic/omnion-w4`).

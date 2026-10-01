@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 mod support;
 use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+use support::walk_auth;
 
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
@@ -189,6 +190,37 @@ async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
         redis,
         test_storage(),
     );
+
+    // **The limiter is the one thing a database per walk does not fix.** Its counters live in
+    // one Redis shared with every other writer's worktree, and a sign-in carries no session, so
+    // its budget is keyed on the peer address: `ip:127.0.0.1` for every walk in every suite on
+    // this box. The shipped `sign_in` policy allows ten per five minutes, and this file signs in
+    // three accounts per walk across thirteen walks — so without this the suite is refused at
+    // the eleventh sign-in, on a walk that was never testing rate limits.
+    //
+    // The symptom is worse than a `429` here, and worth recording: the run HANGS rather than
+    // failing. Measured — a full `--test-threads=1` run stopped dead on
+    // `another_organizations_form_is_not_reachable` with every PostgreSQL session parked in
+    // `ClientRead` and the process's only other thread in `futex_do_wait`, while the very same
+    // walk passed in 49 s on its own. A database per walk is what made the difference visible,
+    // because the walks stopped timing out on the shared database's own contention and started
+    // competing for one shared counter instead.
+    walk_auth::give_the_process_its_own_sign_in_budget(|| {
+        let policies: Vec<omnion_security::RatePolicy> = omnion_security::RatePolicy::defaults()
+            .into_iter()
+            .map(|mut policy| {
+                if policy.scope == "sign_in" {
+                    policy.limit = 10_000;
+                    policy.burst = 0;
+                }
+                policy
+            })
+            .collect();
+        omnion_api::rate_limit_middleware::install(
+            omnion_api::rate_limit_middleware::RateLimiter::new(&state, policies),
+        );
+    });
+
     Some((state, db, isolated))
 }
 
