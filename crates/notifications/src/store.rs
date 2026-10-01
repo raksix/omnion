@@ -203,6 +203,32 @@ pub async fn find(pool: &PgPool, user_id: Uuid, id: Uuid) -> Result<Option<Notif
         .await?)
 }
 
+/// Read one notification back by the `dedupe_key` it was written with.
+///
+/// **Exists because `record` answers a `bool`, and one caller needs the id.** The emit path
+/// counts rows and never asks which ones; the test-delivery route writes a row and then has
+/// to address the delivery it just queued. Returning the id from `record` would change the
+/// contract every caller depends on for one caller, so the lookup lives here — keyed by a
+/// value the caller itself chose, never by "the most recent row", which would be wrong the
+/// moment two readers pressed the button in the same second.
+///
+/// Scoped to `user_id` for the same reason `find` is: a key is not a capability, and a lookup
+/// that ignored the owner would let a caller read another's notification by guessing a key.
+pub async fn find_by_dedupe_key(
+    pool: &PgPool,
+    user_id: Uuid,
+    dedupe_key: &str,
+) -> Result<Option<Notification>> {
+    let query = format!(
+        "select {COLUMNS} from notifications where user_id = $1 and dedupe_key = $2"
+    );
+    Ok(sqlx::query_as::<_, Notification>(&query)
+        .bind(user_id)
+        .bind(dedupe_key)
+        .fetch_optional(pool)
+        .await?)
+}
+
 /// Push the scope and every filter.
 ///
 /// One loop, and each branch writes its own clause *and* its own value — a `$n` in a clause

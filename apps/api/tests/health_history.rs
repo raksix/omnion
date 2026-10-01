@@ -215,11 +215,17 @@ async fn a_populated_window_reports_real_aggregates_and_its_own_bounds() {
         .await
         .expect("the day window must read");
     let redis = find(&day, "redis", "latency_ms");
-    assert_eq!(redis.samples, 2, "both samples are inside 24 h");
+    // **Three**, not two. `series()` inserts three rows — 2.0 h, 1.0 h and 0.5 h old — and every
+    // one of them is inside a 24 h window. The walk asserted `2`, which its own comment then
+    // described as "both samples", so the fixture and the prose were written as if there were
+    // only two. The aggregates below are the mean of all three, `20.0`, which is what the walk
+    // already expected: `(10 + 20 + 30) / 3 == 20` and `(10 + 30) / 2 == 20` too, so the mean
+    // could not tell the two fixtures apart — which is exactly why only the count exposed it.
+    assert_eq!(redis.samples, 3, "all three samples are inside 24 h");
     assert_eq!(redis.current, Some(30.0), "current is the newest value");
     assert_eq!(redis.min, Some(10.0));
     assert_eq!(redis.max, Some(30.0));
-    assert_eq!(redis.avg, Some(20.0), "the mean of 10 and 30, not 30");
+    assert_eq!(redis.avg, Some(20.0), "the mean of 10, 20 and 30, not 30");
     assert_eq!(redis.spread(), Some(20.0));
     assert!(!redis.is_empty());
     assert!(redis.last_sample_at.is_some());
@@ -231,7 +237,7 @@ async fn a_populated_window_reports_real_aggregates_and_its_own_bounds() {
         .await
         .expect("the hour window must read");
     let hour_row = find(&hour, "redis", "latency_ms");
-    assert_eq!(hour_row.samples, 1, "the two-hour-old sample is outside 1h");
+    assert_eq!(hour_row.samples, 1, "the 1.0 h and 2.0 h old samples are outside 1h");
     assert_eq!(hour_row.current, Some(30.0));
     assert_eq!(
         hour_row.avg,
@@ -395,7 +401,10 @@ async fn retention_leaves_the_windows_the_table_reads_intact() {
     .expect("the week window must still read");
     let queue = find(&week, "queue", "queue_depth");
     assert_eq!(queue.samples, 1, "the week-old sample survived the sweep");
-    assert_eq!(queue.min, Some(1.0), "and it is the only one in range");
+    // `12.0`, not `1.0`. The 1.0 sample is the 45-day-old one, and the assertion above already
+    // proved it was *pruned*; expecting it as the survivor's value contradicts the walk's own
+    // fixture, and it fails with the survivor's own number beside it.
+    assert_eq!(queue.min, Some(12.0), "and it is the only one in range");
 
     harness.dispose().await;
 }

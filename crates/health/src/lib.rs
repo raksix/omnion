@@ -93,8 +93,8 @@ pub use probes::{
     probe_search, probe_storage, probe_workers,
 };
 pub use registry::{
-    DESCRIPTIONS, build_overview, described_services, describe, registry_size, run_all,
-    run_and_record, unprobed_overview,
+    DESCRIPTIONS, PolicyOutcome, ServiceTransition, build_overview, described_services, describe,
+    policy_outcome, registry_size, run_all, run_and_record, unprobed_overview,
 };
 pub use store::{
     SAMPLE_RETENTION_DAYS, last_sample_at, latest_sample, latest_samples, prune_old_samples,
