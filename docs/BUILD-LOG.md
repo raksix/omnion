@@ -7580,3 +7580,56 @@ RAM, 24G of 31G swap. The criterion stays unticked.
 **Next.** `undo-selection` (unmeasured since tick 50, and `drag-undo`'s row now contradicts it on
 the same toolbar button), then the REDO half of `reload-rebase`, then the run-from-here / pill /
 table-mode rows. The plugin row stays BLOCKED on REQ-121.
+
+## 2026-10-01 · tick 53 · omnion-wave3 · REQ-004 · the prune fixed every node and kept the edge
+
+**What.** The rule "adopting a graph wholesale must prune what it adopts" was fixed for nodes two
+ticks ago and never applied to edges. `pruneSelection(current, alive)` filtered `current.nodes`
+against the alive set and returned `edge: current.edge` **verbatim**, so a selected *connection*
+survived every rebase still naming a line the adopted graph does not have.
+
+An edge is not a corner. It is one of the two things that can be selected at all, and it
+**outranks every node selection** in both `deleteTarget` and `whatEscapeClears` — so the stale id
+is what `Del` resolves to (`removeEdge` then finds no such edge and changes nothing), and the
+status bar renders `1 connection selected (Del removes it)` from it over a canvas drawing no
+such line. Those are the same three claims the node half already answers, which is why this is
+the same defect and not a new one.
+
+**The test had already ruled for the bug.** `reload-rebase.test.ts` carried a row reading "the
+rebase keeps the selected EDGE only when it is not asked about edges", justified in a comment as
+the conservative half: "`alive` is a node id set, so an edge selection cannot be validated here …
+deleting an edge that is still there is recoverable, and a reload cannot invent one." Both halves
+are true and neither answers the question. The asymmetry is backwards **on the reload path
+specifically**: the graph being adopted is the *other editor's*, so their removed connections are
+the ordinary case, not an edge case. The old reasoning guarded the false positive and accepted the
+false negative. That row now states both halves of the corrected rule.
+
+`aliveEdges` is **optional**, and that is the design rather than an oversight: a caller holding
+only a node list (`removeNodes` prunes against `nextNodes.map(n => n.id)`) cannot answer the
+question, and a prune that answered "no" for every unknown would discard a selection nobody had
+grounds to doubt. Handed the set, decide; handed nothing, do not guess — with both halves asserted,
+so the fix cannot quietly turn "cannot answer" into "answer no".
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **287 passed**
+(280 before, +7) · `pnpm typecheck` → 2/2 successful · `cargo test -p omnion-workflows --lib` →
+**157 unchanged** · `node --check scripts/qa/walkthrough.cjs` clean. **Four mutations red:**
+the product fix reverted (5 tests), `load`'s third argument dropped (1), the third argument built
+from nodes instead of edges (1), the rebase passing `aliveEdges` nowhere (5).
+
+**A guard of mine was wrong before it was right, and it was wrong the branch's own way.** The
+wiring assertion counted the call's arguments with `split(",")` and read **4** against a correct
+three-argument call — the formatter's trailing comma is a fourth, and `map((n) => n.id)` carries
+one inside the parens the split ignores. The cheap repair is to widen the expectation to 4, which
+is precisely how a broken guard becomes a green one. The count is taken at paren depth instead, and
+the comment says why, because the next person to touch it will be tempted by the same repair.
+
+**No browser pass.** The slot's holder is a live pass, not a stale file: pid 1561646, alive, with
+`/proc/1561646/cwd` = `/mnt/apopic/omnion-w4` (the second pid in the same holder file is dead — the
+two-pid concatenation again). w7 and main are running too: 55 Chrome, 0 free RAM, 24G of 31G swap.
+`undo-selection` — the row this tick was pointed at, and the one whose reading cannot go red
+because the card it names is gone from the DOM either way — stays unmeasured.
+
+**Next.** `undo-selection` off the DOM and onto the product's own rules, the same move this tick
+made for the edge: `deleteTarget(selection)` and the status-bar string answer "what is selected"
+for a node *and* an edge, and neither moves when a stale id survives. Then the run-from-here / pill
+/ table-mode rows. The plugin row stays BLOCKED on REQ-121.
