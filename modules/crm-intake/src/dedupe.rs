@@ -270,6 +270,25 @@ pub fn normalize_email(value: Option<&str>) -> Option<String> {
 /// rather than shared by import: the transform cleans a value on the way in, this normalizes
 /// it for matching, and a value that arrived through an unmapped field never went through
 /// the transform at all.
+///
+/// ## The SQL side of this rule is [`PHONE_DIGITS_SQL`], and the two must be read together
+///
+/// **The `+` is the whole difference, and it is enough to disable matching entirely.**
+/// `regexp_replace(phone, '[^0-9]', '', 'g')` strips the `+` along with the spaces, while this
+/// function keeps it — so comparing this function's output against that expression is
+/// `'+905321112233'` against `'905321112233'`, which is never equal, and the phone arm of the
+/// matcher never fires against a stored contact. It stayed invisible because
+/// `a_formatted_phone_matches_the_same_digits` compares the function **with itself** on both
+/// sides, which agrees by construction; only a query that normalizes the *stored* column can
+/// disagree, and no unit test crosses that boundary.
+///
+/// The asymmetry this function keeps is deliberate and worth stating, because it is the reason
+/// the two sides must not be unified by deleting the `+`: **`+` distinguishes two people.**
+/// `+1 555 010 22 33` and `+90 555 010 22 33` are different people on two continents who happen
+/// to share a tail. Dropping the plus to satisfy the SQL would merge them, and the correct
+/// direction is to make the *SQL* keep it, which is what [`PHONE_DIGITS_SQL`] does.
+///
+/// [`PHONE_DIGITS_SQL`]: https://docs.rs
 #[must_use]
 pub fn normalize_phone(value: Option<&str>) -> Option<String> {
     let raw = value?.trim();
@@ -286,6 +305,27 @@ pub fn normalize_phone(value: Option<&str>) -> Option<String> {
         Some(digits)
     }
 }
+
+/// The **SQL** spelling of [`normalize_phone`], for the one place that must agree with it.
+///
+/// Written as a named constant rather than pasted into a query string for the third time,
+/// because the failure mode of pasting is a *silent* one: the query compiles, the plan uses the
+/// index, and the arm simply never matches. The two sides differ in exactly one way, and the
+/// constant is where that difference is written down:
+///
+/// | value in the column or payload | `normalize_phone` | this expression |
+/// |---|---|---|
+/// | `+90 (532) 111 22 33` | `+905321112233` | `+905321112233` |
+/// | `0532 111 22 33`   | `5321112233`      | `5321112233`      |
+/// | `n/a`              | `None` (too short) | `''` — never equal to a key |
+///
+/// The `+` is preserved by prefixing it back **only when the source value has one**, so a
+/// number stored without a country code and a submission typed without one still match. The
+/// `nullif(…, '')` matters for the same reason: an empty stored phone normalizes to the empty
+/// string, which would equal another empty string and match every blank contact in the tenant.
+pub const PHONE_DIGITS_SQL: &str =
+    "case when btrim(coalesce({column}, '')) like '+%' then '+' else '' end \
+     || regexp_replace(coalesce({column}, ''), '[^0-9]', '', 'g')";
 
 /// The web host of a company name, a web address or an e-mail.
 ///
@@ -615,5 +655,52 @@ mod tests {
         assert_eq!(name_similarity("", "ada"), 0.0);
         assert_eq!(name_similarity("ada", ""), 0.0);
         assert_eq!(name_similarity("   ", "ada"), 0.0);
+    }
+
+    /// **The unit-level guard for the defect the integration gate found.**
+    ///
+    /// `a_formatted_phone_matches_the_same_digits` compares `normalize_phone` with **itself**
+    /// on both sides, so it agrees by construction and cannot notice the stored column being
+    /// normalized differently in SQL. The test that did notice it lives in the gate, against a
+    /// real database, which is the right place — but it is nine minutes of migration sweep and
+    /// a compile, and the mistake is one character in a string constant that nobody re-reads.
+    ///
+    /// So the constant carries a machine-checkable fingerprint of the rule it has to implement:
+    /// the `+` branch that restores the leading plus, and nothing that could quietly drop it
+    /// again. **This asserts the SHAPE of the SQL, not its result** — the result needs a real
+    /// `regexp_replace`, and pretending a string test can stand in for that is the mistake the
+    /// last two generations of this branch's gates have made. The two are complementary: this
+    /// one runs in a millisecond on every `cargo test -p`, and the gate is what proves the
+    /// answer.
+    #[test]
+    fn the_sql_normalization_carries_the_plus_the_rust_one_carries() {
+        // A shape check with a consequence spelled out: if someone "simplifies" this constant
+        // back to a bare regexp_replace, this fails at the next unit run instead of at the next
+        // dedupe verdict, which is to say: on a customer's inbox rather than in CI.
+        assert!(
+            PHONE_DIGITS_SQL.contains("like '+%'"),
+            "the stored column must keep a leading plus, or it can never equal a key produced \
+             by normalize_phone, which keeps it — PHONE_DIGITS_SQL is now: {PHONE_DIGITS_SQL}"
+        );
+        assert!(
+            PHONE_DIGITS_SQL.contains("regexp_replace"),
+            "the punctuation still has to be stripped: {PHONE_DIGITS_SQL}"
+        );
+        assert!(
+            !PHONE_DIGITS_SQL.contains("lower("),
+            "a phone number has no case; a lower() here means the expression drifted into \
+             copying the e-mail arm: {PHONE_DIGITS_SQL}"
+        );
+        assert_eq!(
+            PHONE_DIGITS_SQL.matches("{column}").count(),
+            2,
+            "both operands must read the same column — the column appears once in the plus test \
+             and once in the digits, and replacing only one of them is a third drift"
+        );
+        assert!(
+            !PHONE_DIGITS_SQL.contains("suffix"),
+            "a suffix comparison merges two people on two continents who share a tail; see \
+             a_different_phone_is_not_matched_just_because_a_suffix_is_shared"
+        );
     }
 }

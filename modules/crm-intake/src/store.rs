@@ -1661,12 +1661,27 @@ pub async fn fetch_candidates(
         return Ok(Vec::new());
     }
 
+    // **The stored column and the incoming key are normalized by ONE named expression on both
+    // sides of the comparison.** This used to be `regexp_replace(coalesce(phone, ''),
+    // '[^0-9]', '', 'g') = $3` with `$3` coming from `dedupe::normalize_phone`, and the two
+    // disagreed by one character: the expression strips the leading `+` with the punctuation,
+    // the function keeps it, so the equality was never true and **no contact was ever a
+    // candidate on the phone key**. A submission with a phone and no e-mail was therefore
+    // `Unique` against an installation holding that exact contact, and a `reject_duplicate`
+    // source filed it as a brand-new lead — the one outcome this module exists to prevent.
+    //
+    // Nothing could see it: `dedupe::phone_match` is unit-tested with `normalize_phone` on both
+    // sides, which agrees with itself, and every fixture in this file's gate maps an e-mail so
+    // the first arm answers before the second is reached. Only a query that normalizes the
+    // *stored* column can disagree with the key, and only a phone-only fixture reaches it.
+    let stored_phone = dedupe::PHONE_DIGITS_SQL.replace("{column}", "phone");
+
     let query = format!(
         "select {CANDIDATE_COLUMNS} from crm_contacts \
          left join crm_companies c on c.id = crm_contacts.company_id \
          where crm_contacts.organization_id = $1 and crm_contacts.archived_at is null and ( \
              ($2::text is not null and lower(email) = $2) \
-          or ($3::text is not null and regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g') = $3) \
+          or ($3::text is not null and {stored_phone} = $3) \
           or ($4::text is not null and company_id is not null and exists ( \
                 select 1 from crm_companies c2 where c2.id = crm_contacts.company_id \
                   and c2.organization_id = $1 and lower(c2.name) like $4) ) ) \

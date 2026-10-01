@@ -109,6 +109,80 @@ async fn seed_contact(pool: &PgPool, org: Uuid, email: &str, first: &str, last: 
     id
 }
 
+/// A contact reachable only by phone.
+///
+/// Deliberately has **no e-mail**: a contact with one would let the e-mail arm answer first and
+/// the test would pass against the broken query, which is exactly how this defect survived
+/// sixteen tests of its own file.
+async fn seed_contact_with_phone(
+    pool: &PgPool,
+    org: Uuid,
+    phone: &str,
+    first: &str,
+    last: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "insert into crm_contacts (id, organization_id, first_name, last_name, phone) \
+         values ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(org)
+    .bind(first)
+    .bind(last)
+    .bind(phone)
+    .execute(pool)
+    .await
+    .expect("a contact to match against");
+    id
+}
+
+/// A source whose mapping yields a **phone and no e-mail**, plus one submission through it.
+///
+/// The `e_mail` source key is the point twice over: the payload never carries it, so the e-mail
+/// key is `None` and the phone arm is the only thing that can answer; and the name is not
+/// `email`, so a lookup that reached for a column called `email` — rather than for the *mapped*
+/// value — would also fail here, which keeps the two halves of this fix honest against each
+/// other.
+async fn submit_with_phone(pool: &PgPool, org: Uuid, policy: &str, phone: &str) -> (Uuid, Uuid) {
+    let source_id = Uuid::new_v4();
+    let mapping = serde_json::json!([
+        { "target": "email", "source_key": "e_mail", "transform": ["trim", "lowercase"],
+          "required": false },
+        { "target": "phone", "source_key": "phone", "transform": ["trim", "e164_lite"],
+          "required": false }
+    ]);
+    sqlx::query(
+        "insert into crm_intake_sources (id, organization_id, name, kind, mapping, \
+             required_targets, dedupe_policy) \
+         values ($1, $2, $4, 'endpoint', $3, '{}', $5)",
+    )
+    .bind(source_id)
+    .bind(org)
+    .bind(mapping)
+    .bind(format!("phone dedupe source {}", source_id))
+    .bind(policy)
+    .execute(pool)
+    .await
+    .expect("a source");
+
+    let captured = store::capture(
+        pool,
+        &Submission {
+            organization_id: org,
+            site_id: None,
+            source_id,
+            submission_id: Some(format!("sub-{source_id}")),
+            ip: Some("203.0.113.7".to_string()),
+            payload: serde_json::json!({ "phone": phone }),
+            received_at: time::OffsetDateTime::now_utc(),
+        },
+    )
+    .await
+    .expect("a submission must be captured, whatever the dedupe verdict is");
+    (source_id, captured.lead.id)
+}
+
 /// A source with the given dedupe policy, and one submission through it.
 async fn submit(pool: &PgPool, org: Uuid, policy: &str, email: &str) -> (Uuid, Uuid) {
     let source_id = Uuid::new_v4();
@@ -468,6 +542,88 @@ async fn another_organizations_duplicate_answers_the_same_nothing_as_a_deleted_o
     assert_eq!(still.status, "duplicate", "the refused call wrote nothing");
     drop_org(&pool, theirs).await;
     drop_org(&pool, mine).await;
+}
+
+/// **The candidate query and the scorer disagreed about what a phone number IS, so the phone
+/// arm of the matcher could never fire against a stored contact.**
+///
+/// `store::fetch_candidates` narrows the contact table in SQL with
+/// `regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g') = $3`, and `$3` is
+/// `dedupe::normalize_phone(submission)`. That function keeps a leading `+` when the value it
+/// is given has one, so `+90 532 111 22 33` becomes `+905321112233` — while the SQL side strips
+/// the `+` along with the spaces and answers `905321112233`. The equality is therefore never
+/// true and **no contact is ever a candidate on the phone key**, no matter how many rows the
+/// scorer would have matched.
+///
+/// The consequence is not "the score is slightly off", it is that the second key in the
+/// documented match order does not exist: a submission carrying a phone number and no e-mail
+/// is `Unique` against an installation full of that exact contact, and `dedupe_policy =
+/// 'reject_duplicate'` files it as a brand-new lead instead of a duplicate claim. The lead
+/// gets worked twice, which is the one outcome the whole module exists to prevent.
+///
+/// ## Why nothing on this branch could see it
+///
+/// Every fixture in this file maps an e-mail and seeds a contact with an e-mail, so the first
+/// arm answers and the second is never reached; and `dedupe::phone_match` is unit-tested
+/// **against `normalize_phone`'s own output on both sides**, which agrees with itself by
+/// construction. The disagreement lives in the one hop the unit tests never cross: the SQL
+/// side is a *different implementation* of the same rule, written in a different language
+/// inside a query string, and it is the half that is wrong. This is the mirror image of
+/// `merge_attribution`'s renamed key: there the two halves used two names for one value,
+/// here they use two rules for one value — and the module header calls out "a `check`
+/// constraint and a Rust constant are written twice" as its standing lesson.
+#[tokio::test]
+async fn a_contact_stored_with_an_international_phone_is_matched_on_that_phone() {
+    let pool = pool().await;
+    ensure_crm_tables(&pool).await;
+    let org = fresh_org(&pool, "dedupe-phone-arm").await;
+    // Stored the way the CRM stores what an operator types, and submitted the way a visitor
+    // types: same number, different punctuation. This is not an adversarial fixture, it is two
+    // people writing one phone number.
+    seed_contact_with_phone(&pool, org, "+90 (532) 111 22 33", "Ilker", "Demir").await;
+
+    let (_source, lead_id) = submit_with_phone(&pool, org, "reject_duplicate", "+90 532 111 22 33").await;
+    let lead = store::find_lead(&pool, org, lead_id)
+        .await
+        .expect("read the lead")
+        .expect("it exists");
+
+    assert_eq!(
+        lead.status, "duplicate",
+        "the one contact whose phone IS this number must be found by the phone arm"
+    );
+    assert_eq!(
+        lead.dedupe_key.as_deref(),
+        Some("+905321112233"),
+        "the key recorded is the *normalized* phone, which is the shape the queue compares on"
+    );
+    drop_org(&pool, org).await;
+}
+
+/// The regression guard for the opposite mistake: a phone-only submission that is genuinely
+/// somebody else must stay `Unique`. A fix that widens the SQL to match anything with the same
+/// digits — for instance by comparing suffixes — would pass the test above and merge two
+/// different people who share a tail, so the negative half is load-bearing rather than tidy.
+#[tokio::test]
+async fn a_different_phone_is_not_matched_just_because_a_suffix_is_shared() {
+    let pool = pool().await;
+    ensure_crm_tables(&pool).await;
+    let org = fresh_org(&pool, "dedupe-phone-suffix").await;
+    // Same last seven digits, different country codes: +90 555 … vs +1 555 …
+    seed_contact_with_phone(&pool, org, "+1 (555) 010 22 33", "Someone", "Else").await;
+
+    let (_source, lead_id) = submit_with_phone(&pool, org, "reject_duplicate", "+90 555 010 22 33").await;
+    let lead = store::find_lead(&pool, org, lead_id)
+        .await
+        .expect("read the lead")
+        .expect("it exists");
+
+    assert_eq!(
+        lead.status, "new",
+        "two people whose numbers share a tail are two people; a suffix comparison would file \
+         this as a duplicate of a contact on another continent"
+    );
+    drop_org(&pool, org).await;
 }
 
 #[tokio::test]
