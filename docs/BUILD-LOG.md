@@ -7751,3 +7751,78 @@ see a misnumbered positional parameter.
 panel: `ai-change-sets.tsx` must read `approvals[]` off the confirm answer and route to the
 inbox, and the inbox must render the `change_set_id` link. The QA pass is still outstanding
 from slice 2c, and the w7 slot was held by w3 last tick.
+
+## Tick 88 — REQ-021 slice 6c: the delivery queue had no producer
+
+**What.** `delivery::enqueue` had **zero production callers**. `store::record` wrote the
+`notifications` row and stopped; the emit route (`POST /api/v1/notifications/emit`) and the event
+router (`router::route`) both went through it; `enqueue` — which writes the
+`notification_deliveries` rows the runner claims — was called from exactly one place, the
+test-delivery route. So for six slices the platform had shipped a durable queue with a claim
+lease, four transports, exponential backoff, a cap, an admin outbox and a live-database
+lifecycle suite, and **no notification had ever produced a delivery row**. The consequences were
+silent and total: no e-mail was sent, no push was delivered, and the drawer's per-channel rows —
+the whole reason `notification_delivery_reader` exists — had nothing to read. "It is in my panel
+but the e-mail never came" was true for a reason nobody could see.
+
+**Why six slices of green tests missed it.** Every walk in `notification_delivery.rs` calls
+`enqueue` itself. That proves the queue *drains*. Nothing proved anything *fills* it, and a
+suite that supplies its own input is a suite that cannot detect a missing wire. The one caller
+that did exist — the test-delivery route — has the job of proving the queue works, so it could
+never be evidence that an ordinary notification produces a delivery.
+
+**The fix.** `store::record_with_deliveries` is the missing join: one insert whose `returning`
+supplies the id, then the reader's own allowed/disabled channel lists (both now answered by
+`preference_store`, so no caller writes its own subtraction), then `enqueue`. The emit route and
+`router::route` both call it. `record` and `enqueue` stay public for the paths that legitimately
+want a different channel set.
+
+**Three defects, all in my own code, all found by writing the walk that had been missing.**
+
+1. **A double insert.** The first shape called `record` and then repeated the insert with
+   `returning id` to recover the id — which writes **two** `notifications` rows for every draft
+   with no `dedupe_key`, because the `on conflict` clause is partial (`where dedupe_key is not
+   null`) and does nothing at all for a null key. Every undeduped notification would have
+   appeared twice and both would have counted in the badge. The walk's `count(*) == 1` is the only
+   assertion that distinguishes the two shapes.
+2. **`chat` queued for a channel with no transport.** `chat` is in the closed vocabulary and the
+   default matrix has it **enabled**, so enqueueing "every allowed channel" writes it `pending`;
+   the runner then claims it, finds no transport, re-queues to the cap and writes `failed` — a
+   channel the platform has not built spending three attempts and appearing in the outbox as a
+   failed delivery. `enqueue` now owns `QUEUEABLE` and writes undrainable channels `skipped` with
+   a reason **distinct** from the reader's own switch-off, because the two send the reader to
+   different places (a setting vs an administrator).
+3. **The fix for (2) was itself a no-op until the walk caught it.** The skip was in a third loop
+   *after* the enabled loop, and `insert_delivery` is `on conflict do nothing` — so the enabled
+   loop had already inserted `chat` as `pending` and the `skipped` row silently did nothing. The
+   code read correct and compiled green. Only reading the status back out of the table (all five
+   `pending`, expected `skipped`) exposed it. The check belongs in the first loop.
+
+**A pre-existing red gate, fixed here.** `the_email_transport_refuses_a_reader_with_no_address…`
+asserts the webhook reason contains `"no endpoint"`; commit `43a86c13` (slice 5) improved that
+sentence to `"no destination"` and left the assertion behind. **This walk has been red since
+slice 5** — a live-database suite that nobody ran because it was known-red, covering the exact
+lifecycle slice 6c is about. The assertion now covers the substance rather than the wording.
+
+**Proof.**
+
+```text
+cargo test -p omnion-notifications --lib    102 passed  (was 101)
+cargo test -p omnion-api --lib              258 passed
+cargo test -p omnion-permissions --lib       63 passed
+tsc -p apps/admin/tsconfig.json --noEmit    exit 0
+cargo test -p omnion-api --test notification_delivery -- --test-threads=1   10 passed
+```
+
+The two new walks (`a_notification_written_by_the_producer_path_arrives_with_its_deliveries`,
+`a_channel_the_reader_switched_off_is_skipped_by_the_producer_path`) call **no `enqueue` of their
+own** — that absence is the assertion — and read the channels, statuses and reasons back out of
+PostgreSQL rather than trusting a returned count.
+
+**Not done this tick.** The browser pass. The QA slot was held for the whole tick by a **live**
+w4 pass (`/tmp/omnion-qa-slot-holders` → pid 4149471, cwd `/mnt/apopic/omnion-w4`); it is
+back-to-back passes, not a stale holder, so `QA_SLOT_WAIT=3600` queued this one rather than letting
+it collide — which is what that limit exists for. The device-block legs from tick 87 and the
+keyboard/mobile legs are therefore still **written, not measured**. Next tick runs the pass first.
+
+Next: the remaining REQ-021 legs, then REQ-016.
