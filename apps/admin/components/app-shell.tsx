@@ -177,7 +177,24 @@ export function AppShell({ title, description, children }: AppShellProps) {
         </span>
       </Link>
 
-      <nav aria-label="Sections" className="flex flex-col gap-1">
+      {/* The list scrolls; the brand above it and the account block below it do not.
+        *
+        * This frame is `sticky top-0 h-screen`, so it is exactly one viewport tall and, before
+        * this, its contents were not either: `h-full` on a flex column with no `overflow` clips
+        * what does not fit and gives no way to reach it. With ~34 entries the identity/access
+        * shelves put the last links ("Sessions", "Devices", "Search settings") roughly 400px below
+        * a 900px fold — permanently unreachable, with no scrollbar to say so. A QA pass reported
+        * it as three `click-error`s on those exact links while every one of them looked perfectly
+        * normal in a screenshot, because "rendered" and "reachable" are different properties and
+        * only a click measures the second.
+        *
+        * `min-h-0` is load-bearing: a flex child defaults to `min-height: auto`, so it refuses to
+        * shrink below its content and `overflow-y-auto` would never engage. `overscroll-contain`
+        * keeps the wheel inside the list instead of chaining to the page once it reaches the end,
+        * which is what makes the end of the list feel like a wall rather than a dead zone.
+        */}
+      <nav aria-label="Sections" className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <div className="flex flex-col gap-1 pr-1">
         {navItems.map((item) => {
           const active = isActive(item.href, pathname);
           const Icon = item.icon;
@@ -198,6 +215,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
             </Link>
           );
         })}
+        </div>
       </nav>
 
       <div className="mt-auto flex flex-col gap-3 border-t border-line pt-4">
