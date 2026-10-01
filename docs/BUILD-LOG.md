@@ -10024,3 +10024,70 @@ cargo test -p omnion-core --lib   62 passed; 0 failed
 against, the `/notifications/settings` device block (three device API functions in
 `api.ts` still have **zero UI callers**), and `prune_endpoints`/`prune_stale` — which still
 have **zero call sites anywhere**, so a revoked endpoint is not yet pruned. Next tick.
+
+
+---
+
+## Tick 54 · wave4 · REQ-055 slice 2b — the leave screens
+
+**What.** Four screens for the leave module slice 2a built the API for: `/hr/leave` (the request
+list drawn above the absence calendar), `/hr/leave/new` (the form), `/hr/leave/{id}` (balance card,
+timeline, decision panel) and `/hr/leave/types` (the catalogue editor). Plus `hr-parts.tsx` and
+`absence-calendar.tsx`, the module shelf, a `People` sidebar entry, and `runHrLeave` in the
+walkthrough with the three `/hr/*` routes in the ordinary route list.
+
+**Four defects the slice found in its own work, one of them the reason the slice is worth having:**
+
+1. **The module nav listed three routes that render nothing.** `/hr/employees`, `/hr/attendance`
+   and `/hr/settings` were linked from slice 1's shelf while no page component existed for any of
+   them — dead buttons in a module's own navigation, which is the first thing that makes a module
+   read as unfinished. The shelf now lists only what ships, and the remaining destinations arrive
+   with the slices that build them.
+2. **The nav's "am I here" test could not tell a page from its child.** `/hr/leave/types` sits
+   under `/hr/leave`, and the previous condition had a `&& link.href === "/hr/leave" && false`
+   clause — a term that is constant-false, i.e. the branch was never taken and every match came
+   from the plain `startsWith`. Opening the catalogue lit the *requests* tab. It now resolves by
+   asking whether any longer href also matches, which is the only formulation of "longest wins"
+   that does not need the list sorted.
+3. **`BalanceCard` flattens a `LeaveType`, so its key is `id`, not `leave_type_id`.** The
+   server-side struct carries `#[serde(flatten)] pub leave_type: LeaveType`, which means every
+   field of the type — `id`, `name`, `code` — arrives at the top level. The card was keyed on a
+   field that does not exist, so every balance card rendered `data-qa-hr-balance-card="undefined"`
+   and the QA harness would have matched five cards by one selector.
+4. **`working_days` and `workingDays`.** The preview route answers `working_days`; the form read
+   the camelCase spelling and TypeScript caught it. Same class as the `json!`-vs-serde Date trap
+   from slice 2a: the wire is snake_case and the only thing that notices is the compiler.
+
+**One design decision worth recording.** The form's day counter calls
+`GET /hr/leave/requests/preview` rather than counting anything in TypeScript. The acceptance
+criterion is "the number shown before submit equals the stored value", and that criterion is
+*untestable* the moment two implementations exist. `runHrLeave` asserts it end to end: it reads
+the preview out of the DOM, submits exactly that range, opens the stored request and compares —
+over a **Monday-to-Sunday** range, because a Mon–Fri range charges 5 whichever implementation you
+ask and the weekend is precisely where a second implementation would diverge silently.
+
+**Proof.**
+
+```text
+cargo test -p omnion-module-hr --quiet      69 passed; 0 failed
+pnpm typecheck                              2 successful, 2 total
+node --check scripts/qa/walkthrough.cjs      parse clean
+QA_STACK=w4 … QA_ONLY=hr bash scripts/qa/run.sh
+  3 pages walked · 15 clicks · 108 screenshots · QA_VERDICT=pass
+```
+
+**The pass measured the QA fixture, not the screens.** Every `/hr/*` route answered **400
+`organization_required`** and the pass reported `high 490`. The root cause is one query:
+`select count(*) from organizations` returns **0** in `omnion_qa_w4` while one user has
+`organization_id IS NULL` — the walkthrough's sign-in creates an account that belongs to no
+organization, so every org-scoped route refuses at once. CRM, sales, inventory and accounting all
+report the same wall in the same run. This is the fixture defect the tick-26 ledger entry
+described, still unfixed, and **no acceptance box is ticked by this entry**: a pass that measures
+nothing proves nothing. What the run does establish is that the screens *render* — the nav links,
+the five filter chips, the disabled month buttons and a working "Try again" in the error state
+were all clicked — and that the error state shows a retry rather than an empty table.
+
+**Next.** Slice 2c: `/hr/me/*` self-service. `GET /hr/leave/balances` already refuses somebody
+else's balance unless the caller holds `hr.employees.read`, so the self-service screen is the
+caller's own balance with no permission at all — which is the slice that closes the
+"`own`-level self-service read is the only part still open" note on the route-guard box.
