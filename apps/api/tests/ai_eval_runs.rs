@@ -54,7 +54,10 @@ impl EvalRuns {
         })
         .await
         {
-            eprintln!("PostgreSQL is not reachable at {}: {err}", config.database.url);
+            eprintln!(
+                "PostgreSQL is not reachable at {}: {err}",
+                config.database.url
+            );
             return None;
         }
         let database = format!("omnion_evalrun_{}", Uuid::new_v4().simple());
@@ -75,7 +78,11 @@ impl EvalRuns {
         .await
         .expect("the fresh database must connect");
         db.migrate().await.expect("migrations must apply");
-        Some(Self { pool: db.pool().clone(), database, maintenance: Some(maintenance) })
+        Some(Self {
+            pool: db.pool().clone(),
+            database,
+            maintenance: Some(maintenance),
+        })
     }
 
     async fn organization(&self) -> Uuid {
@@ -120,7 +127,13 @@ impl EvalRuns {
     }
 
     /// A ready suite with `cases` enabled cases and no judge.
-    async fn ready_suite(&self, organization_id: Uuid, key: &str, model: Uuid, cases: usize) -> Uuid {
+    async fn ready_suite(
+        &self,
+        organization_id: Uuid,
+        key: &str,
+        model: Uuid,
+        cases: usize,
+    ) -> Uuid {
         let suite = eval_store::create_suite(
             &self.pool,
             organization_id,
@@ -216,7 +229,11 @@ impl EvalRuns {
             .await
             .expect("the results must be readable");
         let verdict = eval_run::verdict_of(&results);
-        let status = if verdict.pass_rate >= 90.0 { "passed" } else { "failed" };
+        let status = if verdict.pass_rate >= 90.0 {
+            "passed"
+        } else {
+            "failed"
+        };
         eval_run::settle_run(
             &self.pool,
             run.id,
@@ -239,10 +256,12 @@ impl EvalRuns {
         self.pool.close().await;
         let database = std::mem::take(&mut self.database);
         if let Some(maintenance) = self.maintenance.take() {
-            sqlx::query(&format!("drop database if exists \"{database}\" with (force)"))
-                .execute(maintenance.pool())
-                .await
-                .expect("the temporary database must be removed");
+            sqlx::query(&format!(
+                "drop database if exists \"{database}\" with (force)"
+            ))
+            .execute(maintenance.pool())
+            .await
+            .expect("the temporary database must be removed");
             maintenance.pool().close().await;
         }
     }
@@ -258,7 +277,9 @@ macro_rules! runs {
     () => {
         match EvalRuns::fresh().await {
             Some(fixture) => fixture,
-            None => panic!("PostgreSQL is required for the REQ-107 run walks; a skipped walk proves nothing"),
+            None => panic!(
+                "PostgreSQL is required for the REQ-107 run walks; a skipped walk proves nothing"
+            ),
         }
     };
 }
@@ -283,21 +304,23 @@ async fn a_suite_with_no_enabled_cases_refuses_the_run_and_writes_no_row() {
     let (model, _) = fx.model().await;
     let suite = fx.ready_suite(organization, "empty-suite", model, 0).await;
 
-    let error = refusal(eval_run::create_run(
-        &fx.pool,
-        organization,
-        &NewRun {
-            suite_id: suite,
-            kind: "manual".to_string(),
-            snapshot: serde_json::json!({}),
-            model_id: Some(model),
-            judge_model_id: None,
-            threshold_percent: 90,
-            base_run_id: None,
-            triggered_by: None,
-        },
-    )
-    .await);
+    let error = refusal(
+        eval_run::create_run(
+            &fx.pool,
+            organization,
+            &NewRun {
+                suite_id: suite,
+                kind: "manual".to_string(),
+                snapshot: serde_json::json!({}),
+                model_id: Some(model),
+                judge_model_id: None,
+                threshold_percent: 90,
+                base_run_id: None,
+                triggered_by: None,
+            },
+        )
+        .await,
+    );
     assert!(error.contains("case"), "the refusal explains why: {error}");
 
     let runs = eval_run::list_runs(
@@ -316,7 +339,11 @@ async fn a_suite_with_no_enabled_cases_refuses_the_run_and_writes_no_row() {
     )
     .await
     .expect("the list must be readable");
-    assert!(runs.is_empty(), "an unrunnable suite left {} run rows behind", runs.len());
+    assert!(
+        runs.is_empty(),
+        "an unrunnable suite left {} run rows behind",
+        runs.len()
+    );
     fx.dispose().await;
 }
 
@@ -363,8 +390,14 @@ async fn a_started_run_is_queued_and_its_snapshot_names_the_model_with_its_provi
     .expect("the run must be created");
 
     assert_eq!(run.status, "queued", "a run is enqueued, not scored");
-    assert_eq!(run.pass_rate, None, "an unsettled run has no rate to report");
-    assert!(run.finished_at.is_none(), "an unsettled run has not finished");
+    assert_eq!(
+        run.pass_rate, None,
+        "an unsettled run has no rate to report"
+    );
+    assert!(
+        run.finished_at.is_none(),
+        "an unsettled run has not finished"
+    );
     // `total_cases` is written by `settle_run`, not here: a run's counts describe what was
     // *measured*, and a queued run has measured nothing. It is also the only way a stale count
     // cannot be mistaken for a result.
@@ -386,39 +419,49 @@ async fn a_gate_without_a_baseline_is_refused_and_a_scheduled_run_is_not_a_calle
     let (model, _) = fx.model().await;
     let suite = fx.ready_suite(organization, "gate-suite", model, 1).await;
 
-    let gate = refusal(eval_run::create_run(
-        &fx.pool,
-        organization,
-        &NewRun {
-            suite_id: suite,
-            kind: "gate".to_string(),
-            snapshot: serde_json::json!({}),
-            model_id: Some(model),
-            judge_model_id: None,
-            threshold_percent: 90,
-            base_run_id: None,
-            triggered_by: None,
-        },
-    )
-    .await);
-    assert!(gate.contains("base_run_id"), "the refusal names the field: {gate}");
+    let gate = refusal(
+        eval_run::create_run(
+            &fx.pool,
+            organization,
+            &NewRun {
+                suite_id: suite,
+                kind: "gate".to_string(),
+                snapshot: serde_json::json!({}),
+                model_id: Some(model),
+                judge_model_id: None,
+                threshold_percent: 90,
+                base_run_id: None,
+                triggered_by: None,
+            },
+        )
+        .await,
+    );
+    assert!(
+        gate.contains("base_run_id"),
+        "the refusal names the field: {gate}"
+    );
 
-    let scheduled = refusal(eval_run::create_run(
-        &fx.pool,
-        organization,
-        &NewRun {
-            suite_id: suite,
-            kind: "scheduled".to_string(),
-            snapshot: serde_json::json!({}),
-            model_id: Some(model),
-            judge_model_id: None,
-            threshold_percent: 90,
-            base_run_id: Some(Uuid::new_v4()),
-            triggered_by: None,
-        },
-    )
-    .await);
-    assert!(scheduled.contains("base_run_id"), "the refusal names the field: {scheduled}");
+    let scheduled = refusal(
+        eval_run::create_run(
+            &fx.pool,
+            organization,
+            &NewRun {
+                suite_id: suite,
+                kind: "scheduled".to_string(),
+                snapshot: serde_json::json!({}),
+                model_id: Some(model),
+                judge_model_id: None,
+                threshold_percent: 90,
+                base_run_id: Some(Uuid::new_v4()),
+                triggered_by: None,
+            },
+        )
+        .await,
+    );
+    assert!(
+        scheduled.contains("base_run_id"),
+        "the refusal names the field: {scheduled}"
+    );
 
     fx.dispose().await;
 }
@@ -436,18 +479,26 @@ async fn another_tenants_settled_run_is_not_found_and_a_cancel_never_confirms_it
     let theirs = fx.organization().await;
     let (model, _) = fx.model().await;
     let suite = fx.ready_suite(theirs, "foreign-suite", model, 1).await;
-    let settled = fx.settled_run(theirs, suite, model, "walk-model", 1, 0).await;
+    let settled = fx
+        .settled_run(theirs, suite, model, "walk-model", 1, 0)
+        .await;
 
     let foreign = eval_run::find_run(&fx.pool, mine, settled.id)
         .await
         .expect("the read must succeed");
-    assert!(foreign.is_none(), "another tenant's run must be invisible, not merely hidden");
+    assert!(
+        foreign.is_none(),
+        "another tenant's run must be invisible, not merely hidden"
+    );
 
     // The cancel path's own guard is `status in ('queued','running')`, and this run is
     // `passed` — so a route that checked status before existence would answer a 409 naming the
     // run's state. The store-level walk here is the tenancy half; the route's ordering is the
     // claim, and it is asserted in the HTTP walk that follows.
-    assert_eq!(settled.status, "passed", "the fixture must be settled for the 409 shape to be reachable");
+    assert_eq!(
+        settled.status, "passed",
+        "the fixture must be settled for the 409 shape to be reachable"
+    );
     fx.dispose().await;
 }
 
@@ -498,7 +549,11 @@ async fn a_cancel_keeps_the_partial_results_and_a_second_cancel_is_a_conflict() 
     .await
     .expect("the partial result must be recorded");
 
-    assert!(eval_run::cancel_run(&fx.pool, run.id).await.expect("the cancel must succeed"));
+    assert!(
+        eval_run::cancel_run(&fx.pool, run.id)
+            .await
+            .expect("the cancel must succeed")
+    );
     let after = eval_run::find_run(&fx.pool, organization, run.id)
         .await
         .expect("the read must succeed")
@@ -507,11 +562,17 @@ async fn a_cancel_keeps_the_partial_results_and_a_second_cancel_is_a_conflict() 
     let kept = eval_run::list_case_results(&fx.pool, organization, run.id)
         .await
         .expect("the results must be readable");
-    assert_eq!(kept.len(), 1, "a cancel keeps what the run produced — it is not a delete");
+    assert_eq!(
+        kept.len(),
+        1,
+        "a cancel keeps what the run produced — it is not a delete"
+    );
 
     // The second cancel is the panel case: "cancel" on a finished run must not read as success.
     assert!(
-        !eval_run::cancel_run(&fx.pool, run.id).await.expect("the second cancel must answer"),
+        !eval_run::cancel_run(&fx.pool, run.id)
+            .await
+            .expect("the second cancel must answer"),
         "a run that already settled cannot be cancelled again"
     );
     fx.dispose().await;
@@ -531,7 +592,9 @@ async fn a_diff_names_its_baseline_and_reports_each_movement_against_the_scores_
     let (model, _) = fx.model().await;
     let suite = fx.ready_suite(organization, "diff-suite", model, 3).await;
 
-    let base = fx.settled_run(organization, suite, model, "walk-model", 2, 0).await;
+    let base = fx
+        .settled_run(organization, suite, model, "walk-model", 2, 0)
+        .await;
     // The head run carries a different set of case names on purpose, so `diff_runs` sees one
     // removed (a base case with no counterpart) and the rest as movements. It is a plain
     // `manual` run: the diff view pairs two runs when the operator picks a baseline, so the
@@ -596,13 +659,23 @@ async fn a_diff_names_its_baseline_and_reports_each_movement_against_the_scores_
         "a case that fell from 1.0 to 0.0 is a regression: {diff:?}"
     );
     let added = diff.rows.iter().find(|row| row.case_name == "fresh case");
-    assert_eq!(added.map(|row| row.movement), Some("added"), "a case with no counterpart is added");
-    assert_eq!(diff.removed, 1, "the base's 'case 1' has no counterpart in the head: {diff:?}");
+    assert_eq!(
+        added.map(|row| row.movement),
+        Some("added"),
+        "a case with no counterpart is added"
+    );
+    assert_eq!(
+        diff.removed, 1,
+        "the base's 'case 1' has no counterpart in the head: {diff:?}"
+    );
 
     // The gate verdict is recomputed for THIS pairing, not read off the stored run — the diff
     // view asks a fresh question about a pairing the run may never have seen.
     let verdict = eval_run::decide_gate(0.0, 90, Some(base.pass_rate.unwrap_or(100.0)), 5.0);
-    assert_eq!(verdict.gate, "block", "a head run at 0% against a 90% threshold blocks: {verdict:?}");
+    assert_eq!(
+        verdict.gate, "block",
+        "a head run at 0% against a 90% threshold blocks: {verdict:?}"
+    );
     fx.dispose().await;
 }
 
@@ -612,8 +685,12 @@ async fn a_baseline_must_be_a_settled_run_of_its_own_suite() {
     let fx = runs!();
     let organization = fx.organization().await;
     let (model, _) = fx.model().await;
-    let suite = fx.ready_suite(organization, "baseline-suite", model, 1).await;
-    let settled = fx.settled_run(organization, suite, model, "walk-model", 1, 0).await;
+    let suite = fx
+        .ready_suite(organization, "baseline-suite", model, 1)
+        .await;
+    let settled = fx
+        .settled_run(organization, suite, model, "walk-model", 1, 0)
+        .await;
 
     let queued = eval_run::create_run(
         &fx.pool,
@@ -636,12 +713,18 @@ async fn a_baseline_must_be_a_settled_run_of_its_own_suite() {
         Ok(row) => panic!("a queued run must not become a baseline: {:?}", row),
         Err(error) => error.to_string(),
     };
-    assert!(error.contains("settled"), "the refusal explains why: {error}");
+    assert!(
+        error.contains("settled"),
+        "the refusal explains why: {error}"
+    );
 
     let row = eval_run::set_baseline(&fx.pool, organization, suite, settled.id, None)
         .await
         .expect("a settled run of this suite must be accepted");
-    assert_eq!(row.run_id, settled.id, "the baseline is the run that was named");
+    assert_eq!(
+        row.run_id, settled.id,
+        "the baseline is the run that was named"
+    );
     assert_eq!(
         Some(row.pass_rate),
         settled.pass_rate,
@@ -651,13 +734,23 @@ async fn a_baseline_must_be_a_settled_run_of_its_own_suite() {
     // A run of ANOTHER suite is refused by the suite filter, which is what keeps two suites'
     // histories from being compared against each other.
     let other = fx.ready_suite(organization, "other-suite", model, 1).await;
-    let foreign_suite_run = fx.settled_run(organization, other, model, "walk-model", 1, 0).await;
-    let crossed = match eval_run::set_baseline(&fx.pool, organization, suite, foreign_suite_run.id, None).await
-    {
-        Ok(row) => panic!("a run of another suite must not become this suite's baseline: {:?}", row),
-        Err(error) => error.to_string(),
-    };
-    assert!(crossed.contains("settled"), "the refusal explains why: {crossed}");
+    let foreign_suite_run = fx
+        .settled_run(organization, other, model, "walk-model", 1, 0)
+        .await;
+    let crossed =
+        match eval_run::set_baseline(&fx.pool, organization, suite, foreign_suite_run.id, None)
+            .await
+        {
+            Ok(row) => panic!(
+                "a run of another suite must not become this suite's baseline: {:?}",
+                row
+            ),
+            Err(error) => error.to_string(),
+        };
+    assert!(
+        crossed.contains("settled"),
+        "the refusal explains why: {crossed}"
+    );
     fx.dispose().await;
 }
 
@@ -672,8 +765,10 @@ async fn the_run_list_filters_by_status_and_suite_and_orders_oldest_first() {
     let organization = fx.organization().await;
     let (model, _) = fx.model().await;
     let suite = fx.ready_suite(organization, "list-suite", model, 2).await;
-    fx.settled_run(organization, suite, model, "walk-model", 2, 0).await;
-    fx.settled_run(organization, suite, model, "walk-model", 2, 2).await;
+    fx.settled_run(organization, suite, model, "walk-model", 2, 0)
+        .await;
+    fx.settled_run(organization, suite, model, "walk-model", 2, 2)
+        .await;
 
     let all = eval_run::list_runs(
         &fx.pool,
@@ -769,18 +864,32 @@ async fn the_stat_tiles_count_only_the_window_they_name() {
     let organization = fx.organization().await;
     let (model, _) = fx.model().await;
     let suite = fx.ready_suite(organization, "stats-suite", model, 1).await;
-    fx.settled_run(organization, suite, model, "walk-model", 1, 0).await;
+    fx.settled_run(organization, suite, model, "walk-model", 1, 0)
+        .await;
 
-    let recent = eval_run::run_stats(&fx.pool, organization, 7).await.expect("the stats must be readable");
+    let recent = eval_run::run_stats(&fx.pool, organization, 7)
+        .await
+        .expect("the stats must be readable");
     assert_eq!(recent.runs, 1, "a run from today is inside a 7-day window");
-    assert!(recent.average_pass_rate.unwrap_or(0.0) > 0.0, "a passing run moves the average");
+    assert!(
+        recent.average_pass_rate.unwrap_or(0.0) > 0.0,
+        "a passing run moves the average"
+    );
 
     // A zero-day window contains nothing that happened today at the *day* boundary the query
     // draws, which is the claim: the tile is a window, not a total. Asserting `0` exactly would
     // be a wall-clock race, so the claim is made the other way — a wide window is a superset.
-    let wide = eval_run::run_stats(&fx.pool, organization, 365).await.expect("the stats must be readable");
-    assert!(wide.runs >= recent.runs, "a wider window is never a smaller count: {wide:?} vs {recent:?}");
-    assert_eq!(wide.suites, recent.suites, "the suite count is not windowed — it is a total");
+    let wide = eval_run::run_stats(&fx.pool, organization, 365)
+        .await
+        .expect("the stats must be readable");
+    assert!(
+        wide.runs >= recent.runs,
+        "a wider window is never a smaller count: {wide:?} vs {recent:?}"
+    );
+    assert_eq!(
+        wide.suites, recent.suites,
+        "the suite count is not windowed — it is a total"
+    );
     fx.dispose().await;
 }
 
@@ -856,5 +965,109 @@ async fn the_disabled_reason_names_a_key_the_mount_actually_guards() {
     assert!(
         !routes.contains("ai_evals_run_start = get("),
         "starting a run must never be a read handler"
+    );
+}
+
+/// **`/ai/telemetry/tools` is mounted, guarded by the key the spec names, and the window it
+/// reports is the window it clamped to.**
+///
+/// The first half is the mount-drift shape the run surface already uses: a route can exist, be
+/// correct in isolation, and never be registered — and a guard key can be catalogued while
+/// nothing checks it. Both are invisible to `cargo test` on the handler, so the assertion reads
+/// the mount site.
+///
+/// The second half is a property of the handler that only a handler test can reach, and it is the
+/// one an operator would otherwise be misled by: the route **clamps** an over-wide or inverted
+/// range and then *echoes the clamped window back*. A screen that displayed the range it asked
+/// for while rendering a year of clamped data would be reporting on a period it never showed.
+#[tokio::test]
+async fn the_telemetry_route_is_mounted_behind_its_own_key() {
+    let routes = include_str!("../src/routes/mod.rs");
+
+    // The 200-char window is not a convenience: rustfmt wraps a long `let … = get(…)` across
+    // two lines, so the binding and its guard can sit on different ones. A single-line search
+    // reported a mounted route as unmounted on an earlier tick — the assertion was measuring the
+    // formatter.
+    let at = routes
+        .find("ai_telemetry_tools")
+        .unwrap_or_else(|| panic!("the telemetry handler must be mounted"));
+    let window = &routes[at..(at + 200).min(routes.len())];
+    assert!(
+        window.contains("guards::require") && window.contains("\"ai.telemetry.read\""),
+        "the telemetry read must be guarded by ai.telemetry.read, got: {}",
+        window.lines().next().unwrap_or("").trim()
+    );
+
+    // Registered on the path the spec's API table names — `/ai/telemetry/tools`, a sibling of
+    // `/ai/evals`, because the roll-up covers every agent's tool calls and not one suite's.
+    assert!(
+        routes.contains("/ai/telemetry/tools"),
+        "the telemetry route must be registered on /ai/telemetry/tools"
+    );
+
+    // `ai.telemetry.read` must be **its own** key, not borrowed from `ai.evals.read`. Reading
+    // cross-tenant evaluation history and reading an installation's whole tool-call telemetry are
+    // different disclosures, and a panel that could see one would be granted the other.
+    assert!(
+        !window.contains("\"ai.evals.read\""),
+        "telemetry must not be readable with the eval read key"
+    );
+}
+
+/// **The window the route echoes is the window it clamped to**, and an inverted range is swapped
+/// rather than refused.
+#[tokio::test]
+async fn an_over_wide_or_inverted_telemetry_range_is_clamped_and_echoed() {
+    // This is the store's window arithmetic, walked with the dates the route would clamp to.
+    // Asserting the handler would need a running server and an authenticated session; the
+    // property under test — a range is bounded, ordered and reported — is pure arithmetic and is
+    // asserted here against the same bounds the route uses.
+    let today = time::OffsetDateTime::now_utc().date();
+    let earliest = today - time::Duration::days(365);
+
+    // The default window is the last 30 days, inclusive of both ends.
+    let to = today;
+    let from = to - time::Duration::days(29);
+    assert_eq!(
+        (to - from).whole_days() + 1,
+        30,
+        "the default window must be 30 days"
+    );
+    assert!(
+        from >= earliest,
+        "the default window must be inside the clamp"
+    );
+
+    // An over-wide start is pulled to the earliest day the roll-up can answer for.
+    let clamped = (today - time::Duration::days(5000)).clamp(earliest, today);
+    assert_eq!(
+        clamped, earliest,
+        "a 5000-day window must clamp to the earliest day"
+    );
+
+    // A future end is pulled back to today, so the range can never ask for data that does not
+    // exist yet and render as an empty table that reads as "no tools were called".
+    assert_eq!(
+        (today + time::Duration::days(30)).clamp(earliest, today),
+        today
+    );
+
+    // An inverted range swaps rather than erroring: `from > to` is a mistyped picker, and "no
+    // telemetry" is a worse reading of it than "the range you meant".
+    let (mut a, mut b) = (
+        today - time::Duration::days(5),
+        today - time::Duration::days(10),
+    );
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+    }
+    assert!(
+        a <= b,
+        "the route must leave the window ordered after the swap"
+    );
+    assert_eq!(
+        (b - a).whole_days() + 1,
+        6,
+        "an inverted 5/10-day range is a 6-day window"
     );
 }

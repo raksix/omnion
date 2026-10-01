@@ -41,14 +41,15 @@ use omnion_ai_hub::error::AiHubError;
 use omnion_ai_hub::eval_case;
 use omnion_ai_hub::eval_run;
 use omnion_ai_hub::eval_store::{
-    self, CaseChanges, CaseRow, NewCase, NewSuite, SuiteChanges, SuiteRow, MAX_CASE_INPUT_CHARS,
-    SCHEDULE_PRESETS,
+    self, CaseChanges, CaseRow, MAX_CASE_INPUT_CHARS, NewCase, NewSuite, SCHEDULE_PRESETS,
+    SuiteChanges, SuiteRow,
 };
 use omnion_ai_hub::run_store;
 use omnion_ai_hub::store;
+use omnion_ai_hub::tool_stats::{self, ToolAggregate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use time::OffsetDateTime;
+use time::{Date, Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
@@ -202,7 +203,11 @@ pub async fn list_suites(
             }
         }
         let (readiness, readiness_note) = suite_readiness(suite);
-        suites.push(SuiteSummary { suite: suite.clone(), readiness, readiness_note });
+        suites.push(SuiteSummary {
+            suite: suite.clone(),
+            readiness,
+            readiness_note,
+        });
     }
 
     let viewer_missing = viewer_run_keys(pool, &current).await?;
@@ -250,14 +255,25 @@ fn suite_readiness(suite: &SuiteRow) -> (&'static str, String) {
             format!(
                 "{} case{} ask for a rubric and no judge model is set — those cases will error.",
                 suite.rubric_case_count,
-                if suite.rubric_case_count == 1 { "" } else { "s" }
+                if suite.rubric_case_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ),
         );
     }
     (
         "ready",
-        format!("{} enabled case{} ready to run.", suite.enabled_case_count,
-            if suite.enabled_case_count == 1 { "" } else { "s" }),
+        format!(
+            "{} enabled case{} ready to run.",
+            suite.enabled_case_count,
+            if suite.enabled_case_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ),
     )
 }
 
@@ -362,7 +378,10 @@ fn field_for(message: &str) -> Option<&'static str> {
         ("tags", "tags"),
         ("name", "name"),
     ];
-    if let Some((_, field)) = MAP.iter().find(|(needle, _)| message.contains(&format!("`{needle}`"))) {
+    if let Some((_, field)) = MAP
+        .iter()
+        .find(|(needle, _)| message.contains(&format!("`{needle}`")))
+    {
         return Some(field);
     }
     // Two store messages name the field without backticks — "a case's expected properties must
@@ -585,16 +604,66 @@ pub struct PropertyInfo {
 /// which editor field belongs to which key.
 fn property_infos() -> Vec<PropertyInfo> {
     const TABLE: &[(&str, &str, &str, bool)] = &[
-        ("exact", "Output equals this string", "expected.exact", false),
-        ("contains", "Output contains this text", "expected.contains", false),
-        ("regex", "Output matches this pattern", "expected.regex", false),
-        ("json_schema", "Output parses and matches this schema", "expected.json_schema", false),
-        ("citations_required", "Output cites its sources", "expected.citations_required", false),
-        ("no_pii", "Output masks nothing the data guard would mask", "expected.no_pii", false),
-        ("max_steps", "Run uses at most this many steps", "expected.max_steps", false),
-        ("max_cost_micros", "Run costs at most this much", "expected.max_cost_micros", false),
-        ("max_latency_ms", "Run answers within this many milliseconds", "expected.max_latency_ms", false),
-        ("rubric", "A second model judges this free text", "expected.rubric", true),
+        (
+            "exact",
+            "Output equals this string",
+            "expected.exact",
+            false,
+        ),
+        (
+            "contains",
+            "Output contains this text",
+            "expected.contains",
+            false,
+        ),
+        (
+            "regex",
+            "Output matches this pattern",
+            "expected.regex",
+            false,
+        ),
+        (
+            "json_schema",
+            "Output parses and matches this schema",
+            "expected.json_schema",
+            false,
+        ),
+        (
+            "citations_required",
+            "Output cites its sources",
+            "expected.citations_required",
+            false,
+        ),
+        (
+            "no_pii",
+            "Output masks nothing the data guard would mask",
+            "expected.no_pii",
+            false,
+        ),
+        (
+            "max_steps",
+            "Run uses at most this many steps",
+            "expected.max_steps",
+            false,
+        ),
+        (
+            "max_cost_micros",
+            "Run costs at most this much",
+            "expected.max_cost_micros",
+            false,
+        ),
+        (
+            "max_latency_ms",
+            "Run answers within this many milliseconds",
+            "expected.max_latency_ms",
+            false,
+        ),
+        (
+            "rubric",
+            "A second model judges this free text",
+            "expected.rubric",
+            true,
+        ),
     ];
     TABLE
         .iter()
@@ -657,17 +726,17 @@ async fn model_options(pool: &sqlx::PgPool) -> Result<Vec<Option_>, ApiError> {
             id: model.id.to_string(),
             // The column is nullable and the panel falls back to the wire key when it is
             // blank, so an option is `None` rather than an empty label.
-            label: model.display_name.clone().unwrap_or_else(|| model.model_key.clone()),
+            label: model
+                .display_name
+                .clone()
+                .unwrap_or_else(|| model.model_key.clone()),
             detail: Some(model.model_key.clone()),
         })
         .collect())
 }
 
 /// The agents a suite may target.
-async fn agent_options(
-    pool: &sqlx::PgPool,
-    organization: Uuid,
-) -> Result<Vec<Option_>, ApiError> {
+async fn agent_options(pool: &sqlx::PgPool, organization: Uuid) -> Result<Vec<Option_>, ApiError> {
     let rows = run_store::list_agents(pool, organization).await?;
     Ok(rows
         .into_iter()
@@ -731,11 +800,15 @@ pub async fn update_suite(
         max_regression_points: body.max_regression_points,
         blocking: body.blocking,
         schedule: body.schedule.map(|value| {
-            value.map(|inner| inner.trim().to_owned()).filter(|inner| !inner.is_empty())
+            value
+                .map(|inner| inner.trim().to_owned())
+                .filter(|inner| !inner.is_empty())
         }),
         judge_model_id: body.judge_model_id,
         judge_prompt: body.judge_prompt.map(|value| {
-            value.map(|inner| inner.trim().to_owned()).filter(|inner| !inner.is_empty())
+            value
+                .map(|inner| inner.trim().to_owned())
+                .filter(|inner| !inner.is_empty())
         }),
         enabled: body.enabled,
     };
@@ -806,7 +879,11 @@ pub async fn list_cases(
         .ok_or_else(|| AiHubError::EvalSuiteNotFound(key.clone()))?;
     let cases = eval_store::list_cases(pool, organization, suite.id).await?;
     Ok(Json(CaseList {
-        enabled_weight: cases.iter().filter(|case| case.enabled).map(|case| case.weight).sum(),
+        enabled_weight: cases
+            .iter()
+            .filter(|case| case.enabled)
+            .map(|case| case.weight)
+            .sum(),
         rubric_count: cases
             .iter()
             .filter(|case| case.enabled && case.expected.get("rubric").is_some())
@@ -887,13 +964,20 @@ pub async fn create_case(
         weight: body.weight,
         tags: body.tags,
         enabled: body.enabled,
-        source: if body.source == "import" { "manual".to_string() } else { body.source },
+        source: if body.source == "import" {
+            "manual".to_string()
+        } else {
+            body.source
+        },
         source_run_id: body.source_run_id,
     };
     let created = eval_store::create_case(pool, organization, suite.id, &case)
         .await
         .map_err(annotate)?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "case": created }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "case": created })),
+    ))
 }
 
 /// A bare string input becomes `{"prompt": …}`.
@@ -1087,7 +1171,10 @@ pub async fn import_cases(
         let row = match read_csv_row(&columns, &cells) {
             Ok(row) => row,
             Err(message) => {
-                problems.push(ImportProblem { line: line_number, message });
+                problems.push(ImportProblem {
+                    line: line_number,
+                    message,
+                });
                 continue;
             }
         };
@@ -1154,12 +1241,18 @@ fn read_csv_row(columns: &[String], cells: &[String]) -> std::result::Result<Csv
             .position(|name| wanted.contains(&name.as_str()))
             .and_then(|index| cells.get(index).cloned())
     };
-    let name = get(&["name", "case"]).unwrap_or_default().trim().to_string();
+    let name = get(&["name", "case"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if name.is_empty() {
         return Err("`name` is empty".to_string());
     }
     if name.chars().count() > 80 {
-        return Err(format!("`name` is longer than 80 characters ({} chars)", name.chars().count()));
+        return Err(format!(
+            "`name` is longer than 80 characters ({} chars)",
+            name.chars().count()
+        ));
     }
 
     let input = get(&["input", "prompt", "context"]).unwrap_or_default();
@@ -1230,7 +1323,14 @@ fn read_csv_row(columns: &[String], cells: &[String]) -> std::result::Result<Csv
         None => true,
     };
 
-    Ok(CsvRow { name, input, properties, weight, tags, enabled })
+    Ok(CsvRow {
+        name,
+        input,
+        properties,
+        weight,
+        tags,
+        enabled,
+    })
 }
 
 /// Turn a JSON property value into the string the store stores.
@@ -1370,13 +1470,19 @@ fn run_state(run: &eval_run::RunRow) -> (String, String) {
         ),
         "running" => (
             "running".to_string(),
-            format!("Scoring — {} of {} case results so far.", {
-                run.passed_cases + run.failed_cases + run.error_cases
-            }, run.total_cases),
+            format!(
+                "Scoring — {} of {} case results so far.",
+                { run.passed_cases + run.failed_cases + run.error_cases },
+                run.total_cases
+            ),
         ),
         "passed" => (
             "passed".to_string(),
-            format!("{:.1}% against a threshold of {}%.", run.pass_rate.unwrap_or(0.0), run.threshold_percent),
+            format!(
+                "{:.1}% against a threshold of {}%.",
+                run.pass_rate.unwrap_or(0.0),
+                run.threshold_percent
+            ),
         ),
         "failed" => (
             "failed".to_string(),
@@ -1485,7 +1591,9 @@ pub async fn start_run(
         Some(id) => Some(id),
         // No explicit baseline: the suite's own, when it has one. A gate that silently compared
         // against nothing would report a verdict from a single run and call it a comparison.
-        None => eval_run::get_baseline(pool, suite.id).await?.map(|row| row.run_id),
+        None => eval_run::get_baseline(pool, suite.id)
+            .await?
+            .map(|row| row.run_id),
     };
     if kind == "gate" && baseline.is_none() {
         return Err(ApiError::bad_request(
@@ -1511,7 +1619,9 @@ pub async fn start_run(
         suite.judge_prompt_version.into(),
         &tools,
         suite.temperature,
-        judge_model_key(pool, suite.judge_model_id).await?.as_deref(),
+        judge_model_key(pool, suite.judge_model_id)
+            .await?
+            .as_deref(),
         suite.judge_prompt.as_deref(),
         suite.judge_prompt_version.into(),
         current.user.id.into(),
@@ -1661,7 +1771,11 @@ pub async fn read_run(
     )
     .await?
     .into_iter()
-    .filter(|row| row.id != run.id && row.pass_rate.is_some() && !matches!(row.status.as_str(), "queued" | "running"))
+    .filter(|row| {
+        row.id != run.id
+            && row.pass_rate.is_some()
+            && !matches!(row.status.as_str(), "queued" | "running")
+    })
     .map(|row| RunOption {
         id: row.id,
         started_at: row.started_at,
@@ -1884,8 +1998,14 @@ pub async fn set_baseline(
         .await?
         .ok_or_else(|| AiHubError::EvalSuiteNotFound(key.clone()))?;
     Ok(Json(
-        eval_run::set_baseline(pool, organization, suite.id, body.run_id, Some(current.user.id))
-            .await?,
+        eval_run::set_baseline(
+            pool,
+            organization,
+            suite.id,
+            body.run_id,
+            Some(current.user.id),
+        )
+        .await?,
     ))
 }
 
@@ -1901,13 +2021,21 @@ mod tests {
 
     #[test]
     fn the_header_matches_columns_by_name_not_by_order() {
-        let columns: Vec<String> =
-            split_csv("Weight,Name,EXACT").iter().map(|name| name.trim().to_lowercase()).collect();
-        let row = read_csv_row(&columns, &["2.5".to_string(), "case one".to_string(), "hi".into()])
-            .expect("the row must parse");
+        let columns: Vec<String> = split_csv("Weight,Name,EXACT")
+            .iter()
+            .map(|name| name.trim().to_lowercase())
+            .collect();
+        let row = read_csv_row(
+            &columns,
+            &["2.5".to_string(), "case one".to_string(), "hi".into()],
+        )
+        .expect("the row must parse");
         assert_eq!(row.name, "case one");
         assert_eq!(row.weight, 2.5);
-        assert_eq!(row.properties, vec![("exact".to_string(), "hi".to_string())]);
+        assert_eq!(
+            row.properties,
+            vec![("exact".to_string(), "hi".to_string())]
+        );
     }
 
     #[test]
@@ -1915,7 +2043,10 @@ mod tests {
         let columns: Vec<String> = vec!["name".into(), "exact".into()];
         let error = read_csv_row(&columns, &["".to_string(), "hi".into()])
             .expect_err("an empty name must be refused");
-        assert!(error.contains("name"), "the refusal names the column: {error}");
+        assert!(
+            error.contains("name"),
+            "the refusal names the column: {error}"
+        );
     }
 
     #[test]
@@ -1928,9 +2059,18 @@ mod tests {
 
     #[test]
     fn the_field_a_refusal_names_is_the_field_the_form_marks() {
-        assert_eq!(field_for("`threshold_percent` must be between 1 and 100, got 0"), Some("threshold_percent"));
-        assert_eq!(field_for("`judge_model_id` must be a different model"), Some("judge_model_id"));
-        assert_eq!(field_for("`weight` must be between 0.1 and 10, got 20"), Some("weight"));
+        assert_eq!(
+            field_for("`threshold_percent` must be between 1 and 100, got 0"),
+            Some("threshold_percent")
+        );
+        assert_eq!(
+            field_for("`judge_model_id` must be a different model"),
+            Some("judge_model_id")
+        );
+        assert_eq!(
+            field_for("`weight` must be between 0.1 and 10, got 20"),
+            Some("weight")
+        );
         assert_eq!(field_for("the database is on fire"), None);
     }
 
@@ -1975,8 +2115,14 @@ mod tests {
     #[test]
     fn a_property_refusal_names_the_property_and_not_the_form() {
         // The two shapes the scorer actually writes, taken from `eval_case`'s own messages.
-        assert_eq!(field_for("expected `regex` entry is invalid: bad"), Some("regex"));
-        assert_eq!(field_for("expected `rubric` must not be blank"), Some("rubric"));
+        assert_eq!(
+            field_for("expected `regex` entry is invalid: bad"),
+            Some("regex")
+        );
+        assert_eq!(
+            field_for("expected `rubric` must not be blank"),
+            Some("rubric")
+        );
     }
 
     #[test]
@@ -1988,13 +2134,188 @@ mod tests {
                 "`{property}` is scorable but the case editor cannot ask for it"
             );
         }
-        assert_eq!(offered.len(), eval_case::PROPERTIES.len(), "no dead checkboxes");
+        assert_eq!(
+            offered.len(),
+            eval_case::PROPERTIES.len(),
+            "no dead checkboxes"
+        );
     }
 
     #[test]
     fn a_bare_string_input_and_a_json_input_store_the_same_way() {
-        assert_eq!(normalize_input(Value::String("hi".into())), serde_json::json!({"prompt": "hi"}));
-        assert_eq!(normalize_input(Value::Null), serde_json::json!({"prompt": ""}));
-        assert_eq!(normalize_input(serde_json::json!({"prompt": "hi"})), serde_json::json!({"prompt": "hi"}));
+        assert_eq!(
+            normalize_input(Value::String("hi".into())),
+            serde_json::json!({"prompt": "hi"})
+        );
+        assert_eq!(
+            normalize_input(Value::Null),
+            serde_json::json!({"prompt": ""})
+        );
+        assert_eq!(
+            normalize_input(serde_json::json!({"prompt": "hi"})),
+            serde_json::json!({"prompt": "hi"})
+        );
     }
+}
+
+// -------------------------------------------------------------------------------------------
+// Tool telemetry (REQ-107 slice 4)
+// -------------------------------------------------------------------------------------------
+
+/// `GET /ai/telemetry/tools` query.
+#[derive(Debug, Default, Deserialize)]
+pub struct TelemetryQuery {
+    /// Inclusive first day. Defaults to 30 days back.
+    pub from: Option<Date>,
+    /// Inclusive last day. Defaults to today.
+    pub to: Option<Date>,
+    /// One tool's row.
+    pub tool: Option<String>,
+    /// Restrict to the tools that failed at least once.
+    pub failing: Option<bool>,
+}
+
+/// One tool's row on the telemetry screen.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolTelemetryRow {
+    /// Everything the store aggregated for the window.
+    #[serde(flatten)]
+    pub aggregate: ToolAggregate,
+    /// Share of calls that succeeded, or `None` when the tool was never called.
+    pub success_percent: Option<f64>,
+    /// Share of calls the platform refused, or `None` when the tool was never called.
+    pub denial_percent: Option<f64>,
+}
+
+/// The tool-telemetry screen's payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolTelemetry {
+    /// The window the numbers cover, echoed so the screen can label the range it is showing.
+    pub from: Date,
+    pub to: Date,
+    /// The days in the window, so "3 of 30 days" is computable without a second query.
+    pub days: i64,
+    /// Whether there is nothing at all, so the screen can show its empty state.
+    pub is_empty: bool,
+    /// The headline numbers.
+    pub totals: TelemetryTotals,
+    /// The rows, busiest first.
+    pub tools: Vec<ToolTelemetryRow>,
+    /// The most expensive failing tool per day — the table under the scatter.
+    pub costliest_failing: Vec<CostliestFailing>,
+}
+
+/// The window's headline numbers.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TelemetryTotals {
+    pub calls: i64,
+    pub successes: i64,
+    pub failures: i64,
+    pub denials: i64,
+    pub cost_micros: i64,
+}
+
+/// One day's costliest failing tool.
+#[derive(Debug, Clone, Serialize)]
+pub struct CostliestFailing {
+    pub day: Date,
+    pub tool: String,
+    pub failures: i32,
+    pub cost_micros: i64,
+}
+
+/// `GET /ai/telemetry/tools` — per-tool success, denial and latency stats for a window.
+///
+/// **The window is clamped, and the clamp is the honest part.** An operator asking for a year of
+/// telemetry on a roll-up that is written daily is asking for at most 366 rows per tool, so a
+/// wide range is cheap — but a range of `1970` is not a window, it is a scan of everything the
+/// table holds. Both ends are therefore clamped to `[today - 366, today]` and the *clamped*
+/// window is echoed back in the response, so a screen that asked for too much shows the range it
+/// actually got rather than silently reporting less than it displayed.
+///
+/// An inverted range (`from > to`) is **swapped rather than refused**: the store answers an empty
+/// window, and "no telemetry" is a worse reading of a mistyped picker than "the range you meant".
+pub async fn tool_telemetry(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Query(query): Query<TelemetryQuery>,
+) -> Result<Json<ToolTelemetry>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    let pool = state.db().pool();
+
+    let today = OffsetDateTime::now_utc().date();
+    // A year is the widest window the daily roll-up can answer honestly: the table keeps one row
+    // per `(day, organization, tool)`, so beyond a year the window is adding noise, not history.
+    let earliest = today - Duration::days(365);
+    let mut to = query.to.unwrap_or(today).clamp(earliest, today);
+    let mut from = query
+        .from
+        .unwrap_or(to - Duration::days(29))
+        .clamp(earliest, to);
+
+    // `from` was clamped against the *unclamped* `to`; a picker that sent both out of order needs
+    // the swap after the clamp, or `from` can still sit above `to`.
+    if from > to {
+        std::mem::swap(&mut from, &mut to);
+    }
+
+    let window = tool_stats::Window { from, to };
+    let mut tools = tool_stats::tools_in_window(pool, organization, window).await?;
+
+    if let Some(only) = query
+        .tool
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        tools.retain(|row| row.tool == only);
+    }
+    if query.failing == Some(true) {
+        tools.retain(|row| row.failures > 0);
+    }
+
+    let totals = TelemetryTotals {
+        calls: tools.iter().map(|row| row.calls).sum(),
+        successes: tools.iter().map(|row| row.successes).sum(),
+        failures: tools.iter().map(|row| row.failures).sum(),
+        denials: tools.iter().map(|row| row.denials).sum(),
+        cost_micros: tools.iter().map(|row| row.cost_micros).sum(),
+    };
+    let is_empty = tools.is_empty();
+
+    let rows = tools
+        .into_iter()
+        .map(|aggregate| {
+            let success_percent = aggregate.success_percent();
+            let denial_percent = aggregate.denial_percent();
+            ToolTelemetryRow {
+                aggregate,
+                success_percent,
+                denial_percent,
+            }
+        })
+        .collect();
+
+    let costliest_failing = tool_stats::costliest_failing_per_day(pool, organization, window)
+        .await?
+        .into_iter()
+        .map(|(day, tool, failures, cost_micros)| CostliestFailing {
+            day,
+            tool,
+            failures,
+            cost_micros,
+        })
+        .collect();
+
+    Ok(Json(ToolTelemetry {
+        from,
+        to,
+        // Inclusive of both ends, so a one-day window is 1 and never 0.
+        days: (to - from).whole_days() + 1,
+        is_empty,
+        totals,
+        tools: rows,
+        costliest_failing,
+    }))
 }

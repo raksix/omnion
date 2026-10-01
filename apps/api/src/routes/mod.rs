@@ -72,8 +72,8 @@
 pub mod ai;
 pub mod ai_agent_workspace;
 pub mod ai_agents;
-pub mod ai_approvals;
 pub mod ai_airgap;
+pub mod ai_approvals;
 pub mod ai_change_sets;
 pub mod ai_decisions;
 pub mod ai_evals;
@@ -923,8 +923,8 @@ pub fn router(state: AppState) -> Router {
         get(ai_local::read_doctor).layer(guards::require(&state, "ai.local.read"));
     let ai_local_doctor_run =
         post(ai_local::run_doctor).layer(guards::require(&state, "ai.local.manage"));
-    let ai_local_doctor_one = post(ai_local::rerun_doctor_check)
-        .layer(guards::require(&state, "ai.local.manage"));
+    let ai_local_doctor_one =
+        post(ai_local::rerun_doctor_check).layer(guards::require(&state, "ai.local.manage"));
 
     // The air-gap switch (REQ-106 slice 2). Reading it is `ai.local.read` — it answers the same
     // question the local screen does ("does anything leave this machine?"), so anyone who may
@@ -934,13 +934,11 @@ pub fn router(state: AppState) -> Router {
     // name. The `/hosts` editor is on the same key, because widening the allow-list is another
     // way to decide what counts as internal.
     let ai_airgap_read = get(ai_airgap::read).layer(guards::require(&state, "ai.local.read"));
-    let ai_airgap_manage =
-        put(ai_airgap::set).layer(guards::require(&state, "ai.airgap.manage"));
-    let ai_airgap_hosts = post(ai_airgap::add_host)
+    let ai_airgap_manage = put(ai_airgap::set).layer(guards::require(&state, "ai.airgap.manage"));
+    let ai_airgap_hosts =
+        post(ai_airgap::add_host).layer(guards::require(&state, "ai.airgap.manage"));
+    let ai_airgap_host_delete = axum::routing::delete(ai_airgap::remove_host)
         .layer(guards::require(&state, "ai.airgap.manage"));
-    let ai_airgap_host_delete =
-        axum::routing::delete(ai_airgap::remove_host)
-            .layer(guards::require(&state, "ai.airgap.manage"));
     let ai_airgap_verify =
         post(ai_airgap::verify).layer(guards::require(&state, "ai.airgap.manage"));
 
@@ -948,11 +946,13 @@ pub fn router(state: AppState) -> Router {
     // `read`, `manage` and — for slice 2's runner — `run`. `manage` and `run` are deliberately
     // different keys so the person who may weaken the ruler is not the person who presses it.
     //
-    // `ai.evals.run` and `ai.telemetry.read` are catalogued but NOT mounted yet, and that is the
-    // honest state: no route below is guarded by either, because the runner is slice 2 and the
-    // telemetry screen is slice 4. A guard key with nothing behind it is a promise the platform
-    // cannot keep, so they are declared in the catalogue now (where an installation can already
-    // grant them) and left unmounted until the route that uses them exists.
+    // `ai.telemetry.read` now has a route behind it (slice 4's tool telemetry, below). A guard
+    // key with nothing behind it is a promise the platform cannot keep, so each key is mounted in
+    // the same slice that gives it a handler — and the comment that used to say "not mounted yet"
+    // is the reason a reader can trust the catalogue: every key in it either guards a route here
+    // or says why it cannot yet.
+    let ai_telemetry_tools =
+        get(ai_evals::tool_telemetry).layer(guards::require(&state, "ai.telemetry.read"));
     let ai_evals_suites_read =
         get(ai_evals::list_suites).layer(guards::require(&state, "ai.evals.read"));
     let ai_evals_suites_create =
@@ -977,11 +977,14 @@ pub fn router(state: AppState) -> Router {
     // inference tokens, so `ai.evals.run` is separate from `ai.evals.read` — an audience that
     // may read results is not automatically an audience that may cause them. Setting a baseline
     // is likewise a write: it is the yardstick every later regression is measured against.
-    let ai_evals_runs_read = get(ai_evals::list_runs).layer(guards::require(&state, "ai.evals.read"));
-    let ai_evals_run_start = post(ai_evals::start_run).layer(guards::require(&state, "ai.evals.run"));
+    let ai_evals_runs_read =
+        get(ai_evals::list_runs).layer(guards::require(&state, "ai.evals.read"));
+    let ai_evals_run_start =
+        post(ai_evals::start_run).layer(guards::require(&state, "ai.evals.run"));
     let ai_evals_run_read = get(ai_evals::read_run).layer(guards::require(&state, "ai.evals.read"));
     let ai_evals_run_diff = get(ai_evals::diff_run).layer(guards::require(&state, "ai.evals.read"));
-    let ai_evals_run_cancel = post(ai_evals::cancel_run).layer(guards::require(&state, "ai.evals.run"));
+    let ai_evals_run_cancel =
+        post(ai_evals::cancel_run).layer(guards::require(&state, "ai.evals.run"));
     let ai_evals_baseline =
         post(ai_evals::set_baseline).layer(guards::require(&state, "ai.evals.manage"));
 
@@ -2223,19 +2226,29 @@ pub fn router(state: AppState) -> Router {
         // and slice 4 and are deliberately absent: a route that 404s is honest, where a route
         // that returns "queued" without a runner behind it would be a lie the panel could not
         // detect.
-        .route("/ai/evals/suites", ai_evals_suites_read.merge(ai_evals_suites_create))
+        .route(
+            "/ai/evals/suites",
+            ai_evals_suites_read.merge(ai_evals_suites_create),
+        )
         .route(
             "/ai/evals/suites/{key}",
             ai_evals_suite_read
                 .merge(ai_evals_suite_write)
                 .merge(ai_evals_suite_delete),
         )
-        .route("/ai/evals/suites/{key}/cases", ai_evals_cases_read.merge(ai_evals_cases_create))
+        .route(
+            "/ai/evals/suites/{key}/cases",
+            ai_evals_cases_read.merge(ai_evals_cases_create),
+        )
         .route("/ai/evals/suites/{key}/import", ai_evals_import)
         .route(
             "/ai/evals/cases/{id}",
             ai_evals_case_write.merge(ai_evals_case_delete),
         )
+        // The tool telemetry (REQ-107 slice 4). Sibling of `/evals`, not a child of it: the
+        // roll-up summarises `ai_tool_calls`, which spans every agent and copilot — a suite that
+        // never evaluated anything still has tools being called all day.
+        .route("/ai/telemetry/tools", ai_telemetry_tools)
         // The run history. `/runs` is a sibling of `/suites` rather than a child because a run
         // is read across suites — "did anything regress today" is not a per-suite question.
         .route("/ai/evals/runs", ai_evals_runs_read)
