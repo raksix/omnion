@@ -7216,3 +7216,85 @@ The screen-states box stays open, and REQ-010 stays open.
 it should now be `ok: true` with the pair steps present. Then REQ-010's last open code item, the
 CDN purge hook to REQ-011 (the `media.version_created` emitter it subscribes to shipped in slice 2;
 REQ-011 itself is a wave-5 REQ and out of my waves, so this stays a note).
+
+
+## 2026-10-01 · tick 101 · REQ-010 — the five filters the store had and the toolbar did not
+
+**What.** The acceptance box for the browser listing carried, in its own words, that *"size,
+uploader and date-range filters are in the API and the store but not yet on the toolbar"*. That
+was true of `min_bytes`, `max_bytes`, `uploaded_by`, `created_after`, `created_before` **and**
+`tag` — six filters implemented in `ListQuery::filters` with SQL clauses, accepted by
+`FileQuery`, and reachable only by hand-editing a URL. Nothing was broken: the enum compiled, the
+unit tests asserted the statements, the API answered, the columns existed, the walk passed. The
+panel simply could not say any of it.
+
+The class is tick 100's, one module over: a value **handled** on one side of a boundary and
+**offered** on the other. `cargo` cannot see the toolbar; `tsc` cannot see the filter list; the
+browser pass only finds it if somebody opens the filter bar. A half-wired feature is invisible to
+every instrument in the repository.
+
+**Also fixed, found while writing the controls:** `text-danger` / `border-danger` are used by
+`scanning-view.tsx` and defined **nowhere** in `globals.css` — the theme's palette is
+`canvas/surface/ink/muted/line/accent/accent-strong/accent-soft/positive/caution/quiet-soft`. Those
+messages were rendering in the inherited colour. My own first draft of the new controls used them
+too; the new gate caught it on the second read.
+
+**Decisions worth keeping.**
+
+* **The uploader list comes from the library, not from IAM.** `GET /api/v1/iam/users` is guarded by
+  `users.read`. A media operator holds `media.read` and five media keys, not that one — so a
+  toolbar sourced from IAM renders its filter behind a `403` for precisely the people who run the
+  library: a control that is present, enabled and always empty. `list_uploaders` groups the
+  library's own `created_by` and left-joins `users`, so a row whose account has been deleted still
+  appears (its files are still there) and `display_name` falls back to the address, because the
+  column is `not null default ''` and an empty dropdown label is worse than an email.
+* **A contradictory range is refused by name.** `min_bytes` above `max_bytes` is two adjacent
+  boxes an operator can type into disagreement. PostgreSQL answers zero rows; the panel renders
+  zero rows as *"no files match these filters"* — a claim about the library, printed for a form
+  that disagrees with itself. `MediaError::InvalidFilter { field, reason }` → `400 invalid_filter`
+  with `details.field`, and the toolbar puts the sentence under that input. A one-sided range and
+  a negative size stay legal, because "at most 1 MB" and "from 0 bytes" are both filters somebody
+  means.
+* **The date window is drawn in the browser.** `new Date("2026-10-03")` on a server is midnight
+  **UTC**, so a server-side expansion of a date filter shifts the window by the server's offset
+  from the operator's and a file uploaded at 23:00 becomes invisible. `mediaQuery` expands it
+  client-side, and `created_before` is the start of the **following** day, because the store's
+  clause is `created_at <` — sending the start of the picked day would empty the window's last
+  day silently.
+
+**Two PostgreSQL traps, found by the walk rather than by reading.** `list_uploaders` answered
+`500: column "label" does not exist` and stayed that way through the first fix, because **two**
+rules were in play: an output alias is visible to `order by` only when it is the *whole*
+expression (wrap it in `lower(...)` and the lookup falls through to the input columns), and
+`group by` never sees an alias at all. The fixes are not symmetric — the group is positional
+(`group by 1, 2`, which also keeps two accounts sharing a display name as two rows instead of
+collapsing their counts), and the order repeats the `coalesce` expression, because the positional
+escape for *that* is `lower(2)`, which is `lower(integer)` and whose hint names a missing function
+rather than a missing column.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **248 passed** (243 → 248) |
+| api | `cargo test -p omnion-api --lib --quiet` | **284 passed** |
+| walk | `cargo test -p omnion-api --test media` | +2 walks over the real router, live PostgreSQL |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| syntax | `node --check scripts/qa/walkthrough.cjs` | clean |
+| contract | `node scripts/qa/probe-helper-contract.cjs` | 15/15 |
+| **wiring** | `node scripts/qa/probe-media-filter-wiring.cjs` | **36/36**, proven to fail **34/36** and **35/36** |
+
+**Browser pass: not run.** The slot is held live by `w3` (`pid 2044970`, `cwd=/mnt/apopic/omnion-w3`),
+25 Chrome, load 7.8. The walkthrough gained the new controls as steps
+(`media-filter-controls`, `media-range-refusal`, `media-filters-cleared`, `media-uploader-filter`)
+so a free slot measures them on the next pass; the screen-states box stays open.
+
+**Disk, for whoever runs next:** `/mnt/apopic` is at **98 % (1.3 G free)**. `omnion-w2-target`
+(6.0 G) has **11 live processes** and `w8build` (3.7 G) is referenced by the `omnion-w8` cron job
+which ran ok six minutes before this check — **neither is reclaimable**, and the disk guard's globs
+(`omnion*/target`, `/dev/shm/*-target`) do not match either name, so it will not rescue them
+either. Only 220 M was reclaimable inside my own worktree. A `CARGO_TARGET_DIR` under `/dev/shm`
+is the lever that actually works.
+
+**Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps
+out of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
