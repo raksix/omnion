@@ -38,7 +38,7 @@ pub mod versions;
 pub use browser::{
     FilePage, ListQuery, MetadataPatch, Sort, TrashEntry, Uploader, assert_same_site, count_files,
     count_in_folder, files_in_folder, find_file, find_file_any_state, list_files, list_trash,
-    list_uploaders, purge_files, restore_files, storage_keys, trash_files, trash_summary,
+    list_uploaders, owned_object_keys, purge_files, restore_files, trash_files, trash_summary,
     trashed_ids, update_file,
 };
 pub use duplicates::{
@@ -67,9 +67,9 @@ pub use model::{MAX_FILENAME_LENGTH, MAX_UPLOAD_BYTES, Media, MediaFile, NewMedi
 pub use pixels::{Box2, Transformed, apply, decode, target_box, transform_bytes};
 pub use preset_store::{
     NewDerivative, STANDARD_PRESET, Served, clear_derivatives, create_preset, delete_preset,
-    derivative_filename, derivative_keys, derivative_totals, ensure_default_presets,
-    find_derivative, find_preset, find_preset_by_name, insert_derivative, list_derivatives,
-    list_presets, require_preset, require_preset_by_id, served_for, update_preset,
+    derivative_filename, derivative_totals, ensure_default_presets, find_derivative, find_preset,
+    find_preset_by_name, insert_derivative, list_derivatives, list_presets, require_preset,
+    require_preset_by_id, served_for, update_preset,
 };
 pub use probe::{HEADER_BYTES, MediaProbe, probe};
 pub use ranges::{ByteWindow, RangePlan};
