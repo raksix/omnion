@@ -6724,3 +6724,77 @@ desktop and the mobile pass, and which will be visited the first time the box is
 
 **Next.** The browser pass owed for slices 1–4, then slice 4's remaining two thirds: the
 security-event view over the audit trail and the secret-inventory projection.
+
+## Tick 95 — the secret inventory, and the box that could have leaked a credential
+
+**REQ-012 slice 4, third piece.** Two ships this tick: the security-event view (finished by the
+previous tick and committed here) and the secret inventory, which is the REQ's one
+**release-blocker** box.
+
+**What shipped.** `crates/security/src/{secrets,secrets_store}.rs`, `GET /security/secrets`
+(read-only, `security.read`), `features/security/security-secrets.tsx`, the tab, the walkthrough
+entry. Plus the events view's four commits, which the previous tick left uncommitted in the tree.
+
+**The requirement reads as a request for a secrets table, and there is no secrets table.** This is
+a projection over references, and its entire value is being the one screen in the security centre
+from which no secret can be read. So the guarantee is structural rather than a comment:
+
+- `SecretRef` has no `value`/`ciphertext`/`hash`/`preview` field — adding one would make the
+  struct able to carry a credential, and that ability *is* the risk.
+- There is **no `healthy` state and no `present` one**. The platform can see that a reference
+  exists and can read nothing about the value behind it. The first draft carried a `Present`
+  variant no row produced, which would have let a future contributor render "present = fine"; it
+  was removed and the test rewritten to pin the whole vocabulary.
+- The store selects explicit columns, **never `*`** — `*` re-reads a source's schema, so a source
+  gaining a value column upstream would start appearing in a security screen with no code change
+  here. The three sources holding material are read as **counts**.
+
+**Proof (commands and results).**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-security --quiet` | **208 passed**, 0 failed (18 new) |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **9/10**, the 10th a `dispose()` teardown flake (`UnexpectedEof`) that passes in isolation — a harness fault, not an assertion |
+| types | `pnpm typecheck` | **0 errors** (admin + web) |
+
+The containment walk is `no_secret_value_reaches_the_inventory_response`. It **probes the values,
+not the column names** — a name scan would pass an aliased column or a value inlined into a note,
+while a literal scan only fails when the actual leak happens. It seeds a webhook secret, a
+service-account hash and a TOTP ciphertext into a live database and asserts all three literals are
+absent from the response **while the reference name is present**. The positives matter as much: an
+empty body satisfies every containment check in the test while showing an operator a blank screen.
+
+**Three defects this tick, and the two that were not the code.**
+
+1. **A real one, found by the walk on its first run:** `column reference "expires_at" is
+   ambiguous` — `service_account_keys` and `service_accounts` both carry that column. The query
+   read correctly in review and answered `500` on *every* inventory load. **The tenth instance of
+   this REQ's defect class**, and the argument for why a walk drives the router rather than reading
+   the SQL.
+2. **A harness fault, twice:** the walk built its own `Bearer` header when the test credential is a
+   packed `session\x1fcsrf` pair, so the request failed at header parsing instead of at the route
+   — which reads as a product defect and is not one. `the_inventory_cannot_be_written_through`
+   now goes through the shared `request()` helper.
+3. **The blocker was the linker, not the code.** The first run died in `collect2` with
+   `ld terminated with signal 7 [Bus error]`. `/mnt/apopic` was at **100% (193 MiB free)** with
+   load 13–27 and 30/32 GiB RAM used. Reclaiming **only this worktree's** `target/debug/incremental`
+   (795 MiB) and then grouping `target/debug/deps` by `lib<crate>-<16 hex>` and keeping only the
+   newest of each (835 stale artifacts, 2 691 MiB) returned the disk to 95% and the suite to
+   green in one run. **Rule worth keeping: a linker bus error on this box is a disk symptom until
+   proven otherwise, and the reclaim must be scoped by `readlink /proc/<pid>/cwd`** — a sibling
+   writer had live cargo in `omnion-w6`.
+
+**One decision worth carrying forward.** `unverifiable` is rendered **neutral**, not amber.
+Almost every row on this screen is unverifiable, because that is the honest state for almost every
+secret; painting it amber would paint the whole screen amber and train the operator to ignore the
+tone. Only `missing` and `expired` are coloured, because only those are actionable.
+
+**Browser pass: still owed, and it is now a standing risk rather than bad luck.** Two consecutive
+ticks recorded a deferral for the same reason. This tick the slot was held by `w4`
+(`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd`, not
+by the age of the placeholder), load 12.9, 45 Chrome processes. **Six screen boxes in this REQ now
+turn on a pass that has not run**, and the definition of done forbids closing a REQ on tests alone.
+
+**Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
+a free slot.
