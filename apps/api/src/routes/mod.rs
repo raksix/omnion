@@ -1056,6 +1056,11 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "ai.approvals.act"));
     let ai_change_set_discard = post(ai_change_sets::discard)
         .layer(guards::require(&state, "ai.approvals.act"));
+    // The apply is the only route here that writes content, so it is the second `act` one and
+    // carries the same guard the confirm does: a viewer may *ask* for a set and *see* it, and
+    // a person with the permission is the only one who can make it happen.
+    let ai_change_set_apply = post(ai_change_sets::apply)
+        .layer(guards::require(&state, "ai.approvals.act"));
 
     let ai_runs = get(ai_agents::list_runs_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run = get(ai_agents::get_run_route).layer(guards::require(&state, "ai.agents.read"));
@@ -2011,6 +2016,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/change-sets/{id}", ai_change_set_update)
         .route("/ai/change-sets/{id}/confirm", ai_change_set_confirm)
         .route("/ai/change-sets/{id}/discard", ai_change_set_discard)
+        .route("/ai/change-sets/{id}/apply", ai_change_set_apply)
         .route("/ai/agents/{id}/tools", ai_agent_tool_set)
         .route("/ai/agents/{id}/skills", ai_agent_skills)
         .route("/ai/agents/{id}/skills/{key}", ai_agent_skill)

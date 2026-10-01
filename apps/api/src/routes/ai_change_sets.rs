@@ -247,8 +247,9 @@ pub async fn update(
     }
 
     let sql = format!(
-        "update ai_change_sets set title = $3, operations = $4, base_revisions = $5, updated_at = now() \
-         where id = $1 and organization_id = $2 and status = $6 returning {}",
+        "update ai_change_sets set title = $3, operations = $4, base_revisions = $5, \
+         updated_by = $6, updated_at = now() \
+         where id = $1 and organization_id = $2 and status = $7 returning {}",
         change_sets::CHANGE_SET_COLUMNS
     );
     let operations: Vec<ChangeOp> = body.operations.clone();
@@ -262,6 +263,7 @@ pub async fn update(
         .bind(body.title.trim())
         .bind(serde_json::to_value(&operations).unwrap_or_default())
         .bind(serde_json::to_value(&body.base_revisions).unwrap_or_default())
+        .bind(actor)
         .bind(&existing.status)
         .fetch_optional(state.db().pool())
         .await
@@ -477,6 +479,260 @@ pub async fn discard(
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiscardBody {
     pub reason: String,
+}
+
+/// `POST /ai/change-sets/{id}/apply` — run a confirmed set, all of it or none of it.
+///
+/// This is the route slice 3a left as a seam: the store opens the transaction and hands the
+/// applier the same `&mut PgConnection`, so the writes below go **through** it rather than
+/// beside it. An applier that took `&PgPool` — which is what
+/// `content::pages::update_page` takes — would commit operation 1 on its way to operation 3,
+/// and the refusal at 3 would leave two pages rewritten by a set the reviewer was told was
+/// all-or-nothing. `update_page_in` is the same writer on a connection it does not own, so
+/// there is still exactly one implementation of "append the next revision".
+///
+/// The order on a refusal is the whole point of the route: roll back, **then** record. A
+/// `failed` row written inside the transaction that just failed is the record that vanishes,
+/// and the person who has to re-do the work would be looking at a set that still reads
+/// `confirmed` — indistinguishable from one that is about to apply.
+///
+/// # Errors
+///
+/// `409 change_set_failed` naming the operation, after the set has been rolled back and
+/// marked `failed`. `409 not_confirmable` when the set is not `confirmed` at all.
+pub async fn apply(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<AppliedSet>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    let actor = current.user.id;
+
+    // The set is read once here so the refusal message can name the operation by key, and the
+    // store re-reads it **inside** the transaction. Two reads of the same row is not a race: the
+    // store's read is the one that decides, and this one only supplies the sentence.
+    let known = change_sets::store::read(state.db().pool(), organization, id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "change_set_not_found",
+                format!("no change set `{id}` in this organization"),
+            )
+        })?;
+    if known.status != "confirmed" {
+        return Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "not_confirmable",
+            format!(
+                "this change set is `{}`; only a confirmed set can be applied",
+                known.status
+            ),
+        ));
+    }
+
+    let applied = change_sets::store::apply_confirmed(
+        state.db().pool(),
+        organization,
+        id,
+        move |set, connection| Box::pin(apply_operations(set, connection, actor)),
+    )
+    .await;
+
+    let applied = match applied {
+        Ok(applied) => applied,
+        Err(err) => {
+            // Rolled back already: `apply_confirmed` owns the transaction. What is left is to
+            // make the refusal visible to whoever has to fix it.
+            let reason = err.to_string();
+            let recorded =
+                change_sets::store::mark_failed(state.db().pool(), organization, id, &reason)
+                    .await
+                    .map_err(ApiError::from)?;
+
+            bus::emit(
+                state.db().pool(),
+                NewEvent::new("ai.changeset.failed")
+                    .organization(organization)
+                    .actor(actor)
+                    .payload(serde_json::json!({
+                        "change_set_id": id,
+                        "reason": reason,
+                    })),
+            )
+            .await?;
+
+            // Only `422` when the row is still ours to annotate. `Ok(false)` means a competing
+            // discard won the race and the row already says why it stopped — a second, different
+            // reason on the same record would be a worse answer than a conflict.
+            let code = if recorded {
+                "change_set_failed"
+            } else {
+                "not_confirmable"
+            };
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                code,
+                reason,
+            ));
+        }
+    };
+
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("ai.changeset.applied")
+            .organization(organization)
+            .actor(actor)
+            .payload(serde_json::json!({
+                "change_set_id": id,
+                "operations": applied.len(),
+            })),
+    )
+    .await?;
+
+    Ok(Json(AppliedSet {
+        applied: true,
+        set: change_sets::store::read(state.db().pool(), organization, id)
+            .await
+            .map_err(ApiError::from)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    axum::http::StatusCode::NOT_FOUND,
+                    "change_set_not_found",
+                    format!("no change set `{id}` in this organization"),
+                )
+            })?,
+        operations: applied,
+    }))
+}
+
+/// Apply one set's operations, in order, on the caller's connection.
+///
+/// The applier lives here and not in `change_sets` because it calls the **content crate**,
+/// which the AI hub deliberately does not depend on: the dependency runs the other way, or the
+/// content layer would not be usable without the AI hub. A route is a module of the binary, so
+/// a walk cannot call this function — which is what the `OperationExecutor` trait on the store
+/// is for. The walk supplies an executor that writes real pages through
+/// `content::pages::update_page_in` and drives `apply_all`, so the loop, the transaction and
+/// the writer are all exercised without a second copy of this function.
+///
+/// Each operation is re-planned against the target **as it is inside the transaction**, by the
+/// same `preview_on` the single-call approval path uses. That is what makes "a change set can
+/// never apply something an approval would have refused" structural rather than a promise.
+async fn apply_operations(
+    set: &ChangeSet,
+    connection: &mut sqlx::PgConnection,
+    editor: uuid::Uuid,
+) -> Result<Vec<AppliedOp>, omnion_ai_hub::error::AiHubError> {
+    // The loop is the store's `apply_all_with`, not a copy of it, and that is a correction
+    // rather than a style choice. This file used to annotate only its own **write**, so a
+    // refusal from the preview — a page deleted between proposal and apply — reached the
+    // reviewer as "`page` a0d4… does not exist": a uuid out of a set whose operations all carry
+    // keys, and the acceptance criterion asks for the failing operation. A walk against a real
+    // database is what surfaced it, because only a real database can make the second operation
+    // fail in the preview rather than in the writer.
+    struct PageApplier<'a> {
+        connection: &'a mut sqlx::PgConnection,
+        editor: uuid::Uuid,
+    }
+
+    impl change_sets::AsyncOperationExecutor for PageApplier<'_> {
+        fn execute<'a>(
+            &'a mut self,
+            op: &'a ChangeOp,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<AppliedOp, omnion_ai_hub::error::AiHubError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(apply_one(op, self.connection, self.editor))
+        }
+    }
+
+    let mut applier = PageApplier { connection, editor };
+    change_sets::apply_all_with(&set.operations, &mut applier).await
+}
+
+/// One operation, through the same plan → change → writer chain the approval apply uses.
+///
+/// `preview_on` is the *same function* the single-call approval path previews with, run on
+/// the applier's connection: the diff this writes is computed from the state inside the
+/// transaction, by the module that decides what a page write means. There is no second
+/// interpretation of the operation's arguments here to drift from the reviewer's diff.
+async fn apply_one(
+    op: &ChangeOp,
+    connection: &mut sqlx::PgConnection,
+    editor: uuid::Uuid,
+) -> Result<AppliedOp, omnion_ai_hub::error::AiHubError> {
+    let mapping = omnion_ai_hub::approvals::target::mapping_for(&op.operation.resource_type)?;
+    let plan =
+        omnion_ai_hub::approvals::target::preview_on(&mut *connection, mapping, &op.operation)
+            .await?;
+    let change = omnion_ai_hub::approvals::target::changes_for(&plan)?;
+
+    if change.is_empty() {
+        // A no-op apply would otherwise report success for an operation that wrote nothing.
+        // `plan` already refuses an operation that changes no field, so reaching this means
+        // the writer cannot express what the plan describes — which is a refusal, not a
+        // silently skipped write.
+        return Err(omnion_ai_hub::error::AiHubError::InvalidChangeSet(format!(
+            "operation `{}` previews a change this build cannot write",
+            op.key
+        )));
+    }
+
+    let page_id: uuid::Uuid = op.operation.resource_id.parse().map_err(|_| {
+        omnion_ai_hub::error::AiHubError::InvalidChangeSet(format!(
+            "operation `{}` targets `{}`, which is not a page id",
+            op.key, op.operation.resource_id
+        ))
+    })?;
+    let page = omnion_content::pages::update_page_in(
+        connection,
+        page_id,
+        &omnion_content::model::PageChanges {
+            slug: change.slug,
+            title: change.title,
+            body: change.body,
+            summary: change.summary,
+        },
+        Some(editor),
+    )
+    .await
+    .map_err(|err| {
+        // The page id belongs in the message: the key names a row of the reviewer's list and
+        // the id names the thing that refused. `annotate` adds the key around the whole
+        // pipeline, so this layer only adds what only it knows.
+        omnion_ai_hub::error::AiHubError::InvalidChangeSet(format!(
+            "page {page_id} could not be written: {err}"
+        ))
+    })?;
+
+    Ok(AppliedOp {
+        key: op.key.clone(),
+        kind: op.operation.kind,
+        resource_id: op.operation.resource_id.clone(),
+        slug: page.slug,
+        status: page.status,
+    })
+}
+
+/// What an apply answers.
+///
+/// The row is re-read rather than derived: the screen cannot then render a status the store
+/// did not commit.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppliedSet {
+    pub applied: bool,
+    #[serde(flatten)]
+    pub set: ChangeSet,
+    /// One row per operation, in the order they were applied.
+    pub operations: Vec<AppliedOp>,
 }
 
 /// `GET /ai/change-sets` — the proposed sets, newest first.
