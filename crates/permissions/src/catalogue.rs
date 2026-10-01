@@ -230,6 +230,37 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "deployment",
         description: "Generate an environment bundle and render what it produces",
     },
+    // REQ-129 adds three, and the split is the request's own: reading the ledger is `read`,
+    // CHANGING THE SCHEMA is not a deployment power, and rehearsing a reversal is neither of
+    // those two.
+    //
+    // * `migrations.read` — the ledger, one migration's SQL, the policy and the lint findings.
+    //   Metadata only: every field on those routes is derived from files and rows this
+    //   installation already has, so a viewer who may read deployments may read them too.
+    // * `migrations.apply` — runs DDL. Deliberately NOT `deployment.deploy`: an operator who may
+    //   ship a release is not thereby authorised to write the schema, and a key that means both
+    //   cannot answer "who changed the database?" after an incident. It IS narrower than
+    //   `deployment.rollback`, which only selects a previous image.
+    // * `migrations.verify` — rehearses a reversal against a scratch database and writes the one
+    //   column (`down_verified_at`) that makes a release claim its database can be rolled back.
+    //   Its own key because it is the one write in this family that LAUNCHES SQL, and because
+    //   separating it means "who approved the rollback path" is a distinct question from "who
+    //   applied the migration".
+    PermissionDef {
+        key: "deployment.migrations.read",
+        category: "deployment",
+        description: "Read the migration ledger, one migration's SQL, the policy and lint findings",
+    },
+    PermissionDef {
+        key: "deployment.migrations.apply",
+        category: "deployment",
+        description: "Apply pending schema migrations and save the migration policy",
+    },
+    PermissionDef {
+        key: "deployment.migrations.verify",
+        category: "deployment",
+        description: "Rehearse a migration reversal against a scratch database",
+    },
     // Identity and access management.
     PermissionDef {
         key: "iam.permissions.read",
@@ -815,6 +846,60 @@ mod tests {
         assert_ne!(
             "deployment.bundle.generate", "deployment.read",
             "generation is a write, not a read"
+        );
+    }
+
+    #[test]
+    fn applying_a_migration_is_not_a_deployment_power_and_rehearsing_is_not_either() {
+        // REQ-129's three keys, and the reasons they are three rather than one.
+        for key in [
+            "deployment.migrations.read",
+            "deployment.migrations.apply",
+            "deployment.migrations.verify",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("deployment"),
+                "{key} belongs to the deployment category"
+            );
+        }
+        // The claim this file exists to make load-bearing: `deployment.deploy` ships an image, it
+        // does not write the schema. A route that guarded `POST /migrations/apply` with the deploy
+        // key would be green in every test in this crate — none of them builds a router — and
+        // would answer "who changed the database?" with "whoever could deploy".
+        assert_ne!(
+            "deployment.migrations.apply", "deployment.deploy",
+            "changing the schema is not deploying an image"
+        );
+        assert_ne!(
+            "deployment.migrations.apply", "deployment.rollback",
+            "applying is the opposite of rolling back"
+        );
+        // Rehearsing a reversal is its own power because it is the only write here that executes
+        // SQL, and because it is the write that turns `unknown` into `reversible` on the release.
+        assert_ne!(
+            "deployment.migrations.verify", "deployment.migrations.apply",
+            "proving the rollback path is not applying a migration"
+        );
+        // Distinct descriptions, which is the cheapest way to catch two keys that drifted into
+        // one power. Two identical descriptions means the family grew a name and not a permission.
+        let mut descriptions: Vec<&str> = [
+            "deployment.read",
+            "deployment.migrations.read",
+            "deployment.migrations.apply",
+            "deployment.migrations.verify",
+        ]
+        .iter()
+        .map(|key| get(key).map(|entry| entry.description).unwrap_or(""))
+        .collect();
+        descriptions.sort_unstable();
+        let before = descriptions.len();
+        descriptions.dedup();
+        assert_eq!(
+            before,
+            descriptions.len(),
+            "two powers with one description are one power written twice"
         );
     }
 

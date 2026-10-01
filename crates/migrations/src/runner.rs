@@ -222,7 +222,11 @@ pub enum LockRisk {
 /// next deploy will apply. Reading the tree as well would let a plan preview describe statements
 /// the runner will never run.
 #[must_use]
-pub fn embedded_files(migrator: &sqlx::migrate::Migrator) -> Vec<MigrationFile> {
+///
+/// The parameter is `&'static` because that is what every caller has: the migration bundle is a
+/// `static` in `omnion-core`, and a reborrow of it into an elided-lifetime parameter is what
+/// stops the caller's future from being provably `Send`.
+pub fn embedded_files(migrator: &'static sqlx::migrate::Migrator) -> Vec<MigrationFile> {
     migrator
         .iter()
         .filter(|migration| !migration.migration_type.is_down_migration())
@@ -461,8 +465,8 @@ pub fn statements_without_down(sql: &str) -> Vec<String> {
 /// defect as a checksum recomputed at read time.
 pub async fn plan(
     pool: &PgPool,
-    migrator: &sqlx::migrate::Migrator,
-    policy: &Policy,
+    migrator: &'static sqlx::migrate::Migrator,
+    policy: Policy,
 ) -> Result<Plan> {
     let files = embedded_files(migrator);
     let applied: std::collections::HashSet<i64> = applied_versions(pool).await?;
@@ -520,7 +524,7 @@ pub async fn plan(
         pending,
         violations,
         missing_down,
-        policy: policy.clone(),
+        policy,
         gate_fails,
         summary,
     })
@@ -612,8 +616,18 @@ pub async fn ensure_sqlx_table(pool: &PgPool) -> Result<()> {
 ///
 /// [`MigrationSafetyError::Drift`] carrying [`crate::ledger::Drift`]'s message, which names the
 /// file and the only fix.
-pub async fn check_drift(pool: &PgPool, files: &[MigrationFile]) -> Result<()> {
-    let ledger_input = ledger::drift_input(pool).await?;
+pub async fn check_drift(pool: PgPool, files: &[MigrationFile]) -> Result<()> {
+    // `PgPool` by value rather than by reference.
+    //
+    // This is not a style preference and not a micro-optimisation. A `&PgPool` parameter makes the
+    // future's captured type `&'a PgPool` for the CALLER's `'a`, and the compiler then cannot
+    // prove the future is `Send` — it reports "implementation of `Send` is not general enough",
+    // which names no argument and no line. Every unit test in this crate and the CLI stayed green,
+    // because both await the runner on the current thread where `Send` is never asked for. The
+    // first caller that needed it — an HTTP handler, which axum requires to be `Send` — failed with
+    // `the trait Handler<_, _> is not implemented`, names no cause, and cost this request a full
+    // bisection. Owning a `PgPool` is an `Arc` clone, so the fix costs one atomic increment.
+    let ledger_input = ledger::drift_input(&pool).await?;
     if ledger_input.is_empty() {
         return Ok(());
     }
@@ -642,11 +656,21 @@ pub async fn check_drift(pool: &PgPool, files: &[MigrationFile]) -> Result<()> {
 /// The waiver lookup is by `(version, pattern, line)` — the finding's own identity — because a
 /// waiver keyed on the excerpt expires the moment somebody improves a comment, and a waiver that
 /// silently expires is a gate that fires on a change nobody made.
-pub async fn check_policy(pool: &PgPool, plan: &Plan) -> Result<()> {
+pub async fn check_policy(pool: PgPool, plan: &Plan) -> Result<()> {
+    // `PgPool` by value rather than by reference.
+    //
+    // This is not a style preference and not a micro-optimisation. A `&PgPool` parameter makes the
+    // future's captured type `&'a PgPool` for the CALLER's `'a`, and the compiler then cannot
+    // prove the future is `Send` — it reports "implementation of `Send` is not general enough",
+    // which names no argument and no line. Every unit test in this crate and the CLI stayed green,
+    // because both await the runner on the current thread where `Send` is never asked for. The
+    // first caller that needed it — an HTTP handler, which axum requires to be `Send` — failed with
+    // `the trait Handler<_, _> is not implemented`, names no cause, and cost this request a full
+    // bisection. Owning a `PgPool` is an `Arc` clone, so the fix costs one atomic increment.
     let waived: std::collections::HashSet<String> = sqlx::query_as::<_, (String, String, i32)>(
         "select version, pattern, line from migration_violations where waived_at is not null",
     )
-    .fetch_all(pool)
+    .fetch_all(&pool)
     .await
     .unwrap_or_default()
     .into_iter()
@@ -693,34 +717,40 @@ pub async fn check_policy(pool: &PgPool, plan: &Plan) -> Result<()> {
 /// policy are checked after the lock and before the first statement, so a refused run leaves
 /// nothing behind — not a journal row, not a ledger row, not a half-applied schema.
 pub async fn apply(
-    pool: &PgPool,
-    migrator: &sqlx::migrate::Migrator,
-    policy: &Policy,
-    actor: &RunActor,
+    pool: PgPool,
+    migrator: &'static sqlx::migrate::Migrator,
+    policy: Policy,
+    actor: RunActor,
 ) -> Result<ApplyReport> {
-    lock::acquire(pool, lock::LOCK_WAIT).await?;
+    lock::acquire(&pool, lock::LOCK_WAIT).await?;
 
     // Whatever happens below, the lock is released on this path and not on the success path
     // alone: a refused run that keeps the lock is the one bug that turns a bad deploy into an
     // outage, because the next runner is then refused for a reason that no longer exists.
-    let result = apply_locked(pool, migrator, policy, actor).await;
-    lock::release(pool).await;
+    let result = apply_locked(pool.clone(), migrator, policy, actor).await;
+    lock::release(&pool).await;
     result
 }
 
 /// The body of [`apply`], with the lock already held.
 async fn apply_locked(
-    pool: &PgPool,
-    migrator: &sqlx::migrate::Migrator,
-    policy: &Policy,
-    actor: &RunActor,
+    pool: PgPool,
+    migrator: &'static sqlx::migrate::Migrator,
+    policy: Policy,
+    actor: RunActor,
 ) -> Result<ApplyReport> {
-    let files = embedded_files(migrator);
-    check_drift(pool, &files).await?;
-    ensure_sqlx_table(pool).await?;
+    // Owned, not borrowed. A `&T` parameter makes the future's captured type `&'a T` for the
+    // caller's `'a`, and the compiler then cannot prove the future is `Send` even when `T` is —
+    // it reports "implementation of `Send` is not general enough". Both arguments are cheap to own
+    // (`PgPool` is an `Arc` clone, the migrator is a `&'static`), and owning them is what lets an
+    // HTTP handler — which must run its future on a `Send` runtime — call this at all.
 
-    let plan = plan(pool, migrator, policy).await?;
-    check_policy(pool, &plan).await?;
+    let files = embedded_files(migrator);
+    check_drift(pool.clone(), &files).await?;
+    ensure_sqlx_table(&pool).await?;
+
+    let plan = plan(&pool, migrator, policy.clone()).await?;
+    check_policy(pool.clone(), &plan).await?;
 
     if plan.pending.is_empty() {
         return Ok(ApplyReport {
@@ -730,10 +760,19 @@ async fn apply_locked(
     }
 
     let mut applied = Vec::new();
-    for entry in &plan.pending {
+    // The pending set is consumed rather than iterated by reference. A `slice::Iter` and the
+    // `&MigrationFile` lookup below are borrows that live across the migration's await points, and
+    // a future holding them is not provably `Send` — see the note on `check_policy` above. Both
+    // vectors are owned locals here, so iterating by value removes the borrows at no cost.
+    for entry in plan.pending {
+        // The found file is CLONED, not borrowed. A `&MigrationFile` living across this
+        // migration's await points is one of the captures that stops the future being `Send` (see
+        // the note on `check_policy`); the clone is a `Vec<String>` of SQL that this loop runs
+        // exactly once per pending migration.
         let file = files
             .iter()
             .find(|file| file.version == entry.version)
+            .cloned()
             .ok_or_else(|| MigrationSafetyError::InvalidVersion {
                 version: entry.version.clone(),
                 reason: "the plan named a migration the bundle does not carry".to_owned(),
@@ -745,7 +784,13 @@ async fn apply_locked(
         // the one migration that cannot journal itself, because the journal arrives with it.
         // Everything after this point journals normally, which is why the fallback is per-run and
         // not a flag on the runner.
-        let run_id = match start_run(pool, &entry.version, Direction::Up, actor, &pending_plan_json(entry))
+        let run_id = match start_run(
+            pool.clone(),
+            entry.version.clone(),
+            Direction::Up,
+            actor.clone(),
+            pending_plan_json(&entry),
+        )
             .await
         {
             Ok(id) => Some(id),
@@ -772,20 +817,34 @@ async fn apply_locked(
         //
         // `set local` rather than `set` is what scopes them to the transaction below, so one
         // migration's timeout cannot leak onto a pooled connection and bind the NEXT one's DDL.
-        let mut conn = pool.acquire().await?;
-        sqlx::query(&format!(
-            "set local lock_timeout = '{}ms'",
-            policy.lock_timeout_ms
-        ))
-        .execute(&mut *conn)
-        .await?;
-        sqlx::query(&format!(
-            "set local statement_timeout = '{}ms'",
-            policy.statement_timeout_ms
-        ))
-        .execute(&mut *conn)
-        .await?;
-        let mut tx = conn.begin().await?;
+        // `begin()` on the pool rather than `acquire()` then `begin()` on the connection. The
+        // acquired `PoolConnection` is a value that lives across the migration's await points, and
+        // a future holding `&mut PgConnection` is not provably `Send` — which is what stopped an
+        // HTTP handler from calling this at all. `Pool::begin()` hands back a `Transaction`
+        // directly and leaves no borrowed connection in the future.
+        let mut tx = pool.begin().await?;
+        //
+        // Each statement is bound to a NAMED local rather than passed as `&format!(..)` straight
+        // into `sqlx::query`. That is not style. A temporary `&String` makes the query's lifetime
+        // the tail expression, and the future this loop sits in then captures `policy` in a form
+        // the compiler cannot prove `Send` — the whole of `apply` stops being `Send`, every unit
+        // test and the CLI stay green (both await on the current thread), and the first caller
+        // that needs `Send` — an HTTP handler — fails with
+        // `the trait Handler<_, _> is not implemented`, which names no cause whatsoever. See
+        // `the_public_async_surface_is_send` in this module's tests.
+        //
+        // Each statement is bound to a NAMED local rather than passed as `&format!(..)` straight
+        // into `sqlx::query`. A temporary `&String` ties the query to the tail expression, and the
+        // future then captures `policy` in a form the compiler cannot prove `Send`.
+        let set_lock_timeout = format!("set local lock_timeout = '{}ms'", policy.lock_timeout_ms);
+        sqlx::query(set_lock_timeout.as_str())
+            .execute(&mut *tx)
+            .await?;
+        let set_statement_timeout =
+            format!("set local statement_timeout = '{}ms'", policy.statement_timeout_ms);
+        sqlx::query(set_statement_timeout.as_str())
+            .execute(&mut *tx)
+            .await?;
 
         // The whole file in ONE transaction together with SQLx's own bookkeeping row.
         //
@@ -803,7 +862,7 @@ async fn apply_locked(
         // database has this version" and "the database HAS these tables" the same claim. A
         // migration that applied and then failed to record itself would be re-applied by the
         // next boot, and every `create table` in it would fail on the tables it already made.
-        let outcome = apply_one(&mut tx, file).await;
+        let outcome = apply_one(&mut tx, &file).await;
         let duration_ms = started.elapsed().as_millis().min(u128::from(i32::MAX as u32)) as i32;
 
         match outcome {
@@ -812,12 +871,12 @@ async fn apply_locked(
                     // The statements are rolled back with the transaction, so the migration did
                     // NOT happen and the journal has to say so rather than report a success the
                     // database cannot confirm.
-                    finish_run(pool, run_id, "failed", duration_ms, Some(&err.to_string())).await?;
+                    finish_run(pool.clone(), run_id, "failed".to_owned(), duration_ms, Some(err.to_string())).await?;
                     return Err(MigrationSafetyError::Store(err));
                 }
-                finish_run(pool, run_id, "succeeded", duration_ms, None).await?;
+                finish_run(pool.clone(), run_id, "succeeded".to_owned(), duration_ms, None).await?;
                 match ledger::record(
-                    pool,
+                    &pool,
                     &NewLedgerRow {
                         version: entry.version.clone(),
                         name: entry.name.clone(),
@@ -849,7 +908,7 @@ async fn apply_locked(
                 let message = err.to_string();
                 // The transaction is dropped here, which rolls the statements back — the same
                 // all-or-nothing guarantee SQLx's own `apply` makes.
-                finish_run(pool, run_id, "failed", duration_ms, Some(&message)).await?;
+                finish_run(pool.clone(), run_id, "failed".to_owned(), duration_ms, Some(message)).await?;
                 return Err(MigrationSafetyError::Store(err));
             }
         }
@@ -867,7 +926,7 @@ async fn apply_locked(
     // Leaving it undone is not a cosmetic gap: the ledger screen is specified as "applied and
     // pending" over the WHOLE history, and an operator asking "has 0044 run here?" gets "no" from
     // a ledger that only ever saw 0207.
-    let backfilled = backfill_ledger(pool, &files).await?;
+    let backfilled = backfill_ledger(&pool, &files).await?;
 
     Ok(ApplyReport {
         summary: format!(
@@ -977,11 +1036,11 @@ pub struct ApplyReport {
 
 /// Write a `running` journal row and return its id.
 pub async fn start_run(
-    pool: &PgPool,
-    version: &str,
+    pool: PgPool,
+    version: String,
     direction: Direction,
-    actor: &RunActor,
-    plan: &Value,
+    actor: RunActor,
+    plan: Value,
 ) -> Result<i64> {
     let id: i64 = sqlx::query_scalar(
         "insert into migration_runs (version, direction, status, actor, source, plan) \
@@ -989,10 +1048,10 @@ pub async fn start_run(
     )
     .bind(version)
     .bind(direction.as_str())
-    .bind(&actor.actor)
-    .bind(&actor.source)
+    .bind(actor.actor)
+    .bind(actor.source)
     .bind(plan)
-    .fetch_one(pool)
+    .fetch_one(&pool)
     .await?;
     Ok(id)
 }
@@ -1003,11 +1062,11 @@ pub async fn start_run(
 /// functions that could each pass a fourth value, and the check constraint would answer all three
 /// with the same `23514` that names no function.
 pub async fn finish_run(
-    pool: &PgPool,
+    pool: PgPool,
     run_id: Option<i64>,
-    status: &str,
+    status: String,
     duration_ms: i32,
-    error: Option<&str>,
+    error: Option<String>,
 ) -> Result<()> {
     let Some(run_id) = run_id else {
         // No journal row exists for this run (the migration that creates the journal is the one
@@ -1015,9 +1074,9 @@ pub async fn finish_run(
         // start time nobody observed.
         return Ok(());
     };
-    if !matches!(status, "succeeded" | "failed" | "aborted") {
+    if !matches!(status.as_str(), "succeeded" | "failed" | "aborted") {
         return Err(MigrationSafetyError::InvalidVersion {
-            version: status.to_owned(),
+            version: status.clone(),
             reason: "a run can only be closed as succeeded, failed or aborted".to_owned(),
         });
     }
@@ -1029,7 +1088,7 @@ pub async fn finish_run(
     .bind(status)
     .bind(duration_ms)
     .bind(error)
-    .execute(pool)
+    .execute(&pool)
     .await?;
     Ok(())
 }
@@ -1053,7 +1112,7 @@ pub async fn finish_run(
 pub async fn verify_down(
     ledger_pool: &PgPool,
     scratch: &PgPool,
-    migrator: &sqlx::migrate::Migrator,
+    migrator: &'static sqlx::migrate::Migrator,
     version: &str,
     by: &str,
 ) -> Result<VerifyReport> {
@@ -1091,11 +1150,11 @@ pub async fn verify_down(
     }
 
     let run_id = start_run(
-        ledger_pool,
-        version,
+        ledger_pool.clone(),
+        version.to_owned(),
         Direction::Down,
-        &RunActor::new(by, "cli")?,
-        &json!({ "statements": file.down_statements.len(), "scratch": true }),
+        RunActor::new(by, "cli")?,
+        json!({ "statements": file.down_statements.len(), "scratch": true }),
     )
     .await?;
     let started = Instant::now();
@@ -1107,12 +1166,12 @@ pub async fn verify_down(
     match outcome {
         Err(err) => {
             let message = err.to_string();
-            finish_run(ledger_pool, Some(run_id), "failed", duration_ms, Some(&message)).await?;
+            finish_run(ledger_pool.clone(), Some(run_id), "failed".to_owned(), duration_ms, Some(message)).await?;
             return Err(MigrationSafetyError::Store(err));
         }
         Ok(_) => {
             let after = table_names(scratch).await?;
-            finish_run(ledger_pool, Some(run_id), "succeeded", duration_ms, None).await?;
+            finish_run(ledger_pool.clone(), Some(run_id), "succeeded".to_owned(), duration_ms, None).await?;
             ledger::mark_down_verified(ledger_pool, version, by).await?;
             // The verdict is computed BEFORE the report is built, not from the report's own
             // fields afterwards: `restored` is the claim and the two lists are the evidence, so
@@ -1183,6 +1242,7 @@ pub fn now() -> OffsetDateTime {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
