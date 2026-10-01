@@ -716,6 +716,139 @@ pub async fn live_code_count(pool: &PgPool, app_id: Uuid, now: OffsetDateTime) -
     Ok(count)
 }
 
+/// Write an access token, returning the plaintext **once**.
+///
+/// The scopes are written as the grant's, never re-read from the app: see the migration's
+/// comment for why that denormalisation is the safe direction. `user_id` is `Some` only for a
+/// token that stands for a person, and the table's `oauth_tokens_provenance_is_whole`
+/// constraint refuses the half-pairs, so a caller that passes the wrong one here gets a
+/// constraint violation rather than a token that misattributes the app's traffic.
+pub async fn issue_token(
+    pool: &PgPool,
+    token_hash: &str,
+    app_id: Uuid,
+    user_id: Option<Uuid>,
+    grant_type: &str,
+    scopes: &[String],
+    expires_at: OffsetDateTime,
+) -> Result<()> {
+    sqlx::query(
+        "insert into oauth_access_tokens \
+         (token_hash, app_id, user_id, grant_type, scopes, expires_at) \
+         values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(token_hash)
+    .bind(app_id)
+    .bind(user_id)
+    .bind(grant_type)
+    .bind(serde_json::json!(scopes))
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A token row resolved from its hash, and whether it is still usable at a given instant.
+///
+/// The clock is applied **in the query** rather than read back and compared, for the same reason
+/// [`redeem_code`] spends a code inside its own `where`: a read-then-check invites two
+/// simultaneous requests to both see a live token. Here the token is not single-use so the race
+/// is benign, but the *answer* would still differ between the two callers if expiry were applied
+/// in Rust, and an answer that depends on when the read happened is an answer worth not having.
+pub async fn find_token(
+    pool: &PgPool,
+    token_hash: &str,
+    now: OffsetDateTime,
+) -> Result<Option<TokenRow>> {
+    let row = sqlx::query(
+        "select token_hash, app_id, user_id, grant_type, scopes, expires_at, revoked_at \
+         from oauth_access_tokens \
+         where token_hash = $1 and revoked_at is null and expires_at > $2",
+    )
+    .bind(token_hash)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    Ok(Some(TokenRow {
+        app_id: row.try_get("app_id")?,
+        user_id: row.try_get("user_id")?,
+        grant_type: row.try_get("grant_type")?,
+        scopes: string_array(row.try_get("scopes")?),
+        expires_at: row.try_get("expires_at")?,
+    }))
+}
+
+/// What a resolved token grants.
+#[derive(Debug, Clone)]
+pub struct TokenRow {
+    /// Which app it belongs to.
+    pub app_id: Uuid,
+    /// The person it stands for, or `None` for a machine token.
+    pub user_id: Option<Uuid>,
+    /// The grant that produced it.
+    pub grant_type: String,
+    /// What it may do, as fixed at issue time.
+    pub scopes: Vec<String>,
+    /// When it stops working.
+    pub expires_at: OffsetDateTime,
+}
+
+/// Revoke a token, returning whether a live one was revoked.
+///
+/// `None` when it was already revoked or already expired, and the caller answers the same thing
+/// either way: a client presenting a revoked token must not learn whether it was revoked
+/// deliberately or ran out, because that is one bit about a credential's history.
+pub async fn revoke_token(pool: &PgPool, token_hash: &str) -> Result<bool> {
+    let updated = sqlx::query(
+        "update oauth_access_tokens set revoked_at = now() \
+         where token_hash = $1 and revoked_at is null",
+    )
+    .bind(token_hash)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() > 0)
+}
+
+/// Remove tokens that are revoked-and-old or long expired.
+///
+/// Two predicates for the same reason [`purge_codes`] has two: a token deliberately revoked
+/// months ago and a token nobody used have different reasons to go, and one predicate would
+/// either keep revoked rows for ever or delete live ones. `revoked_at` is also what an incident
+/// review wants, so the retention question is a policy decision rather than a sweep's guess —
+/// which is why the caller passes the cutoff.
+pub async fn purge_tokens(pool: &PgPool, before: OffsetDateTime) -> Result<u64> {
+    let removed = sqlx::query(
+        "delete from oauth_access_tokens \
+         where expires_at < $1 or (revoked_at is not null and revoked_at < $1)",
+    )
+    .bind(before)
+    .execute(pool)
+    .await?;
+    Ok(removed.rows_affected())
+}
+
+/// How many live tokens an app is holding, for the app's detail screen beside the code count.
+///
+/// Same definition as [`live_code_count`] and the same reason: rows in the table are not tokens
+/// in use, and a panel that reported the row count would send an operator hunting for a
+/// compromise that never happened.
+pub async fn live_token_count(pool: &PgPool, app_id: Uuid, now: OffsetDateTime) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from oauth_access_tokens \
+         where app_id = $1 and revoked_at is null and expires_at > $2",
+    )
+    .bind(app_id)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
