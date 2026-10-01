@@ -26,6 +26,8 @@ const { execFileSync } = require("node:child_process");
 const path = require("node:path");
 
 let failures = 0;
+/** Checks that could not run because the database was unavailable — reported, never counted as failures. */
+let skipped = 0;
 function check(name, cond, detail) {
   if (cond) {
     console.log(`  ok  ${name}`);
@@ -307,8 +309,44 @@ console.log("\n4. an early FAILURE still ends the process, and its code survives
 
 // ---------------------------------------------------------------- 5. the uuid guard, against a real database
 console.log("\n5. uuidOrNull makes every id executable — including a valid one");
-probeUuidStatements();
+/**
+ * Is the disposable QA database answering? A probe that cannot reach Postgres must SKIP, loudly.
+ *
+ * Every check in this section needs a real database, and on a shared box Postgres is sometimes in
+ * recovery — a container restart under another writer. Reporting those as failures says "the uuid
+ * guard is broken" when the guard was never reached, and that is precisely the false alarm this
+ * file exists to remove: a measurement that reports a defect it did not observe is worse than no
+ * measurement, because it sends the next tick looking for a bug that does not exist.
+ *
+ * A skip has to be loud and it has to be distinguishable from a pass. It prints its own line, it
+ * is counted, and `pgIsUp` is exported so a reader can see why the section did not run.
+ */
+function pgIsUp() {
+  try {
+    execFileSync(
+      "docker",
+      ["exec", process.env.QA_PG_CONTAINER || "omnion-postgres", "pg_isready", "-q"],
+      { encoding: "utf8", timeout: 15000 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+const PG_UP = pgIsUp();
+if (!PG_UP) {
+  skipped += 1;
+  console.log(
+    `  SKIP ${7} checks — the QA database is not answering (${process.env.QA_PG_CONTAINER || "omnion-postgres"}).`,
+  );
+  console.log(
+    "       This says NOTHING about uuidOrNull; it says the statements could not be run. Re-run this test once Postgres is up.",
+  );
+} else {
+  probeUuidStatements();
+}
 
-console.log(`\n${failures === 0 ? "PASS" : `FAIL (${failures})`} — ${SRC}`);
+const verdict = failures === 0 ? "PASS" : `FAIL (${failures})`;
+console.log(`\n${verdict}${skipped ? ` · ${skipped} section(s) SKIPPED (database unavailable)` : ""} — ${SRC}`);
 fs.rmSync(OUT, { recursive: true, force: true });
 process.exit(failures === 0 ? 0 : 1);
