@@ -2584,3 +2584,107 @@ export type HealthSettings = {
 
 /** What `PATCH /health/incidents/{id}` accepts. */
 export type HealthIncidentAction = "acknowledge" | "resolve";
+
+// ---------------------------------------------------------------------------------------------
+// AI App Builder (REQ-045)
+// ---------------------------------------------------------------------------------------------
+
+/** One plan as the console list renders it. */
+export type AppBuilderPlan = {
+  id: string;
+  title: string;
+  status: string;
+  plan_version: number;
+  model_label: string;
+  created_by: string | null;
+  artifact_count: number;
+  accepted_count: number;
+  rejected_count: number;
+  pending_count: number;
+  invalid_count: number;
+  cost_cents: number;
+  /** Why generation failed or the plan was rejected; absent while the plan is open. */
+  error?: string;
+  created_at: string;
+};
+
+/** The page of plans plus what the filter bar draws itself from. */
+export type AppBuilderPlanList = {
+  plans: AppBuilderPlan[];
+  total: number;
+  statuses: string[];
+  page_size: number;
+};
+
+/** One validator finding, `{ path, message }` (REQ-045). */
+export type AppBuilderFinding = { path?: string; message: string };
+
+/** One artifact as the review tree and the detail pane render it. */
+export type AppBuilderArtifact = {
+  id: string;
+  kind: string;
+  key: string;
+  parent_key?: string;
+  ordinal: number;
+  status: string;
+  /** The artifact body, exactly as generated or edited — untyped on purpose. */
+  spec: Record<string, unknown>;
+  rationale: string;
+  /** The validator's answer for this artifact. */
+  validation: AppBuilderFinding[] | null;
+  rejected_reason?: string;
+  supersedes_id?: string;
+  updated_at: string;
+};
+
+/** The counters the footer renders, straight from the API. */
+export type AppBuilderCounts = {
+  artifacts: number;
+  accepted: number;
+  rejected: number;
+  pending: number;
+  invalid: number;
+};
+
+/** What stands between a plan and apply, named (the server decides; the panel never re-derives it). */
+export type AppBuilderBlocker = {
+  kind: string;
+  key: string;
+  status: string;
+  reason?: string;
+};
+
+/** One plan with everything the review screen draws. */
+export type AppBuilderPlanDetail = {
+  plan: AppBuilderPlan;
+  artifacts: AppBuilderArtifact[];
+  counts: AppBuilderCounts;
+  blockers: AppBuilderBlocker[];
+  /** Whether every required artifact is resolved. */
+  applicable: boolean;
+  decision_reason?: string;
+  applied_at: string | null;
+};
+
+/** One worked example for the composer's chips. */
+export type AppBuilderExample = { title: string; prompt: string };
+
+/** The composer's vocabulary — served with no database round-trip. */
+export type AppBuilderVocabulary = {
+  examples: AppBuilderExample[];
+  kinds: string[];
+  statuses: string[];
+  plan_statuses: string[];
+  field_types: string[];
+  max_prompt_len: number;
+};
+
+/** What an accept, reject or edit answers, so the client never re-fetches to draw new state. */
+export type AppBuilderDecision = {
+  artifact: AppBuilderArtifact;
+  counts: AppBuilderCounts;
+  blockers: AppBuilderBlocker[];
+};
+
+/** What rejecting or deleting a plan answers. */
+export type AppBuilderPlanDecision = { plan: AppBuilderPlan };

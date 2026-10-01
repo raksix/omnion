@@ -131,6 +131,18 @@ import type {
   NotificationSummary,
   Site,
   User,
+  AppBuilderArtifact,
+  AppBuilderBlocker,
+  AppBuilderCounts,
+  AppBuilderDecision,
+  AppBuilderExample,
+  AppBuilderFinding,
+  AppBuilderPlan,
+  AppBuilderPlanDecision,
+  AppBuilderPlanDetail,
+  AppBuilderPlanList,
+  AppBuilderVocabulary,
+
 } from "./types";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
@@ -7046,4 +7058,283 @@ export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
   return request<void>(`/api/v1/health/maintenance-windows/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// AI App Builder (REQ-045).
+//
+// The console and the review workspace talk to nine routes and one stream. Two decisions are
+// worth naming because they are the reason the client looks like this:
+//
+// * **The decision routes answer with the counters and the blockers.** Accepting one artifact
+//   usually removes one blocker, so a client that re-fetched the whole plan after every
+//   decision would spend a round trip to redraw three numbers the answer already carried —
+//   and would show a stale count for the duration of the request.
+// * **`getAppBuilderPlan` is the only read that is not cached.** The review screen is a
+//   decision surface: a plan that renders from a cached body is a plan whose artifacts may
+//   have been regenerated since, which is precisely the change the reviewer came to see.
+// ---------------------------------------------------------------------------------------------
+
+/** The composer's vocabulary: sample prompts, kinds, statuses, field types. */
+export function fetchAppBuilderVocabulary(): Promise<AppBuilderVocabulary> {
+  return request<AppBuilderVocabulary>("/api/v1/app-builder/examples");
+}
+
+/**
+ * The plan list. Every filter is in the URL, so a reload and a bookmark land on the same
+ * view — the QA pass depends on it, and so does anybody comparing two screenshots.
+ */
+export function fetchAppBuilderPlans(query: {
+  status?: string;
+  q?: string;
+  mine?: boolean;
+  offset?: number;
+  limit?: number;
+  organizationId?: string;
+} = {}): Promise<AppBuilderPlanList> {
+  const params = new URLSearchParams();
+  if (query.status) params.set("status", query.status);
+  if (query.q && query.q.trim()) params.set("q", query.q.trim());
+  if (query.mine) params.set("mine", "true");
+  if (query.offset) params.set("offset", String(query.offset));
+  if (query.limit) params.set("limit", String(query.limit));
+  if (query.organizationId) params.set("organization_id", query.organizationId);
+  const search = params.toString();
+  return request<AppBuilderPlanList>(`/api/v1/app-builder/plans${search ? `?${search}` : ""}`);
+}
+
+/** One plan with its artifacts, counters and blockers — the review workspace's whole state. */
+export function fetchAppBuilderPlan(planId: string): Promise<AppBuilderPlanDetail> {
+  return request<AppBuilderPlanDetail>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/** Accept one artifact. Refused with `422` naming the finding when the validator refused it. */
+export function acceptAppBuilderArtifact(
+  planId: string,
+  artifactId: string,
+): Promise<AppBuilderDecision> {
+  return request<AppBuilderDecision>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}/accept`,
+    { method: "POST" },
+  );
+}
+
+/** Refuse one artifact. `reason` is required by the store: a bare refusal teaches nobody anything. */
+export function rejectAppBuilderArtifact(
+  planId: string,
+  artifactId: string,
+  reason: string,
+): Promise<AppBuilderDecision> {
+  return request<AppBuilderDecision>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}/reject`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
+
+/**
+ * Edit one draft artifact. The body is **untrusted input of the same kind the model's is**, so
+ * it goes back through the same validator: a `422` here carries the field path that broke.
+ */
+export function editAppBuilderArtifact(
+  planId: string,
+  artifactId: string,
+  spec: Record<string, unknown>,
+): Promise<AppBuilderDecision> {
+  return request<AppBuilderDecision>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}`,
+    { method: "PATCH", body: JSON.stringify({ spec }) },
+  );
+}
+
+/** Refuse the whole plan. */
+export function rejectAppBuilderPlan(planId: string, reason: string): Promise<AppBuilderPlanDecision> {
+  return request<AppBuilderPlanDecision>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/reject`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
+
+/** Delete a plan that was never applied; an applied plan answers `409` and stays. */
+export function deleteAppBuilderPlan(planId: string): Promise<void> {
+  return request<void>(`/api/v1/app-builder/plans/${encodeURIComponent(planId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** One frame of a generation, as the two handlers report it. */
+export type AppBuilderStreamHandlers = {
+  /** What the platform is doing right now (`plan`). */
+  onStage?: (stage: string) => void;
+  /** The plan the generation produced or failed on — it exists either way. */
+  onFailed?: (failure: { code: string; message: string }) => void;
+};
+
+/**
+ * Generate a plan from a prompt, reading the stream to its end.
+ *
+ * The frames carry **no artifact bodies**: the answer is validated before it is stored, so a
+ * client that rendered deltas would be rendering something apply may still refuse. What the
+ * stream does carry is the failure — and the plan row exists whichever way it ends, so the
+ * reviewer can *see* the attempt that failed instead of watching a banner and losing the
+ * sentence they typed. `signal` is the Cancel button; aborting stops the read and nothing
+ * is written from this side.
+ */
+export async function streamGenerateAppBuilderPlan(
+  input: { prompt: string; model?: string; title?: string; organizationId?: string },
+  handlers: AppBuilderStreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch("/api/v1/app-builder/generate", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      // The METHOD is what makes this a mutating call; a `{ signal }`-only init reads as a
+      // GET, sends no token, and this one screen answers `403 csrf_failed` while every other
+      // write on the platform works.
+      ...csrfHeader({ method: "POST" }),
+    },
+    body: JSON.stringify({
+      prompt: input.prompt,
+      model: input.model && input.model.trim() ? input.model.trim() : null,
+      title: input.title && input.title.trim() ? input.title.trim() : null,
+      organization_id: input.organizationId || null,
+    }),
+    signal,
+  });
+
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+
+      const payload = JSON.parse(data) as Record<string, unknown>;
+      if (event === "stage") {
+        handlers.onStage?.(payload.stage as string);
+      } else if (event === "error") {
+        handlers.onFailed?.({
+          code: (payload.code as string) ?? "generation_failed",
+          message: (payload.message as string) ?? "The generation did not finish.",
+        });
+        return;
+      }
+    }
+  }
+}
+
+/**
+ * Ask the model for one artifact again, with a note, streaming.
+ *
+ * Same reader as the plan generation on purpose: a revision that answered after one round
+ * trip would leave the operator pressing a button again, and the review screen would need a
+ * second implementation of the progress panel the console already has. The answer carries
+ * the artifact as it now reads, the counters and the blockers.
+ */
+export async function streamRegenerateAppBuilderArtifact(
+  planId: string,
+  artifactId: string,
+  feedback: string,
+  handlers: {
+    onStage?: (stage: string) => void;
+    onArtifact?: (decision: AppBuilderDecision) => void;
+  } = {},
+  model?: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}/regenerate`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        ...csrfHeader({ method: "POST" }),
+      },
+      body: JSON.stringify({
+        feedback,
+        model: model && model.trim() ? model.trim() : null,
+      }),
+      signal,
+    },
+  );
+
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+
+      const payload = JSON.parse(data) as Record<string, unknown>;
+      if (event === "stage") {
+        handlers.onStage?.(payload.stage as string);
+      } else if (event === "artifact") {
+        handlers.onArtifact?.(payload as unknown as AppBuilderDecision);
+        return;
+      } else if (event === "error") {
+        throw new ApiError(
+          502,
+          (payload.code as string) ?? "regeneration_failed",
+          (payload.message as string) ?? "The regeneration did not finish.",
+        );
+      }
+    }
+  }
 }

@@ -47,6 +47,11 @@ const NAV = [
   // an operator who asked a model to write a rule is answering a question the Hub started,
   // and burying the console under Automations would make it look like a separate product.
   { href: "/ai/workflows", label: "AI workflows", icon: WandSparkles },
+  // The app builder (REQ-045) sits under the AI Hub too, for the same reason and one more:
+  // it is the Hub's question taken to its conclusion — a sentence becomes a plan here, where
+  // every artifact is reviewed before anything is created. It is a separate screen from
+  // Automations because nothing automates until a person has accepted it.
+  { href: "/app-builder", label: "App builder", icon: WandSparkles },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

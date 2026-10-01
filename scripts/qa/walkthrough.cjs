@@ -2711,6 +2711,303 @@ async function runAiWorkflowConsole(page, report) {
   await page.setViewportSize({ width: 1440, height: 900 });
   return steps;
 }
+/**
+ * Drive the AI app builder's console and its review workspace (REQ-045, slice 2's screens).
+ *
+ * The console and the review workspace are **two screens with one honest gap between them**,
+ * and this pass is shaped by that gap rather than by what would be nicest to assert:
+ *
+ * * The console is measured in its **real** state. The QA stack has no AI provider connected,
+ *   so `Generate plan` is disabled — and what this pass asserts is that the three sample chips
+ *   still fill the textarea, the counter reads the server's own bound, and the composer's
+ *   vocabulary endpoint answered without a database round-trip. A screen only ever walked with
+ *   a model behind it has proved nothing about the state an installation is in on the day it
+ *   is installed.
+ * * The review workspace (`/app-builder/plans/{id}`) is a route whose path carries an id, so
+ *   it cannot appear in the static routes list — the same reason `/ai/workflows/[id]` is not
+ *   in it. A plan with artifacts is therefore **written straight into the table** and the
+ *   screen opened by its real id.
+ *
+ * That fixture is acceptable for a specific reason, and the reason is worth stating because a
+ * fixture that cannot fail is not a fixture: the generator needs a live provider the box has no
+ * key for, so what this pass can honestly measure is the *review* half — and every decision it
+ * makes is read back **out of the database**, never out of the screen it just drove. The
+ * generator itself is proved by the API suite (`cargo test -p omnion-api --test app_builder`)
+ * against a mock provider.
+ *
+ * The fixture is deliberately **not** a fully accepted plan: one artifact is seeded `invalid`
+ * and one `pending`, because a review screen driven only against an already-resolved plan would
+ * be the screen that ships without ever having said no to anything.
+ */
+async function runAppBuilderConsole(page, report) {
+  const steps = {};
+  const note = (step) => {
+    Object.assign(steps, step);
+    record({ page: "app-builder", action: "app-builder-console", ...step });
+  };
+
+  // ---- the console -----------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/app-builder`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-composer]", { timeout: 10000 }).catch(() => {});
+
+  const chips = await page.locator("[data-sample-chip]").count();
+  const modelChip = (await page.locator("[data-model-chip]").first().innerText().catch(() => "")) || "";
+  note({ chips, modelChip });
+
+  // The composer's own contract: a prompt under the minimum disables Generate, and the counter
+  // says so rather than leaving the operator to guess why the button is grey.
+  await page.fill("[data-composer-prompt]", "short").catch(() => {});
+  await page.waitForTimeout(250);
+  const counterShort = (await page.locator("[data-prompt-counter]").first().innerText().catch(() => "")) || "";
+  const generateDisabledShort = await page.locator("[data-generate]").isDisabled().catch(() => false);
+  note({ counterShort, generateDisabledShort });
+
+  // The sample chips are click-to-fill, and there are three of them by the request's own count.
+  let chipFilled = 0;
+  if (chips > 0) {
+    await page.locator("[data-sample-chip]").first().click().catch(() => {});
+    await page.waitForTimeout(300);
+    chipFilled = (await page.inputValue("[data-composer-prompt]").catch(() => "")) || "";
+  }
+  note({ chipFilledChars: chipFilled.length });
+  steps.ok = chips === 3 && chipFilled.length >= 10 && generateDisabledShort;
+  if (!steps.ok) {
+    steps.reason = `composer: chips=${chips} (want 3) filled=${chipFilled.length} disabledShort=${generateDisabledShort}`;
+  }
+
+  // The plan list's filters live in the URL. A filter that is not in the URL is a filter a
+  // reload throws away, which is the request's own acceptance criterion.
+  const mineToggle = page.locator("[data-filter-mine]");
+  if ((await mineToggle.count()) > 0) {
+    await mineToggle.click().catch(() => {});
+    await page.waitForTimeout(900);
+    const urlAfterMine = page.url();
+    note({ urlAfterMine, mineInUrl: urlAfterMine.includes("mine=true") });
+    if (!urlAfterMine.includes("mine=true")) {
+      steps.ok = false;
+      steps.reason = "the \"mine only\" filter did not write itself into the URL";
+    }
+    await page.goto(`${URL_ADMIN}/app-builder`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(700);
+  }
+  await shot(page, "page-app-builder");
+
+  // ---- the review workspace, opened by a REAL id ----------------------------------------------
+  // A fixture, for the reason in the doc comment. The organization is read the way the AI
+  // workflow pass reads it: from the table itself when a row exists, from `users` otherwise —
+  // and a value that is not a uuid aborts the pass rather than being interpolated into a uuid
+  // column, which is how a fresh QA database once produced "no provider" for a screen that had
+  // nothing to do with providers.
+  const org = (
+    qaSql("select organization_id from app_builder_plans limit 1") ||
+    qaSql("select organization_id from users order by created_at desc limit 1") ||
+    ""
+  ).trim();
+  if (!/^[0-9a-f-]{36}$/i.test(org)) {
+    note({ seededPlan: false });
+    steps.ok = false;
+    steps.reason = `no organization to seed a plan into (users=${qaSql("select organization_id from users order by created_at desc limit 1")})`;
+    return steps;
+  }
+
+  // **The last line of a psql `insert … returning` is the command tag, not the row** — the same
+  // trap the AI workflow fixture hit, where `.pop()` handed the next line `INSERT 0 1` as an id
+  // and the "visited" screen was `/ai/workflows/INSERT 0 1`. The value is shape-checked here.
+  const seeded = qaSql(
+    `insert into app_builder_plans
+       (organization_id, prompt, title, status, plan_version, model_label, created_by)
+     values ('${org}',
+             'Create an app to manage employees'' leave requests',
+             'QA leave requests', 'draft', 1, 'qa/mock-model',
+             (select id from users order by created_at desc limit 1))
+     returning id`,
+  );
+  const planLine = (seeded || "").split("\n")[0].trim();
+  const planId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(planLine)
+    ? planLine
+    : "";
+  note({ seededPlan: Boolean(planId), seededRaw: (seeded || "").slice(0, 80) });
+  if (!planId) {
+    steps.ok = false;
+    steps.reason = "the review fixture could not be written — are migrations 0224/0226/0227 applied?";
+    return steps;
+  }
+
+  // Nine artifacts across five kinds: enough for the tree to group, enough for one of them to
+  // be `invalid` and one to be `pending`, which is what makes the footer name real blockers.
+  // The `field` artifacts carry a `parent_key` so the tree's parent column is exercised too.
+  const artifacts = [
+    ["entity", "leave_requests", null, JSON.stringify({ label: "Leave requests", plural: "Leave requests", fields: [{ key: "employee_id", label: "Employee", type: "uuid", required: true, unique: false, default: "" }, { key: "starts_on", label: "Starts on", type: "date", required: true, unique: false, default: "" }, { key: "days", label: "Days", type: "number", required: true, unique: false, default: "1" }] }), "Leave requests are the one table a leave app cannot work without."],
+    ["field", "leave_requests.reason", "leave_requests", JSON.stringify({ label: "Reason", type: "text", required: false, unique: false, default: "" }), "A reason is why the request can be read later without asking the person again."],
+    ["field", "leave_requests.approved_by", "leave_requests", JSON.stringify({ label: "Approved by", type: "uuid", required: false, unique: false, default: "" }), "The approver is the audit trail; without it a leave approval is a rumour."],
+    ["ui", "leave_requests.list", "leave_requests", JSON.stringify({ label: "Leave requests", screens: [{ key: "leave_requests.list", label: "All requests", columns: ["employee_id", "starts_on", "days"], fields: ["reason", "starts_on", "days"] }, { key: "leave_requests.detail", label: "One request", columns: ["employee_id"], fields: ["starts_on", "days", "reason"] }] }), "Two screens are enough to be an app: a list to find one and a form to file one."],
+    ["permission", "leave_requests.read", null, JSON.stringify({ keys: [{ key: "leave_requests.read", description: "Read every employee's leave requests" }, { key: "leave_requests.approve", description: "Approve or refuse a leave request" }] }), "Reading somebody's leave is a permission, not a column."],
+    ["role", "leave_manager", null, JSON.stringify({ label: "Leave manager", keys: ["leave_requests.read", "leave_requests.approve"] }), "One role, so an approval right can be given without giving everything."],
+    ["workflow", "leave_approval", null, JSON.stringify({ trigger: "leave_request.created", steps: [{ kind: "approval", label: "The employee's manager approves" }, { kind: "notification", label: "The requester is told the outcome" }] }), "An approval step in the flow is what keeps the permission out of the UI's hands."],
+    ["notification", "leave_outcome", null, JSON.stringify({ channel: "email", template: "Your leave request for {{starts_on}} was {{outcome}}." }), "The requester has to be told without asking."],
+    ["report", "leave_by_month", null, JSON.stringify({ group_by: "starts_on", chart: "bar", columns: ["employee_id", "days"] }), "One grouped table and one chart, which is the report the request allows."],
+  ];
+  let ordinal = 0;
+  for (const [kind, key, parentKey, spec, rationale] of artifacts) {
+    // One artifact is seeded with a finding, because the review screen's validation column and
+    // the footer's `invalid` blocker are the two things a reviewer reads most and the two a
+    // happy-path fixture would never exercise.
+    const status = key === "leave_requests.reason" ? "invalid" : "pending";
+    const validation =
+      status === "invalid"
+        ? JSON.stringify([{ path: "fields.reason.type", message: "reason must declare a type the platform knows" }])
+        : "[]";
+    qaSql(
+      `insert into app_builder_artifacts
+         (plan_id, kind, key, parent_key, ordinal, status, spec, rationale, validation)
+       values ('${planId}', '${kind}', '${key}', ${parentKey ? `'${parentKey}'` : "null"}, ${ordinal},
+               '${status}', '${spec.replace(/'/g, "''")}'::jsonb,
+               '${rationale.replace(/'/g, "''")}',
+               '${validation.replace(/'/g, "''")}'::jsonb)`,
+    );
+    ordinal += 1;
+  }
+
+  await page.goto(`${URL_ADMIN}/app-builder/plans/${planId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-artifact-tree]", { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  const treeRows = await page.locator("[data-artifact-row]").count();
+  const groups = await page.locator("[data-tree-group]").count();
+  const focusedKey = (await page.locator("[data-focused-key]").first().innerText().catch(() => "")) || "";
+  const footerAccepted = (await page.locator("[data-counter-accepted]").first().innerText().catch(() => "")) || "";
+  const footerPending = (await page.locator("[data-counter-pending]").first().innerText().catch(() => "")) || "";
+  const blockers = await page.locator("[data-blocker]").count();
+  note({ treeRows, groups, focusedKey, footerAccepted, footerPending, blockers });
+  if (treeRows !== 9) {
+    steps.ok = false;
+    steps.reason = `the tree drew ${treeRows} artifacts, want 9`;
+  }
+
+  // `j` moves the selection: the keyboard is advertised in the tree's own header, so a
+  // handler-less `j` is a claim the screen makes and does not keep.
+  const beforeKey = focusedKey;
+  await page.locator("[data-artifact-tree]").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.keyboard.press("j");
+  await page.waitForTimeout(350);
+  const afterKey = (await page.locator("[data-focused-key]").first().innerText().catch(() => "")) || "";
+  note({ beforeKey, afterKey, keyboardMoved: beforeKey !== afterKey });
+  if (beforeKey === afterKey) {
+    steps.ok = false;
+    steps.reason = "`j` did not move the artifact selection";
+  }
+  await shot(page, "page-app-builder-review");
+
+  // Reject asks for a reason, and an empty one never leaves the browser. The panel is driven
+  // twice: once empty (refused by the form) and once with a reason (the row moves in the
+  // DATABASE, which is the only place a decision can be proven to have happened).
+  await page.click("[data-reject-artifact]").catch(() => {});
+  await page.waitForTimeout(300);
+  const rejectPanel = (await page.locator("[data-reject-panel]").count()) > 0;
+  await page.fill("[data-reject-reason]", "").catch(() => {});
+  await page.click("[data-confirm-reject]").catch(() => {});
+  await page.waitForTimeout(500);
+  const refusalShown = (await page.locator("[data-action-error]").count()) > 0;
+  const statusBeforeReason = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = '${afterKey}'`);
+  note({ rejectPanel, refusalShown, statusBeforeReason: statusBeforeReason.trim() });
+  if (!rejectPanel || !refusalShown) {
+    steps.ok = false;
+    steps.reason = "an empty rejection reason was not refused on the screen";
+  }
+
+  await page.fill("[data-reject-reason]", "the screen has no form, so a reviewer cannot file one").catch(() => {});
+  await page.click("[data-confirm-reject]").catch(() => {});
+  await page.waitForTimeout(1200);
+  const statusAfterReason = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = '${afterKey}'`);
+  const reasonAfter = qaSql(`select rejected_reason from app_builder_artifacts where plan_id = '${planId}' and key = '${afterKey}'`);
+  note({
+    statusAfterReason: statusAfterReason.trim(),
+    reasonRecorded: reasonAfter.trim().slice(0, 60),
+    reasonReadBack: (await page.locator("[data-rejected-reason]").first().innerText().catch(() => "")) || "",
+  });
+  if (statusAfterReason.trim() !== "rejected") {
+    steps.ok = false;
+    steps.reason = `a rejection with a reason left the row at "${statusAfterReason.trim()}"`;
+  }
+  if (!reasonAfter.trim()) {
+    steps.ok = false;
+    steps.reason = "a rejection stored no reason — the store rule is the whole point of this control";
+  }
+
+  // Accept moves the row AND the footer, and the footer is the number the request's own
+  // acceptance criterion names ("accepted / rejected / pending counts").
+  const invalidRow = page.locator('[data-artifact-row][data-artifact-status="invalid"]').first();
+  const invalidKey = (await invalidRow.innerText().catch(() => "")) || "";
+  if (await invalidRow.count()) {
+    await invalidRow.click().catch(() => {});
+    await page.waitForTimeout(300);
+    await page.click("[data-accept-artifact]").catch(() => {});
+    await page.waitForTimeout(1200);
+    const acceptedError = (await page.locator("[data-action-error]").first().innerText().catch(() => "")) || "";
+    const stillInvalid = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = 'leave_requests.reason'`);
+    note({ invalidKey: invalidKey.slice(0, 40), acceptRefusal: acceptedError.slice(0, 90), stillInvalid: stillInvalid.trim() });
+    if (stillInvalid.trim() !== "invalid") {
+      steps.ok = false;
+      steps.reason = "an artifact the validator refused was ACCEPTED — the guard did not hold";
+    }
+  }
+
+  const acceptRow = page.locator('[data-artifact-row][data-artifact-status="pending"]').first();
+  if (await acceptRow.count()) {
+    const acceptKey = qaSql(`select key from app_builder_artifacts where plan_id = '${planId}' and status = 'pending' order by ordinal limit 1`).trim();
+    await page.locator(`[data-artifact-row]`).filter({ hasText: acceptKey }).first().click().catch(() => {});
+    await page.waitForTimeout(300);
+    await page.click("[data-accept-artifact]").catch(() => {});
+    await page.waitForTimeout(1200);
+    const acceptedNow = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = '${acceptKey}'`);
+    const footerAfter = (await page.locator("[data-counter-accepted]").first().innerText().catch(() => "")) || "";
+    note({ acceptKey, acceptedNow: acceptedNow.trim(), footerAfter });
+    if (acceptedNow.trim() !== "accepted") {
+      steps.ok = false;
+      steps.reason = `accepting ${acceptKey} left the row at "${acceptedNow.trim()}"`;
+    }
+    if (!footerAfter.includes("1 accepted")) {
+      steps.ok = false;
+      steps.reason = `the footer counter did not move after an accept: "${footerAfter}"`;
+    }
+  }
+  await shot(page, "page-app-builder-review-decided");
+
+  // The footer names what stands between this plan and apply, and it must still name the
+  // invalid artifact by its key — a footer that says "1 blocker" without the key is the same
+  // dead end the request calls out.
+  const blockerText =
+    (await page.locator("[data-blockers]").first().innerText().catch(() => "")) || "";
+  note({ blockerText: blockerText.slice(0, 160) });
+  if (!blockerText.includes("leave_requests.reason")) {
+    steps.ok = false;
+    steps.reason = `the blocker list does not name the invalid artifact: "${blockerText.slice(0, 120)}"`;
+  }
+
+  // The entity artifact renders a FIELD TABLE, not a JSON blob: the request names the columns
+  // (key, label, type, required, unique, default) and a reviewer reads a table.
+  const entityRow = page.locator('[data-artifact-row]').filter({ hasText: "leave_requests" }).first();
+  await entityRow.click().catch(() => {});
+  await page.waitForTimeout(400);
+  const entityHeaders = await page.locator("[data-artifact-detail] table thead th").allInnerTexts().catch(() => []);
+  note({ entityHeaders });
+  if (!entityHeaders.join(" ").includes("Unique")) {
+    steps.ok = false;
+    steps.reason = `the entity detail is not a field table: ${JSON.stringify(entityHeaders)}`;
+  }
+
+  // And there is no Apply button anywhere on the screen. The runner is a later slice, so a
+  // button that answers "coming soon" is precisely what the Definition of Done forbids — this
+  // assertion is the screen's honesty, and it is a cheap one to lose to a future button.
+  const applyButtons = await page.locator('[data-apply-plan], button:has-text("Apply")').count();
+  note({ applyButtons });
+  if (applyButtons > 0) {
+    steps.ok = false;
+    steps.reason = "the review screen offers Apply before the apply runner exists";
+  }
+
+  return steps;
+}
 
 async function runMediaFileDetail(page, report) {
   const steps = [];
@@ -8620,6 +8917,12 @@ async function main() {
     // REAL draft, which is the only way the review screen (`/ai/workflows/[id]`, a route whose
     // path carries an id) is ever visited — the same reason `/media/[id]` is not in this list.
     { path: "/ai/workflows", name: "ai-workflows" },
+    // The AI app builder's console (REQ-045, slice 2's screens). It is walked here so a screen
+    // that only ever existed in a route table still gets screenshotted; the depth pass below
+    // opens a REAL plan, which is the only way the review workspace
+    // (`/app-builder/plans/{id}`, a route whose path carries an id) is ever visited — the same
+    // reason `/media/[id]` and `/automations/[id]` are not in this list.
+    { path: "/app-builder", name: "app-builder" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
@@ -8807,6 +9110,19 @@ async function main() {
     matchedOnly.add("media-presets");
     report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
     log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
+  }
+
+  // The AI app builder's console and review workspace (REQ-045, slice 2's screens). It runs
+  // after the AI workflow pass for the same reason: it seeds a fixture row, and the pass that
+  // follows wants a database whose shape it did not have to guess at. Its review half is driven
+  // against a plan with an INVALID artifact and a PENDING one on purpose — a review screen
+  // measured only against an already-resolved plan is a screen that has never said no.
+  if (wants("app-builder-console")) {
+    matchedOnly.add("app-builder-console");
+    report.appBuilderConsole = await runDepthPass("app-builder-console", () =>
+      runAppBuilderConsole(page, report),
+    );
+    log(`app builder: ${JSON.stringify(report.appBuilderConsole)}`);
   }
 
   // The storage tab (REQ-010, slice 3): the range refused by the form, a connection test that
