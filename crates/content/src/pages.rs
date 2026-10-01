@@ -12,6 +12,7 @@
 //! - restoring copies an older revision forward as a new draft and records where it came from
 //!   — history is never rewritten, which is what makes compare and restore possible.
 
+use sqlx::PgConnection;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -390,6 +391,37 @@ pub async fn delete_page(pool: &PgPool, id: Uuid) -> Result<bool> {
         > 0;
 
     tx.commit().await?;
+    Ok(deleted)
+}
+
+/// Delete a page on a connection that is **already inside** a caller's transaction.
+///
+/// This exists because [`delete_page`] opens its own transaction, and an applier that runs its
+/// writes through one all-or-nothing transaction cannot call it: doing so would delete outside
+/// the transaction that is meant to roll the whole set back, which is exactly the guarantee a
+/// change set exists to provide. A set of three operations whose third failed would leave the
+/// first delete committed and the row claiming `failed`.
+///
+/// `delete_page_in` is the same two statements, on the caller's connection, so the row and its
+/// revisions disappear together or not at all.
+pub async fn delete_page_in(connection: &mut PgConnection, id: Uuid) -> Result<bool> {
+    sqlx::query(
+        "delete from translations \
+         where resource_type = $1 and resource_id in \
+         (select id from page_revisions where page_id = $2)",
+    )
+    .bind(crate::model::REVISION_RESOURCE)
+    .bind(id)
+    .execute(&mut *connection)
+    .await?;
+
+    let deleted = sqlx::query("delete from pages where id = $1")
+        .bind(id)
+        .execute(&mut *connection)
+        .await?
+        .rows_affected()
+        > 0;
+
     Ok(deleted)
 }
 

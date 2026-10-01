@@ -513,6 +513,10 @@ async fn park_gated_operations(
                 policy,
                 requested_at: time::OffsetDateTime::now_utc(),
                 change_set_id: Some(set.id),
+                // The editor's own key for this operation, so the release path can answer
+                // "which operation may now run?" without re-deriving the classification that
+                // filed this row (migration `0203`).
+                operation_key: Some(op.key.clone()),
             },
         )
         .await
@@ -692,52 +696,12 @@ pub async fn apply(
         ));
     }
 
-    let applied = change_sets::store::apply_confirmed(
-        state.db().pool(),
-        organization,
-        id,
-        move |set, connection| Box::pin(apply_operations(set, connection, actor)),
-    )
-    .await;
+    let applied = apply_set(&state, organization, actor, id).await;
 
-    let applied = match applied {
-        Ok(applied) => applied,
-        Err(err) => {
-            // Rolled back already: `apply_confirmed` owns the transaction. What is left is to
-            // make the refusal visible to whoever has to fix it.
-            let reason = err.to_string();
-            let recorded =
-                change_sets::store::mark_failed(state.db().pool(), organization, id, &reason)
-                    .await
-                    .map_err(ApiError::from)?;
-
-            bus::emit(
-                state.db().pool(),
-                NewEvent::new("ai.changeset.failed")
-                    .organization(organization)
-                    .actor(actor)
-                    .payload(serde_json::json!({
-                        "change_set_id": id,
-                        "reason": reason,
-                    })),
-            )
-            .await?;
-
-            // Only `422` when the row is still ours to annotate. `Ok(false)` means a competing
-            // discard won the race and the row already says why it stopped — a second, different
-            // reason on the same record would be a worse answer than a conflict.
-            let code = if recorded {
-                "change_set_failed"
-            } else {
-                "not_confirmable"
-            };
-            return Err(ApiError::new(
-                axum::http::StatusCode::CONFLICT,
-                code,
-                reason,
-            ));
-        }
-    };
+    // The failure half lives in `apply_set`, so the release path gets the rollback, the
+    // `failed` row and the event with it rather than a version that reports success on a set
+    // whose third operation was refused.
+    let applied = applied?;
 
     bus::emit(
         state.db().pool(),
@@ -765,6 +729,71 @@ pub async fn apply(
             })?,
         operations: applied,
     }))
+}
+
+/// Apply a confirmed set and, on a refusal, record the failure.
+///
+/// Extracted from [`apply`] so the **release** path can reach it: a parked set is confirmed by
+/// the inbox's decision and then applied by exactly this function, which is what makes "one
+/// pipeline, one screen" a statement about the code and not about two handlers that happen to
+/// agree. Two apply paths with one write is a bug waiting for the version where one of them
+/// forgets a field; one apply path with two callers cannot drift like that.
+///
+/// `mark_failed` and `ai.changeset.failed` live here for the same reason — the ordering that
+/// makes them mean anything is *after* the rollback, and rollback is a property of
+/// `apply_confirmed`, so the statement that depends on it belongs next to it.
+pub(crate) async fn apply_set(
+    state: &AppState,
+    organization: uuid::Uuid,
+    actor: uuid::Uuid,
+    id: uuid::Uuid,
+) -> Result<Vec<AppliedOp>, ApiError> {
+    let applied = change_sets::store::apply_confirmed(
+        state.db().pool(),
+        organization,
+        id,
+        move |set, connection| Box::pin(apply_operations(set, connection, actor)),
+    )
+    .await;
+
+    match applied {
+        Ok(applied) => Ok(applied),
+        Err(err) => {
+            // Rolled back already: `apply_confirmed` owns the transaction. What is left is to
+            // make the refusal visible to whoever has to fix it.
+            let reason = err.to_string();
+            let recorded =
+                change_sets::store::mark_failed(state.db().pool(), organization, id, &reason)
+                    .await
+                    .map_err(ApiError::from)?;
+
+            bus::emit(
+                state.db().pool(),
+                NewEvent::new("ai.changeset.failed")
+                    .organization(organization)
+                    .actor(actor)
+                    .payload(serde_json::json!({
+                        "change_set_id": id,
+                        "reason": reason,
+                    })),
+            )
+            .await?;
+
+            // Only annotate when the row is still ours. `Ok(false)` means a competing discard
+            // won the race and the row already says why it stopped — a second, different
+            // reason on the same record is a worse answer than a conflict.
+            let code = if recorded {
+                "change_set_failed"
+            } else {
+                "not_confirmable"
+            };
+            Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                code,
+                reason,
+            ))
+        }
+    }
 }
 
 /// Apply one set's operations, in order, on the caller's connection.
@@ -834,6 +863,59 @@ async fn apply_one(
             .await?;
     let change = omnion_ai_hub::approvals::target::changes_for(&plan)?;
 
+    // # A delete has to be deleted, not written with nothing
+    //
+    // This is a defect the walks caught, not a branch that was always here. `is_empty()` below
+    // asks "does this change name any field to write", which is the right question for an
+    // **update** and the wrong one for a **delete**: a delete's plan carries no diffs at all —
+    // the diff IS the target going away (see `plan::preview_on`) — so a delete arrived here
+    // with an empty change, fell through `is_empty()`'s update branch into
+    // `update_page_in` with every field `None`, and wrote nothing while the transaction
+    // committed and the row reported `applied`.
+    //
+    // The failure mode is the worst one available: a reviewer approves "delete these two
+    // pages", the inbox says the set was applied, the audit trail says applied, and both
+    // pages are still there. Nothing errors, so nothing reports it.
+    //
+    // `preview_on` has already proved the target exists (it read the current row to build the
+    // diff and the cascades), so reaching here means the delete is applicable.
+    if op.operation.kind == omnion_ai_hub::approvals::plan::OpKind::Delete {
+        let page_id = page_id_of(op)?;
+        let deleted = omnion_content::pages::delete_page_in(connection, page_id)
+            .await
+            .map_err(|err| {
+                omnion_ai_hub::error::AiHubError::InvalidChangeSet(format!(
+                    "operation `{}` could not delete page {page_id}: {err}",
+                    op.key
+                ))
+            })?;
+
+        if !deleted {
+            // The row is gone although the plan saw it moments ago — a concurrent delete
+            // inside this transaction. Reported as applied either way is defensible (the
+            // reviewer asked for the page to not exist, and it does not), so this is a
+            // deliberate no-op rather than a refusal.
+            return Ok(AppliedOp {
+                key: op.key.clone(),
+                kind: op.operation.kind,
+                resource_id: op.operation.resource_id.clone(),
+                slug: String::new(),
+                status: "deleted".to_owned(),
+            });
+        }
+
+        return Ok(AppliedOp {
+            key: op.key.clone(),
+            kind: op.operation.kind,
+            resource_id: op.operation.resource_id.clone(),
+            // The slug is carried by the row that is now gone, and the editor is not going to
+            // invent one: an empty slug is the honest answer, and the panel shows the resource
+            // id for a delete anyway.
+            slug: String::new(),
+            status: "deleted".to_owned(),
+        });
+    }
+
     if change.is_empty() {
         // A no-op apply would otherwise report success for an operation that wrote nothing.
         // `plan` already refuses an operation that changes no field, so reaching this means
@@ -845,12 +927,7 @@ async fn apply_one(
         )));
     }
 
-    let page_id: uuid::Uuid = op.operation.resource_id.parse().map_err(|_| {
-        omnion_ai_hub::error::AiHubError::InvalidChangeSet(format!(
-            "operation `{}` targets `{}`, which is not a page id",
-            op.key, op.operation.resource_id
-        ))
-    })?;
+    let page_id = page_id_of(op)?;
     let page = omnion_content::pages::update_page_in(
         connection,
         page_id,
@@ -878,6 +955,19 @@ async fn apply_one(
         resource_id: op.operation.resource_id.clone(),
         slug: page.slug,
         status: page.status,
+    })
+}
+
+/// The page an operation targets, or a refusal that names the key and the id.
+///
+/// Extracted because the delete branch and the update branch now both need it, and a second
+/// copy of the same parse is a second copy of the same message that can drift.
+fn page_id_of(op: &ChangeOp) -> Result<uuid::Uuid, omnion_ai_hub::error::AiHubError> {
+    op.operation.resource_id.parse().map_err(|_| {
+        omnion_ai_hub::error::AiHubError::InvalidChangeSet(format!(
+            "operation `{}` targets `{}`, which is not a page id",
+            op.key, op.operation.resource_id
+        ))
     })
 }
 
