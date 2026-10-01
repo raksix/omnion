@@ -12619,3 +12619,57 @@ inspector — is written and unmeasured, and for three ticks each has been "the 
 run". The reason was never that the pass was slow. It was that consecutive ticks were starting
 competing passes that destroyed each other, and the resulting failure mode is a report full of
 findings measured against a database that was dropped underneath the walk.
+## Tick 59 · REQ-133 slice 18 + REQ-117 slice 28 · migration 200 could not be installed, and 390 px was never measured
+
+**What.** Two defects, one found through the other.
+
+1. **`0200_crm_intake_source_key_lookup.sql` executed `create index concurrently`.** sqlx wraps every
+   migration in a transaction (`crates/core/src/db.rs` → `sqlx::migrate!`), a concurrent build is
+   illegal inside one, and so **every fresh installation failed at `migrate()`** —
+   `CREATE INDEX CONCURRENTLY cannot run inside a transaction block` — with the API restart-looping
+   before serving a request. It is now a plain `create index`.
+2. **REQ-133's criterion naming 390 px had never been measured.** `runProjectsDepth` visits six
+   screens and set `setViewportSize` in none of them, while four other passes in the same harness do
+   measure it. The line could not have passed however the CSS looked.
+
+**Why neither was caught, which is the reusable half.**
+
+- The index's own gate (`run-crm-key-lookup-index.sh`, 6/6) applies migrations with `psql < file`.
+  **psql is not the product's runner** — no transaction wrapper — so it cannot reproduce this failure
+  even in principle. It proved the *query plan* on a database the shipped binary could never reach.
+  **A gate that provisions its fixture by a different mechanism than the product proves the fixture,
+  not the product.**
+- The file's own comment had already predicted the exact error and argued it away ("that is the
+  runner's shape, not this migration's"). It was wrong twice: a comment is not a boot path, and
+  `concurrently` was aimed at the wrong moment — a migration runs at install, **before the platform
+  serves traffic**, so the write path it protects does not exist. The index is identical either way.
+- The 390 px criterion was a promise with no measurement anywhere. The harness's inverse of the
+  branch's usual defect: not a correct panel describing an unreachable state, but a criterion
+  describing a state no gate ever looked for.
+
+**Proof.**
+
+- `scripts/qa/run-migration-installs.sh` **5/5** — boots `omnion-api` against an *empty* database and
+  lets `Db::migrate` run: **64/64 migrations applied by the product's own runner**, the intake index
+  present in the installed schema.
+- `crates/core/tests/migration_transaction_directive.rs` **3/3**, **PROVEN TO FAIL 1/3** with
+  `concurrently` restored and **2/3** with a `-- no-transaction` declared below the comment header,
+  where sqlx's `sql.starts_with` cannot see it.
+- `run-crm-key-lookup-index.sh` **6/6 unchanged** — the plan is served by the index either way.
+- `omnion-core --lib` **79**, `omnion-api` builds, admin `tsc --noEmit` exit 0.
+
+**The gate was wrong three times before the product was, and each is worth more than the fix.**
+`OMNION_ENV=test` is not a value `Config::from_env` accepts, so the process died before
+`migrate()`. The key is **`OMNION_DATABASE_URL`**; `DATABASE_URL` is silently ignored, which pointed
+a destructive check at the *installation* database and produced a bogus "migration 19 missing" that
+belongs to another writer's worktree — the gate now proves which database it reached before trusting
+any output. And `sqlx::migrate!` **embeds the SQL at compile time** while cargo does not fingerprint
+`database/migrations/*.sql`, so the gate booted a binary built hours before the fix and reported the
+fix as a defect; `crates/core/build.rs` now lists the files rather than the directory.
+
+**Not claimed: the 390 px observation.** The pass ran on the private stack (`QA_STACK=w8`,
+18087/3107/3207, `QA_SLOTS=0` — the shared slot was held by a live w3 pass) and recorded **1 764
+steps** before the box hit **load 90 / `/mnt/apopic` 98%**; it died in the media/backups depth passes,
+never reached `runProjectsDepth`, and `summary.json` carries `fatal`. A pass that cannot finish is not
+a pass that reports zero findings. **Next:** re-run the pass when the box is healthy — the API boots
+now, which it did not before this tick, so the measurement is possible for the first time.
