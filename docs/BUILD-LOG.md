@@ -8273,3 +8273,58 @@ inspector — is written and unmeasured, and for three ticks each has been "the 
 run". The reason was never that the pass was slow. It was that consecutive ticks were starting
 competing passes that destroyed each other, and the resulting failure mode is a report full of
 findings measured against a database that was dropped underneath the walk.
+
+## tick 47 — REQ-101 slice 3g: the entry point the pipeline was missing
+
+**What.** Every change set in every walk from slice 3a onward was filed by a screen or a test.
+The request says "a conversation may end in a proposed change set" and the editor is "opened
+from a chat reply proposing operations", and neither had a producer. `POST /ai/chat` now reads
+a fenced `change-set` block out of the answer and files it through the **same** `store::append`
+and the same `ai.changeset.proposed` event the hand-filed route writes.
+
+- `crates/ai-hub/src/proposal.rs` (new) — the parser. 32 unit tests, 511 → 543 in the crate.
+- `validate_operation` extracted out of `change_sets::validate`, so the parser runs the store's
+  rules rather than a copy that could drift.
+- `GET /ai/chat/proposal-instruction` — the instruction is **served**, not written by the panel.
+- `ai_change_sets::file_from_chat` — the shared insert, called from both producers.
+- `proposal` / `proposal_error` SSE frames, and the panel's card with a real link to the editor.
+- `scripts/qa/walkthrough.cjs` — `runAiChatProposalDepth`; the chat was in the route inventory
+  but had never been *driven*.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --quiet` → **543 passed** (was 511).
+- `cargo test -p omnion-api --test ai_chat_proposal --test ai_change_sets --test ai_approvals`
+  → **4 + 18 + 29 passed**, against `postgres://…@127.0.0.1:5433/omnion_test_w7`.
+- `pnpm typecheck` → 2/2 packages clean.
+- `cargo build -p omnion-api` → no errors.
+- The walkthrough's fixture SQL was executed **statement by statement against the live
+  `omnion_qa_w7` database** (page → revision → change set → read-back → cleanup) because a
+  fixture that never plants anything reports a reason that has nothing to do with the feature.
+  Two of my three columns were wrong on the first attempt and both failed at the `insert`.
+- `node --check scripts/qa/walkthrough.cjs` clean.
+
+**Two decisions worth the record.**
+
+1. **A failed filing is its own frame, not the `error` event.** The `error` event makes the
+   client **throw**, and the screen renders a throw as a failed answer. The answer is complete
+   and on screen; what failed is the bookkeeping after it. Reporting that as a failed answer
+   replaces a good reply with an error and hides the proposal the person was reading about.
+2. **An account with no primary organization keeps the answer and files no proposal.** A set is
+   organization-scoped and the chat route is not. Branching in the route — rather than passing
+   `Option<Uuid>` down — keeps `Ok(None)` meaning "proposed nothing" and nothing else, which is
+   the only thing a caller branching on it can act on.
+
+**Open, and why.** The browser pass. The QA slot was held by a **live** w3 holder for the whole
+tick (`kill -0` green, `cwd=/mnt/apopic/omnion-w3`), and `/mnt/apopic` was at 98% with 1.6 G
+free. A live holder is not mine to take, so this is a code + walkthrough tick and the
+stale-banner and viewer-permission boxes from tick 46 are still open alongside the new one.
+
+**A defect found in someone else's pass, not fixed here.** `runAiChangeSetsDepth` plants its
+page with `insert into pages (…, title, body, …)`. `pages` has no `title` and no `body` — the
+title lives on `page_revisions` — so that statement fails on this schema and the pass reports
+"no page could be planted", a reason that has nothing to do with the feature. It is a sibling
+wave's file and a sibling's pass; it is recorded rather than rewritten, and slice 3g's own
+fixture was written against the real columns.
+
+**Next.** Run `QA_STACK=w7 … bash scripts/qa/run.sh` when the slot frees, to close three
+browser boxes at once. Then REQ-099 slice 4, REQ-100, REQ-105, REQ-106, REQ-107, REQ-108.
