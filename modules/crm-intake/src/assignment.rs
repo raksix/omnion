@@ -164,27 +164,198 @@ impl AssignmentInput {
     /// Build from a simulator's pasted payload. Accepts the lead's own column names and the
     /// friendly aliases the panel's form uses, because a pasted payload is written by a
     /// person and "the country" is what they will type.
+    ///
+    /// The spellings live in [`INPUT_ALIASES`] rather than inline, because [`unread_keys`]
+    /// answers the complementary question from the same table: a key this reader does not
+    /// know is a key the operator will never see again, so the simulator has to name it. Two
+    /// copies of the list would make that answer quietly wrong the first time an alias is
+    /// added here and not there.
+    ///
+    /// The fallback arm is a case-insensitive scan, which the jsonb reader never needs: a
+    /// captured submission's keys were produced by a mapping the platform validated, while a
+    /// pasted payload was typed by a person, and `COUNTRY` is as plausible there as
+    /// `Country`. It is deliberately *not* used by [`AssignmentInput::from_lead_row`], whose
+    /// keys are a controlled vocabulary.
     pub fn from_payload(payload: &Value) -> Self {
-        let pick = |keys: &[&str]| -> Option<String> {
-            keys.iter().find_map(|k| {
-                payload
-                    .get(*k)
-                    .and_then(Value::as_str)
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-            })
+        let map = payload.as_object();
+        let pick = |field: &str| -> Option<String> {
+            let map = map?;
+            let aliases = aliases_of(field)?;
+            // Exact alias first, so the declared order decides between `region` and `Region`.
+            for alias in aliases {
+                if let Some(found) = non_blank(map.get(*alias).and_then(Value::as_str)) {
+                    return Some(found);
+                }
+            }
+            map.iter()
+                .find(|(key, _)| aliases.iter().any(|a| a.eq_ignore_ascii_case(key)))
+                .and_then(|(_, value)| non_blank(value.as_str()))
         };
         Self {
-            country: pick(&["country", "country_code", "Country"]),
-            region: pick(&["region", "state", "Region"]),
-            product_interest: pick(&["product_interest", "product", "productInterest"]),
-            budget_band: pick(&["budget_band", "budget", "budgetBand"]),
-            source_id: pick(&["source_id", "sourceId"]).and_then(|v| Uuid::parse_str(&v).ok()),
-            source_name: pick(&["source_name", "source", "sourceName"]),
-            language: pick(&["language", "lang", "Language"]),
-            has_email: Some(pick(&["email", "e-mail", "Email"]).is_some()),
+            country: pick("country"),
+            region: pick("region"),
+            product_interest: pick("product_interest"),
+            budget_band: pick("budget_band"),
+            source_id: pick("source_id").and_then(|v| Uuid::parse_str(&v).ok()),
+            source_name: pick("source_name"),
+            language: pick("language"),
+            has_email: Some(pick("has_email").is_some()),
         }
     }
+}
+
+/// A non-empty, trimmed string value, or nothing. Shared by both arms of [`pick`] above and
+/// by nothing else: an empty string is not a country, and reading it as one would let a
+/// country rule match a lead that said nothing.
+fn non_blank(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Every spelling the simulator's payload reader accepts, one row per condition key.
+///
+/// The order inside a row is the tie-break: the first spelling present wins, so `region`
+/// beats `Region` and `source_name` beats `source` for a payload carrying both.
+pub const INPUT_ALIASES: [(&str, &[&str]); 8] = [
+    ("country", &["country", "country_code", "Country"]),
+    ("region", &["region", "state", "Region"]),
+    (
+        "product_interest",
+        &["product_interest", "product", "productInterest"],
+    ),
+    ("budget_band", &["budget_band", "budget", "budgetBand"]),
+    ("source_id", &["source_id", "sourceId"]),
+    (
+        "source_name",
+        &["source_name", "source", "sourceName"],
+    ),
+    ("language", &["language", "lang", "Language"]),
+    ("has_email", &["email", "e-mail", "Email"]),
+];
+
+fn aliases_of(field: &str) -> Option<&'static [&'static str]> {
+    INPUT_ALIASES
+        .iter()
+        .find(|(key, _)| *key == field)
+        .map(|(_, aliases)| *aliases)
+}
+
+/// A key in a pasted payload that no condition reads under any spelling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnreadKey {
+    /// The key as it was pasted.
+    pub key: String,
+    /// The alias it was probably meant to be, when one is close enough to be worth naming.
+    pub did_you_mean: Option<String>,
+}
+
+/// What a pasted payload carried that the evaluator will never look at.
+///
+/// **This is the half of "why didn't my rule win" that the rule list cannot answer.** The
+/// skip list names the *rule's* condition (`country`), which reads to the operator as "your
+/// rule is wrong" — but the far more common cause is a payload whose key is spelled
+/// something the reader does not know, so the rule was right and the paste was not read.
+/// Without this the simulator answers confidently about a payload it silently ignored, and
+/// the operator edits a rule that was never the problem.
+///
+/// `did_you_mean` is deliberately conservative: an edit distance of two or less over a key of
+/// reasonable length, so `contury` is named and `notes` is not. A wrong suggestion is worse
+/// than none because it looks authoritative.
+pub fn unread_keys(payload: &Value) -> Vec<UnreadKey> {
+    let Some(map) = payload.as_object() else {
+        return Vec::new();
+    };
+    let mut unread: Vec<UnreadKey> = map
+        .keys()
+        .filter(|key| !is_readable_key(key))
+        .map(|key| UnreadKey {
+            key: key.clone(),
+            did_you_mean: closest_alias(key),
+        })
+        .collect();
+    unread.sort_by(|a, b| a.key.cmp(&b.key));
+    unread
+}
+
+/// Whether the payload reader understands this key under any spelling or case.
+pub fn is_readable_key(key: &str) -> bool {
+    INPUT_ALIASES
+        .iter()
+        .any(|(_, aliases)| aliases.iter().any(|a| a.eq_ignore_ascii_case(key)))
+}
+
+/// The alias a mistyped key was most likely meant to be, or nothing.
+///
+/// Distance is **Damerau-Levenshtein** (adjacent transposition costs one), not plain
+/// Levenshtein, because the slip this exists to catch *is* a transposition: `contury` is a
+/// single keystroke from `country`, and plain Levenshtein scores it 2 — which would put the
+/// most common paste typo of all just outside the threshold and leave the operator with no
+/// name for it. Scoring a real mistake as two mistakes and then declining to mention it is
+/// the wrong direction to err.
+///
+/// The budget is one edit for a short key and two for a longer one. Two is where it stops
+/// being a guess: at three, `budget` and `budget_band` compete for the same paste and the
+/// screen would be naming two different keys.
+fn closest_alias(key: &str) -> Option<String> {
+    let lowered = key.to_ascii_lowercase();
+    let allowed = if lowered.chars().count() > 5 { 2 } else { 1 };
+    let mut best: Option<(usize, &'static str)> = None;
+    for (_, aliases) in INPUT_ALIASES {
+        for alias in aliases {
+            let distance = damerau_levenshtein(&lowered, &alias.to_ascii_lowercase());
+            if distance > allowed {
+                continue;
+            }
+            if best.is_none_or(|(current, _)| distance < current) {
+                best = Some((distance, alias));
+            }
+        }
+    }
+    best.map(|(_, alias)| alias.to_string())
+}
+
+/// Damerau-Levenshtein distance: edit distance where swapping two adjacent characters costs
+/// one edit, which is what a mistyped word on a keyboard actually costs.
+///
+/// The classic three-row formulation is enough here — the pairs of rows are small and the
+/// full-algorithm bookkeeping would buy nothing for strings a person typed.
+fn damerau_levenshtein(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.is_empty() {
+        return right.len();
+    }
+    if right.is_empty() {
+        return left.len();
+    }
+    // `two_back`/`previous`/`current` are the three rows the recurrence needs: the diagonal
+    // transposition term reads a cell two rows up and two columns left.
+    let mut two_back: Vec<usize> = vec![0; right.len() + 1];
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+
+    for i in 1..=left.len() {
+        current[0] = i;
+        for j in 1..=right.len() {
+            let cost = usize::from(left[i - 1] != right[j - 1]);
+            let mut cell = (previous[j] + 1)
+                .min(current[j - 1] + 1)
+                .min(previous[j - 1] + cost);
+            if i > 1
+                && j > 1
+                && left[i - 1] == right[j - 2]
+                && left[i - 2] == right[j - 1]
+            {
+                cell = cell.min(two_back[j - 2] + 1);
+            }
+            current[j] = cell;
+        }
+        std::mem::swap(&mut two_back, &mut previous);
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 /// The evaluation of a conditions document against an input. Kept separate from
@@ -864,6 +1035,125 @@ mod tests {
         // "2026-01-05T09:00:00Z" → 2026-01-05 is a Monday.
         OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
             .expect("timestamp")
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // What a pasted payload carried and what the evaluator will never look at
+    //
+    // Every test here is about one thing: a paste is written by a person, so its keys are
+    // spelled however that person spelled them, and a reader that silently ignores a key
+    // reports a confident answer about an input it did not read.
+    // ---------------------------------------------------------------------------------------
+
+    /// The defect this half exists for. `contury` is one keystroke from `country`, the
+    /// evaluator sees a payload with no country at all, and the simulator's own skip list
+    /// then names the operator's rule as the reason — sending them to edit a rule that was
+    /// never the problem.
+    #[test]
+    fn a_mistyped_key_is_named_rather_than_silently_dropped() {
+        let payload = json!({ "contury": "TR", "email": "visitor@example.invalid" });
+        let input = AssignmentInput::from_payload(&payload);
+        assert_eq!(
+            input.country, None,
+            "the evaluator genuinely knows nothing about the country here"
+        );
+
+        let unread = unread_keys(&payload);
+        assert_eq!(unread.len(), 1, "one key was ignored: {unread:?}");
+        assert_eq!(unread[0].key, "contury");
+        assert_eq!(
+            unread[0].did_you_mean.as_deref(),
+            Some("country"),
+            "a single-keystroke slip must be named, not merely flagged"
+        );
+    }
+
+    /// A key the operator pasted for a *reason we do not have a condition for* is reported
+    /// without a suggestion. Suggesting `lang` for `notes` would be authoritative and wrong,
+    /// which is worse than saying nothing — the whole value of `did_you_mean` is that it can
+    /// be trusted.
+    #[test]
+    fn an_unrelated_key_is_reported_without_a_suggestion() {
+        let unread = unread_keys(&json!({ "notes": "called on friday" }));
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].key, "notes");
+        assert_eq!(
+            unread[0].did_you_mean, None,
+            "no alias is close enough to `notes` to name one"
+        );
+    }
+
+    /// Everything the reader understands is absent from the unread list, in every spelling it
+    /// accepts. A false positive here is the failure that would teach an operator to ignore
+    /// the warning entirely, so the aliases are asserted one by one rather than by a sample.
+    #[test]
+    fn every_spelling_the_reader_accepts_is_not_reported_as_unread() {
+        for (_, aliases) in INPUT_ALIASES {
+            for alias in aliases {
+                assert!(
+                    !unread_keys(&json!({ *alias: "x" }))
+                        .iter()
+                        .any(|u| u.key == *alias),
+                    "`{alias}` is a spelling the reader accepts, so it must not be reported"
+                );
+                assert!(is_readable_key(alias), "`{alias}` should be readable");
+            }
+        }
+        // And in a case the reader accepts through the fallback arm rather than an exact row.
+        assert!(is_readable_key("COUNTRY"));
+        assert!(is_readable_key("E-mail"));
+    }
+
+    /// The fallback arm and the declared order, which together decide what a paste carrying
+    /// two spellings of one field means. The declared spelling wins, so a payload with both
+    /// `country` and `Country` is not at the mercy of jsonb's key order.
+    #[test]
+    fn the_declared_spelling_wins_over_a_case_variant() {
+        let input = AssignmentInput::from_payload(&json!({ "COUNTRY": "DE", "country": "TR" }));
+        assert_eq!(input.country.as_deref(), Some("TR"));
+
+        // With only the variant present the fallback reads it — this is the arm the walkthrough
+        // and every operator typing `Country` depend on.
+        let variant = AssignmentInput::from_payload(&json!({ "COUNTRY": "DE" }));
+        assert_eq!(variant.country.as_deref(), Some("DE"));
+    }
+
+    /// A blank value is no value. `{"country": "  "}` read as `Some("")` would let a country
+    /// rule match a lead that said nothing, which is the exact thing the evaluator's own
+    /// "a key the payload is silent about is a miss" rule exists to prevent.
+    #[test]
+    fn a_blank_value_is_not_a_value() {
+        let input = AssignmentInput::from_payload(&json!({ "country": "   ", "email": "" }));
+        assert_eq!(input.country, None);
+        assert_eq!(
+            input.has_email,
+            Some(false),
+            "an empty e-mail string is still an absent e-mail"
+        );
+    }
+
+    /// A payload that is not an object at all is not an error: it is a paste that cannot say
+    /// anything, and the evaluator's answer for it is "nothing matched", which is true.
+    #[test]
+    fn a_payload_that_is_not_an_object_reports_nothing_unread() {
+        assert!(unread_keys(&json!("TR")).is_empty());
+        assert!(unread_keys(&json!([1, 2, 3])).is_empty());
+        assert_eq!(AssignmentInput::from_payload(&json!("TR")).country, None);
+    }
+
+    /// The table the reader and the report share is the same table, which is what keeps the
+    /// two from drifting. A key added to one and not the other would make the simulator
+    /// warn about a key it happily reads, or stay silent about one it ignores.
+    #[test]
+    fn the_readable_set_is_the_alias_table() {
+        for (_, aliases) in INPUT_ALIASES {
+            for alias in aliases {
+                assert!(is_readable_key(alias));
+            }
+        }
+        // A key nobody conditions on is not readable, and that is the whole category.
+        assert!(!is_readable_key("first_name"));
+        assert!(!is_readable_key("utm_source"));
     }
 
     /// The four cases a conditions document can be in, which are genuinely four and not two.

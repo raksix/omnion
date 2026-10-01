@@ -50,8 +50,9 @@ pub mod store;
 pub mod vocabulary;
 
 pub use assignment::{
-    AssignmentInput, AssignmentOutcome, AssignmentRule, BusinessHours, SlaPolicy, SlaState, due_at,
-    next_position, renumber, simulate, validate_policy, validate_rule,
+    AssignmentInput, AssignmentOutcome, AssignmentRule, BusinessHours, INPUT_ALIASES, SlaPolicy,
+    SlaState, UnreadKey, due_at, is_readable_key, next_position, renumber, simulate, unread_keys,
+    validate_policy, validate_rule,
 };
 pub use claims::{
     CLAIM_STALE_AFTER, Claimed, MAX_SUBMISSION_ID, complete as complete_claim, lead_of as claim_lead,
