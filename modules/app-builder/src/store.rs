@@ -242,26 +242,73 @@ pub async fn set_artifact_status(
     status: &str,
 ) -> Result<Option<AppBuilderArtifact>> {
     require_known_artifact_status(status)?;
-    if artifact_is_resolved(status) {
+    // `edited` is refused and `accepted` is not — and the asymmetry is the point, so it is
+    // worth the sentence. An EDIT claims the artifact was corrected, which is something the
+    // validator has to re-read the body for, so it belongs to the edit path. An ACCEPT is a
+    // person saying "this artifact is right" about a body that was already validated when it
+    // was stored, and the review screen has an Accept button that must work: refusing the
+    // verb would leave the whole review unable to reach an applicable plan.
+    //
+    // An earlier version of this refused both. That was an over-correction -- the rule was
+    // meant to stop a caller asserting validity, and it went on to delete the only way a
+    // reviewer can assert it. The guard belongs on the STATE an artifact is in, not on the
+    // verb: see the `invalid` branch below.
+    if status == "edited" {
         return Err(AppBuilderError::invalid(
             "app_builder_artifact_not_decidable",
-            format!(
-                "`{status}` is decided by the edit path, not by a status write: it is a claim \
-                 that the artifact is valid, and the validator is what decides that"
-            ),
+            "`edited` is written by the edit path, which re-validates the body; a status write \
+             cannot claim a correction it did not check"
         ));
     }
 
-    let row = sqlx::query_as::<_, AppBuilderArtifact>(&format!(
-        "update app_builder_artifacts
-            set status = $2, updated_at = now()
-          where id = $1 and status <> 'accepted'
-        returning {ARTIFACT_COLUMNS}"
-    ))
-    .bind(artifact_id)
-    .bind(status)
-    .fetch_optional(pool)
-    .await?;
+    let row = if artifact_is_resolved(status) {
+        // Accepting an artifact the validator refused is the one write in this module that
+        // would make apply unsafe, so it is refused BY NAME and by what is in `validation` --
+        // the reviewer is told which finding is in the way rather than being offered a
+        // retry that will fail the same way.
+        let existing = sqlx::query_as::<_, AppBuilderArtifact>(&format!(
+            "select {ARTIFACT_COLUMNS} from app_builder_artifacts where id = $1"
+        ))
+        .bind(artifact_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        let findings = existing.validation.as_array().map_or(0, Vec::len);
+        if findings > 0 {
+            let first = first_finding(&existing.validation).unwrap_or_default();
+            return Err(AppBuilderError::invalid(
+                "app_builder_artifact_invalid",
+                format!(
+                    "`{}` cannot be accepted while it has {} validation finding(s): {first}. \
+                     Edit it, or reject it",
+                    existing.key, findings
+                ),
+            ));
+        }
+        sqlx::query_as::<_, AppBuilderArtifact>(&format!(
+            "update app_builder_artifacts
+                set status = $2, updated_at = now()
+              where id = $1 and status <> 'accepted'
+            returning {ARTIFACT_COLUMNS}"
+        ))
+        .bind(artifact_id)
+        .bind(status)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, AppBuilderArtifact>(&format!(
+            "update app_builder_artifacts
+                set status = $2, updated_at = now()
+              where id = $1 and status <> 'accepted'
+            returning {ARTIFACT_COLUMNS}"
+        ))
+        .bind(artifact_id)
+        .bind(status)
+        .fetch_optional(pool)
+        .await?
+    };
     Ok(row)
 }
 
@@ -479,12 +526,10 @@ pub async fn list_plans(
                 count(a.id) filter (where a.status = 'invalid')::bigint    as invalid_count \
            from app_builder_plans p \
            left join app_builder_artifacts a on a.plan_id = p.id \
-          where (p.organization_id is null or p.organization_id = ",
+          where (p.organization_id is not distinct from ",
     );
     builder.push_bind(organization_id);
-    builder.push(" or p.organization_id is null or ");
-    builder.push_bind(organization_id);
-    builder.push(")");
+    builder.push(" or p.organization_id is null)");
 
     if let Some(status) = filter.status.as_deref() {
         builder.push(" and p.status = ");
@@ -538,12 +583,12 @@ async fn count_matching(
     organization_id: Option<Uuid>,
     filter: &PlanFilter,
 ) -> Result<i64> {
-    let mut builder: QueryBuilder<'_, Postgres> =
-        QueryBuilder::new("select count(*) from app_builder_plans where (organization_id is null or organization_id = ");
+    let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
+        "select count(*) from app_builder_plans \
+          where (organization_id is not distinct from ",
+    );
     builder.push_bind(organization_id);
-    builder.push(" or organization_id is null or ");
-    builder.push_bind(organization_id);
-    builder.push(")");
+    builder.push(" or organization_id is null)");
     if let Some(status) = filter.status.as_deref() {
         builder.push(" and status = ");
         builder.push_bind(status);

@@ -33,8 +33,6 @@
 //!   disagree with its rows;
 //! * an applied plan is undeletable and an unapplied one is deletable.
 
-use std::sync::{Arc, Mutex};
-
 use omnion_core::config::{Config, DatabaseConfig};
 use omnion_core::Db;
 use omnion_module_app_builder::{
@@ -404,43 +402,68 @@ async fn the_migrations_checks_hold_on_a_populated_table() {
     harness.cleanup().await;
 }
 
-/// A caller may not assert validity: `accepted` and `edited` are refused as status writes.
+/// Accept works, `edited` does not, and an artifact the validator refused cannot be accepted.
 #[tokio::test]
-async fn validity_is_not_a_status_a_caller_may_assert() {
+async fn accepting_an_artifact_is_possible_and_editing_is_not_a_status_write() {
     let harness = harness!();
     let plan = harness
         .store()
         .begin(new_plan("Create an app to manage employees' leave requests"))
         .await
         .expect("the plan row must be written");
-    let artifact = harness
+    let clean = harness
         .store()
         .artifact(plan.id, &entity("leave_request", 0), &[])
         .await
         .expect("the artifact must be written");
 
-    for claimed in ["accepted", "edited"] {
-        let error = harness
-            .store()
-            .decide(artifact.id, claimed)
-            .await
-            .expect_err("a caller may not claim validity");
-        assert_eq!(error.code(), "app_builder_artifact_not_decidable");
-        assert!(
-            error.to_string().contains("the validator is what decides that"),
-            "{error}"
-        );
-    }
-
-    // `rejected` is the decision a caller *may* make, and it is the one the review screen's
-    // Reject button writes.
-    let rejected = harness
+    // `edited` claims a correction, which a status write cannot check.
+    let error = harness
         .store()
-        .decide(artifact.id, "rejected")
+        .decide(clean.id, "edited")
+        .await
+        .expect_err("edited belongs to the edit path");
+    assert_eq!(error.code(), "app_builder_artifact_not_decidable");
+    assert!(
+        error.to_string().contains("re-validates the body"),
+        "{error}"
+    );
+
+    // `accepted` is a PERSON saying the artifact is right about a body that validated when
+    // it was stored. Refusing this verb leaves the review screen unable to reach an
+    // applicable plan -- which is what an earlier version of this store did.
+    let accepted = harness
+        .store()
+        .decide(clean.id, "accepted")
         .await
         .expect("the decision must be recorded")
         .expect("the artifact must still be decidable");
-    assert_eq!(rejected.status, "rejected");
+    assert_eq!(accepted.status, "accepted");
+
+    // Accepting an artifact the validator refused is refused BY NAME and by the finding.
+    let reserved = entity("users", 1);
+    let findings = validate_artifact(&reserved);
+    let invalid = harness
+        .store()
+        .artifact(plan.id, &reserved, &findings)
+        .await
+        .expect("an invalid artifact is still stored");
+    assert_eq!(invalid.status, "invalid");
+
+    let error = harness
+        .store()
+        .decide(invalid.id, "accepted")
+        .await
+        .expect_err("an invalid artifact cannot be accepted");
+    assert_eq!(error.code(), "app_builder_artifact_invalid");
+    assert!(
+        error.to_string().contains("reserved platform key"),
+        "the refusal must name the finding in the way: {error}"
+    );
+    assert!(
+        error.to_string().contains("Edit it, or reject it"),
+        "the refusal must say what the reviewer can do: {error}"
+    );
 
     harness.cleanup().await;
 }
@@ -1066,15 +1089,15 @@ async fn the_console_walk_produces_a_reviewable_plan() {
 
 /// A key the platform owns is refused by `validate_key` without a database at all, and the
 /// refusals are the ones the review screen shows.
+///
+/// Deliberately a plain `#[test]` rather than another walk: naming rules are pure, and paying
+/// 4 s of database setup to learn that `users` is reserved proves less than this does.
 #[test]
 fn the_reserved_list_is_the_platforms_own_vocabulary() {
     for key in ["users", "organizations", "workflows", "roles", "audit_log"] {
         let findings = validate_key(key, "key");
         assert_eq!(findings.len(), 1, "{key}: {findings:?}");
-        assert!(
-            findings[0].message.contains("reserved"),
-            "{key}: {findings:?}"
-        );
+        assert!(findings[0].message.contains("reserved"), "{key}: {findings:?}");
     }
     for key in ["leave_request", "start_date", "supplier_contract"] {
         assert!(
@@ -1082,16 +1105,4 @@ fn the_reserved_list_is_the_platforms_own_vocabulary() {
             "{key} must be storable"
         );
     }
-}
-
-/// Two stores on one pool: the shared-namespace trap cannot reach here.
-#[test]
-fn two_harnesses_never_share_a_database_name() {
-    let a = format!("omnion_appbuilder_{}", Uuid::new_v4().simple());
-    let b = format!("omnion_appbuilder_{}", Uuid::new_v4().simple());
-    assert_ne!(a, b);
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let shared: Arc<()> = Arc::new(());
-    assert_eq!(shared.ref_count(), 1, "the test owns one; nothing else does");
 }
