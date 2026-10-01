@@ -10998,3 +10998,23 @@ as product bugs — one of them was a real missing secret, the other three were 
 `content_blocks` 21/21 · `cms_forms` 13/13 · `cms_comments` 12/12 · `cms_seo` 15/15 ·
 `cms_members` 11/11 · `cms_newsletter` 13/14 (14/14 in isolation) · `cms_featured_media` and
 `content_block_media` converted and compiling, runs owed.
+
+**Final sweep proof (same tick, the property that was claimed in the last addendum, re-measured
+on a clean target).** `content_block_media` had **2** stale `omnion_content_block_media_*`
+databases from killed runs; one walk later it has **1** — its own, created and dropped inside the
+run. The two orphans were taken by `IsolatedDb::open`'s sweep, not left behind. The same on
+`cms_comments`. A `cargo test -p omnion-content --lib` closes the tick at **328 passed, 0 failed**.
+
+**`content_block_media` 10/10 and `cms_featured_media` 7/7**, both on the private Postgres.
+`content_block_media` carried the same missing secret as the other five, in a third shape: a
+`csrf_secret()` helper that *reads* `OMNION_CSRF_SECRET` and falls back to the runner's documented
+value, with a comment predicting that a page-creating walk "would fail on the harness" — and it
+did, every time, because the Config never carried the value. The comment blamed the environment
+for a value the suite was already reading. That is the sixth file and the third shape of one
+defect, which is the argument for the shared helper rather than for a sixth copy of the fix.
+
+**Counts on a clean database, one suite at a time, private Postgres.**
+`content_blocks` 21/21 (93 s) · `cms_forms` 13/13 (198 s) · `cms_comments` 12/12 (166 s) ·
+`cms_seo` 15/15 (194 s) · `cms_members` 11/11 (124 s) · `cms_featured_media` 7/7 (78 s) ·
+`content_block_media` 10/10 (116 s) · `cms_newsletter` 13/14 (14/14 in isolation) ·
+`omnion-content --lib` 328/0.
