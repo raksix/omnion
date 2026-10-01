@@ -11524,3 +11524,63 @@ runs. Reclaim at the START of a tick on a full box, never mid-build — a reclai
 `--only=theme-customize` on a free slot, reading the three `data-theme-branding-error` lists out
 of `summary.json` after a provoked refusal. Then REQ-062's Builder criterion (the screen landed
 in an earlier tick; its pass is still owed).
+
+## 2026-10-01 · wave-2 · tick 61 — the contrast badge was measuring the last save
+
+**What.** REQ-062 criterion 11. `POST /api/v1/sites/{id}/theme-settings/contrast-check` — a dry
+run that measures the palette the customize screen is holding — plus the panel wiring that asks
+it on every edit.
+
+**The find.** The screen keeps `form` (the draft being edited) and `view` (the last server
+response) side by side and rendered `view.contrast`, so the badge described the last SAVE while
+the preview beside it showed the draft. Editing the accent into a failing pair printed
+"Every text/background pair in this draft meets WCAG AA" next to the failing colours, and the
+publish refusal — whose entire instruction is "read the contrast panel, then publish again" —
+sent the operator to that all-clear. `acknowledge` was
+`view.contrast.length === 0 || contrastSeen`, so the browser decided whether the server's guard
+ran at all. Rule 2 of the view's own header claimed "measured by the SERVER, on every edit" the
+whole time.
+
+**Why a route and not a browser calculation.** The 422 and the badge must agree; a ratio
+computed in the browser differs in colour-space rounding and in the large-text threshold. The
+dry run merges the theme defaults under the submitted overrides — a token the draft does not
+set is still painted from the theme, so measuring the bare overrides reports a palette the site
+never renders. It is guarded on `themes.read`, not `themes.customize`: it writes nothing, and a
+403 to an account that can read the draft it measures reads as "your palette is broken".
+
+`null` is distinct from `[]` in the panel. `[]` is "measured, nothing fails" and may print the
+all-clear; `null` is "not measured" and may not, so a pending check says "Checking this draft's
+contrast…" and a failed one says it could not check. In a measurement panel, silence reads as a
+pass. An unmeasured palette publishes with `acknowledge: false` and takes the server's refusal.
+
+**Proof**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-api --test cms_theme_settings` | **16 passed / 0 failed** (104 s, real PostgreSQL) |
+| the same walks against a dry run that ignores its body | **14 passed / 2 failed** — proven to fail first |
+| `cargo test -p omnion-content --lib` | **346 passed / 0 failed** |
+| `cargo build -p omnion-api` | clean (warnings pre-existing) |
+| `tsc --noEmit` (apps/admin, real tree) | exit 0 |
+| `node scripts/qa/probe-contrast-live.cjs` | **11/11**, and **2/11 against the pre-change tree** |
+
+Two of the eleven probe checks were red on the first run and were **wrong in the probe, not the
+product**: the guard is a `Layer` in `routes/mod.rs` rather than in the handler file, and the
+acknowledgement is optional-chained. Both were confirmed against the source before the regex
+changed.
+
+**Browser pass: not run.** The slot is held live by `w3` (holder pid 2914377, cwd
+`/mnt/apopic/omnion-w3`, verified with `kill -0` *and* `/proc/<pid>/cwd`); `w7` is running a pass
+too, and load is 15.5 on six cores. Criterion 11 therefore stays **unticked** — the value the
+operator reads is now the server's, but "it matches the palette beside it" is a claim no browser
+has watched. `--only=theme-customize` is owed.
+
+**Disk.** 97 % at the start of the tick and 99 % by the middle. Reclaimed 1.3 GB of my own
+`debug/incremental`, then 485 MB of stale duplicate rlibs in my own `deps` (newest per
+crate-name+extension, skipping anything modified in the last 20 minutes so a running cargo is
+never cut off), keeping `debug/omnion-api` — the QA stack runs that binary. **The volume is the
+gate that kills this loop, not the slot.**
+
+**Next.** `--only=theme-customize` on a free slot: provoke a refusal and read the three
+`data-theme-contrast-pending` / `data-theme-contrast-row` / `data-theme-contrast-ok` states out of
+`summary.json`, which is the only thing that can tick criteria 8 and 11.
