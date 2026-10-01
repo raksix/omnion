@@ -8328,3 +8328,46 @@ fixture was written against the real columns.
 
 **Next.** Run `QA_STACK=w7 … bash scripts/qa/run.sh` when the slot frees, to close three
 browser boxes at once. Then REQ-099 slice 4, REQ-100, REQ-105, REQ-106, REQ-107, REQ-108.
+
+## tick 48 — REQ-101 slice 3h: the decision finally moves the run
+
+**What.** The `reject → stop_reason = cancelled` criterion had been ticked since slice 1, and
+nothing implemented it: `decide()` wrote the status, the decider and the audit row, then
+**returned**. The reviewer saw `rejected`, the run stayed `awaiting_approval` and the step that
+asked stayed `running` — so `resume_point` reported its tool as "may already have fired" for the
+rest of the installation's life. The expiry sweeper already handed the run back on the
+clock-driven path; a decision is the person-driven version of the same event.
+
+- **Approve requeues** (`run_store::requeue_run`), so the runner continues from the parked step.
+- **Reject finishes** the run `cancelled` with the reviewer's reason, and closes the parked step
+  `skipped` — *deliberately not run*, which is what stops `resume_point` reading a settled
+  question as an ambiguous one.
+- **A set-bound gate moves nothing.** This is the half the tick found in its own first draft: a
+  set files one row per gated operation and every row carries the set's `created_by_run`, so the
+  naive `if let Some(run_id)` requeued on the **first** gate of two while the set was still blocked
+  and unappliable. `release_gate` (slice 3d) is the only path that knows whether the set cleared.
+
+**Proof.**
+- `cargo test -p omnion-api --test ai_approvals` → **32 passed** (was 29; +3 walks).
+- `cargo test -p omnion-ai-hub --quiet` → **543 passed**.
+- `pnpm typecheck` → 2/2 packages clean.
+- **The new walk is proven to fail on the pre-fix code**: with the `change_set_id` filter removed
+  it fails `left: "queued" / right: "awaiting_approval"` (0 passed / 1 failed). An assertion that
+  has never been red is a description, not a gate.
+
+**The test that was wrong, twice.** Both new walks first asserted `code() == Some("approved")`.
+`DecisionOutcome::code()` returns `None` *on success by design* — I wrote the assertion against a
+contract the function does not have. The walks now read `approval().status` off the stored row,
+which is both correct and the stronger claim: the row is what the inbox, the detail screen and
+the audit trail read, and a `matches!(…, Decided(_))` would only prove which arm ran.
+
+**Environment, not code.** One run died with `ld terminated with signal 7 [Bus error]`. That is
+`/dev/shm` at **100% (4 K free)**, not a bad build: eight writers hold build caches there. My own
+cache was the 8.4 G one. Reclaimed *only* my own target — rlibs/rmeta older than 4 h, the crashed
+link's 180 M `.tmp`, and stale test executables — with `fuser`/`/proc` confirming nobody held it:
+4.3 G, and `/dev/shm` back to 87%.
+
+**Next.** Run the w7 pass when the slot frees (held by a live w3 holder all tick — a live holder
+is never mine to take). It is the only thing that can close three browser boxes at once: the stale
+banner, the viewer-permission rendering, and slice 3g's proposal card. Then REQ-099 slice 4,
+REQ-100, REQ-105, REQ-106, REQ-107, REQ-108.
