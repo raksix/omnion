@@ -6600,6 +6600,65 @@ Next: slice 3's remaining work is the one this tick made visible — make `crate
 `register_failure` read the **security centre's** lockout document, so the tuned number is the
 enforced number. Then REQ-012's browser pass (still owed, box permitting) for the boxes that name
 a screen.
+
+
+## Tick 93 — REQ-012 slice 3: the enforced threshold is now the tuned threshold
+
+**What.** Slice 3's remaining work, done. `omnion_security::enforce::resolve` is the single
+implementation of "how many failures lock an account" (`3761c541`), `register_failure` reads it and
+honours the failure **window** from the sign-in log rather than a monotonic counter (`171c7998`),
+the walk that tells the two implementations apart ships (`789e388c`), and the per-test peer address
+is fixed at its root (`83d47951`). Four atomic commits, pushed.
+
+**The defect, stated once.** `/security/sign-in-protection` writes `security_settings.lockout` and
+the sign-in path locked from `security_policies.lockout_attempts` — a different table, from a
+different migration, with a different default. Four of the six fields an operator could tune had no
+reader on the request path at all. Every screen, the tester and the probe agreed with each other and
+all of them described something inert.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-identity -p omnion-security --lib` | 114 + 139 passed |
+| `cargo test -p omnion-api --lib` | 261 passed |
+| `cargo test -p omnion-events --lib` | 49 passed |
+| `cargo test -p omnion-permissions --lib` | 63 passed |
+| `cargo test -p omnion-api --test security` | 5 passed (42.7s) |
+| `cargo test -p omnion-api --test auth` | 8 passed (15.6s) |
+| `pnpm typecheck` | exit 0 |
+
+**Proven to fail.** `the_threshold_on_the_screen_is_the_threshold_that_locks` reverts to the legacy
+read and reads `left: Some(10), right: Some(3)`; green again with the fix. Two walks, two
+numbers — the only way to tell them apart.
+
+**The regression this tick nearly shipped backwards, and the trap in it.** Enforcing the document's
+default of 5 (against the IAM column's 10) turned **three unrelated auth walks** red with
+`address_blocked`. Diagnosis, in order, because the first two answers were both wrong:
+
+1. The stale `omnion` development database (real: `VersionMissing(19)` fails all eight auth tests
+   identically — but it accounted for 3 of 6 failures, not all of them).
+2. My new walk polluting its neighbours (wrong: it does not; isolating its peer address changed
+   nothing).
+3. The actual cause — the address rule keys on the **IP** and ignores the port, so
+   `tests/auth.rs::test_peer` varied only the port and every walk in the file shared one
+   `127.0.0.1` budget of `attempts × 3`. At 10 that budget was 30 failures and no walk reached it;
+   at 5 it is 15 and three walks tripped over each other. `attempts: 10` hardcoded was verified to
+   restore 8/8, which is what made the diagnosis certain rather than plausible.
+
+The lesson is the one worth keeping: the tempting repair is to put the 10 back, which makes the
+tests green and the screen a lie again. The harness was wrong, not the product.
+
+**Next.** REQ-012's browser pass is still owed for the boxes that name a screen
+(`/security`, `/security/events`, the locked-accounts table and its unlock). Slices 4 and 5 follow.
+**Browser pass deliberately not started this tick (recorded, not skipped silently).** Tick 93 is
+not a REQ-close tick, and the box this tick proved is a backend walk rather than a screen box. The
+slot was free — the holder PID is dead, so the place file is stale — but the box was not: load 7.15
+on 6 cores, swap 23.5G of 32G used, 35 Chrome processes and two sibling passes (w5, w8) mid
+walkthrough. A third browser pass into that is the documented 29-September failure (consecutive
+passes OOM-killing each other), and killing a sibling's pass to make room for mine trades one
+loop's evidence for another's. The boxes that name a screen stay unticked until a tick finds the
+box idle, which is the same condition `run.sh`'s own `flock` was added to protect.
 ## Tick 36 — REQ-004/REQ-046 harness: a guard on 12 of 23 call sites, and a dead tab that decided the run
 
 **What.** Merged six commits from `origin/main` and then made the QA pass survive the box it runs

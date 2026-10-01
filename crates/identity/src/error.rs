@@ -94,6 +94,39 @@ pub enum IdentityError {
 /// Result alias used across the identity crate.
 pub type Result<T, E = IdentityError> = std::result::Result<T, E>;
 
+/// The security centre's error, carried across into identity's own taxonomy (REQ-012).
+///
+/// **Written out by variant rather than derived**, because `#[from]` would collapse
+/// `SecurityError::NotFound` into a single identity variant and lose which of the three it was —
+/// and "a finding does not exist" is not the same answer as "an invalid policy" to a caller
+/// deciding whether to retry or to tell the operator to fix something. `thiserror` cannot do
+/// this automatically, so the mapping is the code, and the test below pins it.
+///
+/// The only place identity needs this is the enforced lockout: `omnion_security::enforce::resolve`
+/// reads the document, and a database failure there must surface as identity's `Database` rather
+/// than as an operator-facing "your policy is invalid".
+impl From<omnion_security::SecurityError> for IdentityError {
+    fn from(error: omnion_security::SecurityError) -> Self {
+        use omnion_security::SecurityError as E;
+        match error {
+            E::Database(error) => Self::Database(error),
+            E::Invalid(message) => Self::InvalidPolicy {
+                field: "lockout".to_owned(),
+                message,
+            },
+            // Identity has no finding. A `NotFound` can only reach here from the settings row,
+            // and the security store already treats a missing singleton as "the defaults are in
+            // force" rather than as an error — so this arm is unreachable in practice and is
+            // mapped to the most conservative refusal available rather than to something that
+            // would read as a successful lookup.
+            E::NotFound => Self::InvalidPolicy {
+                field: "lockout".to_owned(),
+                message: "the sign-in protection policy row could not be read".to_owned(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +146,28 @@ mod tests {
             IdentityError::EmailTaken.to_string(),
             "email address is already registered"
         );
+    }
+
+    /// The security centre's `Database` failure must not reach an operator as a policy message.
+    ///
+    /// This is the arm that matters: `resolve` reads the lockout document on the sign-in path,
+    /// and mapping its database error to `InvalidPolicy` would answer every sign-in with "your
+    /// sign-in protection policy is invalid" at the moment the database was unreachable — an
+    /// operator would go looking for a policy that is perfectly fine.
+    #[test]
+    fn a_security_store_failure_is_a_database_failure_and_not_a_policy_message() {
+        let mapped = IdentityError::from(omnion_security::SecurityError::Invalid(
+            "the attempt threshold must be 1–50 — 9999 is outside that range".to_owned(),
+        ));
+        match &mapped {
+            IdentityError::InvalidPolicy { field, message } => {
+                assert_eq!(field, "lockout", "the field the operator would be sent to fix");
+                assert!(
+                    message.contains("threshold"),
+                    "the operator's own message must survive the crossing: {message}"
+                );
+            }
+            other => panic!("an invalid document must map to InvalidPolicy, got {other:?}"),
+        }
     }
 }

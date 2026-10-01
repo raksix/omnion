@@ -24,6 +24,7 @@
 
 pub mod csrf;
 pub mod csv;
+pub mod enforce;
 pub mod error;
 pub mod header_store;
 pub mod headers;
@@ -38,6 +39,7 @@ pub mod vocabulary;
 
 pub use csrf::{CSRF_COOKIE, CSRF_HEADER, derive_token as derive_csrf_token, tokens_match};
 pub use csv::{COLUMNS as EXPORT_COLUMNS, MAX_EXPORT_ROWS, render as render_findings_csv};
+pub use enforce::{EnforcedLockout, resolve as resolve_lockout};
 pub use error::{Result, SecurityError};
 pub use header_store::{
     HeaderChange, StoredHeaders, header_history, history_count, load_headers, save_headers,
