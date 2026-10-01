@@ -19,6 +19,7 @@ pub mod folder_store;
 pub mod folders;
 pub mod grants;
 pub mod library;
+pub mod metadata_pairs;
 pub mod model;
 pub mod pixels;
 pub mod preset_store;
@@ -31,6 +32,7 @@ pub mod storage_settings;
 pub mod transform;
 pub mod usage;
 pub mod validation;
+pub mod validators;
 pub mod versions;
 
 pub use browser::{

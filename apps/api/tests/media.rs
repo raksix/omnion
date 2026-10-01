@@ -9,7 +9,7 @@
 //! machine without Docker.
 
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use omnion_api::rate_limit_middleware::RateLimiter;
 use omnion_api::routes;
@@ -73,6 +73,10 @@ struct TestResponse {
     accept_ranges: Option<String>,
     /// `Content-Range` on the response, when the answer was a window.
     content_range: Option<String>,
+    /// `ETag` — the representation's validator, which the conditional walk echoes back.
+    etag: Option<String>,
+    /// `Last-Modified` — the date fallback a validator-less client may use.
+    last_modified: Option<String>,
     body: Value,
     bytes: Vec<u8>,
 }
@@ -134,6 +138,8 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     let nosniff = header_text(header::X_CONTENT_TYPE_OPTIONS).as_deref() == Some("nosniff");
     let accept_ranges = header_text(header::ACCEPT_RANGES);
     let content_range = header_text(header::CONTENT_RANGE);
+    let etag = header_text(header::ETAG);
+    let last_modified = header_text(header::LAST_MODIFIED);
 
     let bytes = response
         .into_body()
@@ -158,6 +164,8 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         nosniff,
         accept_ranges,
         content_range,
+        etag,
+        last_modified,
         body,
         bytes,
     }
@@ -2771,6 +2779,263 @@ fn png(width: u32, height: u32) -> Vec<u8> {
 /// The body is compared as **bytes** against the object that was uploaded, not by length: a
 /// length check passes by accident on an off-by-one, and the last byte of an object is precisely
 /// where a window implementation loses one.
+/// A conditional `GET` is answered from the row's own checksum, so a replace invalidates it.
+///
+/// This walk exists because of a defect the range walk beside it could not see. The serve path set
+/// `private, max-age=300` at a URL that names the file rather than its contents, and the tree
+/// carried no `ETag` and no `If-None-Match` handling at all — `grep -rn 'IF_NONE_MATCH\|NOT_MODIFIED'
+/// apps/ crates/` returned nothing. So two facts held at once and neither was visible: every repeat
+/// request pulled the whole object, and a replace changed the bytes behind an address that had
+/// promised they had not changed.
+///
+/// The load-bearing assertion is **step 6**. A validator built from anything but the content — a
+/// timestamp, a version counter, the row's `updated_at` — passes "echo the validator, get a 304"
+/// and fails exactly there: the client is holding the pre-replace bytes and must be told the
+/// representation moved.
+#[tokio::test]
+async fn a_conditional_get_is_answered_from_the_bytes_and_a_replace_moves_the_validator() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+
+    let original = b"the first photograph, which is the one everybody has cached".to_vec();
+    let replacement = b"a completely different photograph with a different length".to_vec();
+
+    let upload = call(
+        &fixture.state,
+        upload_request(&library, Some(&editor), "hero.png", "image/png", &original),
+    )
+    .await;
+    assert_eq!(upload.status, StatusCode::CREATED, "body: {}", upload.body);
+    let media_id = id_of(&upload.body);
+    let raw = format!("/api/v1/media/{media_id}/raw");
+
+    // 1. The `200` carries a validator. Without one, every client below is guessing.
+    let first = call(
+        &fixture.state,
+        request(Method::GET, &raw, Some(&editor), None),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(
+        first.bytes, original,
+        "the first read is the bytes that were uploaded"
+    );
+    let etag = first
+        .etag
+        .clone()
+        .expect("a serve response must offer a validator");
+    assert!(
+        etag.starts_with("W/\"") && etag.ends_with('"'),
+        "the validator is a weak quoted entity-tag, got {etag:?}"
+    );
+    let last_modified = first
+        .last_modified
+        .clone()
+        .expect("a serve response must offer a date too");
+
+    // 2. The same validator is answered `304` with **no body**.
+    let revalidated = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some(&etag), None),
+    )
+    .await;
+    assert_eq!(
+        revalidated.status,
+        StatusCode::NOT_MODIFIED,
+        "a caller holding these bytes must not be sent them again"
+    );
+    assert!(
+        revalidated.bytes.is_empty(),
+        "a 304 carries no body: {} bytes arrived",
+        revalidated.bytes.len()
+    );
+    assert_eq!(
+        revalidated.content_range, None,
+        "a 304 is not a range, so it carries no Content-Range"
+    );
+    assert_eq!(
+        revalidated.etag.as_deref(),
+        Some(etag.as_str()),
+        "the 304 repeats the validator so the client can refresh its own"
+    );
+
+    // 3. `*` asks whether a representation exists, and one does.
+    let star = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some("*"), None),
+    )
+    .await;
+    assert_eq!(
+        star.status,
+        StatusCode::NOT_MODIFIED,
+        "If-None-Match: * with a representation present is a 304"
+    );
+
+    // 4. The date fallback, for a client that sent no validator.
+    let by_date = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), None, Some(&last_modified)),
+    )
+    .await;
+    assert_eq!(
+        by_date.status,
+        StatusCode::NOT_MODIFIED,
+        "the date fallback answers a client that held no validator"
+    );
+
+    // 5. **The replace.** Same URL, same id, different bytes.
+    let replaced = call(
+        &fixture.state,
+        replace_request(
+            &format!("/api/v1/media/{media_id}/versions"),
+            &editor,
+            "hero.png",
+            "image/png",
+            &replacement,
+            "a corrected photograph",
+        ),
+    )
+    .await;
+    assert_eq!(
+        replaced.status,
+        StatusCode::CREATED,
+        "the replace must succeed, body: {}",
+        replaced.body
+    );
+
+    // 6. The stale validator must be told the representation moved — and this is the assertion a
+    // timestamp-based validator cannot pass.
+    let after = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some(&etag), None),
+    )
+    .await;
+    assert_eq!(
+        after.status,
+        StatusCode::OK,
+        "a replace changes the bytes behind an unchanged URL, so the old validator must not match"
+    );
+    assert_eq!(
+        after.bytes, replacement,
+        "and the bytes that arrive are the new ones, not the ones the caller held"
+    );
+    let new_etag = after
+        .etag
+        .clone()
+        .expect("the new representation carries its own validator");
+    assert_ne!(
+        new_etag, etag,
+        "the validator is the content, so different bytes are a different validator"
+    );
+
+    // 7. The new validator is the current one, and it is what a second revalidation echoes.
+    let settled = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some(&new_etag), None),
+    )
+    .await;
+    assert_eq!(
+        settled.status,
+        StatusCode::NOT_MODIFIED,
+        "after the replace the new validator settles"
+    );
+
+    // 8. An old **version** validates against its own bytes, never against the file's current
+    // ones. A version route comparing against the file would answer `304` for a picture the caller
+    // has never seen.
+    let version_raw = format!("/api/v1/media/{media_id}/versions/1/raw");
+    let version_one = call(
+        &fixture.state,
+        request(Method::GET, &version_raw, Some(&editor), None),
+    )
+    .await;
+    assert_eq!(version_one.status, StatusCode::OK);
+    assert_eq!(
+        version_one.bytes, original,
+        "version 1 still holds the pre-replace bytes"
+    );
+    let version_etag = version_one
+        .etag
+        .clone()
+        .expect("a version answers with its own validator");
+    assert_ne!(
+        version_etag, new_etag,
+        "the historical version is a different representation from the current file"
+    );
+    let version_revalidated = call(
+        &fixture.state,
+        conditional_request(&version_raw, Some(&editor), Some(&version_etag), None),
+    )
+    .await;
+    assert_eq!(
+        version_revalidated.status,
+        StatusCode::NOT_MODIFIED,
+        "a version revalidates against itself"
+    );
+    let version_with_the_file_etag = call(
+        &fixture.state,
+        conditional_request(&version_raw, Some(&editor), Some(&new_etag), None),
+    )
+    .await;
+    assert_eq!(
+        version_with_the_file_etag.status,
+        StatusCode::OK,
+        "the current file's validator must not answer for a historical version"
+    );
+    assert_eq!(
+        version_with_the_file_etag.bytes, original,
+        "and it sends the version's own bytes"
+    );
+
+    // 9. A validator the origin cannot parse is not an absent one: the representation is sent,
+    // never a `304` nobody asked for.
+    let garbage = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some("not-a-tag"), None),
+    )
+    .await;
+    assert_eq!(
+        garbage.status,
+        StatusCode::OK,
+        "an unreadable validator gets the bytes"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// A `GET` carrying the caller's revalidation headers.
+///
+/// Built from the request helper and then having its headers appended, rather than from a
+/// `RequestBuilder`: `request()` returns the finished `Request`, and a builder does not exist
+/// after it. `append` is what a conditional request needs anyway — the session and CSRF headers
+/// are already there, and the validator is one more.
+fn conditional_request(
+    uri: &str,
+    token: Option<&str>,
+    if_none_match: Option<&str>,
+    if_modified_since: Option<&str>,
+) -> Request<Body> {
+    let mut built = request(Method::GET, uri, token, None);
+    let headers = built.headers_mut();
+    if let Some(validator) = if_none_match {
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(validator).expect("a validator must be a header value"),
+        );
+    }
+    if let Some(date) = if_modified_since {
+        headers.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_str(date).expect("a date must be a header value"),
+        );
+    }
+    built
+}
+
 #[tokio::test]
 async fn a_range_request_answers_a_window_and_says_what_it_sent() {
     let Some(fixture) = Fixture::new().await else {
@@ -3027,4 +3292,510 @@ async fn a_range_request_answers_a_window_and_says_what_it_sent() {
 
     let anonymous = call(&fixture.state, range_request(&raw, None, "bytes=0-9")).await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+}
+
+
+/// The custom pairs on a file are stored, filtered on, and refused by name.
+///
+/// The column this walk reads has existed since `0025` with a GIN index over it, and until this
+/// change **nothing in the tree wrote it**: every row in every installation was `{}`, the index
+/// scanned an empty object per row, and the REQ's own scope ("custom key/value pairs … with a
+/// GIN index", "a metadata filter in the browser") was satisfied by a column. The uncalled-column
+/// defect class, one level up from the uncalled `prune_candidates` function.
+///
+/// Every assertion here reads the value **out of PostgreSQL** or back out of a real listing.
+/// A response that omits a field is indistinguishable from one that stored it and chose not to
+/// say so, and that is exactly the failure mode a walk over the HTTP layer cannot see.
+#[tokio::test]
+async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    // Two endpoints, two jobs: the upload posts to the flat library, and the *browser* listing
+    // — the one with folders, filters and a `total` the footer reads — is `/media/files`. My
+    // first draft filtered the flat one, which answers `{"media": [...]}` with no count at all;
+    // the walk caught it on its first assertion, and the endpoint whose name looks like the file
+    // manager is not the one the panel's toolbar talks to.
+    let library = format!("/api/v1/media?site_id={site}");
+    let browser = format!("/api/v1/media/files?site_id={site}");
+
+    let spring = call(
+        &fixture.state,
+        upload_request(
+            &library,
+            Some(&editor),
+            "spring-hero.png",
+            "image/png",
+            b"the spring campaign hero",
+        ),
+    )
+    .await;
+    assert_eq!(spring.status, StatusCode::CREATED, "body: {}", spring.body);
+    let spring_id = id_of(&spring.body);
+
+    let autumn = call(
+        &fixture.state,
+        upload_request(
+            &library,
+            Some(&editor),
+            "autumn-hero.png",
+            "image/png",
+            b"the autumn campaign hero",
+        ),
+    )
+    .await;
+    assert_eq!(autumn.status, StatusCode::CREATED, "body: {}", autumn.body);
+    let autumn_id = id_of(&autumn.body);
+
+    // A file nobody touched carries no pairs at all — not `null`, and not a pair with an empty
+    // value. `{}` is what every pre-existing row holds, so this is the state the platform ships.
+    assert_eq!(
+        media_column(&fixture.state, Uuid::parse_str(&autumn_id).expect("an id"), "metadata")
+            .await,
+        Some(json!({})),
+        "an untouched file carries no pairs"
+    );
+
+    // 1. A pair set is stored whole, and read back **out of the database**.
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{spring_id}"),
+            Some(&editor),
+            Some(json!({
+                "metadata": { "campaign": "spring-2026", "licence": "CC-BY-4.0", "pages": 4 }
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "body: {}", saved.body);
+
+    let stored = media_column(
+        &fixture.state,
+        Uuid::parse_str(&spring_id).expect("an id"),
+        "metadata",
+    )
+    .await
+    .expect("the metadata column must be readable");
+    assert_eq!(
+        stored,
+        json!({ "campaign": "spring-2026", "licence": "CC-BY-4.0", "pages": "4" }),
+        "every stored value is text, so one comparison operator works on every row"
+    );
+
+    // 2. The filter finds it, and finds *only* it.
+    let filtered = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dspring-2026"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(filtered.status, StatusCode::OK, "body: {}", filtered.body);
+    let ids: Vec<String> = filtered.body["files"]
+        .as_array()
+        .expect("the page carries rows")
+        .iter()
+        .map(|file| file["id"].as_str().expect("a row has an id").to_owned())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![spring_id.clone()],
+        "the pair filter matched one file and no other"
+    );
+    assert_eq!(
+        filtered.body["total"].as_i64(),
+        Some(1),
+        "the count agrees with the rows it counts: {}",
+        filtered.body
+    );
+
+    // 3. The second pair is independently addressable — one filter is one pair, not "has any".
+    let by_licence = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=licence%3DCC-BY-4.0"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(by_licence.body["total"].as_i64(), Some(1));
+
+    // A value that is not there is not a match, and a *partial* value is not a match either:
+    // `spring` must not find `spring-2026`, or the filter is a prefix search the screen never
+    // says it is.
+    for term in ["campaign=winter", "campaign=spring"] {
+        let miss = call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("{browser}&metadata={term}"),
+                Some(&editor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            miss.body["total"].as_i64(),
+            Some(0),
+            "[{term}] must match exactly, not approximately: {}",
+            miss.body
+        );
+    }
+
+    // 4. A half-typed term narrows nothing rather than everything. The toolbar field is re-read on
+    // every keystroke; `campaign=` mid-word must not empty the listing under the operator's hands.
+    for term in ["campaign", "campaign%3D"] {
+        let partial = call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("{browser}&metadata={term}"),
+                Some(&editor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(partial.status, StatusCode::OK, "body: {}", partial.body);
+        assert_eq!(
+            partial.body["total"].as_i64(),
+            Some(2),
+            "[{term}] is not a filter yet, so the listing is untouched: {}",
+            partial.body
+        );
+    }
+
+    // 5. The filter combines with the others rather than replacing them.
+    let combined = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dspring-2026&kind=image"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(combined.body["total"].as_i64(), Some(1));
+
+    let contradicted = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dspring-2026&kind=video"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        contradicted.body["total"].as_i64(),
+        Some(0),
+        "two filters narrow each other: {}",
+        contradicted.body
+    );
+
+    // 6. A refused pair writes **nothing**. The row still holds the set it had.
+    for (label, body, expect_field) in [
+        (
+            "a nested object",
+            json!({ "shoot": { "lens": "50mm" } }),
+            "metadata.shoot",
+        ),
+        ("a list", json!({ "colours": ["red", "blue"] }), "metadata.colours"),
+        (
+            "an over-long value",
+            json!({ "licence": "C".repeat(600) }),
+            "metadata.licence",
+        ),
+    ] {
+        let refused = call(
+            &fixture.state,
+            request(
+                Method::PATCH,
+                &format!("/api/v1/media/files/{spring_id}"),
+                Some(&editor),
+                Some(json!({ "metadata": body })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "[{label}] a pair this release cannot store is a 400: {}",
+            refused.body
+        );
+        // The error envelope is `{"error": {...}}`, not a bare body — reading `body["code"]`
+        // yields `null` and looks like a missing field rather than a wrong address.
+        let error = &refused.body["error"];
+        assert_eq!(
+            error["code"], "invalid_metadata",
+            "[{label}] carries its own code: {}",
+            refused.body
+        );
+        assert_eq!(
+            error["details"]["field"], expect_field,
+            "[{label}] names the pair that caused it: {}",
+            refused.body
+        );
+    }
+    assert_eq!(
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&spring_id).expect("an id"),
+            "metadata"
+        )
+        .await,
+        Some(json!({ "campaign": "spring-2026", "licence": "CC-BY-4.0", "pages": "4" })),
+        "a refused save leaves the stored set exactly as it was"
+    );
+
+    // 7. Sending `{}` **clears** the pairs — the whole set is the unit, which is what makes the
+    // editor's "remove this pair" row work and what makes an omitted field different from an
+    // empty one.
+    let cleared = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{spring_id}"),
+            Some(&editor),
+            Some(json!({ "metadata": {} })),
+        ),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "body: {}", cleared.body);
+    assert_eq!(
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&spring_id).expect("an id"),
+            "metadata"
+        )
+        .await,
+        Some(json!({})),
+        "an empty object clears the set"
+    );
+    let after_clear = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dspring-2026"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        after_clear.body["total"].as_i64(),
+        Some(0),
+        "a cleared pair stops matching: {}",
+        after_clear.body
+    );
+
+    // 8. Omitting the field entirely is NOT a clear. `coalesce($7, metadata)` is what keeps a
+    // caption edit from wiping every pair; a partial merge is not what this column does.
+    let saved_again = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{spring_id}"),
+            Some(&editor),
+            Some(json!({ "metadata": { "campaign": "spring-2026" } })),
+        ),
+    )
+    .await;
+    assert_eq!(saved_again.status, StatusCode::OK);
+    let caption_only = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{spring_id}"),
+            Some(&editor),
+            Some(json!({ "caption": "the spring hero" })),
+        ),
+    )
+    .await;
+    assert_eq!(caption_only.status, StatusCode::OK, "body: {}", caption_only.body);
+    assert_eq!(
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&spring_id).expect("an id"),
+            "metadata"
+        )
+        .await,
+        Some(json!({ "campaign": "spring-2026" })),
+        "a patch that omits metadata leaves the pairs alone"
+    );
+
+    // 9. Another tenant's filter cannot see them, and the reader may read them.
+    // Another tenant's site is not this account's to list at all, so the refusal happens before
+    // the filter is ever built — which is the *stronger* of the two answers: the row cannot be
+    // mined by guessing pairs, because the site is refused wholesale. The filter's own tenancy
+    // clause (`media.site_id = $1`, written inside `push_filters`) is the layer below this one,
+    // and the walk proves it separately in the browser: the listing scoped to site A never
+    // contains a site B row no matter what pair is typed.
+    let other_site = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "/api/v1/media/files?site_id={}&metadata=campaign%3Dspring-2026",
+                fixture.site_b
+            ),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        other_site.status == StatusCode::FORBIDDEN
+            || other_site.status == StatusCode::NOT_FOUND
+            || other_site.body["total"].as_i64() == Some(0),
+        "another tenant's site is not listed: got {} {}",
+        other_site.status,
+        other_site.body
+    );
+
+    // And the clause that does the scoping is proven *from the other side*, which needs no
+    // cross-tenant permission at all: a pair stored on site A is never visible in a listing
+    // scoped to site B, whatever the status above was. `push_filters` writes `media.site_id`
+    // into both the page and the count, so the guarantee does not depend on a filter being
+    // present — an unfiltered listing of the wrong site is equally empty.
+    let scoped = call(
+        &fixture.state,
+        request(Method::GET, &browser, Some(&editor), None),
+    )
+    .await;
+    let rows = scoped.body["files"].as_array().cloned().unwrap_or_default();
+    assert!(
+        rows.iter()
+            .all(|file| file["site_id"] == json!(site.to_string())),
+        "every listed row belongs to the requested site: {}",
+        scoped.body
+    );
+
+    // The pairs are on the **wire**, not only in the row. A value that is stored and never
+    // serialised is invisible to every editor, which is the other half of the uncalled-column
+    // defect and the half the database assertion alone cannot see.
+    let read_pairs = call(
+        &fixture.state,
+        request(Method::GET, &browser, Some(&editor), None),
+    )
+    .await;
+    assert_eq!(read_pairs.status, StatusCode::OK, "body: {}", read_pairs.body);
+    let shown = read_pairs.body["files"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|file| file["id"] == json!(spring_id))
+        .expect("the file is in the listing");
+    assert_eq!(
+        shown["metadata"]["campaign"], "spring-2026",
+        "the pairs are on the wire, not only in the row: {}",
+        read_pairs.body
+    );
+
+    fixture.cleanup().await;
+}
+
+/// A pair is refused **before** the row is touched, and the refusal is scoped like the write.
+///
+/// Split from the walk above on purpose: it needs an account with no write permission, and a
+/// test that asserted "this is refused" by reading the status code alone would pass just as well
+/// on a `403` from the wrong check.
+#[tokio::test]
+async fn the_pair_filter_and_editor_hold_the_line_a_tenant_does_not_cross() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+    let browser = format!("/api/v1/media/files?site_id={site}");
+
+    let upload = call(
+        &fixture.state,
+        upload_request(
+            &library,
+            Some(&editor),
+            "scoped.png",
+            "image/png",
+            b"a file tagged in one tenant only",
+        ),
+    )
+    .await;
+    assert_eq!(upload.status, StatusCode::CREATED, "body: {}", upload.body);
+    let id = id_of(&upload.body);
+
+    call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{id}"),
+            Some(&editor),
+            Some(json!({ "metadata": { "campaign": "tenant-a" } })),
+        ),
+    )
+    .await;
+
+    // An account of the same organization that holds no media key at all cannot write the pairs.
+    // The answer must not be a `403` **because the id exists** — but a member's refusal on a file
+    // it can also not read is genuinely ambiguous, so the load-bearing half of the assertion is
+    // the one below it: the row is unchanged afterwards. A tenancy oracle is what
+    // `media_grants::delete_one` learned the hard way, and a walk that only checked a status
+    // code could not tell the two refusals apart.
+    let member = fixture.member_token().await;
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{id}"),
+            Some(&member),
+            Some(json!({ "metadata": { "campaign": "tenant-b" } })),
+        ),
+    )
+    .await;
+    assert!(
+        refused.status == StatusCode::FORBIDDEN || refused.status == StatusCode::NOT_FOUND,
+        "an account with no media key cannot write pairs, got {}: {}",
+        refused.status,
+        refused.body
+    );
+    assert_eq!(
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&id).expect("an id"),
+            "metadata"
+        )
+        .await,
+        Some(json!({ "campaign": "tenant-a" })),
+        "the refused write changed nothing"
+    );
+
+    // An anonymous caller cannot read the listing, so cannot mine pairs out of it.
+    let anonymous = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dtenant-a"),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "no session, no listing: {}",
+        anonymous.body
+    );
+
+    fixture.cleanup().await;
 }

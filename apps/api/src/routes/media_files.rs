@@ -325,6 +325,8 @@ pub struct FileQuery {
     /// Only files with more than one version.
     #[serde(default)]
     pub has_versions: bool,
+    /// Only files whose custom pairs carry this `key=value`.
+    pub metadata: Option<String>,
     /// Sort key.
     pub sort: Option<String>,
     /// Page size (1–500).
@@ -352,6 +354,7 @@ impl FileQuery {
             tag: self.tag.clone(),
             scan_status: self.scan_status.clone(),
             has_versions: self.has_versions,
+            metadata: self.metadata.clone(),
             limit: self.limit.unwrap_or(100).clamp(1, 500),
             offset: self.offset.unwrap_or(0).max(0),
         }
@@ -745,6 +748,14 @@ pub async fn update_file(
     }
     if let Some(tags) = patch.tags.as_deref() {
         patch.tags = Some(normalize_tags(tags));
+    }
+    // The whole pair set is validated and rewritten here, before the row is touched. The write is
+    // a whole-object `coalesce($7, metadata)` — a partial merge would let a caller who does not
+    // know the current set drop every pair they did not send, so "omitted means unchanged" is
+    // false for this one field by design and the type says `Option<Value>`, not a patch map.
+    if let Some(metadata) = patch.metadata.take() {
+        let pairs = omnion_media::metadata_pairs::parse(&metadata)?;
+        patch.metadata = Some(omnion_media::metadata_pairs::to_json(&pairs));
     }
 
     if !omnion_media::update_file(pool, file_id, &patch).await? {
