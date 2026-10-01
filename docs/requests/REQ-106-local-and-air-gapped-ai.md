@@ -1,6 +1,6 @@
 # REQ-106 — Local & Air-gapped AI Mode
 
-> **Status:** in-progress (slice 1 complete; slice 2's storage, events, API and enforcement done — the switch screen and the browser pass are still owed) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
+> **Status:** in-progress (slice 1 complete; slice 2's storage, events, API, enforcement AND the switch screen done — the browser pass is still owed) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -200,6 +200,39 @@ Slice 2 (`a2379ab3`, `84e75a4c`, `779a1ca6`, `c2dc38ce`, `f3e15973`, `a499b745`,
     hand-typed list would under-report, and under-reporting is the direction that hurts.
   * `ai.airgap.manage` is its own key, not a third of the `ai.local.*` family; reading the switch
     is `ai.local.read` because it answers the locality badges' question.
+-->
+
+<!--
+Slice 2's switch screen (`6982ff1c`, `5b59cd9f`, `0e9f65f0`) added `/ai/settings/airgap` and the
+depth pass that drives it. What exists:
+
+  * The confirmation lists the providers that stop, **arriving computed** — the client never
+    rebuilds the locality rule, because a second copy could disagree with the check in the one
+    direction that hurts. Type-to-confirm sits on top of the acknowledgement, and the phrase is
+    this installation's own wording rather than a generic "ENABLE", so the control cannot be
+    completed by muscle memory on a screen full of switches.
+  * The sheet **knows which direction it is**: the reason field is required on the way ON and
+    absent on the way OFF. Showing an OFF sheet with a reason box would hide an emergency action
+    behind a field, which is the exact failure the store's asymmetry exists to avoid.
+  * The egress panel prints "Never verified" as a third state. Folding it into the pass branch would
+    draw an unrun check green, which is the same false reassurance the request calls "the loudest
+    alert in this request" — only softer.
+  * The banner has two tones and the depth pass asserts the `blocked` one; `failed` (a call escaped)
+    is what slice 4's live checker will produce and it outranks the working tone in the UI.
+  * The allow-list editor sits on this screen rather than a second one, so adding an internal host
+    and seeing it stop being refused is one action instead of a hunt.
+
+`pnpm typecheck` caught one real bug in the screen on the way in: `egress_verified_at` is an ISO
+string (serde on `OffsetDateTime`), written as a unix stamp. An unrun verification would have
+rendered `Invalid Date` inside the one sentence on this screen that is supposed to be trustworthy.
+This is the second time in two slices that a wire-shape assumption cost a compile error — read the
+store's struct before assuming what the JSON says.
+
+NOT YET PROVED: the browser pass. It is queued behind w8's live slot. The depth pass restores the
+switch to OFF in its tail — a harness that leaves the air gap on makes every later pass read a
+banner, refuse a chat and measure a screen in an emergency state, and those findings would land in
+another writer's report with nothing connecting them to here. No acceptance row is ticked on the
+strength of code alone.
 -->
 
 ### QA plan
