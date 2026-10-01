@@ -10393,3 +10393,43 @@ SIGKILLed pass never runs its EXIT trap. `/dev/shm` reached **100% (75 MB free)*
 tick with six writers' cargo targets on it, mine among them; nothing live was in mine, but with
 five other directories holding gigabytes each and a running pass that may hold one, reclaiming
 mine buys minutes and risks a sibling's build for nothing. Recorded, not acted on.
+
+
+**Addendum, written when the pass finally returned: the browser gate did not run, and the
+reason is the box rather than the code.** The slot freed mid-tick (w6's walkthrough finished,
+`/dev/shm` dropped from 100% back to 93%), so the pass was started on this writer's own stack
+(`QA_STACK=w5`, ports 18084/3104/3204, database `omnion_qa_w5`) and it took the place
+immediately — `place=1822897 holder=1822938 cwd=/mnt/apopic/omnion-w5`. It walked the page sweep
+for roughly ninety minutes under a load average that reached **203**, and then the shared
+PostgreSQL died underneath it.
+
+| Depth pass | Outcome |
+| --- | --- |
+| `runEventsDepth` | `psql … could not write blocks 6..6: No space left on device` |
+| `runEnvironmentsDepth` | `/environments rendered no rows at all` |
+| `runWebhooksDepth` | `locator.fill` timeout on `[data-webhook-field-name]` |
+| `runRetentionDepth` | `locator.fill` timeout on `[data-retention-window]` |
+| `runCdnRulesDepth` | `psql: connection to server … failed` |
+| `runCdnPurgeDepth` | same |
+
+`/mnt/apopic` — the volume holding the docker data — went to **100% (196 MB free)** mid-pass,
+and `omnion-postgres` is now `Up 9 hours (unhealthy)` and answering `rejecting connections`. The
+first failure is a **write** that ran the disk out; everything after it is that same database
+being unreachable. So the pass produced **no evidence about the gates this tick wrote**, and the
+four passes whose selectors timed out are measuring a dead API, not a broken screen.
+
+**What I did about the disk, and why it was only mine.** `/mnt/apopic/omnion-w5-target` — a
+3.5 GB cargo target in **my own** worktree's namespace, untouched since 30 Sep, with
+`lsof +D` reporting **zero** live files and no cargo pointing at it (this worktree builds to
+`CARGO_TARGET_DIR=/dev/shm/w5-target`). Removed: 100% → 94%, 3.8 GB free. Nothing else was
+touched. There is more reclaimable — `/mnt/apopic/omnion/target` is 5.3 GB, `w8build` 2.7 GB,
+`omnion-w2-target` 1.6 GB — and all of it belongs to other writers, and `/mnt/apopic/omnion-w8/target`
+has 270 live file handles right now. Seven writers are sharing one 60 GB volume and one
+PostgreSQL, and the third symptom of that is a walkthrough that reports `steps: 0` and reads as
+a broken product.
+
+**The gates remain unproven and the two REQs stay open.** Nothing in this tick's gates has been
+executed; the honest position is the one tick 92 recorded, one tick further on. The next
+environments- or cdn-scoped pass to reach a **healthy** stack must read a red in
+`audit-depth-claims` output as a real product defect — and the first thing to establish, before
+any finding is believed, is that `pg_isready` answers.
