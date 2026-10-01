@@ -2138,6 +2138,95 @@ async function runHrLeave(page, report) {
   return { ok: true, steps: steps.length };
 }
 
+/** The self-service surfaces (REQ-055, slice 2c): profile, leave, documents and the request form. */
+async function runHrMe(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "hr", action: "hr-me", ...step });
+  };
+
+  // --- the profile ------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/hr/me`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const profileLoaded = (await page.locator("[data-qa-hr-me-profile]").count()) > 0;
+  note({ step: "profile", loaded: profileLoaded });
+  if (!profileLoaded) {
+    return { ok: false, reason: "the self-service profile did not render", steps };
+  }
+  await shot(page, "page-hr-me");
+
+  // The nav is the surface's own, and it must offer all three destinations -- a self-service group
+  // with one live link is the module-shelf problem one level down.
+  const navLinks = await page.locator("[data-qa-hr-me-link]").count();
+  note({ step: "nav", links: navLinks });
+  if (navLinks < 3) {
+    return { ok: false, reason: `the My workspace nav offers ${navLinks} links, not 3`, steps };
+  }
+
+  // --- the leave, with the year switch ----------------------------------------------------------
+  await page.locator('[data-qa-hr-me-link="leave"]').click().catch(() => {});
+  await page.waitForTimeout(1500);
+  const leaveLoaded = (await page.locator("[data-qa-hr-me-leave]").count()) > 0;
+  note({ step: "leave", loaded: leaveLoaded });
+  if (!leaveLoaded) {
+    return { ok: false, reason: "My leave did not render", steps };
+  }
+  await shot(page, "page-hr-me-leave");
+
+  // The year switch is a control, not a decoration: it writes to the URL, so a reload keeps the
+  // year a person is looking at.
+  const yearNow = (await page.locator("[data-qa-hr-me-leave-year]").first().textContent()) || "";
+  await page.locator("[data-qa-hr-me-year-prev]").click().catch(() => {});
+  await page.waitForTimeout(1500);
+  const yearPrev = (await page.locator("[data-qa-hr-me-leave-year]").first().textContent()) || "";
+  note({ step: "year-switch", from: yearNow.trim(), to: yearPrev.trim() });
+  if (yearNow.trim() === yearPrev.trim()) {
+    return { ok: false, reason: "the year control did not change the year on screen", steps };
+  }
+  // Back to the current year, so the rest of the pass is about a card somebody is looking at.
+  await page.locator("[data-qa-hr-me-year-next]").click().catch(() => {});
+  await page.waitForTimeout(1500);
+
+  // --- the request form, and the counter that must not be a second implementation ----------------
+  await page.locator("[data-qa-hr-me-leave-new]").click().catch(() => {});
+  await page.waitForTimeout(1600);
+  const formLoaded = (await page.locator("[data-qa-hr-me-leave-form]").count()) > 0;
+  note({ step: "form", loaded: formLoaded });
+  if (!formLoaded) {
+    return { ok: false, reason: "the self-service request form did not render", steps };
+  }
+
+  // The same Mon-Sun range the leave pass uses, because a weekend is where a form and a store each
+  // owning the arithmetic first disagree: one implementation counts days between the dates.
+  const base = nextMonday(Date.now() + 70 * 86_400_000);
+  const from = isoOf(base);
+  const to = isoOf(addDays(base, 6));
+  await page.fill("[data-qa-hr-me-leave-from]", from).catch(() => {});
+  await page.fill("[data-qa-hr-me-leave-to]", to).catch(() => {});
+  await page.waitForTimeout(1800);
+  const previewed =
+    (await page.locator("[data-qa-hr-me-leave-preview-days]").first().textContent()) || "";
+  note({ step: "preview", days: previewed.trim() });
+  if (previewed.trim() !== "5") {
+    return {
+      ok: false,
+      reason: `a Mon-Sun range over a weekend previewed as "${previewed.trim()}", not 5 charged days`,
+      steps,
+    };
+  }
+  await shot(page, "page-hr-me-leave-form");
+
+  // --- the documents ----------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/hr/me/documents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const documentsRendered = (await page.locator("[data-qa-hr-me-documents]").count()) > 0;
+  note({ step: "documents", rendered: documentsRendered });
+  await shot(page, "page-hr-me-documents");
+
+  return { ok: true, steps: steps.length };
+}
+
 /** The next Monday at or after `ms`, as midnight UTC. */
 function nextMonday(ms) {
   const date = new Date(ms);
@@ -9960,6 +10049,14 @@ async function main() {
     // the not-found state renders and nothing else — and `runHrLeave` opens a real request instead.
     { path: "/hr/leave", name: "hr-leave" },
     { path: "/hr/leave/new", name: "hr-leave-new" },
+    // The self-service surfaces (REQ-055, slice 2c). In the ordinary list, not only inside a
+    // depth pass, for the same reason as the leave screens above. They are also the **only** HR
+    // routes that answer for an account holding no `hr.*` key, so a pass that only ever signs in
+    // as an approver never exercises the reason the surface exists.
+    { path: "/hr/me", name: "hr-me" },
+    { path: "/hr/me/leave", name: "hr-me-leave" },
+    { path: "/hr/me/leave/new", name: "hr-me-leave-new" },
+    { path: "/hr/me/documents", name: "hr-me-documents" },
     { path: "/hr/leave/types", name: "hr-leave-types" },
     // The security centre's five screens (REQ-012, slices 1–3). `runSecurityDepth` drives the
     // overview, the findings store and the header policy, but it never opened the last two —
@@ -10185,6 +10282,16 @@ async function main() {
   if (!onlyGroup("hr")) {
     report.hrLeave = await runDepthPass("hr-leave", () => runHrLeave(page, report));
     log(`hr leave: ${JSON.stringify(report.hrLeave)}`);
+  }
+
+  // The self-service surfaces (REQ-055, slice 2c). Driven rather than merely visited: the pass
+  // opens the profile, switches the leave year and asserts the year on screen changed, then drives
+  // the request form and checks the previewed day count for a range straddling a weekend -- the
+  // same range the leave pass uses, because "the number shown before submit equals the stored
+  // value" is worthless if the self-service form answers it with a second implementation.
+  if (!onlyGroup("hr")) {
+    report.hrMe = await runDepthPass("hr-me", () => runHrMe(page, report));
+    log(`hr me: ${JSON.stringify(report.hrMe)}`);
   }
 
   if (!onlyGroup("crm")) {
@@ -10465,7 +10572,7 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/crm/contacts", name: "crm-contacts" }, { path: "/crm/companies", name: "crm-companies" }, { path: "/crm/deals", name: "crm-deals-mobile" }, { path: "/crm/activities", name: "crm-activities-mobile" }, { path: "/crm/leads", name: "crm-leads-mobile" }, { path: "/crm/settings/pipelines", name: "crm-pipelines-mobile" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
+  const mobileRoutes = [{ path: "/hr/me/leave", name: "hr-me-leave" }, { path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/crm/contacts", name: "crm-contacts" }, { path: "/crm/companies", name: "crm-companies" }, { path: "/crm/deals", name: "crm-deals-mobile" }, { path: "/crm/activities", name: "crm-activities-mobile" }, { path: "/crm/leads", name: "crm-leads-mobile" }, { path: "/crm/settings/pipelines", name: "crm-pipelines-mobile" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and it carries the
   // CRM screens with the rest: a layout that has never been measured at 390px has not been
