@@ -8874,3 +8874,67 @@ It closes `undo-selection-edge` for `writeSettled: true` beside `edgeRemovedByUn
 `edge-delete`/`edge-delete-undo` for their new `writeSettled`; then `run-from-here` and
 `step-trace` per tick 61's conjunction. `table-save-survives` for `clicked > 0` AND
 `inspected > 0` AND `builderSeesTableEdit: true`. Plugin row stays BLOCKED on REQ-121.
+
+## tick 65 — a blocker four ticks deferred a pass over was never a blocker (2026-10-01)
+
+**The finding.** REQ-004 has carried, in its own words, "**This branch cannot run the DB
+integration tests at all**" since 2026-09-30. Four ticks have quoted it as the reason no
+browser pass ran. It is false, and the test that disproves it was already in the tree when
+the claim about it was typed — `apps/api/tests/migration_gap.rs`, added 2026-09-29
+(`cd2c6f14`), whose header names this exact misbelief: *"Two build logs have since written
+that this makes `migrate()` fail on any fresh database … That is a claim about sqlx's
+`Migrator::run`, so it is tested here rather than believed."*
+
+**Measured, not inherited.** Run against the live server on `:5433`:
+
+| suite | result |
+|---|---|
+| `migration_gap` | **4 passed** / 0 failed (2.85 s) |
+| `ai_workflow_builder` | **10 passed** / 0 failed (34.6 s) |
+| `ai_prompt_step_run` | **2 passed** / 0 failed (9.8 s) |
+| `auth` | 2 passed / **6 failed** — every failure `VersionMissing(19)` |
+
+**Why the gap cannot block a fresh database**, read at the source rather than recalled
+(`sqlx-core-0.8.6/src/migrate/migrator.rs:28`): `validate_applied_migrations` iterates the
+**applied** rows and rejects one whose version is absent from the embedded set. A fresh
+database has no applied rows, so the loop has nothing to reject. The gap is inert by
+construction.
+
+**The real fault, which is a different one and was blamed on the gap.** `auth.rs`'s
+`live_db` does `Db::connect(&config.database)` — no swap, no throwaway database — unlike
+`automation.rs`, which swaps to `postgres` and creates `omnion_<uuid>`. So it migrates the
+**shared `omnion` database**, and that database carries `_sqlx_migrations` row
+`19|cms blocks`, written into it by `omnion-w2` under the shared numbering namespace (27
+rows, max 38). Log line 4907 had already diagnosed this correctly as "a stale QA database
+from a sibling's tree", with the right remedy (a disposable database, as `omnion_build_69`
+was used for); the mislabeling happened when the finding was copied into a place that
+dropped the subject and kept the error string. 31 of 52 suites migrate the shared
+database; 21 build their own.
+
+**Why this is the tick's work and not a typo.** A *believed* blocker is indistinguishable
+from a real one inside a `NOT ticked` note — both render as "no gate is green", so the gate
+looks unrun either way. Four ticks therefore chased the box (slot, load, `/mnt/apopic` at
+94%, Chrome counts) while the gate was green and runnable throughout, and the one thing all
+of them agreed on was the one thing nobody had re-run. **A blocker quoted from an earlier
+tick's note must be re-measured before it is quoted again**, and a claim about what a
+dependency does deserves the test that settles it.
+
+**Also this tick:** merged `origin/main` (`fe223919`, 6 commits, `security`/`events` slices
+3–4). `docs/BUILD-LOG.md` conflicted — append-only from three directions — and was merged
+by `scripts/qa/merge-build-log.py`: base 6800 → merged 8876 lines, exact-multiset verified,
+0 conflict markers, 124 `## ` headings with every heading from both parents present.
+`docs/requests/REQ-004` and `crates/events/**`, `crates/security/**`, `apps/api/**` were
+the only touched files and are resolved.
+
+**Proof.** `cargo test -p omnion-workflows -p omnion-automation -p omnion-events --lib` →
+**323 passed / 0 failed** (117 + 49 + 157) · `pnpm typecheck` → **2/2** · `migration_gap`
+**4/4** · REQ-004's two suites **12/12** · merge multiset verified · commits `fe223919`,
+`b65178e4`.
+
+**Next.** The pass is still queued (`/tmp/w3-tick64-pass.log`); the slot's holder is a live
+`omnion-w8` pass, re-verified with `kill -0` + `/proc/<pid>/cwd`, not by age. Nothing is
+ticked this tick — no criterion gained a reading, and the blocker that stood in for "no
+reading yet" is now gone, so the only thing between the remaining boxes and a tick is a
+free slot. The `auth.rs` shared-database trap is a harness fix in shared infrastructure
+and is not this worktree's to land; it is named here so the next writer does not re-derive
+it as a ledger gap.
