@@ -86,12 +86,7 @@ impl From<&Incident> for IncidentBody {
             detail: incident.detail.clone(),
             started_at: incident.started_at.to_string(),
             resolved_at: incident.resolved_at.map(|at| at.to_string()),
-            state: if incident.is_open() {
-                "open"
-            } else {
-                "resolved"
-            }
-            .to_string(),
+            state: if incident.is_open() { "open" } else { "resolved" }.to_string(),
             duration_seconds: incident.duration_seconds(),
             suppressed: incident.suppressed,
             acknowledged_by: incident.acknowledged_by,
@@ -313,14 +308,16 @@ pub struct IncidentsQuery {
 /// A filter that quietly drops an unparseable `from` returns rows the operator did not ask
 /// for, and the screen cannot tell — so the parse is here, and it names the parameter.
 fn parse_instant(raw: &str, field: &str) -> Result<time::OffsetDateTime, ApiError> {
-    time::OffsetDateTime::parse(raw.trim(), &time::format_description::well_known::Rfc3339).map_err(
-        |_| {
-            ApiError::bad_request(
-                "invalid_incident_filter",
-                format!("{field} must be an RFC 3339 instant, e.g. 2026-09-30T12:00:00Z"),
-            )
-        },
+    time::OffsetDateTime::parse(
+        raw.trim(),
+        &time::format_description::well_known::Rfc3339,
     )
+    .map_err(|_| {
+        ApiError::bad_request(
+            "invalid_incident_filter",
+            format!("{field} must be an RFC 3339 instant, e.g. 2026-09-30T12:00:00Z"),
+        )
+    })
 }
 
 /// `GET /health/incidents` — the list, newest first, with the count behind the filter.
@@ -378,13 +375,8 @@ pub async fn patch_incident(
     let actor = session.user.id;
     let row = match body.action.as_str() {
         "acknowledge" => {
-            omnion_health::acknowledge(
-                state.db().pool(),
-                id,
-                actor,
-                body.note.as_deref().unwrap_or(""),
-            )
-            .await
+            omnion_health::acknowledge(state.db().pool(), id, actor, body.note.as_deref().unwrap_or(""))
+                .await
         }
         "resolve" => omnion_health::resolve(state.db().pool(), id).await,
         other => {
@@ -430,7 +422,10 @@ pub async fn get_settings(State(state): State<AppState>) -> Result<Json<Settings
 /// carries the document, `health_thresholds` carries the validated copy, and a payload built
 /// from only the first would answer "not configured" for a pair the breach emitter is
 /// currently honouring.
-async fn settings_body_from(pool: &sqlx::PgPool, settings: &HealthSettings) -> SettingsBody {
+async fn settings_body_from(
+    pool: &sqlx::PgPool,
+    settings: &HealthSettings,
+) -> SettingsBody {
     let stored: Thresholds = omnion_health::thresholds(pool).await.unwrap_or_default();
     let suggested = omnion_health::suggested_thresholds();
 
@@ -442,9 +437,7 @@ async fn settings_body_from(pool: &sqlx::PgPool, settings: &HealthSettings) -> S
     for metric in THRESHOLD_METRICS {
         let effective = stored.get(*metric).or_else(|| suggested.get(*metric));
         match effective {
-            Some(threshold) => {
-                thresholds.push(ThresholdBody::of(threshold, stored.contains_key(*metric)))
-            }
+            Some(threshold) => thresholds.push(ThresholdBody::of(threshold, stored.contains_key(*metric))),
             None => thresholds.push(ThresholdBody {
                 metric: (*metric).to_string(),
                 warn: 0.0,
@@ -493,9 +486,13 @@ pub async fn put_settings(
             for row in rows {
                 // Every pair goes through the constructor, so the message names the metric
                 // the operator typed wrong rather than "invalid health input".
-                let threshold =
-                    omnion_health::Threshold::new(&row.metric, row.warn, row.crit, &row.direction)
-                        .map_err(map_store)?;
+                let threshold = omnion_health::Threshold::new(
+                    &row.metric,
+                    row.warn,
+                    row.crit,
+                    &row.direction,
+                )
+                .map_err(map_store)?;
                 map.insert(row.metric.clone(), threshold);
             }
             Some(map)
@@ -519,9 +516,7 @@ pub async fn put_settings(
 }
 
 /// `GET /health/maintenance-windows` — the windows, newest first, with an `active` flag.
-pub async fn list_windows(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<MaintenanceWindowBody>>, ApiError> {
+pub async fn list_windows(State(state): State<AppState>) -> Result<Json<Vec<MaintenanceWindowBody>>, ApiError> {
     let rows: Vec<MaintenanceWindow> = sqlx::query_as(
         "select id, starts_at, ends_at, services, note, created_by, created_at \
          from health_maintenance_windows order by starts_at desc, id desc",
@@ -530,7 +525,9 @@ pub async fn list_windows(
     .await
     .map_err(map_store_error)?;
     let now = time::OffsetDateTime::now_utc();
-    Ok(Json(rows.iter().map(|row| window_body(row, now)).collect()))
+    Ok(Json(
+        rows.iter().map(|row| window_body(row, now)).collect(),
+    ))
 }
 
 /// `POST /health/maintenance-windows` — create one.
@@ -714,13 +711,7 @@ mod tests {
         assert!(window_body(&window, inside).active);
         // The end is exclusive, so a window ending exactly now is over — otherwise a window
         // and the moment it ends would both claim to be active.
-        assert!(
-            !window_body(
-                &window,
-                time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(200)
-            )
-            .active
-        );
+        assert!(!window_body(&window, time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(200)).active);
         assert!(!window_body(&window, after).active);
     }
 
@@ -731,8 +722,7 @@ mod tests {
         // path then refuses — which is the "interval 0" criterion arriving by a different
         // route.
         assert_eq!(
-            omnion_health::MIN_CHECK_INTERVAL_SECONDS,
-            5,
+            omnion_health::MIN_CHECK_INTERVAL_SECONDS, 5,
             "the migration says 5"
         );
         assert_eq!(omnion_health::MAX_CHECK_INTERVAL_SECONDS, 600);

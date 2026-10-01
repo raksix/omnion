@@ -18,7 +18,7 @@ use axum::extract::{Path, State};
 use omnion_audit::NewAuditEntry;
 use omnion_cdn::invalidation;
 use omnion_cdn::purge::{
-    self, MAX_TARGETS, NewPurge, PurgeFilter, PurgeInputError, PurgeItemRow, PurgeKind, PurgeStatus,
+    self, NewPurge, PurgeFilter, PurgeInputError, PurgeItemRow, PurgeKind, PurgeStatus, MAX_TARGETS,
 };
 use omnion_cdn::store::{self, SettingsRow};
 use omnion_cdn::{CdnError, is_shipped};
@@ -236,7 +236,8 @@ pub async fn status(
 
     let depth = purge::queue_depth(pool, Some(site_id)).await?;
     let counters = purge::counters(pool, Some(site_id), 24).await?;
-    let (provider, _settings, _attempts) = purge::provider_for_site(pool, Some(site_id)).await?;
+    let (provider, _settings, _attempts) =
+        purge::provider_for_site(pool, Some(site_id)).await?;
 
     let page = purge::list(
         pool,
@@ -307,10 +308,7 @@ pub async fn get_purge(
 /// the purge without the source would make the drawer's "automatic · `page.published`" line
 /// vanish the moment an operator retried a failed automatic purge, and the panel would read
 /// the disappearance as "this one is a manual purge now" — which is exactly backwards.
-async fn detail_of(
-    pool: &sqlx::PgPool,
-    row: purge::PurgeRow,
-) -> Result<PurgeDetailResponse, ApiError> {
+async fn detail_of(pool: &sqlx::PgPool, row: purge::PurgeRow) -> Result<PurgeDetailResponse, ApiError> {
     let items = purge::items_of(pool, row.id).await?;
     // One source per purge by construction (the table's key is `purge_id`), so the first
     // row is the whole answer. A drain that could write two would mean one publication
@@ -341,8 +339,7 @@ pub async fn create_purge(
             .with_details(json!({ "field": "kind" }))
     })?;
 
-    let targets =
-        purge::validate(kind, &input.targets, input.zone_confirmed).map_err(input_error)?;
+    let targets = purge::validate(kind, &input.targets, input.zone_confirmed).map_err(input_error)?;
 
     // The adapter is captured now, not resolved when the worker drains. A purge queued
     // under one provider and drained under another is a history row describing a call
@@ -399,10 +396,7 @@ pub async fn create_purge(
     )
     .await?;
 
-    Ok((
-        axum::http::StatusCode::CREATED,
-        Json(PurgeBody::build(&row)),
-    ))
+    Ok((axum::http::StatusCode::CREATED, Json(PurgeBody::build(&row))))
 }
 
 /// `POST /api/v1/cdn/purges/{id}/retry` — requeue only the failed items.
@@ -440,13 +434,15 @@ pub async fn retry_purge(
     )
     .await?;
 
-    let row = purge::find(state.db().pool(), id).await?.ok_or_else(|| {
-        ApiError::new(
-            axum::http::StatusCode::NOT_FOUND,
-            "purge_not_found",
-            "no cache purge with that id exists",
-        )
-    })?;
+    let row = purge::find(state.db().pool(), id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "purge_not_found",
+                "no cache purge with that id exists",
+            )
+        })?;
     Ok(Json(detail_of(state.db().pool(), row).await?))
 }
 
@@ -460,10 +456,7 @@ pub async fn adapters(current: CurrentSession) -> Result<Json<AdaptersResponse>,
     // reveals which endpoints and capabilities the installation can drive, which is not
     // something an unauthenticated caller should be able to enumerate.
     let _ = current;
-    let list: Vec<_> = omnion_cdn::catalogue()
-        .into_iter()
-        .map(AdapterBody::build)
-        .collect();
+    let list: Vec<_> = omnion_cdn::catalogue().into_iter().map(AdapterBody::build).collect();
     Ok(Json(AdaptersResponse { adapters: list }))
 }
 
@@ -508,16 +501,15 @@ pub async fn put_settings(
         .with_details(json!({ "field": "provider" })));
     }
     if !(1..=1000).contains(&input.batch_size) {
-        return Err(
-            ApiError::bad_request("invalid_batch_size", "batch size must be 1 to 1000")
-                .with_details(json!({ "field": "batch_size" })),
-        );
+        return Err(ApiError::bad_request("invalid_batch_size", "batch size must be 1 to 1000")
+            .with_details(json!({ "field": "batch_size" })));
     }
     if !(1..=10).contains(&input.max_attempts) {
-        return Err(
-            ApiError::bad_request("invalid_max_attempts", "max attempts must be 1 to 10")
-                .with_details(json!({ "field": "max_attempts" })),
-        );
+        return Err(ApiError::bad_request(
+            "invalid_max_attempts",
+            "max attempts must be 1 to 10",
+        )
+        .with_details(json!({ "field": "max_attempts" })));
     }
 
     // The credential is sealed BEFORE the row is written, so a refused credential never
@@ -600,8 +592,7 @@ pub async fn put_settings(
             .ok_or_else(|| {
                 ApiError::from_core(omnion_core::CoreError::Unavailable {
                     dependency: "cdn settings".into(),
-                    message: "the settings row disappeared between the insert and the update"
-                        .into(),
+                    message: "the settings row disappeared between the insert and the update".into(),
                 })
             })?
         }
@@ -644,15 +635,16 @@ pub async fn test_settings(
     }
     let (key, settings, _attempts) =
         purge::provider_for_site(state.db().pool(), query.site_id).await?;
-    let probe =
-        tokio::task::spawn_blocking(move || omnion_cdn::provider_for(&key, &settings).verify())
-            .await
-            .map_err(|error| {
-                ApiError::from_core(omnion_core::CoreError::Unavailable {
-                    dependency: "cdn provider".into(),
-                    message: format!("the reachability check could not be scheduled: {error}"),
-                })
-            })?;
+    let probe = tokio::task::spawn_blocking(move || {
+        omnion_cdn::provider_for(&key, &settings).verify()
+    })
+    .await
+    .map_err(|error| {
+        ApiError::from_core(omnion_core::CoreError::Unavailable {
+            dependency: "cdn provider".into(),
+            message: format!("the reachability check could not be scheduled: {error}"),
+        })
+    })?;
     Ok(Json(TestResponse {
         ok: probe.ok,
         latency_ms: probe.latency_ms,
@@ -884,7 +876,8 @@ fn input_error(error: PurgeInputError) -> ApiError {
         PurgeInputError::MalformedUrl => "invalid_purge_url",
         PurgeInputError::MalformedTag => "invalid_purge_tag",
     };
-    ApiError::bad_request(code, error.to_string()).with_details(json!({ "field": error.field() }))
+    ApiError::bad_request(code, error.to_string())
+        .with_details(json!({ "field": error.field() }))
 }
 
 /// Load a purge and check the caller owns its site.

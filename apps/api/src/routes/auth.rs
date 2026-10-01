@@ -378,26 +378,11 @@ mod tests {
         // The 60/61 pair is the whole reason the arithmetic exists — 60 seconds is 1 minute and
         // 61 is 2, so a truncating division and a rounding one disagree exactly here, and that
         // is the only place they do.
-        assert_eq!(
-            lockout_minutes_between(now(), now() + time::Duration::seconds(90)),
-            2
-        );
-        assert_eq!(
-            lockout_minutes_between(now(), now() + time::Duration::seconds(30)),
-            1
-        );
-        assert_eq!(
-            lockout_minutes_between(now(), now() + time::Duration::seconds(60)),
-            1
-        );
-        assert_eq!(
-            lockout_minutes_between(now(), now() + time::Duration::seconds(61)),
-            2
-        );
-        assert_eq!(
-            lockout_minutes_between(now(), now() + time::Duration::seconds(1)),
-            1
-        );
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(90)), 2);
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(30)), 1);
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(60)), 1);
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(61)), 2);
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(1)), 1);
     }
 
     #[test]

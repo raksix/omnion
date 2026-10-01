@@ -411,7 +411,8 @@ impl WebPushTransport {
                             format!("a registered browser answered {code} and was removed")
                         });
                     } else {
-                        last_reason.get_or_insert_with(|| format!("a device answered {code}"));
+                        last_reason
+                            .get_or_insert_with(|| format!("a device answered {code}"));
                     }
                 }
                 Err(error) => {
@@ -492,12 +493,15 @@ pub fn spawn(state: AppState) -> Option<JoinHandle<()>> {
     // The webhook transport is optional for the reason in its own constructor: an HTTP client
     // that cannot be built is a process misconfiguration, and the runner says so at boot
     // instead of writing a failed row for every queued notification.
-    let timeout =
-        StdDuration::from_millis(config.request_timeout.whole_milliseconds().max(1) as u64);
+    let timeout = StdDuration::from_millis(
+        config.request_timeout.whole_milliseconds().max(1) as u64,
+    );
     match WebhookTransport::new(timeout) {
         Some(webhook) => transports.push(("webhook".to_owned(), Box::new(webhook))),
         None => {
-            tracing::error!("the notification webhook channel has no HTTP client; it will not run");
+            tracing::error!(
+                "the notification webhook channel has no HTTP client; it will not run"
+            );
         }
     }
 
@@ -648,10 +652,7 @@ mod tests {
         // and no browser ever registered, because the panel never asked them to. The reason
         // has to name the screen, or it reads as "push is broken" and the fix is guessed at.
         let transport = push_transport().expect("the test installation has a push key pair");
-        match transport
-            .deliver(&job_pushing_to(&[]), &delivery_config())
-            .await
-        {
+        match transport.deliver(&job_pushing_to(&[]), &delivery_config()).await {
             TransportOutcome::Failed { reason, .. } => {
                 assert!(reason.contains("no registered browser"), "{reason}");
                 assert!(reason.contains("notification settings"), "{reason}");
@@ -674,10 +675,11 @@ mod tests {
         // services at send time, so the constructor refuses it here rather than answering
         // `401` for every notification days after an operator believed push worked.
         assert!(WebPushTransport::new(StdDuration::from_secs(1), &push_config(None)).is_none());
-        assert!(
-            WebPushTransport::new(StdDuration::from_secs(1), &push_config(Some("not-a-url")))
-                .is_none()
-        );
+        assert!(WebPushTransport::new(
+            StdDuration::from_secs(1),
+            &push_config(Some("not-a-url"))
+        )
+        .is_none());
     }
 
     #[test]
@@ -702,10 +704,8 @@ mod tests {
         );
 
         // And it is the public half of the key that signs, not a separately configured value.
-        let signing = VapidKeys::from_private_bytes(
-            &omnion_core::base64url::decode(PUSH_PRIVATE_KEY).expect("b64"),
-        )
-        .expect("a valid scalar");
+        let signing = VapidKeys::from_private_bytes(&omnion_core::base64url::decode(PUSH_PRIVATE_KEY).expect("b64"))
+            .expect("a valid scalar");
         assert_eq!(signing.public_key(), published);
     }
 
@@ -725,10 +725,7 @@ mod tests {
         assert!(keys.contains(&"notification_id"));
         assert!(keys.contains(&"title"));
         assert!(keys.contains(&"url"));
-        assert!(
-            !keys.contains(&"body"),
-            "the body must not leave through push"
-        );
+        assert!(!keys.contains(&"body"), "the body must not leave through push");
         assert!(!keys.contains(&"user_id"), "nor who it was for");
     }
 
@@ -768,7 +765,10 @@ mod tests {
         )]);
         match transport.deliver(&job, &delivery_config()).await {
             TransportOutcome::Failed { reason, .. } => {
-                assert!(reason.contains("could not be reached"), "got: {reason}");
+                assert!(
+                    reason.contains("could not be reached"),
+                    "got: {reason}"
+                );
             }
             other => panic!("nothing is listening on that port, got {other:?}"),
         }
@@ -823,10 +823,12 @@ mod tests {
 
         /// Channels the runner deliberately does not drain yet, and why. Each one is a
         /// `skipped` row in the outbox, never a silent `pending`.
-        const UNTRANSPORTED: [(&str, &str); 1] = [(
-            "chat",
-            "the connector vocabulary is REQ-015's, not the notification crate's",
-        )];
+        const UNTRANSPORTED: [(&str, &str); 1] = [
+            (
+                "chat",
+                "the connector vocabulary is REQ-015's, not the notification crate's",
+            ),
+        ];
 
         for channel in CHANNELS {
             let registered = REGISTERED.contains(&channel);

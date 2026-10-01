@@ -112,7 +112,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tracing::warn!("the notification delivery runner is not running");
         }
     } else {
-        tracing::info!("the notification delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
+        tracing::info!(
+            "the notification delivery runner is disabled (OMNION_EVENTS_RUNNER=false)"
+        );
     }
 
     // The event-retention sweeper ticks in this process too (REQ-016, slice 3), under its own

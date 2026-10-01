@@ -224,16 +224,11 @@ async fn item_targets(pool: &sqlx::PgPool, purge: Uuid) -> Vec<String> {
 
 #[tokio::test]
 async fn publishing_a_page_queues_a_purge_without_anybody_asking() {
-    let Some(harness) = harness().await else {
-        return;
-    };
+    let Some(harness) = harness().await else { return };
     harness.enable(&[Trigger::PagePublished]).await;
 
     let event_id = harness
-        .emit(
-            "page.published",
-            json!({ "page_id": Uuid::new_v4(), "slug": "blog/hello" }),
-        )
+        .emit("page.published", json!({ "page_id": Uuid::new_v4(), "slug": "blog/hello" }))
         .await;
 
     let report = harness.run_drain().await;
@@ -275,15 +270,10 @@ async fn publishing_a_page_queues_a_purge_without_anybody_asking() {
 
 #[tokio::test]
 async fn the_drain_is_exactly_once_across_repeated_walks() {
-    let Some(harness) = harness().await else {
-        return;
-    };
+    let Some(harness) = harness().await else { return };
     harness.enable(&[Trigger::PagePublished]).await;
     harness
-        .emit(
-            "page.published",
-            json!({ "page_id": Uuid::new_v4(), "slug": "one" }),
-        )
+        .emit("page.published", json!({ "page_id": Uuid::new_v4(), "slug": "one" }))
         .await;
 
     let first = harness.run_drain().await;
@@ -306,22 +296,14 @@ async fn the_drain_is_exactly_once_across_repeated_walks() {
 
 #[tokio::test]
 async fn a_second_publication_is_purged_too_and_only_once_each() {
-    let Some(harness) = harness().await else {
-        return;
-    };
+    let Some(harness) = harness().await else { return };
     harness.enable(&[Trigger::PagePublished]).await;
     harness
-        .emit(
-            "page.published",
-            json!({ "page_id": Uuid::new_v4(), "slug": "one" }),
-        )
+        .emit("page.published", json!({ "page_id": Uuid::new_v4(), "slug": "one" }))
         .await;
     harness.run_drain().await;
     harness
-        .emit(
-            "page.published",
-            json!({ "page_id": Uuid::new_v4(), "slug": "two" }),
-        )
+        .emit("page.published", json!({ "page_id": Uuid::new_v4(), "slug": "two" }))
         .await;
 
     let report = harness.run_drain().await;
@@ -346,17 +328,12 @@ async fn a_second_publication_is_purged_too_and_only_once_each() {
 
 #[tokio::test]
 async fn a_trigger_the_operator_turned_off_queues_nothing() {
-    let Some(harness) = harness().await else {
-        return;
-    };
+    let Some(harness) = harness().await else { return };
     // The *other* trigger is on. The point is that the map is consulted per name, not
     // read once as a single yes/no.
     harness.enable(&[Trigger::PageDeleted]).await;
     harness
-        .emit(
-            "page.published",
-            json!({ "page_id": Uuid::new_v4(), "slug": "quiet" }),
-        )
+        .emit("page.published", json!({ "page_id": Uuid::new_v4(), "slug": "quiet" }))
         .await;
 
     let report = harness.run_drain().await;
@@ -371,16 +348,10 @@ async fn a_trigger_the_operator_turned_off_queues_nothing() {
     // *subsequent* publication is then invalidated.
     harness.enable(&[Trigger::PagePublished]).await;
     harness
-        .emit(
-            "page.published",
-            json!({ "page_id": Uuid::new_v4(), "slug": "loud" }),
-        )
+        .emit("page.published", json!({ "page_id": Uuid::new_v4(), "slug": "loud" }))
         .await;
     let report = harness.run_drain().await;
-    assert_eq!(
-        report.queued, 1,
-        "the toggle is the only thing that changed: {report:?}"
-    );
+    assert_eq!(report.queued, 1, "the toggle is the only thing that changed: {report:?}");
 
     // And the publication that arrived while the trigger was off is **not** re-examined
     // now. This is the honest shape of a cursor, and it is worth asserting because the
@@ -406,9 +377,7 @@ async fn a_trigger_the_operator_turned_off_queues_nothing() {
 
 #[tokio::test]
 async fn an_event_with_no_usable_address_queues_nothing() {
-    let Some(harness) = harness().await else {
-        return;
-    };
+    let Some(harness) = harness().await else { return };
     harness.enable(&[Trigger::PagePublished]).await;
 
     // No slug: there is no address to invalidate, and inventing one from the page id would
@@ -430,34 +399,23 @@ async fn an_event_with_no_usable_address_queues_nothing() {
     .await
     .expect("the event must record");
     let report = harness.run_drain().await;
-    assert_eq!(
-        report.queued, 0,
-        "an event with no site has no site cache: {report:?}"
-    );
+    assert_eq!(report.queued, 0, "an event with no site has no site cache: {report:?}");
 
     harness.cleanup().await;
 }
 
 #[tokio::test]
 async fn an_event_from_another_area_is_ignored_without_looking_broken() {
-    let Some(harness) = harness().await else {
-        return;
-    };
+    let Some(harness) = harness().await else { return };
     harness.enable(&[Trigger::PagePublished]).await;
     harness
         .emit("user.created", json!({ "user_id": Uuid::new_v4() }))
         .await;
     harness
-        .emit(
-            "media.created",
-            json!({ "media_id": Uuid::new_v4(), "filename": "a.png" }),
-        )
+        .emit("media.created", json!({ "media_id": Uuid::new_v4(), "filename": "a.png" }))
         .await;
     harness
-        .emit(
-            "page.published",
-            json!({ "page_id": Uuid::new_v4(), "slug": "real" }),
-        )
+        .emit("page.published", json!({ "page_id": Uuid::new_v4(), "slug": "real" }))
         .await;
 
     let report = harness.run_drain().await;
@@ -472,16 +430,11 @@ async fn an_event_from_another_area_is_ignored_without_looking_broken() {
 
 #[tokio::test]
 async fn a_replaced_file_purges_the_media_address_and_not_the_site() {
-    let Some(harness) = harness().await else {
-        return;
-    };
+    let Some(harness) = harness().await else { return };
     harness.enable(&[Trigger::MediaVersionCreated]).await;
     let media = Uuid::new_v4();
     harness
-        .emit(
-            "media.version_created",
-            json!({ "media_id": media, "site_id": harness.site }),
-        )
+        .emit("media.version_created", json!({ "media_id": media, "site_id": harness.site }))
         .await;
 
     let report = harness.run_drain().await;
@@ -489,10 +442,7 @@ async fn a_replaced_file_purges_the_media_address_and_not_the_site() {
     let purges = harness.purges().await;
     assert_eq!(purges.len(), 1);
     let (id, kind, ..) = purges[0].clone();
-    assert_eq!(
-        kind, "tag",
-        "`origin` resolves the tag to the address: {kind}"
-    );
+    assert_eq!(kind, "tag", "`origin` resolves the tag to the address: {kind}");
     assert_eq!(
         item_targets(harness.db.pool(), id).await,
         vec![format!("/api/v1/public/media/{media}")],
@@ -506,9 +456,7 @@ async fn a_replaced_file_purges_the_media_address_and_not_the_site() {
 
 #[tokio::test]
 async fn a_theme_activation_purges_the_whole_site_by_tag() {
-    let Some(harness) = harness().await else {
-        return;
-    };
+    let Some(harness) = harness().await else { return };
     harness.enable(&[Trigger::ThemeActivated]).await;
 
     for slug in ["home", "blog"] {
@@ -523,10 +471,7 @@ async fn a_theme_activation_purges_the_whole_site_by_tag() {
         .expect("the page must insert");
     }
     harness
-        .emit(
-            "theme.activated",
-            json!({ "theme": "atlas", "site_id": harness.site }),
-        )
+        .emit("theme.activated", json!({ "theme": "atlas", "site_id": harness.site }))
         .await;
 
     let report = harness.run_drain().await;
@@ -592,10 +537,7 @@ async fn the_tag_fallback_is_decided_by_the_planner_not_by_the_drain() {
         site,
         &json!({ "theme": "atlas" }),
         &json!({ "theme.activated": true }),
-        &omnion_cdn::provider::Capabilities {
-            tags: true,
-            purge_all: true,
-        },
+        &omnion_cdn::provider::Capabilities { tags: true, purge_all: true },
     );
     assert_eq!(by_tag.kind, omnion_cdn::purge::PurgeKind::Tag);
     assert_eq!(by_tag.targets, vec![invalidation::site_tag(site)]);
@@ -615,15 +557,10 @@ async fn a_queued_automatic_purge_drains_to_succeeded_through_the_worker_path() 
     // The end of the request's diagram: publish -> queue -> the edge agrees. The last step
     // goes through the same claim/apply functions the binary calls, so the status this
     // asserts is one something computed rather than one the walk wrote.
-    let Some(harness) = harness().await else {
-        return;
-    };
+    let Some(harness) = harness().await else { return };
     harness.enable(&[Trigger::PagePublished]).await;
     harness
-        .emit(
-            "page.published",
-            json!({ "page_id": Uuid::new_v4(), "slug": "fresh" }),
-        )
+        .emit("page.published", json!({ "page_id": Uuid::new_v4(), "slug": "fresh" }))
         .await;
     harness.run_drain().await;
 
@@ -657,9 +594,7 @@ async fn a_queued_automatic_purge_drains_to_succeeded_through_the_worker_path() 
     .execute(pool)
     .await
     .expect("the foreign claims must be released");
-    omnion_cdn::purge::mark_running(pool, &[id])
-        .await
-        .expect("the parent must be marked");
+    omnion_cdn::purge::mark_running(pool, &[id]).await.expect("the parent must be marked");
     let outcome = omnion_cdn::PurgeOutcome::Succeeded;
     let (_, message) = omnion_cdn::purge::apply_outcome(
         &mut claimed,
@@ -672,9 +607,7 @@ async fn a_queued_automatic_purge_drains_to_succeeded_through_the_worker_path() 
     omnion_cdn::purge::save_items(pool, &claimed)
         .await
         .expect("the items must write");
-    omnion_cdn::purge::settle(pool, &[id])
-        .await
-        .expect("settle must run");
+    omnion_cdn::purge::settle(pool, &[id]).await.expect("settle must run");
 
     let row: (String, Option<time::OffsetDateTime>) =
         sqlx::query_as("select status, finished_at from cdn_purges where id = $1")

@@ -129,11 +129,7 @@ impl Announcement {
         };
         let missing: Vec<&str> = entry
             .required_fields()
-            .filter(|field| {
-                !payload
-                    .get(field.name)
-                    .is_some_and(|value| !value.is_null())
-            })
+            .filter(|field| !payload.get(field.name).is_some_and(|value| !value.is_null()))
             .map(|field| field.name)
             .collect();
         if !missing.is_empty() {
@@ -209,15 +205,15 @@ pub async fn announce_changes(pool: &PgPool, policy: &PolicyOutcome) -> usize {
             continue;
         }
         let Some(breach) = Announcement::new(
-            "health.threshold.breached",
-            json!({
-                "metric": check.metric,
-                "value": check.value,
-                "crit_limit": check.crit_limit,
-                "window_start": omnion_health::breach_window(time::OffsetDateTime::now_utc()),
-            }),
-            None,
-        ) else {
+                "health.threshold.breached",
+                json!({
+                    "metric": check.metric,
+                    "value": check.value,
+                    "crit_limit": check.crit_limit,
+                    "window_start": omnion_health::breach_window(time::OffsetDateTime::now_utc()),
+                }),
+                None,
+            ) else {
             continue;
         };
         announced += emit_for_subscribers(pool, &breach).await;
@@ -353,73 +349,63 @@ mod tests {
         // actually build rather than on a hand-written stand-in. Every one must be `Some` — a
         // silent `None` here would be the defect the check exists to catch, and a test that only
         // called it for the side effect would pass while the emitters recorded nothing.
-        assert!(
-            Announcement::new(
-                "health.checks.completed",
-                json!({"state": "healthy", "services": 8, "worst_service": ""}),
-                None,
-            )
-            .is_some()
-        );
+        assert!(Announcement::new(
+            "health.checks.completed",
+            json!({"state": "healthy", "services": 8, "worst_service": ""}),
+            None,
+        )
+        .is_some());
 
-        assert!(
-            Announcement::new(
-                "health.service.degraded",
-                json!({
-                    "service": "redis",
-                    "from_state": "healthy",
-                    "to_state": "down",
-                    "message": "no answer",
-                    "incident_id": Uuid::nil(),
-                    "suppressed": false,
-                }),
-                None,
-            )
-            .is_some()
-        );
+        assert!(Announcement::new(
+            "health.service.degraded",
+            json!({
+                "service": "redis",
+                "from_state": "healthy",
+                "to_state": "down",
+                "message": "no answer",
+                "incident_id": Uuid::nil(),
+                "suppressed": false,
+            }),
+            None,
+        )
+        .is_some());
 
-        assert!(
-            Announcement::new(
-                "health.service.recovered",
-                json!({
-                    "service": "redis",
-                    "from_state": "down",
-                    "to_state": "healthy",
-                    "duration_seconds": 42,
-                    "incident_id": Uuid::nil(),
-                }),
-                None,
-            )
-            .is_some()
-        );
+        assert!(Announcement::new(
+            "health.service.recovered",
+            json!({
+                "service": "redis",
+                "from_state": "down",
+                "to_state": "healthy",
+                "duration_seconds": 42,
+                "incident_id": Uuid::nil(),
+            }),
+            None,
+        )
+        .is_some());
 
-        assert!(
-            Announcement::new(
-                "health.threshold.breached",
-                json!({
-                    "metric": "disk_percent",
-                    "value": 97.0,
-                    "crit_limit": 92.0,
-                    "window_start": "2026-09-30T12:00:00Z",
-                }),
-                None,
-            )
-            .is_some()
-        );
+        assert!(Announcement::new(
+            "health.threshold.breached",
+            json!({
+                "metric": "disk_percent",
+                "value": 97.0,
+                "crit_limit": 92.0,
+                "window_start": "2026-09-30T12:00:00Z",
+            }),
+            None,
+        )
+        .is_some());
 
-        assert!(
-            Announcement::new(
-                "health.incident.acknowledged",
-                json!({
-                    "incident_id": Uuid::nil(),
-                    "service": "redis",
-                    "actor": Uuid::nil(),
-                    "note": "on it",
-                }),
-                Some(Uuid::nil()),
-            )
-            .is_some()
-        );
+        assert!(Announcement::new(
+            "health.incident.acknowledged",
+            json!({
+                "incident_id": Uuid::nil(),
+                "service": "redis",
+                "actor": Uuid::nil(),
+                "note": "on it",
+            }),
+            Some(Uuid::nil()),
+        )
+        .is_some());
     }
 
     #[test]
@@ -438,10 +424,12 @@ mod tests {
 
         // A name nobody has heard of is refused the same way, because emitting it would put a
         // row in `events` that no endpoint can ever subscribe to.
-        assert!(
-            Announcement::new("health.service.exploded", json!({"service": "redis"}), None,)
-                .is_none()
-        );
+        assert!(Announcement::new(
+            "health.service.exploded",
+            json!({"service": "redis"}),
+            None,
+        )
+        .is_none());
     }
 
     #[test]
@@ -449,18 +437,16 @@ mod tests {
         // `json!({"service": null})` is a legal `Value` and satisfies a naive `is_some()` check.
         // The gap it would open is the worst kind: the event is recorded, the receiver's
         // required field is null, and nothing anywhere says so.
-        assert!(
-            Announcement::new(
-                "health.service.degraded",
-                json!({
-                    "service": null,
-                    "from_state": "healthy",
-                    "to_state": "down",
-                }),
-                None,
-            )
-            .is_none()
-        );
+        assert!(Announcement::new(
+            "health.service.degraded",
+            json!({
+                "service": null,
+                "from_state": "healthy",
+                "to_state": "down",
+            }),
+            None,
+        )
+        .is_none());
     }
 
     #[test]
@@ -481,14 +467,8 @@ mod tests {
 
         assert!(build("   ").get("note").is_none());
         assert_eq!(build("restarting redis")["note"], json!("restarting redis"));
-        assert!(
-            Announcement::new(
-                "health.incident.acknowledged",
-                build("  "),
-                Some(Uuid::nil())
-            )
-            .is_some()
-        );
+        assert!(Announcement::new("health.incident.acknowledged", build("  "), Some(Uuid::nil()))
+            .is_some());
     }
 
     #[test]

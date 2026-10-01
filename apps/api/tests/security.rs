@@ -73,11 +73,7 @@ impl Harness {
         // ever consulted, and a suite that measured the wrong refusal would look like a guard
         // that works.
         support::walk_auth::with_csrf_secret(&mut config);
-        let csrf_secret = config
-            .csrf
-            .as_bytes()
-            .expect("the suite just set a secret")
-            .to_vec();
+        let csrf_secret = config.csrf.as_bytes().expect("the suite just set a secret").to_vec();
         live_db(&config).await?;
 
         let database = format!("omnion_security_{}", Uuid::new_v4().simple());
@@ -321,30 +317,10 @@ async fn create_organization_row(db: &Db, name: &str) -> Uuid {
 /// compared against itself and pass. Here the path and the key are two claims about the code
 /// that a person made, and each walk checks both: the refusal below must name the key.
 const SURFACE: &[(&str, Method, &str, &str)] = &[
-    (
-        "/api/v1/security/overview",
-        Method::GET,
-        "security.read",
-        "read",
-    ),
-    (
-        "/api/v1/security/findings",
-        Method::GET,
-        "security.read",
-        "read",
-    ),
-    (
-        "/api/v1/security/findings.csv",
-        Method::GET,
-        "security.read",
-        "read",
-    ),
-    (
-        "/api/v1/security/headers",
-        Method::GET,
-        "security.read",
-        "read",
-    ),
+    ("/api/v1/security/overview", Method::GET, "security.read", "read"),
+    ("/api/v1/security/findings", Method::GET, "security.read", "read"),
+    ("/api/v1/security/findings.csv", Method::GET, "security.read", "read"),
+    ("/api/v1/security/headers", Method::GET, "security.read", "read"),
     (
         "/api/v1/security/rate-limits",
         Method::GET,
@@ -425,12 +401,7 @@ const SURFACE: &[(&str, Method, &str, &str)] = &[
 /// would get a validation error, which is still a refusal and still not a `403`. What these
 /// walks assert is that the request is turned away **before** the body is looked at — a guard
 /// is a gate, not a parser.
-fn surface_request(
-    method: Method,
-    uri: &str,
-    kind: &str,
-    credential: Option<&str>,
-) -> Request<Body> {
+fn surface_request(method: Method, uri: &str, kind: &str, credential: Option<&str>) -> Request<Body> {
     let uri = uri.replace("{id}", &Uuid::new_v4().to_string());
     let body = match kind {
         "write" => Some(json!({ "note": "walk" })),
@@ -601,7 +572,8 @@ async fn the_full_holder_passes_the_guard_on_every_route() {
             .await;
 
         assert!(
-            response.status != StatusCode::UNAUTHORIZED && response.status != StatusCode::FORBIDDEN,
+            response.status != StatusCode::UNAUTHORIZED
+                && response.status != StatusCode::FORBIDDEN,
             "{method} {uri} refuses the account that holds {key}; the route is unreachable for \
              everybody. Body: {}",
             response.text

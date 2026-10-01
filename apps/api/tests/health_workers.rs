@@ -29,8 +29,8 @@
 
 #![allow(clippy::too_many_lines)]
 
-use omnion_core::Db;
 use omnion_core::config::{Config, DatabaseConfig};
+use omnion_core::Db;
 use omnion_health::workers::{self, Heartbeat};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -159,9 +159,7 @@ async fn a_repeated_heartbeat_is_one_row_and_keeps_its_start_time() {
     let pool = harness.pool();
 
     let first = beat("scheduler", 101);
-    workers::beat(pool, &first)
-        .await
-        .expect("the first beat writes");
+    workers::beat(pool, &first).await.expect("the first beat writes");
 
     let started_at: time::OffsetDateTime =
         sqlx::query_scalar("select started_at from worker_heartbeats where id = $1")
@@ -182,9 +180,7 @@ async fn a_repeated_heartbeat_is_one_row_and_keeps_its_start_time() {
             .await
             .expect("the row exists");
 
-    workers::beat(pool, &first)
-        .await
-        .expect("the second beat writes");
+    workers::beat(pool, &first).await.expect("the second beat writes");
 
     assert_eq!(
         alive_via_reader(pool).await,
@@ -256,9 +252,7 @@ async fn one_silent_worker_is_named_and_the_limit_is_the_one_that_was_saved() {
             .expect("each worker registers");
     }
 
-    let fresh = workers::rows(pool, 24 * 3_600)
-        .await
-        .expect("the rows are readable");
+    let fresh = workers::rows(pool, 24 * 3_600).await.expect("the rows are readable");
     let summary = workers::summarise(&fresh, i64::from(settings.worker_stale_seconds));
     assert_eq!(summary.alive, 4, "every worker beat: {summary:?}");
     assert_eq!(summary.expected, 3, "three kinds registered");
@@ -282,9 +276,7 @@ async fn one_silent_worker_is_named_and_the_limit_is_the_one_that_was_saved() {
     .await
     .expect("the fixture may age one worker");
 
-    let aged_rows = workers::rows(pool, 24 * 3_600)
-        .await
-        .expect("the rows are readable");
+    let aged_rows = workers::rows(pool, 24 * 3_600).await.expect("the rows are readable");
     let aged = workers::summarise(&aged_rows, i64::from(settings.worker_stale_seconds));
     assert_eq!(aged.alive, 3, "the quiet worker is not counted alive");
     assert_eq!(aged.expected, 3, "the denominator does not shrink");
@@ -298,14 +290,9 @@ async fn one_silent_worker_is_named_and_the_limit_is_the_one_that_was_saved() {
     workers::beat(pool, &beat("delivery", 203))
         .await
         .expect("the worker beats again");
-    let recovered_rows = workers::rows(pool, 24 * 3_600)
-        .await
-        .expect("the rows are readable");
+    let recovered_rows = workers::rows(pool, 24 * 3_600).await.expect("the rows are readable");
     let recovered = workers::summarise(&recovered_rows, i64::from(settings.worker_stale_seconds));
-    assert_eq!(
-        recovered.alive, 4,
-        "beating is what makes it alive: {recovered:?}"
-    );
+    assert_eq!(recovered.alive, 4, "beating is what makes it alive: {recovered:?}");
     assert!(recovered.stale.is_empty());
 
     harness.dispose().await;
@@ -324,20 +311,19 @@ async fn a_clean_stop_is_recorded_as_stopped_rather_than_left_to_go_stale() {
     let pool = harness.pool();
 
     let worker = beat("scheduler", 301);
-    workers::beat(pool, &worker)
-        .await
-        .expect("the worker registers");
+    workers::beat(pool, &worker).await.expect("the worker registers");
 
     let changed = workers::mark_stopped(pool, &worker.id)
         .await
         .expect("the stop must be recorded");
     assert!(changed, "a row that existed must report as changed");
 
-    let (state,): (String,) = sqlx::query_as("select state from worker_heartbeats where id = $1")
-        .bind(&worker.id)
-        .fetch_one(pool)
-        .await
-        .expect("the row survives the stop");
+    let (state,): (String,) =
+        sqlx::query_as("select state from worker_heartbeats where id = $1")
+            .bind(&worker.id)
+            .fetch_one(pool)
+            .await
+            .expect("the row survives the stop");
     assert_eq!(state, "stopped", "a deliberate stop is its own state");
 
     // Stopping a row that is not there is `false`, not an error: a process that never beat must
@@ -368,9 +354,7 @@ async fn a_restart_replaces_the_row_and_does_not_grow_the_fleet() {
     let pool = harness.pool();
 
     let before = beat("api", 401);
-    workers::beat(pool, &before)
-        .await
-        .expect("the first process beats");
+    workers::beat(pool, &before).await.expect("the first process beats");
     let (first_started, first_seen_before_restart): (time::OffsetDateTime, time::OffsetDateTime) =
         sqlx::query_as("select started_at, last_seen_at from worker_heartbeats where id = $1")
             .bind(&before.id)
@@ -384,9 +368,7 @@ async fn a_restart_replaces_the_row_and_does_not_grow_the_fleet() {
         .execute(pool)
         .await
         .expect("the fixture may age the row");
-    workers::beat(pool, &before)
-        .await
-        .expect("the restarted process beats");
+    workers::beat(pool, &before).await.expect("the restarted process beats");
 
     assert_eq!(
         alive_via_reader(pool).await,
@@ -477,9 +459,7 @@ async fn a_worker_outside_the_window_is_not_counted() {
         .await
         .expect("the fixture may age the row");
 
-    let rows = workers::rows(pool, 24 * 3_600)
-        .await
-        .expect("the rows are readable");
+    let rows = workers::rows(pool, 24 * 3_600).await.expect("the rows are readable");
     assert!(
         rows.is_empty(),
         "a month-old heartbeat is not a worker, got {} rows",
@@ -487,10 +467,7 @@ async fn a_worker_outside_the_window_is_not_counted() {
     );
     let summary = workers::summarise(&rows, 120);
     assert_eq!(summary.alive, 0);
-    assert_eq!(
-        summary.expected, 0,
-        "and the denominator does not count it either"
-    );
+    assert_eq!(summary.expected, 0, "and the denominator does not count it either");
 
     harness.dispose().await;
 }

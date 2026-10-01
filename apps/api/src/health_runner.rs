@@ -108,18 +108,15 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
 /// closes: the panel says "stale", which is true and useless, because "we stopped it on
 /// purpose" and "it died" are the two answers an operator needs.
 pub async fn stopped(state: &AppState) {
-    if let Err(error) = omnion_health::mark_stopped(state.db().pool(), &self_heartbeat_id()).await {
+    if let Err(error) = omnion_health::mark_stopped(state.db().pool(), &self_heartbeat_id()).await
+    {
         tracing::warn!(error = %error, "this worker's heartbeat could not be marked stopped");
     }
 }
 
 /// The id this process's heartbeat is stored under.
 fn self_heartbeat_id() -> String {
-    omnion_health::heartbeat_id(
-        WORKER_KIND,
-        &omnion_health::hostname(),
-        std::process::id() as i32,
-    )
+    omnion_health::heartbeat_id(WORKER_KIND, &omnion_health::hostname(), std::process::id() as i32)
 }
 
 /// Write this process's heartbeat row, upserting on conflict.
@@ -181,8 +178,7 @@ async fn run_once(state: &AppState) {
             // opens on `health.checks.completed` and then receives the degraded event for the
             // same tick has to reconcile the two, and delivering the news before the "still
             // working on it" is the order that reads correctly.
-            let announced = crate::health_events::announce_changes(state.db().pool(), &policy)
-                .await
+            let announced = crate::health_events::announce_changes(state.db().pool(), &policy).await
                 + crate::health_events::announce_run(state.db().pool(), &overview, None).await;
             let worst = overview
                 .services

@@ -579,13 +579,14 @@ async fn a_lockout_emits_the_event_once_and_carries_no_attempted_secret() {
     // would produce an event that is written, appears in `/events` as real, and reaches nobody.
     // That is the exact shape of an emitter that forgot `.organization(...)`, and it is why the
     // account is created inside the organization rather than with the shared helper.
-    let organization_id: Uuid =
-        sqlx::query_scalar("insert into organizations (name, slug) values ($1, $2) returning id")
-            .bind("Lockout walk")
-            .bind(format!("lockout-walk-{}", Uuid::new_v4().simple()))
-            .fetch_one(db.pool())
-            .await
-            .expect("the organization must be created");
+    let organization_id: Uuid = sqlx::query_scalar(
+        "insert into organizations (name, slug) values ($1, $2) returning id",
+    )
+    .bind("Lockout walk")
+    .bind(format!("lockout-walk-{}", Uuid::new_v4().simple()))
+    .fetch_one(db.pool())
+    .await
+    .expect("the organization must be created");
 
     let email = format!("lockout-{}@omnion.test", Uuid::new_v4().simple());
     let user = users::create_user(
@@ -660,9 +661,16 @@ async fn a_lockout_emits_the_event_once_and_carries_no_attempted_secret() {
         .await;
         let (mut parts, body) = post_login(&email, "definitely-not-the-password").into_parts();
         if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
-            parts.extensions.insert(axum::extract::ConnectInfo(address));
+            parts
+                .extensions
+                .insert(axum::extract::ConnectInfo(address));
         }
-        let response = call_from(&state, Request::from_parts(parts, body), &peer).await;
+        let response = call_from(
+            &state,
+            Request::from_parts(parts, body),
+            &peer,
+        )
+        .await;
         if response.body["error"]["code"] == "account_locked" {
             locked_at = Some(attempt);
             break;
@@ -735,7 +743,9 @@ async fn a_lockout_emits_the_event_once_and_carries_no_attempted_secret() {
         .await;
         let (mut parts, body) = post_login(&email, "definitely-not-the-password").into_parts();
         if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
-            parts.extensions.insert(axum::extract::ConnectInfo(address));
+            parts
+                .extensions
+                .insert(axum::extract::ConnectInfo(address));
         }
         let response = call_from(&state, Request::from_parts(parts, body), &peer).await;
         assert_eq!(
@@ -760,12 +770,13 @@ async fn a_lockout_emits_the_event_once_and_carries_no_attempted_secret() {
     );
 
     // And the fan-out actually happened: an event nobody is subscribed to is not delivered.
-    let queued: i64 =
-        sqlx::query_scalar("select count(*) from webhook_deliveries where endpoint_id = $1")
-            .bind(endpoint_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("the delivery queue must be readable");
+    let queued: i64 = sqlx::query_scalar(
+        "select count(*) from webhook_deliveries where endpoint_id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("the delivery queue must be readable");
     assert_eq!(
         queued, 1,
         "the lockout event queued {queued} deliveries for its one subscriber; it must queue \

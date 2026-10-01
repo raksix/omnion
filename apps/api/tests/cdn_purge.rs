@@ -1118,11 +1118,7 @@ async fn the_overview_counters_follow_a_real_drain_rather_than_the_queue() {
 
     // No settings row yet, so the adapter is `origin`.
     let ok = fixture
-        .purge(
-            &token,
-            site,
-            json!({ "kind": "url", "targets": ["/served/one"] }),
-        )
+        .purge(&token, site, json!({ "kind": "url", "targets": ["/served/one"] }))
         .await;
     assert_eq!(ok.status, StatusCode::CREATED);
     let ok_id: Uuid = ok.body["id"]
@@ -1161,10 +1157,7 @@ async fn the_overview_counters_follow_a_real_drain_rather_than_the_queue() {
     // Drain one: `origin` accepts it, so the window gains a real success.
     let (failed, attempted) = drain_once(&fixture.state, Some(site)).await;
     assert_eq!(attempted, 1, "the target was sent");
-    assert_eq!(
-        failed, 0,
-        "`origin` accepts every target, so nothing failed"
-    );
+    assert_eq!(failed, 0, "`origin` accepts every target, so nothing failed");
     assert_eq!(
         fixture.detail(&token, &ok_id.to_string()).await.body["purge"]["status"],
         "succeeded",
@@ -1209,11 +1202,7 @@ async fn the_overview_counters_follow_a_real_drain_rather_than_the_queue() {
     );
 
     let bad = fixture
-        .purge(
-            &token,
-            site,
-            json!({ "kind": "url", "targets": ["/never/answers"] }),
-        )
+        .purge(&token, site, json!({ "kind": "url", "targets": ["/never/answers"] }))
         .await;
     assert_eq!(bad.status, StatusCode::CREATED);
     let bad_id: Uuid = bad.body["id"]
@@ -1809,10 +1798,8 @@ async fn a_credential_pasted_in_the_panel_is_stored_and_the_worker_sends_it() {
 
     let head = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
         .await
-        .expect(
-            "the adapter must have called the endpoint: the drain reported no failure, so \
-                 the request either never left the process or never reached the loopback port",
-        )
+        .expect("the adapter must have called the endpoint: the drain reported no failure, so \
+                 the request either never left the process or never reached the loopback port")
         .expect("the recorder's channel must stay open");
     // Matched case-insensitively, and on a prefix plus suffix rather than the whole value.
     // Two separate reasons, and the first is the one that matters: **HTTP header names are
