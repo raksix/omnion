@@ -124,17 +124,31 @@ pub struct AuthenticatedKey {
     pub organization_id: Uuid,
 }
 
+/// Whether a **scope list** grants one permission.
+///
+/// The free function, because two callers need this and neither of them should build a whole
+/// [`ApiKey`] to ask a question about a `Vec<String>`: the API's key guard holds the scopes
+/// after resolving the row, and the crate's own [`AuthenticatedKey::allows`] holds the row.
+///
+/// Exact match, plus the explicit global `*`. That is the whole policy, and the reason is worth
+/// restating at the definition: a prefix or suffix wildcard turns a key's scope list into
+/// decoration. A reviewer reading `omn_abc.def` sees a list of permissions and reasonably
+/// concludes those are the powers it carries — so a key holding `content.pages.read` must not
+/// acquire `content.pages.publish` because they share a prefix.
+#[must_use]
+pub fn scope_allows(scopes: &[String], permission: &str) -> bool {
+    scopes
+        .iter()
+        .any(|scope| scope == permission || scope == "*")
+}
+
 impl AuthenticatedKey {
     /// Whether this key's own scopes include `permission`.
     ///
-    /// Exact match, and that is the decision worth arguing about. A wildcard (`*`, or
-    /// `developer.*`) would be a convenience that turns a key's scope list into decoration: a
-    /// reviewer reading `omn_abc.def` sees a list of permissions and reasonably concludes those
-    /// are the powers. An exact list is longer and cannot mislead. The one concession is the
-    /// global `*`, which is explicit enough to be obvious in a list of twenty entries.
+    /// Delegates to [`scope_allows`], which carries the argument for why the match is exact.
     #[must_use]
     pub fn allows(&self, permission: &str) -> bool {
-        self.key.scopes.iter().any(|scope| scope == permission || scope == "*")
+        scope_allows(&self.key.scopes, permission)
     }
 
     /// The scopes, joined, for a log line or an error detail.

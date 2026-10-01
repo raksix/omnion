@@ -584,14 +584,39 @@ pub fn router(state: AppState) -> Router {
 
     // Content: pages and their revision history (docs/05-VERSIONING.md §4–§7). Reading the
     // history needs the read key; every mutation carries its own.
+    // The content surface is also the developer surface (REQ-033, slice 1): it is what a
+    // developer's first integration calls, so it is the surface that accepts an API key.
+    //
+    // Both guards are installed, session first. `guards::require` resolves the cookie and
+    // `developer_auth::require_or_key` stands aside when it finds one, so a signed-in panel is
+    // unaffected and a bearer token gets the *key's* scope list rather than a role's — which is
+    // the whole difference between the two machine paths documented in `developer_auth`.
+    //
+    // The scope-enforcement boundary this creates is the acceptance criterion: a key holding
+    // only `content.pages.read` reaches `GET /pages` and is refused on `POST /pages` with a 403
+    // naming the permission it lacks.
     let pages = get(content::list_pages)
         .layer(guards::require(&state, "content.pages.read"))
-        .merge(post(content::create_page).layer(guards::require(&state, "content.pages.create")));
+        .layer(crate::developer_auth::require_or_key(&state, "content.pages.read"))
+        .merge(
+            post(content::create_page)
+                .layer(guards::require(&state, "content.pages.create"))
+                .layer(crate::developer_auth::require_or_key(&state, "content.pages.create")),
+        );
 
     let page = get(content::get_page)
         .layer(guards::require(&state, "content.pages.read"))
-        .merge(patch(content::update_page).layer(guards::require(&state, "content.pages.update")))
-        .merge(delete(content::delete_page).layer(guards::require(&state, "content.pages.delete")));
+        .layer(crate::developer_auth::require_or_key(&state, "content.pages.read"))
+        .merge(
+            patch(content::update_page)
+                .layer(guards::require(&state, "content.pages.update"))
+                .layer(crate::developer_auth::require_or_key(&state, "content.pages.update")),
+        )
+        .merge(
+            delete(content::delete_page)
+                .layer(guards::require(&state, "content.pages.delete"))
+                .layer(crate::developer_auth::require_or_key(&state, "content.pages.delete")),
+        );
 
     let page_publish =
         post(content::publish_page).layer(guards::require(&state, "content.pages.publish"));

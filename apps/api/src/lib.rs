@@ -17,6 +17,7 @@ pub mod cluster_runtime;
 pub mod cookies;
 pub mod deployment_check;
 pub mod deployment_runner;
+pub mod developer_auth;
 pub mod dto;
 pub mod environment_clone_runner;
 pub mod error;
