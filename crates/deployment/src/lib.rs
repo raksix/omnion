@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cluster;
 pub mod error;
 pub mod job;
 pub mod jobs;
@@ -22,6 +23,12 @@ pub mod manifest;
 pub mod preflight;
 pub mod version;
 
+pub use cluster::{
+    MAX_WORKLOAD_NAME, Metric, Point, Process, RestartEdit, RestartRefusal, Runtime,
+    SAMPLE_INTERVAL_SECONDS, SAMPLE_RETENTION_MINUTES, SAMPLE_WINDOW_MINUTES, Sparkline, Unit,
+    Usage, Workload, check_restart, format_bytes, format_duration, prune_before, sample_bucket,
+    sparkline,
+};
 pub use error::{FeedContext, StoreError};
 pub use job::{Job, JobKind, JobStatus, Step, StepStatus, cancel_refusal, may_cancel, plan_steps};
 pub use manifest::{
@@ -41,10 +48,21 @@ pub use version::{Availability, Channel, Release, Version, VersionError, availab
 #[cfg(feature = "store")]
 pub mod store;
 
+/// The cluster panel's persistence, behind the same `store` feature.
+///
+/// A module of its own rather than more of [`store`], for the reason the slice's storage is not
+/// the centre's storage: `store` answers "what does the deployment centre know" and this answers
+/// "what did the cluster report a minute ago", with a different lifetime and a different pruning
+/// rule. Folding it in would put a bounded, self-pruning history table behind the same
+/// documentation as the release cache that must never be pruned.
+#[cfg(feature = "store")]
+pub mod cluster_store;
+
+#[cfg(feature = "store")]
+pub use cluster_store::{Recorded, SampleRow};
+
 #[cfg(feature = "store")]
 // `UpdateCheck`, not `CheckState`: `preflight::CheckState` is the pass/warn/fail/unknown of a
 // wizard row, and a crate that exports two things called `CheckState` forces every reader to
 // write the module path to say which one they mean.
-pub use store::{
-    DeploymentRow, HealthRow, HistoryFilter, ReleaseRow, StepRow, UpdateCheck,
-};
+pub use store::{DeploymentRow, HealthRow, HistoryFilter, ReleaseRow, StepRow, UpdateCheck};
