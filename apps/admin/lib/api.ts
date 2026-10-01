@@ -62,7 +62,11 @@ import type {
   DeploymentEnvironmentDetail,
   DeploymentEnvironmentsResponse,
   DeploymentHistoryFilters,
+  DeploymentCancelResponse,
   DeploymentHistoryResponse,
+  DeploymentJobResponse,
+  DeploymentLogChunk,
+  DeploymentPreflight,
   DeploymentHistoryRow,
   DeploymentRelease,
   DeploymentReleaseDetail,
@@ -6616,6 +6620,68 @@ export async function fetchDeploymentChecks(): Promise<DeploymentChecksResponse>
  * needs the answer before the wizard's pre-flight, not a spinner and a re-poll. The response
  * carries *this* run's result, never the previous run's.
  */
+/* ── REQ-024 slice 2: the deploy wizard ───────────────────────────────────────────────────── */
+
+/** Run the pre-flight for a target version. Recomputed server-side on every call. */
+export async function runDeploymentPreflight(
+  environment: string,
+  toVersion: string,
+): Promise<DeploymentPreflight> {
+  return request<DeploymentPreflight>(
+    `/api/v1/deployment/environments/${encodeURIComponent(environment)}/preflight`,
+    { method: "POST", body: JSON.stringify({ to_version: toVersion }) },
+  );
+}
+
+/** Start a deploy. Production additionally requires the typed version. */
+export async function startDeployment(input: {
+  environment: string;
+  toVersion: string;
+  confirmVersion?: string;
+  backupFirst?: boolean;
+  preflightToken?: string;
+  acknowledged?: boolean;
+}): Promise<DeploymentJobResponse> {
+  return request<DeploymentJobResponse>(
+    `/api/v1/deployment/environments/${encodeURIComponent(input.environment)}/deploy`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        to_version: input.toVersion,
+        confirm_version: input.confirmVersion ?? null,
+        // The server defaults this to true; sending it explicitly means the panel's checkbox and
+        // the request cannot drift apart.
+        backup_first: input.backupFirst ?? true,
+        preflight_token: input.preflightToken ?? null,
+        acknowledged: input.acknowledged ?? false,
+      }),
+    },
+  );
+}
+
+/** One poll of a running job. */
+export async function fetchDeploymentJob(id: string): Promise<DeploymentJobResponse> {
+  return request<DeploymentJobResponse>(`/api/v1/deployment/jobs/${encodeURIComponent(id)}`);
+}
+
+/** The log since a cursor. The polling fallback for a browser that cannot hold an SSE open. */
+export async function fetchDeploymentLog(
+  id: string,
+  cursor: number,
+): Promise<DeploymentLogChunk> {
+  return request<DeploymentLogChunk>(
+    `/api/v1/deployment/jobs/${encodeURIComponent(id)}/log?cursor=${cursor}`,
+  );
+}
+
+/** Stop a job before its migrate step. */
+export async function cancelDeployment(id: string): Promise<DeploymentCancelResponse> {
+  return request<DeploymentCancelResponse>(
+    `/api/v1/deployment/jobs/${encodeURIComponent(id)}/cancel`,
+    { method: "POST" },
+  );
+}
+
 export async function runDeploymentCheck(): Promise<DeploymentCheckRunResponse> {
   return request<DeploymentCheckRunResponse>("/api/v1/deployment/checks/run", { method: "POST" });
 }

@@ -2953,6 +2953,73 @@ export type DeploymentEnvironmentCard = {
   last_deploy: DeploymentHistoryRow | null;
 };
 
+/* ── REQ-024 slice 2: the deploy wizard ─────────────────────────────────────────────────────── */
+
+/** One pre-flight row. `state` is `pass`, `warn`, `fail` or `unknown`. */
+export type DeploymentPreflightRow = {
+  id: string;
+  /** The check's title, so the panel does not hard-code the copy. */
+  title: string;
+  state: string;
+  detail: string;
+  /** Empty when there is nothing to suggest. */
+  action: string | null;
+  needs_acknowledgement: boolean;
+};
+
+/** `POST /api/v1/deployment/environments/{id}/preflight`. */
+export type DeploymentPreflight = {
+  checks: DeploymentPreflightRow[];
+  blocked: boolean;
+  can_continue: boolean;
+  needs_acknowledgement: boolean;
+  production: boolean;
+  /** `type_version` for production, `none` elsewhere. */
+  confirmation: string;
+  requires_maintenance_window: boolean;
+  /** Identifies this report; changes when a check's result changes. */
+  token: string;
+};
+
+/** A deploy job, as the wizard's step 3 and the history expansion read it. */
+export type DeploymentJob = {
+  id: string;
+  environment: string;
+  kind: string;
+  status: string;
+  from_version: string | null;
+  to_version: string | null;
+  started_by: string | null;
+  reason: string | null;
+  started_at: string;
+  finished_at: string | null;
+  elapsed_ms: number | null;
+  error: string | null;
+  /** Whole percent, counting finished steps only. */
+  progress_percent: number;
+  cancellable: boolean;
+  /** Why `Cancel` is refused, when it is. */
+  cancel_refusal: string | null;
+  steps: DeploymentStep[];
+};
+
+/** `GET /api/v1/deployment/jobs/{id}`. */
+export type DeploymentJobResponse = { job: DeploymentJob };
+
+/** `GET /api/v1/deployment/jobs/{id}/log?cursor=`. */
+export type DeploymentLogChunk = {
+  chunk: string;
+  cursor: number;
+  running: boolean;
+  status: string;
+};
+
+/** `POST /api/v1/deployment/jobs/{id}/cancel`. */
+export type DeploymentCancelResponse = {
+  job: DeploymentJob;
+  message: string;
+};
+
 /** `GET /api/v1/deployment/environments`. */
 export type DeploymentEnvironmentsResponse = {
   environments: DeploymentEnvironmentCard[];

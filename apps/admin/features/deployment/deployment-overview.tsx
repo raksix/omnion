@@ -340,18 +340,28 @@ function EnvironmentCard({ card }: { card: DeploymentEnvironmentCard }) {
           </span>
         )}
 
-        <span
-          aria-disabled="true"
-          title={
-            card.deployable
-              ? "The deploy wizard arrives with slice 2."
-              : (card.blocked_reason ?? "The deploy wizard arrives with slice 2.")
-          }
-          className="inline-flex cursor-not-allowed items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium text-muted opacity-60"
-        >
-          <Rocket aria-hidden="true" className="size-3.5" />
-          Deploy
-        </span>
+        {/* A live `Deploy` needs a version to deploy *to*, and the card's own `available` line
+            is prose ("2.5.0", "— (up to date)", "2.6.0-rc.1 needs core 2.7.0"). Only the enum
+            says whether there is something to press, and only an upgrade the server offers has a
+            target — so the link is built from `availability`, never by parsing that line. */}
+        {card.deployable && card.availability.state === "upgrade" ? (
+          <Link
+            href={`/deployment/deploy?to=${encodeURIComponent(card.availability.version)}&environment=${encodeURIComponent(card.environment)}`}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium text-ink hover:bg-panel"
+          >
+            <Rocket aria-hidden="true" className="size-3.5" />
+            Deploy
+          </Link>
+        ) : (
+          <span
+            aria-disabled="true"
+            title={card.blocked_reason ?? "There is no release this environment may upgrade to."}
+            className="inline-flex cursor-not-allowed items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium text-muted opacity-60"
+          >
+            <Rocket aria-hidden="true" className="size-3.5" />
+            Deploy
+          </span>
+        )}
 
         <span
           aria-disabled="true"

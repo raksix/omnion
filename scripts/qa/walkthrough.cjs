@@ -10035,6 +10035,12 @@ async function main() {
     { path: "/deployment/releases", name: "deployment-releases" },
     { path: "/deployment/history", name: "deployment-history" },
     { path: "/deployment/checks", name: "deployment-checks" },
+    // The deploy wizard (REQ-024, slice 2). Opened **without** a target on purpose: the
+    // harness must never start a real deploy, and a wizard with no `?to=` renders its
+    // "choose a release first" state, which is a real screen state worth walking. The
+    // pre-flight rows, the acknowledgement gate and the log pane are covered by the
+    // API tests, not by clicking through a production deploy.
+    { path: "/deployment/deploy", name: "deployment-deploy" },
     // The security centre's five screens (REQ-012, slices 1-3). `runSecurityDepth` drives the
     // overview, the findings store and the header policy, but it never opened the last two --
     // and the same is true of the route list, so two screens that ship with rules, a policy
