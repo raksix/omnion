@@ -9690,3 +9690,27 @@ would otherwise start every writer's stack with a wrong password.
 verify button end to end and assert the banner turns red on `escaped`. Then acceptance row 1 by
 walking the SSE frame rather than only the store refusal, then slice 3 (local embeddings / offline
 knowledge), then the doctor checks and the docs page.
+
+**Browser pass: still owed, and this tick proved WHY it cannot simply be run.** Two attempts, both
+dying with `Page crashed`:
+
+1. A pass from an earlier continued turn (`/tmp/w7-tick62-qa.log`) got through **every** route —
+   `ai-local` and `ai-local-models` each rendered 40 elements — and then died in `runAiProviderDepth`
+   with `page.waitForTimeout: Page crashed`.
+2. A focused pass on this slice's own screen only (`QA_ONLY=ai-airgap`) crashed on **80 pages**,
+   including `media-trash`, `backups` and `health-settings` — screens this REQ has never touched.
+
+Eighty crashes across routes no code of mine reaches is not a defect in the slice. The box carries
+7–10 writers, ~35 Chromium processes and **22.3G of 32G swap in use**; Chromium's renderer dies on
+page load rather than degrading. The known mitigations do not help while other writers hold the
+box: the earlier slot rule still applies (read the holder's `fd/1`, never the place file's *name*).
+
+So acceptance row 8 stays `[~]` and the two claims it owes are recorded rather than claimed:
+
+- the HTTP shape end to end through the panel, and the banner turning red on `escaped`;
+- `ai.airgap.verify.passed` / `.failed` reaching the event bus.
+
+Both now have assertions written and waiting (`scripts/qa/walkthrough.cjs`: the run button is
+pressed, the inversion is asserted as `blocked` = pass, the message must say "refused", the badge
+must leave its "never" state on the same screen, and the stored word is read back from the API). The
+next tick with a quiet box runs one command to collect them.
