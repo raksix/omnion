@@ -9852,3 +9852,63 @@ through `/dev/shm`. On this box, write a file to `/dev/shm` first and copy it in
 45 Chrome processes, load 27. REQ-010's screen-state box and this REQ's five screen boxes turn on it.
 
 **Next:** `bash scripts/qa/run.sh --only=media` on a free slot.
+
+## 2026-10-01 · w7 · REQ-106 slice 4 — the doctor
+
+**Shipped:** `902c2d0d` the checks, the derivation and the store · `ec1a8b4f` the screen, the nav
+entry and the depth pass · the `git rm` of a zero-byte `.hermes-tmp` a full disk produced mid-tick.
+Also merged `origin/main` (6 commits, one BUILD-LOG conflict resolved with `merge-build-log.py`).
+
+**What the slice is:** one screen answering "can this machine run AI by itself", as a *list* of
+checks rather than a boolean. The load-bearing decision is that `warn` is a third answer and never a
+soft pass: "we did not establish this" is its own claim, and "Ready for air-gapped operation" may
+only be printed when every check that could establish it did.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --lib` — **614 passed**, 0 failed (603 before this slice, 11 new).
+  No skips: the suite has none.
+- `cargo test -p omnion-api --test ai_local_doctor` — **6 passed** against PostgreSQL, run with an
+  explicit `OMNION_DATABASE_URL` from the container's published dev password and
+  `--test-threads=1` (the suite opens a scratch database per test).
+- `cargo build -p omnion-api` — clean.
+- `pnpm --filter @omnion/admin typecheck` — clean. `node --check scripts/qa/walkthrough.cjs` — clean.
+- NOT RUN: the browser pass. The QA slot was held by **w5** for the whole tick (pids 1269373 /
+  1143404, `cwd=/mnt/apopic/omnion-w5`, alive by `kill -0` and `/proc`). My pass is queued, not
+  failed. The walkthrough's `runAiLocalDoctorDepth` is committed and registered; the acceptance row
+  stays `[~]` for exactly that reason.
+
+**Four defects found while writing, none of which a compile or a typecheck could see.**
+
+1. **A stored `status` that is a cache of a derivation.** `ai_local_doctor_runs.status` existed
+   before this module (the migration declared it), and the first draft read it. The walk now writes
+   a run whose stored word is `failed` with all-passing checks and asserts the reader reports
+   `passed`. A column beside the rows it summarises is a second copy, and two copies drift.
+2. **My own `unreachable!()` in the first draft.** The endpoint helper needed a pool and I wrote a
+   function that returned one — `pool_of(endpoint)` whose body was `unreachable!()`. It would have
+   compiled if `LocalEndpoint` had carried a pool, and it carried a `&LocalEndpoint` that does not.
+   Caught by reading the diff back rather than by the compiler.
+3. **A test asserting my first wording of a correct sentence.** "no egress verification has ever
+   run" vs. the assertion's `never run`. The code was right and the test was narrow: it would have
+   failed on a copy edit and passed on a lie. Now asserted on the claim (says nothing was
+   verified), not the phrase.
+4. **A fixture defect and an assertion that was backwards.** `ai_local_models.id` has **no
+   default** — the fixture omitted it and PostgreSQL named the column, which is how a fixture
+   mistake is found rather than guessed at. And the history walk asserted the newest run was the
+   `failed` one when the reader orders by `started_at`; the regression it meant to describe was
+   built backwards and the walk now constructs the timestamps explicitly so the ordering is
+   decided by the column the query orders on.
+
+**The box, again.** `/mnt/apopic` hit **100% (0 bytes)** between two commands and
+`write_file` returned `{bytes_written: 0, verified: true}` — the same failure mode as tick 62, and
+the 0-byte `.hermes-tmp` it left was swept by `git add -A` into the UI commit before I noticed it.
+Recovered with the project's own `scripts/qa/disk-guard.sh` (which printed `freed ~0M` and still
+freed room) and by waiting out a PostgreSQL crash-recovery that a full disk had triggered —
+`the database system is in recovery mode` reads exactly like a code failure and is the box.
+`/root/w7target` (2.3 G, my own, zero holders, zero writes in 30 minutes) was reclaimed at the top
+of the tick.
+
+**Next:** the browser pass, which is now three slices deep and blocked on the shared QA slot rather
+than on anything in this tree. When it runs it must cover `/ai/local/doctor` (never-run state,
+a real run, a rerun), `/ai/local`, `/ai/local/models` and `/ai/settings/airgap`. After that: slice 3
+(local embeddings, offline knowledge, judge-model refusal), then the "Run AI locally" docs page to
+close REQ-106, then REQ-107 and REQ-108.

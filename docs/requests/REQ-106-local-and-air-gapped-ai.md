@@ -1,6 +1,6 @@
 # REQ-106 — Local & Air-gapped AI Mode
 
-> **Status:** in-progress (slice 1 complete; slice 2's storage, events, API, enforcement AND the switch screen done — the browser pass is still owed) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
+> **Status:** in-progress (slice 1 complete; slice 2's storage, events, API, enforcement AND the switch screen done; slice 4's doctor is code-complete — the browser pass is still owed for all three) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -145,7 +145,7 @@ three cannot drift apart; the allow-list widens it, never replaces it.
 - [ ] A knowledge collection pinned to a local embedding model indexes and searches with the remote provider unreachable (test runs with the remote endpoint pointed at a closed port).
 - [ ] With the air gap on, a collection whose embedding model is remote is listed as blocked with a "needs a local embedding model" chip and a one-click repoint that works when a local embedding model exists.
 - [~] `/api/v1/ai/airgap/verify` reports a pass when the refusal happens and a failure when a call escapes; a failure turns the `/ai/local` banner red and emits `ai.airgap.verify.failed`.
-- [ ] The doctor reports each of reachability, model presence, a one-token completion, embedding presence and dimension, and air-gap state with a pass/warn/fail and a fix hint; a rerun after fixing a check changes the verdict.
+- [~] The doctor reports each of reachability, model presence, a one-token completion, embedding presence and dimension, and air-gap state with a pass/warn/fail and a fix hint; a rerun after fixing a check changes the verdict.
 - [ ] The "Run AI locally" documentation page exists, names the supported servers, the verification steps, and what stops working while the gap is on.
 - [ ] Every screen has empty, loading and error states with a real action; `/ai/local` renders with no endpoint registered at all.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
@@ -326,3 +326,27 @@ pass (390×844) over local overview, models, doctor and the air-gap switch.
   context window, tool support) before an operator points production copilots at a small model.
 - The air gap is a switch that can strand features: the confirmation must list what stops, and the
   refusal message must always name the route that changes it.
+
+<!--
+Slice 4's doctor (`902c2d0d` the checks and the store, `ec1a8b4f` the screen and the pass) proved,
+against a real database and a real socket:
+  * the verdict is **computed from the checks**, so a row whose stored `status` says `failed` with
+    all-passing checks is reported as `passed`. The column is a cache; the derivation is the
+    authority. `a_run_whose_stored_status_lies_is_reported_from_its_checks` writes exactly that row.
+  * an installation with no local endpoint is `warned`, never `passed` — the state of every fresh
+    box, and the one most likely to render a list of green ticks.
+  * a broken endpoint FAILS reachability with a fix, while the checks that depend on it are
+    `warn`: "no models" read off a server that never answered sends an operator looking for models
+    that are on disk, working. This is the sentence the request's "diagnosed with a fix" asks for.
+  * a rerun after the cause is fixed CHANGES that check's verdict — the slice's "done when" — and
+    the walk asserts the changed verdict rather than a number.
+  * the egress check reads the RECORDED verification and never dials out itself: a check that
+    dials outward on every "Run all" is a second source of egress rather than a check against one.
+    `Blocked` is the passing arm, so the inversion survives into the check type.
+  * `read_model_ids` reads BOTH documented shapes (`data[].id` and `models[].model`). A doctor that
+    understood one would report "serves no model" for a healthy Ollama.
+
+NOT PROVED, and this is why the row stays [~]: the browser pass has still not run (the QA slot was
+w8's, then w5's, both live). The screen is written, typed, `node --check`ed and its depth pass is
+registered — a claim about the panel, not a measurement of it. What the pass will assert is listed
+in `runAiLocalDoctorDepth`'s header.
