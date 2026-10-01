@@ -78,11 +78,44 @@ const wants = (name) => ONLY_ALL || ONLY.includes(name);
  * `ONLY === group` compared a whole list to one string and was false for every list spelling.
  */
 const onlyGroup = (group) => ONLY.includes(group);
+/**
+ * TRUE when this section's depth passes belong in the current pass.
+ *
+ * The guard these passes carried was `!onlyGroup(group)`, which reads as "skip this section when
+ * the pass is scoped to it" — so `--only=hr` walked the fourteen `/hr` routes and then SKIPPED
+ * every HR depth pass while running CRM, sales and accounting instead, and a full pass skipped
+ * HR and inventory outright. Scoping a pass to a module therefore proved the module's screens
+ * render and nothing else, and the report said nothing was missing. The polarity is the whole
+ * bug: a section runs when the pass is full, or when the pass named it.
+ */
+const runsSection = (group) => ONLY_ALL || onlyGroup(group);
 // `hr` is listed for the same reason as the other three: the HR depth pass drives the whole chain
 // (raise → preview → decide → calendar), so `--only=hr` has to narrow the ROUTE list too. Without
 // the entry the flag would still run the pass but the walk would visit every other module's screens
 // with it — which is the "scoped pass that is not scoped" shape this table was introduced to stop.
-const SCOPED_SECTIONS = { crm: "/crm", sales: "/sales", inventory: "/inventory", hr: "/hr" };
+const SCOPED_SECTIONS = {
+  crm: "/crm",
+  sales: "/sales",
+  inventory: "/inventory",
+  accounting: "/accounting",
+  hr: "/hr",
+};
+/**
+ * The report keys each scoped section's depth passes write, so a focused pass can count what it
+ * actually ran. Without this list a pass cannot tell "this section proved nothing" from "this
+ * section has no depth passes" — and the inverted-guard bug it now catches was invisible for
+ * exactly that reason: the routes were walked, the report had no section keys in it, and nothing
+ * compared the two. Listed here rather than derived at runtime because the CRM passes are called
+ * bare (each function assigns its own `report.*` key), so the `runDepthPass(` call sites alone do
+ * not name them.
+ */
+const SECTION_PASSES = {
+  crm: ["crm", "crmDeals", "crmActivities", "crmCopilot", "crmLeads", "crmStates", "crmKeyboardMobile"],
+  sales: ["salesCatalog", "salesApprovals", "salesQuotes", "salesOrders", "salesReports"],
+  inventory: ["inventoryLedger", "inventoryTransfers", "inventoryStocktake", "inventoryReports"],
+  accounting: ["accountingDepth", "accountingReports"],
+  hr: ["hrPeopleCore", "hrLeave", "hrDocumentsReports", "hrOnboarding", "hrMe", "hrAttendance"],
+};
 const SHOTS = path.join(OUT, "shots");
 const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome";
 const MAX_PER_PAGE = Number(arg("max-per-page", "40"));
@@ -10761,6 +10794,25 @@ async function main() {
     // bespoke function is a screen whose *inventory* presence nobody checks, and the
     // rule is that a new screen is visited from the ordinary list too.
     { path: "/inventory/reports", name: "inventory-reports" },
+    // The three inventory screens slice 3 added. They shipped with an API, walks and a full table
+    // of state and none of them was ever in this inventory, so no pass had ever opened them -- the
+    // pass drove them through a bespoke `page.goto` inside a depth function, which is precisely the
+    // arrangement that leaves a screen looking tested while nothing checks that it still exists.
+    { path: "/inventory/transfers", name: "inventory-transfers" },
+    { path: "/inventory/stocktake", name: "inventory-stocktake" },
+    { path: "/inventory/alerts", name: "inventory-alerts" },
+    // Accounting (REQ-054). The module shipped nine screens and this list named none of them, so
+    // `--only=accounting` matched no route at all and reported the empty-pass finding while the
+    // depth pass below drove the screens anyway -- a pass whose route inventory and whose depth
+    // pass disagreed about what accounting is. The dynamic `[id]` routes are left out on purpose:
+    // a placeholder id proves the not-found state renders, and `runAccountingDepth` opens real ones.
+    { path: "/accounting/journal", name: "accounting-journal" },
+    { path: "/accounting/accounts", name: "accounting-accounts" },
+    { path: "/accounting/tax-rates", name: "accounting-tax-rates" },
+    { path: "/accounting/reports", name: "accounting-reports-screen" },
+    { path: "/accounting/invoices", name: "accounting-invoices" },
+    { path: "/accounting/invoices/new", name: "accounting-invoice-new" },
+    { path: "/accounting/payments", name: "accounting-payments" },
     // The HR leave surfaces (REQ-055, slice 2b). All three are in the ordinary route list and not
     // only inside the depth pass, for the same reason as the reports screen above: a screen the
     // harness can reach only through a bespoke `page.goto` is a screen whose presence in the
@@ -10985,7 +11037,7 @@ async function main() {
   // no-edit promise measured by counting the controls a row actually carries, the scanner's
   // honest miss, and the adjustment inbox. Scoped to its own group so `--only=sales` does not
   // drag the warehouse in.
-  if (!onlyGroup("sales")) {
+  if (runsSection("sales")) {
     report.inventoryLedger = await runDepthPass(
       "inventory-ledger",
       () => runInventoryLedger(page, report),
@@ -11025,7 +11077,7 @@ async function main() {
   // department and a child of it, two employees with a reporting line between them, reads the
   // counts back off the department screen, opens the org chart tab, and then proves the delete
   // refusal is *visible* on a department that now holds people.
-  if (!onlyGroup("hr")) {
+  if (runsSection("hr")) {
     report.hrPeopleCore = await runDepthPass("hr-people-core", () => runHrPeopleCore(page, report));
     log(`hr people core: ${JSON.stringify(report.hrPeopleCore)}`);
   }
@@ -11033,7 +11085,7 @@ async function main() {
   // The HR leave surfaces (REQ-055, slice 2b). Driven, not merely visited: the pass raises a
   // request through the real form, compares the previewed day count against the stored one,
   // approves it and walks the calendar forward until the approved request draws a bar.
-  if (!onlyGroup("hr")) {
+  if (runsSection("hr")) {
     report.hrLeave = await runDepthPass("hr-leave", () => runHrLeave(page, report));
     log(`hr leave: ${JSON.stringify(report.hrLeave)}`);
 
@@ -11042,7 +11094,7 @@ async function main() {
   // report the served picker offers and asserts each one produced a table. Both screens shipped
   // with an API and walks before either had a route in the inventory, so a pass that only opened
   // them by URL would leave the shelf untested too.
-  if (!onlyGroup("hr")) {
+  if (runsSection("hr")) {
     report.hrDocumentsReports = await runDepthPass("hr-documents-reports", () =>
       runHrDocumentsAndReports(page, report));
     log(`hr documents+reports: ${JSON.stringify(report.hrDocumentsReports)}`);
@@ -11050,7 +11102,7 @@ async function main() {
   // The onboarding board (REQ-055, slice 4b), driven for two things a screenshot cannot show: a bar
   // that carries its number beside it, and a due date rendered as a YYYY-MM-DD day rather than the
   // ordinal array `time`'s serde impl writes.
-  if (!onlyGroup("hr")) {
+  if (runsSection("hr")) {
     report.hrOnboarding = await runDepthPass("hr-onboarding", () => runHrOnboarding(page, report));
     log(`hr onboarding: ${JSON.stringify(report.hrOnboarding)}`);
   }
@@ -11073,14 +11125,14 @@ async function main() {
     log(`hr me: ${JSON.stringify(report.hrMe)}`);
   }
 
-  if (!onlyGroup("hr")) {
+  if (runsSection("hr")) {
     report.hrMe = await runDepthPass("hr-me", () => runHrMe(page, report));
     log(`hr me: ${JSON.stringify(report.hrMe)}`);
 
   // The clock (REQ-055, slice 2d). Driven rather than merely visited: the pass presses the punch
   // and then presses it again, because "a second check-in is refused" is the criterion and a
   // click-through pass that visits the page never finds out.
-  if (!onlyGroup("hr")) {
+  if (runsSection("hr")) {
     report.hrAttendance = await runDepthPass("hr-attendance", () => runHrAttendance(page, report));
     log(`hr attendance: ${JSON.stringify(report.hrAttendance)}`);
   }
@@ -11109,7 +11161,7 @@ async function main() {
   // The accounting desk (REQ-054, slice 1): the journal, the chart and the rates, and — the
   // point of the pass — an unbalanced entry refused with a message that names the numbers.
   // Scoped so it can be run on its own: `--only=accounting`.
-  if (!onlyGroup("accounting")) {
+  if (runsSection("accounting")) {
     report.accountingDepth = await runDepthPass("accounting-depth", () =>
       runAccountingDepth(page, report),
     );
@@ -11264,6 +11316,10 @@ async function main() {
 
   } // end the non-CRM depth passes skipped by a scoped pass
 
+  // The CRM depth passes ran UNGUARDED while the sections around them were scoped, so a pass
+  // scoped to another module spent its minutes on CRM and then reported the CRM results as if
+  // they belonged to the module it was asked about. Scoped like every other section now.
+  if (runsSection("crm")) {
   // The CRM pass (REQ-051, slice 2): a company, a contact on it, an inline edit that survives a
   // reload, a saved view, a column chooser, a filter that is a URL, an import dry run with one
   // refused row and a CSV export read back from the API.
@@ -11307,6 +11363,7 @@ async function main() {
     runCrmKeyboardAndMobile(page, report),
   );
   log(`crm keyboard + mobile: ${JSON.stringify(report.crmKeyboardMobile)}`);
+  } // end the CRM depth passes
 
   if (!onlyGroup("crm")) {
   // Sign-out is exercised last so it cannot break the walk.
@@ -11364,7 +11421,7 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }, { path: "path", name: "name" }];
+  const mobileRoutes = [{ path: "/hr/me/leave", name: "hr-me-leave" }, { path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/crm/contacts", name: "crm-contacts" }, { path: "/crm/companies", name: "crm-companies" }, { path: "/crm/deals", name: "crm-deals-mobile" }, { path: "/crm/activities", name: "crm-activities-mobile" }, { path: "/crm/leads", name: "crm-leads-mobile" }, { path: "/crm/settings/pipelines", name: "crm-pipelines-mobile" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and it carries the
   // CRM screens with the rest: a layout that has never been measured at 390px has not been
@@ -11482,6 +11539,26 @@ async function main() {
   // as "the screens passed". The one thing a focused pass must not be is indistinguishable
   // from a pass that proved nothing because it was pointed at nothing. The count is also
   // printed in the log line above, so a reader can tell how much of the panel was covered.
+  // A scoped pass must say which of its section's depth passes it actually RAN. Without this the
+  // inverted-guard bug was invisible: `--only=hr` walked 14/14 HR routes, ran zero HR depth
+  // passes, and still printed a normal coverage line. The routes are walked by the loop above and
+  // the passes are called inside the sections, so neither counter can see the other's failure.
+  if (!ONLY_ALL) {
+    for (const group of Object.keys(SCOPED_SECTIONS)) {
+      if (!onlyGroup(group)) continue;
+      const expected = SECTION_PASSES[group] || [];
+      const ran = expected.filter((key) => Object.hasOwn(report, key));
+      log(`section ${group}: ${ran.length}/${expected.length} depth pass(es) ran`);
+      if (ran.length === 0) {
+        pushFindings(
+          "high",
+          "section-drove-nothing",
+          `--only=${ONLY.join(",")} named ${group} but ran none of its depth passes: the pass proved only that its routes render`,
+        );
+      }
+    }
+  }
+
   if (!ONLY_ALL) {
     // A SECTION name (`crm`, `sales`, `inventory`) is a legitimate filter that is deliberately
     // not a route name, so it is absent from `matchedOnly` by construction — `onlyGroup()` asks
