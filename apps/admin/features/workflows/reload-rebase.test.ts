@@ -52,6 +52,37 @@ const snap = (ids: string[]): HistorySnapshot =>
 const historyWithOneEntry = () =>
   record(emptyHistory(), { key: "add:mine", before: snap([]), after: snap(["mine"]), now: 1000 });
 
+/**
+ * The arguments of a call expression, split at paren/bracket depth zero.
+ *
+ * Counting commas is the obvious version and it is wrong twice over: a trailing comma is an
+ * extra one, and `map((n) => n.id)` carries a comma inside the parens the split ignores. A
+ * guard built on it measures the formatter's mood rather than the call, and the response to
+ * it going red is to widen the expected number — which is how a broken guard becomes a green
+ * one. Depth is the only count here that tracks the thing being asserted.
+ */
+const countTopLevelArgs = (call: string): string[] => {
+  const open = call.indexOf("(");
+  const body = call.slice(open + 1, call.lastIndexOf(")"));
+  const args: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const char of body) {
+    if (char === "(" || char === "[" || char === "{") depth += 1;
+    else if (char === ")" || char === "]" || char === "}") depth -= 1;
+    if (char === "," && depth === 0) {
+      args.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim() !== "") {
+    args.push(current.trim());
+  }
+  return args;
+};
+
 test("the history survives a reload, and the Undo button stays enabled", () => {
   // The state the product was in. Written as the precondition rather than asserted as a defect,
   // so the next assertion below reads as a change in behaviour rather than as a second fact
@@ -144,15 +175,80 @@ test("a deleted FOCUS inside a group falls back to a member the author had also 
   assert.deepEqual(rebased.selection.nodes, ["a", "b"]);
 });
 
-test("the rebase keeps the selected EDGE only when it is not asked about edges", () => {
-  // `alive` is the node id set, so an edge selection cannot be validated here. The honest
-  // statement of the limit: this function prunes NODES, and a rebase that silently kept a
-  // selected edge would point the delete key at a connection the loaded graph may not have.
-  // `pruneSelection` keeps `edge` untouched, which is the conservative half — deleting an edge
-  // that is still there is recoverable, and a reload cannot invent one.
+test("the rebase judges the selected EDGE, and the node-only signature is the don't-guess half", () => {
+  // **This test used to assert the defect as a design decision**, which is the part worth
+  // recording: it read "the rebase keeps the selected EDGE only when it is not asked about
+  // edges" and justified it as the conservative half — `alive` is a node id set, so an edge
+  // selection cannot be validated here, and "deleting an edge that is still there is
+  // recoverable, while a reload cannot invent one".
+  //
+  // Both halves of that are true and neither answers the question. The asymmetry is backwards:
+  // the conservative move on a *reload* is to DROP a selection the adopted graph cannot vouch
+  // for, because the whole point of the Reload button is that the graph is now somebody else's.
+  // The false positive it was avoiding (dropping an edge that is still there) costs a
+  // re-selection; the false negative it was accepting (keeping one the other editor deleted)
+  // makes `Del` resolve to nothing and the status bar name a line that is not on the canvas.
+  //
+  // Both halves of the corrected rule are stated here, because the optional argument is the
+  // design: asked, the rebase decides; not asked, it does not guess.
   const withEdge: CanvasSelection = { nodes: ["a"], focus: "a", edge: "e-1" };
-  const rebased = rebaseAfterReload(withEdge, ["a"]);
-  assert.equal(rebased.selection.edge, "e-1", "the edge is left alone rather than guessed at");
+
+  assert.equal(
+    rebaseAfterReload(withEdge, ["a"], ["e-other"]).selection.edge,
+    null,
+    "asked about edges, the rebase drops one the adopted graph does not contain",
+  );
+  assert.equal(
+    rebaseAfterReload(withEdge, ["a"], ["e-1"]).selection.edge,
+    "e-1",
+    "asked about edges, the rebase KEEPS one that survived, so the author keeps their place",
+  );
+  assert.equal(
+    rebaseAfterReload(withEdge, ["a"]).selection.edge,
+    "e-1",
+    "not asked, the rebase does not guess: a caller with no edge list has no grounds to drop it",
+  );
+});
+
+test("the reload hands the rebase the ADOPTED graph's edge ids, or the rule is inert", () => {
+  // The wiring assertion, and it is the one that would have caught this defect. Every test
+  // above passes against a `load` that passes no edge ids at all — which is the defect,
+  // unchanged. So this reads the component.
+  //
+  // The window is the `load` body, not the file: the module-level lesson here is that React
+  // source is not ordered by events, so a guard claiming an order over the whole file goes red
+  // on correct code (that mistake was made and caught on this branch already).
+  const callOf = (name: string): number => WITHOUT_IMPORTS.indexOf(`${name}(`);
+  assert.ok(callOf("rebaseAfterReload") !== -1, "the reload must rebase the history and selection");
+
+  const loadAt = WITHOUT_IMPORTS.indexOf("const load =");
+  assert.ok(loadAt !== -1, "the loader must exist");
+  const loadBody = WITHOUT_IMPORTS.slice(loadAt, loadAt + 2600);
+
+  // The call must carry THREE arguments, and the third has to be the adopted graph's edges.
+  // Asserting the argument *count* is the part that cannot be satisfied by a comment or by a
+  // neighbouring call: the old two-argument call and the new three-argument one are both in
+  // this file, and only the one inside `load` is the Reload exit.
+  //
+  // The count is taken at paren DEPTH, not by splitting the text on commas. Splitting is the
+  // check-about-the-text this file has now caught twice: the first draft read 4 instead of 3
+  // because the formatter's trailing comma is a fourth comma, and it would have been "fixed"
+  // by loosening the assertion to 4 — which is the whole failure mode. A split also counts
+  // the commas inside `map((n) => n.id)`, so it moves with the formatting and not with the
+  // call.
+  const callStart = loadBody.indexOf("rebaseAfterReload(");
+  assert.ok(callStart !== -1, "the rebase must be called inside load itself");
+  const call = loadBody.slice(callStart, loadBody.indexOf(");", callStart) + 2);
+  const args = countTopLevelArgs(call);
+  assert.equal(
+    args.length,
+    3,
+    `the rebase must be given the adopted graph's EDGE ids too, not just its node ids: ${call}`,
+  );
+  assert.ok(
+    /edges\s*\.\s*map\(\s*\(\s*e\s*\)\s*=>\s*e\s*\.\s*id\s*\)/.test(args[2] ?? ""),
+    `the third argument must be built from the loaded graph's edges: ${call}`,
+  );
 });
 
 test("pruneSelection is what both paths agree on, so the rule has one implementation", () => {
