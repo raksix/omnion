@@ -9631,3 +9631,62 @@ with it set explicitly.
 It is the critical path: five slices deep, and it now also covers `/ai/local`, `/ai/local/models`,
 REQ-105 slice 5 and the closes of REQ-099/100/101. Then close acceptance row 1 by walking the SSE
 frame rather than only the store refusal, then slices 3–4, then REQ-107 and REQ-108.
+
+## REQ-106 slice 4 — the egress verification, and three bugs that all pointed the same wrong way
+
+`f586db19` the checker · `9f38b2bf` the panel · `a81014dc` the verdict semantics
+
+The air-gap switch's entire claim is "never leaves the instance", and until now nothing tested it.
+A switch an operator cannot check is a switch they take on faith — precisely what a compliance
+control must not be. `verify_egress` inverts the usual probe: it attempts a non-local call and
+**expects the refusal**. So the outcomes name the measurement, not the verdict — `Blocked` (the
+refusal, which IS the pass), `Escaped`, `Undetermined`. Only `Blocked` "holds".
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --lib` — **603 passed** (596 before this tick, +7 new).
+- `cargo test -p omnion-api --test ai_airgap` — **14 passed**, throwaway DB, `--test-threads=1`.
+- `cargo test -p omnion-api --test ai_local` — **9 passed**, no regression.
+- `pnpm --filter @omnion/admin typecheck` — clean.
+
+**The bug the walks found, in my own code.** `a_local_endpoint_never_counts_as_an_escape` failed
+with `Escaped == Escaped`. The first cut treated "the check said yes" as the breach verdict. A
+loopback endpoint is *supposed* to be permitted — that is the entire point of the air gap — so the
+first version put a red breach badge in front of every operator with a healthy local Ollama box.
+An alarm that fires on the happy path is an alarm nobody reads. The verdict is now re-derived from
+`classify_host` **independently of the check's answer**: reusing the check's own verdict would make
+the breach branch undetectable, since the check said fine so the checker agreed. It is a pure
+`verdict_for(still_local)` because the breach arm is unreachable from any database walk, and an
+unreachable branch is a branch nobody has read.
+
+**Two bugs already in the tree, both found only by writing the checker.**
+- `banner_for` compared the stored result to `"failed"` — a word the checker has never written. The
+  red tone was dead code, so a breach would have rendered a **reassuring** banner: the exact
+  failure the request exists to prevent.
+- The panel's `verifyTone` tested `"passed"`. The green "Verified" tone was therefore unreachable
+  AND a breach rendered as "Never verified" — the alarm and a check that never ran looked
+  identical. Both sides now read one `EgressOutcome` union rather than two independent `string`
+  types, which is what let them drift.
+
+Neither would have been caught by a compile, a typecheck or a test on the code that was already
+there. They were caught by making the writer and the reader agree on one word list — which is the
+cheapest possible standing test for a control whose whole job is to be believable.
+
+**Row 8 stays `[~]`.** Proved: the refusal reports `Blocked` with its provider and host; the
+result is written to the row and read back out of the **database**; loopback and allow-listed hosts
+are neither passes nor breaches; an off switch and a hostless URL are both `Undetermined` rather
+than a pass. Not proved: the HTTP shape through the panel, the banner turning red in a browser,
+and the `ai.airgap.verify.passed` / `.failed` events in the bus.
+
+**Operational note.** Postgres went into crash recovery mid-tick (the disk hit 100% again with five
+siblings live) and every walk failed with "PostgreSQL is required" — an environment failure that
+reads exactly like a code failure. `scripts/qa/disk-guard.sh` freed 1.2G, and the walks went green
+against `omnion-postgres`. The committed `run-media-walk.sh` / `run.sh` carry a **masked** `***`
+password in their default URL (the credential-masking trap, on `main`), so the walks were run with
+an explicit `OMNION_DATABASE_URL` built from the container's own published dev password — that file
+would otherwise start every writer's stack with a wrong password.
+
+**Next.** The browser pass is still the critical path and is queued behind w6's live slot (holder
+`2904616`, cwd `/mnt/apopic/omnion-w6`, alive by `kill -0` and `/proc`). It must now also drive the
+verify button end to end and assert the banner turns red on `escaped`. Then acceptance row 1 by
+walking the SSE frame rather than only the store refusal, then slice 3 (local embeddings / offline
+knowledge), then the doctor checks and the docs page.

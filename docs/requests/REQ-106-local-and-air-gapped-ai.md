@@ -144,7 +144,7 @@ three cannot drift apart; the allow-list widens it, never replaces it.
 - [~] `/api/v1/ai/local/models` lists what the endpoint serves and a pull moves a model from `missing` to `available` through `pulling` with progress visible in the UI; the same key cannot be pulled twice concurrently.
 - [ ] A knowledge collection pinned to a local embedding model indexes and searches with the remote provider unreachable (test runs with the remote endpoint pointed at a closed port).
 - [ ] With the air gap on, a collection whose embedding model is remote is listed as blocked with a "needs a local embedding model" chip and a one-click repoint that works when a local embedding model exists.
-- [ ] `/api/v1/ai/airgap/verify` reports a pass when the refusal happens and a failure when a call escapes; a failure turns the `/ai/local` banner red and emits `ai.airgap.verify.failed`.
+- [~] `/api/v1/ai/airgap/verify` reports a pass when the refusal happens and a failure when a call escapes; a failure turns the `/ai/local` banner red and emits `ai.airgap.verify.failed`.
 - [ ] The doctor reports each of reachability, model presence, a one-token completion, embedding presence and dimension, and air-gap state with a pass/warn/fail and a fix hint; a rerun after fixing a check changes the verdict.
 - [ ] The "Run AI locally" documentation page exists, names the supported servers, the verification steps, and what stops working while the gap is on.
 - [ ] Every screen has empty, loading and error states with a real action; `/ai/local` renders with no endpoint registered at all.
@@ -228,11 +228,54 @@ rendered `Invalid Date` inside the one sentence on this screen that is supposed 
 This is the second time in two slices that a wire-shape assumption cost a compile error — read the
 store's struct before assuming what the JSON says.
 
-NOT YET PROVED: the browser pass. It is queued behind w8's live slot. The depth pass restores the
+`NOT YET PROVED: the browser pass. It is queued behind a sibling's live slot. The depth pass restores the
 switch to OFF in its tail — a harness that leaves the air gap on makes every later pass read a
 banner, refuse a chat and measure a screen in an emergency state, and those findings would land in
 another writer's report with nothing connecting them to here. No acceptance row is ticked on the
 strength of code alone.
+-->
+
+<!--
+Slice 4's egress verification (`f586db19`, `9f38b2bf`, `a81014dc`) is the check the request calls
+"the loudest alert in this request". What exists:
+
+  * `verify_egress` runs the attempt through `check_call` — the SAME function the chat path calls —
+    so a pass is evidence about that path and not about a parallel harness that could pass while
+    the chat drifted. Nothing reaches the network when the check refuses; when it permits, the
+    call is genuinely sent, because a predicted escape is not a measurement.
+  * Three outcomes, named to refuse the misreading: `Blocked` (the refusal — **this is the
+    pass**), `Escaped`, `Undetermined`. Only `Blocked` "holds"; `from_str_lossy` defaults to
+    `Undetermined`, so a `NULL` row, a stale word or an unknown value can never read as
+    reassuring.
+  * The verdict for a PERMITTED call is re-derived from `classify_host`, independently of the
+    check's answer. That independence is the instrument: reusing the check's own verdict would
+    make the breach branch undetectable, because the check said fine so the checker agreed.
+
+Two bugs the work found, both of which pointed the wrong way and neither of which a compile or a
+typecheck would have surfaced:
+
+  * `banner_for` compared the stored word to `"failed"` — a word the checker never wrote. The red
+    tone was dead code, so a breach would have rendered a **reassuring** banner, which is the
+    exact failure the request exists to prevent.
+  * the panel's `verifyTone` tested `"passed"`. So the green "Verified" tone was unreachable AND a
+    breach rendered as "Never verified" — the alarm and a check that never ran looked identical.
+    Both sides now read one `EgressOutcome` union instead of two independent `string` types, which
+    is what let them drift in the first place.
+
+And one bug my own walk found, which is the reason it is worth writing down: the first cut called
+every permitted call an **escape**. A loopback endpoint is supposed to be permitted — that is the
+entire point of the air gap — so the first version would have put a red breach badge in front of
+every operator with a healthy local Ollama box. An alarm that fires on the happy path is an alarm
+nobody reads. The branch is now a pure `verdict_for(still_local)` so both arms are asserted; the
+breach arm cannot be reached by any database walk without contriving a rule/row disagreement, and
+an unreachable branch is a branch nobody has read.
+
+Row 8 stays `[~]`, not `[x]`. What the walks prove: a refused call reports `Blocked` and carries
+the refusal with its provider and host; the result is written to the row and read back **out of
+the database**; a loopback host and an allow-listed host are neither passes nor breaches; a switch
+that is off and a URL with no host are both `Undetermined` rather than a pass. What is NOT proved:
+the HTTP shape end to end through the panel, the banner turning red in a browser, and the
+`ai.airgap.verify.passed` / `.failed` events landing in the bus — all three need the browser pass.
 -->
 
 ### QA plan
