@@ -1003,3 +1003,133 @@ async fn a_reservation_of_a_source_switched_off_inside_its_delay_is_released() {
 
     drop_org(&pool, org).await;
 }
+
+#[tokio::test]
+async fn two_workers_sending_one_due_reservation_produce_one_mail() {
+    // The runner's own header states the rule this test exists for, in one sentence:
+    // *"a claim is taken **before** the send, and a completion is recorded **after** it, or
+    // two workers both mail."* `send_one` does the opposite order: it calls the mailer first
+    // and only then calls `mark_sent`, which is the completion. So the arbiter is consulted
+    // *after* the irreversible act it is supposed to prevent, and its `Ok(false)` branch —
+    // commented "another worker completed the same reservation … sending again would be the
+    // duplicate this whole design exists to prevent" — is reached **after** the second copy
+    // has already left the building.
+    //
+    // The sweep makes this reachable rather than theoretical. `due_reservations` is a plain
+    // read (`where sent = 'false' and due_at <= now`, no lock, no `skip locked`), so two app
+    // instances on the same database both receive the same reservation. The file's own words
+    // on the batch size: "Two app instances both see the same due row" — that sentence was
+    // true about the *completion* and never about the *send*.
+    //
+    // What is measured here is the *claim*, not the mail: a real SMTP conversation is not
+    // available inside a gate, so asserting "one message left" would be a claim nothing
+    // observes. The property that is observable, and that the defect breaks, is that only one
+    // caller may begin a send for a given reservation — the second caller must be told "not
+    // yours" **without** the mailer being touched.
+    //
+    // So the fixture asks both workers for the same reservation at once and asserts exactly
+    // one of them is told to send. Against the shipping order both are, and the assertion
+    // below is the failure: two workers, two copies of the same acknowledgement, and a
+    // `warn!` that arrives afterwards to document a duplicate that already happened.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder worker race").await;
+    let source = source_with_autoresponder(&pool, org, 30).await;
+    let lead = accepted_lead(&pool, org, &source, "two-workers@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    // Reserved, so the sweep has a row to offer two workers at once.
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is reserved");
+
+    let sweep = now + time::Duration::minutes(31);
+
+    // Worker A takes the batch first; worker B then sweeps the very same table a moment later.
+    // Sequential rather than concurrent on purpose: the two workers in production are two
+    // *processes* whose ticks interleave at the row level, and the question — may a second
+    // caller begin a send for a reservation another caller is already sending? — has the same
+    // answer whether they overlap in wall time or merely in batch order.
+    let first = ar_store::due_reservations(&pool, sweep, 50)
+        .await
+        .expect("the first sweep runs");
+    let mine = first
+        .iter()
+        .find(|r| r.lead.id == lead.id)
+        .expect("the reservation is due and is offered")
+        .clone();
+
+    // **Both workers are offered the reservation, and that is correct** — the sweep is a read
+    // and it is not supposed to arbitrate anything. Asserting the sweep withholds the row would
+    // be asserting the fix somewhere it does not live: this test's first version did exactly
+    // that, stayed red against the fixed code, and was measuring the wrong surface.
+    //
+    // The arbitration belongs at the *send*, which is the irreversible act. So this is what
+    // the second worker does with what it was handed.
+    assert!(
+        ar_store::claim_delivery(&pool, lead.id, &mine.message.to, sweep)
+            .await
+            .expect("the first worker claims the send"),
+        "the first worker to reach the mailer owns this reservation's send"
+    );
+    assert!(
+        !ar_store::claim_delivery(&pool, lead.id, &mine.message.to, sweep)
+            .await
+            .expect("the second worker's claim is a loss, not an error"),
+        "a second worker must be told 'not yours' BEFORE it touches the mailer — against the \
+         shipping order both callers send and the loser only learns of it afterwards, by which \
+         time the visitor has two copies"
+    );
+
+    // A third worker must lose too, not merely the second: the claim is not consumed by the
+    // first caller, so "one caller wins" must mean exactly one among any number.
+    assert!(
+        !ar_store::claim_delivery(&pool, lead.id, &mine.message.to, sweep)
+            .await
+            .expect("a third worker's claim is also a loss"),
+        "the claim admits one caller, not one-per-round"
+    );
+
+    // **Recovery.** A claim a dead worker left behind must not skip the lead for ever, which is
+    // the failure a plain lock would have shipped instead. One minute past the window, the
+    // reservation is claimable again — and the worker that takes it can answer the lead.
+    let after_stale = sweep + ar_store::DELIVERY_CLAIM_STALE_AFTER + time::Duration::seconds(1);
+    assert!(
+        ar_store::claim_delivery(&pool, lead.id, &mine.message.to, after_stale)
+            .await
+            .expect("a claim left behind by a dead worker is reclaimable"),
+        "a send claim older than the staleness window must be recoverable, or a crashed worker \
+         skips the lead for ever by the very mechanism meant to answer it"
+    );
+
+    // And the observable consequence, spelled out so a reader does not have to infer it: the
+    // trail may carry ONE claim line for this lead, and the completion is one-shot. A second
+    // completion attempt must lose, which is what the runner relies on to avoid *recording*
+    // a duplicate — it is only ever half of the answer.
+    assert!(
+        ar_store::mark_sent(&pool, lead.id, sweep)
+            .await
+            .expect("the first worker completes the send"),
+        "the worker that sent it records the delivery"
+    );
+    assert!(
+        !ar_store::mark_sent(&pool, mine.lead.id, sweep)
+            .await
+            .expect("a second completion is a loss, not an error"),
+        "the completion is one-shot, so a duplicate can be *recorded* once at most"
+    );
+
+    let claims: i64 = sqlx::query_scalar(
+        "select count(*) from crm_lead_events where lead_id = $1 and kind = $2 and detail ? 'sent'",
+    )
+    .bind(lead.id)
+    .bind(ar_store::SENT_KIND)
+    .fetch_one(&pool)
+    .await
+    .expect("counting the claim lines");
+    assert_eq!(
+        claims, 1,
+        "one reservation is one claim line however many workers sweep for it"
+    );
+
+    drop_org(&pool, org).await;
+}
