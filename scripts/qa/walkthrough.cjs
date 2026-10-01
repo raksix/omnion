@@ -169,6 +169,50 @@ function assertWave5bScreensWalked() {
 }
 
 /**
+ * A route measured while the session is gone is NOT a clean screen.
+ *
+ * Tick 59's pass reported 16/16 pages walked and ZERO findings on the wave-5b screens, and eight
+ * of those thirteen screens were the login form: `diagnostics()` recorded `url:
+ * ".../login"` for `/observability/*` and `/secrets/audit`, `interact()` then filled the sign-in
+ * form and pressed "Sign in" — eight times, each press walking deeper into the limiter's
+ * `sign_in` budget — and the roll-up attributed the resulting console errors to something else
+ * entirely. The report was true sentence by sentence and false in aggregate: a login form has no
+ * broken image, no overflow and no unlabeled input, so "zero findings" is exactly what eight
+ * unmeasured screens look like.
+ *
+ * The session died mid-walk (route 8 of the desktop list, `/secrets/audit`) and nothing noticed,
+ * because nothing compared where the browser WAS against where it was ASKED to go. That
+ * comparison is this function, and it runs per route rather than once at the end, so the first
+ * screen that loses the session is named instead of the eighth.
+ *
+ * It returns the reason rather than throwing: a route that lost the session should still be
+ * pushed into `report.pages` with its reason attached (a page that dies is a finding ABOUT that
+ * page — see the route loop's own comment), so the caller decides. And it distinguishes the two
+ * cases that look identical in the URL: a bounce to `/login` (no session) and a redirect to
+ * `/setup` (a session that was never created), because they need different fixes.
+ */
+async function sessionFault(page, route) {
+  const actual = await page
+    .evaluate(() => ({
+      path: location.pathname,
+      alert: (document.querySelector('[role="alert"]')?.textContent || "").trim().slice(0, 160),
+      shell: !!document.querySelector('nav[aria-label="Sections"]'),
+    }))
+    .catch(() => null);
+  if (!actual) return `${route.name}: the page did not answer, so it was not measured`;
+  if (/\/login\/?$/.test(actual.path)) {
+    return `${route.name}: the session was lost — the browser was on the sign-in form, so this screen was NOT measured`;
+  }
+  if (/\/setup\/?$/.test(actual.path)) {
+    return `${route.name}: no session and no tenant — the browser was on the first-run wizard, so this screen was NOT measured`;
+  }
+  if (!actual.shell) {
+    return `${route.name}: the app shell did not render (at ${actual.path}${actual.alert ? ` — "${actual.alert}"` : ""}), so this screen was NOT measured`;
+  }
+  return "";
+}
+
+/**
  * `true` when the DESKTOP route list walks this exact path.
  *
  * Scoped to the `routes` array on purpose. The first version matched the whole file, and the phone
@@ -344,6 +388,9 @@ function ensureSampleJpegWithExif() {
 fs.mkdirSync(SHOTS, { recursive: true });
 
 const clickLines = [];
+// Every depth pass that threw, read by the roll-up. Declared next to the click stream rather than
+// next to `runDepthPass` because the reader is ~3,000 lines further down and the writer is here.
+const failedDepthPasses = [];
 function log(...a) {
   console.log("[walk]", ...a);
 }
@@ -1244,6 +1291,12 @@ async function runDepthPass(name, pass) {
     const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
     log(`depth pass ${name} failed: ${reason}`);
     record({ page: "qa", action: "depth-pass-failed", pass: name, reason });
+    // `failedDepthPasses` is the list the roll-up reads. Recording the failure here was not enough:
+    // tick 59 ran `observabilityTraces` to `{ok: false, steps: 0}` and the run's 233 findings never
+    // mentioned it, because nothing downstream read the return value — a pass that proved NOTHING
+    // was indistinguishable from a pass that proved nothing was asked. The list is a module-level
+    // array precisely so the two modules do not have to find each other.
+    failedDepthPasses.push({ pass: name, reason });
     return { ok: false, steps: 0, reason };
   }
 }
@@ -7921,7 +7974,19 @@ async function runObservabilityTracesDepth(page, report) {
 
   // (4) a min-duration that nothing meets must be an empty state with the filters still shown,
   //     not a silent reset.
-  await page.locator("[data-trace-min-input]").fill("999999");
+  //
+  // The `.catch(() => {})` on every one of these is not defensive padding, and the comment above
+  // this function already says why once: an unguarded `fill` rejects when the screen it belongs to
+  // is not on the page, and `runDepthPass`'s try/catch then records `ok: false, steps: 0` — a pass
+  // that measured NOTHING and reported no finding. Tick 59 ran exactly that: the session was gone,
+  // `[data-trace-min-input]` was not attached, the fill timed out after 30 s, and the summary said
+  // `observabilityTraces: {ok: false, steps: 0}` inside a run whose findings never mentioned it.
+  // A step that cannot run is a recorded false, not the end of the pass.
+  const minInput = page.locator("[data-trace-min-input]");
+  if ((await minInput.count()) === 0) {
+    note({ check: "min-duration-input", present: false, reason: "the filter input is not on the page, so the filter checks below did not run" });
+  }
+  await minInput.fill("999999").catch(() => {});
   await page.waitForTimeout(1100);
   const none = await page.locator("[data-trace-open]").count();
   const clearStillThere = await page.locator("[data-trace-clear]").count();
@@ -7944,7 +8009,7 @@ async function runObservabilityTracesDepth(page, report) {
         .filter((n) => n.includes("/api/v1/observability/traces")),
     );
 
-  await page.locator("[data-trace-min-input]").fill("12x");
+  await page.locator("[data-trace-min-input]").fill("12x").catch(() => {});
   await page.waitForTimeout(1400);
   const minMessage = (await page.locator("[data-trace-min-error]").innerText().catch(() => "")) || "";
   const minUrls = await traceUrls();
@@ -7957,8 +8022,8 @@ async function runObservabilityTracesDepth(page, report) {
 
   // (4b) the same for a request id that is not a uuid — the QA harness pastes words into every
   //      text box it finds, and a bad paste is an operator's paste too.
-  await page.locator("[data-trace-min-input]").fill("");
-  await page.locator("[data-trace-request-input]").fill("QA sample");
+  await page.locator("[data-trace-min-input]").fill("").catch(() => {});
+  await page.locator("[data-trace-request-input]").fill("QA sample").catch(() => {});
   await page.waitForTimeout(1400);
   const idMessage = (await page.locator("[data-trace-request-id-error]").innerText().catch(() => "")) || "";
   const idUrls = await traceUrls();
@@ -10347,6 +10412,16 @@ async function main() {
         log(`media upload: ${JSON.stringify(report.mediaUpload)}`);
         await page.waitForTimeout(600);
       }
+      // The session guard sits BETWEEN the navigation and the measurement, so a screen that lost
+      // the session is recorded as unmeasured instead of being measured as a login form. See
+      // `sessionFault` for what eight "zero-finding" screens in one pass actually meant.
+      const fault = await sessionFault(page, route);
+      if (fault) {
+        record({ page: route.name, action: "route-not-measured", reason: fault });
+        log(`page ${route.name}: ${fault}`);
+        report.pages.push({ ...route, failed: fault, notMeasured: true });
+        continue;
+      }
       const diag = await diagnostics(page);
       await shot(page, `page-${route.name}`);
       await interact(page, route.name, report);
@@ -11001,6 +11076,16 @@ async function runReliabilityBreakersDepth(page) {
     : mobileRoutes.filter((r) => wants(`mobile:${r.name}`) || wants(r.name)))) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
+    // Same guard as the desktop loop. A phone context carries its own session, and `mobileLogin`
+    // already records when that one did not land — but a phone can also lose the session partway
+    // through, and then 390px "zero overflow" is a measurement of the sign-in form's phone layout.
+    const fault = await sessionFault(mpage, route);
+    if (fault) {
+      record({ page: `mobile-${route.name}`, action: "route-not-measured", reason: fault });
+      log(`mobile ${route.name}: ${fault}`);
+      report.mobile.push({ ...route, failed: fault, notMeasured: true });
+      continue;
+    }
     const diag = await diagnostics(mpage);
     await shot(mpage, `mobile-${route.name}`);
     report.mobile.push({ ...route, diagnostics: diag });
@@ -11154,13 +11239,33 @@ async function runReliabilityBreakersDepth(page) {
     // (reading 'horizontalOverflow')` — and took the entire finding report with it.
     const d = m.diagnostics;
     if (!d) {
-      pushFindings("high", "unmeasured-mobile", `mobile ${m.name}: no diagnostics were produced — this screen was not measured at 390px`);
+      // The reason is carried through, not just the fact: a phone context that lost its session
+      // and a phone context whose navigation threw are different defects with different fixes,
+      // and "no diagnostics were produced" reads the same for both.
+      pushFindings(
+        "high",
+        "unmeasured-mobile",
+        `mobile ${m.name}: no diagnostics were produced — this screen was not measured at 390px${m.failed ? ` (${m.failed})` : ""}`,
+      );
       continue;
     }
     if (d.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
     if (d.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${d.offscreen.length} element(s) outside the viewport`);
   }
   const refusedOnPurpose = [];
+  // A depth pass that threw measured NOTHING, so it is a high finding — not a note in the summary
+  // and not an entry in the log the next reader has to go and find. Tick 59's `observabilityTraces`
+  // ended at `{ok: false, steps: 0}` after a 30 s fill timeout, and the 233 findings that run
+  // produced contained no mention of it: the pass was written, exported, invoked, and answered with
+  // nothing. `steps: 0` is the tell — a pass that recorded a single check has proved at least one
+  // thing, so a zero alongside `ok: false` means every assertion in it was skipped.
+  for (const failure of failedDepthPasses) {
+    pushFindings(
+      "high",
+      "depth-pass-failed",
+      `the ${failure.pass} depth pass measured nothing and failed: ${failure.reason.slice(0, 200)}`,
+    );
+  }
   for (const [index, f] of consoleLog.entries()) {
     if (f.type === "warning") continue;
     // A console line names the status, not the URL: the allowance for one is the window it was
