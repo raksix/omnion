@@ -430,7 +430,11 @@ pub async fn raw_file(
     let file = crate::routes::media_files::file_in_scope(&state, &current, media_id).await?;
     ensure_servable(&state, &current, &file).await?;
     let range = range_header(&headers);
-    let conditional = conditional_headers(&headers, &file.checksum, file.updated_at.or(Some(file.created_at)));
+    let conditional = conditional_headers(
+        &headers,
+        &file.checksum,
+        file.updated_at.or(Some(file.created_at)),
+    );
     serve_file(&state, &file, "private, max-age=300", range, conditional).await
 }
 
@@ -526,7 +530,12 @@ pub async fn public_media(
     let request_path = format!("/api/v1/public/media/{media_id}");
     let shape = cdn_cache::request_shape(&request_path, None, &headers);
     let policy = cdn_cache::policy_for(state.db().pool(), file.site_id, &shape).await;
-    Ok(cdn_cache::apply(response, &policy, cdn_cache::Validator::Preserved, &headers))
+    Ok(cdn_cache::apply(
+        response,
+        &policy,
+        cdn_cache::Validator::Preserved,
+        &headers,
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -831,7 +840,11 @@ pub(crate) fn conditional_headers(
         &etag,
         rendered.as_deref(),
     );
-    ConditionalAnswer { verdict, etag, rendered }
+    ConditionalAnswer {
+        verdict,
+        etag,
+        rendered,
+    }
 }
 
 /// What a conditional answer decided, carried with the values a `304` still has to report.

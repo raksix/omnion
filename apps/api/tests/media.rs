@@ -3294,7 +3294,6 @@ async fn a_range_request_answers_a_window_and_says_what_it_sent() {
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
 }
 
-
 /// The custom pairs on a file are stored, filtered on, and refused by name.
 ///
 /// The column this walk reads has existed since `0025` with a GIN index over it, and until this
@@ -3352,8 +3351,12 @@ async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
     // A file nobody touched carries no pairs at all — not `null`, and not a pair with an empty
     // value. `{}` is what every pre-existing row holds, so this is the state the platform ships.
     assert_eq!(
-        media_column(&fixture.state, Uuid::parse_str(&autumn_id).expect("an id"), "metadata")
-            .await,
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&autumn_id).expect("an id"),
+            "metadata"
+        )
+        .await,
         Some(json!({})),
         "an untouched file carries no pairs"
     );
@@ -3510,7 +3513,11 @@ async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
             json!({ "shoot": { "lens": "50mm" } }),
             "metadata.shoot",
         ),
-        ("a list", json!({ "colours": ["red", "blue"] }), "metadata.colours"),
+        (
+            "a list",
+            json!({ "colours": ["red", "blue"] }),
+            "metadata.colours",
+        ),
         (
             "an over-long value",
             json!({ "licence": "C".repeat(600) }),
@@ -3622,7 +3629,12 @@ async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
         ),
     )
     .await;
-    assert_eq!(caption_only.status, StatusCode::OK, "body: {}", caption_only.body);
+    assert_eq!(
+        caption_only.status,
+        StatusCode::OK,
+        "body: {}",
+        caption_only.body
+    );
     assert_eq!(
         media_column(
             &fixture.state,
@@ -3689,7 +3701,12 @@ async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
         request(Method::GET, &browser, Some(&editor), None),
     )
     .await;
-    assert_eq!(read_pairs.status, StatusCode::OK, "body: {}", read_pairs.body);
+    assert_eq!(
+        read_pairs.status,
+        StatusCode::OK,
+        "body: {}",
+        read_pairs.body
+    );
     let shown = read_pairs.body["files"]
         .as_array()
         .expect("rows")

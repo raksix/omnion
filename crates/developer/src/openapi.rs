@@ -509,6 +509,121 @@ pub static OPERATIONS: std::sync::LazyLock<Vec<Operation>> = std::sync::LazyLock
             ],
             &["method", "path"],
         )),
+        // --- Developer · OAuth applications (slice 3) ---------------------------------------------
+        //
+        // The panel's half only. The authorization and token endpoints are deliberately absent
+        // from this document: they are sessionless, they take a client secret in a body, and a
+        // reference that showed them under a "run this with your session" Explorer would
+        // describe two surfaces that authenticate in opposite ways.
+        Operation::read(
+            "GET",
+            "/api/v1/oauth-apps",
+            "Developer",
+            "List this organization's OAuth applications",
+            Some("developer.oauth.read"),
+        ),
+        Operation::read(
+            "POST",
+            "/api/v1/oauth-apps",
+            "Developer",
+            "Register an application; the client secret is returned exactly once",
+            Some("developer.oauth.manage"),
+        )
+        .with_body(Schema::object(
+            vec![
+                Property::new(
+                    "name",
+                    Schema::string().described("3-60 characters, unique among live apps."),
+                ),
+                Property::new(
+                    "description",
+                    Schema::string().described("Shown on the consent screen."),
+                ),
+                Property::new(
+                    "redirect_uris",
+                    Schema::array_of(Schema::string().described(
+                        "Absolute. https, or http on localhost/127.0.0.1/[::1] exactly. \
+                             Compared as whole strings, never as a prefix.",
+                    )),
+                ),
+                Property::new(
+                    "scopes",
+                    Schema::array_of(Schema::string().described("At least one permission key.")),
+                ),
+                Property::new(
+                    "grant_types",
+                    Schema::array_of(Schema::enumeration(&[
+                        "authorization_code",
+                        "client_credentials",
+                    ])),
+                ),
+            ],
+            &["name", "redirect_uris", "scopes"],
+        )),
+        Operation::read(
+            "GET",
+            "/api/v1/oauth-apps/{id}",
+            "Developer",
+            "One application with its live authorization-code count",
+            Some("developer.oauth.read"),
+        )
+        .with_parameters(vec![id_param()]),
+        Operation::read(
+            "PATCH",
+            "/api/v1/oauth-apps/{id}",
+            "Developer",
+            "Edit an application. Absent fields are left alone; null clears them.",
+            Some("developer.oauth.manage"),
+        )
+        .with_parameters(vec![id_param()])
+        .with_body(Schema::object(
+            vec![
+                Property::new("name", Schema::string()),
+                Property::new("description", Schema::string()),
+                Property::new(
+                    "redirect_uris",
+                    Schema::array_of(Schema::string())
+                        .described("Replacing the list invalidates every authorization in flight."),
+                ),
+                Property::new("scopes", Schema::array_of(Schema::string())),
+                Property::new(
+                    "grant_types",
+                    Schema::array_of(Schema::enumeration(&[
+                        "authorization_code",
+                        "client_credentials",
+                    ])),
+                ),
+            ],
+            &[],
+        )),
+        Operation::read(
+            "DELETE",
+            "/api/v1/oauth-apps/{id}",
+            "Developer",
+            "Withdraw an application. The row and its audit trail are kept.",
+            Some("developer.oauth.manage"),
+        )
+        .with_parameters(vec![id_param()]),
+        Operation::read(
+            "POST",
+            "/api/v1/oauth-apps/{id}/rotate",
+            "Developer",
+            "Rotate the client secret; the previous one keeps working for seven days",
+            Some("developer.oauth.manage"),
+        )
+        .with_parameters(vec![id_param()]),
+        Operation::read(
+            "POST",
+            "/api/v1/oauth-apps/{id}/suspend",
+            "Developer",
+            "Suspend or resume an application",
+            Some("developer.oauth.manage"),
+        )
+        .with_parameters(vec![id_param()])
+        .with_body(Schema::object(
+            vec![Property::new("suspended", Schema::boolean())],
+            &["suspended"],
+        )),
         // --- Content ------------------------------------------------------------------------------
         Operation::read(
             "GET",
@@ -1422,6 +1537,8 @@ mod tests {
             "developer.explorer.run",
             "developer.keys.manage",
             "developer.keys.read",
+            "developer.oauth.manage",
+            "developer.oauth.read",
             "developer.read",
             "iam.permissions.read",
             "iam.roles.read",
@@ -1448,6 +1565,8 @@ mod tests {
             "developer.explorer.run",
             "developer.keys.manage",
             "developer.keys.read",
+            "developer.oauth.manage",
+            "developer.oauth.read",
             "developer.read",
             "iam.permissions.read",
             "iam.roles.read",

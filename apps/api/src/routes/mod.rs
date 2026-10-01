@@ -84,6 +84,7 @@ pub mod deployment_cluster;
 pub mod deployment_ops;
 pub mod deployment_run;
 pub mod developer;
+pub mod developer_oauth;
 pub mod environments;
 pub mod explorer;
 pub mod health;
@@ -1177,6 +1178,38 @@ pub fn router(state: AppState) -> Router {
     let dev_operations =
         get(explorer::list_operations).layer(guards::require(&state, "developer.read"));
 
+    // OAuth applications (REQ-033, slice 3). Panel side only -- the authorization and token
+    // endpoints a third-party client calls are sessionless and live in their own file.
+    //
+    // Every mutating verb is a **sub-path**, never a second method on `/oauth-apps/{id}`, for
+    // the reason the API-key routes above carry in their own comment: axum builds its router at
+    // runtime, so two handlers for one method on one path is a startup panic
+    // (`Overlapping method route`) that `cargo check`, `cargo build` and every passing test
+    // cannot see. Rotate and suspend therefore own their segments, and the detail path carries
+    // a GET, a PATCH and a DELETE.
+    let oauth_apps = get(developer_oauth::list_apps)
+        .layer(guards::require(&state, "developer.oauth.read"))
+        .merge(
+            post(developer_oauth::create_app)
+                .layer(guards::require(&state, "developer.oauth.manage")),
+        );
+    let oauth_app_one = get(developer_oauth::get_app)
+        .layer(guards::require(&state, "developer.oauth.read"))
+        .merge(
+            patch(developer_oauth::edit_app)
+                .layer(guards::require(&state, "developer.oauth.manage")),
+        )
+        .merge(
+            delete(developer_oauth::delete_app)
+                .layer(guards::require(&state, "developer.oauth.manage")),
+        );
+    let oauth_app_rotate = post(developer_oauth::rotate_secret)
+        .layer(guards::require(&state, "developer.oauth.manage"));
+    // Suspend is its own verb rather than a PATCH with a status, because the two are not
+    // symmetric: suspending is reversible, withdrawing is not.
+    let oauth_app_suspend = post(developer_oauth::set_suspended)
+        .layer(guards::require(&state, "developer.oauth.manage"));
+
     // The deployment centre (REQ-024, slice 1). Six reads and one write, and the write is
     // `deployment.manage` because "check for updates now" reaches out to the network and
     // rewrites the release cache — it is not a read even though it answers a question.
@@ -2195,6 +2228,10 @@ pub fn router(state: AppState) -> Router {
         .route("/dev/openapi.json", dev_openapi)
         .route("/dev/operations", dev_operations)
         .route("/dev/explorer/requests", dev_explorer_run)
+        .route("/oauth-apps", oauth_apps)
+        .route("/oauth-apps/{id}", oauth_app_one)
+        .route("/oauth-apps/{id}/rotate", oauth_app_rotate)
+        .route("/oauth-apps/{id}/suspend", oauth_app_suspend)
         .route("/cdn/status", cdn_status)
         .route("/cdn/purges", cdn_purges)
         .route("/cdn/purges/{id}", cdn_purge_one)

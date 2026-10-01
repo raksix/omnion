@@ -481,6 +481,32 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "developer",
         description: "Send API requests from the Explorer as the signed-in caller",
     },
+    // OAuth applications (docs/requests/REQ-033, slice 3). Two keys, and the split is the one
+    // that keeps the token endpoint honest.
+    //
+    // * `developer.oauth.read` is the app's own metadata: which redirect URIs it registered,
+    //   what it may be granted, whether its secret rotation is still inside an overlap. That is
+    //   a support question ("our integration started failing on Tuesday") and it is the same
+    //   kind of question as reading a key's metadata, so it rides with the rest of the
+    //   developer read surface.
+    // * `developer.oauth.manage` mints and rotates a **client secret**. A client secret is a
+    //   credential that authenticates as this organization at an endpoint no panel session ever
+    //   passes through, and rotating one starts an overlap in which two secrets are valid. An
+    //   account that can read the list must not thereby be able to add one — the same argument
+    //   as `developer.keys.read` / `developer.keys.manage`, kept separate for the same reason.
+    //
+    // Neither key grants anything about a *user's* OAuth session: those are scoped by the
+    // consent the user gave, not by a permission in this table.
+    PermissionDef {
+        key: "developer.oauth.read",
+        category: "developer",
+        description: "Read OAuth application metadata and registered redirect URIs",
+    },
+    PermissionDef {
+        key: "developer.oauth.manage",
+        category: "developer",
+        description: "Register OAuth applications and rotate client secrets",
+    },
     // Notifications (docs/requests/REQ-021). Four powers, split by *who is affected* rather
     // than by what the button does:
     //
@@ -826,6 +852,8 @@ mod tests {
             "developer.keys.manage",
             "developer.read",
             "developer.explorer.run",
+            "developer.oauth.read",
+            "developer.oauth.manage",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),

@@ -12139,3 +12139,115 @@ have to be added to the permission catalogue or the guards refuse **everyone**, 
 catalogue half of slice 3 is mostly REQ-016's work already: `/api/v1/events/catalogue` reads
 the same compiled registry, so what is left is the developer framing, not a second source of
 truth.
+
+## 2026-10-01 · REQ-033 slice 3b — OAuth applications: the store, the routes, the permission keys
+
+### What
+
+The panel's half of the OAuth story: register an app, edit it, rotate its client secret,
+suspend it, withdraw it. Four files.
+
+* `crates/developer/src/model_oauth.rs` — `OAuthApp` (no secret field, and no
+  previous-hash field: what is exposed is *when the old secret stops working*, which is a fact
+  and not a credential), `MintedApp` with a hand-written redacting `Debug`, the field rules, and
+  `authorize()`.
+* `crates/developer/src/store_oauth.rs` — the database half: registration, a partial edit built
+  with a `QueryBuilder`, rotation, withdrawal, the code ledger, and the credential read.
+* `apps/api/src/routes/developer_oauth.rs` — six routes behind two permission keys.
+* `crates/permissions/{catalogue,seed}.rs` + `crates/developer/src/openapi.rs` — the keys and the
+  six documented operations.
+
+### The rule `authorize()` exists to keep, and why it is one function
+
+**The order is the security property.** An authorization endpoint that validates the client
+*after* the redirect URI leaks whether a client id exists to a caller who controls the URL, and
+one that checks scopes before the redirect builds a scope oracle. So: client usable → grant
+registered → redirect registered → scopes are a subset → PKCE structurally usable. The grant is
+checked before the redirect because it is a property of the client, answerable without ever
+looking at a caller-supplied URL.
+
+**Every refusal carries a position or nothing at all.** `RedirectUriSchemeRefused { index }`
+rather than the URL: a redirect URI is an attack surface by construction, and an error that
+quotes one puts that surface into a log index and a browser console. Three tests assert the
+`Display` *and* the `Debug` never contain the submitted string — `Display` reaches a log,
+`Debug` reaches a panic message, and only checking one leaves the other open.
+
+**An omitted `scope` parameter means "everything the app registered"**, and a *non-empty* list
+that is not a subset is refused rather than silently narrowed. Narrowing would hand the client a
+token that answers `insufficient_scope` three redirects later, which reads as a platform bug.
+
+**A scope the app did not register is refused at the consent screen's own door**, and
+`Susp | Deleted | unknown id` all answer `AppNotActive`/`AppNotFound` — an authorization endpoint
+that distinguishes them is an enumeration oracle for which client ids exist in this install.
+
+### What the store is responsible for
+
+`redeem_code` spends the code **inside the `update`'s own predicate** rather than in a read that
+precedes it. A read-then-update lets two simultaneous redemptions both see `used_at is null` and
+both issue a token, which turns a one-time code into a two-time code and is invisible in every
+test that redeems a code once. Unknown, already-spent and expired are one error, and it is the
+same answer `InvalidClient` gives for a bad secret.
+
+Rotation moves the old hash into the overlap slot *by the same expression* that writes the new
+one — `previous_secret_hash = client_secret_hash` inside the `update` — so there is no window in
+which the old secret is in neither slot, and migration `0231`'s constraint makes a half-window
+unwritable rather than merely unlikely. `which_secret_matched` filters the overlap by the clock
+*before* comparing and returns **which slot** matched, so the audit row can distinguish a
+deployment that has not redeployed from one that has; that is the only reason the overlap exists.
+
+`delete_app` writes `status = 'deleted'` and `deleted_at` in one statement and never deletes the
+row: the codes, the audit trail and any token a client is still presenting reference it, and a
+cascade would take the evidence with it.
+
+### Migration: renumbered, and one column added
+
+**0229 → 0231.** w8 holds `0229_crm_lead_sla_index_terminal_status.sql`, and the namespace is
+shared across every worktree. When both push, sqlx reads two files numbered 229 and answers
+`VersionMismatch(29)` for the whole database — one writer's numbering choice kills every other
+writer's test suite. The union high-water across all ten worktrees was 0230.
+
+`deleted_at` arrives with this slice, **constrained to travel with `status`**: a `deleted` app
+with no timestamp is a row the panel cannot date, and a timestamp on an app whose status still
+reads `active` is an app that keeps issuing codes after somebody believed they had stopped it.
+`oauth_apps_grant_types_are_known` joins it for the same kind of reason — an unknown flow is a
+`400` at the API, not a row that only a future build can read.
+
+### Proof
+
+- `cargo test -p omnion-developer --features store --lib` — **104** (was 73; +31)
+- `cargo test -p omnion-permissions --lib` — **64**, including the family test that now names
+  both OAuth keys
+- `cargo test -p omnion-api --lib` — **396**
+- `pnpm typecheck` — 2/2
+- migration `0231` against live PostgreSQL: **8 named refusals across 7 constraints**
+  (`oauth_apps_deletion_is_whole` twice — in *both* directions — plus
+  `oauth_apps_overlap_is_whole`, `oauth_apps_grant_types_are_known`,
+  `oauth_apps_redirect_uris_known`, `oauth_codes_challenge_is_whole`,
+  `oauth_codes_expiry_is_future`, `oauth_apps_org_name_key`) and **3 positive controls** that
+  prove they are not simply refusing everything. The control that matters: a *withdrawn* app
+  frees its name, so the partial unique index is doing its job rather than blocking a
+  re-registration.
+- `scripts/qa/probe-oauth-apps-migration.sql` is the probe, kept in the repo so the next
+  migration can be proved the same way.
+
+### A fix to my own last tick's code, found by this tick's tests
+
+`http://[::1].attacker.example/cb` was being accepted as loopback. Slice 3a fixed IPv6 loopback
+by taking a bracketed authority whole, so that `split(':')` would not reduce `[::1]` to `[` —
+and taking it whole *as a literal* accepts a hostname that merely begins with the literal. The
+closing bracket is now honoured only when nothing but an optional decimal `:port` follows it.
+Same family as `starts_with("localhost")`, one level down, and found by the redirect-list
+validator rather than by slice 3a's own tests: those covered the accepted spellings and the
+obvious near-misses, and not a bracket-prefixed hostname. The regression test now lives in the
+module that holds the predicate as well as in the caller, because a test in the caller is fixed
+by changing the caller and leaves the hole in the shared rule (`816b89d5`).
+
+### Next
+
+Slice 3c: the sessionless half — `oauth_flow.rs` with the authorization request, the consent
+screen and the token endpoint, including the code→token exchange with PKCE verification. It is a
+different surface in a way that matters: those endpoints carry a client secret in a body, take no
+session, and resolve their tenant from the *app row* rather than from `organization_of`, which is
+why they must not share a file with the panel's handlers. Then the panel screen
+(`/developer/oauth-apps`, list + detail + register + rotate + suspend/withdraw), and the
+walkthrough route so it is actually clicked.

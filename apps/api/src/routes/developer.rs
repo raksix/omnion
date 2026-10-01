@@ -442,7 +442,11 @@ pub async fn get_request_log(
 ///
 /// A platform account (`organization_id: None`) has no organization to hold a key, and saying
 /// so plainly beats a `403` that names a permission the caller does hold.
-fn organization_of(current: &CurrentSession) -> Result<Uuid, ApiError> {
+/// `pub(crate)` because the OAuth routes in `developer_oauth.rs` resolve the tenant the same
+/// way and must not carry a second copy: a handler that read `organization_id` from anywhere
+/// else (the body, a header, an app row) is a cross-tenant write, and the only defence is that
+/// there is exactly one function that answers "which tenant is this" for a session.
+pub(crate) fn organization_of(current: &CurrentSession) -> Result<Uuid, ApiError> {
     current.user.organization_id.ok_or_else(|| {
         ApiError::forbidden(
             "organization_required",
@@ -561,7 +565,7 @@ fn decode_error(error: sqlx::Error) -> ApiError {
 /// Propagated rather than logged-and-ignored, matching the rest of the API: a key that was
 /// minted and left no audit row is a credential an operator cannot account for, and a `500`
 /// naming the audit table is a better outcome than a silent gap.
-async fn audit(
+pub(crate) async fn audit(
     state: &AppState,
     current: &CurrentSession,
     address: &ClientAddress,

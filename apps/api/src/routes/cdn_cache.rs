@@ -525,9 +525,10 @@ mod tests {
         // be told no, forever, with nothing in the logs to say why.
         let carried = "W/\"b".to_string() + &"b".repeat(63) + "\"";
         let mut response = body();
-        response
-            .headers_mut()
-            .insert(header::ETAG, HeaderValue::from_str(&carried).expect("a valid tag"));
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&carried).expect("a valid tag"),
+        );
 
         let response = apply(
             response,
@@ -565,10 +566,12 @@ mod tests {
         // The counterpart of the case above: with nothing to compare, this layer must leave the
         // response alone. Answering `304` because the header was *absent* would drop a body a
         // client never claimed to have.
-        let response = apply(body(), &cacheable(), Validator::Preserved, &headers_of(&[(
-            "if-none-match",
-            "\"anything\"",
-        )]));
+        let response = apply(
+            body(),
+            &cacheable(),
+            Validator::Preserved,
+            &headers_of(&[("if-none-match", "\"anything\"")]),
+        );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(header(&response, "etag"), None);
     }

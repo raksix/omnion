@@ -118,6 +118,13 @@ const BASE_ROLES: &[BaseRole] = &[
             // owner/administrator, who hold `BasePermissions::All` — a read-only developer role
             // must not be able to reach `POST /pages` through a form instead of through a key.
             "developer.read",
+            // Reading which OAuth applications this tenant registered and what they may be
+            // granted is an integrator's debugging question and fits a manager.
+            // `developer.oauth.manage` is deliberately absent, exactly as
+            // `developer.keys.manage` is: rotating a client secret starts an overlap in which
+            // two credentials are valid, and a manager who can see which integrations exist
+            // must not be able to mint one that authenticates as this organization.
+            "developer.oauth.read",
             "search.read",
             "search.manage",
             "analytics.read",
