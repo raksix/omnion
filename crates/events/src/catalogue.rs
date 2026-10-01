@@ -622,6 +622,53 @@ catalogue! {
     [("notification_id", Uuid, req), ("channel", String, req), ("test", Boolean, req),
      ("delivered", Boolean, opt)];
 
+    // ---- Migration backfills -------------------------------------------------------------------
+    // Four rows for the one write in the platform that touches every existing row. The split that
+    // matters is NOT started-vs-resumed (both mean "a batch ran") but ran-vs-**what else could
+    // have happened**: a pause, a completion and a failure are four different facts about a
+    // migration in flight, and a receiver that cannot tell them apart either pages an operator for
+    // a pause or misses a failure. Every payload carries `resume_key` as well as `rows_done`,
+    // because a receiver handed only a row count cannot distinguish a stalled job from a finished
+    // one — both counters stop moving.
+    "backfill.started", "migrations", Live,
+    "The first batch of a backfill ran. `resume_key` is the last key processed, in the key column's \
+     OWN type — sorting it as text is the defect that makes a restart redo work.",
+    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
+     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt),
+     ("batch_rows", Integer, opt)];
+
+    "backfill.resumed", "migrations", Live,
+    "A later batch ran after a pause, continuing from the stored cursor rather than from the \
+     beginning of the table. `resumed_from` is the cursor the job restarted at, so a receiver can \
+     prove it did not rewind.",
+    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
+     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt),
+     ("resumed_from", String, opt), ("batch_rows", Integer, opt)];
+
+    "backfill.paused", "migrations", Live,
+    "An operator stopped a job after its current batch. The cursor is KEPT: a pause is not a \
+     reset, and `resume_key` is what the next run continues from. Never paired with \
+     `backfill.completed` — recording a completion for a pause is a permanent fact for something \
+     that did not happen.",
+    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
+     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt),
+     ("reason", String, opt)];
+
+    "backfill.completed", "migrations", Live,
+    "A backfill reached the end of its rows: the batch found nothing left to write. Emitted from \
+     the batch OUTCOME, never from the job's state, so a pause cannot record one.",
+    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
+     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt)];
+
+    "backfill.failed", "migrations", Live,
+    "A batch's statement failed and the job stopped. `error` carries the database's own message: \
+     the statement is written by the migration author, so nobody else can reconstruct it. \
+     `resume_key` is the cursor the retry starts from — it is the last GOOD key, never the failing \
+     one, so a retry is exactly the work that did not happen.",
+    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
+     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt),
+     ("error", String, opt)];
+
     // ---- Commerce (reserved: the module is not shipped yet) -------------------------------------
     "order.created", "commerce", Reserved,
     "An order was placed. Listed now; the commerce module records it when it ships.",
