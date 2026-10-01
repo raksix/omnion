@@ -164,6 +164,23 @@ pub enum AiHubError {
     /// the editor marks one field at a time.
     #[error("invalid eval input: {0}")]
     InvalidEval(String),
+    /// No suite with that key in this organization (REQ-107 slice 1).
+    ///
+    /// A `404`, never a 403, for the same reason as every other not-found in this crate: a key
+    /// that answered "exists in another tenant" would make the key space of the installation an
+    /// existence oracle for every suite in it.
+    #[error("no eval suite `{0}` in this organization")]
+    EvalSuiteNotFound(String),
+    /// No case with that id in this organization.
+    #[error("no eval case `{0}` in this organization")]
+    EvalCaseNotFound(Uuid),
+    /// Another suite already uses that key.
+    ///
+    /// Its own code rather than a generic conflict because the panel *resolves* it: the suite
+    /// editor offers a different key and keeps the rest of the form, where a generic conflict
+    /// would make the operator guess which field collided.
+    #[error("an eval suite with the key `{0}` already exists in this organization")]
+    EvalSuiteKeyTaken(String),
     /// An air-gap setting breaks one of the switch's own rules (REQ-106 slice 2).
     ///
     /// Its own code for the same reason as the three above: the refusal belongs on a field of
@@ -348,6 +365,9 @@ impl AiHubError {
             // keyword the schema uses not), and a client that collapsed it with the change-set
             // code would print a sentence about change sets above the case's own input.
             Self::InvalidEval(_) => "invalid_eval",
+            Self::EvalSuiteNotFound(_) => "eval_suite_not_found",
+            Self::EvalCaseNotFound(_) => "eval_case_not_found",
+            Self::EvalSuiteKeyTaken(_) => "eval_suite_key_taken",
             Self::InvalidAirgap(_) => "invalid_airgap",
             Self::AirgapHostNotFound(_) => "airgap_host_not_found",
             Self::ChangeSetNotFound(_) => "change_set_not_found",
