@@ -440,17 +440,23 @@ pub async fn spend(state: &AppState, token_id: Uuid, limit: i32, endpoint: &str)
         };
     };
 
+    // **The argument list is the script's contract, and a spare one is silent corruption.**
+    // This call had a leftover `.arg(1)` where the script reads ARGV[2] as `errors` — so every
+    // single request was recorded as an error, and nothing anywhere said so: the responses were
+    // all `200`, the usage chart looked plausible, and the error column read 100%. The only
+    // reason it was caught is a test that read the raw hash out of Redis instead of trusting the
+    // route's own account of itself. The arguments are now named, in order, with the count
+    // checked by `ARGV_COUNT` below.
     match redis::cmd("EVAL")
         .arg(SPEND)
-        .arg(2)
+        .arg(2) // two keys: the budget and the usage bucket
         .arg(&budget)
         .arg(&usage)
-        .arg(limit)
-        .arg(1)
-        .arg(0)
-        .arg(0)
-        .arg(BUDGET_RETENTION.as_secs())
-        .arg(USAGE_RETENTION.as_secs())
+        .arg(limit) // ARGV[1] the tier
+        .arg(0) // ARGV[2] errors — the status is not known until the handler answers
+        .arg(0) // ARGV[3] throttled by the caller — the script decides this itself
+        .arg(BUDGET_RETENTION.as_secs()) // ARGV[4]
+        .arg(USAGE_RETENTION.as_secs()) // ARGV[5]
         .query_async::<Vec<i64>>(&mut connection)
         .await
     {
@@ -555,6 +561,63 @@ mod tests {
             let wait = retry_after_seconds(1_000_000_020 + second);
             assert!((1..=60).contains(&wait), "second {second} waits {wait}");
         }
+    }
+
+    #[test]
+    fn the_script_and_the_argument_list_agree_on_how_many_arguments_there_are() {
+        // A *spare* `.arg()` on the call site is not a type error, not a runtime error, and not
+        // visible in any response — it simply shifts every ARGV after it, and the effect is a
+        // counter that records something nobody asked for. This file shipped one. The guard is
+        // the count, compared against the highest ARGV the script reads.
+        const ARGV_COUNT: usize = 5;
+        // **Only the executable lines, not the doc comment above the constant.** The comment
+        // *explains* the arguments using the same notation, so scanning the whole constant reads
+        // prose and trips over a bracket that was never code. The discriminator is the line's own
+        // content rather than a delimiter: a line of Lua either calls Redis or it is a comment.
+        // (I first tried to slice the raw-string delimiters off, which is the version of this that
+        // depends on the literal's *syntax* staying the same — a `r##"…"##` edit would break it.)
+        // A line is Lua rather than prose if it holds a `redis.call`, a `return`, or an
+        // `ARGV[` — the last one is what this test is looking for, so filtering on it would be
+        // circular. The `if` line holding only `tonumber(ARGV[1])` is why "redis.call OR return"
+        // was not enough.
+        let lua: String = SPEND
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with("--")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let literal = lua.as_str();
+        // **`match_indices` on a `&str` pattern yields the *pattern* as its second element, not
+        // the tail.** I assumed the tail twice while writing this — first slicing `[4..]` "one
+        // byte past the A", then `[5..]` for the same reason — and both failures read as "the
+        // script is malformed", because an empty slice has no `]` to find. The indices are the
+        // only thing that is right, so the digits are read out of the whole string at the offset
+        // the match reports.
+        let highest = literal
+            .match_indices("ARGV[")
+            .map(|(index, _pattern)| {
+                let start = index + "ARGV[".len();
+                let rest = &literal[start..];
+                let end = rest
+                    .find(']')
+                    .expect("every ARGV reference in the script is closed");
+                rest[..end]
+                    .parse::<usize>()
+                    .expect("ARGV indices are numbers")
+            })
+            .max()
+            .expect("the script reads at least one argument");
+        assert_eq!(
+            highest, ARGV_COUNT,
+            "the script reads ARGV[{highest}] but the call passes {ARGV_COUNT} values — a spare \
+             or a missing one shifts every argument after it"
+        );
+        // And both keys are used, because a script that only touches KEYS[1] has a second key
+        // the caller believes is being written.
+        assert!(literal.contains("KEYS[1]"), "the budget key");
+        assert!(literal.contains("KEYS[2]"), "the usage key");
     }
 
     #[test]
