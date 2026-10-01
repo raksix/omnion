@@ -1,4 +1,51 @@
 
+## Tick 65 — the CRM visibility levels were implemented on two keys and checked on one (wave 4, REQ-051)
+
+The box for CRM's visibility scoping was **ticked**, and reading it closely is what ended the
+tick: "a team lead sees the group's" was proved by a walk named `the_own_visibility_level_…`,
+and `grep -rn "group_members" apps/api/tests/*.rs` found **no CRM walk ever created a group**. So
+`Visibility::Team` had a SQL branch, two unit tests over a `QueryBuilder` string, and no
+evidence at all. The same audit as tick 64's HR finding, one module over.
+
+**Two defects, both in the same direction: a promise silently withheld.**
+
+| # | Where | What |
+|---|---|---|
+| a | `routes/crm.rs:371` | `visibility_of` matched `crm.contacts.read`/`crm.contacts.update` — the **contact** screens' keys. A level on `crm.deals.read` was not found, and the answer was `all`. Fifteen of the seventeen `crm.*` keys were invisible to the one query that decides the level. |
+| b | `routes/mod.rs` | Every CRM guard was `guards::require`, which authorizes against an organization-wide context. A **department** binding — which is what a level *is* — matches none, so a role holding `crm.deals.read` at `own` was refused `403` one layer **before** the handler implementing the level. Tick 64's HR defect, never carried across. |
+
+(a) now matches the **family** (`crm.%`), which fails closed. (b) is `require_department_scoped`
+on all twenty CRM guards: organization context first, so every organization-scoped role is
+byte-identical to before.
+
+**Proof.** Both proven-to-fail by reverting each alone — the *same* walk, red both ways:
+
+| Gate | Command | Result |
+|---|---|---|
+| walk | `cargo test -p omnion-api --test crm -- --test-threads=1 a_visibility_level_holds_on_any_key_of_the_family` | **1 passed** |
+| proven-to-fail (a) | revert `routes/crm.rs` | **red** — `team` sees the stranger's deal |
+| proven-to-fail (b) | revert `routes/mod.rs` | **red** — `403`, `"1 binding(s) looked at, 0 counted"`, `"department": null` |
+
+**The walk repeated tick 64's mistake before it was caught.** Its first version proved
+*neither*: every account in it also held an **organization** grant, which opens the route on its
+own, so reverting the guard left it green — I read that as a passing result before noticing the
+count had not moved. The account with *no* organization grant exists because of it: a level's
+department binding is the only way to hold a level at all, so the walk has to hold nothing else
+to prove the guard reads it. The DB asserts `scoped_org == 0` before the read, so the
+precondition is part of the evidence rather than a comment.
+
+**A third defect, pre-existing and blocking the whole suite.** The CSRF layer arrived from
+`main` on 2026-09-29 (`6e7b9206`) and made the session cookie ambient authority. The CRM harness
+predates it: `call()` read `headers().get(SET_COOKIE)` — the **first** header only — so
+sign-in held a session with no token, and every write walk answered `csrf_unavailable`, a code
+whose message names *the deployment's* configuration. `the_own_visibility_level_…` fails on a
+bare checkout, which is how it was found. Migrated to the shared `support/walk_auth` helper that
+exists for exactly this (config-side `with_csrf_secret`, `Session::pack`, `apply_credential`,
+`get_all` on the cookies, a `sign_in` budget the six-account fixture needs).
+
+**Next:** REQ-051's three browser-only boxes (empty/loading/error, mobile 390×844, keyboard) are
+still unticked and still need a free QA slot — the holder was w8's, live, all tick.
+
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
 
 build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you

@@ -360,6 +360,19 @@ pub(crate) async fn visibility_of(state: &AppState, current: &CurrentSession) ->
         resource_id: String,
     }
 
+    // The permission is matched on the **family** (`crm.%`), not on two hand-picked names.
+    //
+    // The two names this used to name — `crm.contacts.read` and `crm.contacts.update` — are the
+    // keys the *contact* screens carry, and a tenant that expresses a visibility level on any
+    // other key got `all` instead. The consequence is the direction that matters: a role granted
+    // "own deals" as `crm.deals.read` on a department binding was asked how much of the
+    // organization it reads, the query did not find the binding, and the answer was `all` — a
+    // promise the tenant wrote silently withheld. `own`/`team` also narrow the activity feed and
+    // the lead inbox, and a level granted on a write key is still a level.
+    //
+    // Matching the family is the **fail-closed** direction on purpose: an unrecognised `crm.` key
+    // narrows rather than widens, because a read this module cannot reason about should be
+    // restricted, and a level nobody meant to set can be removed by revoking the binding.
     let rows: Vec<Narrowing> = sqlx::query_as(
         "select rb.resource_id \
          from role_bindings rb \
@@ -368,7 +381,7 @@ pub(crate) async fn visibility_of(state: &AppState, current: &CurrentSession) ->
            and rb.scope_type = 'department' \
            and exists (select 1 from role_permissions rp \
                        where rp.role_id = rb.role_id and rp.effect = 'allow' \
-                         and rp.permission_key in ('crm.contacts.read', 'crm.contacts.update'))",
+                         and rp.permission_key like 'crm.%')",
     )
     .bind(current.user.id)
     .bind(organization_id)

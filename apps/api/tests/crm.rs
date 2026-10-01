@@ -30,6 +30,18 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support {
+    //! The sign-in half, shared. See `support/walk_auth.rs` for why a hand-rolled `login()` is
+    //! the exact defect this closes: it reads the FIRST `Set-Cookie` and silently discards the
+    //! CSRF token that sits beside it, and then every write answers `csrf_unavailable` — a code
+    //! whose message names the **deployment's** configuration, so the suite's own loss of the
+    //! token read as a broken server and the red survived. The CSRF layer arrived from `main`
+    //! (tick 59); this suite predated it and had not been migrated.
+    pub mod walk_auth;
+}
+
+use support::walk_auth::{self, Session};
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -91,7 +103,8 @@ const OTHER_WRITER_PERMISSIONS: [&str; 4] = [
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
     status: StatusCode,
-    set_cookie: Option<String>,
+    /// **Every** `Set-Cookie` on the response, in order.
+    set_cookie: Vec<String>,
     body: Value,
 }
 
@@ -103,11 +116,18 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .expect("router must answer");
 
     let status = response.status();
+    // `get_all`, not `get`. Sign-in answers with the session cookie and the CSRF cookie as
+    // **two** `Set-Cookie` headers, and `headers().get()` answers with the first one only — so a
+    // read that takes the first is a read that signed in holding a session with no token. Every
+    // write then answers `csrf_unavailable`, whose message names the server's configuration
+    // rather than the helper's loss, so the suite blamed the product for its own bug.
     let set_cookie = response
         .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let bytes = response.into_body().collect().await.expect("body must read").to_bytes();
     let body = if bytes.is_empty() {
         Value::Null
@@ -146,8 +166,10 @@ fn query_value(value: &str) -> String {
 /// Build a JSON request; `token` becomes the session cookie and `body` the payload.
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
+    // `walk_auth::apply_credential` is the ONLY place that sends the cookie and the CSRF header
+    // together. A suite that builds its own headers re-opens the ambient-authority defect.
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(credential) => walk_auth::apply_credential(credential, builder),
         None => builder,
     };
 
@@ -176,7 +198,12 @@ async fn live_db(config: &Config) -> Option<Db> {
 
 /// A state whose database has all migrations applied and the IAM seed loaded.
 async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    // Installed ON THE CONFIG, not exported into the environment, so the suite does not depend on
+    // a shell having remembered to set it. Without it sign-in issues no token and every write is
+    // refused with `csrf_unavailable` — which is the product working correctly on a deployment
+    // that never configured a secret.
+    walk_auth::with_csrf_secret(&mut config);
     let db = live_db(&config).await?;
     db.migrate().await.expect("migrations must apply");
 
@@ -189,6 +216,27 @@ async fn live_state() -> Option<(AppState, Db)> {
         omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
             .expect("the default storage configuration is valid"),
     );
+    // The shipped `sign_in` budget is ten requests per five minutes and the cell is process-wide.
+    // This file signs in six accounts for its fixture and several more inside individual walks, so
+    // without a larger ceiling the suite is refused at the eleventh sign-in and every walk after
+    // that dies on a line that has nothing to do with what it was testing. Only `sign_in` is
+    // raised — the other ceilings stay as a deployment ships them, so this suite can never be the
+    // reason a genuinely over-budget request stops being refused.
+    walk_auth::give_the_process_its_own_sign_in_budget(|| {
+        let policies: Vec<omnion_security::RatePolicy> =
+            omnion_security::RatePolicy::defaults()
+                .into_iter()
+                .map(|mut policy| {
+                    if policy.scope == "sign_in" {
+                        policy.limit = 10_000;
+                    }
+                    policy
+                })
+                .collect();
+        omnion_api::rate_limit_middleware::install(omnion_api::rate_limit_middleware::RateLimiter::new(
+            &state, policies,
+        ));
+    });
     Some((state, db))
 }
 
@@ -361,16 +409,27 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, granted_by: Uuid, 
         .expect("the role binding must be created");
 }
 
-/// Narrow an account to the `own` visibility level, the way an organization does it with a
-/// `department` binding.
-async fn narrow_to_own(db: &Db, organization_id: Uuid, user_id: Uuid, granted_by: Uuid) {
+/// Narrow an account to a visibility level on **any** key of the CRM family.
+///
+/// The existing `narrow_to_own` hard-codes `crm.contacts.read`, which is exactly what hid the
+/// defect this generalises: a level granted on any *other* key was invisible to
+/// `visibility_of`, which matched two hand-picked names. Granting the level on a key the caller
+/// genuinely holds and still expecting it to count is the only way to catch that class.
+async fn narrow_to_level(
+    db: &Db,
+    organization_id: Uuid,
+    user_id: Uuid,
+    granted_by: Uuid,
+    level: &str,
+    permission: &str,
+) {
     let role = role_store::create_role(
         db.pool(),
         NewRole {
             organization_id,
-            key: format!("crm-narrow-{}", Uuid::new_v4().simple()),
-            name: "CRM Own Only".to_owned(),
-            description: "Sees only its own records".to_owned(),
+            key: format!("crm-narrow-{}-{}", level, Uuid::new_v4().simple()),
+            name: format!("CRM {level} Only"),
+            description: format!("Sees only {level} records"),
             priority: 300,
             inherits_role_id: None,
         },
@@ -382,7 +441,7 @@ async fn narrow_to_own(db: &Db, organization_id: Uuid, user_id: Uuid, granted_by
         db.pool(),
         role.id,
         &[RolePermissionInput {
-            key: "crm.contacts.read".to_owned(),
+            key: permission.to_owned(),
             effect: Effect::Allow,
         }],
     )
@@ -394,7 +453,7 @@ async fn narrow_to_own(db: &Db, organization_id: Uuid, user_id: Uuid, granted_by
         user_id,
         scope: PermScope::Department {
             organization_id,
-            department: "own".to_owned(),
+            department: level.to_owned(),
         },
         granted_by: Some(granted_by),
         expires_at: None,
@@ -402,6 +461,43 @@ async fn narrow_to_own(db: &Db, organization_id: Uuid, user_id: Uuid, granted_by
     omnion_permissions::bindings::grant(db.pool(), binding)
         .await
         .expect("the narrowing binding must be created");
+}
+
+/// Put two accounts in one group — the membership a `team` level reads.
+async fn share_a_group(db: &Db, organization_id: Uuid, members: &[Uuid]) {
+    let slug = format!("crm-team-{}", Uuid::new_v4().simple());
+    let group_id: Uuid = sqlx::query_scalar(
+        "insert into groups (organization_id, name, slug) values ($1, $2, $3) returning id",
+    )
+    .bind(organization_id)
+    .bind(format!("CRM Team {slug}"))
+    .bind(&slug)
+    .fetch_one(db.pool())
+    .await
+    .expect("the group must be created");
+
+    for member in members {
+        sqlx::query("insert into group_members (group_id, user_id) values ($1, $2)")
+            .bind(group_id)
+            .bind(*member)
+            .execute(db.pool())
+            .await
+            .expect("the group membership must be written");
+    }
+}
+
+/// Narrow an account to the `own` visibility level, the way an organization does it with a
+/// `department` binding.
+async fn narrow_to_own(db: &Db, organization_id: Uuid, user_id: Uuid, granted_by: Uuid) {
+    narrow_to_level(
+        db,
+        organization_id,
+        user_id,
+        granted_by,
+        "own",
+        "crm.contacts.read",
+    )
+    .await;
 }
 
 /// Sign an account in and return its session token.
@@ -423,17 +519,9 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
-        .set_cookie
-        .clone()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("cookie has a value")
-        .split_once('=')
-        .expect("cookie has a name")
-        .1
-        .to_owned()
+    // **Every** `Set-Cookie`, not the first. `call` keeps them in one joined string because that
+    // is what the CSRF layer compares the header against.
+    Session::from_set_cookies(&response.set_cookie).pack()
 }
 
 /// The audit rows of one action, newest first.
@@ -1222,6 +1310,308 @@ async fn the_own_visibility_level_hides_a_colleagues_record() {
     )
     .await;
     assert_eq!(direct.status, StatusCode::NOT_FOUND, "body: {}", direct.body);
+}
+
+/// A visibility level is a promise about **the whole family**, and a `team` level is a promise
+/// about a *group*.
+///
+/// The walk beside this one proved `own` on `crm.contacts.read` — the one key the level query
+/// named. Two things it could not see, and both were real:
+///
+/// 1. `visibility_of` matched the two names `crm.contacts.read` / `crm.contacts.update`, so a
+///    level granted on **any other** key — `crm.deals.read`, the board, the feed — was not found
+///    and the answer was `all`. The tenant's promise was silently withheld on the one screen
+///    that most needs it: a pipeline's open value is the business' own.
+/// 2. Nothing in the suite ever created a `group`, so `Visibility::Team` had never run through
+///    the API at all. The level had a SQL branch, two unit tests over a `QueryBuilder` string and
+///    no evidence. "a team lead sees the group's" was a sentence in a ticked box.
+///
+/// The level is granted on `crm.deals.read` and asserted against **deals** — the contact family
+/// is deliberately not involved, so a pass cannot be explained by the key that used to be named.
+#[tokio::test]
+async fn a_visibility_level_holds_on_any_key_of_the_family() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let manager = fixture.token(&fixture.manager).await;
+    let marker = Uuid::new_v4().simple().to_string();
+    let (owner_id,): (Uuid,) = sqlx::query_as(
+        "select id from users where organization_id is null order by created_at limit 1",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the platform owner exists");
+
+    // The three accounts: the reader, a colleague they share a group with, and a stranger. Each
+    // owns one deal, and the marker isolates this walk's rows from the rest of the suite.
+    let (reader_id, reader_email) =
+        create_account(&fixture.db, Some(fixture.org), "CRM Team Reader").await;
+    let (colleague_id, colleague_email) =
+        create_account(&fixture.db, Some(fixture.org), "CRM Teammate").await;
+    let (stranger_id, _stranger_email) =
+        create_account(&fixture.db, Some(fixture.org), "CRM Stranger").await;
+    grant(&fixture.db, fixture.org, reader_id, owner_id, &MANAGER_PERMISSIONS).await;
+    grant(&fixture.db, fixture.org, colleague_id, owner_id, &MANAGER_PERMISSIONS).await;
+    grant(&fixture.db, fixture.org, stranger_id, owner_id, &MANAGER_PERMISSIONS).await;
+    share_a_group(&fixture.db, fixture.org, &[reader_id, colleague_id]).await;
+
+    let reader_token = fixture.token(&reader_email).await;
+    let colleague_token = fixture.token(&colleague_email).await;
+
+    let mut deal_ids = Vec::new();
+    for (label, owner) in [
+        ("Mine", reader_id),
+        ("Team", colleague_id),
+        ("Outsider", stranger_id),
+    ] {
+        let response = create_deal_via_api(
+            state,
+            &manager,
+            json!({
+                "title": format!("{label}-{marker}"),
+                "amount": "1000.00",
+                "owner_user_id": owner,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "the {label} deal must be creatable: {}",
+            response.body
+        );
+        deal_ids.push(response.body["id"].as_str().expect("a deal id").to_owned());
+    }
+    let (mine, teams, outsider) = (
+        deal_ids[0].as_str(),
+        deal_ids[1].as_str(),
+        deal_ids[2].as_str(),
+    );
+
+    // Before any level the reader is an ordinary organization member and sees the organization.
+    let un_narrowed = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals?view=list&search=-{marker}&limit=200"),
+            Some(&reader_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        un_narrowed.status,
+        StatusCode::OK,
+        "body: {}",
+        un_narrowed.body
+    );
+    let before: Vec<Value> = un_narrowed.body["page"]["items"]
+        .as_array()
+        .expect("items is a list")
+        .iter()
+        .map(|item| item["id"].clone())
+        .collect();
+    assert!(
+        before.contains(&json!(outsider)),
+        "an unnarrowed member sees the organization's deals: {before:?}"
+    );
+
+    // `team`, granted on `crm.deals.read` — a key `visibility_of` did not name.
+    narrow_to_level(
+        &fixture.db,
+        fixture.org,
+        reader_id,
+        owner_id,
+        "team",
+        "crm.deals.read",
+    )
+    .await;
+
+    let as_team = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals?view=list&search=-{marker}&limit=200"),
+            Some(&reader_token),
+            None,
+        ),
+    )
+    .await;
+    // The first thing this asserts is that the route **opened at all**. A level lives on a
+    // department binding, and `require()` authorizes against an organization-wide context that
+    // matches no department — so before the guard was taught the binding, a caller whose role
+    // says `team` is refused `403` naming a key they demonstrably hold, one layer before the
+    // handler that implements the level ever runs.
+    assert_eq!(
+        as_team.status,
+        StatusCode::OK,
+        "a `team` level must open the board, not refuse it: {}",
+        as_team.body
+    );
+    let items = as_team.body["page"]["items"]
+        .as_array()
+        .expect("the list view nests the page under `page`");
+    let ids: Vec<Value> = items.iter().map(|item| item["id"].clone()).collect();
+    assert!(
+        ids.contains(&json!(mine)),
+        "the caller must still read their own deal: {ids:?}"
+    );
+    assert!(
+        ids.contains(&json!(teams)),
+        "a `team` level must read the group member's deal: {ids:?}"
+    );
+    assert!(
+        ids.iter().all(|id| id != &json!(outsider)),
+        "a `team` level must stop at the group: {ids:?}"
+    );
+
+    // The colleague shares a group with the reader but holds **no level of their own**, so what
+    // they see is `all` — the organization's. That is the product behaving correctly and the
+    // assertion that matters is in the other direction: the level belongs to the account that
+    // holds it, and granting one to the reader must not have leaked a narrowing onto a
+    // colleague who never asked for one. A group membership alone narrows nobody.
+    let colleague_sees = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals?view=list&search=-{marker}&limit=200"),
+            Some(&colleague_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        colleague_sees.status,
+        StatusCode::OK,
+        "body: {}",
+        colleague_sees.body
+    );
+    let colleague_ids: Vec<Value> = colleague_sees.body["page"]["items"]
+        .as_array()
+        .expect("items is a list")
+        .iter()
+        .map(|item| item["id"].clone())
+        .collect();
+    assert!(
+        colleague_ids.contains(&json!(outsider)),
+        "a member holding no level reads the organization, and the reader's level did not \
+         leak onto them: {colleague_ids:?}"
+    );
+
+    // `own` is tighter than `team`, and the tightest level a caller holds is the one that
+    // applies. Adding it after `team` must narrow further, not be ignored.
+    narrow_to_level(
+        &fixture.db,
+        fixture.org,
+        reader_id,
+        owner_id,
+        "own",
+        "crm.deals.read",
+    )
+    .await;
+
+    let as_own = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals?view=list&search=-{marker}&limit=200"),
+            Some(&reader_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(as_own.status, StatusCode::OK, "body: {}", as_own.body);
+    let own_ids: Vec<Value> = as_own.body["page"]["items"]
+        .as_array()
+        .expect("items is a list")
+        .iter()
+        .map(|item| item["id"].clone())
+        .collect();
+    assert!(
+        own_ids.contains(&json!(mine)),
+        "the caller still reads their own: {own_ids:?}"
+    );
+    assert!(
+        own_ids.iter().all(|id| id != &json!(teams) && id != &json!(outsider)),
+        "`own` is the tightest level held, so it wins over `team`: {own_ids:?}"
+    );
+
+    // A deal outside the level is not merely filtered out of a list — the record itself is a
+    // `404`, so a direct URL cannot read what the list refuses to show.
+    let hidden = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/crm/deals/{teams}"),
+            Some(&reader_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND, "body: {}", hidden.body);
+
+    // The half that a narrowed account on its own has to prove, and the reason the reader above
+    // cannot prove it: every account so far also holds an **organization** grant, and an
+    // organization grant opens the route on its own. So a walk built only out of them passes
+    // whether or not the guard knows about a department binding — which is precisely how the
+    // guard's defect survived: the level was fully implemented, and every walk that exercised it
+    // also granted the key organization-wide.
+    //
+    // This account's **only** grant is the department binding, so the route is open if and only
+    // if the guard consults the bindings a level actually lives in.
+    let (scoped_id, scoped_email) =
+        create_account(&fixture.db, Some(fixture.org), "CRM Scoped Only").await;
+    narrow_to_level(
+        &fixture.db,
+        fixture.org,
+        scoped_id,
+        owner_id,
+        "own",
+        "crm.deals.read",
+    )
+    .await;
+    let (scoped_bindings,): (i64,) = sqlx::query_as(
+        "select count(*) from role_bindings \
+         where user_id = $1 and revoked_at is null and scope_type = 'department'",
+    )
+    .bind(scoped_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the scoped account's bindings must be countable");
+    let (scoped_org,): (i64,) = sqlx::query_as(
+        "select count(*) from role_bindings \
+         where user_id = $1 and revoked_at is null and scope_type <> 'department'",
+    )
+    .bind(scoped_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the scoped account's bindings must be countable");
+    assert_eq!(scoped_bindings, 1, "the level is granted exactly once");
+    assert_eq!(
+        scoped_org, 0,
+        "this account holds no organization grant, so a guard that only reads an organization \
+         context has nothing to find and answers 403 naming a key the caller demonstrably holds"
+    );
+
+    let scoped_token = fixture.token(&scoped_email).await;
+    let scoped_read = call(
+        state,
+        request(
+            Method::GET,
+            "/api/v1/crm/deals?view=list&limit=5",
+            Some(&scoped_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        scoped_read.status,
+        StatusCode::OK,
+        "a level on a department binding must open the board, not refuse it one layer before the \
+         handler that implements the level runs: {}",
+        scoped_read.body
+    );
 }
 
 /// The flagged fields are absent for a role without the key — in the list and in the detail.

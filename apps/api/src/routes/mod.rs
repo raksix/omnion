@@ -1399,26 +1399,41 @@ pub fn router(state: AppState) -> Router {
         .route("/crm/contacts/{id}", get(crm::get_contact))
         .route("/crm/companies", get(crm::list_companies))
         .route("/crm/companies/{id}", get(crm::get_company))
-        .route_layer(guards::require(&state, "crm.contacts.read"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.read",
+        ));
 
     let crm_create = Router::new()
         .route("/crm/contacts", post(crm::create_contact))
         .route("/crm/companies", post(crm::create_company))
-        .route_layer(guards::require(&state, "crm.contacts.create"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.create",
+        ));
 
     let crm_update = Router::new()
         .route("/crm/contacts/{id}", patch(crm::update_contact))
         .route("/crm/companies/{id}", patch(crm::update_company))
-        .route_layer(guards::require(&state, "crm.contacts.update"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.update",
+        ));
 
     let crm_archive = Router::new()
         .route("/crm/contacts/{id}", delete(crm::archive_contact))
         .route("/crm/companies/{id}", delete(crm::archive_company))
-        .route_layer(guards::require(&state, "crm.contacts.delete"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.delete",
+        ));
 
     let crm_merge = Router::new()
         .route("/crm/contacts/merge", post(crm::merge_contacts))
-        .route_layer(guards::require(&state, "crm.contacts.merge"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.merge",
+        ));
 
     // Slice 2 adds what a *list* needs to be more than a table: saved views, the import and the
     // export. Reading a view and running a dry run are reads (`crm.contacts.read`); saving a view,
@@ -1430,12 +1445,18 @@ pub fn router(state: AppState) -> Router {
         .route("/crm/views/columns", get(crm_views::view_columns))
         .route("/crm/contacts/export", get(crm_views::export_contacts))
         .route("/crm/companies/export", get(crm_views::export_companies))
-        .route_layer(guards::require(&state, "crm.contacts.read"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.read",
+        ));
 
     let crm_views_manage = Router::new()
         .route("/crm/views", post(crm_views::create_view))
         .route("/crm/views/{id}", delete(crm_views::delete_view))
-        .route_layer(guards::require(&state, "crm.views.manage"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.views.manage",
+        ));
 
     let crm_import = Router::new()
         .route(
@@ -1445,7 +1466,10 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(
             omnion_module_crm::csv::MAX_IMPORT_BYTES,
         ))
-        .route_layer(guards::require(&state, "crm.contacts.import"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.import",
+        ));
 
     // Slice 3: the board. Deals carry keys of their own rather than reusing the contact family,
     // because a pipeline is a *different* disclosure — its open value and win rate describe the
@@ -1457,29 +1481,44 @@ pub fn router(state: AppState) -> Router {
         .route("/crm/deals", get(crm_deals::list_deals))
         .route("/crm/deals/{id}", get(crm_deals::get_deal))
         .route("/crm/pipelines", get(crm_deals::list_pipelines))
-        .route_layer(guards::require(&state, "crm.deals.read"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.deals.read",
+        ));
 
     let crm_deals_create = Router::new()
         .route("/crm/deals", post(crm_deals::create_deal))
-        .route_layer(guards::require(&state, "crm.deals.create"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.deals.create",
+        ));
 
     let crm_deals_update = Router::new()
         .route("/crm/deals/{id}", patch(crm_deals::update_deal))
         // The stage move is the drag and the keyboard's `ctrl + ←/→`: one route, one write, one
         // event, so a card cannot be moved by the mouse and by the keyboard down different paths.
         .route("/crm/deals/{id}/stage", post(crm_deals::move_deal_stage))
-        .route_layer(guards::require(&state, "crm.deals.update"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.deals.update",
+        ));
 
     let crm_deals_archive = Router::new()
         .route("/crm/deals/{id}", delete(crm_deals::archive_deal))
-        .route_layer(guards::require(&state, "crm.deals.delete"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.deals.delete",
+        ));
 
     let crm_pipelines_manage = Router::new()
         .route(
             "/crm/pipelines/{id}/stages",
             put(crm_deals::save_pipeline_stages),
         )
-        .route_layer(guards::require(&state, "crm.pipelines.manage"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.pipelines.manage",
+        ));
 
     // The HR surface (docs/requests/REQ-055, slice 1): the people core — employees, the
     // department tree and the org chart. The family splits the way CRM's does, with two keys that
@@ -1784,7 +1823,10 @@ pub fn router(state: AppState) -> Router {
             get(crm_activities::company_timeline),
         )
         .route("/crm/deals/{id}/timeline", get(crm_activities::deal_timeline))
-        .route_layer(guards::require(&state, "crm.activities.read"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.activities.read",
+        ));
 
     let crm_activities_create = Router::new()
         .route("/crm/activities", post(crm_activities::create_activity))
@@ -1792,7 +1834,10 @@ pub fn router(state: AppState) -> Router {
             "/crm/activities/{id}/done",
             post(crm_activities::complete_activity),
         )
-        .route_layer(guards::require(&state, "crm.activities.create"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.activities.create",
+        ));
 
     // The copilot. `crm.copilot.use` is a key of its own and not a sub-permission of the read or
     // the update, for the reason the catalogue gives: a model that can read the whole CRM is a
@@ -1807,7 +1852,10 @@ pub fn router(state: AppState) -> Router {
             "/crm/copilot/follow-up/{deal_id}",
             post(crm_copilot::follow_up),
         )
-        .route_layer(guards::require(&state, "crm.copilot.use"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.copilot.use",
+        ));
 
     // The form → lead ingress (slice 4 part seven). Two keys and not one: **reading** the log of
     // submissions that arrived and **deciding what a submission becomes** are separate decisions
@@ -1816,7 +1864,10 @@ pub fn router(state: AppState) -> Router {
     // one path, split by method into two layers so the read does not need the manage key.
     let crm_leads_read = Router::new()
         .route("/crm/leads", get(crm_leads::list_leads))
-        .route_layer(guards::require(&state, "crm.leads.read"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.leads.read",
+        ));
 
     let crm_leads_manage = Router::new()
         .route(
@@ -1824,7 +1875,10 @@ pub fn router(state: AppState) -> Router {
             get(crm_leads::get_lead_settings).put(crm_leads::update_lead_settings),
         )
         .route("/crm/leads/drain", post(crm_leads::drain_now))
-        .route_layer(guards::require(&state, "crm.leads.manage"));
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.leads.manage",
+        ));
 
     let crm = crm_read
         .merge(crm_leads_read)

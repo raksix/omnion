@@ -153,6 +153,48 @@ Payloads carry ids and the changed field list only — never a rendered document
 - [x] Pipeline board drag moves a deal, persists the new stage, updates per-stage count/sum/weighted sum, and is reversible with `ctrl + ←/→`. The one statement that computes the count, the sum and the weighted sum is the board's own header query, and the keyboard path sends the **same** request the drag sends. *Proved by `a_new_deal_lands_on_the_first_open_stage_and_the_board_adds_up` and `moving_a_deal_to_the_stage_it_is_already_in_is_a_no_op` in the 29/29 run. The browser walk (`runCrmDealsDepth`) is registered in the route list.*
 - [x] Moving a deal to `lost` requires a reason; moving to `won` records/confirms the close date and emits `crm.deal.won`. The rule is in the module (`resolve_move`) and in the schema's trigger, the dialog is required before the write, and leaving the lost column forgets the old reason. *Proved by `the_won_and_lost_flows_demand_their_own_input_and_emit_their_own_event` in the 29/29 run. `b49aa3d` is what made this reachable at all: the close date was a 422 for every caller.*
 - [x] Visibility scoping works: a member with `own` sees only their records (enforced in SQL, a hidden record is a `404`), a team lead sees the group's, an unnarrowed account sees the organization's — `the_own_visibility_level_hides_a_colleagues_record`.
+  *The box was ticked on a claim two of its three levels had never been checked for. Reading it
+  this tick, "a team lead sees the group's" was proved by a walk named `..._own_visibility_...`,
+  and nothing in the suite had ever created a **group** — so `Visibility::Team` had a SQL
+  branch, two unit tests over a `QueryBuilder` string, and no evidence. Two defects, both of the
+  shape tick 64 found in HR, and both found by the audit rather than by a failing test.*
+
+  ***A level granted on any key but two was silently ignored, and the answer was `all`.***
+  `visibility_of` matched exactly `crm.contacts.read` / `crm.contacts.update`. Those are the
+  **contact** screens' keys. A tenant that expressed "own deals" as `crm.deals.read` on a
+  department binding was asked how much of the organization the role reads, the query did not
+  find the binding, and the answer was `all` — the promise withheld, in the direction that
+  matters, on the one screen whose contents are the business' own open pipeline value. The
+  other fifteen `crm.*` keys were invisible to the one query that decides the level; it now
+  matches the **family** (`crm.%`), which fails closed: a key this module cannot reason about
+  narrows rather than widens.
+
+  ***The guard refused the very grant a level lives in*** — tick 64's HR defect, unfixed here.
+  `require()` authorizes against an organization-wide `ResourceContext`; a **department** binding
+  — which is what a level *is* — matches no such context. So a role holding `crm.deals.read` at
+  the `own` level was refused `403` by the route layer, one step **before** the handler that
+  implements the level ever ran, naming a key the caller demonstrably held. The only way to hold
+  a level at all was an organization grant: precisely the level the level exists to prevent.
+  All twenty CRM guards are now `require_department_scoped`, which tries the organization
+  context first (so every organization-scoped role is unchanged) and then each department the
+  caller's own bindings name.
+
+  *Proved by `a_visibility_level_holds_on_any_key_of_the_family`, which grants the level on
+  `crm.deals.read` and asserts against **deals**, so a pass cannot be explained by the key that
+  used to be named. `team` reads the group member and stops at a stranger; `own`, added after
+  `team`, is tighter and wins; a deal outside the level is a `404` on a direct URL; a member
+  holding **no** level still reads the organization, so a level never leaks onto a colleague;
+  and a final account whose *only* grant is the department binding reads the board at all.
+
+  *Both fixes are proven to fail by reverting each alone, the same walk going red each time:
+  the guard revert answers `403` with `"1 binding(s) looked at, 0 counted"` and
+  `"department": null`; the family revert answers `all` and the `team` assertion sees the
+  stranger's deal. The first version of this walk proved **neither** — every account in it also
+  held an organization grant, which opens the route on its own, so reverting the guard left it
+  green. That is tick 64's own mistake repeated inside the tick that was fixing it, and the
+  account with no organization grant exists because of it: a level's binding is the **only** way
+  to open a route at the `own` level, so the walk has to hold nothing else to prove the guard
+  reads it.*
 - [x] A role without `crm.fields.sensitive.read` sees the flagged field hidden, at every depth of the custom object, in both the list and the detail — `the_flagged_fields_are_hidden_from_a_role_without_the_key`. (Export and import preview arrive with slice 2's CSV.)
 - [x] Record timeline merges activities, stage changes and audit-worthy notes in one ordered stream with correct relative times. (`record_timeline` in `modules/crm/src/activities.rs` merges three arms under **one** `order by` — an activity, a deal's stage change and a deal's archive marker — rather than three queries merged in Rust, which can disagree with themselves the moment a row moves between them. The stage arm reads the deal rows rather than the event log, so a record imported before the event bus existed still has a correct history and a replayed event cannot duplicate an entry. `a_logged_activity_appears_in_the_feed_and_on_the_records_timeline` asserts the activity *and* the stage change are both on a contact's stream and that a contact's call is **not** on its company's; `the_relative_label_reads_as_a_person_would_say_it` pins the label, which is presentation only — ordering always uses `occurred_at`.)
 - [x] CRM copilot returns a summary and a suggested next action; nothing is written to a record without an explicit user action, and the call is audited. (Route in `d2b9f74`: `POST /api/v1/crm/copilot/summarize/{deal_id}` and `/follow-up/{deal_id}` behind `crm.copilot.use`, sharing one handler. The **scoped read runs before the model is resolved**, so a foreign deal is a `404` and never reaches a provider. Every call is audited — `crm.copilot.summarized` / `crm.copilot.follow_up_drafted`, and `crm.copilot.failed` on the failure path — carrying the deal, the action, the model and the size but **neither the draft nor the deal's title**. Proved by `the_copilot_is_guarded_scoped_and_audited` in the 36/36 run: 401, 403 for a manager holding the whole contact/deal family but not the copilot key, 404 across the tenant boundary **in both directions**, the audit row, and the deal unchanged afterwards. No provider is faked — this installation connects none, so the call fails and the audit is asserted *because* a failure is still a call; the sanitiser's text rules are unit-tested in `modules/crm/src/copilot.rs`. **The screen shipped in `2eb8638`** — the endpoints had been reachable only from curl, which is the same as a feature that does not exist: a **Copilot** button on every board card (on the card rather than in a row menu, because on the board the card *is* the record), a side panel that answers both actions, takes focus when it opens and closes on Escape, and `?focus=<id>&copilot=1` to land on the answer from a link. A **refusal renders as a sentence** rather than a silently missing panel, and `is_draft` drives a visible marker that turns amber and reads "written to the record" if a response ever contradicts it. The answer renders in a **text node** — the server's sanitiser already reduced it to plain text. Proved in the browser by `runCrmCopilotDepth`.)
