@@ -43,7 +43,17 @@ DEFAULT_PG_PORT=5433
 export QA_PG_CONTAINER="${QA_PG_CONTAINER:-omnion-postgres}"
 # The database URL in ONE place, because `run.sh` and `walkthrough.cjs` must agree: a pass that
 # resets the database and then cannot sign in to it dies before its first screen.
-QA_DATABASE_URL="postgres://omnion:***@127.0.0.1:${QA_PG_PORT:-$DEFAULT_PG_PORT}/$QA_DB_NAME"
+#
+# The password is read from the environment, never written into the file. A literal was committed
+# here once and it was not a password at all: a masked value re-typed over the real one, which is
+# the shape a credential takes when it is copied back out of a log or a tool's echo. The pass then
+# spent its whole slot waiting for an API that had died on `password authentication failed`, and
+# the symptom — a browser pass that times out on a screen nobody has opened in days — reads as a
+# slow harness, not as a broken URL. `QA_PG_PASSWORD` overrides it for a container that is not the
+# dev one; the default matches every other QA script in this directory.
+QA_PG_PASSWORD="${QA_PG_PASSWORD:-omnion}"
+export QA_PG_PASSWORD
+QA_DATABASE_URL="postgres://omnion:${QA_PG_PASSWORD}@127.0.0.1:${QA_PG_PORT:-$DEFAULT_PG_PORT}/$QA_DB_NAME"
 export QA_DATABASE_URL
 export NODE_PATH="${QA_NODE_PATH:-/root/test-hermes/node_modules}"
 export QA_CHROME="${QA_CHROME:-/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome}"
