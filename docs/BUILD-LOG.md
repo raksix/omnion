@@ -9943,6 +9943,66 @@ Three layers had to be fixed, and each revealed the next one:
 below: *a suite that cannot exercise its subject reports the same number as a suite that is broken*,
 so "5 failed" and "5 never ran" are the same line and only the panic message tells them apart.
 
+### tick 103 — the third direction: the specs were never held against the event catalogue
+
+REQ-010's last open code item was "the CDN purge hook to REQ-011", so I read what that hook
+actually consumes. `media.replaced` is a name nothing emits under any spelling. The file manager
+records `media.version_created` — in REQ-010's own Events list and in the comment on the emitter
+— and REQ-011's spec subscribes to something else. The hook was not merely unbuilt: **built to
+that spec it would have subscribed to a name the bus never publishes**, and because `reconcile`
+deliberately keeps an unknown concrete name (a plugin may own names the table has never heard of)
+the subscription would have been accepted. The picker would have offered nothing, and a replaced
+file would have kept serving the previous version from the edge for ever — the one case the purge
+exists for.
+
+The interesting part is why every gate in this repo called the platform correct. Two drift gates
+already close that seam: `every_emitted_name_is_in_the_catalogue` (an emitter cannot name a
+missing row) and `every_live_name_has_an_emitter` (a `Live` row cannot lack an emitter). Both
+hold *emitters* against the catalogue. **Neither can see the third participant**, which is a
+request file writing down a name it expects to receive. The specs are hand-written, the
+catalogue is hand-written, and nothing in the repository ever compared them.
+
+`every_consumed_name_in_a_live_area_is_deliverable` (`apps/api/tests/events.rs`) walks
+`docs/requests/` and checks that direction. Two decisions make it a measurement rather than a
+guess:
+
+* **The name's *stem*, not its catalogue area.** My first probe compared against the area label
+  (`backups`) and found 9 violations; the Rust gate groups on the stem (`backup`), which is what
+  wildcards group on, and finds 25. The probe was measuring the wrong thing and the gate is the
+  accurate one — a subscriber writes `backup.*`, not `backups.*`.
+* **Only names whose area already emits.** Fifty-nine names across the specs belong to areas
+  nothing emits yet (`order.paid`, `crm.deal.won`, `chat.notify`). A module that has not been
+  built is *expected* to consume its neighbour's names; demanding a row for each would be the
+  registry lying in the direction this crate exists to prevent.
+
+**A gate that is red when it is written is a gate people stop reading**, and twenty-five names
+are unpayable today — every one owed by an unbuilt wave-5b module. So the debt is written down
+with its owner in `OWED_BY_AN_UNBUILT_MODULE`, and the assertion fails on anything *not* there
+and on any entry that has become redundant. Twenty-seven names, two specs, and every one of the
+`iam.*` entries belongs to REQ-065…074, all `pending`.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| gate | `cargo test -p omnion-api --test events -- …every_emitted …every_live …every_consumed` | **3 passed** — the seam now has three directions |
+| crate | `cargo test -p omnion-events --lib --quiet` | **49 passed**, unchanged |
+| proven to fail (1) | planting `media.shadow_copy` in REQ-010's own `Consumed:` line | **FAILED** — `1 name(s) cannot be delivered and nothing owes them`, naming file and line |
+| proven to fail (2) | adding a `Reserved` row for the owed `backup.completed` | **FAILED** — `1 entr(ies) … have become redundant`, so the list cannot rot |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| fmt | `rustfmt --edition 2024` on the one touched file | clean; `git status` shows the two files and nothing else |
+
+**Browser pass: not run.** The slot is held live by `w6` (`pid 1420424`,
+`cwd=/mnt/apopic/omnion-w6`). No screen changed this tick, so nothing is blocked behind it.
+
+**Disk:** `/mnt/apopic` is at **98 % (1.6 G free)**. `omnion-w2-target` (6.9 G) is in use by a
+live sibling test binary and was left alone; I reclaimed `target/debug/{build,.fingerprint}` from
+my own tree, which `lsof` showed held by nothing.
+
+**Next:** the browser pass on a free slot (`--only=media`, reading `mediaFileDetail` and the four
+filter steps out of `summary.json`), which closes REQ-010's screen-states box. The remaining half
+of the purge hook — `crates/cdn` itself — is REQ-011's slice 2.
+
 
 ---
 
