@@ -195,12 +195,43 @@ export function membersOf(current: CanvasSelection): string[] {
   return uniqueIds([...current.nodes, ...(current.focus ? [current.focus] : [])]);
 }
 
-/** Drop every id that no longer exists, so a delete cannot leave a phantom focus behind. */
-export function pruneSelection(current: CanvasSelection, alive: readonly string[]): CanvasSelection {
+/**
+ * Drop every id that no longer exists, so a delete cannot leave a phantom focus behind.
+ *
+ * ## Why the edge is a third argument and not a detail
+ *
+ * The node half of this rule is the one the acceptance criteria talk about, and it was the one
+ * that got fixed: a selection naming a card the graph no longer has leaves the inspector blank,
+ * keeps Duplicate and Copy enabled (`disabled={!selected}` reads the surviving string) and
+ * makes `Del` resolve to nothing. This function is where that was fixed.
+ *
+ * The edge sat outside it for two ticks, and it is not a corner: an edge is one of the two
+ * things that can be selected at all, and it **outranks every node selection** in
+ * `deleteTarget` and in `whatEscapeClears`. So a surviving `edge` id is not cosmetic — it is
+ * what `Del` resolves to, and the status bar renders "1 connection selected (Del removes it)"
+ * from it.
+ *
+ * `aliveEdges` is **optional**, and that is the design rather than an oversight. A caller that
+ * only knows the node set — `removeNodes` prunes against `nextNodes.map(n => n.id)` and has no
+ * edge list in hand — cannot answer the question, and a prune that answered "no" for every
+ * unknown would throw away a selection the caller had no reason to doubt. So: handed the set,
+ * decide; handed nothing, do not guess. `rebaseAfterReload` is the caller that has it, and it
+ * is the one that must, because the graph it just adopted is **the other editor's** and their
+ * removed connections are the ordinary case.
+ */
+export function pruneSelection(
+  current: CanvasSelection,
+  alive: readonly string[],
+  aliveEdges?: readonly string[],
+): CanvasSelection {
   const present = new Set(alive);
   const nodes = current.nodes.filter((id) => present.has(id));
   const focus = current.focus && present.has(current.focus) ? current.focus : (nodes[0] ?? null);
-  return { nodes, focus, edge: current.edge };
+  const edge =
+    current.edge !== null && aliveEdges !== undefined && !aliveEdges.includes(current.edge)
+      ? null
+      : current.edge;
+  return { nodes, focus, edge };
 }
 
 /**
