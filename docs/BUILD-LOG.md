@@ -7122,3 +7122,53 @@ cause is in the file that is supposed to be measuring them.
   **The browser pass over REQ-126/127/128's screens and REQ-129's two new screens stays queued.**
 - **Next.** Two-concurrent-runners proof and the live `lock_timeout` proof as soon as PostgreSQL
   answers; then the QA pass that closes 126, 127 and 128 at once.
+
+## Tick 91 — the eighth key, the disabled button, and the pass that was erasing its own report
+
+Three defects from tick 90's measurement, all found by reading the measurement rather than
+the code, and all mine.
+
+**1. `/` did focus the filter — something else then took the focus back.**
+`slashFocusedFilter: false` was recorded as "`/` is not wired", and the natural fix would have
+been to add a handler. The handler was already there: `notification-list.tsx` binds `/` on the
+table body and focuses `notification-search`. `components/global-search.tsx` binds the same key
+on `window` and focuses its own input. Both run for one keystroke, and the window listener runs
+second — document listeners fire in registration order — so it answered a key the page had
+already claimed and moved focus straight back out. `50221aeb` guards on
+`event.defaultPrevented`: `preventDefault` is set by whoever claimed the key first, so a page
+with its own `/` keeps it and every page without one still gets the global box.
+
+**2. A disabled push button with its reason in a paragraph above it.**
+`pushEnableExplainsItself: false` sat next to `pushUnavailableNamesAVariable: true`: the notice
+named `OMNION_PUSH_*` correctly while the button beside it was disabled and silent. That is the
+dead control the definition of done forbids, and the same shape as the webhook `chat`-channel
+defect. `36259f96` renders the reason next to the button, names it in `title`, and points
+`aria-describedby` at it so a screen reader hears it *before* the click.
+
+**3. The pass erased its own report when a page threw.** A page whose walk fails is pushed as
+`{ ...route, failed }` with no `diagnostics` key; the roll-up then read `d.horizontalOverflow`
+off `undefined` and threw. The throw landed in the mobile phase — the last thing a pass does —
+so one crashed page took every finding with it, and a pass that reported nothing reads exactly
+like a pass with no findings. That is how tick 90's mobile legs stayed unmeasured. `71375c41`
+records an absent measurement as a high finding naming the screen, continues the roll-up, and
+separates a *live* push button (must produce a sentence when the browser refuses) from a
+*disabled* one (must carry its reason) — the old leg clicked unconditionally, and clicking a
+disabled button measures Playwright's refusal rather than the screen.
+
+Proof this tick: `cargo build -p omnion-api` clean · `cargo test -p omnion-notifications --lib`
+**102 passed, 0 failed** · `pnpm --filter @omnion/admin typecheck` exit 0 · `node --check
+scripts/qa/walkthrough.cjs` clean · focused pass `QA_ONLY='notifications-depth'` running.
+
+Next: read the pass's `slashFocusedFilter`, `pushEnableExplainsItself`,
+`pushDisabledReasonNamesAVariable` and `pushDisabledReasonIsDescribed` legs, and the REQ-021
+mobile legs that tick 90's crash never reached.
+
+**The pass is still walking, and the box is why.** At 07:31 the focused
+`QA_ONLY='notifications-depth'` pass had been walking for 55 minutes with its last screenshot
+at 07:23 and `node scripts/qa/walkthrough.cjs` at **0.0% CPU in state S** — not crashed, not
+finished, waiting on a browser whose renderer gets no time. `uptime` reads **load 97** on a
+six-core box: six sibling worktrees are compiling at once, and `QA_SLOT_WAIT=60` had already
+spent its budget and proceeded without a place because the shared slot belongs to the w5 pass
+(`/tmp/omnion-qa-slot` holder alive, cwd `/mnt/apopic/omnion-w5`). So this tick ends with the
+three fixes committed and every gate green, and the browser leg **still owed** — which is the
+honest state, not the "I ran a pass" reading of the same log.

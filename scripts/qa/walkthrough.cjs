@@ -4923,11 +4923,21 @@ async function runNotificationSettingsDepth(page, report) {
       steps.pushEnableLiveWithKey = !(await enable.first().isDisabled().catch(() => true));
     }
 
-    // Pressing it in a headless pass cannot succeed — there is no user gesture and no service
-    // worker — and the block must say *that* rather than silently doing nothing or throwing
-    // an unhandled rejection into the console. Chromium without a service worker rejects
-    // `navigator.serviceWorker.ready`, which is the exact leg that catches a missing catch.
-    if (steps.pushEnableOffered) {
+    // Pressing a LIVE button in a headless pass cannot succeed — there is no user gesture and
+    // no service worker — and the block must say *that* rather than silently doing nothing or
+    // throwing an unhandled rejection into the console. Chromium without a service worker
+    // rejects `navigator.serviceWorker.ready`, which is the exact leg that catches a missing
+    // catch.
+    //
+    // A *disabled* button is a different case and the earlier version measured it wrongly:
+    // it clicked unconditionally and read "no error appeared" as a defect, while on an
+    // installation with no key pair the button is `disabled` by design — Playwright refuses
+    // the click, so the leg was measuring the browser, not the screen. The two are separated
+    // now and BOTH still have to say something: a live button must produce a sentence when
+    // its browser refuses, and a disabled one must carry the reason *with the control*
+    // rather than leaving it in a paragraph further up the block.
+    const enableDisabled = await enable.first().isDisabled().catch(() => true);
+    if (steps.pushEnableOffered && !enableDisabled) {
       await enable.first().click().catch(() => {});
       await page.waitForTimeout(1800);
       const said = await page.locator("[data-push-error]").count();
@@ -4939,6 +4949,17 @@ async function runNotificationSettingsDepth(page, report) {
           .catch(() => "");
         steps.pushErrorIsASentence = text.trim().length > 20;
       }
+    } else if (steps.pushEnableOffered) {
+      steps.pushEnableExplainsItself =
+        (await page.locator("[data-push-enable-reason]").count()) > 0;
+      steps.pushDisabledReasonNamesAVariable = /OMNION_PUSH_[A-Z_]+/.test(
+        await page
+          .locator("[data-push-enable-reason]")
+          .innerText()
+          .catch(() => ""),
+      );
+      steps.pushDisabledReasonIsDescribed =
+        (await page.locator("[data-push-enable][aria-describedby=push-enable-reason]").count()) > 0;
     }
 
     // A remove button that exists on a row must delete that row, and the row must disappear
@@ -10566,7 +10587,25 @@ async function runReliabilityBreakersDepth(page) {
   }
 
   for (const p of report.pages) {
+    // A page whose walk threw is pushed as `{ ...route, failed }` with no `diagnostics` at
+    // all, so every field read off `d` below is a read off `undefined`. That is not a
+    // cosmetic gap: this loop runs *before* the rest of the roll-up, and an uncaught
+    // TypeError here takes every later finding with it — one crashed page silently converts a
+    // pass that measured 90 screens into a pass that reported nothing, and a pass with no
+    // verdict reads as "no findings". The measurement is therefore recorded as **absent**
+    // (a finding that says so) instead of being assumed clean, and the loop continues so a
+    // single bad page cannot cost every later page its report.
     const d = p.diagnostics;
+    if (!d) {
+      pushFindings(
+        "high",
+        "unmeasured-page",
+        `${p.name}: the page walk failed before it produced diagnostics${
+          p.failed ? ` (${p.failed})` : ""
+        } — this screen was not measured`,
+      );
+      continue;
+    }
     if (d.horizontalOverflow) pushFindings("high", "overflow", `${p.name}: page scrolls horizontally (${d.scrollWidth}px > ${d.viewport.w}px)`);
     if (d.offscreen.length) pushFindings("high", "offscreen", `${p.name}: ${d.offscreen.length} element(s) outside the viewport, e.g. ${JSON.stringify(d.offscreen[0])}`);
     if (d.brokenImages.length) pushFindings("high", "broken-image", `${p.name}: ${d.brokenImages.join(", ")}`);
@@ -10577,8 +10616,17 @@ async function runReliabilityBreakersDepth(page) {
     if (d.h1Count === 0) pushFindings("low", "no-h1", `${p.name}: no h1 heading`);
   }
   for (const m of report.mobile) {
-    if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
-    if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
+    // The same absent-measurement rule as the desktop roll-up above, for the same reason: the
+    // phone phase is the last thing a pass does, so a throw here is the throw that erases
+    // everything it just measured. This pass died here — `Cannot read properties of undefined
+    // (reading 'horizontalOverflow')` — and took the entire finding report with it.
+    const d = m.diagnostics;
+    if (!d) {
+      pushFindings("high", "unmeasured-mobile", `mobile ${m.name}: no diagnostics were produced — this screen was not measured at 390px`);
+      continue;
+    }
+    if (d.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
+    if (d.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${d.offscreen.length} element(s) outside the viewport`);
   }
   const refusedOnPurpose = [];
   for (const [index, f] of consoleLog.entries()) {

@@ -305,6 +305,9 @@ export function NotificationDevices() {
           onClick={() => void turnOn()}
           disabled={busy || unavailable}
           data-push-enable
+          {...(unavailable
+            ? { title: key?.reason ?? undefined, "aria-describedby": "push-enable-reason" }
+            : {})}
           className="inline-flex min-h-9 items-center gap-2 rounded-md bg-[var(--accent)] px-3 py-2 text-[13px] text-white disabled:opacity-50"
         >
           {busy ? (
@@ -314,6 +317,19 @@ export function NotificationDevices() {
           )}
           {busy ? "Asking this browser…" : "Turn on notifications in this browser"}
         </button>
+        {/* A disabled control whose reason lives somewhere else is the dead button the
+            definition of done forbids, and the reason has to travel WITH the control: the
+            notice above names the environment variable, but the two are separate elements and
+            a reader's eye goes to the button that looks actionable. The label is appended
+            rather than replaced — the button still says what it does, and now it also says
+            why it cannot do it yet. `title` carries the same sentence for a pointer, and
+            `aria-describedby` points at it so a screen reader gets the reason before the
+            click, not after the refusal. */}
+        {unavailable ? (
+          <span id="push-enable-reason" className="text-[12px] text-muted">
+            {key?.reason} <span className="text-muted">(set it, then press Refresh)</span>
+          </span>
+        ) : null}
         <button
           type="button"
           onClick={() => void load()}
