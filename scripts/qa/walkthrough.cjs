@@ -6517,6 +6517,55 @@ async function runCdnPurgeDepth(page, report) {
   } catch (cleanupError) {
     steps.cleanupFailed = String(cleanupError);
   }
+
+  // ---- the gates -------------------------------------------------------------------------
+  // Same shape as the rules pass, and for the same reason: a `steps.x = false` here reaches
+  // summary.json and no gate. Six of these claims were written across three ticks specifically
+  // to catch defects the pass's author could not see from the source — `filterNarrows` and
+  // `countMatches` were the two that turned out to be reporting the harness's own arithmetic —
+  // and they are precisely the ones that could not have failed.
+  const gate = (claim, severity, what) => {
+    if (steps[claim] === true || (typeof steps[claim] === "number" && steps[claim] > 0)) return;
+    record({
+      page: "cdn-purges",
+      action: `purge-${claim}`,
+      severity,
+      detail: what,
+      measured: steps[claim],
+    });
+  };
+
+  gate("console", "high", "the purge console did not render its target field");
+  gate("malformedMessage", "high", "a target with no leading slash was accepted with no message naming the problem");
+  gate("malformedBlocksSubmit", "high", "a malformed target does not block submit, so the refusal happens server-side where the operator cannot see it");
+  gate("zoneBlockedBeforeConfirm", "high", "a whole-zone purge is submittable before the confirmation word is typed — the confirmation is a label, not a gate");
+  gate("zoneEnabledAfterConfirm", "high", "typing the confirmation word did not enable a whole-zone purge, so the control is unreachable");
+  gate("submitted", "high", "a valid purge was submitted and the screen reported nothing — the operator cannot tell whether it queued");
+  gate("failedBanner", "high", "a purge the provider refused is in the history and nothing on screen says so");
+  gate("countMatches", "high", "the visible rows, the API's total and the header's 'Showing N of M' are not the same fact");
+  gate("pageOneOfMany", "medium", "the history holds more purges than the API's total reports, so the count is stale or the query is not paging");
+  gate("drawerOpened", "high", "a failed purge row does not open its drawer, so the provider's own error message is unreachable");
+  gate("drawerError", "high", "the drawer shows no provider error for a purge that failed");
+  gate("drawerItems", "high", "the drawer lists no items for a purge that has per-item results");
+  gate("retryLabel", "medium", "the retry control does not name how many targets it will re-send — a 'Retry' on a partial row hides whether already-delivered targets are re-sent");
+  gate("escClosedDrawer", "medium", "Escape does not close the purge drawer");
+  gate("statusFilterIsSelect", "high", "the status filter is not a <select>; the pass cannot drive it and any 'filter does not narrow' reading would be the harness, not the product");
+  gate("filterNarrows", "high", "choosing a status left the row count unchanged — the filter narrows nothing");
+  gate("emptyStateShown", "high", "a filter matching no rows did not produce an empty state, so the table simply looks empty");
+  gate("emptyStateIsNotTheUnfilteredOne", "high", "the filtered empty state is the unfiltered 'no purges yet' message, which tells an operator their site has no history when a filter is wrong");
+  gate("clearedBackToRows", "high", "clearing the filter did not restore the rows the screen had before it — the clear control does not clear");
+  gate("cleanupFailed", "low", "the pass could not remove the rows it created, so the next pass inherits them");
+  // Layout facts, recorded rather than gated: an empty table legitimately has no cards and a
+  // legitimately empty list is not a defect.
+  if (steps.mobileTableHidden === false && steps.mobileCards > 0) {
+    record({
+      page: "cdn-purges",
+      action: "purge-mobile-table-not-hidden",
+      severity: "medium",
+      detail: "the purge table is still on screen at 390px alongside the cards",
+      measured: { mobileCards: steps.mobileCards },
+    });
+  }
   return steps;
 }
 
