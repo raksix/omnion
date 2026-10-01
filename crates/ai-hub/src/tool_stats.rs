@@ -146,23 +146,53 @@ pub async fn refresh_day(pool: &PgPool, day: Date) -> Result<u64> {
             -- time); `left join` because a call whose step was pruned contributes a call and no
             -- cost, which is different from contributing no call.
             coalesce(sum(s.cost_micros), 0)::bigint        as cost_micros,
-            -- The failure-reason histogram. `coalesce(error_code, 'unknown')` because a failed
-            -- call with no code is still a failure the operator has to see — dropping it would
-            -- make the ranked list quietly under-report, which is the failure mode of every
-            -- "only count what we can name" aggregation.
-            coalesce(
-                jsonb_object_agg(
-                    coalesce(c.error_code, 'unknown'),
-                    count(*) filter (
-                        where c.status not in ('ok', 'denied')
-                    )::bigint
-                ) filter (
-                    where c.status not in ('ok', 'denied')
-                ),
-                '{}'::jsonb
-            )                                             as error_codes
+            -- The failure-reason histogram, as `{code: count}`.
+            --
+            -- **Two steps, and the second one is a real Postgres restriction.** The obvious form —
+            -- `jsonb_object_agg(code, count(*) filter (...))` — is illegal: `jsonb_object_agg`
+            -- *is* an aggregate, and its value argument may not contain another aggregate
+            -- ("aggregate function calls cannot be nested"). The histogram is therefore counted
+            -- in a subquery of its own and joined in, so the value is a plain per-group column.
+            --
+            -- `coalesce(error_code, 'unknown')` because a failed call with no code is still a
+            -- failure the operator has to see; dropping it would make the ranked list quietly
+            -- under-report, which is the failure mode of every "only count what we can name"
+            -- aggregation.
+            --
+            -- `min(h.codes::text)::jsonb`, and the path to it is worth writing down because the
+            -- two obvious alternatives are both wrong in ways that pass a casual read:
+            --
+            -- - `max(h.codes)` — **`max` does not exist for jsonb.** jsonb has no ordering.
+            -- - `(jsonb_agg(distinct h.codes))[1]` — **jsonb has no equality operator**, so
+            --   `distinct` cannot compare the values it is aggregating and collapses every row
+            --   to nothing. The query runs, returns no error, and yields `null`. This is the
+            --   worst kind of bug: a silent empty histogram that reads as "no failures".
+            --
+            -- `min()` over the *text* form is the working reduction, and it is exact rather than
+            -- a stand-in: the subquery emits exactly one histogram per `(organization, tool)`, so
+            -- every row being min'd holds the same document and the minimum is that document.
+            -- jsonb's text form is stable for a given value, so the comparison is well-defined.
+            coalesce(min(h.codes::text)::jsonb, '{}'::jsonb) as error_codes
         from ai_tool_calls c
         left join ai_run_steps s on s.id = c.step_id
+        -- The failure histogram, aggregated on its own because it cannot share the outer
+        -- `group by`: it groups by a *third* column (`error_code`) that the row totals do not,
+        -- and folding it in as a nested aggregate is rejected outright by the planner.
+        left join (
+            select organization_id, tool_key, jsonb_object_agg(code, hits) as codes
+            from (
+                select organization_id,
+                       tool_key,
+                       coalesce(error_code, 'unknown') as code,
+                       count(*)::bigint as hits
+                from ai_tool_calls
+                where (created_at at time zone 'utc')::date = $1::date
+                  and organization_id is not null
+                  and status not in ('ok', 'denied')
+                group by organization_id, tool_key, coalesce(error_code, 'unknown')
+            ) failures
+            group by organization_id, tool_key
+        ) h on h.organization_id = c.organization_id and h.tool_key = c.tool_key
         where (c.created_at at time zone 'utc')::date = $1::date
           and c.organization_id is not null
         group by c.organization_id, c.tool_key
@@ -209,7 +239,6 @@ pub async fn tools_in_window(
         p95_ms: Option<i32>,
         p99_ms: Option<i32>,
         cost_micros: i64,
-        error_codes: serde_json::Value,
         days_seen: i32,
     }
 
@@ -234,29 +263,39 @@ pub async fn tools_in_window(
             sum(successes)::bigint   as successes,
             sum(failures)::bigint    as failures,
             sum(denials)::bigint     as denials,
-            case when sum(calls) = 0 then null else
-                (weighted_avg(p50_ms, calls))::int
+            -- A day's percentile contributes in proportion to that day's calls, and a day with
+            -- a NULL percentile (no call recorded a duration) contributes nothing rather than
+            -- dragging the mean down — `sum(p * c)` skips the NULL on its own, which is the
+            -- correct handling: an unmeasured day is not a zero-latency day.
+            --
+            -- The division is guarded by `sum(calls) filter (where p is not null)` rather than by
+            -- `sum(calls)`, so a window whose *only* rows have no percentile yields NULL ("not
+            -- measured") instead of 0 ("measured as instant") — the same distinction
+            -- `success_percent` makes between "—" and "0%".
+            case when sum(calls) filter (where p50_ms is not null) = 0 then null else
+                round(sum(p50_ms::float8 * calls) filter (where p50_ms is not null)
+                      / sum(calls) filter (where p50_ms is not null))::int
             end                       as p50_ms,
-            case when sum(calls) = 0 then null else
-                (weighted_avg(p95_ms, calls))::int
+            case when sum(calls) filter (where p95_ms is not null) = 0 then null else
+                round(sum(p95_ms::float8 * calls) filter (where p95_ms is not null)
+                      / sum(calls) filter (where p95_ms is not null))::int
             end                       as p95_ms,
-            case when sum(calls) = 0 then null else
-                (weighted_avg(p99_ms, calls))::int
+            case when sum(calls) filter (where p99_ms is not null) = 0 then null else
+                round(sum(p99_ms::float8 * calls) filter (where p99_ms is not null)
+                      / sum(calls) filter (where p99_ms is not null))::int
             end                       as p99_ms,
             sum(cost_micros)::bigint as cost_micros,
-            -- Merging the daily histograms by summing each code's count, then dropping the zeros
-            -- a re-run can leave behind. An `error_code` present with count 0 is not a failure
-            -- and must not render as one.
-            coalesce((
-                select jsonb_object_agg(code, hits)
-                from (
-                    select key as code, sum(value::bigint) as hits
-                    from jsonb_each_text(error_codes)
-                    group by key
-                    having sum(value::bigint) > 0
-                ) merged
-            ), '{}'::jsonb)          as error_codes,
             count(*)::int             as days_seen
+            -- The failure histograms are merged by a SECOND query rather than a correlated
+            -- subquery inside this one. `jsonb_each_text(error_codes)` needs the row's
+            -- `error_codes`, which is not in this query's `group by` (only `tool` is), and a
+            -- subquery that reaches an ungrouped column of the outer query is rejected outright
+            -- ("subquery uses ungrouped column"). Splitting the work in two is also the honest
+            -- shape: the roll-up totals and the histogram are two different aggregations over two
+            -- different columns.
+            -- No `error_codes` here on purpose: this query groups by `tool` only, and reaching
+            -- a row's histogram from inside it is exactly what the grouping rule forbids. The
+            -- histograms are read by the second query below, which has no grouping to violate.
         from ai_tool_stats_daily
         where organization_id = $1 and day between $2 and $3
         group by tool
@@ -269,33 +308,87 @@ pub async fn tools_in_window(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
+    // The histograms for the same window, keyed by tool.
+    //
+    // Zeros are dropped: an `error_code` present with count 0 is not a failure and must not
+    // render as one. `jsonb_each_text` yields text values, so the count is parsed rather than
+    // cast — `value::bigint` on a jsonb text value is a cast Postgres rejects for exactly this
+    // shape.
+    //
+    // A `#[derive(FromRow)]` struct rather than a tuple: `query_scalar` with a tuple type does not
+    // decode a two-column row (it expects one column per type), and the failure is a
+    // `ColumnDecode` about `RECORD` against `TEXT` rather than anything that names the mistake.
+    #[derive(sqlx::FromRow)]
+    struct Histogram {
+        tool: String,
+        error_codes: serde_json::Value,
+    }
+
+    let histograms: std::collections::HashMap<String, std::collections::BTreeMap<String, i64>> =
+        sqlx::query_as::<_, Histogram>(
+            "select tool, error_codes from ai_tool_stats_daily \
+             where organization_id = $1 and day between $2 and $3",
+        )
+        .bind(organization_id)
+        .bind(window.from)
+        .bind(window.to)
+        .fetch_all(pool)
+        .await?
         .into_iter()
-        .map(|row| ToolAggregate {
-            tool: row.tool,
-            calls: row.calls,
-            successes: row.successes,
-            failures: row.failures,
-            denials: row.denials,
-            p50_ms: row.p50_ms,
-            p95_ms: row.p95_ms,
-            p99_ms: row.p99_ms,
-            cost_micros: row.cost_micros,
-            error_codes: row
+        .map(|row| {
+            // **The counts are JSON numbers, not strings.** `jsonb_object_agg(code, hits)`
+            // writes `{"tool_timeout": 2}` — `hits` was bound as `bigint`, so the value decodes
+            // as `Value::Number`. A reader that reaches for `as_str()` gets `None` for every
+            // code and returns an empty histogram — a "no failures" reading on a tool with two,
+            // with no error anywhere. `as_i64()` is the matching accessor; the string arm is kept
+            // only for rows written by an older hand, and it is not the path production takes.
+            let merged = row
                 .error_codes
                 .as_object()
                 .map(|map| {
                     map.iter()
-                        .filter_map(|(code, count)| {
-                            count
-                                .as_str()
-                                .and_then(|raw| raw.parse::<i64>().ok())
-                                .map(|hits| (code.clone(), hits))
+                        .filter_map(|(code, hits)| {
+                            let parsed = hits.as_i64().or_else(|| {
+                                hits.as_str().and_then(|raw| raw.parse::<i64>().ok())
+                            })?;
+                            (parsed > 0).then(|| (code.clone(), parsed))
                         })
-                        .collect()
+                        .fold(
+                            std::collections::BTreeMap::<String, i64>::new(),
+                            |mut acc, (code, hits)| {
+                                *acc.entry(code).or_default() += hits;
+                                acc
+                            },
+                        )
                 })
-                .unwrap_or_default(),
-            days_seen: row.days_seen,
+                .unwrap_or_default();
+            (row.tool, merged)
+        })
+        .collect();
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            // Borrowed before the move: `histograms.get(&row.tool)` reads the name, and the
+            // struct literal moves it on the next line. Looking the histogram up first is the
+            // order that compiles and the order that reads.
+            let error_codes = histograms.get(&row.tool).cloned().unwrap_or_default();
+            ToolAggregate {
+                tool: row.tool,
+                calls: row.calls,
+                successes: row.successes,
+                failures: row.failures,
+                denials: row.denials,
+                p50_ms: row.p50_ms,
+                p95_ms: row.p95_ms,
+                p99_ms: row.p99_ms,
+                cost_micros: row.cost_micros,
+                // From the merged histogram map. A tool with no failures gets an empty map rather
+                // than a missing key, so the reader renders "no failures" instead of having to
+                // distinguish absent from zero.
+                error_codes,
+                days_seen: row.days_seen,
+            }
         })
         .collect())
 }
