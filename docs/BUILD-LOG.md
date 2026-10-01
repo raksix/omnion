@@ -7298,3 +7298,66 @@ is the lever that actually works.
 
 **Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps
 out of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+## 2026-10-01 · tick 102 · REQ-010 — every purge was leaving storage behind
+
+**What.** Three interactive purge paths — the single file, the bulk bar and empty-trash — read
+`media.storage_key`, deleted that one object and then removed the row. But `media_versions` and
+`media_derivatives` are both `on delete cascade` from `media`, so **the row delete that made the
+purge look complete also destroyed the only remaining record of where every superseded version and
+every preset-cache object lives.** They stayed in the bucket with nothing able to name them again.
+
+Nothing was red. The crates compiled, `omnion-media --lib` was green, the API answered, the
+retention sweep's own walk passed. A purge's tests assert the *row* is gone — and it is. The class is
+ticks 100 and 101's again: a value handled on one side of a boundary and not offered on the other,
+here a key that exists in three tables and is read from one.
+
+**Second defect, found by the walk written to measure the first.** `POST /media/{id}/versions` was
+mounted as a bare `post(…)` with no `DefaultBodyLimit`, so axum's **2 MB framework default** applied.
+Every replacement above it was refused `413` before `create_version` was ever entered — while the
+handler carries its own check against `MAX_UPLOAD_BYTES` (25 MB) and *names that number* in its
+error message. So the panel could store a 20 MB file through `/media` and then be unable to replace
+it, with an error saying "larger than the 26214400 byte limit" on a 2 MB body. Two limits for one
+operation, the smaller one undocumented and unintentional.
+
+**Decisions worth keeping.**
+
+* **One question, one function.** `owned_object_keys` is the union over all three tables;
+  `retention::all_keys_of` is now a **delegate** rather than a second query, and the uncalled third
+  copy (`preset_store::derivative_keys`) is deleted. The two survivors had *already drifted* — the
+  sweep unioned only two of three tables, so the nightly purge that exists to reclaim storage
+  nothing else will left every preset object behind. That is the class named in one line: three
+  implementations of one answer is how the interactive paths came to read one key.
+* **The gate counts, because duplication is the failure mode.** It fails when a fourth answer
+  appears and when the delegate is rewritten into a query. It cannot tell whether a query is
+  *correct* — the sibling walk answers that, against a real database. Its first version counted the
+  whole file and got 2, because the assertion message contains the string it counts: a gate that
+  reads its own explanation cannot fail. It now counts the function body only.
+* **A fixture is not a product.** Three of the four failures on the way here were the test's, and
+  each looked exactly like a product defect. A synthetic PNG header stores, lists and reorders fine
+  and answers `422 not_transformable` the first time anything *opens* it. A site row inserted after
+  `db.migrate()` has no `standard` preset, and an unknown preset deliberately serves the original
+  with a `200` — so the walk read two owned keys where it expected three. And the derivative cache
+  is keyed by `sha256(checksum | preset body)` and looked up **by cache key, not by `media_id`**,
+  so a repeated fixture was served *another file's* cached derivative and had none of its own. The
+  walk now asserts `image/webp` rather than `200`, because a `200` is not proof the preset ran.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **250 passed** (248 → 250) |
+| gate | the new `one_answer_to_what_a_file_owns_not_three` | proven to fail by rewriting the delegate into a query |
+| walk | `cargo test -p omnion-api --test media -- …purge… …replacement_may…` | **2 passed** over the real router, live PostgreSQL and MinIO |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| fmt | `rustfmt --edition 2024` on the touched files | clean; the ~40 files `cargo fmt --all` still lists are **pre-existing** and untouched here |
+
+**Browser pass: not run.** The slot is held live by `w3` (`pid 2914377`,
+`cwd=/mnt/apopic/omnion-w3`). The screen-states box stays open for that reason alone.
+
+**Disk:** `/mnt/apopic` is at **93 % (4.1 G free)** — up from 98 % last tick. `CARGO_INCREMENTAL=0`
+was used after a sibling deleted `target/` mid-build (`failed to copy … .o: No such file or
+directory`), which is the harness, not the code.
+
+**Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps out
+of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
