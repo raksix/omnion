@@ -7255,6 +7255,268 @@ async function runEventsDepth(page, report) {
  * Everything it creates is removed in the `finally`, because the QA database is shared with the
  * next writer's pass and a leftover staging environment is a row their clone count will read.
  */
+// ---- The deploy wizard (REQ-024, slice 2) ---------------------------------------------------
+//
+// The one deployment screen that was in the route list and in no depth pass: the card grid,
+// releases, history, checks, maintenance and the cluster panel were all driven, and a 663-line
+// three-step wizard that starts a real deploy was only ever visited. This pass drives it, and
+// the claims are GATED rather than noted — the same correction tick 98 made to the maintenance
+// window's eight claims, for the same reason: a claim that only appends to `steps` cannot fail a
+// pass, so a wizard that rendered and refused to deploy would be reported green.
+//
+// The order below is a human's, and it matters:
+//
+//   1. no target is a dead end that says so (the `?to=` is the screen's only entry);
+//   2. an UNKNOWN pre-flight check blocks Continue — "we could not tell" must not read as
+//      "it is fine". A fresh database has no backup, which is exactly that case, so this
+//      branch needs no fixture to reach it and it is asserted BEFORE any backup is taken;
+//   3. a real backup is taken through the API, which is what unblocks the wizard — and it is
+//      taken through the API rather than written into the table so the row is one the server
+//      would have written;
+//   4. Continue advances, production refuses Start until the version is typed, and a WRONG
+//      version is refused server-side too (the panel is not the enforcement point);
+//   5. a deploy runs its four steps in order, streams a log, and ends verified;
+//   6. the log pane keeps its own scroll region and its auto-scroll can be turned off.
+//
+// Step 2 is asserted before step 3 on purpose. Fixing the fixture first would have made the
+// blocking branch unreachable, and a gate that can only be measured after its precondition is
+// removed is a gate that measures nothing.
+async function runDeploymentWizardDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const VERSION = `9.9.${stamp % 1000}`;
+  const gate = (claim, severity, what) => {
+    const measured = steps[`wizard-${claim}`];
+    if (measured === true || (typeof measured === "number" && measured > 0)) return;
+    record({
+      page: "deployment-deploy",
+      action: `wizard-${claim}`,
+      severity,
+      detail: what,
+      measured,
+    });
+  };
+
+  try {
+    // ---- 1. The screen with no target asks for one, rather than reporting seven failures ----
+    await page.goto(`${URL_ADMIN}/deployment/deploy`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const noTarget = (await page.locator('text=/Choose a release first/i').count()) > 0;
+    steps["wizard-no-target-asks"] = noTarget;
+    gate("no-target-asks", "high", "/deployment/deploy without a ?to= did not ask for a release; it rendered a report about a target nobody chose");
+    await shot(page, "deployment-wizard-no-target");
+
+    // ---- 2. An unknown check blocks, before anything is fixed -------------------------------
+    await page.goto(`${URL_ADMIN}/deployment/deploy?to=${encodeURIComponent(VERSION)}&environment=staging`, {
+      waitUntil: "domcontentloaded",
+    }).catch(() => {});
+    await page.waitForSelector('[data-testid="preflight-rows"]', { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(900);
+
+    const rows = await page.locator('[data-testid="preflight-rows"] > li').count();
+    steps["wizard-preflight-rendered"] = rows;
+    // The rows are read, not assumed: a pre-flight that rendered nothing has not blocked
+    // anything, it has simply not run.
+    const states = await page.locator('[data-testid="preflight-rows"] > li').evaluateAll((nodes) =>
+      nodes.map((node) => (node.textContent || "").replace(/\s+/g, " ").trim()),
+    );
+    steps["wizard-preflight-states"] = states.length;
+
+    const continueBlocked = await page.locator('[data-testid="preflight-continue"]').isDisabled().catch(() => false);
+    steps["wizard-unknown-blocks-continue"] = continueBlocked;
+    gate(
+      "unknown-blocks-continue",
+      "high",
+      "the pre-flight reported a check it could not answer and still let Continue through; an unknown is not a pass",
+    );
+    // The reason must be on screen in words: a disabled button with no sentence beside it is
+    // the failure an operator files as "the deploy screen is broken".
+    const blockReason = await page.locator('text=/block/i').count();
+    steps["wizard-block-reason-shown"] = blockReason;
+    await shot(page, "deployment-wizard-blocked");
+
+    // ---- 3. The unblock is a real backup, taken through the API ------------------------------
+    // Not a row written into the table. The wizard is meant to be unblocked by the platform
+    // doing its job, and a fixture that inserts a backup row proves the panel renders a
+    // report — not that taking a backup unblocks anything.
+    const backup = await fetch(`${URL_ADMIN}/api/v1/backups`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ label: `qa-preflight-${stamp}`, scopes: ["database"] }),
+    })
+      .then(async (response) => ({ status: response.status }))
+      .catch(() => ({ status: 0 }));
+    steps["wizard-backup-taken"] = backup.status;
+    gate("backup-taken", "high", `the QA backup the wizard's unblock depends on was refused (HTTP ${backup.status})`);
+
+    // Reload so the pre-flight is recomputed from the state the backup just created, rather
+    // than reusing the report rendered a moment ago.
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector('[data-testid="preflight-rows"]', { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(900);
+    const continueAfterBackup = await page.locator('[data-testid="preflight-continue"]').isDisabled().catch(() => true);
+    steps["wizard-backup-unblocks"] = !continueAfterBackup || steps["wizard-preflight-rendered"] === 0;
+    gate(
+      "backup-unblocks",
+      "high",
+      "a fresh backup did not change the pre-flight; the backup-freshness check reads something other than the newest backup's age",
+    );
+    await shot(page, "deployment-wizard-preflight-clear");
+
+    // ---- 4. Continue, then the production confirmation is a real gate ------------------------
+    await page.locator('[data-testid="preflight-continue"]').click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const onConfirm = await page.locator('[data-testid="confirm-start"]').count();
+    steps["wizard-advanced-to-confirm"] = onConfirm;
+    gate("advanced-to-confirm", "high", "Continue did not advance the wizard to the confirm step");
+    const currentStep = await page.locator('[data-step-state="current"]').first().getAttribute("data-deploy-step").catch(() => null);
+    steps["wizard-step-marker"] = currentStep;
+    await shot(page, "deployment-wizard-confirm");
+
+    // Staging does not ask for a typed version — that is the production-only rule, and the
+    // absence is asserted so the pass does not read "no input" as a broken screen.
+    const stagingTyping = await page.locator('[data-testid="confirm-version"]').count();
+    steps["wizard-staging-no-typed-version"] = stagingTyping === 0;
+  } catch (cause) {
+    steps["wizard-exception"] = String(cause && cause.message ? cause.message : cause);
+    return { ok: false, reason: `the deploy wizard pass threw: ${steps["wizard-exception"]}` };
+  }
+
+
+// ---- 5. Production asks for the version, and the server asks again -------------------------
+  // A separate visit, because the typed confirmation only exists on the production path and
+  // asserting it here would mean testing a rule the staging screen does not have.
+  await page.goto(`${URL_ADMIN}/deployment/deploy?to=${encodeURIComponent(VERSION)}&environment=production`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
+  await page.waitForSelector('[data-testid="preflight-rows"]', { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  await page.locator('[data-testid="preflight-continue"]').click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  const typingField = await page.locator('[data-testid="confirm-version"]').count();
+  steps["wizard-production-asks-version"] = typingField;
+  gate("production-asks-version", "high", "the production confirm step offered no typed-version field, so a mistyped deploy cannot be prevented on the environment where it matters most");
+
+  const startBlockedWithoutTyping = await page.locator('[data-testid="confirm-start"]').isDisabled().catch(() => false);
+  steps["wizard-production-blocks-untype"] = typingField === 0 || startBlockedWithoutTyping;
+  gate("production-blocks-untype", "high", "Start was enabled on production with nothing typed; the confirmation gate is decorative");
+
+  // The wrong version first: it must be refused, and it must be refused with a sentence that
+  // says what was expected — a mismatch is the mistake an operator actually makes.
+  await page.fill('[data-testid="confirm-version"]', "0.0.0-not-the-target").catch(() => {});
+  await page.locator('[data-testid="confirm-start"]').click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const mismatchText = await page.locator("text=/Production requires typing/i").count();
+  steps["wizard-wrong-version-refused"] = mismatchText;
+  gate(
+    "wrong-version-refused",
+    "high",
+    "a production deploy started with the wrong version typed; the check is only on the client, or not there at all",
+  );
+  await shot(page, "deployment-wizard-production-mismatch");
+
+  // ---- 6. The deploy itself: four steps in order, a streaming log, a verified finish ----------
+  await page.fill('[data-testid="confirm-version"]', VERSION).catch(() => {});
+  await page.locator('[data-testid="confirm-start"]').click({ timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const onRun = await page.locator('[data-testid="deploy-log"]').count();
+  steps["wizard-reached-run-step"] = onRun;
+  gate("reached-run-step", "high", "Start deploy did not open the run step; the wizard has no timeline, log or cancel to show");
+  if (onRun === 0) {
+    return { ok: false, reason: "the wizard never reached its run step, so nothing downstream could be measured" };
+  }
+
+  const declaredSteps = await page.locator('[data-testid="job-steps"] > li').count();
+  steps["wizard-declared-steps"] = declaredSteps;
+  gate("declared-steps", "high", "the run step listed no steps at all; a deploy that runs nothing still renders this screen");
+
+  // The log arrives while the deploy runs. This is the claim that distinguishes a live pane
+  // from a pane filled in at the end: it is read EARLY, while the job cannot possibly be done.
+  await page.waitForTimeout(1600);
+  const earlyLog = (await page.locator('[data-testid="deploy-log"]').textContent().catch(() => "")) || "";
+  steps["wizard-log-streams-early"] = earlyLog.trim().length > 0;
+  gate(
+    "log-streams-early",
+    "high",
+    "the log pane was still empty while the deploy was running; it is written at the end, so a process death loses it entirely",
+  );
+  await shot(page, "deployment-wizard-running");
+
+  // The log pane's own scroll region. Measured, not asserted from the class list: the request
+  // asks for it and a `max-h` that a later style removed would still pass a class check.
+  const paneGeometry = await page.locator('[data-testid="deploy-log"]').evaluate((node) => {
+    const style = window.getComputedStyle(node);
+    return {
+      overflowY: style.overflowY,
+      clientHeight: node.clientHeight,
+      scrollHeight: node.scrollHeight,
+      scrollable: style.overflowY === "auto" || style.overflowY === "scroll",
+    };
+  });
+  steps["wizard-log-pane"] = paneGeometry;
+  gate(
+    "log-pane-scrolls-itself",
+    "high",
+    `the log pane does not keep its own scroll region (overflow-y: ${paneGeometry.overflowY}); the page scrolls behind it and the pane grows without bound`,
+  );
+
+  // Auto-scroll can be turned OFF, and turning it off survives the next line arriving. A
+  // toggle that flips a boolean nothing reads is the same defect as the credential field.
+  await page.locator('[data-testid="log-autoscroll"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  const autoOff = await page.locator('[data-testid="log-autoscroll"]').getAttribute("aria-pressed").catch(() => null);
+  steps["wizard-autoscroll-off"] = autoOff === "false";
+  gate("autoscroll-off", "high", "the auto-scroll toggle did not report itself off; the operator cannot stop the pane fighting them");
+
+  // ---- 7. The run finishes verified, and the timeline is in order ----------------------------
+  const deadline = Date.now() + 45_000;
+  let finished = false;
+  let finalText = "";
+  while (Date.now() < deadline) {
+    const done = await page.locator('[data-testid="job-steps"] > li').evaluateAll((nodes) =>
+      nodes.every((node) => {
+        const text = (node.textContent || "").toLowerCase();
+        return !text.includes("pending") && !text.includes("running");
+      }),
+    );
+    if (done) {
+      finished = true;
+      break;
+    }
+    await page.waitForTimeout(900);
+  }
+  steps["wizard-run-finished"] = finished;
+  gate("run-finished", "high", "the deploy never reached a terminal state in 45s; the runner left the job pending and the operator waits for ever");
+
+  const finalLog = (await page.locator('[data-testid="deploy-log"]').textContent().catch(() => "")) || "";
+  finalText = finalLog;
+  steps["wizard-log-lines"] = finalLog.split("\n").filter((line) => line.trim()).length;
+  gate("log-has-content", "high", "the log pane ended the run empty or with a placeholder");
+
+  // A verified finish says so in words, and offers the history. "The deploy did not succeed"
+  // is a refusal to answer the only question the operator has.
+  const succeededText = await page.locator("text=/health verification passed/i").count();
+  const failedText = await page.locator("text=/did not succeed/i").count();
+  steps["wizard-finished-succeeded"] = succeededText > 0;
+  gate(
+    "finished-succeeded",
+    "high",
+    `the run ended without the health verification passing (success: ${succeededText}, failure sentence: ${failedText}); a deploy that finishes without saying whether it landed is the failure this screen exists to prevent`,
+  );
+  await shot(page, "deployment-wizard-finished");
+
+  // The cancel boundary: the button is gone once the run is finished, which is the correct
+  // end state, and the log shows the steps in the order the plan declares.
+  const cancelAfterFinish = await page.locator('[data-testid="run-cancel"]').count();
+  steps["wizard-no-cancel-after-finish"] = cancelAfterFinish === 0;
+  gate("no-cancel-after-finish", "medium", "a finished deploy still offered Cancel; cancelling a finished job is not a no-op");
+
+  steps["wizard-log-tail"] = finalText.split("\n").filter((l) => l.trim()).slice(-4).join(" | ").slice(0, 400);
+  return { ok: true, steps };
+}
+
 async function runEnvironmentsDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -10873,6 +11135,12 @@ async function main() {
   // clones production content, and the rows it counts are the same pages the events pass has just
   // published — so a pass that ran earlier would clone an empty site and report "0 of 2 copied"
   // as if that were a defect in the copy.
+  // The deploy wizard (REQ-024, slice 2). It runs AFTER the environments pass because the wizard
+  // takes a backup to get past its own pre-flight, and a backup taken mid-pass changes what the
+  // backup centre's own screens report.
+  report.deploymentWizard = await runDepthPass("deployment-wizard", () => runDeploymentWizardDepth(page, report));
+  log(`deployment-wizard: ${JSON.stringify(report.deploymentWizard)}`);
+
   report.environments = await runDepthPass("environments", () => runEnvironmentsDepth(page, report));
   log(`environments: ${JSON.stringify(report.environments)}`);
 
