@@ -29,6 +29,7 @@ import {
   type GuardTestResult,
   createGuardFixture,
   fetchGuardFixtures,
+  fetchGuardPolicy,
   runGuardTest,
 } from "@/lib/guard-api";
 
@@ -42,6 +43,19 @@ export function GuardTester() {
   const [error, setError] = useState<string | null>(null);
   const [fixtures, setFixtures] = useState<GuardFixture[]>([]);
   const [savingFixture, setSavingFixture] = useState(false);
+  /**
+   * The guard keys this viewer is missing, or `null` while it is still being read.
+   *
+   * `POST /ai/guard/test` is `ai.guard.manage`, not `read`: a tester run accepts an arbitrary
+   * pasted payload and reports the verdict, which is exactly the capability an auditor should
+   * not have without the permission to change the guard. So the Run button is disabled for them,
+   * named, rather than left live to answer 403.
+   *
+   * Three states, not two: `null` (unknown) keeps the button disabled rather than guessing
+   * "allowed", because a wrongly-enabled Run button leaks the detector's own behaviour to somebody
+   * without the key, and a wrongly-disabled one costs a reload.
+   */
+  const [missing, setMissing] = useState<string[] | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -53,6 +67,14 @@ export function GuardTester() {
         // sample list must not read as "this tester has nothing to try".
       });
   }, []);
+
+  useEffect(() => {
+    fetchGuardPolicy()
+      .then((policy) => setMissing(policy.viewer_missing ?? []))
+      .catch(() => setMissing(["ai.guard.manage"]));
+  }, []);
+
+  const canRun = missing !== null && !missing.includes("ai.guard.manage");
 
   const run = useCallback(async () => {
     if (!payload.trim()) return;
@@ -132,6 +154,18 @@ export function GuardTester() {
 
   return (
     <div className="flex flex-col gap-4" data-guard-tester>
+      {!canRun && missing !== null ? (
+        <p
+          role="status"
+          data-guard-tester-readonly
+          className="rounded-md bg-muted/60 px-3 py-2 text-[12.5px]"
+        >
+          Running the tester needs <code className="font-mono">ai.guard.manage</code>: it accepts an
+          arbitrary pasted payload and answers with the detector&apos;s verdict, which is the same
+          power as being able to change what the guard inspects. The API answers without it with a
+          403 naming the permission, so Run is switched off rather than hidden.
+        </p>
+      ) : null}
       <div className="grid gap-4 lg:grid-cols-2">
         {/* Left: the input. On mobile this stacks above the result, which is the order the spec
             asks for — an operator on a phone reads the verdict below the text they pasted. */}
@@ -184,7 +218,8 @@ export function GuardTester() {
               type="button"
               onClick={() => void run()}
               data-guard-tester-run
-              disabled={running || !payload.trim()}
+              disabled={running || !payload.trim() || !canRun}
+              title={canRun ? undefined : "Needs ai.guard.manage"}
               className="inline-flex items-center gap-1.5 rounded-md bg-ink px-3 py-1.5 text-[12.5px] text-bg disabled:opacity-40"
             >
               <Play aria-hidden className="size-3.5" />
@@ -203,7 +238,8 @@ export function GuardTester() {
             <button
               type="button"
               onClick={() => void saveFixture()}
-              disabled={savingFixture || !payload.trim()}
+              disabled={savingFixture || !payload.trim() || !canRun}
+              title={canRun ? undefined : "Needs ai.guard.manage"}
               className="rounded-md border border-line px-3 py-1.5 text-[12.5px] disabled:opacity-40"
             >
               {savingFixture ? "Saving…" : "Save as sample"}

@@ -52,6 +52,14 @@ export type GuardPolicy = {
   window_days: number;
   /** Whether a stored policy row exists. */
   has_policy_row: boolean;
+  /**
+   * Guard keys this viewer is missing — `["ai.guard.manage"]` for an auditor.
+   *
+   * Served by the API rather than guessed from a role name, so the panel's disabled controls name
+   * the permission the API will refuse. `null` here would mean the policy could not be read at
+   * all, which is a different screen state (an error), not a permission.
+   */
+  viewer_missing: string[];
 };
 
 /** `PUT /api/v1/ai/guard/policy` accepts this. */
@@ -96,6 +104,8 @@ export type GuardRuleList = {
   validators: string[];
   mask_styles: string[];
   label_notes: GuardLabel[];
+  /** Guard keys this viewer is missing. See `GuardPolicy['viewer_missing']`. */
+  viewer_missing: string[];
 };
 
 /** `POST /api/v1/ai/guard/rules` accepts this. */
@@ -385,4 +395,36 @@ export function deleteGuardExemption(id: string): Promise<void> {
   return request<void>(`/api/v1/ai/guard/exemptions/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+/**
+ * `GET /api/v1/ai/guard/about` — the residual-risk statement.
+ *
+ * Every label with what it misses, plus the measured counts. The labels are the SAME constant the
+ * detector is built from (served by the API, not restated here), so this screen cannot drift away
+ * from the rules it describes — a hand-typed list of "what we don't catch" is the kind of page
+ * that is wrong within one release.
+ */
+export type GuardAbout = {
+  /** Every label, with `catches` and `misses`. */
+  labels: GuardLabel[];
+  /** Labels whose rule is switched off, so they catch nothing at all right now. */
+  labels_disabled: number;
+  /** Enabled rules in force for this tenant. */
+  enabled_rules: number;
+  /** The ceiling; above it the guard refuses to start. */
+  rule_budget: number;
+  /** True when every label sits at `allow`. */
+  all_permissive: boolean;
+};
+
+/**
+ * Read the residual-risk statement.
+ *
+ * Gated on `ai.guard.read`, not `manage`, on purpose: an operator who may look but not configure
+ * is exactly the person who needs to know what the guard misses, so the disclosure must not sit
+ * behind the permission to change the control.
+ */
+export function fetchGuardAbout(): Promise<GuardAbout> {
+  return request<GuardAbout>("/api/v1/ai/guard/about");
 }

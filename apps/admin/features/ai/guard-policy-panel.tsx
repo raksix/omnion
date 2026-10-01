@@ -295,8 +295,33 @@ export function GuardPolicyPanel() {
 
   const totals = policy.totals ?? {};
 
+  // `ai.guard.manage`, read from the policy response rather than guessed from a role name. The
+  // write paths enforce the same key with a 403, so disabling on this is a promise the API keeps
+  // — whereas inferring it from `role === "admin"` would offer buttons the API refuses, and
+  // inferring "allowed" on a failed read would take the control away from somebody who has it.
+  // A failed read never reaches here: it renders the error state above, so there is no "unknown"
+  // case to represent and no reason to invent one.
+  const canManage = !(policy.viewer_missing ?? []).includes("ai.guard.manage");
+
   return (
     <div className="flex flex-col gap-6" data-guard-policy>
+      {/* Read-only is stated once, at the top, and every control below is disabled — rather than
+          hiding the controls, which would leave an auditor unable to tell "you cannot change this"
+          from "this platform has no such setting". */}
+      {!canManage ? (
+        <div
+          role="status"
+          data-guard-policy-readonly
+          className="rounded-lg border border-line bg-muted/30 p-4"
+        >
+          <p className="text-[13.5px] font-medium">You are reading this guard, not configuring it.</p>
+          <p className="mt-1 text-[12.5px] text-muted">
+            Saving the policy, editing rules and creating exemptions all need{" "}
+            <code className="font-mono">ai.guard.manage</code>. The API answers without it with a
+            403 naming that permission, so every control below is switched off rather than hidden.
+          </p>
+        </div>
+      ) : null}
       {policy.all_permissive ? (
         <div
           role="status"
@@ -346,6 +371,18 @@ export function GuardPolicyPanel() {
               <Link href="/ai/guard/rules" className="underline underline-offset-2 hover:text-ink">
                 Open the rules table
               </Link>
+              , and{" "}
+              {/* The residual-risk statement lives one link away from the controls themselves,
+                  because the moment an operator asks "what does this not catch?" is the moment
+                  they are looking at this panel. A disclosure behind a separate nav entry is a
+                  disclosure almost nobody opens. */}
+              <Link
+                href="/ai/guard/about"
+                className="underline underline-offset-2 hover:text-ink"
+                data-guard-about-link
+              >
+                what this guard does not catch
+              </Link>
               .
             </p>
           </div>
@@ -375,7 +412,8 @@ export function GuardPolicyPanel() {
               type="button"
               onClick={() => void save()}
               data-guard-policy-save
-              disabled={!dirty || saving}
+              disabled={!dirty || saving || !canManage}
+              title={canManage ? undefined : "Needs ai.guard.manage"}
               className="rounded-md bg-ink px-3 py-1.5 text-[12.5px] text-bg disabled:opacity-40"
             >
               {saving ? "Saving…" : "Save policy"}
@@ -426,6 +464,7 @@ export function GuardPolicyPanel() {
                 <select
                   id={`guard-action-${label.key}`}
                   data-guard-action={label.key}
+                  disabled={!canManage}
                   value={draft.label_defaults[label.key] ?? "allow"}
                   onChange={(event) =>
                     setDraft((current) =>
@@ -469,6 +508,7 @@ export function GuardPolicyPanel() {
           </label>
           <select
             id="guard-mask-style"
+            disabled={!canManage}
             value={draft.mask_style}
             onChange={(event) =>
               setDraft((current) =>
@@ -492,6 +532,7 @@ export function GuardPolicyPanel() {
           <label className="flex items-start gap-3">
             <input
               type="checkbox"
+              disabled={!canManage}
               checked={draft.allow_user_override}
               onChange={(event) =>
                 setDraft((current) =>
@@ -529,8 +570,10 @@ export function GuardPolicyPanel() {
             type="button"
             onClick={() => setExemptionOpen((current) => !current)}
             data-guard-exemption-new
+            disabled={!canManage}
+            title={canManage ? undefined : "Needs ai.guard.manage"}
             aria-expanded={exemptionOpen}
-            className="inline-flex items-center gap-1.5 rounded-md border border-line px-3 py-1.5 text-[12.5px] hover:bg-muted/40"
+            className="inline-flex items-center gap-1.5 rounded-md border border-line px-3 py-1.5 text-[12.5px] hover:bg-muted/40 disabled:opacity-40"
           >
             <Plus aria-hidden className="size-3.5" />
             New exemption
@@ -621,6 +664,7 @@ export function GuardPolicyPanel() {
         <ExemptionRows
           exemptions={exemptions}
           loaded={exemptionsLoaded}
+          canManage={canManage}
           confirming={confirming}
           onConfirm={setConfirming}
           onRemove={removeExemption}
@@ -641,12 +685,16 @@ export function GuardPolicyPanel() {
 function ExemptionRows({
   exemptions,
   loaded,
+  canManage,
   confirming,
   onConfirm,
   onRemove,
 }: {
   exemptions: GuardExemption[];
   loaded: boolean;
+  /** Whether this viewer holds `ai.guard.manage`. Withdrawing an exemption writes, so the X is
+   *  disabled rather than hidden for an auditor — same promise the delete keeps on the API. */
+  canManage: boolean;
   confirming: GuardExemption | null;
   onConfirm: (row: GuardExemption | null) => void;
   onRemove: () => void;
@@ -720,8 +768,10 @@ function ExemptionRows({
               <button
                 type="button"
                 onClick={() => onConfirm(row)}
+                disabled={!canManage}
+                title={canManage ? undefined : "Needs ai.guard.manage"}
                 aria-label={`Withdraw the ${row.label} exemption`}
-                className="rounded-md border border-line p-1.5 hover:bg-muted/40"
+                className="rounded-md border border-line p-1.5 hover:bg-muted/40 disabled:opacity-40"
               >
                 <X aria-hidden className="size-3.5" />
               </button>

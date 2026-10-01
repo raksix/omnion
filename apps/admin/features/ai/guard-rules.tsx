@@ -329,8 +329,21 @@ export function GuardRules() {
 
   const budgetFull = data.enabled >= data.budget;
 
+  // `ai.guard.manage`, served by the same list response that carries the rules. Every control on
+  // this screen writes, so the whole screen is read-only without it — and it is read-only
+  // *visibly*: the rules stay readable and the actions are switched off, because an auditor still
+  // has to review what is installed.
+  const canManage = !(data.viewer_missing ?? []).includes("ai.guard.manage");
+
   return (
     <div className="flex flex-col gap-4" data-guard-rules>
+      {!canManage ? (
+        <p role="status" data-guard-rules-readonly className="rounded-md bg-muted/60 px-3 py-2 text-[12.5px]">
+          You can read these rules but not change them: creating, editing, deleting and duplicating
+          a rule all need <code className="font-mono">ai.guard.manage</code>, which the API refuses
+          with a 403 naming it.
+        </p>
+      ) : null}
       {error ? (
         <p role="alert" className="rounded-md bg-danger/10 px-3 py-2 text-[12.5px] text-danger">
           {error}
@@ -356,7 +369,9 @@ export function GuardRules() {
           type="button"
           onClick={() => setEditing("new")}
           data-guard-rules-new
-          className="inline-flex items-center gap-1.5 rounded-md bg-ink px-3 py-1.5 text-[12.5px] text-bg"
+          disabled={!canManage}
+          title={canManage ? undefined : "Needs ai.guard.manage"}
+          className="inline-flex items-center gap-1.5 rounded-md bg-ink px-3 py-1.5 text-[12.5px] text-bg disabled:opacity-40"
         >
           <Plus aria-hidden className="size-3.5" />
           New rule
@@ -555,6 +570,7 @@ export function GuardRules() {
                     <td className="px-3 py-2">
                       <RowActions
                         rule={rule}
+                        canManage={canManage}
                         busy={busy}
                         confirming={confirming?.id === rule.id}
                         onEdit={() => setEditing(rule)}
@@ -607,6 +623,7 @@ export function GuardRules() {
                   </label>
                   <RowActions
                     rule={rule}
+                    canManage={canManage}
                     busy={busy}
                     confirming={confirming?.id === rule.id}
                     onEdit={() => setEditing(rule)}
@@ -648,6 +665,7 @@ export function GuardRules() {
  */
 function RowActions({
   rule,
+  canManage,
   busy,
   confirming,
   onEdit,
@@ -657,6 +675,9 @@ function RowActions({
   onConfirmDelete,
 }: {
   rule: GuardRule;
+  /** Whether this viewer holds `ai.guard.manage`. Every action on this row writes — edit, delete
+   *  and duplicate all POST/PATCH — so all three are disabled together for an auditor. */
+  canManage: boolean;
   busy: boolean;
   confirming: boolean;
   onEdit: () => void;
@@ -695,7 +716,7 @@ function RowActions({
             label={`Edit ${rule.key}`}
             hook="data-guard-rule-edit"
             onClick={onEdit}
-            disabled={busy}
+            disabled={busy || !canManage}
           >
             <Pencil aria-hidden className="size-3.5" />
           </IconButton>
@@ -703,13 +724,17 @@ function RowActions({
             label={`Delete ${rule.key}`}
             hook="data-guard-rule-delete"
             onClick={onDelete}
-            disabled={busy}
+            disabled={busy || !canManage}
           >
             <Trash2 aria-hidden className="size-3.5" />
           </IconButton>
         </>
       ) : null}
-      <IconButton label={`Duplicate ${rule.key}`} onClick={onDuplicate} disabled={busy}>
+      <IconButton
+        label={`Duplicate ${rule.key}`}
+        onClick={onDuplicate}
+        disabled={busy || !canManage}
+      >
         <Copy aria-hidden className="size-3.5" />
       </IconButton>
     </div>

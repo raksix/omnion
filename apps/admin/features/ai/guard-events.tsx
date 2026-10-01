@@ -267,7 +267,7 @@ export function GuardEvents() {
           hint={
             filtersActive
               ? "Widen the window or clear the filters."
-              : "An event is written the first time a prompt is inspected."
+              : "No decision has been recorded yet. An event is written the first time a prompt is inspected — and an empty log means no rule fired, not that nothing sensitive left the platform."
           }
           action={
             filtersActive ? (
@@ -279,12 +279,21 @@ export function GuardEvents() {
                 Clear filters
               </button>
             ) : (
-              <Link
-                href="/ai/guard/tester"
-                className="rounded-md bg-ink px-3 py-1.5 text-[12.5px] text-bg"
-              >
-                Test a sample
-              </Link>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <Link
+                  href="/ai/guard/about"
+                  className="rounded-md border border-line px-3 py-1.5 text-[12.5px]"
+                  data-guard-events-about
+                >
+                  What this guard does not catch
+                </Link>
+                <Link
+                  href="/ai/guard/tester"
+                  className="rounded-md bg-ink px-3 py-1.5 text-[12.5px] text-bg"
+                >
+                  Test a sample
+                </Link>
+              </div>
             )
           }
         />
