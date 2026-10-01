@@ -12780,7 +12780,28 @@ note({
           const inputs = blocks(block, "inputs");
           const output = blocks(block, "output");
           return {
-            stepNo: block.getAttribute("data-step-trace-step"),
+            // **NORMALISED TO A NUMBER HERE, AT THE SOURCE, AND THIS IS THE FIFTH INSTANCE
+            // OF THE SAME DEFECT.** `getAttribute` returns a STRING; the run's `step_no` is a
+            // JSON number. So the panel's set was `["1"]` and the run's was `[1]`, and
+            // `["1"].includes(1)` is `false` in both directions — which is why the pass recorded
+            // `stepsShownButNotInRun: ["1"]` AND `stepsInRunButNotShown: [1]` **on a panel
+            // that had rendered the one step it was supposed to**. Both lists were non-empty
+            // and both were fiction: the sets are equal, the comparison just could not see it.
+            //
+            // The guard that should have caught it tested the comparison's SHAPE (both
+            // directions present, `filter`/`includes` spelled) and never asked whether its two
+            // sides were type-coherent — a claim about a use, answered by a claim about a
+            // mention, which is the same lesson as tick 58's prefix collision. A set equality
+            // between two sources is only a set equality if both sides are the same type, and
+            // nothing in the expression that performs the comparison can tell you that.
+            //
+            // Coerce at the DOM boundary rather than in the comparison: `stepNo` is used in
+            // three more places (`stepsWithoutBothSides`, `shownStepNos`, and the note's own
+            // `shownStepNos` field), and normalising once means every one of them is right by
+            // construction instead of by a second careful look at each. `Number()` on a
+            // non-numeric attribute yields `NaN`, which survives JSON and reads as `null`
+            // beside a real number rather than silently equal to one of them.
+            stepNo: Number(block.getAttribute("data-step-trace-step")),
             status: block.getAttribute("data-step-trace-status"),
             inputs,
             output,

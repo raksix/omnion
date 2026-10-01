@@ -160,6 +160,49 @@ test("the panel's step numbers are compared against the run's in BOTH directions
   );
 });
 
+test("the two step-number sets are TYPE-COHERENT, and this is the one the shape check missed", () => {
+  // TICK 61, and the pass caught it on a panel that was CORRECT.
+  //
+  // `shownStepNos` came off `getAttribute("data-step-trace-step")` — a STRING — and
+  // `runStepNos` came out of the run's JSON `step_no` — a NUMBER. So the panel said `["1"]`
+  // and the run said `[1]`, and `["1"].includes(1)` is `false` in BOTH directions. The pass
+  // recorded, against a panel that had opened and rendered its one step:
+  //
+  //     stepsShownButNotInRun: ["1"]
+  //     stepsInRunButNotShown: [1]
+  //
+  // Both non-empty, both fiction. The sets are equal; the comparison simply could not see it.
+  // So the gate `stepsInRunButNotShown: []` was **unsatisfiable on a correct product** — the
+  // fifth instance of this REQ's habit, and the first one the SHAPE check above could not
+  // have found: it asserted that both directions are present and spelled correctly, which
+  // they were. It never asked whether the two sides could ever be equal.
+  //
+  // The lesson is narrow and worth stating as its own rule, because it is not the
+  // "read the subject" rule the previous four instances were: **a set comparison between two
+  // sources is only a comparison if both sides are the same type, and nothing in the
+  // expression doing the comparing can tell you that.** `["1"]` and `[1]` are different sets
+  // by every rule the language has. Coercing at the boundary is the repair; the guard has to
+  // be about the coercion, because the comparison will keep its shape forever and be wrong
+  // forever without it.
+  assert.ok(
+    /stepNo: Number\(block\.getAttribute\("data-step-trace-step"\)\)/.test(PANEL_READ),
+    "the panel's step number must be normalised to a number where it leaves the DOM; compared as a string against the run's number, the set equality is unsatisfiable on a correct product",
+  );
+  // The old form has to be gone, named exactly — a bare `getAttribute` is the defect.
+  assert.ok(
+    !/stepNo: block\.getAttribute\("data-step-trace-step"\)/.test(PANEL_READ),
+    "a raw getAttribute here is the unsatisfiable gate restated: ['1'] never equals [1]",
+  );
+  // The coercion has to happen at the READ, not inside the comparison. `stepNo` is consumed
+  // by `stepsWithoutBothSides` and by the note's own `shownStepNos` as well, and a normalise-
+  // at-each-use fix is three chances to forget one — the shape this REQ's mistakes always
+  // take is a fix applied at one use while a second use keeps the old value.
+  assert.ok(
+    !/stepsWithoutBothSides:[\s\S]{0,200}?Number\(/.test(ROW),
+    "the number is normalised once at the DOM boundary; coercing again per use is what leaves two of the three uses on the old value",
+  );
+});
+
 test("the wire probe reads BOTH payloads, and distinguishes an absent key from an empty one", () => {
   // `output` was never read here, so the note reported the `params` gate beside an
   // `outputRendered` number that no server assertion supported.
