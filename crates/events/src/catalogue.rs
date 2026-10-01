@@ -317,6 +317,17 @@ catalogue! {
     "ai.changeset.discarded", "ai", Live,
     "A person discarded a change set, with the reason they gave.",
     [("change_set_id", Uuid, req), ("reason", String, req)];
+    // `failed` and `applied` are the two halves of the same promise, and both carry `reason`
+    // so a subscriber can render the same line for either. `failed` is the one that matters
+    // most: an all-or-nothing apply that rolled back writes nothing anywhere, so without this
+    // name a subscriber cannot tell "the set is still waiting" from "the set was tried and
+    // undid itself" — and the second is the one a person has to act on.
+    "ai.changeset.failed", "ai", Live,
+    "A confirmed change set was rolled back: no operation was applied.",
+    [("change_set_id", Uuid, req), ("reason", String, req)];
+    "ai.changeset.applied", "ai", Live,
+    "A confirmed change set applied every operation it carried, in one transaction.",
+    [("change_set_id", Uuid, req), ("operations", Integer, req)];
     // The tool registry (REQ-100). `ai.tool.denied` is the one an operator subscribes to: it
     // is the signal that a model tried to reach something it was not granted, which is the
     // visible form of a probing agent. The rest are the panel's own audit trail — a registry
@@ -1057,6 +1068,52 @@ mod tests {
         let live = live_names();
         assert!(live.contains(&"page.published"));
         assert!(!live.contains(&"order.created"));
+    }
+
+    /// REQ-101's change-set names, asserted the way the tool-registry ones are.
+    ///
+    /// The drift test walks the sources for `NewEvent::new("…")` and fails on a name this table
+    /// does not carry, so listing a name here is the *permission* to emit it. `ai.changeset.failed`
+    /// is the one that matters: an all-or-nothing apply that rolled back writes nothing anywhere,
+    /// so this name is the only signal a subscriber gets that a set was tried and undid itself.
+    #[test]
+    fn the_change_set_names_are_live_and_typed() {
+        for (name, required_field, kind) in [
+            ("ai.changeset.proposed", "change_set_id", FieldKind::Uuid),
+            ("ai.changeset.confirmed", "change_set_id", FieldKind::Uuid),
+            ("ai.changeset.discarded", "reason", FieldKind::String),
+            ("ai.changeset.failed", "reason", FieldKind::String),
+            ("ai.changeset.applied", "operations", FieldKind::Integer),
+        ] {
+            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be in the catalogue"));
+            assert_eq!(
+                entry.status,
+                Status::Live,
+                "{name} is emitted today, not reserved"
+            );
+            assert_eq!(entry.area, "ai", "{name} belongs to the AI area");
+            let field = entry
+                .payload_fields
+                .iter()
+                .find(|candidate| candidate.name == required_field)
+                .unwrap_or_else(|| panic!("{name} must declare {required_field}"));
+            assert!(field.required, "{name}.{required_field} is required");
+            assert_eq!(field.kind, kind, "{name}.{required_field} has the wrong kind");
+        }
+
+        // `failed` and `applied` are the two halves of one promise, and a subscriber has to be
+        // able to tell them apart: the same id, one that rolled back and one that committed.
+        // If either were renamed to the other's spelling, this fails.
+        let failed = lookup("ai.changeset.failed").expect("listed");
+        let applied = lookup("ai.changeset.applied").expect("listed");
+        assert!(
+            !failed.payload_fields.iter().any(|f| f.name == "operations"),
+            "`failed` has no operation count: it applied none"
+        );
+        assert!(
+            applied.payload_fields.iter().any(|f| f.name == "operations"),
+            "`applied` says how many operations committed"
+        );
     }
 
     #[test]
