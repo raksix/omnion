@@ -8998,3 +8998,53 @@ Next: slice 3's remaining work is the one this tick made visible — make `crate
 `register_failure` read the **security centre's** lockout document, so the tuned number is the
 enforced number. Then REQ-012's browser pass (still owed, box permitting) for the boxes that name
 a screen.
+
+## w7 · tick 57 · REQ-105 slice 4 — the audit trail that had never written a row
+
+**What.** `checkpoint` filed `finding.action.as_wire()` into `ai_guard_events.action` — the
+per-rule action vocabulary (`allow`/`flag`/`mask`/`block`) — while the column's check has always
+required the verdict vocabulary (`allowed`/`masked`/`blocked`). The two sets are disjoint, so **every
+insert the guard ever attempted was rejected**: a masked turn and a refusal alike, on every call,
+since the guard shipped. The audit trail was not "mostly working" or "missing a case"; it had never
+existed.
+
+The failure was invisible by design and that is the part worth keeping. A failed audit is
+*deliberately* non-fatal — the checkpoint returns the verdict it reached and surfaces the write
+failure as `audit_error`, which the chat route logs at `warn` — so a user's chat still succeeded and
+the only symptom any human could see was `/ai/guard/events` reporting "no events" for an
+installation whose rules were demonstrably rewriting turns. An audit screen that shows nothing is
+worse than no audit screen, because it is an affirmative statement that nothing happened. The
+"pre-existing red walk" I had been carrying as an inconvenience since tick 56 was this bug.
+
+Fixed at the source rather than by widening the check: the column means "what happened to this
+request", so `0215` narrows it to the three names `verdict.as_wire()` really returns and
+`GuardVerdict::recordable_names()` becomes the one list the store validates against and derives
+`blocked` from. That derivation also changed: it read `Action::from_wire(&action)`, which with a
+verdict column is `None` for every value — `blocked` would have been `false` on every row and
+`ai_guard_events_blocked_matches_action` would then have rejected the one row that matters most.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --quiet` → 587 passed, 0 failed.
+- `cargo test -p omnion-api --test ai_guard` → 10 passed, 0 failed (was 9; +1 regression walk).
+- `cargo test -p omnion-api --test ai_guard_outbound` → **8 passed, 0 failed** (was 7 passed / 1
+  failed) — including `a_blocked_turn_is_refused_and_the_provider_is_never_dialled`, red since
+  slice 2, and `a_clean_payload_…`, which still proves a clear turn files nothing.
+- `cargo build -p omnion-api` → exit 0. `apps/admin` `tsc --noEmit` → exit 0, empty log.
+- Migration applied to a **live** database twice (idempotent, exit 0 both times), and the four
+  verdict names verified insertable with `blocked` derived correctly while the action names are
+  still rejected. Before the fix, the same insert was reproduced failing against the real table.
+
+**What the new walk caught in its own author.** `every_verdict_…` asserted a card reaches `blocked`
+and failed with "reached `allowed`" — the default for an absent label is `Allow`, so the walk needed
+a policy row. Fixing that surfaced the bigger finding: there is **no `flagged` verdict**. `Action::Flag`
+exists and looks like it must produce one, but flagging means "send it and record that a human should
+look", which is `Allowed` with a rule key attached. So `flagged` and `remapped` — two of the five
+names `0210` allowed — were producible by nothing in the build, and the events screen offered both as
+filter options that could only ever return an empty table.
+
+**Not run / still open.**
+- **The browser pass has NOT run.** The QA slot is held by a *live* w6 walkthrough (holder pid alive,
+  `cwd=/mnt/apopic/omnion-w6`), so no screen of this REQ is claimed verified in a browser.
+- Unticked: the permission-gated screen (403 named), `ai.guard.exemption.expired`, `/ai/guard/about`.
+
+**Next.** The browser pass when the slot frees, then the three unticked criteria above.
