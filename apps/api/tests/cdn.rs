@@ -818,7 +818,9 @@ async fn another_organizations_rule_is_neither_readable_nor_writable() {
             Method::POST,
             &format!("/api/v1/cdn/rules/{id}/toggle"),
             Some(&fixture.token_a),
-            Some(json!({ "site_id": fixture.site_a, "enabled": !before.as_bool().unwrap_or(true) })),
+            Some(
+                json!({ "site_id": fixture.site_a, "enabled": !before.as_bool().unwrap_or(true) }),
+            ),
         ),
     )
     .await;

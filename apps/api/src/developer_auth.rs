@@ -35,7 +35,7 @@ use axum::http::{HeaderMap, Request};
 // import `guards.rs` carries for the same call.
 use axum::response::IntoResponse;
 use omnion_developer::store;
-use omnion_developer::{decide, secret, KeyRefusal};
+use omnion_developer::{KeyRefusal, decide, secret};
 use std::net::IpAddr;
 use time::OffsetDateTime;
 use tower::Service;
@@ -137,7 +137,7 @@ pub async fn authenticate_key(
             })
         })?;
 
-        if let Err(refusal) = decide(&key, &stored_hash, secret_half, address, now) {
+    if let Err(refusal) = decide(&key, &stored_hash, secret_half, address, now) {
         return Err(refusal_error(refusal));
     }
 
@@ -156,7 +156,10 @@ pub async fn authenticate_key(
 /// again — because "your key was refused from this address" is a fact an attacker can use to
 /// learn that a key is real. The precise reason is a `tracing::debug` line and nothing more.
 fn invalid_key() -> ApiError {
-    ApiError::unauthorized("invalid_api_key", "this API key is not valid for this request")
+    ApiError::unauthorized(
+        "invalid_api_key",
+        "this API key is not valid for this request",
+    )
 }
 
 /// Turn a refusal into the response a caller sees.
@@ -239,9 +242,15 @@ pub async fn record_key_use(
         tracing::warn!(error = %error, "the developer request log did not accept a row");
         return;
     }
-    if let Err(error) =
-        store::record_use(state.db().pool(), principal.key_id, principal.organization_id, status, duration_ms, now)
-            .await
+    if let Err(error) = store::record_use(
+        state.db().pool(),
+        principal.key_id,
+        principal.organization_id,
+        status,
+        duration_ms,
+        now,
+    )
+    .await
     {
         tracing::warn!(error = %error, "the API key usage rollup was not updated");
     }
@@ -316,8 +325,11 @@ pub struct RequireKeyService<S> {
 
 impl<S> Service<Request<Body>> for RequireKeyService<S>
 where
-    S: Service<Request<Body>, Response = axum::response::Response, Error = std::convert::Infallible>
-        + Clone
+    S: Service<
+            Request<Body>,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
@@ -354,14 +366,7 @@ where
             let principal = if crate::cookies::session_token(&headers).is_some() {
                 None
             } else {
-                match authenticate_key(
-                    &state,
-                    &headers,
-                    address,
-                    OffsetDateTime::now_utc(),
-                )
-                .await
-                {
+                match authenticate_key(&state, &headers, address, OffsetDateTime::now_utc()).await {
                     Ok(principal) => Some(principal),
                     Err(error) => {
                         return Ok(error.into_response());

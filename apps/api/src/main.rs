@@ -233,6 +233,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // reach `state` after `router(state)` has taken the original by value.
     let state_for_runners = state.clone();
     let app = routes::router(state);
+
+    // The API Explorer dispatches *through this router* rather than building one of its own
+    // (REQ-033, slice 2). Two routers would mean two header layers, two limiters and two IP
+    // access lists fighting over the same process-wide `OnceLock`s, and the second install
+    // would be silently ignored — so the Explorer would either run under the wrong policy or
+    // under none. The one built above is the whole application, layers included, which is
+    // exactly what "run the call as the signed-in caller" requires.
+    omnion_api::routes::explorer::install_router(app.clone());
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

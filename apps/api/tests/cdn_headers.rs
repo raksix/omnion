@@ -952,7 +952,9 @@ async fn a_media_file_answers_a_conditional_read_with_304_and_the_same_validator
         .expect("a media response carries a validator")
         .to_owned();
 
-    let second = fixture.public_file(media, &[("if-none-match", &etag)]).await;
+    let second = fixture
+        .public_file(media, &[("if-none-match", &etag)])
+        .await;
     assert_eq!(
         second.status,
         StatusCode::NOT_MODIFIED,
@@ -1028,8 +1030,7 @@ async fn a_cache_rule_written_for_the_media_path_changes_what_a_visitor_keeps() 
         "the edge TTL is a separate header, not a longer Cache-Control"
     );
     assert_eq!(
-        after.body,
-        before.body,
+        after.body, before.body,
         "the rule changes the headers, never the bytes"
     );
     fixture.cleanup().await;
@@ -1049,7 +1050,11 @@ async fn a_file_the_scanner_has_not_cleared_is_refused_before_any_cache_header()
     // The upload leaves the row `pending` and no site has scanning switched on, so this is
     // the ordinary state of a freshly uploaded file: served, but privately.
     let response = fixture.public_file(media, &[]).await;
-    assert_eq!(response.status, StatusCode::OK, "scanning is off by default");
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "scanning is off by default"
+    );
     assert_eq!(response.header("cache-control"), Some("private, no-store"));
 
     // Now a site that *has* asked for scanning, and a file nobody has looked at. The

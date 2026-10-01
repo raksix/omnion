@@ -26,7 +26,10 @@ use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_developer::model::RateTier;
 use omnion_developer::store;
-use omnion_developer::{ApiKey, DeveloperError, Environment, Minted, NewKey, RequestLog, RequestLogPage, RequestLogQuery};
+use omnion_developer::{
+    ApiKey, DeveloperError, Environment, Minted, NewKey, RequestLog, RequestLogPage,
+    RequestLogQuery,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
@@ -189,9 +192,14 @@ pub async fn get_key(
     let key = store::get(state.db().pool(), organization_id, key_id)
         .await
         .map_err(ApiError::from)?;
-    let usage = store::usage(state.db().pool(), organization_id, key_id, query.days.unwrap_or(30))
-        .await
-        .map_err(ApiError::from)?;
+    let usage = store::usage(
+        state.db().pool(),
+        organization_id,
+        key_id,
+        query.days.unwrap_or(30),
+    )
+    .await
+    .map_err(ApiError::from)?;
 
     Ok(Json(KeyDetailResponse {
         key,
@@ -234,10 +242,11 @@ pub async fn create_key(
             RateTier::High
         }
         Some(other) => {
-            return Err(
-                ApiError::bad_request("invalid_rate_tier", format!("{other:?} is not a rate tier"))
-                    .with_details(json!({ "field": "rate_tier" })),
-            );
+            return Err(ApiError::bad_request(
+                "invalid_rate_tier",
+                format!("{other:?} is not a rate tier"),
+            )
+            .with_details(json!({ "field": "rate_tier" })));
         }
     };
 
@@ -490,9 +499,7 @@ fn expiry_from_days(days: Option<i64>) -> Result<Option<OffsetDateTime>, Develop
     if days < 0 || days > 3650 {
         return Err(DeveloperError::InvalidExpiry(days));
     }
-    Ok(Some(
-        OffsetDateTime::now_utc() + time::Duration::days(days),
-    ))
+    Ok(Some(OffsetDateTime::now_utc() + time::Duration::days(days)))
 }
 
 /// The default time window of the log screen.
@@ -695,7 +702,8 @@ mod tests {
         // The write-only property as an actual assertion on the bytes a client receives. It is
         // not "there is no field" but "the name is absent", which is what a test that greps a
         // response body can also rely on.
-        let rendered = serde_json::to_string(&KeysResponse { keys: Vec::new() }).expect("serialises");
+        let rendered =
+            serde_json::to_string(&KeysResponse { keys: Vec::new() }).expect("serialises");
         assert!(!rendered.contains("secret"));
         assert!(!rendered.contains("hash"));
     }
@@ -729,18 +737,14 @@ impl From<DeveloperError> for ApiError {
             }
             DeveloperError::NoScopes
             | DeveloperError::EmptyScope
-            | DeveloperError::DuplicateScope(_) => {
-                api.with_details(json!({ "field": "scopes" }))
-            }
+            | DeveloperError::DuplicateScope(_) => api.with_details(json!({ "field": "scopes" })),
             DeveloperError::UnknownEnvironment(_) => {
                 api.with_details(json!({ "field": "environment" }))
             }
             DeveloperError::UnknownRateTier(_) | DeveloperError::InvalidExpiry(_) => {
                 api.with_details(json!({ "field": "expires_in_days" }))
             }
-            DeveloperError::InvalidCidr(_) => {
-                api.with_details(json!({ "field": "ip_allowlist" }))
-            }
+            DeveloperError::InvalidCidr(_) => api.with_details(json!({ "field": "ip_allowlist" })),
             DeveloperError::UnknownStatusClass(_) | DeveloperError::NegativeDuration => {
                 api.with_details(json!({ "field": "status_class" }))
             }

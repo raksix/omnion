@@ -25,8 +25,8 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use omnion_deployment::jobs::{self, CreatedJob, NewJob, StartRefusal, StepRefusal, Target};
 use omnion_deployment::preflight::{
     CheckId, CheckOutcome, Confirmation, PreflightReport, confirmation_for, confirmation_matches,
@@ -401,7 +401,9 @@ pub async fn log(
     Query(query): Query<LogQuery>,
 ) -> Result<Response, ApiError> {
     if query.cursor.is_some() {
-        return poll_log(State(state), current, Path(id), Query(query)).await.map(Into::into);
+        return poll_log(State(state), current, Path(id), Query(query))
+            .await
+            .map(Into::into);
     }
     stream_log(State(state), current, Path(id)).await
 }

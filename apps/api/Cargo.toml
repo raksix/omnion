@@ -24,6 +24,11 @@ serde_json.workspace = true
 percent-encoding.workspace = true
 sqlx.workspace = true
 time.workspace = true
+# The API Explorer's own per-user budget (REQ-033, slice 2). It is a second counting path on
+# purpose — the budget has to be keyed on the *user* and held under a prefix of its own, so
+# spending Explorer calls can never exhaust an API budget — but it reuses the same counter
+# machinery the request-path limiter uses, so there is only one INCR/EXPIRE implementation.
+redis.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 tokio-stream = { version = "0.1", features = ["sync", "time"] }

@@ -77,14 +77,15 @@ pub mod backups;
 pub mod cdn;
 pub mod cdn_cache;
 pub mod cdn_purge;
-pub mod developer;
 pub mod commands;
 pub mod content;
 pub mod deployment;
 pub mod deployment_cluster;
 pub mod deployment_ops;
 pub mod deployment_run;
+pub mod developer;
 pub mod environments;
+pub mod explorer;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -597,25 +598,40 @@ pub fn router(state: AppState) -> Router {
     // naming the permission it lacks.
     let pages = get(content::list_pages)
         .layer(guards::require(&state, "content.pages.read"))
-        .layer(crate::developer_auth::require_or_key(&state, "content.pages.read"))
+        .layer(crate::developer_auth::require_or_key(
+            &state,
+            "content.pages.read",
+        ))
         .merge(
             post(content::create_page)
                 .layer(guards::require(&state, "content.pages.create"))
-                .layer(crate::developer_auth::require_or_key(&state, "content.pages.create")),
+                .layer(crate::developer_auth::require_or_key(
+                    &state,
+                    "content.pages.create",
+                )),
         );
 
     let page = get(content::get_page)
         .layer(guards::require(&state, "content.pages.read"))
-        .layer(crate::developer_auth::require_or_key(&state, "content.pages.read"))
+        .layer(crate::developer_auth::require_or_key(
+            &state,
+            "content.pages.read",
+        ))
         .merge(
             patch(content::update_page)
                 .layer(guards::require(&state, "content.pages.update"))
-                .layer(crate::developer_auth::require_or_key(&state, "content.pages.update")),
+                .layer(crate::developer_auth::require_or_key(
+                    &state,
+                    "content.pages.update",
+                )),
         )
         .merge(
             delete(content::delete_page)
                 .layer(guards::require(&state, "content.pages.delete"))
-                .layer(crate::developer_auth::require_or_key(&state, "content.pages.delete")),
+                .layer(crate::developer_auth::require_or_key(
+                    &state,
+                    "content.pages.delete",
+                )),
         );
 
     let page_publish =
@@ -1126,16 +1142,14 @@ pub fn router(state: AppState) -> Router {
     // shipped with that bug for one tick and 339 passing tests did not see it.
     let api_keys = get(developer::list_keys)
         .layer(guards::require(&state, "developer.keys.read"))
-        .merge(
-            post(developer::create_key).layer(guards::require(&state, "developer.keys.manage")),
-        );
+        .merge(post(developer::create_key).layer(guards::require(&state, "developer.keys.manage")));
     let api_key_one = get(developer::get_key)
         .layer(guards::require(&state, "developer.keys.read"))
         .merge(
             delete(developer::revoke_key).layer(guards::require(&state, "developer.keys.manage")),
         );
-    let api_key_rotate = post(developer::rotate_key)
-        .layer(guards::require(&state, "developer.keys.manage"));
+    let api_key_rotate =
+        post(developer::rotate_key).layer(guards::require(&state, "developer.keys.manage"));
     // The request log rides the read key — it is the same question as the key list, answered one
     // row at a time.
     let request_logs =
@@ -1146,6 +1160,22 @@ pub fn router(state: AppState) -> Router {
     // different shapes and a `GET` cannot answer both from one route.
     let request_log_one =
         get(developer::get_request_log).layer(guards::require(&state, "developer.keys.read"));
+
+    // The API Explorer (REQ-033, slice 2). Three routes and the permission split is the whole
+    // design: *reading* the document is the same question as reading a key's metadata, so a
+    // manager holds it, while *sending* a call acts as the person at the screen and is the one
+    // that has to stay with owner/administrator.
+    //
+    // `/dev/openapi.json` and `/dev/explorer/requests` are two literal siblings rather than a
+    // child and a parent for the reason `/events/catalogue` is: `{id}`-shaped segments and
+    // literal ones rank differently in axum, and a route that reads as "the explorer's config"
+    // beside "run a call" is the clearer shape anyway.
+    let dev_openapi =
+        get(explorer::openapi_document).layer(guards::require(&state, "developer.read"));
+    let dev_explorer_run =
+        post(explorer::run_request).layer(guards::require(&state, "developer.explorer.run"));
+    let dev_operations =
+        get(explorer::list_operations).layer(guards::require(&state, "developer.read"));
 
     // The deployment centre (REQ-024, slice 1). Six reads and one write, and the write is
     // `deployment.manage` because "check for updates now" reaches out to the network and
@@ -1183,8 +1213,8 @@ pub fn router(state: AppState) -> Router {
     // the handlers have always documented those paths; only the mount disagreed. So the
     // environment route is a plain GET again and each write owns a segment — the same rule
     // `/deployment/cluster/{environment}/restart` already followed.
-    let deployment_environment_deploy = post(deployment_run::start_deploy)
-        .layer(guards::require(&state, "deployment.manage"));
+    let deployment_environment_deploy =
+        post(deployment_run::start_deploy).layer(guards::require(&state, "deployment.manage"));
     // The job routes. Reading a job and its log is `deployment.read` — they return the same
     // values the history screen already shows — while cancel is `deployment.manage`, because
     // stopping a run is an action on the environment, not a read of it.
@@ -2162,6 +2192,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api-keys/{id}/rotate", api_key_rotate)
         .route("/request-logs", request_logs)
         .route("/request-logs/{id}", request_log_one)
+        .route("/dev/openapi.json", dev_openapi)
+        .route("/dev/operations", dev_operations)
+        .route("/dev/explorer/requests", dev_explorer_run)
         .route("/cdn/status", cdn_status)
         .route("/cdn/purges", cdn_purges)
         .route("/cdn/purges/{id}", cdn_purge_one)
@@ -2180,8 +2213,7 @@ pub fn router(state: AppState) -> Router {
         // called these sub-paths since slice 2.
         .route(
             "/deployment/environments/{environment}/preflight",
-            post(deployment_run::preflight)
-                .layer(guards::require(&state, "deployment.manage")),
+            post(deployment_run::preflight).layer(guards::require(&state, "deployment.manage")),
         )
         .route(
             "/deployment/environments/{environment}/deploy",
