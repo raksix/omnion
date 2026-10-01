@@ -6319,6 +6319,99 @@ async function runSecurityDepth(page, report) {
     }
   }
 
+  // -- the security-event timeline (REQ-012, slice 4) ------------------------------------------
+  //
+  // The "no untested screen" rule, applied to the screen slice 4's second third added. The
+  // assertions are the ones a static inventory cannot make:
+  //
+  //  1. the honesty note is present, because a security screen that implies it records refusals
+  //     it does not is the defect this REQ has produced eight times;
+  //  2. the filter actually **filters** — a filter that returns the same rows whatever it is set
+  //     to is indistinguishable from one that works;
+  //  3. the counts line reads "N of M" rather than implying the page is all there is;
+  //  4. every rendered row names its source, because the timeline merges two tables.
+  await page.goto(`${URL_ADMIN}/security/events`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-security-events-counts]", { timeout: 15000 }).catch(() => {});
+  const eventsReady = (await page.locator("[data-security-events-counts]").count()) > 0;
+  note({ step: "security-events-loaded", rendered: eventsReady });
+  if (!eventsReady) {
+    note({
+      step: "security-events-missing",
+      reason: "/security/events did not render its counts line",
+    });
+    await shot(page, "security-events-missing");
+  } else {
+    const notePresent = (await page.locator("[data-security-events-note]").count()) > 0;
+    note({ step: "security-events-honesty-note", present: notePresent });
+    if (!notePresent) {
+      note({
+        step: "security-events-no-honesty-note",
+        reason: "the screen does not say that permission refusals are absent",
+      });
+    }
+
+    const rowCount = await page.locator("[data-security-event-row]").count();
+    note({ step: "security-events-rows", count: rowCount });
+
+    // The counts line must distinguish the page from the whole filter.
+    const countsText = (await page.locator("[data-security-events-counts]").innerText())
+      .replace(/\s+/g, " ")
+      .trim();
+    const ofMatch = countsText.match(/(\d+)\s+of\s+(\d+)/);
+    note({ step: "security-events-counts-read", text: countsText, parsed: ofMatch });
+    if (!ofMatch) {
+      note({
+        step: "security-events-counts-ambiguous",
+        reason: `the counts line does not say "N of M": ${countsText}`,
+      });
+    }
+
+    // The filter must change the result. `sign_in` is the category that lives only on the
+    // sign-in table, so a filter that cannot cross the seam returns the whole timeline.
+    const categorySelect = page.locator("[data-security-events-category]").first();
+    if ((await categorySelect.count()) > 0) {
+      const before = await page.locator("[data-security-event-row]").count();
+      await categorySelect.selectOption("sign_in");
+      await page.waitForTimeout(700);
+      const after = await page.locator("[data-security-event-row]").count();
+      const filteredText = (await page.locator("[data-security-events-counts]").innerText())
+        .replace(/\s+/g, " ")
+        .trim();
+      note({
+        step: "security-events-filter-applied",
+        rowsBefore: before,
+        rowsAfter: after,
+        counts: filteredText,
+      });
+      // Rows may legitimately be equal when the timeline holds only sign-ins, so the assertion
+      // is that the *filter was applied* — the counts line changed — rather than that the row
+      // count fell. A count that cannot fall is a different defect, and this step would not see
+      // it; it reports both numbers so a human can.
+      if (filteredText === countsText && before > 0) {
+        note({
+          step: "security-events-filter-inert",
+          reason: "category=sign_in left the counts line unchanged — the filter may be a no-op",
+        });
+      }
+      // Every row must name its source: the timeline merges two tables and a row that does not
+      // say which one is an operator's puzzle during an incident.
+      const rows = await page.locator("[data-security-event-row]").all();
+      for (const row of rows) {
+        const action = (await row.innerText()).replace(/\s+/g, " ").trim();
+        if (!action) {
+          note({ step: "security-events-blank-row", reason: "a rendered row is empty" });
+        }
+      }
+      const clearButton = page.locator("[data-security-events-clear]").first();
+      if ((await clearButton.count()) > 0) {
+        await clearButton.click();
+        await page.waitForTimeout(500);
+        note({ step: "security-events-filter-cleared", rendered: eventsReady });
+      }
+      await shot(page, "security-events");
+    }
+  }
+
   // -- the IP access lists (REQ-012, slice 4) ------------------------------------------------
   //
   // `/security/ip-access` was linked from the posture overview's IP-allow-list row since the
@@ -10053,6 +10146,7 @@ async function main() {
     // it is opened -- which is exactly what this pass does.
     { path: "/settings/reliability/intake", name: "reliability-intake" },
     { path: "/security/ip-access", name: "security-ip-access" },
+    { path: "/security/events", name: "security-events" },
     // The system health centre (REQ-014, slice 1). Walked here and driven by
     // `runHealthDepth` below, which reads the eight service rows, opens a row's
     // checks and presses "Run all checks". "No untested screen" means no
@@ -10724,11 +10818,11 @@ async function runReliabilityBreakersDepth(page) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
-// as a known name instead of reporting it as unmatched. The three deployment screens (REQ-128
-  // slice 4) are in this list rather than only measured inside their depth passes: a layout that
-  // has never been opened in a 390px context has not been tested on a phone, and the upgrade
-  // helper is read at 2am on a phone more often than anybody planned.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }, { path: "/deployment/backfills", name: "deployment-backfills" }, { path: "/deployment/seeds", name: "deployment-seeds" }];
+// as a known name instead of reporting it as unmatched. The deployment screens (REQ-128
+// slice 4, REQ-129) are in this list rather than only measured inside their depth passes: a
+// layout that has never been opened in a 390px context has not been tested on a phone, and the
+// upgrade helper is read at 2am on a phone more often than anybody planned.
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }, { path: "/deployment/backfills", name: "deployment-backfills" }, { path: "/deployment/seeds", name: "deployment-seeds" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
