@@ -6244,7 +6244,11 @@ async function runCdnPurgeDepth(page, report) {
     (await statusFilter.evaluate((el) => el.tagName.toLowerCase()).catch(() => "")) === "select";
   await statusFilter.selectOption("failed", { timeout: 5000 });
   await page.waitForTimeout(1300);
-  steps.filteredRows = await page.locator("[data-cdn-purge-row]").count();
+  // `:visible`, for the same reason as the count above: without it this reads BOTH renderings,
+  // so the filtered count is doubled (2 rows × table + card) while `before` counts only what is
+  // on screen. `4 < 2` is then false for a filter that works perfectly — the harness reporting
+  // its own arithmetic rather than the panel's behaviour.
+  steps.filteredRows = await page.locator("[data-cdn-purge-row]:visible").count();
   steps.filterNarrows = steps.filteredRows < before;
   // The empty state, reached the only way an operator reaches it: a filter that matches
   // nothing. "No purge has ever been requested" and "nothing matches that filter" are two
@@ -6259,7 +6263,7 @@ async function runCdnPurgeDepth(page, report) {
     .selectOption("tag")
     .catch(() => {});
   await page.waitForTimeout(1300);
-  steps.emptyRows = await page.locator("[data-cdn-purge-row]").count();
+  steps.emptyRows = await page.locator("[data-cdn-purge-row]:visible").count();
   steps.emptyStateShown =
     (await page.locator("text=Nothing matches that filter").count()) > 0;
   // And the two must not be the same sentence: the honest empty state is a *different*
@@ -6269,7 +6273,7 @@ async function runCdnPurgeDepth(page, report) {
   await page.locator("[data-cdn-purge-filter-clear]").click({ timeout: 4000 }).catch(() => {});
   await page.waitForTimeout(1100);
   steps.clearedBackToRows =
-    (await page.locator("[data-cdn-purge-row]").count()) === before;
+    (await page.locator("[data-cdn-purge-row]:visible").count()) === before;
   await shot(page, "page-cdn-purges");
 
   // Mobile: the cards, not a horizontally scrolling table. The hooks are the same ones the
@@ -6277,7 +6281,7 @@ async function runCdnPurgeDepth(page, report) {
   await page.setViewportSize({ width: 390, height: 900 });
   await page.goto(`${URL_ADMIN}/cdn/purges`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1500);
-  steps.mobileCards = await page.locator("[data-cdn-purge-row]").count();
+  steps.mobileCards = await page.locator("[data-cdn-purge-row]:visible").count();
   steps.mobileTableHidden = await page
     .locator("table")
     .first()
@@ -6603,7 +6607,10 @@ async function runCdnRulesDepth(page, report) {
   );
   await page.goto(`${URL_ADMIN}/cdn/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1400);
-  steps.cleanedUp = await page.locator("[data-cdn-rule-row]").count();
+  // `:visible`: the viewport was restored to 1280 above, so the table is back on screen and this
+  // count would otherwise read the table AND the still-mounted card list, while `before` counted
+  // the visible ones. Same class as every other count in this function.
+  steps.cleanedUp = await page.locator("[data-cdn-rule-row]:visible").count();
   return steps;
 }
 
