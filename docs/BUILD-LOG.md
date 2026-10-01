@@ -9980,3 +9980,56 @@ finding count is claimed.
 
 **Next.** Re-run the focused pass against the fixed URL to read `sentinelsStayApart` off a live
 `/validate` answer, then `table-save-survives` and `shortcut-help.closedByEscape`.
+
+
+## Tick 76 — the last red reading in tick 75 was a product defect, and its own comment claimed otherwise
+
+**What.** `shortcut-help.closedByEscape: false` was the one tick-75 reading that would not explain
+itself away as a probe defect, and the reason it could not is the finding rather than the defence.
+The ⌘/ list renders `role="dialog"` + `aria-modal="true"` and its **source comment already claimed
+the opposite** — *"It is a `dialog` and it traps nothing — Escape closes it"*. A stated contract, in
+the file, contradicted by the file.
+
+The Escape handler lives in `onCanvasKeyDown` — React's `onKeyDown` on the **canvas div** — and the
+overlay is a **SIBLING** of that div, not a descendant. A key pressed with focus inside the dialog
+never bubbles through the canvas, so the handler was correct and unreachable; the dialog inherited
+the canvas's focus because it had no `autoFocus`, no trap and no listener of its own. Escape closed
+the list only when the canvas happened to hold focus — which is exactly how a pass opens the dialog
+and then fails to close it.
+
+**Reachable in three keystrokes, no mouse.** `⌘P` focuses the palette (`focusPaletteItem`), `I`
+focuses the inspector (`focusInspector`), and both are siblings of the canvas too. Every other red
+row in this REQ's history asked the wrong question (`node_type`, `/graph/validate`, a fixed sleep);
+this one asked the right question and the product was wrong.
+
+**Proof.**
+- `builder-help-dialog.test.ts` **4/4** — and **red against the code as tick 75 shipped it** (2/4
+  failing) before the fix, so it is a guard and not a description.
+- Full admin suite **359/359** (355 before, +4). `pnpm typecheck` **2/2**.
+- `scripts/qa/mutate-builder-help-dialog.sh` — **7/7 mutations red, each on a named assertion**;
+  `builder-view.tsx` restored byte-exact by md5, asserted on the **passing** runs too.
+- `cargo test -p omnion-workflows --lib`: **unchanged this tick** — the defect was in the client,
+  not the engine, and the tick's every-tick gate is honest about what it did not touch.
+
+**Four of the seven mutations were caught being wrong, and all four were in my guards.**
+(1) The `stopPropagation` assertion was satisfied by the **backdrop's** `onClick` handler — a
+different element and a different event — so removing the keydown's left the suite green.
+(2) A presence assertion and an absence assertion cannot police the same attribute: deleting it can
+only ever fail the positive one. (3) `CODE.slice(at - 400, at + 40)` is a claim about **distance**,
+and the palette's tag is longer than 400 characters, so an `onKeyDown` added at its top fell outside
+the window (M7 stayed green). (4) Two anchors reported the product as broken outright:
+`data-builder-help` also matches `data-builder-help-backdrop`, and `data-builder-inspector`'s **first
+occurrence is inside a `querySelector` string**. Four wrong anchors in one new file, each fixed
+toward the markup's real shape and each documented where it bit.
+
+**No browser pass, and the numbers are the reason rather than the excuse.** 11 concurrent
+`qa/run.sh` processes, 35 Chrome instances, load average 14.6, `MemAvailable` 6 GB, and
+`/mnt/apopic` at **98% (1.6 GB free)** — the same disk that killed tick 74's screenshots with
+`ENOSPC`. A pass in that state produces findings about the machine; the lesson is already written
+down in `references/qa-stack-and-api-test-traps.md` and re-proving it with 22 minutes of Chromium
+would have measured the box. Reclaim was limited to this writer's own cold derived directories
+(0 open fds verified before touching anything).
+
+**Next.** Re-run the focused pass (`--only=workflow-builder`, private `w3` stack, `QA_OUT_ROOT`
+on tmpfs) to read `shortcut-help.closedByEscape` off a live builder, then `sentinelsStayApart` and
+`table-save-survives`.
