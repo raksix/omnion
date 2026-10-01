@@ -11,6 +11,10 @@ import type {
   ApiRequestLog,
   ApiRequestLogPage,
   MintedApiKey,
+  MintedOAuthApp,
+  OAuthAppDetailResponse,
+  OAuthAppsResponse,
+  OAuthGrant,
   CdnAdapterInfo,
   CdnCacheRule,
   CdnCacheRuleInput,
@@ -7120,4 +7124,107 @@ export async function runExplorerRequest(input: ExplorerRunInput): Promise<Explo
  */
 export async function fetchOpenApiDocument(): Promise<Record<string, unknown>> {
   return request("/api/v1/dev/openapi.json");
+}
+
+/**
+ * OAuth applications (REQ-033, slice 3). The panel's side of the OAuth story.
+ *
+ * These six functions wrap the six panel routes in `apps/api/src/routes/developer_oauth.rs`.
+ * The four *sessionless* endpoints — authorize, consent POST, token and introspect — are
+ * deliberately absent here: they take no session and are reached by a third-party client, so
+ * putting them in the panel's `request()` helper would put them behind the caller's cookie and
+ * make them look like panel routes.
+ */
+
+/** `GET /api/v1/oauth-apps`. */
+export async function fetchOAuthApps(): Promise<OAuthAppsResponse> {
+  return request("/api/v1/oauth-apps");
+}
+
+/**
+ * `GET /api/v1/oauth-apps/{id}` — one app and its live authorization-code count.
+ *
+ * The id is encoded: it is a UUID the panel read from the list, but the helper does not assume
+ * a caller passed something it produced.
+ */
+export async function fetchOAuthApp(appId: string): Promise<OAuthAppDetailResponse> {
+  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}`);
+}
+
+/** Body of `POST /api/v1/oauth-apps`. `grant_types` omitted means the browser flow alone. */
+export type CreateOAuthAppInput = {
+  name: string;
+  description?: string;
+  logo_object_key?: string;
+  redirect_uris: string[];
+  scopes: string[];
+  grant_types?: OAuthGrant[];
+};
+
+/** Register an app. The secret is in this response and nowhere else, ever. */
+export async function createOAuthApp(input: CreateOAuthAppInput): Promise<MintedOAuthApp> {
+  return request("/api/v1/oauth-apps", { method: "POST", body: JSON.stringify(input) });
+}
+
+/**
+ * `PATCH /api/v1/oauth-apps/{id}` — a partial edit.
+ *
+ * A `PATCH` rather than a `PUT` because the panel's form submits the record it read, and a `PUT`
+ * means "this is now the whole resource" — so editing one description would blank the redirect
+ * URIs. `description` and `logo_object_key` take `null` to *clear*, which is why they are
+ * `string | null` rather than absent.
+ */
+export async function editOAuthApp(
+  appId: string,
+  input: {
+    name?: string;
+    description?: string | null;
+    logo_object_key?: string | null;
+    redirect_uris?: string[];
+    scopes?: string[];
+    grant_types?: OAuthGrant[];
+  },
+): Promise<OAuthAppDetailResponse> {
+  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * `POST /api/v1/oauth-apps/{id}/rotate` — a new client secret, and a 7-day overlap for the old
+ * one.
+ *
+ * The overlap is the difference from an API key rotation, which has none: a client secret is
+ * usually deployed to more machines than anybody is tracking, so the panel says how long the old
+ * one keeps working rather than pretending the switch is instantaneous.
+ */
+export async function rotateOAuthAppSecret(appId: string): Promise<MintedOAuthApp> {
+  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}/rotate`, { method: "POST" });
+}
+
+/**
+ * `DELETE /api/v1/oauth-apps/{id}` — withdraw.
+ *
+ * Idempotent, and it does not delete the row: its codes and its audit trail reference it, and
+ * "show me what this integration did last March" has to keep working.
+ */
+export async function withdrawOAuthApp(appId: string): Promise<void> {
+  await request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}`, { method: "DELETE" });
+}
+
+/**
+ * `POST /api/v1/oauth-apps/{id}/suspend` — switch an app off and back on without withdrawing it.
+ *
+ * Two verbs rather than a `PATCH` with a status, because the two are not symmetric: suspending is
+ * reversible and safe, withdrawing is neither.
+ */
+export async function setOAuthAppSuspended(
+  appId: string,
+  suspended: boolean,
+): Promise<OAuthAppDetailResponse> {
+  return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}/suspend`, {
+    method: "POST",
+    body: JSON.stringify({ suspended }),
+  });
 }

@@ -3643,3 +3643,94 @@ export type ExplorerRunInput = {
   /** Raw request body. */
   body?: string;
 };
+
+// ---------------------------------------------------------------------------------------------
+// OAuth applications (REQ-033, slice 3). The panel's half of the OAuth story; the four
+// sessionless endpoints a third-party client calls live behind the consent screen, not here.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The two flows this platform implements.
+ *
+ * The strings are the *stored* form, which is also what `POST /oauth-apps` accepts — the Rust
+ * enum is `#[serde(rename_all = "snake_case")]`, so the wire spelling and the variant name are
+ * deliberately the same, and a screen that invented its own spelling would post a `grant_types`
+ * the API refuses with `unknown_grant_type`.
+ */
+export type OAuthGrant = "authorization_code" | "client_credentials";
+
+/** An app's lifecycle state. `deleted` is a *withdrawn* app — the row survives for its audit trail. */
+export type OAuthAppStatus = "active" | "suspended" | "deleted";
+
+/** One registered OAuth application, as the full row the detail screen shows. */
+export type OAuthApp = {
+  id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  /** Object key of an uploaded logo, served through the media surface. */
+  logo_object_key: string | null;
+  /** The public identifier a client sends. Safe to display, log and read aloud. */
+  client_id: string;
+  redirect_uris: string[];
+  /** The most this app may ever be granted. */
+  scopes: string[];
+  grant_types: OAuthGrant[];
+  status: OAuthAppStatus;
+  /**
+   * When the previous client secret stops working, while a rotation's overlap is open.
+   *
+   * This is a *to-do* on the row and the reason it is on the summary: an operator who has
+   * rotated and not yet redeployed is looking at exactly this timestamp.
+   */
+  previous_secret_expires_at: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+};
+
+/**
+ * A list row. A **summary**, not the whole app: a list of ten apps each carrying three
+ * redirect URIs is a payload nobody reads and a table that cannot be scanned.
+ */
+export type OAuthAppSummary = {
+  id: string;
+  name: string;
+  client_id: string;
+  status: OAuthAppStatus;
+  redirect_uri_count: number;
+  /** The first registered URI, for the row's subtitle. */
+  primary_redirect_uri: string | null;
+  grant_types: OAuthGrant[];
+  previous_secret_expires_at: string | null;
+  created_at: string;
+};
+
+/** `GET /api/v1/oauth-apps`. */
+export type OAuthAppsResponse = { apps: OAuthAppSummary[] };
+
+/**
+ * The detail response: the full row plus a figure only a live query can give.
+ *
+ * `live_authorization_codes` counts codes that are still *redeemable*, not rows in the ledger —
+ * an app with forty rows and none redeemable is not holding forty codes, and a panel that said
+ * it was would send somebody hunting a compromise that never happened.
+ */
+export type OAuthAppDetailResponse = {
+  app: OAuthApp;
+  live_authorization_codes: number;
+};
+
+/**
+ * A registered or rotated app, with its client secret shown exactly once.
+ *
+ * It *is* an `OAuthApp` with extra fields — the API flattens the row — so a client that already
+ * reads an app needs no new shape. The presence of `client_secret` is what makes the panel open
+ * the one-time dialog.
+ */
+export type MintedOAuthApp = OAuthApp & {
+  /** Shown exactly once. The API has no endpoint that can return it again. */
+  client_secret: string;
+  /** How many days the previous secret stays valid, while a rotation's overlap is open. */
+  previous_secret_valid_for_days?: number;
+};

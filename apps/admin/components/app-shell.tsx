@@ -8,6 +8,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 import {
   Activity,
+  AppWindow,
   BarChart3,
   Bell,
   Bot,
@@ -112,6 +113,10 @@ const NAV: readonly NavItem[] = [
   // once the Explorer has told you what the call is.
   { href: "/developer/api-explorer", label: "Developer · API Explorer", icon: Compass },
   { href: "/developer/keys", label: "Developer · API keys", icon: KeyRound },
+  // The OAuth app registry (REQ-033, slice 3) sits *after* the keys and not before them: a
+  // developer arrives here with one of two questions — "how do I authenticate my own server?"
+  // (keys) or "let somebody else sign in" (an app) — and only the second one needs a registry.
+  { href: "/developer/oauth-apps", label: "Developer · OAuth apps", icon: AppWindow },
   { href: "/developer/logs", label: "Developer · Logs", icon: ScrollText },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
