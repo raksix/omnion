@@ -15305,3 +15305,56 @@ is the lever that actually works.
 
 **Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps
 out of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+
+## Tick 76 — REQ-117 SLICE 44 · the delivery log's three tenancy questions were three answers
+
+**What.** The admin outbox took `session.user.organization_id` as a *query argument* in three
+places, and each decided what "no organization" means differently: `list_outbox` wrote
+`else { n.organization_id is null }`, `outbox_counts` re-spelled the same rule
+`($1 is null and … is null) or = $1`, and `retry_delivery` had no predicate at all. The sharp
+half is that the retry was a **cross-tenant write**: any session holding `notifications.admin`
+could requeue another tenant's failed delivery by id, and a retry hands the message back to the
+transport. `push::OutboxScope` replaces `Option<Uuid>` on all three; a tenant reads its own rows
+plus the platform's announcements, and `Platform` is a complete predicate of its own rather than
+the tenant arm with the term dropped.
+
+**Proof.**
+
+| gate | result |
+|---|---|
+| `bash scripts/qa/run-outbox-tenancy-http.sh` | **8/8** |
+| the same with `QA_NEUTRALISE=outbox-scope` | **PROVEN TO FAIL at 2/8** — exactly the unscoped retry and the lost platform clause; all six tenancy-free neighbours green |
+| `cargo test -p omnion-notifications` | **117** (was 113, +4 `OutboxScope` tests) |
+| `cargo test -p omnion-api --lib` | **325** |
+| `cargo clippy -p omnion-notifications -p omnion-api --all-targets` | exit 0, 0 errors |
+| `apps/admin` `tsc --noEmit` | exit 0 |
+
+**Two defects of my own, both caught only by running it.**
+
+1. **The gate's negative control could not reproduce the defect it named.** Routing
+   `QA_NEUTRALISE` through the shared `push_outbox_scope` helper reproduced *nothing*: the
+   helper's pre-fix body still refuses tenant A's row, so the gate stayed 7/7 green with the leak
+   in place. The retry needs its predicate removed **entirely** (it never had one), and the two
+   reads need `list_outbox`'s original two-way split. A control that cannot reproduce the
+   defect is worse than none, because it is read as proof.
+2. **The summary line reported the wrong number under the wrong label.** It printed
+   `FAIL 8/8 legs failed` with `$LEG`/`$TOTAL` — the legs that *ran* — under a word saying
+   *failed*. Two red legs read as "the control took the whole route out", which is the exact
+   conclusion the gate's own header tells the reader to watch for. Now `FAIL — N of M legs ran,
+   K failed`. This is the same verb-used-for-two-purposes shape as tick 75's `PASS 16/7`.
+
+Also: the fixture's platform row used to be inserted in the last leg, which made the
+platform-clause leg unfailable. All three rows are now written before the first leg — **a row
+inserted after a measurement cannot change that measurement.**
+
+**Browser pass: not run, and none claimed.** No screen changed. `/mnt/apopic` is at **99 %
+(603 M free)**; w2's 8.7 G target is held by a live pass (`pid 261855`) and is not reclaimable,
+so all builds ran against `/dev/shm/w8-target`. The `notification_delivery` DB suite timed out on
+the shared Postgres (10 writers competing for `max_connections`); both touched integration
+targets were compiled instead, and the HTTP gate covered the same behaviour over a real socket.
+
+**Next.** The read side and the write side now agree in one predicate. Still unasked of
+`push::`: `prune_deliveries` / `prune_endpoints` / `prune_stale` take **no organization at all**,
+so a sweep is global by construction — worth checking whether that is deliberate retention
+(`OUTBOX_RETENTION_DAYS`) or a third spelling of the same question.
