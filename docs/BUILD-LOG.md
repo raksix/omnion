@@ -6659,3 +6659,68 @@ walkthrough. A third browser pass into that is the documented 29-September failu
 passes OOM-killing each other), and killing a sibling's pass to make room for mine trades one
 loop's evidence for another's. The boxes that name a screen stay unticked until a tick finds the
 box idle, which is the same condition `run.sh`'s own `flock` was added to protect.
+
+
+## Tick 94 — REQ-012 slice 4: a denied CIDR is refused, and the screen that was always linked
+
+**What.** Slice 4's IP-access half, done: the rules, the table, the evaluator, the request-path
+layer, the four routes and `/security/ip-access`. Six atomic commits, pushed. The events screen
+and the secret inventory are slice 4's other two thirds and are **not** started.
+
+**The defect this closes, stated once.** `/security/ip-access` has been linked from the posture
+overview's IP-allow-list row since the check registry was written — a link to a route that did not
+exist. And once the routes did exist, nothing read them: an operator could deny `203.0.113.0/24`,
+watch the row appear, and go on being served from it. The criterion is worded *"a denied CIDR
+cannot reach the API"*, which asks for a **refusal**, not a configuration.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-security --lib` | 159 passed (was 137) |
+| `cargo test -p omnion-api --lib` | 269 passed (was 261) |
+| `cargo test -p omnion-api --test security -- --test-threads=1` | 7 passed (42.1 s) |
+| `cargo test -p omnion-api --test migration_gap` | 4 passed, fresh database |
+| `tsc --noEmit` (apps/admin) | exit 0 |
+
+**Proven to fail before it was believed.** Removing the layer application from the router turns
+`a_denied_network_cannot_reach_the_api` red naming the criterion. **The failure payload is the
+best argument in this entry**: with the layer gone, the same response carried
+`{"key":"ip_rules","state":"pass","detail":{"fact":1,"summary":"1 IP access rules are configured"}}`
+— the screen reporting the access list as healthy while the platform served the very network it
+described. Screen and platform disagreeing inside one payload is the ninth instance of this REQ's
+defect class, and it is why the walk drives the **router** rather than the crate.
+
+**Three decisions worth keeping.**
+
+1. **A request with no address is refused, not waved through.** With rules in force it answers
+   `403 ip_unknown`. That is what makes the criterion a claim about the platform: if every
+   in-process request were allowed for want of an address, the walk that proves a CIDR is refused
+   would pass for the wrong reason. The harnesses opt in through a named env var, off by default.
+2. **A rule that blocks the caller is warned about, not refused** — `blocks_you` comes from the
+   server because only the server knows the address the request came from, and the rule is saved
+   either way. Locking yourself out of one route is legitimate; refusing it would only teach the
+   operator which input avoids the check.
+3. **The host-bit CIDR is refused, and the message names the network meant.** `ipnet` accepts
+   `10.0.0.1/8` and answers `contains()` correctly; **Postgres's `cidr` column refuses the same
+   value** with "bits set to right of mask". A range-check-only parser would have accepted it and
+   turned a typo into a `500` from inside the database, and canonicalising it would have silently
+   widened a rule that reads like one address to sixteen million.
+
+**A trap the walk found in itself, and one it found in the product.** The self-lockout walk
+deadlocked on its first draft: its cleanup `DELETE` came from the address it had just blocked, and
+the layer refused it before the route was reached — **once a deny covers your own address you
+cannot delete that rule from the panel.** The walk now uses a third address, and the comment names
+the escape the REQ's own risk note asks for. The *assertion* that was wrong is the other half: it
+expected a `DELETE` to succeed from an already-blocked address, which is a statement about
+nothing; correcting it is what exposed the trap.
+
+**Browser pass deliberately not started (recorded, not skipped silently).** Load 8–25 across the
+tick, two to three sibling walkthroughs at any moment, 45–46 Chrome processes, 0 GB free RAM, and
+the one-pass-per-box slot held live by `omnion-w3` for its whole duration. A fourth pass into that
+is the documented 29-September OOM failure. The boxes that name a screen stay unticked — that now
+includes `/security/ip-access`, whose walkthrough entry is written and registered in both the
+desktop and the mobile pass, and which will be visited the first time the box is idle.
+
+**Next.** The browser pass owed for slices 1–4, then slice 4's remaining two thirds: the
+security-event view over the audit trail and the secret-inventory projection.
