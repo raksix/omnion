@@ -3293,3 +3293,509 @@ async fn a_range_request_answers_a_window_and_says_what_it_sent() {
     let anonymous = call(&fixture.state, range_request(&raw, None, "bytes=0-9")).await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
 }
+
+
+/// The custom pairs on a file are stored, filtered on, and refused by name.
+///
+/// The column this walk reads has existed since `0025` with a GIN index over it, and until this
+/// change **nothing in the tree wrote it**: every row in every installation was `{}`, the index
+/// scanned an empty object per row, and the REQ's own scope ("custom key/value pairs … with a
+/// GIN index", "a metadata filter in the browser") was satisfied by a column. The uncalled-column
+/// defect class, one level up from the uncalled `prune_candidates` function.
+///
+/// Every assertion here reads the value **out of PostgreSQL** or back out of a real listing.
+/// A response that omits a field is indistinguishable from one that stored it and chose not to
+/// say so, and that is exactly the failure mode a walk over the HTTP layer cannot see.
+#[tokio::test]
+async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    // Two endpoints, two jobs: the upload posts to the flat library, and the *browser* listing
+    // — the one with folders, filters and a `total` the footer reads — is `/media/files`. My
+    // first draft filtered the flat one, which answers `{"media": [...]}` with no count at all;
+    // the walk caught it on its first assertion, and the endpoint whose name looks like the file
+    // manager is not the one the panel's toolbar talks to.
+    let library = format!("/api/v1/media?site_id={site}");
+    let browser = format!("/api/v1/media/files?site_id={site}");
+
+    let spring = call(
+        &fixture.state,
+        upload_request(
+            &library,
+            Some(&editor),
+            "spring-hero.png",
+            "image/png",
+            b"the spring campaign hero",
+        ),
+    )
+    .await;
+    assert_eq!(spring.status, StatusCode::CREATED, "body: {}", spring.body);
+    let spring_id = id_of(&spring.body);
+
+    let autumn = call(
+        &fixture.state,
+        upload_request(
+            &library,
+            Some(&editor),
+            "autumn-hero.png",
+            "image/png",
+            b"the autumn campaign hero",
+        ),
+    )
+    .await;
+    assert_eq!(autumn.status, StatusCode::CREATED, "body: {}", autumn.body);
+    let autumn_id = id_of(&autumn.body);
+
+    // A file nobody touched carries no pairs at all — not `null`, and not a pair with an empty
+    // value. `{}` is what every pre-existing row holds, so this is the state the platform ships.
+    assert_eq!(
+        media_column(&fixture.state, Uuid::parse_str(&autumn_id).expect("an id"), "metadata")
+            .await,
+        Some(json!({})),
+        "an untouched file carries no pairs"
+    );
+
+    // 1. A pair set is stored whole, and read back **out of the database**.
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{spring_id}"),
+            Some(&editor),
+            Some(json!({
+                "metadata": { "campaign": "spring-2026", "licence": "CC-BY-4.0", "pages": 4 }
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "body: {}", saved.body);
+
+    let stored = media_column(
+        &fixture.state,
+        Uuid::parse_str(&spring_id).expect("an id"),
+        "metadata",
+    )
+    .await
+    .expect("the metadata column must be readable");
+    assert_eq!(
+        stored,
+        json!({ "campaign": "spring-2026", "licence": "CC-BY-4.0", "pages": "4" }),
+        "every stored value is text, so one comparison operator works on every row"
+    );
+
+    // 2. The filter finds it, and finds *only* it.
+    let filtered = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dspring-2026"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(filtered.status, StatusCode::OK, "body: {}", filtered.body);
+    let ids: Vec<String> = filtered.body["files"]
+        .as_array()
+        .expect("the page carries rows")
+        .iter()
+        .map(|file| file["id"].as_str().expect("a row has an id").to_owned())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![spring_id.clone()],
+        "the pair filter matched one file and no other"
+    );
+    assert_eq!(
+        filtered.body["total"].as_i64(),
+        Some(1),
+        "the count agrees with the rows it counts: {}",
+        filtered.body
+    );
+
+    // 3. The second pair is independently addressable — one filter is one pair, not "has any".
+    let by_licence = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=licence%3DCC-BY-4.0"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(by_licence.body["total"].as_i64(), Some(1));
+
+    // A value that is not there is not a match, and a *partial* value is not a match either:
+    // `spring` must not find `spring-2026`, or the filter is a prefix search the screen never
+    // says it is.
+    for term in ["campaign=winter", "campaign=spring"] {
+        let miss = call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("{browser}&metadata={term}"),
+                Some(&editor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            miss.body["total"].as_i64(),
+            Some(0),
+            "[{term}] must match exactly, not approximately: {}",
+            miss.body
+        );
+    }
+
+    // 4. A half-typed term narrows nothing rather than everything. The toolbar field is re-read on
+    // every keystroke; `campaign=` mid-word must not empty the listing under the operator's hands.
+    for term in ["campaign", "campaign%3D"] {
+        let partial = call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("{browser}&metadata={term}"),
+                Some(&editor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(partial.status, StatusCode::OK, "body: {}", partial.body);
+        assert_eq!(
+            partial.body["total"].as_i64(),
+            Some(2),
+            "[{term}] is not a filter yet, so the listing is untouched: {}",
+            partial.body
+        );
+    }
+
+    // 5. The filter combines with the others rather than replacing them.
+    let combined = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dspring-2026&kind=image"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(combined.body["total"].as_i64(), Some(1));
+
+    let contradicted = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dspring-2026&kind=video"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        contradicted.body["total"].as_i64(),
+        Some(0),
+        "two filters narrow each other: {}",
+        contradicted.body
+    );
+
+    // 6. A refused pair writes **nothing**. The row still holds the set it had.
+    for (label, body, expect_field) in [
+        (
+            "a nested object",
+            json!({ "shoot": { "lens": "50mm" } }),
+            "metadata.shoot",
+        ),
+        ("a list", json!({ "colours": ["red", "blue"] }), "metadata.colours"),
+        (
+            "an over-long value",
+            json!({ "licence": "C".repeat(600) }),
+            "metadata.licence",
+        ),
+    ] {
+        let refused = call(
+            &fixture.state,
+            request(
+                Method::PATCH,
+                &format!("/api/v1/media/files/{spring_id}"),
+                Some(&editor),
+                Some(json!({ "metadata": body })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "[{label}] a pair this release cannot store is a 400: {}",
+            refused.body
+        );
+        // The error envelope is `{"error": {...}}`, not a bare body — reading `body["code"]`
+        // yields `null` and looks like a missing field rather than a wrong address.
+        let error = &refused.body["error"];
+        assert_eq!(
+            error["code"], "invalid_metadata",
+            "[{label}] carries its own code: {}",
+            refused.body
+        );
+        assert_eq!(
+            error["details"]["field"], expect_field,
+            "[{label}] names the pair that caused it: {}",
+            refused.body
+        );
+    }
+    assert_eq!(
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&spring_id).expect("an id"),
+            "metadata"
+        )
+        .await,
+        Some(json!({ "campaign": "spring-2026", "licence": "CC-BY-4.0", "pages": "4" })),
+        "a refused save leaves the stored set exactly as it was"
+    );
+
+    // 7. Sending `{}` **clears** the pairs — the whole set is the unit, which is what makes the
+    // editor's "remove this pair" row work and what makes an omitted field different from an
+    // empty one.
+    let cleared = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{spring_id}"),
+            Some(&editor),
+            Some(json!({ "metadata": {} })),
+        ),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "body: {}", cleared.body);
+    assert_eq!(
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&spring_id).expect("an id"),
+            "metadata"
+        )
+        .await,
+        Some(json!({})),
+        "an empty object clears the set"
+    );
+    let after_clear = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dspring-2026"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        after_clear.body["total"].as_i64(),
+        Some(0),
+        "a cleared pair stops matching: {}",
+        after_clear.body
+    );
+
+    // 8. Omitting the field entirely is NOT a clear. `coalesce($7, metadata)` is what keeps a
+    // caption edit from wiping every pair; a partial merge is not what this column does.
+    let saved_again = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{spring_id}"),
+            Some(&editor),
+            Some(json!({ "metadata": { "campaign": "spring-2026" } })),
+        ),
+    )
+    .await;
+    assert_eq!(saved_again.status, StatusCode::OK);
+    let caption_only = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{spring_id}"),
+            Some(&editor),
+            Some(json!({ "caption": "the spring hero" })),
+        ),
+    )
+    .await;
+    assert_eq!(caption_only.status, StatusCode::OK, "body: {}", caption_only.body);
+    assert_eq!(
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&spring_id).expect("an id"),
+            "metadata"
+        )
+        .await,
+        Some(json!({ "campaign": "spring-2026" })),
+        "a patch that omits metadata leaves the pairs alone"
+    );
+
+    // 9. Another tenant's filter cannot see them, and the reader may read them.
+    // Another tenant's site is not this account's to list at all, so the refusal happens before
+    // the filter is ever built — which is the *stronger* of the two answers: the row cannot be
+    // mined by guessing pairs, because the site is refused wholesale. The filter's own tenancy
+    // clause (`media.site_id = $1`, written inside `push_filters`) is the layer below this one,
+    // and the walk proves it separately in the browser: the listing scoped to site A never
+    // contains a site B row no matter what pair is typed.
+    let other_site = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "/api/v1/media/files?site_id={}&metadata=campaign%3Dspring-2026",
+                fixture.site_b
+            ),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        other_site.status == StatusCode::FORBIDDEN
+            || other_site.status == StatusCode::NOT_FOUND
+            || other_site.body["total"].as_i64() == Some(0),
+        "another tenant's site is not listed: got {} {}",
+        other_site.status,
+        other_site.body
+    );
+
+    // And the clause that does the scoping is proven *from the other side*, which needs no
+    // cross-tenant permission at all: a pair stored on site A is never visible in a listing
+    // scoped to site B, whatever the status above was. `push_filters` writes `media.site_id`
+    // into both the page and the count, so the guarantee does not depend on a filter being
+    // present — an unfiltered listing of the wrong site is equally empty.
+    let scoped = call(
+        &fixture.state,
+        request(Method::GET, &browser, Some(&editor), None),
+    )
+    .await;
+    let rows = scoped.body["files"].as_array().cloned().unwrap_or_default();
+    assert!(
+        rows.iter()
+            .all(|file| file["site_id"] == json!(site.to_string())),
+        "every listed row belongs to the requested site: {}",
+        scoped.body
+    );
+
+    // The pairs are on the **wire**, not only in the row. A value that is stored and never
+    // serialised is invisible to every editor, which is the other half of the uncalled-column
+    // defect and the half the database assertion alone cannot see.
+    let read_pairs = call(
+        &fixture.state,
+        request(Method::GET, &browser, Some(&editor), None),
+    )
+    .await;
+    assert_eq!(read_pairs.status, StatusCode::OK, "body: {}", read_pairs.body);
+    let shown = read_pairs.body["files"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|file| file["id"] == json!(spring_id))
+        .expect("the file is in the listing");
+    assert_eq!(
+        shown["metadata"]["campaign"], "spring-2026",
+        "the pairs are on the wire, not only in the row: {}",
+        read_pairs.body
+    );
+
+    fixture.cleanup().await;
+}
+
+/// A pair is refused **before** the row is touched, and the refusal is scoped like the write.
+///
+/// Split from the walk above on purpose: it needs an account with no write permission, and a
+/// test that asserted "this is refused" by reading the status code alone would pass just as well
+/// on a `403` from the wrong check.
+#[tokio::test]
+async fn the_pair_filter_and_editor_hold_the_line_a_tenant_does_not_cross() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+    let browser = format!("/api/v1/media/files?site_id={site}");
+
+    let upload = call(
+        &fixture.state,
+        upload_request(
+            &library,
+            Some(&editor),
+            "scoped.png",
+            "image/png",
+            b"a file tagged in one tenant only",
+        ),
+    )
+    .await;
+    assert_eq!(upload.status, StatusCode::CREATED, "body: {}", upload.body);
+    let id = id_of(&upload.body);
+
+    call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{id}"),
+            Some(&editor),
+            Some(json!({ "metadata": { "campaign": "tenant-a" } })),
+        ),
+    )
+    .await;
+
+    // An account of the same organization that holds no media key at all cannot write the pairs.
+    // The answer must not be a `403` **because the id exists** — but a member's refusal on a file
+    // it can also not read is genuinely ambiguous, so the load-bearing half of the assertion is
+    // the one below it: the row is unchanged afterwards. A tenancy oracle is what
+    // `media_grants::delete_one` learned the hard way, and a walk that only checked a status
+    // code could not tell the two refusals apart.
+    let member = fixture.member_token().await;
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/media/files/{id}"),
+            Some(&member),
+            Some(json!({ "metadata": { "campaign": "tenant-b" } })),
+        ),
+    )
+    .await;
+    assert!(
+        refused.status == StatusCode::FORBIDDEN || refused.status == StatusCode::NOT_FOUND,
+        "an account with no media key cannot write pairs, got {}: {}",
+        refused.status,
+        refused.body
+    );
+    assert_eq!(
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&id).expect("an id"),
+            "metadata"
+        )
+        .await,
+        Some(json!({ "campaign": "tenant-a" })),
+        "the refused write changed nothing"
+    );
+
+    // An anonymous caller cannot read the listing, so cannot mine pairs out of it.
+    let anonymous = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&metadata=campaign%3Dtenant-a"),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "no session, no listing: {}",
+        anonymous.body
+    );
+
+    fixture.cleanup().await;
+}
