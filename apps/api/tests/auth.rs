@@ -41,14 +41,33 @@ struct TestResponse {
 /// passed with the lockout fix reverted.
 ///
 /// The address is therefore **this walk's own**, allocated per test rather than shared: the
-/// `sign_in` limiter counts per address with a ceiling of 10, so walks that share one loopback
-/// address spend each other's budget and a sign-in round trip is refused `429` by a counter it
-/// never incremented. `TEST_PEER` is the allocation point — every helper in this file routes
-/// through it, so a new walk cannot reintroduce the sharing by forgetting to opt out.
+/// `sign_in` limiter counts per address, so walks that share one loopback address spend each
+/// other's budget and a sign-in round trip is refused `429` by a counter it never incremented.
+/// `TEST_PEER` is the allocation point — every helper in this file routes through it, so a new
+/// walk cannot reintroduce the sharing by forgetting to opt out.
+///
+/// **The IP is drawn as well as the port, because varying the port alone never isolated
+/// anything.** The account limiter hashes the IP and ignores the port, and so does
+/// `sign_in`'s own address rule (`recent_failures_from_address`) — so every walk in this file
+/// shared the single `127.0.0.1` budget no matter which port it claimed, and the comment above
+/// described an isolation the code did not have. It stayed invisible for as long as the address
+/// ceiling was comfortably high: the enforced threshold was the IAM column's 10, giving a budget
+/// of 30 failures that no single walk reached. When the sign-in path was switched to the
+/// lockout document the operator actually edits — whose own default is 5 — the budget halved to
+/// 15 and three walks in this file, none of which touches the threshold, began failing
+/// `address_blocked` on 127.0.0.1. The product was right and the harness was wrong, which is the
+/// only way that story ends well: the fix is to separate the counters, never to put 10 back.
+/// `127.0.0.0/8` is entirely loopback, so the octets below are real, unroutable-free addresses.
 fn test_peer() -> String {
-    // Loopback with a per-test port: a real address, and no other walk in this file has it.
     // `as_u128` rather than `simple()` — the latter is a Display formatter, not a value.
-    format!("127.0.0.1:{}", 51000 + (Uuid::new_v4().as_u128() % 1000))
+    let draw = Uuid::new_v4().as_u128();
+    format!(
+        "127.{}.{}.{}:{}",
+        1 + (draw % 200) as u8,
+        ((draw >> 8) % 250) as u8,
+        1 + ((draw >> 16) % 250) as u8,
+        51000 + ((draw >> 24) % 1000) as u16
+    )
 }
 
 async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
@@ -579,14 +598,13 @@ async fn a_lockout_emits_the_event_once_and_carries_no_attempted_secret() {
     // would produce an event that is written, appears in `/events` as real, and reaches nobody.
     // That is the exact shape of an emitter that forgot `.organization(...)`, and it is why the
     // account is created inside the organization rather than with the shared helper.
-    let organization_id: Uuid = sqlx::query_scalar(
-        "insert into organizations (name, slug) values ($1, $2) returning id",
-    )
-    .bind("Lockout walk")
-    .bind(format!("lockout-walk-{}", Uuid::new_v4().simple()))
-    .fetch_one(db.pool())
-    .await
-    .expect("the organization must be created");
+    let organization_id: Uuid =
+        sqlx::query_scalar("insert into organizations (name, slug) values ($1, $2) returning id")
+            .bind("Lockout walk")
+            .bind(format!("lockout-walk-{}", Uuid::new_v4().simple()))
+            .fetch_one(db.pool())
+            .await
+            .expect("the organization must be created");
 
     let email = format!("lockout-{}@omnion.test", Uuid::new_v4().simple());
     let user = users::create_user(
@@ -661,16 +679,9 @@ async fn a_lockout_emits_the_event_once_and_carries_no_attempted_secret() {
         .await;
         let (mut parts, body) = post_login(&email, "definitely-not-the-password").into_parts();
         if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
-            parts
-                .extensions
-                .insert(axum::extract::ConnectInfo(address));
+            parts.extensions.insert(axum::extract::ConnectInfo(address));
         }
-        let response = call_from(
-            &state,
-            Request::from_parts(parts, body),
-            &peer,
-        )
-        .await;
+        let response = call_from(&state, Request::from_parts(parts, body), &peer).await;
         if response.body["error"]["code"] == "account_locked" {
             locked_at = Some(attempt);
             break;
@@ -743,9 +754,7 @@ async fn a_lockout_emits_the_event_once_and_carries_no_attempted_secret() {
         .await;
         let (mut parts, body) = post_login(&email, "definitely-not-the-password").into_parts();
         if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
-            parts
-                .extensions
-                .insert(axum::extract::ConnectInfo(address));
+            parts.extensions.insert(axum::extract::ConnectInfo(address));
         }
         let response = call_from(&state, Request::from_parts(parts, body), &peer).await;
         assert_eq!(
@@ -770,13 +779,12 @@ async fn a_lockout_emits_the_event_once_and_carries_no_attempted_secret() {
     );
 
     // And the fan-out actually happened: an event nobody is subscribed to is not delivered.
-    let queued: i64 = sqlx::query_scalar(
-        "select count(*) from webhook_deliveries where endpoint_id = $1",
-    )
-    .bind(endpoint_id)
-    .fetch_one(db.pool())
-    .await
-    .expect("the delivery queue must be readable");
+    let queued: i64 =
+        sqlx::query_scalar("select count(*) from webhook_deliveries where endpoint_id = $1")
+            .bind(endpoint_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("the delivery queue must be readable");
     assert_eq!(
         queued, 1,
         "the lockout event queued {queued} deliveries for its one subscriber; it must queue \

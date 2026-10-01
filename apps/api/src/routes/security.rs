@@ -584,7 +584,21 @@ pub async fn import(
         )
         .await
         {
-            Ok((_row, true)) => created += 1,
+            // Only a finding that was **not already known** opens, and the difference is the
+            // whole reason a receiver can act on this: a nightly CI job re-ingests the same
+            // report every morning, and an endpoint that paged on every one of those would be
+            // muted by the second run. `upsert_finding`'s `false` return *is* that answer —
+            // it comes from `xmax`, the statement's own record of which branch it took.
+            Ok((row, true)) => {
+                created += 1;
+                announce_finding_opened(
+                    &state,
+                    session.user.organization_id,
+                    session.user.id,
+                    &row,
+                )
+                .await;
+            }
             // The idempotence the acceptance criteria ask for: ingesting the same report
             // twice must not double the count, and the *return* is what proves it did.
             Ok((_row, false)) => refreshed += 1,
@@ -600,6 +614,63 @@ pub async fn import(
         refreshed,
         rejected,
     }))
+}
+
+/// Announce a finding that was not there before, on `security.finding.opened`.
+///
+/// **The payload is the finding's identity, never its content.** `title`, `description` and
+/// `evidence` are all absent, and that is the whole design of this emitter rather than an
+/// omission:
+///
+/// * `title` is attacker-influenced free text — a dependency report can call its package
+///   anything — and this event fans out to every third-party receiver the operator connected.
+///   The panel reads the row back through `security.read`, so `finding_id` is enough for a
+///   receiver to open the same finding in the same place the operator is looking.
+/// * `description` is a CI vendor's prose and `evidence` is the raw entry. The ingest path
+///   refuses a report whose *keys* look like credentials, but that is a heuristic on names,
+///   and a bus is not the place to bet on a heuristic holding.
+///
+/// What is carried is what a receiver cannot compute from the id: how bad it is, where it came
+/// from, and which package and version it is about — the triage triple, with no prose.
+///
+/// **The failure mode is a log line, never a `500`.** The finding is already committed by the
+/// time this runs, and the caller is the CI job that just uploaded a report it will not re-read
+/// by hand; answering `500` would report an ingest that landed as lost, which is the one thing
+/// the store's `created`/`refreshed` count would then contradict.
+///
+/// The fan-out is per new finding, so a first-time report of `n` findings queues `n`
+/// deliveries per subscribed endpoint — bounded by the report's size, which is a document the
+/// uploader controls, and by the ceiling the report parser already enforces. Nothing here is
+/// sampled: a finding that opens and is never delivered is a finding that quietly did not
+/// happen as far as the receiver is concerned, and the volume is the uploader's own choice.
+async fn announce_finding_opened(
+    state: &AppState,
+    organization_id: Option<Uuid>,
+    actor: Uuid,
+    finding: &Finding,
+) {
+    if let Err(error) = bus::emit(
+        state.db().pool(),
+        NewEvent::new("security.finding.opened")
+            .organization(organization_id)
+            .actor(actor)
+            .payload(json!({
+                "finding_id": finding.id,
+                "severity": finding.severity,
+                "source": finding.source,
+                "component": finding.component,
+                "component_version": finding.component_version,
+                "fixed_in": finding.fixed_in,
+            })),
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %error,
+            finding = %finding.id,
+            "the finding was stored but the event was not emitted"
+        );
+    }
 }
 
 /// What an ingest did.

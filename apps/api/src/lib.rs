@@ -35,5 +35,6 @@ pub mod retention_runner;
 pub mod routes;
 pub mod scope;
 pub mod search_runner;
+pub mod security_ip;
 pub mod state;
 pub mod workflow_runner;

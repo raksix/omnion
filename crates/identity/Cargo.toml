@@ -19,6 +19,13 @@ sha2.workspace = true
 hex.workspace = true
 tracing.workspace = true
 
+# The enforced brute-force thresholds (REQ-012, slice 3). `omnion-security` owns the lockout
+# document `/security/sign-in-protection` edits, and it depends on nothing in this crate — so the
+# edge runs this way and not the other. Before it, this crate carried its own copy of the
+# thresholds against `security_policies`, the one document of the two that nothing on the request
+# path read.
+omnion-security = { path = "../security" }
+
 # TOTP (RFC 6238) needs HMAC over SHA-1 — the RFC's PRF and what authenticator apps implement.
 # Secret envelopes are encrypt-then-MAC with HMAC-SHA256 (crates/identity/src/secrets.rs).
 hmac = "0.12"

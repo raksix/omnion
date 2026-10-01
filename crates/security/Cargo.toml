@@ -8,6 +8,9 @@ publish = false
 
 [dependencies]
 hex.workspace = true
+# The IP access rules (REQ-012, slice 4). CIDR matching and prefix arithmetic for both address
+# families; the migration's `cidr` column is the second layer of the same validation.
+ipnet.workspace = true
 # The CSRF token is an HMAC over the session id (REQ-012, slice 2): derived rather than stored,
 # so there is no table to rotate and nothing to leak from a dump.
 hmac.workspace = true
