@@ -11282,3 +11282,15 @@ the four REQ-055 criteria still unticked are precisely the ones a browser has to
 pid 1689806, cwd `/mnt/apopic/omnion-w4`). REQ-055 stays **in-progress** — its four remaining
 criteria (org chart + keyboard + counts, the event feed reaching a subscribed webhook, empty/
 loading/error states, mobile 390×844) still owe a pass that can be believed.
+
+**Blocker recorded, not silently skipped.** The tick's second gate — the six HR **DB walks** in
+`apps/api/tests/hr*.rs` — did not return. `hr_attendance` ran ~25 min with a live pid, so it was
+measured rather than assumed slow: `/proc/<pid>/stat` CPU ticks showed **delta 0** across 15 s,
+`wchan` = `futex_do_wait`, and `ss -tnp` showed fd 23 to Postgres holding **320 bytes in its
+receive queue** with every backend `idle`/`ClientRead` and **0 ungranted locks**. The database had
+finished; the process had not. Killed after that, and the process tree reaped.
+
+What was verified in this tick stands on its own and is unaffected: `cargo test -p
+omnion-module-hr` **132/132**, `pnpm typecheck` clean, the probe **8/8** (and 7 FAIL on `HEAD`).
+The DB-walk gate is **unmeasured, not passing** — `ps` alone cannot tell a slow walk from a blocked
+one, so the next tick re-runs it rather than recording a green it did not observe.
