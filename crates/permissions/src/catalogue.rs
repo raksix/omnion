@@ -261,6 +261,26 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "deployment",
         description: "Rehearse a migration reversal against a scratch database",
     },
+    // * `backfills.manage` — starts, pauses and resumes a backfill job. Its own key because a
+    //   backfill is the only thing on this surface that WRITES EVERY ROW of a table: applying a
+    //   migration changes the schema for future rows, and this changes rows that already exist.
+    //   An operator trusted with `migrations.apply` has proved they may break the schema; they
+    //   have proved nothing about the data in it.
+    PermissionDef {
+        key: "deployment.backfills.manage",
+        category: "deployment",
+        description: "Run, pause and resume backfill jobs",
+    },
+    // * `seeds.load` — writes fixture rows into an installation. Its own key because the whole
+    //   point of the refusal is that only a non-production installation may be seeded, and the
+    //   key is what makes "who wrote this into my database" answerable. On a production-marked
+    //   installation the environment refuses as well — the two are independent, and this one is
+    //   the one that still applies to a demo-marked production install.
+    PermissionDef {
+        key: "deployment.seeds.load",
+        category: "deployment",
+        description: "Load a seed dataset into a non-production installation",
+    },
     // Identity and access management.
     PermissionDef {
         key: "iam.permissions.read",
@@ -846,6 +866,40 @@ mod tests {
         assert_ne!(
             "deployment.bundle.generate", "deployment.read",
             "generation is a write, not a read"
+        );
+    }
+
+    #[test]
+    fn a_backfill_is_not_the_same_power_as_a_migration_and_a_seed_is_not_either() {
+        // REQ-129 slice 3's two keys. A backfill writes every EXISTING row of a table; applying a
+        // migration only changes the schema for rows written from now on. Both keys are asserted
+        // distinct from the three migration keys because a route that guarded the backfill
+        // endpoints with `migrations.apply` would pass every test in this crate — none of them
+        // builds a router — and would leave "who rewrote my data" answering with the same key as
+        // "who changed my schema".
+        for key in [
+            "deployment.backfills.manage",
+            "deployment.seeds.load",
+            "deployment.migrations.apply",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("deployment"),
+                "{key} belongs to the deployment category"
+            );
+        }
+        assert_ne!(
+            "deployment.backfills.manage", "deployment.migrations.apply",
+            "rewriting existing rows is not changing the schema"
+        );
+        assert_ne!(
+            "deployment.seeds.load", "deployment.migrations.apply",
+            "loading fixture rows is not applying a migration"
+        );
+        assert_ne!(
+            "deployment.seeds.load", "deployment.backfills.manage",
+            "seeding writes chosen rows; a backfill writes a column of every row"
         );
     }
 
