@@ -45,6 +45,11 @@ const NAV = [
   // in the morning — and burying leave under Identity would make a holiday request look like an
   // account problem, which is exactly what it is not.
   { href: "/hr/leave", label: "People", icon: Palmtree },
+  // My workspace (REQ-055 slice 2c). A separate entry rather than a tab inside People, and the
+  // reason is the permission split: "People" is the administrator's shelf and every route under
+  // it answers behind an `hr.*` key, while these three carry no key at all. Hiding the
+  // self-service screens inside the admin shelf would make them look like they 403.
+  { href: "/hr/me", label: "My workspace", icon: UsersRound },
   { href: "/notifications", label: "Notifications", icon: Bell },
   // The event console (REQ-016, slice 1). It sits beside Notifications rather than under
   // Settings because both answer the same question from the bus's side — "what does the

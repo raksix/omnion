@@ -318,3 +318,110 @@ export function cancelRequest(id: string): Promise<LeaveRequest> {
 export function fetchCalendar(params: { from?: string; to?: string } = {}): Promise<AbsenceCalendar> {
   return hrRequest<AbsenceCalendar>(`/api/v1/hr/leave/calendar${query(params)}`);
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * The self-service surface (REQ-055 slice 2c)
+ *
+ * A separate block from the HR screen's client on purpose, and the split is the same one the
+ * server makes: these calls carry **no employee id**, so there is nothing here a caller could
+ * change to read somebody else's record. Writing them next to the HR functions would invite the
+ * obvious-looking `fetchBalances(employeeId)` refactor, and that refactor is the vulnerability.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The caller's own employee record, with the personal fields the request keeps private. */
+export type MyProfile = {
+  employee_id: string;
+  employee_no: string;
+  first_name: string;
+  last_name: string;
+  work_email: string;
+  phone: string | null;
+  position: string;
+  department: string | null;
+  manager_name: string | null;
+  employment_type: string;
+  start_date: string;
+  end_date: string | null;
+  employee_status: string;
+  location: string | null;
+  personal_email: string | null;
+  personal_phone: string | null;
+  address: string | null;
+  emergency_contact: string | null;
+};
+
+/** The caller's own leave: the cards and the requests that produced them, in one answer. */
+export type MyLeave = {
+  employee_id: string;
+  year: number;
+  balances: BalanceCard[];
+  requests: LeaveRequest[];
+  total: number;
+};
+
+/** One of the caller's own documents. */
+export type MyDocument = {
+  id: string;
+  kind: string;
+  title: string;
+  media_id: string;
+  expires_on: string | null;
+  acknowledged: boolean;
+  expiring_soon: boolean;
+};
+
+/** `GET /hr/me` — the caller's own profile. */
+export function fetchMyProfile(): Promise<MyProfile> {
+  return hrRequest<MyProfile>("/api/v1/hr/me");
+}
+
+/** `GET /hr/me/leave` — own balances and own requests for a year. */
+export function fetchMyLeave(year?: number): Promise<MyLeave> {
+  return hrRequest<MyLeave>(`/api/v1/hr/me/leave${query({ year })}`);
+}
+
+/** `GET /hr/me/leave/types` — the catalogue the self-service form offers. */
+export function fetchMyLeaveTypes(): Promise<{ items: LeaveType[] }> {
+  return hrRequest<{ items: LeaveType[] }>("/api/v1/hr/me/leave/types");
+}
+
+/** `GET /hr/me/documents` — own documents, newest first. */
+export function fetchMyDocuments(): Promise<{ items: MyDocument[] }> {
+  return hrRequest<{ items: MyDocument[] }>("/api/v1/hr/me/documents");
+}
+
+/** The body of a self-service request: no `employee_id`, and there will never be one. */
+export type MyNewLeaveRequest = {
+  leave_type_id: string;
+  starts_on: string;
+  ends_on: string;
+  half_day?: boolean;
+  reason?: string;
+};
+
+/** `GET /hr/me/leave/preview` — the days a self-service request would charge. */
+export function previewMyLeaveDays(
+  starts_on: string,
+  ends_on: string,
+  half_day?: boolean,
+): Promise<DaysPreview> {
+  return hrRequest<DaysPreview>(
+    `/api/v1/hr/me/leave/preview${query({ starts_on, ends_on, half_day })}`,
+  );
+}
+
+/** `POST /hr/me/leave/requests` — ask for leave, for oneself. */
+export function createMyLeaveRequest(body: MyNewLeaveRequest): Promise<LeaveRequest> {
+  return hrRequest<LeaveRequest>("/api/v1/hr/me/leave/requests", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/me/leave/requests/{id}/cancel` — withdraw one of one's own pending requests. */
+export function cancelMyLeaveRequest(id: string): Promise<LeaveRequest> {
+  return hrRequest<LeaveRequest>(`/api/v1/hr/me/leave/requests/${id}/cancel`, {
+    method: "POST",
+    body: "{}",
+  });
+}
