@@ -27,6 +27,7 @@ use crate::secrets::SecretBox;
 use crate::security::{self, IpVerdict, SecurityPolicy, SessionPolicy};
 use crate::sessions;
 use crate::users::{User, normalize_email};
+use omnion_security::{EnforcedLockout, resolve_lockout};
 
 /// How long a second-factor challenge stays valid.
 pub const CHALLENGE_TTL_MINUTES: i64 = 5;
@@ -75,6 +76,30 @@ pub enum SignInOutcome {
     AccountLocked {
         /// When the lockout ends.
         until: OffsetDateTime,
+        /// Whether **this attempt** is what applied the lock, as opposed to finding one that was
+        /// already in force.
+        ///
+        /// The two are different facts and only one of them is an event. "An account was locked"
+        /// belongs in a telemetry row the attacker can generate at will — every guess against an
+        /// already-locked account would emit it. "An account just crossed the threshold" is a
+        /// fact about the account, and it is what an operator subscribing to it wants to know.
+        /// Collapsing the two is how a lockout event becomes a volume metric of an attacker's
+        /// patience instead of a record of the account it caught.
+        newly_locked: bool,
+        /// The account that was locked. Not decoration either: the caller refuses an
+        /// anonymous request, so without the id the event could name nothing but a threshold
+        /// and an operator subscribing to it would learn that *somebody* was locked.
+        user_id: Uuid,
+        /// The account's organization, so an emitter can attribute the event.
+        ///
+        /// This is not decoration. `store::enqueue_fanout` returns **zero** deliveries for an
+        /// event with no organization — endpoints belong to organizations, and matching one
+        /// against a fact that belongs to no tenant would leak. So an emitter that omitted it
+        /// would write a row that exists, would appear in `/events` as a real record, and would
+        /// reach **nobody**: the one shape of emitter this field is here to prevent.
+        organization_id: Option<Uuid>,
+        /// The threshold that was in force, which is the number the lock was applied against.
+        attempts: i32,
     },
     /// The address is refused before any password check.
     IpBlocked {
@@ -206,8 +231,23 @@ pub async fn sign_in(
         Some(account) => policy_for(pool, account.organization_id()).await?,
         None => None,
     };
-    let lockout_attempts = policy.as_ref().map_or(10, |policy| policy.lockout_attempts);
-    let lockout_minutes = policy.as_ref().map_or(15, |policy| policy.lockout_minutes);
+    // **The lockout thresholds now come from the sign-in-protection document**, not from the
+    // IAM policy's own two columns. That is the whole point of `omnion_security::enforce`:
+    // `/security/sign-in-protection` writes `security_settings.lockout`, and until this line
+    // nothing on the request path read it — the number an operator tuned there was the number
+    // the screen showed and not the number that locked accounts.
+    //
+    // `resolve` already falls back to the IAM columns and then to the baseline, so a platform
+    // that never opened that screen keeps enforcing the numbers it was promised. The legacy
+    // read stays for the OTHER fields the IAM document owns (session lifetimes, device trust,
+    // the IP lists), which is why both are still read rather than one replacing the other.
+    //
+    // The `?` is `From<SecurityError> for IdentityError`, whose mapping is deliberate: a
+    // database failure stays a database failure rather than becoming an operator-facing "your
+    // policy is invalid" at the moment the database is unreachable.
+    let lockout = resolve_lockout(pool, account.as_ref().and_then(|account| account.organization_id())).await?;
+    let lockout_attempts = lockout.attempts;
+    let lockout_minutes = lockout.lockout_minutes;
     // The ADDRESS threshold is deliberately larger than the ACCOUNT one. Sharing the number is
     // what made the account lockout unreachable: the address rule fired on the same attempt
     // that would have incremented the counter, so the counter never moved. See
@@ -300,14 +340,21 @@ pub async fn sign_in(
                 },
             )
             .await?;
-            return Ok(SignInOutcome::AccountLocked { until });
+            // `newly_locked: false` — this attempt FOUND the lock, it did not apply it. The
+            // distinction is the whole reason the field exists: see `SignInOutcome`.
+            return Ok(SignInOutcome::AccountLocked {
+                until,
+                newly_locked: false,
+                user_id: account.user.id,
+                organization_id: account.organization_id(),
+                attempts: lockout_attempts,
+            });
         }
     }
 
     // 4. The password.
     if !verify_password(password.to_owned(), account.password_hash.clone()).await? {
-        let (failed_count, locked_until) =
-            register_failure(pool, account.user.id, lockout_attempts, lockout_minutes).await?;
+        let (failed_count, locked_until) = register_failure(pool, account.user.id, lockout).await?;
         let locked = locked_until.is_some_and(|until| until > OffsetDateTime::now_utc());
         record_attempt(
             pool,
@@ -324,7 +371,20 @@ pub async fn sign_in(
         .await?;
 
         return Ok(match locked_until {
-            Some(until) if locked => SignInOutcome::AccountLocked { until },
+            // `locked_until.is_some_and(live)` is "this attempt set it". A `locked_until` that
+            // is `None` here means the threshold was not reached, and a `locked_until` in the
+            // past means `register_failure`'s CASE left an expired value alone — neither is a
+            // lock, and both answer `InvalidCredentials`. `locked_until.is_some_and(until >
+            // now())` is deliberately NOT used for the outcome: it is true of an account that was
+            // ALREADY locked, which would make a correct password after an expired window report
+            // a lockout it did not cause.
+            Some(until) if locked => SignInOutcome::AccountLocked {
+                until,
+                newly_locked: true,
+                user_id: account.user.id,
+                organization_id: account.organization_id(),
+                attempts: lockout_attempts,
+            },
             _ => SignInOutcome::InvalidCredentials,
         });
     }
@@ -529,26 +589,51 @@ pub async fn peek_challenge(pool: &PgPool, token: &str, purpose: &str) -> Result
 }
 
 /// Increment the failure counter and lock the account when the threshold is reached.
+///
+/// **The threshold comes from the lockout document the operator edits**, resolved by
+/// `omnion_security::enforce::resolve` — not from the two integers this function used to be
+/// handed. Those came from `security_policies.lockout_attempts` (a different table, from
+/// `0011_iam_advanced.sql`), while `/security/sign-in-protection` edits
+/// `security_settings.lockout`. Two documents, one policy, and only one of them on the request
+/// path: an operator who tuned the threshold to three kept getting ten.
+///
+/// **The count that decides the lock comes from the log, not from `users.failed_sign_in_count`.**
+/// The column is a monotonic counter with no timestamps, so it cannot honour a failure *window*
+/// — and the window is the field an operator could vary most freely (60 seconds to a day). An
+/// account that failed five times last month had those failures counted forever, so raising the
+/// threshold back to five locked that account on its very next typo. `sign_in_attempts` keeps the
+/// timestamps, so the log is what decides; the column is kept in step for the panel and for the
+/// lockout list, which render it.
+///
+/// The two numbers can legitimately disagree by one: this function is called *before*
+/// `record_attempt` writes the row for the attempt being judged, so the log read here excludes
+/// it. `failures_now + 1` is therefore the count *including* the current guess, which is what
+/// the threshold compares against. Getting that off-by-one wrong would lock one attempt late.
 async fn register_failure(
     pool: &PgPool,
     user_id: Uuid,
-    lockout_attempts: i32,
-    lockout_minutes: i32,
+    lockout: EnforcedLockout,
 ) -> Result<(i32, Option<OffsetDateTime>)> {
+    let failures_now = lockout.failures_in_window(pool, user_id).await? as i32;
+    // The current guess is not in the log yet, so the count that *includes* it is one higher —
+    // and that is the number the threshold compares against. Getting this off-by-one wrong
+    // would lock one attempt late, which is one guess too many for the attacker.
+    let failures_including_this_one = failures_now + 1;
     let (count, locked_until): (i32, Option<OffsetDateTime>) = sqlx::query_as(
         "update users set \
-            failed_sign_in_count = failed_sign_in_count + 1, \
+            failed_sign_in_count = $2, \
             locked_until = case \
-                when failed_sign_in_count + 1 >= $2 \
-                then now() + make_interval(mins => $3) \
+                when $2 >= $3 \
+                then now() + make_interval(mins => $4) \
                 else locked_until \
             end \
          where id = $1 \
          returning failed_sign_in_count, locked_until",
     )
     .bind(user_id)
-    .bind(lockout_attempts)
-    .bind(lockout_minutes)
+    .bind(failures_including_this_one)
+    .bind(lockout.attempts)
+    .bind(lockout.lockout_minutes)
     .fetch_one(pool)
     .await?;
     Ok((count, locked_until))
