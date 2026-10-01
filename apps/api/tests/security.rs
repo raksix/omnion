@@ -67,6 +67,23 @@ struct Harness {
 impl Harness {
     /// Open a fresh database with every migration applied and the IAM seed loaded.
     async fn fresh() -> Option<Self> {
+        // `oneshot` carries no `ConnectInfo`, so a request through this harness has no peer
+        // address — and the IP access layer refuses an address-less request with `ip_unknown`
+        // while any rule is in force. That refusal is **correct** and is asserted deliberately by
+        // `a_denied_network_cannot_reach_the_api`; it is simply not what the other walks are
+        // measuring, so they would all be refused before reaching the guard they test.
+        //
+        // Set here, once, rather than in each walk: a suite that only passes when an operator
+        // remembers an environment variable is a suite that silently stops testing. The flag is
+        // off in every deployed configuration and `security_ip` logs it at boot when it is on.
+        //
+        // It is set inside the test process only — `std::env::set_var` is unsafe in a multi
+        // threaded program, so the harness does it once before the router exists and the walks
+        // are `--test-threads=1` throughout this file.
+        unsafe {
+            std::env::set_var("OMNION_IP_ACCESS_ALLOW_UNADDRESSED", "1");
+        }
+
         let mut config = Config::from_env().expect("environment must be valid");
         // The CSRF secret, for the same reason `tests/events.rs` sets one: a cookie write with
         // no double-submit token is refused `403 csrf_failed` before the permission layer is
@@ -436,6 +453,20 @@ const SURFACE: &[(&str, Method, &str, &str)] = &[
     ),
     (
         "/api/v1/security/sign-in-protection/probe",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    // Security events (REQ-012 slice 4). The export is `read` too, deliberately: it changes
+    // nothing, and an operator whose role is to audit must be able to take the trail with them.
+    (
+        "/api/v1/security/events",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/events.csv",
         Method::GET,
         "security.read",
         "read",
@@ -1170,7 +1201,290 @@ async fn a_denied_network_cannot_reach_the_api() {
     harness.dispose().await;
 }
 
-/// A malformed CIDR is refused with a message that names the field's input, for both families.
+/// The security-event timeline shows BOTH real sources, and the walk that would have caught
+/// the audit-only projection (REQ-012, slice 4).
+///
+/// **What this is for.** The REQ words the screen as "a security-event table **from the audit
+/// trail**", and a route built over `audit_log` alone answers `200` with an empty table on a
+/// platform where every one of its own requirements is met — the empty table looks like a
+/// working filter. Sign-ins live in `sign_in_attempts`, which no amount of auditing produces
+/// rows in, because a failed sign-in happens before there is a session and therefore before
+/// there is an actor to write an audit entry for.
+///
+/// So this walk seeds **one row in each of the two tables** and asserts both come back, and then
+/// asserts the *filters* keep working across the seam — a category that matches on the audit side
+/// and nothing on the sign-in side is exactly the defect this screen is built to avoid, and it is
+/// only visible if both halves are checked.
+#[tokio::test]
+async fn the_timeline_merges_the_audit_trail_and_the_sign_in_log() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "Events").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        operator_id,
+        organization,
+        &["security.read", "security.manage"],
+    )
+    .await;
+
+    // One audit row, written through the API's own route so the action name is a real one rather
+    // than a string the test invented.
+    //
+    // The policy store refuses a CSP that is not a policy: `default-src` is what every other
+    // source list is measured against, and one of `script-src` / `script-src-elem` is required
+    // because without it scripts are unconstrained. Both refusals happened here first — the walk
+    // was seeding a row that the product correctly declined to write, and reading that as "the
+    // save worked" would have been the same mistake in a new place.
+    let header = harness
+        .call(put(
+            "/api/v1/security/headers",
+            json!({
+                "csp_mode": "enforce",
+                "csp": [
+                    { "directive": "default-src", "values": ["'self'"] },
+                    { "directive": "script-src", "values": ["'self'"] },
+                ],
+            }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        header.status,
+        StatusCode::OK,
+        "the header save must land an audit row to project: {}",
+        header.text
+    );
+
+    // One sign-in row, written the way the platform writes it: a wrong password against a real
+    // account. This is the row an audit-only projection cannot see.
+    let victim = format!("events-victim-{}@omnion.test", Uuid::new_v4().simple());
+    sqlx::query(
+        "insert into sign_in_attempts (email, organization_id, ip_address, user_agent, outcome) \
+         values ($1, $2, '198.51.100.9', 'Mozilla/5.0 (Windows NT 10.0)', 'failed')",
+    )
+    .bind(&victim)
+    .bind(organization)
+    .execute(harness.db.pool())
+    .await
+    .expect("the sign-in attempt must be recorded");
+
+    let page = harness
+        .call(get("/api/v1/security/events", Some(&operator)))
+        .await;
+    assert_eq!(
+        page.status,
+        StatusCode::OK,
+        "the timeline must answer: {}",
+        page.text
+    );
+
+    let events = page.body["events"].as_array().expect("events is an array");
+    let sources: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["source"].as_str())
+        .collect();
+
+    assert!(
+        sources.contains(&"audit"),
+        "the audit row is missing from the timeline: {}",
+        page.text
+    );
+    assert!(
+        sources.contains(&"sign_in"),
+        "THE BUG THIS WALK EXISTS FOR: the failed sign-in does not appear. The screen would \
+         render an empty sign-in list on a platform where nothing is wrong. events={:?}",
+        events
+            .iter()
+            .map(|event| event["action"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+
+    // The counters agree with the rows, so "50 of 312" is a true sentence.
+    assert!(page.body["total"].as_i64().unwrap_or(0) >= 2);
+    assert!(page.body["audit_count"].as_i64().unwrap_or(0) >= 1);
+    assert!(page.body["sign_in_count"].as_i64().unwrap_or(0) >= 1);
+
+    // A sign-in row has NO actor, and that absence is a fact rather than a rendering fault:
+    // nobody was authenticated. The address is the identity the operator hunts with.
+    let sign_in_row = events
+        .iter()
+        .find(|event| event["source"] == "sign_in")
+        .expect("the sign-in row is present");
+    assert!(
+        sign_in_row["actor"].is_null(),
+        "a failed sign-in has no actor: {}",
+        sign_in_row
+    );
+    // `ip_address::text` on an `inet` column keeps the prefix, so a single address reads as
+    // `/32`. That is Postgres's own canonical text and is what an operator copying the value
+    // out of the screen gets — asserting the bare address would force the query to strip a
+    // prefix the column is supposed to carry.
+    assert_eq!(sign_in_row["client_ip"], "198.51.100.9/32");
+    assert_eq!(
+        sign_in_row["refused"], true,
+        "a wrong password is a refusal. PAYLOAD: {sign_in_row}"
+    );
+
+    // The id carries its source, because both tables have an identity column starting at 1 and
+    // an identity without it would drop one of two real rows as a duplicate.
+    for event in events {
+        let id = event["id"].as_str().expect("every row has an id");
+        assert!(
+            id.starts_with("audit:") || id.starts_with("sign_in:"),
+            "{id} does not name its source"
+        );
+    }
+
+    // -- the filters, across the seam -----------------------------------------------------------------
+    //
+    // Each of these is a claim that a filter on the audit vocabulary cannot silently ignore the
+    // sign-in vocabulary. A category returning rows from one side only is the exact defect.
+
+    let sign_ins_only = harness
+        .call(get(
+            "/api/v1/security/events?category=sign_in",
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        sign_ins_only.status,
+        StatusCode::OK,
+        "category=sign_in must be answerable. BODY: {}",
+        sign_ins_only.text
+    );
+    let sign_in_events = sign_ins_only.body["events"]
+        .as_array()
+        .expect("events is an array");
+    assert!(
+        sign_in_events
+            .iter()
+            .any(|event| event["source"] == "sign_in" && event["action"] == "failed"),
+        "category=sign_in must find the failed attempt: {}",
+        sign_ins_only.text
+    );
+
+    let audit_only = harness
+        .call(get(
+            "/api/v1/security/events?category=settings_change",
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(audit_only.status, StatusCode::OK);
+    let audit_events = audit_only.body["events"]
+        .as_array()
+        .expect("events is an array");
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event["action"] == "security.headers.updated"),
+        "category=settings_change must find the header save: {}",
+        audit_only.text
+    );
+    // The two halves do not bleed into each other.
+    assert!(
+        !audit_events
+            .iter()
+            .any(|event| event["source"] == "sign_in"),
+        "a settings change cannot be a sign-in attempt: {}",
+        audit_only.text
+    );
+
+    // The source filter decides before any query runs.
+    let sign_in_source = harness
+        .call(get("/api/v1/security/events?source=sign_in", Some(&operator)))
+        .await;
+    assert!(
+        sign_in_source.body["events"]
+            .as_array()
+            .expect("events is an array")
+            .iter()
+            .all(|event| event["source"] == "sign_in"),
+        "source=sign_in must not return audit rows: {}",
+        sign_in_source.text
+    );
+
+    // An unknown filter value is refused **by name**, never silently dropped into "no filter" —
+    // an unparsed category shows the operator an unfiltered list they read as a filtered one.
+    let unknown = harness
+        .call(get(
+            "/api/v1/security/events?category=denials",
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        unknown.status,
+        StatusCode::BAD_REQUEST,
+        "an unknown category must be refused: {}",
+        unknown.text
+    );
+    assert_eq!(unknown.body["error"]["code"], "invalid_security_input");
+
+    // -- the export -------------------------------------------------------------------------------
+    //
+    // It is the **whole** filter, not the page: an operator who filters and exports 50 of 300 has
+    // produced a document that reads as a complete list and is not one.
+    let export = harness
+        .call(get("/api/v1/security/events.csv?limit=1", Some(&operator)))
+        .await;
+    assert_eq!(
+        export.status,
+        StatusCode::OK,
+        "the export must answer: {}",
+        export.text
+    );
+    let header_line = export.text.lines().next().unwrap_or_default();
+    for column in ["occurred_at", "category", "action", "outcome", "client_ip"] {
+        assert!(
+            header_line.contains(column),
+            "the export header is missing {column}: {header_line}"
+        );
+    }
+    let exported_rows = export.text.lines().count().saturating_sub(1);
+    assert!(
+        exported_rows >= 2,
+        "limit=1 must NOT page the export — it carries the whole filter. rows={exported_rows}: {}",
+        export.text
+    );
+    assert!(
+        export.text.contains("sign_in"),
+        "the export must carry both sources: {}",
+        export.text
+    );
+
+    // A credential in the audit metadata must not reach the file. A settings change writes the
+    // policy it changed into its metadata, and this file is the thing an operator emails.
+    //
+    // Checked as a **key** in the digest column rather than as a substring of the whole file:
+    // the first version of this assertion was `!export.text.contains("password")`, which is red
+    // on every correct export, because the sign-in outcome renders as the prose "wrong password
+    // or unknown account". Prose that describes an attack is not a credential, and a test that
+    // cannot distinguish the two trains an operator to distrust the export.
+    //
+    // The digest is the only column that carries key *names*, and the shape a leaked one takes is
+    // `secret=<value>` — a bare `=` after a credential-shaped key.
+    for leak in ["secret=", "password=", "token=", "authorization=", "credential="] {
+        assert!(
+            !export.text.contains(leak),
+            "the audit metadata leaked {leak} into the export: {}",
+            export.text
+        );
+    }
+    // The digest that *is* present proves the column works rather than being blank. It renders as
+    // `key=shape` pairs sorted and capped, so the assertion matches the first pair rather than
+    // the whole digest — `csp_mode=set, directive_count=2`, not `csp_mode=set` on its own.
+    assert!(
+        export.text.contains("csp_mode=set"),
+        "the header save's digest should be present. DIGEST FORMAT: {}",
+        export.text
+    );
+
+    harness.dispose().await;
+}
 #[tokio::test]
 async fn a_malformed_cidr_is_refused_with_a_field_level_message() {
     let Some(harness) = Harness::fresh().await else {
