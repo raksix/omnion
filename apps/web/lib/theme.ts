@@ -80,6 +80,44 @@ export function knownThemeKeys(): string[] {
 }
 
 /**
+ * Resolve a key to a theme, and report a key that resolved to nothing.
+ *
+ * `resolveTheme` is the same resolution with the answer only, for the callers that genuinely do
+ * not care — a preview asking "which theme is `x`" and a fallback. This is the pair the
+ * renderer actually uses, because a key that is silently replaced by the default is invisible by
+ * construction: the visitor gets a complete page either way, which is the point, and the
+ * operator who activated a theme nobody ships is left guessing why their site looks like
+ * Minimal.
+ *
+ * The warning is emitted ONCE per key per process, not once per request. A key is a property of
+ * the installation, so a per-request warning turns one mistake into a log flood that buries
+ * everything around it, and "this is noisy" is how an operator learns to ignore the one line
+ * that would have told them their theme key was wrong.
+ */
+const warnedFallbacks = new Set<string>();
+
+export function resolveThemeOrWarn(
+  key: string | undefined,
+  context: string,
+): SiteTheme {
+  const wanted = key?.trim().toLowerCase();
+  const resolved = wanted ? (ALIASES[wanted] ?? wanted) : "";
+  if (wanted && !registry[resolved]) {
+    if (!warnedFallbacks.has(wanted)) {
+      warnedFallbacks.add(wanted);
+      console.warn(
+        `[omnion-web] theme ${JSON.stringify(wanted)} is not one this build ships, so ${context} ` +
+          `falls back to ${DEFAULT_THEME_KEY}. Known keys: ${Object.keys(registry).join(", ")}. ` +
+          "An alias, a typo or a theme that was removed explains it; the visitor still sees a " +
+          "complete page either way.",
+      );
+    }
+    return minimalTheme;
+  }
+  return resolveTheme(key);
+}
+
+/**
  * Resolve the active theme of a site; an unknown key falls back to the default instead of
  * failing a request.
  *

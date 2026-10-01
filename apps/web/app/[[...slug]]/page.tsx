@@ -4,7 +4,8 @@ import { notFound } from "next/navigation";
 
 import { getPublishedPage, viewportForRequest } from "@/lib/api";
 import { metadataFor } from "@/lib/metadata";
-import { resolveTheme } from "@/lib/theme";
+import { resolveThemeOrWarn } from "@/lib/theme";
+import { SITE_HINT_HEADER } from "@/proxy";
 
 /**
  * The public renderer.
@@ -76,13 +77,19 @@ export async function generateMetadata({ params, searchParams }: RouteParams & R
 
 export default async function Page({ params, searchParams }: RouteParams & RouteSearch) {
   const slug = slugOf((await params).slug);
+  const incoming = await headers();
   const viewport = await viewportOf();
-  const content = slug ? await getPublishedPage(slug, viewport, await siteHintOf(searchParams)) : null;
+  // The `?site=` is read from the header `proxy.ts` forwarded it as, so the page and the
+  // layout above it resolve the same site from the same source. They used to read it from two
+  // different places — the layout from the installation default, the page from the query — and
+  // could therefore draw a page in one site's theme under another site's name.
+  const siteHint = incoming.get(SITE_HINT_HEADER) ?? undefined;
+  const content = slug ? await getPublishedPage(slug, viewport, siteHint) : null;
   if (!content) {
     notFound();
   }
 
-  const theme = resolveTheme(content.site.theme);
+  const theme = resolveThemeOrWarn(content.site.theme, "this page");
   const PageLayout = theme.PageLayout;
 
   return <PageLayout content={content} />;

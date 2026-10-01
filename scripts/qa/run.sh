@@ -105,6 +105,17 @@ if [ "${QA_SLOTS:-1}" != "0" ]; then
   # test has to catch by asserting direction rather than by snapshotting the output.
   step "testing the disk guard's tmpfs reading"
   bash "$(dirname "${BASH_SOURCE[0]}")/test-disk-guard-shm.sh" || echo "[qa] disk-guard tmpfs test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The renderer's document/page theme agreement, for the same reason.
+  #
+  # All ten bundled stylesheets ship in ONE bundle and every element rule in them is scoped to
+  # `html[data-theme="<key>"]`, so that one attribute decides whether a theme paints anything.
+  # It used to be written from the installation default rather than the addressed site's theme,
+  # which made every non-default site render as a colour-swapped copy of Minimal — a complete,
+  # valid, entirely wrong page that no request failed and no log line mentioned. That is the most
+  # expensive class of defect this harness can miss: the page is present, so every screen- and
+  # request-level check passes while the site shows the wrong design.
+  step "testing the renderer's per-site theme resolution"
+  node "$(dirname "${BASH_SOURCE[0]}")/probe-site-theme.cjs" || echo "[qa] site-theme probe reported failures (continuing: a broken test is not a reason to skip a pass)"
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
   # QA_SLOT_OWNER_PID is THIS shell's pid, so the slot can tell a place whose pass is still alive
   # from one whose pass was killed without running its EXIT trap. Without it the holder is the

@@ -44,7 +44,7 @@ export async function getPublishedPage(
   viewport: Viewport = "desktop",
   siteHint?: string | string[],
 ): Promise<PublishedPage | null> {
-  const site = normalizeSiteHint(siteHint) || configuredSite || (await visitorHost());
+  const site = await resolveSiteHint(siteHint);
   const query = new URLSearchParams();
   if (site) {
     query.set("site", site);
@@ -123,6 +123,54 @@ async function visitorHost(): Promise<string | null> {
   }
   return host;
 }
+
+/**
+ * Which site this request is about, resolved the ONE way.
+ *
+ * `?site=` (bounded by `normalizeSiteHint`) first, then `OMNION_SITE`, then the visitor's own
+ * host — the order `docs`-level contract in `public.rs` documents on the other end of the wire.
+ *
+ * It exists as a named function because TWO callers have to agree on it: the page that draws a
+ * slug and the layout that announces the theme. When the layout resolved the site on its own,
+ * a `?site=other` link and the page it renders disagreed about which site was being drawn, and
+ * the disagreement was invisible — the page was drawn in one site's theme under another site's
+ * name. One function, two callers, no second answer.
+ */
+async function resolveSiteHint(siteHint: string | string[] | undefined): Promise<string | null> {
+  return normalizeSiteHint(siteHint) || configuredSite || (await visitorHost());
+}
+
+/**
+ * The theme the addressed site is published with, or `null` when the request names no site.
+ *
+ * `null` is not an error and not "use the default": it is the honest answer for a request the
+ * renderer cannot attribute to a site (a loopback address with no `?site=`), and the caller
+ * falls back to the installation-wide theme exactly as `resolveTheme()` does with no argument.
+ *
+ * It reads the same endpoint the page does rather than a second one, so the theme on `<html>`
+ * and the theme the page is drawn with are the same fact fetched once — two requests for one
+ * fact is how the two halves of a page start disagreeing.
+ */
+export async function getSiteTheme(siteHint?: string | string[]): Promise<string | null> {
+  const site = await resolveSiteHint(siteHint);
+  const suffix = site ? `?${new URLSearchParams({ site }).toString()}` : "";
+  const response = await fetch(
+    `${apiOrigin}/api/v1/public/pages/${encodeURIComponent(HOME_SLUG_FOR_THEME)}${suffix}`,
+    { cache: "no-store", headers: { accept: "application/json" } },
+  ).catch(() => null);
+  // A `404` is a real answer — the site exists but publishes no home page yet, and its theme is
+  // still worth knowing. A failed request is not an answer at all, and must not be reported as
+  // one: `null` here reaches the caller's documented fallback.
+  if (!response || !response.ok) {
+    return null;
+  }
+  const payload = (await response.json().catch(() => null)) as { site?: { theme?: string } } | null;
+  const theme = payload?.site?.theme;
+  return typeof theme === "string" && theme.trim() ? theme : null;
+}
+
+/** Address the theme reader asks for; the theme is the site's, so the page itself does not matter. */
+const HOME_SLUG_FOR_THEME = "home";
 
 /**
  * The `?site=` the visitor put on the page's own URL, or `null` when they put nothing usable.
