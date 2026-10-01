@@ -182,6 +182,27 @@ pub const CATALOGUE: &[PermissionDef] = &[
     // power to change what a model will be permitted to do — the switch that un-gates
     // `deployment.deploy` or raises a timeout. `ai.tools.manage` is therefore the key an
     // installation reviews when it asks "who can widen what the agents may touch".
+    // Local endpoints (REQ-106 slice 1). Two keys and one sharp edge: `ai.local.read` shows
+    // which providers are local, how they were classified and what they serve — the same
+    // knowledge as the provider list, and the badge a screen needs to answer "does anything leave
+    // this machine?". `ai.local.manage` is the power to *point the platform's AI at a host on an
+    // operator's own network*, which changes where a tenant's prompts physically go; that is a
+    // different act from reading, so it is a different key.
+    //
+    // `ai.airgap.manage` (slice 2) is deliberately NOT a third name in this family: turning the
+    // air gap on strands every remote feature at once, and it is the switch an auditor looks for
+    // by name. It is added with that slice rather than declared empty here, because a catalogue
+    // entry with no route behind it is a promise the platform cannot keep.
+    PermissionDef {
+        key: "ai.local.read",
+        category: "ai",
+        description: "Read local AI endpoints, their locality and the models they serve",
+    },
+    PermissionDef {
+        key: "ai.local.manage",
+        category: "ai",
+        description: "Register local AI endpoints and manage the models they serve",
+    },
     PermissionDef {
         key: "ai.tools.read",
         category: "ai",
