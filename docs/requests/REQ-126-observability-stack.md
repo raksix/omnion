@@ -1,6 +1,6 @@
 # REQ-126 — Observability Stack
 
-> **Status:** in-progress (seven of seven screens now exist; the Rust and web gates are green, and the browser pass is red for a box reason rather than a product one — ten writer worktrees on six cores) · **Captured:** 2026-09-26 · **Layer:** infra
+> **Status:** in-progress (sixth close-gate tick. **Code-complete and Rust-green; the remaining gate is one browser pass that has not yet finished, and three separate reasons for that turned out to be defects in the measurement rather than the box.** The permissions suite logged for two ticks as "aborts mid-run" was pointed at the MAIN WRITER's database — `OMNION_DATABASE_URL` unset, so `Config::from_env()` fell back to `DEFAULT_DATABASE_URL`, whose database is named `omnion`, carrying `19 = "cms blocks"` against this tree's `0019_secret_hierarchy`; the tell was four walks failing in 0.26 s, and it is **4/4 in 13.86 s** against `omnion_w6_dev` with no code change. `walkthrough.cjs` **could not be loaded at all** — `module.exports` names `DEPLOYMENT_SCREENS` and is evaluated at load time while the `const` sat 570 lines below in TDZ (`55c420bd`). And a depth pass was handed a promise instead of a thunk, so its `try/catch` guarded nothing and the run died after 380 screenshots with no summary (`c1c7fcd6`). All seven screens, all bindings and all routes exist; **NOT measured:** a completed pass over the seven screens) · **Captured:** 2026-09-26 · **Layer:** infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
