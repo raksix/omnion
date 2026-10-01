@@ -49,8 +49,8 @@ use omnion_api::state::AppState;
 use omnion_core::config::{Config, CsrfSecret, DatabaseConfig};
 // `RatePolicy` lives in the security crate, not in `omnion_api` — importing it from the
 // middleware module is a private-import error, which cost one build round.
-use omnion_security::RatePolicy;
 use omnion_core::{BuildInfo, Db, RedisClient};
+use omnion_security::RatePolicy;
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::sync::{Arc, Mutex};
@@ -232,10 +232,12 @@ impl Harness {
     async fn dispose(self) {
         self.db.pool().close().await;
         let database = self.database;
-        sqlx::query(&format!("drop database if exists \"{database}\" with (force)"))
-            .execute(self.maintenance.pool())
-            .await
-            .expect("the temporary database must be removed");
+        sqlx::query(&format!(
+            "drop database if exists \"{database}\" with (force)"
+        ))
+        .execute(self.maintenance.pool())
+        .await
+        .expect("the temporary database must be removed");
     }
 }
 
@@ -362,7 +364,10 @@ async fn recording_provider() -> (String, Received, tokio::task::JoinHandle<()>)
     let address = listener.local_addr().expect("the stub has an address");
 
     let app = Router::new()
-        .route("/v1/models", route_get(|| async { Json(json!({ "data": [] })) }))
+        .route(
+            "/v1/models",
+            route_get(|| async { Json(json!({ "data": [] })) }),
+        )
         .route(
             "/v1/chat/completions",
             route_post(move |body: String| {
@@ -575,11 +580,7 @@ async fn connected(harness: &Harness, base_url: &str) -> Fixture {
 /// but it is set here too so the refusal does not depend on the migration's exact wording —
 /// a fixture whose block case breaks when somebody renames a default fails for the wrong
 /// reason.
-async fn mask_email_and_block_card(
-    harness: &Harness,
-    session: &Session,
-    owner: &Session,
-) {
+async fn mask_email_and_block_card(harness: &Harness, session: &Session, owner: &Session) {
     let (status, body) = harness
         .call_json(put(
             "/api/v1/ai/guard/policy",
@@ -603,18 +604,31 @@ async fn mask_email_and_block_card(
         "the policy must read back as saved: {body}"
     );
 
-    // The installer's own view is the **platform** policy, which a tenant save must not touch:
-    // the bootstrap owner has no organization, so its map is the seeded default and its
-    // `all_permissive` predicate is true. Asserted because this guard's coverage depends on
-    // tenancy rather than on the code, and every walk below makes a *member's* call — this
-    // proves they are not reading the installer's map by accident.
+    // The installer is **inside** the tenant by the time this runs, so its view is the tenant's own.
+    //
+    // `create_organization` deliberately calls `users::set_user_organization(actor, org)`
+    // (`crates/onboarding/src/steps.rs`), because `scope::resolve_organization` answers every
+    // org-scoped route from `users.organization_id` and the wizard's actor would otherwise hold a
+    // NULL and be refused with `organization_required` on every screen.
+    //
+    // An earlier version of this line asserted the installer still read a *permissive platform*
+    // policy (`all_permissive == true`), which stopped being true the moment that call landed —
+    // it fails every walk in this file, not just one. The fact worth asserting now is the one the
+    // fixture exists for: **one tenant, one policy**, seen identically by both sessions. A store
+    // that scoped the policy by something other than the organization would show them
+    // disagreeing here.
     let (status, owner_view) = harness
         .call_json(get("/api/v1/ai/guard/policy", Some(owner)))
         .await;
     assert_eq!(status, StatusCode::OK, "{owner_view}");
     assert_eq!(
-        owner_view["all_permissive"], true,
-        "a tenant's policy must not change the platform view: {owner_view}"
+        owner_view["label_defaults"], body["label_defaults"],
+        "the installer and the member are in the same tenant, so they must read the same policy: \
+         owner={owner_view} member={body}"
+    );
+    assert_eq!(
+        owner_view["has_policy_row"], true,
+        "the tenant save must be readable by the installer's session too: {owner_view}"
     );
 }
 
@@ -887,6 +901,272 @@ async fn a_clean_payload_is_sent_unchanged_and_leaves_no_event_row() {
 /// earned. A tester that dialled would be an oracle over the tenant's rule set *and* a way to
 /// send whatever an operator pasted to a vendor — the two together are why "no provider call" is
 /// a criterion rather than a nicety.
+///
+/// Read straight out of the database rather than through an endpoint on purpose: this is the
+/// claim that the value never reaches storage, so the storage itself has to be what is inspected.
+/// An endpoint would only prove the endpoint redacts.
+async fn audit_rows(harness: &Harness, organization: &Uuid) -> Vec<Value> {
+    let rows: Vec<(String, Value)> = sqlx::query_as::<_, (String, Value)>(
+        "SELECT action, metadata FROM audit_log WHERE organization_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(organization)
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the audit rows must be readable");
+    rows.into_iter()
+        .map(|(action, metadata)| json!({ "action": action, "metadata": metadata }))
+        .collect()
+}
+
+/// The same stub, answering in **SSE framing** instead of a bare JSON body.
+///
+/// A separate function rather than a flag on [`echoing_provider`]: the difference is the whole
+/// point of the test, and a boolean at the call site would read as a formatting option when it is
+/// the wire contract. The client parses `data:` lines and treats anything else as no answer at
+/// all, so a stub that replies with plain JSON fails with "the provider streamed no answer and no
+/// finish reason" — which is a fault of the stub and reads exactly like a product fault.
+async fn streaming_echoing_provider() -> (String, Received, tokio::task::JoinHandle<()>) {
+    let received: Received = Arc::new(Mutex::new(Vec::new()));
+
+    let recorder = Arc::clone(&received);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the stub must bind a port");
+    let address = listener.local_addr().expect("the stub has an address");
+
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            route_get(|| async { Json(json!({ "data": [] })) }),
+        )
+        .route(
+            "/v1/chat/completions",
+            route_post(move |body: String| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    recorder.lock().expect("recorder").push(body.clone());
+                    let echoed = serde_json::from_str::<Value>(&body)
+                        .ok()
+                        .and_then(|parsed| {
+                            parsed["messages"].as_array().and_then(|messages| {
+                                messages
+                                    .iter()
+                                    .rev()
+                                    .find(|message| message["role"] == "user")
+                                    .and_then(|message| {
+                                        message["content"].as_str().map(String::from)
+                                    })
+                            })
+                        })
+                        .unwrap_or_default();
+
+                    let frame = json!({
+                        "choices": [{ "delta": { "content": echoed }, "finish_reason": "stop" }],
+                        "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
+                    })
+                    .to_string();
+                    let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        body,
+                    )
+                }
+            }),
+        );
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}/v1"), received, task)
+}
+
+/// The `done` frame of a chat stream, read out of the SSE body.
+fn done_frame(body: &str) -> Value {
+    body.split("\n\n")
+        .filter(|frame| frame.contains("event: done"))
+        .filter_map(|frame| {
+            frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .and_then(|data| serde_json::from_str::<Value>(data).ok())
+        })
+        .next()
+        .unwrap_or_else(|| panic!("the stream carried no done frame: {body}"))
+}
+
+/// Every `delta` payload of a chat stream, in order.
+fn delta_frames(body: &str) -> Vec<String> {
+    body.split("\n\n")
+        .filter(|frame| frame.contains("event: delta"))
+        .filter_map(|frame| {
+            frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                .and_then(|payload| payload["content"].as_str().map(String::from))
+        })
+        .collect()
+}
+
+/// The answer is re-mapped on completion: the requester gets the original, the audit does not.
+///
+/// Both halves are read off the same request. The `done` frame is the requester's own view and
+/// must contain the address the user typed; the audit row is a second reader's view and must not.
+/// Asserting only the first would pass against a route that substituted everywhere — which is the
+/// leak this control exists to stop.
+#[tokio::test]
+async fn the_requester_reads_the_original_back_and_the_audit_row_does_not() {
+    let harness = guard!();
+    let (base_url, received, _stub) = streaming_echoing_provider().await;
+    let fixture = connected(&harness, &base_url).await;
+    mask_email_and_block_card(&harness, &fixture.member, &fixture.owner).await;
+
+    let chat = harness
+        .call(post(
+            "/api/v1/ai/chat",
+            chat_with(vec![user(&format!("Write to {ADDRESS} about the invoice"))]),
+            Some(&fixture.member),
+        ))
+        .await;
+    assert_eq!(chat.status, StatusCode::OK, "{}", chat.body);
+
+    // The provider saw the placeholder, so the echo carries it back — which is the precondition
+    // for the substitution proving anything.
+    let seen = calls(&received);
+    assert_eq!(seen.len(), 1, "one call must have been dialled: {seen:?}");
+    assert!(
+        seen[0].contains("[EMAIL_1]") && !seen[0].contains(ADDRESS),
+        "the provider must have seen the placeholder and not the address: {}",
+        seen[0]
+    );
+
+    let done = done_frame(&chat.body);
+    let answer = done["answer"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the done frame carried no answer: {done}"));
+    assert!(
+        answer.contains(ADDRESS),
+        "THE REQUESTER MUST SEE THE ORIGINAL BACK; the answer was: {answer}"
+    );
+    assert!(
+        !answer.contains("[EMAIL_1]"),
+        "the requester's own answer must carry no leftover token: {answer}"
+    );
+
+    // The audit row is written by the same request, so it is the second reader.
+    let audit = audit_rows(&harness, &fixture.organization).await;
+    let completed = audit
+        .iter()
+        .find(|row| row["action"] == "ai.chat.completed")
+        .unwrap_or_else(|| {
+            panic!(
+                "the completed chat wrote no audit row; rows were: {}",
+                serde_json::to_string_pretty(&audit).unwrap_or_default()
+            )
+        });
+    let recorded = completed["metadata"]["answer"].as_str().unwrap_or("");
+    assert!(
+        !recorded.contains(ADDRESS),
+        "THE AUDIT ROW MUST NOT CARRY THE ORIGINAL; it read: {recorded}"
+    );
+    assert!(
+        recorded.contains("[EMAIL_1]"),
+        "the audit row must carry the placeholder: {recorded}"
+    );
+
+    harness.dispose().await;
+}
+
+/// While streaming the deltas carry the placeholder; the finished message carries the original.
+///
+/// The criterion's two halves are asserted separately because they are two different claims: the
+/// first is about not leaking mid-stream, the second about the answer being coherent afterwards.
+#[tokio::test]
+async fn the_deltas_carry_the_placeholder_and_the_finished_answer_the_original() {
+    let harness = guard!();
+    let (base_url, _received, _stub) = streaming_echoing_provider().await;
+    let fixture = connected(&harness, &base_url).await;
+    mask_email_and_block_card(&harness, &fixture.member, &fixture.owner).await;
+
+    let chat = harness
+        .call(post(
+            "/api/v1/ai/chat",
+            chat_with(vec![user(&format!("Write to {ADDRESS} about the invoice"))]),
+            Some(&fixture.member),
+        ))
+        .await;
+    assert_eq!(chat.status, StatusCode::OK, "{}", chat.body);
+
+    let streamed: String = delta_frames(&chat.body).concat();
+    assert!(
+        streamed.contains("[EMAIL_1]"),
+        "the streamed deltas must carry the placeholder, since a delta already read cannot be \
+         recalled: {streamed}"
+    );
+    assert!(
+        !streamed.contains(ADDRESS),
+        "THE ADDRESS MUST NOT APPEAR MID-STREAM; the deltas read: {streamed}"
+    );
+
+    let answer = done_frame(&chat.body)["answer"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        answer.contains(ADDRESS),
+        "the completed message must carry the original: {answer}"
+    );
+
+    harness.dispose().await;
+}
+
+/// Two different addresses in two turns both become `[EMAIL_1]`, so the token is withheld.
+///
+/// This is the walk that caught the merge bug: a naive merge hands the reader one of the two
+/// values, and which one is a coin toss. The assertion is that **neither** address comes back —
+/// a wrong answer here is worse than a token left on screen, because it is plausible.
+#[tokio::test]
+async fn an_ambiguous_placeholder_is_withheld_rather_than_guessed() {
+    let harness = guard!();
+    let (base_url, _received, _stub) = streaming_echoing_provider().await;
+    let fixture = connected(&harness, &base_url).await;
+    mask_email_and_block_card(&harness, &fixture.member, &fixture.owner).await;
+
+    let chat = harness
+        .call(post(
+            "/api/v1/ai/chat",
+            chat_with(vec![
+                user(&format!("Write to {ADDRESS} about the invoice")),
+                assistant("Noted."),
+                user("Then write to grace@example.test about the receipt"),
+            ]),
+            Some(&fixture.member),
+        ))
+        .await;
+    assert_eq!(chat.status, StatusCode::OK, "{}", chat.body);
+
+    let done = done_frame(&chat.body);
+    let answer = done["answer"].as_str().unwrap_or_default();
+    assert!(
+        !answer.contains(ADDRESS) && !answer.contains("grace@example.test"),
+        "AN AMBIGUOUS TOKEN MUST PUT NEITHER ADDRESS BACK; the answer read: {answer}"
+    );
+    assert!(
+        answer.contains("[EMAIL_1]"),
+        "the token must stay visible rather than vanish: {answer}"
+    );
+    let withheld = done["guard_withheld"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        withheld,
+        vec![json!("[EMAIL_1]")],
+        "the withheld token must be reported so the screen can say so"
+    );
+
+    harness.dispose().await;
+}
+
 #[tokio::test]
 async fn the_tester_answers_a_verdict_without_dialling_the_provider() {
     let harness = guard!();
