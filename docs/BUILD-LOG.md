@@ -10753,8 +10753,29 @@ thing worth knowing before the next writer tries to "fix" it.
 | `cargo clippy -p omnion-api --all-targets` | clean on `deployment_run.rs`, `deployment_runner.rs`; the two remaining `omnion-deployment` warnings are slice 1's (`preflight.rs:341`, `version.rs:502`) and are not mine to change |
 | `tsc --noEmit` (admin) | clean |
 | `node --check scripts/qa/walkthrough.cjs` | clean, **+6 lines, 11800 → 11806** |
+| the four safety properties, against the **live** `omnion_qa_w5` database | all four hold — see below |
 | browser pass | **still owed, and this tick did not fix that** — see below |
 | `git status` | clean; both commits pushed to `wave5` |
+
+**The four properties, proved where unit tests cannot reach them.** A mock proves that
+`create_job` *asks* for the right thing; only a live database proves the constraint answers.
+Ten statements against `omnion_qa_w5`, each one expected to fail or succeed:
+
+| # | Property | Result |
+| --- | --- | --- |
+| 1 | a deploy on production starts, with its four steps in `plan_steps` order | inserted |
+| 2 | **a second active job on production is refused** | `ERROR: duplicate key … deployments_one_active_per_environment_idx` — this is the `409`, and it names the constraint `create_job` matches on |
+| 3 | the same insert on **staging** is allowed | inserted — the index is per-environment, not a global lock |
+| 4 | a step's output concatenates across two appends | `log=line one\nline two\n` — append-only, verified on the bytes |
+| 5 | a `succeeded` row **without** `finished_at` is refused | `ERROR: deployments_finished_rows_are_stamped` |
+| 6 | the same update **with** the stamp is accepted | `duration_ms=56`, computed from the row's own `started_at` |
+| 7 | a rollback **without** a reason is refused | `ERROR: deployments_rollback_needs_a_reason` |
+| 8 | the same rollback **with** a reason is accepted | inserted |
+
+Tests 5 and 6 are the pair worth keeping: the constraint refuses the shape a naive
+`mark_succeeded` would write, and accepts the shape this crate actually writes. A deploy that
+succeeded and recorded no duration is exactly the row that makes a history screen lie, and it is
+now impossible to write by accident.
 
 **The browser gate: what actually happened.** The tick-93 pass I went looking for is gone, and
 its `summary.json` says why — `fatal: page.goto: net::ERR_CONNECTION_REFUSED at
