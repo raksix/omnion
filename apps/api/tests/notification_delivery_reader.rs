@@ -244,10 +244,7 @@ impl omnion_notifications::delivery::Transport for RefusingTransport {
     > {
         let reason = self.reason.clone();
         Box::pin(async move {
-            omnion_notifications::delivery::TransportOutcome::Failed {
-                reason,
-                status: None,
-            }
+            omnion_notifications::delivery::TransportOutcome::failed(None, reason)
         })
     }
 }

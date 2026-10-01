@@ -70,10 +70,7 @@ impl Transport for AlwaysFails {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransportOutcome> + Send + 'a>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async {
-            TransportOutcome::Failed {
-                status: Some(500),
-                reason: "the receiving side refused the message".to_owned(),
-            }
+            TransportOutcome::failed(Some(500), "the receiving side refused the message")
         })
     }
 }
@@ -91,7 +88,7 @@ impl Transport for AlwaysAccepts {
         _job: &'a DeliveryJob,
         _config: &'a DeliveryConfig,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransportOutcome> + Send + 'a>> {
-        Box::pin(async { TransportOutcome::Accepted { status: None } })
+        Box::pin(async { TransportOutcome::accepted(None) })
     }
 }
 
@@ -360,8 +357,8 @@ async fn a_failing_channel_is_retried_and_then_marked_failed_after_the_cap() {
         "the e-mail row plus the always-queued in-app row"
     );
     assert_eq!(
-        report.skipped, 1,
-        "web_push is switched off for this reader"
+        report.skipped, 2,
+        "web_push is switched off for this reader, and `chat` has no transport at all"
     );
 
     // A disabled channel is written `skipped` with its reason on the row, not omitted. This is
@@ -590,7 +587,14 @@ async fn enqueueing_the_same_notification_twice_does_not_double_its_deliveries()
     let first = delivery::enqueue(&pool, notification_id, &["email".to_owned()], &[])
         .await
         .expect("the first enqueue must succeed");
-    assert_eq!(first.queued, 2, "e-mail plus the in-app row");
+    assert_eq!(
+        first.queued, 2,
+        "e-mail plus the in-app row; `chat` is written skipped and is counted separately"
+    );
+    assert_eq!(
+        first.skipped, 1,
+        "`chat` has no transport on this installation, so it is a skipped row — never pending"
+    );
 
     // The second call is what a re-run of the same emit looks like. Without the unique
     // constraint the drawer would list the same channel twice and the reader would get two
@@ -612,7 +616,10 @@ async fn enqueueing_the_same_notification_twice_does_not_double_its_deliveries()
     .fetch_one(&pool)
     .await
     .expect("the count must read");
-    assert_eq!(rows, 2, "one row per channel, and no more");
+    assert_eq!(
+        rows, 3,
+        "one row per channel and no more: e-mail, in_app, and the skipped `chat` row"
+    );
 
     harness.dispose().await;
 }
@@ -829,8 +836,9 @@ async fn the_outbox_reads_back_what_the_queue_wrote() {
     .expect("the outbox read must succeed");
     assert_eq!(
         rows.len(),
-        3,
-        "one row per channel the reader was asked about"
+        4,
+        "one row per channel in the vocabulary: the two asked about, the in-app row, and the \
+         skipped `chat` row"
     );
 
     let counts = push::outbox_counts(&pool, None)
@@ -839,10 +847,10 @@ async fn the_outbox_reads_back_what_the_queue_wrote() {
     assert_eq!(counts.sent, 1, "the in-app row went out");
     assert_eq!(counts.failed, 1, "the e-mail row reached its cap");
     assert_eq!(
-        counts.skipped, 1,
-        "web_push was switched off for this reader"
+        counts.skipped, 2,
+        "web_push was switched off for this reader, and `chat` has no transport"
     );
-    assert_eq!(counts.total(), 3);
+    assert_eq!(counts.total(), 4);
     assert_eq!(counts.pending, 0, "nothing is left queued");
 
     // Failed first is the ordering the outbox screen relies on during an incident.
@@ -951,11 +959,13 @@ async fn the_email_transport_refuses_a_reader_with_no_address_instead_of_pretend
         body: "Somebody asked for a review.".to_owned(),
         url: None,
         user_email: None,
+        webhook_endpoint: None,
+        push_targets: Vec::new(),
     };
 
     let transport = EmailTransport::new(&omnion_core::config::MailConfig::default());
     match transport.deliver(&job, &fast_config()).await {
-        TransportOutcome::Failed { reason, status } => {
+        TransportOutcome::Failed { reason, status, .. } => {
             assert!(status.is_none(), "there was no HTTP status to report");
             assert!(
                 reason.contains("no e-mail address"),
@@ -966,17 +976,292 @@ async fn the_email_transport_refuses_a_reader_with_no_address_instead_of_pretend
     }
 
     // And the webhook transport's own guard: a notification with no URL has nowhere to post.
+    // The assertion is on the *substance* — that the reason says there is nowhere to send — and
+    // not on the exact wording, because slice 5 reworded this sentence (from "no endpoint" to
+    // "no destination") and left this assertion behind: the walk went red for a message that
+    // got *clearer*, and a red walk is a walk nobody runs.
     let webhook = WebhookTransport::new(std::time::Duration::from_secs(1))
         .expect("the HTTP client must build");
     match webhook.deliver(&job, &fast_config()).await {
         TransportOutcome::Failed { reason, .. } => {
             assert!(
-                reason.contains("no endpoint"),
+                reason.contains("no destination") || reason.contains("no endpoint"),
                 "the reason has to say there is nowhere to post, got: {reason}"
             );
         }
         other => panic!("a notification with no endpoint must not report success, got {other:?}"),
     }
+
+    harness.dispose().await;
+}
+
+/// The producer path fills the queue — **the walk whose absence let the queue ship empty.**
+///
+/// This suite's other walks all call `delivery::enqueue` themselves, which proves the queue
+/// *drains* and says nothing about whether anything ever *fills* it. They could all be green
+/// with a platform that never sends an e-mail to anyone, and they were: slices 1 through 6b
+/// shipped a complete runner, four transports, a retry policy and a live-database lifecycle
+/// suite, and no production code path created a delivery row. The only caller of `enqueue`
+/// outside this file was the test-delivery route — the one path whose entire job is to prove
+/// the queue works, so it could never be evidence that a *notification* produces a delivery.
+///
+/// So this walk starts where a real notification starts: a bus event routed by the router, and
+/// the `store::record_with_deliveries` the emit route now calls. Both assertions read the rows
+/// out of PostgreSQL rather than trusting a returned count, because a count is what the
+/// function under test produced and the row is the fact.
+#[tokio::test]
+async fn a_notification_written_by_the_producer_path_arrives_with_its_deliveries() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let pool = harness.pool().to_owned();
+
+    let reader = omnion_identity::users::create_user(
+        &pool,
+        omnion_identity::users::NewUser {
+            email: format!("producer-{}@omnion.test", Uuid::new_v4().simple()),
+            password: "correct horse battery".to_owned(),
+            display_name: "Producer".to_owned(),
+            organization_id: None,
+        },
+    )
+    .await
+    .expect("the reader must exist");
+
+    // **No `enqueue` call anywhere in this walk.** That absence is the assertion. The walk
+    // calls the same store function the emit route calls, and then reads the delivery table.
+    let draft = NewNotification {
+        user_id: reader.id,
+        category: "system".to_owned(),
+        priority: "normal".to_owned(),
+        title: "A page is waiting".to_owned(),
+        body: "Somebody asked for a review.".to_owned(),
+        url: Some("/reviews/1".to_owned()),
+        source_type: Some("page".to_owned()),
+        source_id: None,
+        payload: serde_json::json!({}),
+        dedupe_key: None,
+    };
+    let (notification_id, report) = store::record_with_deliveries(&pool, None, None, &draft)
+        .await
+        .expect("the producer path must succeed")
+        .expect("an undeduped draft must create a row");
+
+    // One notification, and exactly one — the double-insert shape this slice replaced would
+    // have written two rows here, because the `on conflict` clause is partial and does
+    // nothing at all for a null dedupe key. A count of one is the only assertion that can tell
+    // the two apart.
+    let notifications: i64 =
+        sqlx::query_scalar("select count(*) from notifications where user_id = $1")
+            .bind(reader.id)
+            .fetch_one(&pool)
+            .await
+            .expect("the notification count must read");
+    assert_eq!(
+        notifications, 1,
+        "one notification, not two: the partial on-conflict clause does nothing for a null key"
+    );
+
+    // And the deliveries, read out of the table rather than out of the report.
+    let channels: Vec<String> = sqlx::query_scalar(
+        "select channel from notification_deliveries where notification_id = $1 order by channel",
+    )
+    .bind(notification_id)
+    .fetch_all(&pool)
+    .await
+    .expect("the delivery rows must be readable");
+
+    assert_eq!(
+        channels,
+        vec![
+            "chat".to_owned(),
+            "email".to_owned(),
+            "in_app".to_owned(),
+            "web_push".to_owned(),
+            "webhook".to_owned(),
+        ],
+        "every channel in the closed vocabulary must get a row: the three with a transport plus \
+         the in-app row are due, and `chat` is written skipped rather than left absent — a \
+         notification with no delivery rows is the defect this walk was written for"
+    );
+
+    let statuses: Vec<String> = sqlx::query_scalar(
+        "select status from notification_deliveries where notification_id = $1 order by channel",
+    )
+    .bind(notification_id)
+    .fetch_all(&pool)
+    .await
+    .expect("the delivery statuses must be readable");
+    assert_eq!(
+        statuses,
+        vec![
+            "skipped".to_owned(), // chat — no transport installed
+            "pending".to_owned(), // email
+            "pending".to_owned(), // in_app
+            "pending".to_owned(), // web_push
+            "pending".to_owned(), // webhook
+        ],
+        "a channel with no transport is skipped on the row; a pending one would be claimed, \
+         re-queued to the cap and written failed by the runner"
+    );
+
+    let chat_reason: Option<String> = sqlx::query_scalar(
+        "select error from notification_deliveries where notification_id = $1 and channel = 'chat'",
+    )
+    .bind(notification_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the chat row must carry a reason");
+    assert_eq!(
+        chat_reason.as_deref(),
+        Some(omnion_notifications::NO_TRANSPORT_YET),
+        "the reason distinguishes a platform gap from a reader's own switch"
+    );
+
+    assert_eq!(
+        report.queued, 4,
+        "the three transport channels plus in_app; the report and the table must agree"
+    );
+    assert_eq!(
+        report.skipped, 1,
+        "chat is skipped, and nothing else is"
+    );
+
+    harness.dispose().await;
+}
+
+/// A channel the reader switched off is written `skipped`, by the producer and not by the caller.
+///
+/// The reason a producer path can get this wrong is that it has the notification and it has the
+/// reader, so it looks like it has everything — but "everything" includes the *preference*, and
+/// the only function that knows it is `allowed_channels`. A producer that passes "all the
+/// channels" gets a reader who turned e-mail off an e-mail anyway; one that passes "none" gets a
+/// reader a mail that never arrives. So the switch-off is asserted from the table.
+#[tokio::test]
+async fn a_channel_the_reader_switched_off_is_skipped_by_the_producer_path() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let pool = harness.pool().to_owned();
+
+    let reader = omnion_identity::users::create_user(
+        &pool,
+        omnion_identity::users::NewUser {
+            email: format!("muted-{}@omnion.test", Uuid::new_v4().simple()),
+            password: "correct horse battery".to_owned(),
+            display_name: "Muted".to_owned(),
+            organization_id: None,
+        },
+    )
+    .await
+    .expect("the reader must exist");
+
+    // Stated rows are stored as stated, and `write_preferences` takes the settings row too —
+    // a settings screen always has it loaded, so the signature asks for it rather than letting
+    // a caller invent a default the reader never chose.
+    omnion_notifications::write_preferences(
+        &pool,
+        reader.id,
+        &[omnion_notifications::StatedPreference {
+            category: "ticket".to_owned(),
+            channel: "email".to_owned(),
+            enabled: false,
+        }],
+        &omnion_notifications::Settings::default_for(reader.id),
+    )
+    .await
+    .expect("the preference must be stated");
+
+    let (notification_id, _) = store::record_with_deliveries(
+        &pool,
+        None,
+        None,
+        &NewNotification {
+            user_id: reader.id,
+            category: "ticket".to_owned(),
+            priority: "normal".to_owned(),
+            title: "A ticket moved".to_owned(),
+            body: String::new(),
+            url: None,
+            source_type: Some("ticket".to_owned()),
+            source_id: None,
+            payload: serde_json::json!({}),
+            dedupe_key: None,
+        },
+    )
+    .await
+    .expect("the producer path must succeed")
+    .expect("an undeduped draft must create a row");
+
+    // The row exists — that is the drawer being able to say *why* nothing arrived — and it
+    // carries the reason the queue shows, not an empty one.
+    let (status, error): (String, Option<String>) = sqlx::query_as(
+        "select status, error from notification_deliveries \
+         where notification_id = $1 and channel = 'email'",
+    )
+    .bind(notification_id)
+    .fetch_one(&pool)
+    .await
+    .expect("a switched-off channel still gets a row");
+    assert_eq!(status, "skipped");
+    assert_eq!(
+        error.as_deref(),
+        Some(delivery::READER_SWITCHED_IT_OFF),
+        "the reason on the row is the sentence the drawer shows"
+    );
+
+    // The in-app row is written unconditionally by `enqueue` and is never skipped: the panel
+    // is the inbox, so a row saying "this did not arrive" would be a lie about the one channel
+    // the reader is already looking at.
+    let in_app_error: Option<String> = sqlx::query_scalar(
+        "select error from notification_deliveries \
+         where notification_id = $1 and channel = 'in_app'",
+    )
+    .bind(notification_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the in-app row must exist");
+    assert!(
+        in_app_error.is_none(),
+        "the in-app row is the inbox and is never skipped, got {in_app_error:?}"
+    );
+
+    // The switched-off preference is scoped to its category: `ticket` mail being off must not
+    // silence `security` mail, which is the whole reason the matrix is stored as stated rows
+    // rather than as one flag per channel.
+    let (security_id, _) = store::record_with_deliveries(
+        &pool,
+        None,
+        None,
+        &NewNotification {
+            user_id: reader.id,
+            category: "security".to_owned(),
+            priority: "high".to_owned(),
+            title: "A new sign-in".to_owned(),
+            body: String::new(),
+            url: None,
+            source_type: Some("session".to_owned()),
+            source_id: None,
+            payload: serde_json::json!({}),
+            dedupe_key: None,
+        },
+    )
+    .await
+    .expect("the producer path must succeed")
+    .expect("an undeduped draft must create a row");
+
+    let security_email: String = sqlx::query_scalar(
+        "select status from notification_deliveries \
+         where notification_id = $1 and channel = 'email'",
+    )
+    .bind(security_id)
+    .fetch_one(&pool)
+    .await
+    .expect("a category the reader never switched off must be queued");
+    assert_eq!(
+        security_email, "pending",
+        "turning ticket mail off must not silence the security mail the reader never touched"
+    );
 
     harness.dispose().await;
 }
