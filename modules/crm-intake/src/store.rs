@@ -697,7 +697,7 @@ pub struct Captured {
 ///    a broken form needs the first one.
 /// 5. **Dedupe last**, against the organization's existing contacts, with the policy from the
 ///    source.
-pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured> {
+async fn capture_inner(pool: &PgPool, submission: &Submission) -> Result<Captured> {
     let source = find_source(pool, submission.organization_id, submission.source_id)
         .await?
         .ok_or(CrmIntakeError::UnknownKey)?;
@@ -850,13 +850,6 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
             },
         )
         .await?;
-        record_source_outcome(
-            pool,
-            source.id,
-            false,
-            Some("a submission was rejected: the mapping produced no contactable lead"),
-        )
-        .await?;
         // A rejected submission is still *this* submission's one lead, so the claim completes
         // on this path too. Leaving it open would make a redelivery of a rejected submission
         // answer "already being captured" for ever, and the operator's own re-submit test on a
@@ -889,7 +882,6 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
             },
         )
         .await?;
-        record_source_outcome(pool, source.id, true, Some("spam heuristics fired")).await?;
         finish_claim(pool, submission, &source, claim, lead.id).await;
         return Ok(Captured {
             lead,
@@ -1015,7 +1007,6 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
         "the matched contact must be stored in dedupe_contact_id, never in duplicate_of"
     );
 
-    record_source_outcome(pool, source.id, true, None).await?;
 
     // 6. Route it. **This call is the whole of slice 2's assignment chain, and it was missing
     //    for twenty-four ticks.**
@@ -1066,6 +1057,83 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
         attribution,
     })
 }
+
+/// Turn a submission into a lead row, and **record what the source did with it**.
+///
+/// `capture_inner` is the whole of the capture logic; this wrapper exists for one reason and the
+/// reason is the seventh instance of this crate's signature defect: **`last_error` and
+/// `last_received_at` are the two columns an operator reads when nothing is arriving, and until
+/// now every *refusal* wrote neither of them.** `capture_inner` stamps the outcome on its three
+/// success-shaped exits (rejected, spam, accepted), and returns early with an error on four
+/// others — a paused source, an oversized body, the source's hourly ceiling and the per-address
+/// ceiling — so the four situations in which a form is silently not working are the four that
+/// leave no trace on the source row. `record_source_outcome`'s own doc comment says an operator
+/// asking "why is nothing arriving" wants the error "from an hour ago"; for these four, the
+/// column was always null.
+///
+/// **Why the recording is here rather than at each `return`.** The four early returns are guard
+/// clauses in the middle of a long function, and the function has grown exits for three
+/// consecutive slices (rejected, spam, duplicate); stamping at each site is the shape that
+/// guarantees the next exit forgets. A single wrapper makes the property structural: *there is
+/// no path out of capture that does not record one*, and the four that were wrong are fixed by
+/// existing rather than by four new lines that each need their own review.
+///
+/// **Never fatal, and it cannot be.** `record_source_outcome` opens its own connection outside
+/// any transaction — the capture path commits its lead before this runs — so a failure here
+/// cannot roll back a lead that is already stored, and the error the caller must receive is
+/// still the one from `capture_inner`. A refusal that lost its reason is worse than a refusal
+/// without one; a *lead* that lost its submission because a diagnostic line failed is worse
+/// than both. This is the same rule as the binding-health check and the assignment routing
+/// above it, and for the same reason: **a broken integration must never be the reason a
+/// business stops taking enquiries.**
+pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured> {
+    let outcome = capture_inner(pool, submission).await;
+    let (received, error) = match &outcome {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(operator_reason(error))),
+    };
+    // Best effort, and deliberately not `?`: a diagnostic write that fails must not turn a
+    // refused submission into a 500, which would tell an operator their form is broken in a
+    // way it is not.
+    if let Err(write_error) = record_source_outcome(pool, submission.source_id, received, error.as_deref())
+        .await
+    {
+        tracing::warn!(
+            source_id = %submission.source_id,
+            error = %write_error,
+            "the intake source outcome could not be recorded; the submission itself is unaffected"
+        );
+    }
+    outcome
+}
+
+/// The sentence an operator should read on the source row, per refusal.
+///
+/// The store's own `Display` is written for a log line and for `anyhow`, and it leaks internals
+/// a panel should not show: `PayloadTooLarge` reads *"submission is too large (max 65536 bytes,
+/// got 918273)"*, which is a fine log and a poor answer to "why is nothing arriving". Each arm
+/// is a complete sentence that names **what happened and what to do**, which is the difference
+/// between a column that answers the question and one that repeats it. `UnknownKey` never
+/// reaches here — it means the row itself was not found, so there is no source row to write to
+/// — and the `Database` arm keeps the underlying error, because "something went wrong" is the
+/// only honest thing to record when the platform does not know.
+fn operator_reason(error: &CrmIntakeError) -> String {
+    match error {
+        CrmIntakeError::Invalid(message) => message.clone(),
+        CrmIntakeError::Spam(score) => format!("a submission was filed as spam (score {score})"),
+        CrmIntakeError::RateLimited => {
+            "this source's hourly submission limit was reached — submissions are being \
+             refused, not lost; raise the limit or wait for the window to roll over"
+                .to_string()
+        }
+        CrmIntakeError::PayloadTooLarge { max, actual } => format!(
+            "a submission of {actual} bytes was refused; the ceiling is {max} bytes"
+        ),
+        CrmIntakeError::UnknownKey => "no such intake source".to_string(),
+        other => other.to_string(),
+    }
+}
+
 
 /// Run a freshly captured lead through the assignment chain, and hand back the row as it
 /// stands afterwards.
