@@ -15040,3 +15040,69 @@ organization, and `notifications.admin` is a separate power — whether the emit
 recipient-stamping assumption ("the row's organization is the recipient's tenant") holds for the
 router's own `record_with_deliveries` path, which stamps `event.organization_id` and resolves
 recipients through `resolve_recipients`. That is the same sentence one layer down.
+
+### Tick 75 — REQ-117 · SLICE 43 · the router stamped the event's tenant, not the recipient's (2026-10-01)
+
+**What.** Ticks 73 and 74 fixed the recipient guard in the SLA worker and then in
+`POST /notifications/emit`, and both closed on the same sentence: *the row's organization is the
+recipient's tenant*. The router was never asked. `route()` resolves a recipient set and writes
+every row through `record_with_deliveries(pool, event.organization_id, …)` — the **event's**
+organization, unconditionally — and two of its four recipient rules can name somebody that tenant
+does not own. `RecipientRule::Actor` returns `actor_user_id` verbatim; `RecipientRule::PayloadUser`
+returns an id the **producer wrote into the payload**, whose only check was that it parses as a
+uuid. The other two (`Permission`, `Role`) already select inside `event.organization_id`.
+
+**Proof.** RED first, over a real database with two real tenants: a tenant event naming another
+tenant's user through a payload rule answered `created: 1` and wrote a row stamped with the
+**sending** tenant next to a recipient belonging to a different one — tick 74's shape one layer
+down, with the leak in the *stamp*. → `omnion_notifications::audience::addressable_recipients`,
+called once in `route()` rather than copied into two `match` arms. →
+`scripts/qa/run-router-tenancy.sh` **6/6, PROVEN TO FAIL at 2/6** with the filter reduced to the
+pre-fix body: **exactly the four tenancy walks red**, both tenancy-free neighbours green.
+Regressions: notifications lib **113** (was 109, +4 `audience`), `omnion-api` lib **325**,
+`notification_delivery` **10/10**, `run-notifications-http.sh` **PASS**,
+`run-notification-tenancy-http.sh` **7/7**, clippy `--all-targets` **0 errors**, admin
+`tsc --noEmit` exit 0.
+
+**The platform branch was the worse half and is worth stating separately.** `organization_id:
+None` is the router's documented unscoped arm — a platform-level fact, every active account a
+candidate. It stamped `null`, so a platform announcement was **invisible to every tenant's
+`notifications.admin` outbox, including the tenant whose person it actually reached**, while
+`outbox_counts(None)` counted it as platform traffic. The read side never leaked: `store::list`
+filters on `user_id`, so the stranger's bell stayed clean. **What broke was the admin delivery
+log**, which filters on `n.organization_id` — a log that shows a tenant's strangers and omits its
+own platform traffic is worse than one that shows none. This is also the argument against the
+naive fix: "recipients must share the event's organization" would have refused the platform's own
+announcements, and the gate's platform leg is what holds that line.
+
+**`addressable_recipients` returns `(id, organization)` pairs, and the reason is the whole
+defect.** A filter returning only ids would pass every other test in the file — the refusals, the
+`unmatched_rules` count, the positive control — and still leave a caller free to bind the
+sender's column. That freedom is how the same mistake reached three call sites across three
+ticks, so the API makes the correct binding the only one available rather than documenting the
+correctness. The unit tests pin the filter and its complement as a **partition of the same list**,
+because a boundary with two spellings is not a boundary, and the emit route names refused ids
+back while the router keeps survivors — the two would disagree invisibly if they ever drifted.
+
+**`dropped_recipients` is a separate count from `unmatched_rules` for a reason an administrator
+feels.** "How many rules produced nothing" is *wait for the producer*. "How many people were
+resolved and then refused" is *fix the rule*. Both read `created: 0`, so without the new field a
+rule pointing at a stranger looks exactly like a rule ahead of its event — and stays looking that
+way for as long as nobody counts. The panel's route probe renders it.
+
+**Not claimed.** No browser pass and none claimed: the one screen touched is the existing route
+probe inside the outbox, and `/mnt/apopic` is at **98 % (1.2 G free)** with nine writers on the
+box, so no `scripts/qa/run.sh` was started rather than starting one that cannot finish. Builds ran
+against `/dev/shm/w8-target`, this worktree's own tree. Two sibling APIs held `:18086` and
+`:18085` (cwd `/mnt/apopic/omnion-w7` and `/mnt/apopic/omnion-w6`) — the `run-notifications-http.sh`
+default port collides with the w7 orphan, and the gate answered `relation "notifications" does not
+exist` because it was measuring *their* database. **A gate that fails on a precondition it never
+checked will be read as a product failure**, so it ran on `QA_API_PORT=18089`.
+
+**Next.** The write side of this route now asks the tenancy question and stamps the recipient's
+tenant, and the *read* side is owner-scoped in `store::list`. What has never been asked: the
+admin outbox takes `session.user.organization_id` as a **query argument**
+(`push::list_outbox` / `outbox_counts`), so a tenant administrator's delivery log is correct only
+as long as that argument is the tenant's. A second `notifications.admin` holder, or a session
+whose `users.organization_id` is `null`, gets the `organization_id is null` branch — every row on
+no tenant, which is exactly the platform branch this slice just made reachable for real.
