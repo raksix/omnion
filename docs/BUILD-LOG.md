@@ -7269,3 +7269,72 @@ so the tick was spent on slot-free measured work. The walkthrough needs a row th
 conflict and reads the Undo button's own `disabled` attribute, because `drag-undo` measures the
 reverse: it asserts the button ENABLES after a drag. The 50-press depth claim is still answered
 by the constant `HISTORY_LIMIT = 100` and by nothing else.
+
+---
+
+## Tick 49 — the `reload-rebase` row measured nothing, and its selection count was a constant
+
+**What.** The row `state.json` asked for at the end of tick 48 existed but was not a
+measurement. It read the Undo button and the selection on a page on which no reload had ever
+happened: it sat directly after `drag-undo`, which had just pressed Ctrl+Z, and it never caused
+a conflict, never clicked Reload, and never re-read the button. It would have returned the same
+numbers against a `rebaseAfterReload` deleted outright, and three ticks cited it as evidence the
+rebase held.
+
+The second half was worse, because it looked like data. It counted `[data-selected='true']`; the
+cards write `data-node-selected`. So `selectedInDom` was a hardcoded zero — a constant, not a
+reading, and a constant in a report is the one shape of wrong answer nobody suspects.
+
+**The row now causes the state it measures**, in the order the defect needs: a second tab saves a
+graph that DELETES this tab's selected card (the adoption is only observable if something about
+the graph changes), this tab's own autosave produces the 409, the Reload button is clicked, and
+the button and the selection are read afterwards. The delete goes through the API rather than the
+canvas so it is not itself a history entry here — the question is what the reload does to a
+history this tab built. Preconditions are read too (`undoWasEnabledBefore`,
+`fixtureDeletedACard`), because `undoDisabled: true` is also the answer for a history that never
+had an entry in it and for a graph nobody else changed.
+
+`reload-rebase-row.test.ts` is the instrument's guard, because the row's defect WAS the
+instrument's. Seven structural assertions, and the honest claim is the inverse one: the row is
+wired to the code path under test, so a defect reaches a reading instead of passing silently. It
+does not claim the row passes in a browser — a regex cannot prove a click happened, only that the
+source asks for one.
+
+**Proof.** `node --test features/workflows/*.test.ts` → **245 passed** (238 before, +7),
+`pnpm typecheck` clean, `cargo test -p omnion-workflows --lib` **157 unchanged** (a harness
+defect, not an engine one), `node --check scripts/qa/walkthrough.cjs` clean. All five mutations
+red, one assertion each: the row reverted to its tick-48 shape (**0/7**), the product's marker
+renamed, the click moved after the read, the `finally` removed, the `expectRefusal` registration
+dropped. Restore green.
+
+**Two of the seven were wrong, and one was wrong in the way this branch keeps producing.** The
+ordering test compared the FIRST read of the button — the row's own precondition — against the
+click. Both reads are wanted and they mean opposite things: the precondition says "there was
+something to lose", the one after the click says "there is no longer". The second went red
+against an already-correct row because **the fix's own comment quotes the bug it describes**, so
+a search over raw source matched its own documentation. Hence `stripComments`, and assertions on
+the selector's own brackets, since `[data-selected]` is a substring of `[data-node-selected]`.
+
+**Then a third, in the code rather than the test.** The comment I wrote for the fixture's CSRF
+header claimed a cookie-authenticated PUT without it "is refused before the handler runs".
+`presented_token` reads the header first and **falls back to the `omnion_csrf` cookie**, and
+`csrf.rs` tests that fallback explicitly — so the refusal does not happen and the cookie alone
+verifies. The header is still sent (it is the explicit intention where the cookie is the
+fallback, and a fixture that deletes a live author's card should not rest on the fallback alone);
+what changed is the claim. The guard's assertion made the same claim and was restated as what it
+is — a statement about intent, not about legality. Found by reading `presented_token` before
+pushing the second commit rather than after.
+
+**Not measured.** The QA slot is held by a live `omnion-w5` pass (holder pid 1822938, cwd
+`/mnt/apopic/omnion-w5`, 35 Chrome, `/dev/shm` 85% with 5.0G free), and w7 and w2 passes are
+also running. No second concurrent pass was forced, so the row remains UNMEASURED — the seven
+guards are structural and the browser reading is what proves the value.
+
+**Next.** When the slot frees, read `reload-rebase` for `fixtureDeletedACard`,
+`undoWasEnabledBefore`, `conflictRaised` and `undoDisabled: true` together — the first three are
+preconditions and a row that fails them has measured nothing, which is precisely what the tick-48
+row did silently. Read it against `drag-undo`'s `moved && undoEnabledAfterDrag && returned`:
+opposite assertions on one attribute. REQ-004 is otherwise far from close — run-from-here needs
+a graph with a real prefix, the pill row needs `paintedButNotInRun` empty, and the plugin row
+stays BLOCKED on REQ-121. The 50-step depth claim is still answered by the constant
+`HISTORY_LIMIT = 100` and by nothing else.
