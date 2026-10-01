@@ -1,6 +1,6 @@
 # REQ-024 — Deployment Center
 
-> **Status:** in-progress (`d2ced888`, `4ca9609a`, `34661bce`, `a24c452a`, `9a77f1c4`, `4fa4b3b3`; tick 98 — **slice 3 is shipped as code in full and the gate that closes slices 1, 2 and 3 can now fail.** `4fa4b3b3` is the tick's other half: a gated claim that failed was recorded into `clicks.jsonl` and read by nothing — the roll-up builds `findings` from `pushFindings` and `run.sh` reads only `summary.json` — so the pass reported a clean tally whatever the product did. Proved against artifacts: the tick-86 w5 pass wrote 0 entries carrying a severity, and w7's 04:39 pass recorded 16 depth passes returning `ok: false` that its findings did not list. The maintenance window's own eight claims are now gates rather than notes, so the pass written to prove slice 3 is a pass that can report it failing. Gates that are real: 68 crate tests, 325 api-lib tests, `tsc` clean, `node --check` clean, six window/rollback properties proved against the live `omnion_qa_w5` database by their own constraint names, and two self-tests that lift the shipped promotion code out of the harness and run it.** Slices 1, 2 and 3 all remain open on the same single thing: one browser pass over this build. The tick-96 pass still running was compiled before every one of these commits and measures slice 1's five screens and nothing else.)
+> **Status:** in-progress (`c6495b9b`, `d7476893`, `660ef101`, `aa1dcd1b`; tick 99 — **slice 4 is shipped as code, with the pass that measures it already proved able to fail.** The three-state metric, the unclamped percentage, the flat-series and gap rules, the per-workload sample table and the restart that is a job rather than a row of its own are all in; 103 crate tests and 339 api tests are green, `tsc` and `node --check` are clean, and the `0214` migration is proved on the live `omnion_qa_w5` database by its own constraint names. The walkthrough route and the driven pass are in, and `scripts/qa/cluster-panel-gate-selftest.cjs` lifts the shipped gate out of the harness and shows it firing in all three directions. **The browser pass over this build is still owed, and it is still blocked behind the tick-96 run holding the w5 stack.** Slices 1, 2 and 3 remain open on that same one thing; slice 4 is open only on it too. Prior status follows. `d2ced888`, `4ca9609a`, `34661bce`, `a24c452a`, `9a77f1c4`, `4fa4b3b3`; tick 98 — **slice 3 is shipped as code in full and the gate that closes slices 1, 2 and 3 can now fail.** `4fa4b3b3` is the tick's other half: a gated claim that failed was recorded into `clicks.jsonl` and read by nothing — the roll-up builds `findings` from `pushFindings` and `run.sh` reads only `summary.json` — so the pass reported a clean tally whatever the product did. Proved against artifacts: the tick-86 w5 pass wrote 0 entries carrying a severity, and w7's 04:39 pass recorded 16 depth passes returning `ok: false` that its findings did not list. The maintenance window's own eight claims are now gates rather than notes, so the pass written to prove slice 3 is a pass that can report it failing. Gates that are real: 68 crate tests, 325 api-lib tests, `tsc` clean, `node --check` clean, six window/rollback properties proved against the live `omnion_qa_w5` database by their own constraint names, and two self-tests that lift the shipped promotion code out of the harness and run it.** Slices 1, 2 and 3 all remain open on the same single thing: one browser pass over this build. The tick-96 pass still running was compiled before every one of these commits and measures slice 1's five screens and nothing else.)
 > · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
@@ -140,9 +140,9 @@ Migration: `database/migrations/0014_deployments.sql` (next free number at build
 - [x] Rollback requires a reason, takes a backup first, and produces a history entry. *(server + unit + live: a `rollback` row without a reason is refused by `deployments_rollback_needs_a_reason`; the route refuses an empty one with a `400` before it writes anything, and the dialog refuses it client-side in the same words. The plan is `backup → deploy → verify` — **not** the deploy's four — because the older binary reads the append-only schema and `may_cancel` treats a plan with no migrate step as cancellable throughout. Proved on the live database: three step rows in that order, zero `migrate` rows.)*
 - [x] History filters by environment, kind, result and window; rows expand to the step list.
 - [ ] Maintenance mode blocks write routes with `503` plus the message, shows the banner, and leaves reads and probes working. *(the API half is proved — the deploy route asks the window before the pre-flight and answers `503` with the operator's own message, and the three form rules are `422`s with their reasons, all six window/rollback properties checked on the live `omnion_qa_w5` database by their own constraint names. **Still owed: the browser half, and it is now measurable.** The banner is built and mounted in the shell (`9a77f1c4`), and the driven pass that turns a window on with an empty message, saves it, reads it from a *different* screen and waits one poll interval for it to clear carries eight claims — all of which were notes, and notes cannot fail a pass. `4fa4b3b3` gates them and repairs the channel that was discarding them, so the next pass over this build can return a count that means something. Until it does, this box stays unticked.)*
-- [ ] The cluster panel renders only when a cluster is reported, with real replicas, CPU and memory.
-- [ ] Workload restart requires confirmation and `deployment.manage`.
-- [ ] A single-instance deployment shows the alternative card with a working restart action.
+- [ ] The cluster panel renders only when a cluster is reported, with real replicas, CPU and memory. *(the server half is proved: `/api/v1/deployment/cluster` answers `404 not_a_cluster` on a single instance — never an empty cluster — and `Cluster` is only ever reported from a runtime read that succeeded; a pod that is not ready or a missing metrics-server yields `Unknown` metrics with a reason, never a zero. The pods→owner grouping, the `Ready`-condition readiness and the nanocore/Ki conversion are unit-proved. **Still owed: the browser half.**)*
+- [ ] Workload restart requires confirmation and `deployment.manage`. *(route is `deployment.manage`; the typed-confirmation and known-workload refusals are crate-proved; the `409` on a busy environment comes from the same `0211` partial unique index a deploy hits. **Browser confirmation dialog still owed.**)*
+- [ ] A single-instance deployment shows the alternative card with a working restart action. *(the process card is server-rendered with uptime and a memory figure that is a dash when unreadable, and its reason distinguishes "not a cluster" from "token missing". **The card's rendering and its working restart button are browser-owed.**)*
 - [x] The feed-unreachable banner appears with the cached timestamp when the manifest call fails.
 - [ ] Every screen has empty, loading and error states, and no placeholder numbers anywhere.
 - [ ] Mobile keeps the log pane in its own scroll region; keyboard shortcuts work.
@@ -240,6 +240,51 @@ Visual check should see: a health indicator that is unmistakable with text (not 
    untested in the way that matters — a form that swallows its own refusal and shows nothing is
    indistinguishable from a save that worked until you look at the database.
 4. **Cluster panel.** Cluster detection, live replica/CPU/memory read, metric sampling for the sparkline, conditional route, workload restart with confirmation. *Done when:* a cluster-backed environment shows real numbers and restart works, while a single-instance environment shows the alternative card with no empty cluster shell.
+   *Status:* **the code is whole and green (`c6495b9b`, `d7476893`, `660ef101`); the browser pass that closes it is still owed.**
+   This is the first slice of this request with no code at all behind it when the tick began, and
+   the tick built it end to end — so the interesting part is which of its states are silent
+   failures, because that is what a metrics panel is made of. Four, and each is a type rather than
+   a conditional at the handler: a metric the runtime did not report is `Metric::Unknown` carrying
+   **why** (a pending pod and a broken metrics-server are different problems and an operator treats
+   them differently), a usage with **no limit** is `None` rather than 0% (an undeclared limit means
+   *unlimited*, which is a fact about the deployment), a percentage above 100 is **not clamped**
+   (a bar pinned at 100% for a workload at 240% is a chart that cannot show the thing the screen
+   was opened for, so `over_limit` carries the overflow and the panel says it in words), and a
+   sparkline series is `flat` when every value is equal — the commonest series on a quiet cluster,
+   and a `value / (max - min)` normalisation returns `NaN` for every point of it, which draws as an
+   empty chart.
+   **The bug I wrote first and caught by running the tests:** the normalisation mapped `min` to 50
+   rather than 0, so the bottom half of the chart was never drawn and a low-usage workload looked
+   like a high one. The test that caught it asserted a documented property (the series uses the
+   whole height) rather than a number, which is why it read as a real defect instead of a fussy
+   expectation. The other failing test was the reverse — my *expectation* contradicted my own
+   documented byte-formatting rule, and the code was right, so the test was corrected to state the
+   rule (`118 MiB`, not `117.7 MiB`) and to cover the other half of it (`5.0 MiB`).
+   **A restart is a job**, which is the decision that matters more than the route's shape: a
+   restart writing its own row would have no actor, no step log and no duration, and would not go
+   through `create_job`, so it would ignore the `0211` partial unique index and could race a deploy
+   that is mid-migration. The row is written **before** the runtime call, so a restart the operator
+   asked for is in the history even if the API call then fails — and a failure is marked on the job
+   rather than swallowed. The `0214` constraint `deployments_restart_names_a_workload` refuses a
+   restart with no workload *and* a deploy carrying one, so the column cannot be set inconsistently
+   by a second writer.
+   **The runtime reader is real, and `Cluster` is never a guess.** Pods rather than Deployments
+   (a Deployment whose pods are all crash-looping reports `6/6` while the service is down),
+   readiness from the `Ready` **condition** rather than the phase (a `Running` pod failing its
+   readiness probe is not serving), the metrics API as an *optional* add-on (a cluster without
+   `metrics-server` is a supported deployment, not a broken one), and an unreadable runtime is
+   `Single` **with the failure recorded** — a cluster whose API timed out is still a cluster, and
+   answering "not a cluster" would send the operator looking for one that is right there.
+   **The pass is proved able to fail, in a way that reproduced this harness's own tick-98 defect
+   inside the test written to catch it.** `cluster-panel-gate-selftest.cjs` lifts the shipped gate
+   out of the file and runs it; the first version cut the block at the first call, captured the
+   definition and none of the invocations, and reported "0 findings" for a screen that rendered
+   nothing. The extraction now runs the call sites too, and asserts behaviour in three directions:
+   a screen that rendered neither shape raises exactly one high finding, a healthy pass on either
+   shape raises none, and each shape's claims are scoped **out** of the other shape's pass rather
+   than failed by it.
+   **Still owed:** the browser pass. The screen is rendered by `tsc` and by nothing else, so the
+   screen-level boxes below stay unticked until a walkthrough reports them.
 
 ### Risks / notes
 

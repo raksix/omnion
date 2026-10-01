@@ -11028,3 +11028,69 @@ at page 52 and still holds the w5 stack; it was compiled before every commit in 
 measures slice 1 only.
 
 **Next.** The pass, then REQ-024 slice 3's tick, then slice 4.
+
+### Tick 99 — slice 4, the cluster panel: the first REQ-024 slice that had no code at all
+
+**What.** `c6495b9b`, `d7476893`, `660ef101`, `aa1dcd1b`. While slices 1, 2 and 3 waited on one
+browser pass that the tick-96 run is still holding the stack for, this tick built slice 4 end to
+end — the one slice of this request that had nothing behind it when the tick began.
+
+**The decisions, and why each is a type.** A metrics panel is made of silent failures, so the four
+that matter here are values with tests rather than conditionals at a handler: a metric the runtime
+did not report is `Unknown` *carrying why* (a pending pod and a broken metrics-server are different
+problems); a usage with **no limit** is `None`, not 0% (an undeclared limit means *unlimited*); a
+percentage above 100 is **not clamped** (a bar pinned at 100% for a workload at 240% cannot show the
+reason the screen was opened, so `over_limit` carries the overflow and the panel says it in words);
+and a sparkline series is `flat` when every value is equal — the commonest series on a quiet
+cluster, where a `value / (max - min)` normalisation returns `NaN` for every point and draws an
+empty chart.
+
+**Two defects my own tests caught, kept because they are the class.**
+- The normalisation mapped `min` to 50 instead of 0, so the bottom half was never drawn and a
+  low-usage workload looked like a high one. The test that caught it asserted a *property* (the
+  series uses the whole height), which is why it read as a defect and not a fussy expectation.
+- The other failure was the reverse: my byte-formatting expectation (`117.7 MiB`) contradicted my
+  own documented rule (≥10 drops the decimal). The code was right, so the test now states the rule
+  and covers its other half (`5.0 MiB`). A test corrected toward the code is a loss only when the
+  code is what was wrong — and here it was not.
+
+**A restart is a job.** That is the decision that matters more than the route's shape: a restart
+writing its own row would have no actor, no step log and no duration, and would bypass
+`create_job`, so it would ignore the `0211` partial unique index and could race a deploy mid-
+migration. The row is written *before* the runtime call so an operator's restart is in the history
+even when the API call fails, and a failure is marked on the job rather than swallowed.
+
+**`Cluster` is never a guess.** The runtime reader is real — pods (not Deployments, which report
+`6/6` while their pods crash-loop), readiness from the `Ready` condition (a `Running` pod failing its
+readiness probe is not serving), the metrics API as an *optional* add-on (a cluster without
+`metrics-server` is supported, not broken), nanocore/Ki and `500m`/`1Gi` converted and parsed here.
+An unreadable runtime is `Single` **with the failure recorded** — a cluster whose API timed out is
+still a cluster, and answering "not a cluster" sends the operator hunting one that is right there.
+
+**The pass is proved able to fail — and the first version of that proof reproduced this harness's own
+tick-98 defect inside the test written to catch it.** `cluster-panel-gate-selftest.cjs` lifts the
+shipped gate out of the file and runs it. The first extraction cut the block at the first call,
+captured the definition and none of the invocations, and reported "0 findings" for a screen that
+rendered nothing. The lesson from tick 98 — a measurement that is not gated is a note — is exactly
+what bit the self-test. It now runs the call sites and asserts behaviour in three directions: a
+screen that rendered neither shape raises exactly one high finding; a healthy pass on either shape
+raises none; each shape's claims are scoped *out* of the other shape's pass rather than failed by
+it.
+
+**Proof.** `cargo test -p omnion-deployment --features store` 103 (68 new). `cargo test -p omnion-api
+--lib` 339 (14 new). `tsc --noEmit` clean. `node --check` clean on the walkthrough and the
+self-test, which reports `ALL PASS` over the six gate assertions. The `0214` migration is proved on
+the live `omnion_qa_w5` database *by its own constraint names* (`scripts/qa/cluster_panel_proof.sql`):
+a restart with no workload and a deploy carrying one are both refused by
+`deployments_restart_names_a_workload`; `api --force` and `../../etc/passwd` by
+`deployments_workload_name_is_a_name`; two writes in one minute leave one row holding the newer
+value; two empty-workload rows in one bucket are both allowed (the partial index doing its job); and
+the file applies twice without error.
+
+**Still owed, unchanged: the browser pass.** The cluster screen is rendered by `tsc` and by nothing
+else. The pass and its route are in and its gate is proved able to fail, but until a walkthrough
+over this build reports, the screen-level boxes stay unticked — including the new negative one
+(the card must *not* show a figure it did not measure), which is the claim most likely to catch
+something and impossible to prove without the browser.
+
+**Next.** The pass, then tick slices 1, 2, 3 and 4 in one go, then the next wave-5 request.
