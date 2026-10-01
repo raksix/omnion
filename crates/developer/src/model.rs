@@ -92,7 +92,11 @@ impl KeyStatus {
     /// Decide a key's status from its row. Time is passed in rather than read from the clock
     /// inside, so the boundary is testable: an expiry exactly at `now` is expired, and a key
     /// expiring in a millisecond is not.
-    pub fn of(revoked_at: Option<OffsetDateTime>, expires_at: Option<OffsetDateTime>, now: OffsetDateTime) -> Self {
+    pub fn of(
+        revoked_at: Option<OffsetDateTime>,
+        expires_at: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+    ) -> Self {
         if revoked_at.is_some() {
             Self::Revoked
         } else if expires_at.is_some_and(|at| at <= now) {
@@ -469,7 +473,10 @@ mod tests {
         // The caller typed a literal percent; the query must not read it as "any path".
         assert_eq!(RequestLogQuery::escaped_path_prefix("%"), "\\%");
         assert_eq!(RequestLogQuery::escaped_path_prefix("_"), "\\_");
-        assert_eq!(RequestLogQuery::escaped_path_prefix("/api/v1/keys"), "/api/v1/keys");
+        assert_eq!(
+            RequestLogQuery::escaped_path_prefix("/api/v1/keys"),
+            "/api/v1/keys"
+        );
         assert_eq!(RequestLogQuery::escaped_path_prefix("  /api  "), "/api");
         // An escape character typed by the caller escapes itself rather than eating the
         // character after it.
@@ -478,37 +485,67 @@ mod tests {
 
     #[test]
     fn the_page_size_is_clamped_rather_than_refused() {
-        let query = RequestLogQuery { limit: 10_000, ..Default::default() }.normalized().unwrap();
+        let query = RequestLogQuery {
+            limit: 10_000,
+            ..Default::default()
+        }
+        .normalized()
+        .unwrap();
         assert_eq!(query.limit, RequestLogQuery::MAX_LIMIT);
 
-        let query = RequestLogQuery { limit: 0, ..Default::default() }.normalized().unwrap();
+        let query = RequestLogQuery {
+            limit: 0,
+            ..Default::default()
+        }
+        .normalized()
+        .unwrap();
         assert_eq!(query.limit, RequestLogQuery::DEFAULT_LIMIT);
 
-        let query = RequestLogQuery { limit: -5, offset: -1, ..Default::default() }.normalized().unwrap();
+        let query = RequestLogQuery {
+            limit: -5,
+            offset: -1,
+            ..Default::default()
+        }
+        .normalized()
+        .unwrap();
         assert_eq!(query.offset, 0);
     }
 
     #[test]
     fn an_unknown_status_class_is_refused_but_a_method_is_normalized() {
         assert!(matches!(
-            RequestLogQuery { status_class: Some("9xx".to_owned()), ..Default::default() }.normalized(),
+            RequestLogQuery {
+                status_class: Some("9xx".to_owned()),
+                ..Default::default()
+            }
+            .normalized(),
             Err(DeveloperError::UnknownStatusClass(_))
         ));
-        let query = RequestLogQuery { status_class: Some("4xx".to_owned()), ..Default::default() }
-            .normalized()
-            .unwrap();
+        let query = RequestLogQuery {
+            status_class: Some("4xx".to_owned()),
+            ..Default::default()
+        }
+        .normalized()
+        .unwrap();
         assert_eq!(query.status_class.as_deref(), Some("4xx"));
 
-        let query = RequestLogQuery { method: Some(" post ".to_owned()), ..Default::default() }
-            .normalized()
-            .unwrap();
+        let query = RequestLogQuery {
+            method: Some(" post ".to_owned()),
+            ..Default::default()
+        }
+        .normalized()
+        .unwrap();
         assert_eq!(query.method.as_deref(), Some("POST"));
     }
 
     #[test]
     fn a_negative_duration_filter_is_refused() {
         assert!(matches!(
-            RequestLogQuery { min_duration_ms: Some(-1), ..Default::default() }.normalized(),
+            RequestLogQuery {
+                min_duration_ms: Some(-1),
+                ..Default::default()
+            }
+            .normalized(),
             Err(DeveloperError::NegativeDuration)
         ));
     }

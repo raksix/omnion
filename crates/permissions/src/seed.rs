@@ -112,6 +112,12 @@ const BASE_ROLES: &[BaseRole] = &[
             // together, the read would have arrived with the write and the split above would
             // have been a distinction in name only.
             "developer.keys.read",
+            // The API Explorer's *reference* half. Sending a call is deliberately absent: a
+            // manager may read which operations exist and what they take, and may not use the
+            // reference to act as the person sitting at the screen. The run key stays with
+            // owner/administrator, who hold `BasePermissions::All` — a read-only developer role
+            // must not be able to reach `POST /pages` through a form instead of through a key.
+            "developer.read",
             "search.read",
             "search.manage",
             "analytics.read",

@@ -133,11 +133,7 @@ fn looks_like_cidr(entry: &str) -> bool {
 /// The whole operation is one transaction, and the secret is hashed *before* the insert, so a
 /// failure cannot leave a row whose hash we never computed — which would be a key that exists,
 /// appears in the panel, and can never be used.
-pub async fn create(
-    pool: &PgPool,
-    organization_id: Uuid,
-    new_key: &NewKey,
-) -> Result<Minted> {
+pub async fn create(pool: &PgPool, organization_id: Uuid, new_key: &NewKey) -> Result<Minted> {
     key_rules::validate_name(&new_key.name)?;
     key_rules::validate_scopes(&new_key.scopes)?;
     let ip_allowlist = validate_ip_allowlist(&new_key.ip_allowlist)?;
@@ -145,8 +141,8 @@ pub async fn create(
     let minted = secret::mint();
     // Split once here and never re-derive it: the plaintext is the concatenation, and the
     // hash covers the secret half only, because that is the half a caller proves.
-    let (_, secret_half) = secret::split_token(&minted.plaintext)
-        .ok_or(DeveloperError::KeyUnverifiable)?;
+    let (_, secret_half) =
+        secret::split_token(&minted.plaintext).ok_or(DeveloperError::KeyUnverifiable)?;
     let stored_hash = secret::hash(secret_half);
 
     let mut transaction = pool.begin().await?;
@@ -217,11 +213,7 @@ pub async fn list(pool: &PgPool, organization_id: Uuid) -> Result<Vec<ApiKey>> {
 /// The organization is part of the `where` rather than checked afterwards, so a key belonging
 /// to somebody else is not found — the same answer as a key that does not exist, and not a 403
 /// that confirms it does.
-pub async fn get(
-    pool: &PgPool,
-    organization_id: Uuid,
-    key_id: Uuid,
-) -> Result<ApiKey> {
+pub async fn get(pool: &PgPool, organization_id: Uuid, key_id: Uuid) -> Result<ApiKey> {
     let row = sqlx::query(&format!(
         "select {KEY_COLUMNS} from api_keys where organization_id = $1 and id = $2"
     ))
@@ -249,8 +241,8 @@ pub async fn rotate(
     now: OffsetDateTime,
 ) -> Result<Minted> {
     let minted = secret::mint();
-    let (_, secret_half) = secret::split_token(&minted.plaintext)
-        .ok_or(DeveloperError::KeyUnverifiable)?;
+    let (_, secret_half) =
+        secret::split_token(&minted.plaintext).ok_or(DeveloperError::KeyUnverifiable)?;
     let stored_hash = secret::hash(secret_half);
 
     let mut transaction = pool.begin().await?;
@@ -306,10 +298,7 @@ pub async fn revoke(
 /// before the platform knows who they are. It returns the row *and* the organization, so the
 /// caller can then check the token against the scopes of the tenant it belongs to rather than
 /// trusting a key row it found by string match.
-pub async fn find_by_prefix(
-    pool: &PgPool,
-    prefix: &str,
-) -> Result<Option<(ApiKey, Uuid)>> {
+pub async fn find_by_prefix(pool: &PgPool, prefix: &str) -> Result<Option<(ApiKey, Uuid)>> {
     let row = sqlx::query(&format!(
         "select {KEY_COLUMNS}, organization_id as owning_organization \
          from api_keys where prefix = $1"
@@ -405,10 +394,7 @@ pub async fn usage(
 /// No body, no headers, no query string — the columns are the whole of what the platform knows
 /// about a request once it is over, and a caller cannot get more detail out of this than they
 /// put in the path.
-pub async fn log_request(
-    pool: &PgPool,
-    entry: &RequestLog,
-) -> Result<i64> {
+pub async fn log_request(pool: &PgPool, entry: &RequestLog) -> Result<i64> {
     let row = sqlx::query(
         "insert into api_request_logs (organization_id, api_key_id, actor_user_id, method, path, \
          status, duration_ms, request_id, bytes_in, bytes_out, error_code) \
@@ -569,7 +555,10 @@ mod tests {
         assert_eq!(validate_ip_allowlist(&None).unwrap(), None);
         assert_eq!(validate_ip_allowlist(&Some(vec![])).unwrap(), None);
         // A list of blanks is the same request, not an allowlist that matches no address.
-        assert_eq!(validate_ip_allowlist(&Some(vec!["  ".to_owned()])).unwrap(), None);
+        assert_eq!(
+            validate_ip_allowlist(&Some(vec!["  ".to_owned()])).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -580,6 +569,9 @@ mod tests {
             " 192.168.0.0/16 ".to_owned(),
         ]))
         .unwrap();
-        assert_eq!(stored, Some(vec!["10.0.0.0/8".to_owned(), "192.168.0.0/16".to_owned()]));
+        assert_eq!(
+            stored,
+            Some(vec!["10.0.0.0/8".to_owned(), "192.168.0.0/16".to_owned()])
+        );
     }
 }

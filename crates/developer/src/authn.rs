@@ -81,9 +81,7 @@ impl KeyRefusal {
     #[must_use]
     pub fn message(self) -> &'static str {
         match self {
-            Self::Invalid | Self::AddressNotAllowed => {
-                "this API key is not valid for this request"
-            }
+            Self::Invalid | Self::AddressNotAllowed => "this API key is not valid for this request",
             Self::Revoked => "this API key has been revoked",
             Self::Expired => "this API key has expired",
         }
@@ -395,7 +393,10 @@ mod tests {
     #[test]
     fn an_allowlist_reads_as_no_restriction_when_it_is_absent() {
         assert!(address_allowed(&None, None));
-        assert!(address_allowed(&None, Some("203.0.113.9".parse().expect("a literal"))));
+        assert!(address_allowed(
+            &None,
+            Some("203.0.113.9".parse().expect("a literal"))
+        ));
     }
 
     #[test]
@@ -403,34 +404,73 @@ mod tests {
         // Skipping an unreadable entry must not become a bypass: the address still has to
         // match an entry that parsed.
         let list = Some(vec!["not-a-cidr".to_owned(), "10.0.0.0/8".to_owned()]);
-        assert!(address_allowed(&list, Some("10.9.9.9".parse().expect("a literal"))));
-        assert!(!address_allowed(&list, Some("203.0.113.9".parse().expect("a literal"))));
+        assert!(address_allowed(
+            &list,
+            Some("10.9.9.9".parse().expect("a literal"))
+        ));
+        assert!(!address_allowed(
+            &list,
+            Some("203.0.113.9".parse().expect("a literal"))
+        ));
 
         let all_broken = Some(vec!["garbage".to_owned()]);
-        assert!(!address_allowed(&all_broken, Some("10.0.0.1".parse().expect("a literal"))));
+        assert!(!address_allowed(
+            &all_broken,
+            Some("10.0.0.1".parse().expect("a literal"))
+        ));
     }
 
     #[test]
     fn a_zero_length_block_contains_the_whole_family() {
         // `/0` is the shift-by-width case: `u32::MAX << 32` overflows in the obvious
         // formulation, and an allowlist of `0.0.0.0/0` is a legitimate "any IPv4".
-        assert!(cidr_contains("0.0.0.0/0", "203.0.113.9".parse().expect("a literal")));
-        assert!(cidr_contains("::/0", "2001:db8::1".parse().expect("a literal")));
-        assert!(cidr_contains("10.0.0.0/8", "10.255.255.255".parse().expect("a literal")));
-        assert!(!cidr_contains("10.0.0.0/8", "11.0.0.1".parse().expect("a literal")));
+        assert!(cidr_contains(
+            "0.0.0.0/0",
+            "203.0.113.9".parse().expect("a literal")
+        ));
+        assert!(cidr_contains(
+            "::/0",
+            "2001:db8::1".parse().expect("a literal")
+        ));
+        assert!(cidr_contains(
+            "10.0.0.0/8",
+            "10.255.255.255".parse().expect("a literal")
+        ));
+        assert!(!cidr_contains(
+            "10.0.0.0/8",
+            "11.0.0.1".parse().expect("a literal")
+        ));
         // A single host.
-        assert!(cidr_contains("192.168.1.1/32", "192.168.1.1".parse().expect("a literal")));
-        assert!(!cidr_contains("192.168.1.1/32", "192.168.1.2".parse().expect("a literal")));
+        assert!(cidr_contains(
+            "192.168.1.1/32",
+            "192.168.1.1".parse().expect("a literal")
+        ));
+        assert!(!cidr_contains(
+            "192.168.1.1/32",
+            "192.168.1.2".parse().expect("a literal")
+        ));
     }
 
     #[test]
     fn a_v6_block_never_contains_a_v4_address_even_at_slash_zero() {
         // `::/0` covers every *v6* address. Read as "everything" it would turn a
         // well-intentioned dual-stack allowlist into a universal bypass.
-        assert!(!cidr_contains("::/0", "203.0.113.9".parse().expect("a literal")));
-        assert!(!cidr_contains("0.0.0.0/0", "2001:db8::1".parse().expect("a literal")));
-        assert!(cidr_contains("2001:db8::/32", "2001:db8:dead::1".parse().expect("a literal")));
-        assert!(!cidr_contains("2001:db8::/32", "2001:db9::1".parse().expect("a literal")));
+        assert!(!cidr_contains(
+            "::/0",
+            "203.0.113.9".parse().expect("a literal")
+        ));
+        assert!(!cidr_contains(
+            "0.0.0.0/0",
+            "2001:db8::1".parse().expect("a literal")
+        ));
+        assert!(cidr_contains(
+            "2001:db8::/32",
+            "2001:db8:dead::1".parse().expect("a literal")
+        ));
+        assert!(!cidr_contains(
+            "2001:db8::/32",
+            "2001:db9::1".parse().expect("a literal")
+        ));
     }
 
     #[test]
@@ -475,7 +515,10 @@ mod tests {
     #[test]
     fn the_global_star_grants_exactly_one_key_and_is_visible_in_the_list() {
         let key = AuthenticatedKey {
-            key: ApiKey { scopes: vec!["*".to_owned()], ..key_at(None, None) },
+            key: ApiKey {
+                scopes: vec!["*".to_owned()],
+                ..key_at(None, None)
+            },
             organization_id: Uuid::nil(),
         };
         assert!(key.allows("anything.at.all"));
@@ -485,7 +528,10 @@ mod tests {
     #[test]
     fn a_key_with_no_scopes_says_so_rather_than_rendering_an_empty_string() {
         let key = AuthenticatedKey {
-            key: ApiKey { scopes: Vec::new(), ..key_at(None, None) },
+            key: ApiKey {
+                scopes: Vec::new(),
+                ..key_at(None, None)
+            },
             organization_id: Uuid::nil(),
         };
         assert_eq!(key.scope_list(), "none");
@@ -503,7 +549,10 @@ mod tests {
             KeyRefusal::AddressNotAllowed,
         ] {
             let message = refusal.message();
-            assert!(!message.contains("omn_"), "message leaked a prefix: {message}");
+            assert!(
+                !message.contains("omn_"),
+                "message leaked a prefix: {message}"
+            );
             assert_eq!(refusal.status(), 401);
             assert!(!refusal.into_error().to_string().contains("omn_"));
         }

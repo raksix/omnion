@@ -462,6 +462,25 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "developer",
         description: "Create, rotate and revoke API keys",
     },
+    // The API Explorer (REQ-033, slice 2). Two keys and the split is the one that makes the
+    // Explorer safe rather than interesting: **browsing** the document is reading the platform's
+    // own shape, which is the same question as reading a key's metadata, so it rides
+    // `developer.read` — a manager holds it. **Running** a call is a much larger power even
+    // though it carries no key material, because the caller's *session* is what authorises it:
+    // a developer who can send `DELETE /pages/{id}` from the Explorer is doing that with the
+    // permissions of the person sitting at the screen, and the request file is explicit that a
+    // call the caller could not make from the UI must answer the same `403`. Collapsing both
+    // into one key would have made a read-only role's Explorer a write capability.
+    PermissionDef {
+        key: "developer.read",
+        category: "developer",
+        description: "Browse the API reference and the served OpenAPI document",
+    },
+    PermissionDef {
+        key: "developer.explorer.run",
+        category: "developer",
+        description: "Send API requests from the Explorer as the signed-in caller",
+    },
     // Notifications (docs/requests/REQ-021). Four powers, split by *who is affected* rather
     // than by what the button does:
     //
@@ -802,7 +821,12 @@ mod tests {
         // typo here would read as "permissions are broken" rather than as "a key is missing".
         // The assertion is on the category as well as the key because the panel's role editor
         // groups by it and a key in the wrong category is invisible where the editor looks.
-        for key in ["developer.keys.read", "developer.keys.manage"] {
+        for key in [
+            "developer.keys.read",
+            "developer.keys.manage",
+            "developer.read",
+            "developer.explorer.run",
+        ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
                 Some("developer"),

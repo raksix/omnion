@@ -112,7 +112,10 @@ pub fn verify(secret_half: &str, stored_hash: &str) -> bool {
     if !is_readable_hash(stored_hash) {
         return false;
     }
-    hash(secret_half).as_bytes().ct_eq(stored_hash.as_bytes()).into()
+    hash(secret_half)
+        .as_bytes()
+        .ct_eq(stored_hash.as_bytes())
+        .into()
 }
 
 /// Split a wire-form token into its public prefix and secret half.

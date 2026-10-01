@@ -30,11 +30,14 @@
 pub mod authn;
 pub mod error;
 pub mod model;
+pub mod openapi;
 pub mod secret;
 #[cfg(feature = "store")]
 pub mod store;
 
-pub use authn::{AuthenticatedKey, KeyRefusal, address_allowed, cidr_contains, decide, scope_allows};
+pub use authn::{
+    AuthenticatedKey, KeyRefusal, address_allowed, cidr_contains, decide, scope_allows,
+};
 pub use error::{DeveloperError, Result};
 pub use model::{
     ApiKey, Environment, KeyStatus, Minted, NewKey, RateTier, RequestLog, RequestLogPage,
