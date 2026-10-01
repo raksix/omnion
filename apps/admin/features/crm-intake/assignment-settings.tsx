@@ -71,8 +71,29 @@ interface SimulateOutcome {
 interface SimulateAnswer {
   outcome: SimulateOutcome;
   input_read: Record<string, string | boolean | null>;
+  /** Keys the paste carried that no rule can see. Empty is the healthy answer. */
+  unread: UnreadKey[];
+  readable_keys: ReadableKey[];
   rules_considered: number;
   wrote_nothing: boolean;
+}
+
+/** A key the paste carried that no condition reads, and the alias it probably meant. */
+interface UnreadKey {
+  key: string;
+  did_you_mean: string | null;
+}
+
+/**
+ * What the payload reader accepts, per condition key, as the server publishes it.
+ *
+ * The list is **fetched, not written here**, for the same reason the target picker is: the
+ * reader and the validator must be the same table, and a fourth copy in this file would be
+ * the one that drifts — the reader would gain an alias and the panel's hint would not.
+ */
+interface ReadableKey {
+  condition: string;
+  aliases: string[];
 }
 
 /** The closed list the database enforces, fetched rather than hard-coded. */
@@ -106,6 +127,13 @@ const CONDITION_KEYS: { key: string; label: string; hint: string }[] = [
 // -------------------------------------------------------------------------------------------
 
 export function AssignmentSettings() {
+  // The live editor's form, lifted so the simulator can evaluate an unsaved rule against the
+  // saved chain. Kept separate from `editing` on purpose: `editing` is *which* rule is open
+  // (a saved row, or "new"), and the thing the simulator needs is the form as it stands right
+  // now — the two differ on every keystroke, and reading the saved row would answer about a
+  // rule the operator has already changed.
+  const [draftPreview, setDraftPreview] = useState<RuleDraft | null>(null);
+
   const [rules, setRules] = useState<AssignmentRule[] | null>(null);
   const [targets, setTargets] = useState<Targets | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -332,18 +360,48 @@ export function AssignmentSettings() {
         </ol>
       )}
 
-      <Simulator targets={targets ?? []} />
+      <Simulator targets={targets ?? []} draft={draftPreview} />
 
       {editing ? (
         <RuleEditor
           draft={editing === "new" ? null : editing}
           targets={targets ?? []}
-          onCancel={() => setEditing(null)}
+          onPreview={setDraftPreview}
+          onCancel={() => {
+            setEditing(null);
+            setDraftPreview(null);
+          }}
           onSave={(draft) => void save(draft)}
         />
       ) : null}
     </div>
   );
+}
+
+/**
+ * The editor's form as the simulator sends it.
+ *
+ * Two conversions happen here and both are the alternative to a server-side guess. `id` is
+ * dropped because a draft is not a rule yet — the server gives it `Uuid::nil()` and names it
+ * "(unsaved)", so sending one would suggest the server reads it. And a ticked-but-blank
+ * condition is dropped rather than sent as an empty list, for the reason the editor's own
+ * `submit` gives: an empty list matches nothing, so sending it would let the simulator
+ * answer "your rule matches nothing" for a form the operator is still filling in.
+ */
+function draftToServer(draft: RuleDraft): Record<string, unknown> {
+  const conditions: Record<string, string[]> = {};
+  for (const { key } of CONDITION_KEYS) {
+    const values = draft.conditions[key];
+    if (values && values.length > 0) conditions[key] = values;
+  }
+  return {
+    name: draft.name.trim() || "Untitled draft",
+    conditions,
+    target_kind: draft.target_kind,
+    target_user_id: draft.target_kind === "user" ? draft.target_user_id.trim() || null : null,
+    pool_user_ids: draft.target_kind === "pool" ? draft.pool_user_ids : [],
+    active: draft.active,
+  };
 }
 
 function short(id: string | null | undefined): string {
@@ -401,8 +459,27 @@ function RulesSkeleton() {
  * The "why not" list is the feature. An operator who adds a country rule and sees it not fire
  * needs to know *which* condition it was that did not match, and the server names it in
  * `failed_on`, so the screen shows that string rather than a generic "did not match".
+ *
+ * **Two questions, and the second one is the one a skip list cannot answer.** The skip list
+ * names the *rule's* condition, which reads as "your rule is wrong". Usually the rule is
+ * right and the *paste* is the problem: `contury` is a key the reader does not know, the
+ * evaluator sees no country at all, and the skip list then confidently blames the rule. The
+ * `unread` block is the answer to that, and it is rendered above the winner so it is read
+ * first — an answer about the input belongs above the answer about the chain.
+ *
+ * The draft box is why this is worth opening *before* saving: an unsaved rule is evaluated
+ * at position −1 through the same validator a save would use, so the screen refuses exactly
+ * what the save refuses rather than accepting a rule the editor will reject a round trip
+ * later. The server has carried that field since the endpoint shipped; this is its first
+ * caller.
  */
-function Simulator({ targets }: { targets: string[] }) {
+function Simulator({
+  targets,
+  draft,
+}: {
+  targets: string[];
+  draft: RuleDraft | null;
+}) {
   const [payload, setPayload] = useState("{\n  \"country\": \"TR\",\n  \"email\": \"visitor@example.invalid\"\n}");
   const [answer, setAnswer] = useState<SimulateAnswer | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -415,7 +492,13 @@ function Simulator({ targets }: { targets: string[] }) {
       setAnswer(
         await request<SimulateAnswer>("/api/v1/crm/assignment/simulate", {
           method: "POST",
-          body: JSON.stringify({ payload: parsed }),
+          body: JSON.stringify({
+            payload: parsed,
+            // Only sent while the editor is open. The rules are the same rows either way;
+            // the draft is prepended at position −1 so "let me try this one first" means
+            // what it says to the person typing it.
+            ...(draft ? { draft: draftToServer(draft) } : {}),
+          }),
         }),
       );
       setError(null);
@@ -446,6 +529,18 @@ function Simulator({ targets }: { targets: string[] }) {
           Paste a submission and see which rule would win. This writes nothing and does not
           advance the round-robin cursor, so running it never changes who gets the next lead.
         </p>
+        {draft ? (
+          <p className="mt-1 text-[11.5px] text-muted" data-testid="simulator-draft-note">
+            {draft.name ? (
+              <>
+                Evaluating the unsaved rule <span className="text-ink">{draft.name}</span>{" "}
+                above every saved rule.
+              </>
+            ) : (
+              "Evaluating the unsaved rule above every saved rule — give it a name to see it named back."
+            )}
+          </p>
+        ) : null}
       </div>
 
       <textarea
@@ -490,6 +585,11 @@ function SimulatorResult({ answer }: { answer: SimulateAnswer }) {
   const { outcome } = answer;
   return (
     <div className="space-y-2" data-testid="simulator-result">
+      {/* The input verdict comes first, because it can invalidate the rest. An operator who
+          pastes `contury` and reads "your country rule did not match" edits the rule; told
+          first that the paste was never read, they fix the paste. */}
+      <UnreadKeys unread={answer.unread} readable={answer.readable_keys} />
+
       <p
         data-testid="simulator-winner"
         className="rounded-md border border-line bg-line/20 px-3 py-2 text-[12.5px] text-ink"
@@ -524,10 +624,106 @@ function SimulatorResult({ answer }: { answer: SimulateAnswer }) {
         </ul>
       ) : null}
 
+      <InputRead read={answer.input_read} />
+
       <p className="text-[11px] text-muted">
         {answer.rules_considered} rule{answer.rules_considered === 1 ? "" : "s"} considered ·{" "}
         {answer.wrote_nothing ? "nothing was written" : "something was written"}
       </p>
+    </div>
+  );
+}
+
+/**
+ * The keys the paste carried that no rule can see.
+ *
+ * This is the only place a simulator can catch "you spelled it wrong", because the rule list
+ * answers a different question: it explains why a *rule* lost, and it will happily blame the
+ * rule for a payload the reader never understood. Rendered as a warning rather than as a
+ * refusal — an unread key is frequently harmless (`utm_source` is genuinely not a condition),
+ * and a screen that blocks on it would be teaching operators to ignore the block.
+ *
+ * The readable vocabulary is rendered from the server's own answer rather than from a list in
+ * this file, so the hint and the reader cannot drift apart.
+ */
+function UnreadKeys({ unread, readable }: { unread: UnreadKey[]; readable: ReadableKey[] }) {
+  const spellings = readable.flatMap((row) => row.aliases);
+  return (
+    <div data-testid="simulator-unread">
+      {unread.length === 0 ? (
+        <p className="text-[11.5px] text-muted">
+          Every key in this payload is one a rule can read.
+        </p>
+      ) : (
+        <>
+          <p
+            role="alert"
+            data-testid="simulator-unread-warning"
+            className="rounded-md border border-danger/40 bg-danger/5 px-3 py-2 text-[12px] text-danger"
+          >
+            {unread.length} key{unread.length === 1 ? "" : "s"} in this payload{" "}
+            {unread.length === 1 ? "is" : "are"} not read by any rule
+            {unread.some((u) => u.did_you_mean) ? " — check the spelling below" : ""}.
+          </p>
+          <ul className="space-y-1" data-testid="simulator-unread-list">
+            {unread.map((key) => (
+              <li key={key.key} data-testid="simulator-unread-key" className="text-[11.5px]">
+                <code className="text-ink">{key.key}</code>{" "}
+                {key.did_you_mean ? (
+                  <>
+                    is not a key any rule reads — did you mean{" "}
+                    <code className="text-ink">{key.did_you_mean}</code>?
+                  </>
+                ) : (
+                  <span className="text-muted">
+                    is not a key any rule reads
+                    {spellings.length ? (
+                      <>
+                        {" "}
+                        (the reader looks for {spellings.slice(0, 6).join(", ")}
+                        {spellings.length > 6 ? ", …" : ""})
+                      </>
+                    ) : null}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * What the evaluator actually read, one line per condition key.
+ *
+ * Without it the only view of the input is what the operator typed, and the two differ
+ * whenever a key was ignored — which is exactly the case the unread block is about, so
+ * printing "country: not found" beside the warning is what turns a guess into a fact.
+ */
+function InputRead({ read }: { read: Record<string, string | boolean | null> }) {
+  const rows = Object.entries(read);
+  if (!rows.length) return null;
+  return (
+    <div className="text-[11px]" data-testid="simulator-input-read">
+      <p className="text-muted">What the evaluator read:</p>
+      <ul className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5 text-muted">
+        {rows.map(([key, value]) => (
+          <li key={key} data-testid="simulator-input-read-item" data-condition={key}>
+            <code>{key}</code>:{" "}
+            <span className="text-ink" data-absent={value === null || value === undefined}>
+              {value === null || value === undefined
+                ? "not found"
+                : value === false
+                  ? "no"
+                  : value === true
+                    ? "yes"
+                    : String(value)}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -561,11 +757,14 @@ interface RuleDraft {
 function RuleEditor({
   draft,
   targets,
+  onPreview,
   onCancel,
   onSave,
 }: {
   draft: AssignmentRule | null;
   targets: string[];
+  /** Publish the form as it stands so the simulator can evaluate it without saving it. */
+  onPreview: (draft: RuleDraft) => void;
   onCancel: () => void;
   onSave: (draft: RuleDraft) => void;
 }) {
@@ -611,6 +810,35 @@ function RuleEditor({
     emptyKeys.length === 0 &&
     (form.target_kind !== "user" || form.target_user_id.trim().length > 0) &&
     (form.target_kind !== "pool" || form.pool_user_ids.length > 0);
+
+  // The pool textarea is free text, so the parsed members have to be folded back into the
+  // form before the preview can be right — otherwise the simulator would evaluate a pool of
+  // zero against a textarea listing three people, and report a rule as dead for the reason
+  // that the control above it is a textarea. Publishing on every keystroke is free here: the
+  // simulator only reads it when someone presses Run.
+  const poolIds = useMemo(
+    () =>
+      poolText
+        .split(/[\s,]+/)
+        .map((v) => v.trim())
+        .filter(Boolean),
+    [poolText],
+  );
+
+  const live: RuleDraft = useMemo(
+    () => ({
+      ...form,
+      pool_user_ids: form.target_kind === "pool" ? poolIds : [],
+      // An empty name would be refused by the save, and the simulator must refuse it too —
+      // a preview that names a rule the editor cannot save is the licence this REQ forbids.
+      name: form.name.trim(),
+    }),
+    [form, poolIds],
+  );
+
+  useEffect(() => {
+    onPreview(live);
+  }, [live, onPreview]);
 
   const submit = () => {
     // A ticked-but-blank key is dropped rather than sent as an empty list: the editor
