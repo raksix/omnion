@@ -34,7 +34,31 @@ const { chromium } = require("playwright-core");
 
 // ---------------------------------------------------------------- args / env
 
+/**
+ * `--name value` AND `--name=value`, because `run.sh` builds the second spelling
+ * (`QA_ONLY_ARGS=(--only="$QA_ONLY")`) and this function used to read only the first.
+ *
+ * The two spellings are not interchangeable and the gap between them was silent. `indexOf`
+ * compares whole argv tokens, so `--only=block-editor` was never found as `--only`: the fallback
+ * fired, `ONLY` became `["all"]`, and every pass was "wanted" again. A scoped pass meant to take
+ * minutes walked the whole box for 45 — and, far worse, none of the fourteen depth-pass entry
+ * points matched either, so the demanded-keys `summary.json` was never written. The pass
+ * reported nothing at all about the screen it was queued to measure. Nothing about that read as
+ * a broken filter; it read as a slow pass.
+ *
+ * The equality form is matched FIRST because it cannot be mistaken for a value: `--only` followed
+ * by another flag would otherwise swallow that flag as the option's argument.
+ */
 function arg(name, fallback) {
+  // `findIndex(t => t.startsWith(...))`, NOT `indexOf`: indexOf compares whole argv tokens, so
+  // it can only ever match the literal string "--only=", which is not a token anyone passes.
+  // The prefix search is what makes the equality spelling reachable at all.
+  const prefix = `--${name}=`;
+  const eq = process.argv.findIndex((token) => typeof token === "string" && token.startsWith(prefix));
+  if (eq !== -1) {
+    const inline = process.argv[eq].slice(prefix.length);
+    if (inline) return inline;
+  }
   const i = process.argv.indexOf(`--${name}`);
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
@@ -91,6 +115,103 @@ const ONLY_ALL = ONLY.includes("all");
 const wants = (name) => ONLY_ALL || ONLY.includes(name);
 /** Every route/depth-pass name this pass actually walked, so an unmatched filter is visible. */
 const matchedOnly = new Set();
+/**
+ * Whether a DEPTH PASS was asked for by name — the fifteen entry points that run one pass and
+ * end the process.
+ *
+ * These were `process.argv.includes("--only=block-editor")`: a literal string compared against
+ * whole argv tokens, which only ever matches a pass invoked as a single `--only=<name>` with
+ * nothing else in the filter. So the form `run.sh` actually emits — `--only=block-editor,members`
+ * — entered NO depth pass at all, and because each of these blocks ends in `return`, the pass
+ * neither skipped them nor reported them: it walked the whole box for 45 minutes and wrote no
+ * `summary.json` for the screen it was queued to measure. That is why REQ-063's acceptance 17
+ * sat unmeasured for three ticks under a status line blaming a slow pass. Nothing about it read
+ * as a broken filter.
+ *
+ * Membership of the PARSED list is the honest question, and it composes: `--only=a,b` must run
+ * both. `ONLY_ALL` is deliberately not consulted — on a full pass these blocks are not reached,
+ * and consulting it here would cut the rest of the walk off.
+ */
+const onlyEntry = (name) => ONLY.includes(name);
+/** Whether this entry point is the last of the ones `--only` asked for. */
+const isLastEntry = (name) => ONLY[ONLY.length - 1] === name;
+/**
+ * The worst exit code seen so far, so `--only=a,b` cannot exit green on `b` while `a` was red.
+ */
+let SCOPED_FAILURES = 0;
+/**
+ * Record a scoped pass's outcome, and end the PROCESS only if this is the last pass asked for.
+ *
+ * Six of the entry points used to end in a bare `process.exit`, which is right for one name and
+ * wrong for two: `--only=block-editor,members` would have `block-editor` exit 0 the moment it
+ * finished and `members` would never run at all — a green report for whichever module happened
+ * to be first, and silence about the second.
+ *
+ * A FAILURE still ends the process even mid-list, because there is no point running a second
+ * browser pass against a stack whose first pass died. A clean exit waits for its turn, carrying
+ * whatever the earlier passes recorded.
+ */
+function exitScoped(name, code = 0) {
+  if (code !== 0) SCOPED_FAILURES = Math.max(SCOPED_FAILURES, code || 1);
+  // A FAILURE ends the process even mid-list. There is nothing to gain by running a second
+  // browser pass against a stack whose first pass died — the database is mid-migration, the API
+  // is answering from a half-written tree, and the second pass's own report would then be a
+  // measurement of that wreckage. A clean exit, by contrast, waits its turn.
+  if (code !== 0) process.exit(SCOPED_FAILURES);
+  if (!isLastEntry(name)) return false;
+  process.exit(SCOPED_FAILURES);
+  return true;
+}
+/**
+ * Everything the fourteen entry points used to repeat: write the summary, close the browser,
+ * exit with a code.
+ *
+ * Composing `--only=a,b` is not optional, and every one of these three details has to be right or
+ * the composed pass lies in a different direction each time.
+ *
+ * - **The summary is MERGED.** `writeFileSync` of a whole document overwrites, so a second pass
+ *   writing its own would delete the first's keys with no error and no finding — a green report
+ *   for one module where two were asked for. `missing` is concatenated, because a name absent
+ *   from `missing` is being reported on, and two passes each reporting their own count is the
+ *   only way a combined pass can be honest.
+ * - **The browser closes only on the LAST entry.** Each block tears it down on its way out,
+ *   which is correct for one name and a bug for two: the second pass would navigate with a
+ *   closed context and fail its first click, reporting one module green and the other as an
+ *   ordinary failed pass.
+ * - **The exit code carries earlier failures.** Otherwise the combined pass exits green because
+ *   the LAST module was green while the first was red.
+ *
+ * The payload stays the JSON STRING each site already built, so composing the entry points is a
+ * change to this one function rather than a rewrite of fourteen call sites.
+ */
+function finishScopedPass(name, summaryJson, code = 0) {
+  const file = path.join(OUT, "summary.json");
+  let prev = {};
+  try {
+    prev = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    // A first pass, or a truncated file from a pass that died mid-write. Either way there is
+    // nothing to merge with, and failing to parse IS the answer rather than an error.
+    prev = {};
+  }
+  const mine = typeof summaryJson === "string" ? JSON.parse(summaryJson) : summaryJson || {};
+  const prevNames = Array.isArray(prev.scoped) ? prev.scoped : prev.scoped ? [prev.scoped] : [];
+  const prevMissing = Array.isArray(prev.missing) ? prev.missing : [];
+  const merged = {
+    ...mine,
+    mode: mine.mode || `--only=${name}`,
+    scoped: prevNames.includes(name) ? prevNames : [...prevNames, name],
+    total: (Number(prev.total) || 0) + (Number(mine.total) || 0),
+    passed: (Number(prev.passed) || 0) + (Number(mine.passed) || 0),
+    missing: [...new Set([...prevMissing, ...(mine.missing || [])])],
+    // Each pass keeps its own steps under its own name, so a merged report shows both rather
+    // than one pass's steps under a merged `steps` key that belongs to whichever wrote last.
+    stepsByPass: { ...(prev.stepsByPass || {}), [name]: mine.steps ?? mine },
+  };
+  fs.writeFileSync(file, JSON.stringify(merged, null, 2));
+  if (!isLastEntry(name)) return;
+  return browser.close().catch(() => {});
+}
 /** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
 const MOBILE_NAMES = new Set();
 /**
@@ -11285,19 +11406,17 @@ async function main() {
   // `--only=wizard` re-checks the first-run flow on its own (reset the database first): it drives
   // the steps, then reports what the onboarding endpoints answered. A full pass is minutes; this is
   // the tool for "did the setup step just get refused?".
-  if (process.argv.includes("--only=wizard")) {
+  if (onlyEntry("wizard")) {
     const onboardingFailures = netFailures.filter((f) => String(f.url || "").includes("/onboarding/"));
     const finished = await page
       .evaluate(() => /Your installation is ready/i.test(document.body.innerText))
       .catch(() => false);
     const away = !page.url().includes("/setup");
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("wizard",
       JSON.stringify({ ...report, netFailures, onboardingFailures, wizardFinished: finished, wizardAway: away }, null, 2),
     );
     console.log(`WIZARD_ONBOARDING_FAILURES=${onboardingFailures.length} WIZARD_FINISHED=${finished} WIZARD_LEFT_SETUP=${away}`);
-    await browser.close();
-    process.exit(onboardingFailures.length === 0 ? 0 : 1);
+    exitScoped("wizard", onboardingFailures.length === 0 ? 0 : 1);
   }
 
   const signedIn = await ensureSignedIn(page, report);
@@ -11330,7 +11449,7 @@ async function main() {
   //
   // So the depth passes get their own entry point: sign in, run them, report, exit. Minutes
   // instead of an hour, and it cannot be taken down by what happens on another stack.
-  if (process.argv.includes("--only=block-editor")) {
+  if (onlyEntry("block-editor")) {
     report.blockEditor = await runBlockEditorDepth(page, report);
     log(`block editor: ${JSON.stringify(report.blockEditor)}`);
     report.patterns = await runPatternDepth(page, report);
@@ -11378,15 +11497,13 @@ async function main() {
     if (be.warningJumpOffered === true && be.warningReachable === undefined) {
       missing.push("warningReachable");
     }
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("block-editor",
       JSON.stringify({ mode: "block-editor-only", netFailures, blockEditor: be, patterns: report.patterns, missing }, null, 2),
     );
     console.log(`BLOCK_EDITOR_JSON=${JSON.stringify(be)}`);
     console.log(`BLOCK_EDITOR_MISSING=${missing.length === 0 ? "none" : missing.join(",")}`);
     console.log(`BLOCK_EDITOR_CREATED=${be.created === true} PUBLIC_RENDERED=${be.publicRendered === true}`);
-    await browser.close();
-    process.exit(0);
+    exitScoped("block-editor", 0);
   }
 
   // `--only=menus` runs the navigation and queue depth pass alone.
@@ -11433,7 +11550,7 @@ async function main() {
   // only thing that will ever click *Activate* and *Restore previous* in a browser, and a
   // rollback path that throws a ReferenceError on its first write is indistinguishable from a
   // screen that was never implemented.
-  if (process.argv.includes("--only=themes")) {
+  if (onlyEntry("themes")) {
     report.themes = await runThemesDepth(page, report);
     log(`themes: ${JSON.stringify(report.themes)}`);
     const required = [
@@ -11448,8 +11565,7 @@ async function main() {
     ];
     const themeSteps = report.themes || {};
     const missing = required.filter((key) => themeSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("themes",
       JSON.stringify(
         {
           mode: "--only=themes",
@@ -11467,13 +11583,12 @@ async function main() {
     } else {
       log(`themes depth pass ${required.length}/${required.length}`);
     }
-    await page.context().browser()?.close().catch(() => {});
     return;
   }
   // `--only=theme-settings` runs the customize + history depth pass alone. Same argument as
   // `--only=themes`: it is the only thing in a browser that will ever click Publish and
   // Restore on a settings screen, and those two paths are the ones a store test cannot see.
-  if (process.argv.includes("--only=theme-settings")) {
+  if (onlyEntry("theme-settings")) {
     report.themeSettings = await runThemeSettingsDepth(page, report);
     log(`themeSettings: ${JSON.stringify(report.themeSettings)}`);
     const required = [
@@ -11497,8 +11612,7 @@ async function main() {
     ];
     const settingsSteps = report.themeSettings || {};
     const missing = required.filter((key) => settingsSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("theme-settings",
       JSON.stringify(
         {
           mode: "--only=theme-settings",
@@ -11516,7 +11630,6 @@ async function main() {
     } else {
       log(`theme settings depth pass ${required.length}/${required.length}`);
     }
-    await page.context().browser()?.close().catch(() => {});
     return;
   }
   // `--only=theme-builder` runs the slice-3 depth pass alone: the eight-slot builder and the
@@ -11524,7 +11637,7 @@ async function main() {
   // package refusal and an install are four things no store test can be sure the PANEL does,
   // because the API is correct whether or not the button is wired to it. That is exactly how
   // the gallery's delete control spent a slice rendering with no handler at all.
-  if (process.argv.includes("--only=theme-builder")) {
+  if (onlyEntry("theme-builder")) {
     report.themeBuilder = await runThemeBuilderDepth(page, report);
     log(`themeBuilder: ${JSON.stringify(report.themeBuilder)}`);
     const required = [
@@ -11552,8 +11665,7 @@ async function main() {
     ];
     const builderSteps = report.themeBuilder || {};
     const missing = required.filter((key) => builderSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("theme-builder",
       JSON.stringify(
         {
           mode: "--only=theme-builder",
@@ -11571,19 +11683,18 @@ async function main() {
     } else {
       log(`theme builder depth pass ${required.length}/${required.length}`);
     }
-    await page.context().browser()?.close().catch(() => {});
     // A scoped pass that did not run its steps is a FAILED pass, not a pass with nothing to
     // report. `run.sh` runs under `set -e`, so returning here made "the QA site does not
     // exist" exit 0 — a green result for a pass that checked nothing, which is how 59 skipped
     // steps came to be read as a pass on 2026-09-30. A missing step now ends the process.
-    if (missing.length > 0) process.exit(4);
+    if (missing.length > 0) scopedFail("theme-builder", 4);
     return;
   }
   // `--only=theme-render` draws all ten bundled themes in the public site. Split out from the
   // builder pass for the same reason every other scoped pass exists (a full pass is cut down
   // halfway) and for one more: this pass is the only place in the harness that needs twenty
   // public renders, and folding them into an hour-long pass buries the one claim it makes.
-  if (process.argv.includes("--only=theme-render")) {
+  if (onlyEntry("theme-render")) {
     report.themeRender = await runThemeRenderPass(page, report);
     log(`themeRender: ${JSON.stringify(report.themeRender)}`);
     const required = [
@@ -11593,8 +11704,7 @@ async function main() {
     ];
     const renderSteps = report.themeRender || {};
     const missing = required.filter((key) => renderSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("theme-render",
       JSON.stringify(
         {
           mode: "--only=theme-render",
@@ -11612,11 +11722,10 @@ async function main() {
     } else {
       log(`theme render pass ${required.length}/${required.length}`);
     }
-    await page.context().browser()?.close().catch(() => {});
-    if (missing.length > 0) process.exit(4);
+    if (missing.length > 0) scopedFail("theme-render", 4);
     return;
   }
-  if (process.argv.includes("--only=newsletter")) {
+  if (onlyEntry("newsletter")) {
     report.newsletter = await runNewsletterDepth(page, report);
     log(`newsletter: ${JSON.stringify(report.newsletter)}`);
     const required = [
@@ -11638,8 +11747,7 @@ async function main() {
     ];
     const newsletterSteps = report.newsletter || {};
     const missing = required.filter((key) => newsletterSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("newsletter",
       JSON.stringify(
         {
           mode: "--only=newsletter",
@@ -11657,10 +11765,9 @@ async function main() {
     } else {
       log(`newsletter depth pass ${required.length}/${required.length}`);
     }
-    await page.context().browser()?.close().catch(() => {});
     return;
   }
-  if (process.argv.includes("--only=content-api")) {
+  if (onlyEntry("content-api")) {
     report.contentApi = await runContentApiDepth(page, report);
     log(`content-api: ${JSON.stringify(report.contentApi)}`);
     // The pass's own `steps.*` vocabulary, read off the function. `documented_*` is generated
@@ -11698,8 +11805,7 @@ async function main() {
     // screen renders, so this cannot pass against a hard-coded list of six ids.
     const documentedRows = Object.keys(apiSteps).filter((key) => key.startsWith("documented_"));
     const undocumentedRows = documentedRows.filter((key) => apiSteps[key] !== true);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("content-api",
       JSON.stringify(
         {
           mode: "--only=content-api",
@@ -11727,10 +11833,9 @@ async function main() {
           ` · ${documentedRows.length} endpoints documented`,
       );
     }
-    await page.context().browser()?.close().catch(() => {});
     return;
   }
-  if (process.argv.includes("--only=comments")) {
+  if (onlyEntry("comments")) {
     report.comments = await runCommentsDepth(page, report);
     log(`comments: ${JSON.stringify(report.comments)}`);
     const required = [
@@ -11748,8 +11853,7 @@ async function main() {
     ];
     const commentSteps = report.comments || {};
     const missing = required.filter((key) => commentSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("comments",
       JSON.stringify(
         {
           mode: "--only=comments",
@@ -11767,7 +11871,6 @@ async function main() {
     } else {
       log(`comments depth pass ${required.length}/${required.length}`);
     }
-    await page.context().browser()?.close().catch(() => {});
     return;
   }
   // `--only=featured-media` runs a page's featured-image depth pass alone.
@@ -11777,7 +11880,7 @@ async function main() {
   // the database on its way, so a trashed-file assertion in the full pass is at the mercy of
   // whatever the pass happens to do next. Driving it alone makes the sequence deterministic.
   // It runs the SAME function the full pass calls.
-  if (process.argv.includes("--only=featured-media")) {
+  if (onlyEntry("featured-media")) {
     report.featuredMedia = await runFeaturedMediaDepth(page, report);
     log(`featured media: ${JSON.stringify(report.featuredMedia)}`);
     // The list is the pass's own vocabulary. Every name here was a claim worth making, and a name
@@ -11811,8 +11914,7 @@ async function main() {
     ];
     const featuredSteps = report.featuredMedia || {};
     const missing = required.filter((key) => featuredSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("featured-media",
       JSON.stringify(
         {
           mode: "--only=featured-media",
@@ -11830,10 +11932,9 @@ async function main() {
     } else {
       log(`featured media depth pass ${required.length}/${required.length}`);
     }
-    await page.context().browser()?.close().catch(() => {});
     return;
   }
-  if (process.argv.includes("--only=members")) {
+  if (onlyEntry("members")) {
     report.members = await runMembersDepth(page, report);
     log(`members: ${JSON.stringify(report.members)}`);
     // The list is the pass's own vocabulary. Every name here was a claim worth making, and a
@@ -11873,8 +11974,7 @@ async function main() {
       required.push("drawerOpenedAt390", "drawerFitsAt390");
     }
     const missing = required.filter((key) => memberSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("members",
       JSON.stringify(
         {
           mode: "--only=members",
@@ -11892,10 +11992,9 @@ async function main() {
     } else {
       log(`members depth pass ${required.length}/${required.length}`);
     }
-    await page.context().browser()?.close().catch(() => {});
     return;
   }
-  if (process.argv.includes("--only=seo")) {
+  if (onlyEntry("seo")) {
     report.seo = await runSeoDepth(page, report);
     log(`seo: ${JSON.stringify(report.seo)}`);
     // The list below is the pass's own vocabulary, read off the function rather than guessed.
@@ -11913,8 +12012,7 @@ async function main() {
     ];
     const seoSteps = report.seo || {};
     const missing = required.filter((key) => seoSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("seo",
       JSON.stringify(
         {
           mode: "--only=seo",
@@ -11932,10 +12030,9 @@ async function main() {
     } else {
       log(`seo depth pass ${required.length}/${required.length}`);
     }
-    await page.context().browser()?.close().catch(() => {});
     return;
   }
-  if (process.argv.includes("--only=forms")) {
+  if (onlyEntry("forms")) {
     report.forms = await runFormsDepth(page, report);
     log(`forms: ${JSON.stringify(report.forms)}`);
     // The list below is the pass's own vocabulary, read off the function rather than guessed.
@@ -11965,8 +12062,7 @@ async function main() {
     // into existence would demand checks the function never writes.
     const formSteps = report.forms || {};
     const missing = required.filter((key) => formSteps[key] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("forms",
       JSON.stringify({ mode: "forms-only", netFailures, forms: formSteps, missing }, null, 2),
     );
     console.log(`FORMS_JSON=${JSON.stringify(formSteps)}`);
@@ -11974,11 +12070,10 @@ async function main() {
     console.log(
       `FORMS_CONSOLE_ERRORS=${(report.consoleErrors || []).length} NET_FAILURES=${netFailures.length}`,
     );
-    await browser.close();
-    process.exit(0);
+    exitScoped("forms", 0);
   }
 
-  if (process.argv.includes("--only=menus")) {
+  if (onlyEntry("menus")) {
     report.menus = await runMenusDepth(page, report);
     log(`menus: ${JSON.stringify(report.menus)}`);
     // The names are the pass's own `steps.*` keys, read off the function rather than guessed: a
@@ -12012,8 +12107,7 @@ async function main() {
     // satisfied.
     const menuSteps = report.menus || {};
     const missing = required.filter((f) => menuSteps[f] === undefined);
-    fs.writeFileSync(
-      path.join(OUT, "summary.json"),
+    finishScopedPass("menus",
       JSON.stringify({ mode: "menus-only", netFailures, menus: menuSteps, missing }, null, 2),
     );
     console.log(`MENUS_JSON=${JSON.stringify(menuSteps)}`);
@@ -12021,8 +12115,7 @@ async function main() {
     console.log(
       `MENUS_CONSOLE_ERRORS=${(report.consoleErrors || []).length} NET_FAILURES=${netFailures.length}`,
     );
-    await browser.close();
-    process.exit(missing.length === 0 ? 0 : 1);
+    exitScoped("menus", missing.length === 0 ? 0 : 1);
   }
 
   // The analytics batch goes in before the routes are walked: the report screens read it, and the

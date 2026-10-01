@@ -79,6 +79,17 @@ if [ "${QA_SLOTS:-1}" != "0" ]; then
   # look identical to a box that is simply too loaded to walk anything.
   step "testing the QA slot"
   bash "$(dirname "${BASH_SOURCE[0]}")/test-qa-slot.sh" || echo "[qa] slot test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The `--only` filter's own regression test, for the same reason and with more force.
+  #
+  # This one guards the instrument every scoped pass depends on, and its failure mode is the
+  # most expensive kind there is: a filter that silently matches nothing does not fail the pass,
+  # it makes the pass run something ELSE. For three ticks that made a scoped pass walk the whole
+  # box and write no report, and the only symptom was "the pass takes too long" — which reads as
+  # a scheduling fact, so nobody looked at the filter. The test extracts the REAL helpers out of
+  # `walkthrough.cjs` rather than reimplementing them, because a copy keeps passing after the
+  # original regresses, which is exactly the thing it exists to catch.
+  step "testing the --only filter"
+  node "$(dirname "${BASH_SOURCE[0]}")/test-only-filter.cjs" || echo "[qa] --only filter test reported failures (continuing: a broken test is not a reason to skip a pass)"
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
   # QA_SLOT_OWNER_PID is THIS shell's pid, so the slot can tell a place whose pass is still alive
   # from one whose pass was killed without running its EXIT trap. Without it the holder is the
