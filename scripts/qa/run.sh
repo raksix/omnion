@@ -280,6 +280,31 @@ const doc = [
   `- Console errors: ${summary.counts?.consoleErrors ?? 0} · failed requests: ${summary.counts?.failedRequests ?? 0} · dialogs: ${summary.counts?.dialogs ?? 0}`,
   `- Programmatic findings: ${summary.findings?.length ?? 0} (high ${summary.bySeverity?.high ?? 0} · medium ${summary.bySeverity?.medium ?? 0} · low ${summary.bySeverity?.low ?? 0})`,
   `- Vision issues: ${vision.issues ? vision.issues.length : "skipped"}${vision.skipped ? ` (${vision.skipped})` : ""}`,
+  // A `?? 0` default is how a run that MEASURED NOTHING became indistinguishable from a run that
+  // measured nothing wrong: on 2026-10-01 this file was regenerated from a `summary.json` that
+  // held only `{"fatal": ...}`, and every `?? 0` filled in a clean pass — "0 clicks · 0
+  // screenshots · 0 findings" — over a pass that had taken 232 screenshots and found a crash.
+  // A missing key is not a zero; it is the absence of a measurement, and the report says which.
+  // The three cases are kept distinct because they demand different reactions from the reader:
+  // `fatal` = the pass died and nothing is known, `voidReasons` = it ran but cannot be believed,
+  // `reporterFailed` = it measured a full pass and only the last step threw.
+  ...(summary.fatal
+    ? [
+        "",
+        `> **THIS PASS MEASURED NOTHING — it died before it could count anything:** \`${summary.fatal}\``,
+        `> The zeros above are defaults, NOT results. Re-run the pass; do not read this file as a`,
+        `> result for any screen.`,
+      ]
+    : []),
+  ...(summary.reporterFailed
+    ? [
+        "",
+        `> **THE REPORT COULD NOT BE WRITTEN, THE MEASUREMENTS ARE REAL:** \`${summary.reporterFailed}\``,
+        `> The counts and findings above come from \`report.md\` and \`diagnostics.json\` and are`,
+        `> trustworthy; only the human-readable report.md is missing. Read this file, then fix the`,
+        `> reporter.`,
+      ]
+    : []),
   ...(summary.voidReasons && summary.voidReasons.length
     ? [
         "",

@@ -11821,6 +11821,23 @@ async function main() {
   md.push("");
   for (const p of report.pages) {
     const d = p.diagnostics;
+    // Same guard as the findings roll-up above, and for the same reason — but this loop is the
+    // one that decides whether the *report* exists at all, so it is the one that has to be right.
+    //
+    // A page whose walk threw is pushed as `{ ...route, failed }` with no `diagnostics`, so
+    // `d.horizontalOverflow` here is a read off `undefined`. The TypeError is thrown *after*
+    // `summary.json` and `diagnostics.json` are written but *before* `report.md`, so the pass
+    // loses its human-readable report, falls into `main().catch`, and has that catch overwrite
+    // the good `summary.json` with `{ fatal }` — taking the findings it had just computed with
+    // it. That is how a 232-screenshot pass reached `docs/qa/QA-LATEST-w4.md` as a wall of zeros
+    // with a `?` timestamp: every count there was a `?? 0` default reading a file that no
+    // longer had a `counts` key. The page that was unmeasured is already reported above as an
+    // `unmeasured-page` high finding; saying so again here costs nothing and keeps the two
+    // lists consistent.
+    if (!d) {
+      md.push(`- **${p.name}** — **NOT MEASURED**${p.failed ? ` (${p.failed})` : ""} — see the unmeasured-page finding above`);
+      continue;
+    }
     md.push(`- **${p.name}** — overflow: ${d.horizontalOverflow ? "YES" : "no"} · offscreen: ${d.offscreen.length} · broken images: ${d.brokenImages.length} · low contrast: ${d.lowContrast.length} · unlabeled inputs: ${d.unlabeledInputs.length} · duplicate ids: ${d.duplicateIds.length} · h1: ${d.h1Count}`);
   }
   md.push("");
@@ -11860,7 +11877,32 @@ async function main() {
 main().catch(async (err) => {
   console.error("[walk] unexpected failure:", err);
   try {
-    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: String(err) }, null, 2));
+    // Only write the bare `{ fatal }` marker when there is nothing to lose. The reporter's own
+    // markdown loop used to throw after `summary.json` had already been written, so this line
+    // *replaced* a complete summary — counts, findings, per-severity tallies, shots — with a
+    // single field. Everything the pass had learned was gone, and the zeroed report written from
+    // what was left is indistinguishable from a clean run: `docs/qa/QA-LATEST-w4.md` said
+    // "0 clicks · 0 screenshots · 0 findings" for a pass that had taken 232 screenshots. A
+    // failing reporter must not be able to destroy the evidence the reporter was given.
+    const prior = fs.existsSync(path.join(OUT, "summary.json"))
+      ? JSON.parse(fs.readFileSync(path.join(OUT, "summary.json"), "utf8"))
+      : null;
+    const kept = prior && Array.isArray(prior.findings);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        kept
+          ? { ...prior, reporterFailed: String(err) }
+          : { fatal: String(err) },
+        null,
+        2,
+      ),
+    );
+    if (kept) {
+      console.error(
+        `[walk] summary.json kept (${prior.findings.length} finding(s) survived); the failure is recorded as reporterFailed.`,
+      );
+    }
   } catch {
     /* ignore */
   }
