@@ -1000,20 +1000,43 @@ async function interact(page, pageName, report) {
  * only reaches visible controls — so this is the one place the pass sets a file on an input
  * directly, which is exactly what the browser does when a person picks a file. Without it the
  * library stays empty, and an empty library means the search index has no media to answer with.
+ *
+ * `ok` is the only field a caller should branch on, and it means **the file is in the listing** —
+ * not "the bytes were handed to an input". Two of this pass's guards used to read `uploaded.ok`,
+ * a key this never wrote, so `uploaded.ok` was `undefined`, falsy, and `runMediaFileDetail` and
+ * `runMediaShares` bailed with "the upload step did not succeed" on *every* run, including runs
+ * whose artifact showed `uploaded: true, listed: 2`. The report read that as a crowded box; the
+ * file was there the whole time and the guard was reading the wrong key. So: one answer, and the
+ * answer has to be about the library rather than about the act of setting an input.
  */
 async function uploadMediaSample(page, source) {
   const file = source || ensureSamplePng();
 
   const input = page.locator('input[type="file"]').first();
   if ((await input.count()) === 0) {
-    return { uploaded: false, note: "no file input on this screen" };
+    return { ok: false, uploaded: false, listed: 0, note: "no file input on this screen" };
   }
-  await input.setInputFiles(file).catch(() => {});
+  const setOnInput = await input
+    .setInputFiles(file)
+    .then(() => true)
+    .catch((err) => `setInputFiles failed: ${err.message}`);
   await page.waitForTimeout(1600);
+
+  // The listing is the proof, and it is asynchronous: an upload that the server rejected leaves
+  // no row, and a row the server did not accept is what every caller downstream actually needs.
+  let listed = 0;
+  for (let attempt = 0; attempt < 6 && listed === 0; attempt += 1) {
+    listed = await page.locator(`text=${path.basename(file)}`).count().catch(() => 0);
+    if (listed === 0) await page.waitForTimeout(700);
+  }
+
   return {
-    uploaded: true,
+    ok: listed > 0 && setOnInput === true,
+    uploaded: listed > 0,
     file: path.basename(file),
-    listed: await page.locator(`text=${path.basename(file)}`).count(),
+    listed,
+    setOnInput,
+    ...(listed === 0 ? { note: "the file never appeared in the library listing" } : {}),
   };
 }
 
@@ -1817,12 +1840,39 @@ async function runMediaPresets(page, report) {
   const served = await page.evaluate(async (query) => {
     // The library is where a real file id lives; asking for the listing keeps this in the page
     // with the session cookie, so the bytes come from the real API.
+    //
+    // Every `res.json()` is guarded by a content-type check and a `try`. A body that is not
+    // JSON is the *expected* answer when the request never reached the API — a proxy's HTML
+    // error page, or the `Failed to …` string the server answers a crashed upstream with — and
+    // `await res.json()` on it throws `SyntaxError`, which escaped `page.evaluate` and took the
+    // whole depth pass down with it. The last run reported
+    // `page.evaluate: SyntaxError: Unexpected token 'F', "Failed to"... is not valid JSON` and
+    // `steps: 0`, so the preset pass asserted nothing at all and the report called it a failure
+    // of the *screen*. A measurement that cannot survive an error is not a measurement.
+    const readJson = async (res) => {
+      const type = res.headers.get("content-type") || "";
+      if (!type.includes("json")) {
+        const text = (await res.text().catch(() => "")).slice(0, 120);
+        return { __notJson: true, status: res.status, type, text };
+      }
+      try {
+        return await res.json();
+      } catch (err) {
+        return { __notJson: true, status: res.status, type, error: String(err) };
+      }
+    };
+
     const listed = await fetch("/api/v1/media/files?limit=1", { credentials: "same-origin" });
-    const page1 = await listed.json();
+    const page1 = await readJson(listed);
+    if (page1.__notJson) return { ok: false, reason: `listing: ${page1.text || page1.error}` };
     const file = page1.files && page1.files[0];
     if (!file || !query) return { ok: false, reason: "no file or no preset query" };
     const url = `/api/v1/media/${file.id}/raw${query}`;
     const response = await fetch(url, { credentials: "same-origin" });
+    if ((response.headers.get("content-type") || "").includes("json")) {
+      const text = (await response.text().catch(() => "")).slice(0, 120);
+      return { ok: false, reason: `the bytes came back as json: ${text}` };
+    }
     const buffer = new Uint8Array(await response.arrayBuffer());
     return {
       ok: response.ok,
@@ -2447,6 +2497,7 @@ async function uploadDuplicateSample(page) {
   await input.setInputFiles(second).catch(() => {});
   await page.waitForTimeout(1800);
   return {
+    ok: true,
     uploaded: true,
     first: path.basename(file),
     second: path.basename(second),
@@ -2693,8 +2744,21 @@ async function runMediaGrants(page, report) {
   // Removing it is immediate, and the empty state comes back. The confirmation is a
   // `window.confirm` and the harness accepts dialogs globally, so this is one click: a second
   // one would remove a grant that no longer exists and turn a passing check into a 404.
+  //
+  // The wait is on the *condition*, not on a stopwatch. `onRemove` does three things after the
+  // click — the DELETE, the notice, and a full `load()` of the tab — and the last of those is a
+  // network round trip. A fixed 2500 ms asserts against whichever of those three happened to
+  // finish first, so under load the row was still on screen and the pass reported
+  // `afterRemove: 1` as though the remove had failed. That is the same mistake as reading
+  // `uploaded.ok`: the assertion is measuring the clock instead of the thing.
   await page.click('[data-testid="media-grant-remove"]').catch(() => {});
-  await page.waitForTimeout(2500);
+  await page
+    .waitForFunction(
+      () => document.querySelectorAll('[data-testid="media-grant-row"]').length === 0,
+      undefined,
+      { timeout: 15000 },
+    )
+    .catch(() => {});
   const afterRemove = await page.locator('[data-testid="media-grant-row"]').count();
   const afterNotices = await page.locator('[data-testid="media-grants-notice"]').count();
   note({ step: "removed", afterRemove, afterNotices });
