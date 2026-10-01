@@ -79,6 +79,7 @@ import {
   type History,
   type HistorySnapshot,
 } from "./builder-history";
+import { endDrag, beginDrag, type DragOrigin } from "./drag-history";
 import { decideConnection } from "./connect-edge";
 import { readVersionFrom, resolveConflict } from "./conflict";
 import { arbitrateSave } from "./save-arbitration";
@@ -294,6 +295,17 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     id: string;
     offsetX: number;
     offsetY: number;
+    /**
+     * The graph as it was the instant the gesture opened — what one press of undo restores.
+     *
+     * It has to be taken HERE, on the way down, and not reconstructed on the way up: by
+     * `pointerup` every frame has already written the new position, so there is no snapshot of
+     * the old one left to take. That is the whole reason a drag used to be unrecordable, and
+     * reconstructing it instead (`position - delta`) is wrong the moment the drag crosses a
+     * clamp boundary or a snap grid line — wrong silently, which is the only kind of wrong a
+     * user cannot report.
+     */
+    origin: DragOrigin;
   } | null>(null);
   const [panning, setPanning] = useState<{ x: number; y: number; vx: number; vy: number } | null>(null);
 
@@ -822,20 +834,53 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   const moveNode = useCallback(
     (id: string, x: number, y: number) => {
+      const position = { x: clampCoord(snap(x)), y: clampCoord(snap(y)) };
       setNodes((current) =>
-        current.map((node) =>
-          node.id === id
-            ? { ...node, position: { x: clampCoord(snap(x)), y: clampCoord(snap(y)) } }
-            : node,
-        ),
+        current.map((node) => (node.id === id ? { ...node, position } : node)),
       );
+      // The ref is written here as well as through state, for the same reason `addNode` writes
+      // it: `commitMove` snapshots the graph on `pointerup`, and a ref written in a render body
+      // is one render behind the last pointer frame — so the `after` a drag records can be the
+      // position the card started at, which makes the undo a no-op that still enables the button.
+      // This is the only frame-by-frame write in the builder, and it deliberately touches no
+      // history: the gesture is one entry, closed on the release.
+      graphRef.current = {
+        nodes: graphRef.current.nodes.map((node) => (node.id === id ? { ...node, position } : node)),
+        edges: graphRef.current.edges,
+      };
     },
     [],
   );
 
-  const commitMove = useCallback(() => {
-    queueSave();
-  }, [queueSave]);
+  /**
+   * Close a drag as one undoable step.
+   *
+   * This used to be `queueSave()` and nothing else, which is the defect this whole path exists to
+   * fix: the position had already been written to the canvas by `moveNode`, and the history was
+   * never told, so the Undo button stayed grey and `⌘Z` was a no-op for every drag a mouse
+   * author ever made. The arrow-key nudge *was* recorded (it routes through `commit("nudge", …)`),
+   * which is why the module's own tests had been green for a tick while the criterion read
+   * "restore add, move, connect, delete" and move was broken for half the gestures that perform it.
+   *
+   * `origin` is null when the gesture began before the component knew it was a drag, or on a
+   * locked canvas where the pointer-down branch returned before opening one. Recording from a
+   * half-known gesture is worse than not recording: the `before` would be the graph as it is
+   * *now*, which makes an undo that does nothing while the button moves.
+   */
+  const commitMove = useCallback(
+    (origin: DragOrigin | null) => {
+      if (origin) {
+        // Through `endDrag`, not `pushHistory`: the seal is what keeps two quick drags of the
+        // same card from merging into one entry, which would make the position between them
+        // unreachable. `record` alone cannot do it — it compares the window and finds two
+        // same-key edits 300ms apart, and merges them.
+        historyRef.current = endDrag(historyRef.current, origin, currentSnapshot(), Date.now());
+        setHistoryTick((n) => n + 1);
+      }
+      queueSave();
+    },
+    [currentSnapshot, queueSave],
+  );
 
   const updateNode = useCallback(
     (id: string, patch: Partial<GraphNode>) => {
@@ -1103,13 +1148,21 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       if (locked) {
         return;
       }
+      // The gesture opens here, while the pre-drag graph is the only graph there is.
+      //
+      // `ids` is the one card the pointer is on, because that is what a drag moves: `moveNode`
+      // takes a single id, and a group move is the marquee-then-arrow-key path, which routes
+      // through `commit("nudge", …)` and is already recorded. Naming the drawn selection here
+      // would put an id in the history that no pointer frame ever moved, so undo would restore
+      // a card that had not been touched — an undo that *does* something and should not.
       setDragging({
         id: node.id,
         offsetX: (event.clientX - rect.left - viewport.x) / viewport.zoom - node.position.x,
         offsetY: (event.clientY - rect.top - viewport.y) / viewport.zoom - node.position.y,
+        origin: beginDrag([node.id], currentSnapshot()),
       });
     },
-    [locked, viewport],
+    [currentSnapshot, locked, viewport],
   );
 
   const onCanvasPointerDown = useCallback(
@@ -1262,7 +1315,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     }
     if (dragging) {
       setDragging(null);
-      commitMove();
+      commitMove(dragging.origin);
     }
   }, [commitMove, dragging, marquee, marqueeSelection, panning]);
 
