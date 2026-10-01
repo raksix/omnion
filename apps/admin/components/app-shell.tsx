@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Bot, Boxes, ClipboardCheck, Database, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Bot, Boxes, ClipboardCheck, Database, FileDown, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -68,6 +68,10 @@ const NAV = [
   // asking "what changed my database" is mid-deploy, and the answer they need is the pending set
   // and the rehearsed/unrehearsed column — the same three questions the other two answer.
   { href: "/deployment/migrations", label: "Migration ledger", icon: Database },
+  // Anonymised exports sit with the ledger rather than under Settings: a support dump is asked
+  // for in the middle of an incident, and the two questions beside it are the same one — "what
+  // does this installation know, and what may it hand over".
+  { href: "/deployment/exports", label: "Anonymised exports", icon: FileDown },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

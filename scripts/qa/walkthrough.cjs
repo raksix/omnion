@@ -99,6 +99,10 @@ const DEPLOYMENT_SCREENS = [
   // list fabricating a version — a walk of `/deployment/migrations/9999` would prove only that the
   // 404 renders.
   "/deployment/migrations",
+  // REQ-129 slice 4's panel. The export states were the last unticked acceptance line on that
+  // request — watermark, expiry, single-use and revoke all exist in the database and the API,
+  // and none of them was visible anywhere until this screen existed.
+  "/deployment/exports",
 ];
 
 /**
@@ -10130,6 +10134,10 @@ async function main() {
   // one an operator cannot use from a phone during an incident.
   { path: "/deployment/backfills", name: "deployment-backfills" },
   { path: "/deployment/seeds", name: "deployment-seeds" },
+  // The anonymised export surface (REQ-129, slice 4). It is in DEPLOYMENT_SCREENS as well, so
+  // the startup guard refuses a pass in which this route has been dropped from this list — a
+  // screen reachable only from a URL nobody types is a screen nobody measured.
+  { path: "/deployment/exports", name: "deployment-exports" },
   { path: "/settings/iam", name: "iam-overview" },
     { path: "/settings/iam/users", name: "iam-users" },
     { path: "/settings/iam/groups", name: "iam-groups" },

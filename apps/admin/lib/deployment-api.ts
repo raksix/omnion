@@ -851,3 +851,181 @@ export function loadSeed(
     body: JSON.stringify({ confirm }),
   });
 }
+
+// -------------------------------------------------------------------------------------------
+// Anonymised exports (REQ-129, slice 4)
+//
+// The three states the API can refuse a download with are the reason this section exists as
+// types rather than as `any`: `export_revoked`, `export_expired` and `export_already_downloaded`
+// are three different follow-ups for the same HTTP 410, and a screen that only knows "it failed"
+// turns the single-use guarantee into a support ticket. `download_count: number` is the field
+// that lets the panel say which one happened BEFORE anyone presses the button.
+// -------------------------------------------------------------------------------------------
+
+/** One export, as `export_json` writes it. */
+export type SupportExport = {
+  id: string;
+  reason: string;
+  tables: string[];
+  /** Per-column decisions, as `ColumnPlan[]` — the plan the row was created from. */
+  column_actions: { table: string; column: string; class: string; action: string; overridden: boolean }[];
+  row_limit: number | null;
+  window_start: string | null;
+  window_end: string | null;
+  status: string;
+  file_key: string | null;
+  file_size: number | null;
+  checksum: string | null;
+  /**
+   * The salt's fingerprint, never the salt itself.
+   *
+   * Two exports of the same rows do not hash the same value to the same digest, and that is the
+   * point: a per-export salt is what stops a vendored file from being a cross-customer lookup
+   * table. The fingerprint is stored so an operator can tell two exports apart without the salt
+   * ever being derivable.
+   */
+  salt_fingerprint: string | null;
+  watermark: string;
+  expires_at: string;
+  download_count: number;
+  last_downloaded_at: string | null;
+  revoked_at: string | null;
+  requested_by: string | null;
+  requested_by_name: string;
+  error: string | null;
+  created_at: string;
+};
+
+export type ExportList = {
+  exports: SupportExport[];
+  /** How many rows the expiry sweep flipped on this very request. */
+  expired_by_this_request: number;
+  limits: { max_rows: number; ttl_hours: number };
+};
+
+/** One reviewed column classification. */
+export type ColumnClassification = {
+  table: string;
+  column: string;
+  class: string;
+  default_action: string;
+  notes: string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+};
+
+export type ClassificationList = {
+  classifications: ColumnClassification[];
+  /**
+   * `table.column` for every public column with no classification row.
+   *
+   * This list is the remaining work on the whole feature: the builder fails closed on a
+   * classified-nothing column, so while it is non-empty no export can be produced at all.
+   */
+  unclassified: string[];
+  classes: string[];
+  actions: string[];
+};
+
+export function listExports(status?: string): Promise<ExportList> {
+  const query = status && status.trim() ? `?status=${encodeURIComponent(status.trim())}` : "";
+  return request(`/api/v1/deployment/exports${query}`);
+}
+
+export function fetchExport(id: string): Promise<SupportExport> {
+  return request(`/api/v1/deployment/exports/${encodeURIComponent(id)}`);
+}
+
+export function listClassifications(): Promise<ClassificationList> {
+  return request("/api/v1/deployment/exports/classifications");
+}
+
+/**
+ * Classify or re-classify one column.
+ *
+ * `notes` is required by the API, not by the type, because the note is what the next reviewer
+ * reads; the screen asks for it rather than letting the server be the only place that refuses.
+ */
+export function classifyColumn(input: {
+  table_name: string;
+  column_name: string;
+  class: string;
+  default_action: string;
+  notes: string;
+}): Promise<ColumnClassification> {
+  return request("/api/v1/deployment/exports/classifications", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export type ExportPlanColumn = {
+  table: string;
+  column: string;
+  class: string;
+  action: string;
+  overridden: boolean;
+};
+
+/**
+ * `POST /deployment/exports` — plan and record. Does NOT produce the file.
+ *
+ * Producing is `runExport`; keeping them apart is what lets the refusal for an unclassified
+ * column land in front of the operator instead of after a ten-minute export.
+ */
+export function createExport(input: {
+  reason: string;
+  tables: string[];
+  column_actions?: Record<string, string>;
+  row_limit?: number | null;
+  window_start?: string | null;
+  window_end?: string | null;
+}): Promise<{
+  id: string;
+  status: string;
+  watermark: string;
+  salt_fingerprint: string;
+  expires_at: string;
+  plan: {
+    tables: string[];
+    columns: ExportPlanColumn[];
+    removed: number;
+    hashed: number;
+    synthetic: number;
+    kept: number;
+  };
+}> {
+  return request("/api/v1/deployment/exports", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `POST /deployment/exports/{id}/run` — produce the planned file. */
+export function runExport(id: string): Promise<{
+  id: string;
+  status: string;
+  file_key: string;
+  file_size: number;
+  checksum: string;
+  download_url: string;
+}> {
+  return request(`/api/v1/deployment/exports/${encodeURIComponent(id)}/run`, { method: "POST" });
+}
+
+/** `DELETE /deployment/exports/{id}` — revoke. The audit row stays; the link dies. */
+export function revokeExport(id: string): Promise<{ id: string; status: string; download_count: number }> {
+  return request(`/api/v1/deployment/exports/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+/**
+ * The download link, as a URL for an `<a download>`.
+ *
+ * A plain URL rather than `request()`, because `request()` parses JSON and this endpoint answers
+ * with a file. The browser carries the session cookie on a same-origin navigation, and the API
+ * claims the single use itself — so the panel's job is to say clearly that pressing this spends
+ * the download, not to guard it.
+ */
+export function exportDownloadUrl(id: string): string {
+  return `/api/v1/deployment/exports/${encodeURIComponent(id)}/download`;
+}
