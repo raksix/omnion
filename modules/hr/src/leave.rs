@@ -312,7 +312,13 @@ pub struct LeaveRequest {
     /// The last day away.
     #[serde(with = "crate::dates")]
     pub ends_on: Date,
-    /// The working days charged, as the column's own text.
+    /// The working days charged, rendered the way a person reads it: `3`, `0.5`.
+    ///
+    /// Not the column's own text. `numeric(6,2)` always renders two decimals, so a row read as
+    /// `r.days::text` says `3.00` while every day count the rest of the screen shows says `3` —
+    /// and a leave list that mixes `3.00` with `0.50` reads like a spreadsheet export. The SQL
+    /// trims the trailing zeros (`trim_scale`) so the value is normalized once, at the reader,
+    /// rather than in each of the three places that render it.
     pub days: String,
     /// Whether it is a half-day.
     pub half_day: bool,
@@ -549,7 +555,7 @@ pub async fn create_leave_type(
     let id: Uuid = sqlx::query_scalar(
         "insert into hr_leave_types (organization_id, name, code, paid, annual_days, \
          requires_approval, allow_negative) \
-         values ($1, $2, $3, coalesce($4, true), coalesce($5, 0)::numeric, \
+         values ($1, $2, $3, coalesce($4, true), coalesce($5::numeric, 0), \
                  coalesce($6, true), coalesce($7, false)) returning id",
     )
     .bind(organization_id)

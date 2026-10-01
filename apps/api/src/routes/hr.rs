@@ -995,6 +995,47 @@ impl From<HrError> for ApiError {
             )
             .with_details(json!({ "members": members, "children": children })),
             HrError::InvalidMerge(message) => Self::bad_request("invalid_hr_merge", message),
+            // Leave (slice 2). Every one of these is a **conflict with the current state**, not a
+            // malformed request: the payload is well-formed and the world says no. 409 rather than
+            // 400, because a client that retries a 400 forever will retry this one forever too.
+            HrError::LeaveOverlap {
+                other_request_id,
+                starts_on,
+                ends_on,
+            } => Self::new(
+                StatusCode::CONFLICT,
+                "hr_leave_overlap",
+                format!(
+                    "those dates overlap request {other_request_id}, which runs from {} to {}",
+                    omnion_module_hr::dates::to_wire(&starts_on),
+                    omnion_module_hr::dates::to_wire(&ends_on)
+                ),
+            ),
+            HrError::InsufficientBalance {
+                leave_type,
+                entitled,
+                used,
+                pending,
+                requested,
+                remaining,
+            } => Self::new(
+                StatusCode::CONFLICT,
+                "hr_leave_insufficient_balance",
+                format!(
+                    "this request is {requested} days of {leave_type}, but only {remaining} are left \
+                     ({entitled} entitled, {used} used, {pending} pending)"
+                ),
+            ),
+            HrError::LeaveAlreadyDecided { status } => Self::new(
+                StatusCode::CONFLICT,
+                "hr_leave_already_decided",
+                format!("this request is already {status}, so it cannot be decided again"),
+            ),
+            HrError::LeaveNotCancellable { status } => Self::new(
+                StatusCode::CONFLICT,
+                "hr_leave_not_cancellable",
+                format!("this request is {status}, so it can no longer be cancelled"),
+            ),
             HrError::Database(err)
                 if matches!(
                     err,

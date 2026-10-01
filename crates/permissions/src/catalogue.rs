@@ -755,6 +755,37 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "hr",
         description: "Attach and remove employee documents",
     },
+    // Leave (REQ-055 slice 2). The three keys split the same way the other families do, and the
+    // middle one is the interesting one:
+    //
+    // * **`hr.leave.approve` is a different act from `hr.leave.request`.** Asking for leave and
+    //   agreeing to somebody else's are separate decisions by separate people: an employee's own
+    //   request must not carry the power to approve it, or the approval chain is a formality and
+    //   the audit trail records a person approving themselves.
+    // * **`hr.leave.manage` is the catalogue, not the requests.** It writes leave *types* — the
+    //   entitlement, whether approval is needed, whether a negative balance is allowed — which is
+    //   an organization's policy decision. A role that can request leave must not be able to raise
+    //   the entitlement it is measured against.
+    PermissionDef {
+        key: "hr.leave.read",
+        category: "hr",
+        description: "Read leave requests, balances and the absence calendar",
+    },
+    PermissionDef {
+        key: "hr.leave.request",
+        category: "hr",
+        description: "Raise and cancel one's own leave request",
+    },
+    PermissionDef {
+        key: "hr.leave.approve",
+        category: "hr",
+        description: "Approve or reject a leave request somebody else raised",
+    },
+    PermissionDef {
+        key: "hr.leave.manage",
+        category: "hr",
+        description: "Create and edit leave types: entitlement, approval and negative-balance policy",
+    },
     // Sales (docs/requests/REQ-052). The selling side splits the way the relationship layer
     // does — read, create, edit, archive — and adds the two powers that are genuinely different
     // acts rather than a stricter version of editing:
@@ -1301,8 +1332,8 @@ mod tests {
 
     #[test]
     fn the_hr_family_is_catalogued() {
-        // REQ-055. Ten keys: the directory's read/create/update/terminate/export, the sensitive
-        // block, the department pair and the document pair.
+        // REQ-055. Fourteen keys: the directory's read/create/update/terminate/export, the
+        // sensitive block, the department pair, the document pair and the leave quartet.
         //
         // The reason this test is worth writing by hand rather than trusting the entries above:
         // a `guards::require()` with a key that is **not** in the catalogue does not fall open —
@@ -1320,6 +1351,10 @@ mod tests {
             "hr.departments.manage",
             "hr.documents.read",
             "hr.documents.manage",
+            "hr.leave.read",
+            "hr.leave.request",
+            "hr.leave.approve",
+            "hr.leave.manage",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),

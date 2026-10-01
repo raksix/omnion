@@ -100,6 +100,7 @@ pub mod crm_deals;
 pub mod crm_leads;
 pub mod crm_views;
 pub mod hr;
+pub mod hr_leave;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -1467,6 +1468,47 @@ pub fn router(state: AppState) -> Router {
         .route("/hr/departments/merge", post(hr::merge_departments))
         .route_layer(guards::require(&state, "hr.departments.manage"));
 
+    // Leave (REQ-055 slice 2). Four keys for four different acts, and the split is the point:
+    //
+    // * `hr.leave.approve` is separate from `hr.leave.request` because asking for leave and
+    //   agreeing to somebody else's are different decisions by different people. A key that did
+    //   both would let an employee approve their own holiday, and the audit trail would record it
+    //   as an ordinary approval.
+    // * `hr.leave.manage` writes the CATALOGUE, not the requests: entitlement, whether approval
+    //   is needed, whether a negative balance is allowed. A person who can request leave must not
+    //   be able to raise the entitlement they are measured against.
+    // * The **preview** is a route rather than arithmetic in the browser. The acceptance criterion
+    //   asks that the number shown before submit equals the stored value, and a second
+    //   implementation in TypeScript is a second answer.
+    let hr_leave_read = Router::new()
+        .route("/hr/leave/types", get(hr_leave::list_leave_types))
+        .route("/hr/leave/balances", get(hr_leave::list_balances))
+        .route("/hr/leave/requests", get(hr_leave::list_requests))
+        .route("/hr/leave/requests/preview", get(hr_leave::preview_days))
+        .route("/hr/leave/requests/{id}", get(hr_leave::get_request))
+        .route("/hr/leave/calendar", get(hr_leave::absence_calendar))
+        .route_layer(guards::require(&state, "hr.leave.read"));
+
+    let hr_leave_request = Router::new()
+        .route("/hr/leave/requests", post(hr_leave::create_request))
+        .route(
+            "/hr/leave/requests/{id}/cancel",
+            post(hr_leave::cancel_request),
+        )
+        .route_layer(guards::require(&state, "hr.leave.request"));
+
+    let hr_leave_approve = Router::new()
+        .route(
+            "/hr/leave/requests/{id}/decision",
+            post(hr_leave::decide_request),
+        )
+        .route_layer(guards::require(&state, "hr.leave.approve"));
+
+    let hr_leave_manage = Router::new()
+        .route("/hr/leave/types", post(hr_leave::create_leave_type))
+        .route("/hr/leave/types/{id}", patch(hr_leave::update_leave_type))
+        .route_layer(guards::require(&state, "hr.leave.manage"));
+
     // Activities and the merged timeline. Reading the feed and reading one record's history are
     // the same exposure, so they share `crm.activities.read` — a separate "timeline" key would
     // let a caller read a contact's history through a deal screen while being refused on the
@@ -1540,6 +1582,10 @@ pub fn router(state: AppState) -> Router {
         .merge(hr_employees_terminate)
         .merge(hr_departments_read)
         .merge(hr_departments_manage)
+        .merge(hr_leave_read)
+        .merge(hr_leave_request)
+        .merge(hr_leave_approve)
+        .merge(hr_leave_manage)
         .merge(crm_create)
         .merge(crm_update)
         .merge(crm_archive)

@@ -34,9 +34,9 @@ use crate::store::{DEFAULT_PER_PAGE, MAX_PER_PAGE, MAX_SEARCH_LENGTH, Page};
 const REQUEST_COLUMNS: &str = "r.id, r.organization_id, r.employee_id, \
      concat_ws(' ', e.first_name, e.last_name) as employee_name, \
      r.leave_type_id, t.name as leave_type_name, r.starts_on, r.ends_on, \
-     r.days::text as days, r.half_day, r.reason, r.leave_status, r.decided_by, \
-     (select concat_ws(' ', du.first_name, du.last_name) from platform_users du \
-       where du.id = r.decided_by) as decided_by_name, \
+     trim_scale(r.days)::text as days, r.half_day, r.reason, r.leave_status, r.decided_by, \
+     (select concat_ws(' ', du.display_name) from users du where du.id = r.decided_by) \
+         as decided_by_name, \
      r.decided_at, r.decision_comment, r.cancelled_at, r.created_at";
 
 /// The decision a manager or HR officer makes.
@@ -82,8 +82,10 @@ pub struct AbsenceBar {
     /// The type's name, for the tooltip.
     pub leave_type_name: String,
     /// The first day away, which may be before the window.
+    #[serde(with = "crate::dates")]
     pub starts_on: Date,
     /// The last day away, which may be after the window.
+    #[serde(with = "crate::dates")]
     pub ends_on: Date,
     /// The charged days.
     pub days: String,
@@ -101,9 +103,18 @@ pub struct AbsenceBar {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AbsenceCalendar {
     /// The first day of the window.
+    #[serde(with = "crate::dates")]
     pub from: Date,
     /// The last day of the window.
+    #[serde(with = "crate::dates")]
     pub to: Date,
+    /// Today, for the grid's "now" marker.
+    ///
+    /// Carried by the response rather than computed by the browser: the grid has to mark the same
+    /// day the server considered current, and a client that computed its own would disagree with
+    /// the window by however far the two clocks are apart.
+    #[serde(with = "crate::dates")]
+    pub today: Date,
     /// The bars, in start order.
     pub bars: Vec<AbsenceBar>,
     /// The employees the window has bars for, with their names — the row labels.
@@ -762,7 +773,7 @@ pub async fn absence_calendar(
     // in this month's grid, which is what the request's "continues with an arrow" note is about.
     let rows = sqlx::query(&format!(
         "select r.id, r.employee_id, concat_ws(' ', e.first_name, e.last_name) as employee_name, \
-         r.leave_type_id, t.name as leave_type_name, r.starts_on, r.ends_on, r.days::text as days \
+         r.leave_type_id, t.name as leave_type_name, r.starts_on, r.ends_on, trim_scale(r.days)::text as days \
          from hr_leave_requests r \
          join hr_employees e on e.id = r.employee_id \
          join hr_leave_types t on t.id = r.leave_type_id \
@@ -807,6 +818,7 @@ pub async fn absence_calendar(
     Ok(AbsenceCalendar {
         from,
         to,
+        today: time::OffsetDateTime::now_utc().date(),
         bars,
         employees,
     })
