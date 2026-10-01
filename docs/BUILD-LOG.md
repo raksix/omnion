@@ -13408,3 +13408,65 @@ now failed to measure four ticks running for reasons that are not code. Two of t
 branch's own harness and are fixed; the other two were the box. The measurement exists, compiles and
 typechecks, so this tick's job is `pg_isready` **before** starting and a disk check beside it — and
 if the slot is still held, spend the tick on a slice that needs no browser.
+
+## w8 · tick 64 · REQ-117 slice 32 — the cross-tenant 404 boundary, over a socket
+
+**The line's unticked sentence was in front of the sentence already ticked.** Acceptance line 19
+reads *"Cross-organization ids answer `404` for every route, and `crm.leads.read` without
+`crm.leads.convert` refuses conversion with `403` and writes nothing"* — and its own prose says the
+conversion half was proved at the store *"where the tenancy decision actually lives"*, which is the
+half that was already known true when the line was written. The **`404`, over HTTP, for every
+route** half had never been measured, and this module now has twenty-two handlers in
+`apps/api/src/routes/crm_intake.rs`.
+
+A store function taking `organization_id` proves the store filters. It says nothing about whether
+the **handler** passed its own organization in — `find_lead(pool, organization_id, id)` reads
+perfectly well when the caller hands it the wrong one, and the wrong one is available at every call
+site: `state.db()`, the session, a platform account's `null`. This is the **ninth variation** of
+this branch's standing defect class and the first with the roles reversed: seven previous instances
+shipped a correct, unit-tested function with **no caller** able to produce the state it describes,
+invisible because the defect was the *absence* of a call. Here the call exists and passes the wrong
+argument — equally invisible from the store's own test, because that test supplies the organization
+itself and can therefore never be the wrong one.
+
+→ `scripts/qa/run-crm-tenancy-http.sh` **23/23**. Two tenants created through the real routes
+(`POST /onboarding/owner`, `POST /organizations`, `POST /iam/users`, a real login), then **eleven**
+id-addressed routes driven from the second tenant's session — `GET`/`PATCH`/`DELETE` lead, respond,
+reject, spam, source get/patch/delete/rotate-key/test — every one answering `404`. The row is read
+back afterwards so the refusal is proved to have *written* nothing, not merely answered.
+
+**The gate's first run was worth more than its green one.** With no role on tenant B's account, all
+eleven routes answered `403 permission_denied` with `considered: 0` — the guard refused *before*
+the handler, so not one of the eleven had measured the tenancy boundary at all. They had measured
+the permission catalogue, and they did so as eleven green-looking FAILs whose cause was the fixture.
+`403 considered: 0` ("no rule even looked") is a different sentence from a `403` after a rule looked
+and said no, and only the second is the boundary under test — so a **positive control now runs
+first**, and the gate refuses to proceed unless the second tenant can read *its own* empty list.
+
+The `403` half found its own fixture defect of the same kind. The obvious caller was tenant A's
+owner and it answered **200**: `POST /onboarding/owner` binds a **global** Owner role, and a global
+Owner carries every permission in the catalogue, so for that account `crm.leads.convert` is
+unfalsifiable and the FAIL could not be told from a missing guard. The caller is now a **fourth**
+account holding `crm.leads.read` and `crm.leads.manage` and deliberately **not** `crm.leads.convert`,
+with `converted_at` and `contact_id` re-read afterwards: the refusal refused the *work*, not only
+the response. **Standing negative control** — grant `crm.leads.convert` and the identical request
+answers `200`, so the `403` is that one permission and not the route or the fixture.
+
+**Proof.** `run-crm-tenancy-http.sh` **23/23**, with its own database (`omnion_qa_w8_crm_tenant`),
+its own port (18088) and a refusal to start if pointed at the pass's own stack. `cargo test -p
+omnion-module-crm-intake --lib` **181 passed, 0 failed** — unchanged, because nothing in the crate
+moved: the untested surface was the callers all along. Commit `c78bd973`, pushed.
+
+**Two box findings, both worth keeping.** The QA slot looked held by a live w4 pass for four ticks
+and was not: `HOLDERDIR` was **empty** and the place file 47 minutes old, so the reaper had nothing
+to test and nothing reclaimed it. The lesson is the one already recorded — read the **holder**, and
+remember the reaper needs a holder file to judge with, so a pass that died between taking its place
+and writing the holder down is invisible to it. And route-level PROVEN-TO-FAIL is not free here:
+the neutralising build mixed the live pass's target directory (`/mnt/apopic/w8build`, in use by the
+API the pass was running) with writes to `omnion-w8/target`, filled `/mnt/apopic` to 100 % and took
+the pass's own screenshots down with `ENOSPC`. Reclaimed 2.9 G from stale duplicate rlibs in my own
+build dir — newest of each pair kept, and every stale file checked against `/proc/*/fd` first.
+
+**Next.** REQ-117's remaining unmeasured surface is the `crm-assignment` depth pass, which is in
+this very run; and acceptance line 21's retention-sweep steps, still unexecuted. Both are browser
+work, so the slot and the disk are the gate on them.
