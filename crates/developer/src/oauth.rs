@@ -38,6 +38,7 @@
 
 use rand::RngCore;
 use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -163,7 +164,13 @@ pub fn verify_client_secret(presented: &str, stored_hash: &str) -> bool {
 }
 
 /// A grant type an app may be registered for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` with the stored spelling, because `OAuthApp::grant_types` is a
+/// field the API returns and the panel edits. The round trip is part of the contract: what the
+/// panel submits is `["authorization_code"]` and what it reads back has to be the same two
+/// strings, not the derived `AuthorizationCode` variant name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GrantType {
     /// Authorization code, with PKCE. The flow a user-facing client uses.
     AuthorizationCode,
@@ -271,11 +278,55 @@ pub fn loopback_host(uri: &str) -> bool {
     // loopback name that contains one is the IPv6 literal `[::1]`, and a naive `split(':')`
     // reduces it to `[`, which matches nothing. A bracketed authority is a literal as a
     // whole, so it is taken intact before any colon is treated as a port separator.
-    let host = match host.strip_prefix('[').and_then(|rest| rest.find(']')) {
-        Some(end) => &host[..end + 2],
+    //
+    // **The `]` has to be the last character of the authority, or of the part before the
+    // port.** `[::1].attacker.example` is not an IPv6 literal followed by a port — it is a
+    // hostname that happens to start with a bracket, and treating the bracket as "this is a
+    // literal, take it whole" accepts it as loopback. So the closing bracket is only honoured
+    // when nothing but an optional `:port` follows it; otherwise the whole thing is a hostname
+    // and is matched against the loopback names as one string, which it fails. This is the same
+    // class of bug as `starts_with("localhost")`, one level deeper, and it was found by the
+    // slice-3b list validator rather than by the slice-3a unit tests — the unit tests covered
+    // the accepted forms and the `starts_with` near-misses, and not this one.
+    let host = match host.strip_prefix('[') {
+        // A bracketed authority. The literal is `host[1..=end]`; the remainder after `]` must
+        // be empty (no port) or a bare `:port`.
+        Some(after_bracket) => match after_bracket.find(']') {
+            Some(end) => {
+                let literal = &host[1..=end];
+                let trailing = &after_bracket[end + 1..];
+                let valid_trailing =
+                    trailing.is_empty() || trailing.strip_prefix(':').is_some_and(is_port);
+                if valid_trailing {
+                    // Reconstructed rather than sliced so the match below can stay a plain
+                    // comparison against the bracketed spelling, and so the returned string
+                    // has the same shape regardless of which branch produced it.
+                    return matches!(literal, "::1")
+                        && trailing
+                            .strip_prefix(':')
+                            .is_none_or(|port| port.parse::<u16>().is_ok());
+                }
+                // Not a literal at all: fall through and let the plain host comparison refuse
+                // it, which it will, because the whole authority is not a loopback name.
+                host
+            }
+            None => host,
+        },
         None => host.split(':').next().unwrap_or(host),
     };
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    matches!(host, "localhost" | "127.0.0.1")
+}
+
+/// Whether a string is a decimal port number.
+///
+/// A bound rather than a parse-and-hope: `[::1]:99999999999` is not a URL any browser accepts,
+/// and answering "that is loopback, with a nonsense port" is an answer about a URL that cannot
+/// be redirected to. `u16` is the port range every browser honours.
+fn is_port(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 5
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u16>().is_ok()
 }
 
 /// Check a submitted redirect URI against an app's registered list.
@@ -625,6 +676,68 @@ mod tests {
         assert!(loopback_host("http://user:pw@localhost:9999/x"));
         assert!(!loopback_host("http://localhost:9999@evil.example/x"));
         assert!(!loopback_host("http://evil.example/x"));
+    }
+
+    #[test]
+    fn the_ipv6_loopback_literal_is_recognised_in_every_spelling_a_client_writes() {
+        // The three forms: bare, with a port, and with userinfo. The bracketed authority is a
+        // literal as a whole, which is why a naive `split(':')` cannot be used here — it
+        // reduces `[::1]` to `[`.
+        for good in [
+            "http://[::1]/cb",
+            "http://[::1]:3000/cb",
+            "http://[::1]:65535/cb",
+            "http://user:pw@[::1]:8080/cb",
+        ] {
+            assert!(loopback_host(good), "{good} is loopback");
+        }
+    }
+
+    #[test]
+    fn a_hostname_that_begins_with_a_bracket_is_not_an_ipv6_literal() {
+        // **This is the bug the slice-3b list validator found in the code above.** The fix for
+        // `split(':')` was to take a bracketed authority whole, and taking it whole *as a
+        // literal* accepted `[::1].attacker.example` — an attacker's hostname that merely starts
+        // with the loopback literal. The test lives here as well as in the validator's module
+        // because the defect is in this function: a test in the caller would be fixed by
+        // changing the caller, leaving the hole in the shared predicate.
+        //
+        // The family is the same as `starts_with("localhost")` one level down, so the cases are
+        // written as a family rather than one by one.
+        for hostile in [
+            "http://[::1].attacker.example/cb",
+            "http://[::1]attacker.example/cb",
+            "http://[::1].example/cb",
+            "http://[::1]:3000.attacker.example/cb",
+            // A literal that is not loopback, wearing the same spelling.
+            "http://[2001:db8::1]/cb",
+            "http://[::2]/cb",
+            // A bracket that never closes, and one that closes with junk after it.
+            "http://[::1:99999/cb",
+            "http://[::1]x/cb",
+        ] {
+            assert!(
+                !loopback_host(hostile),
+                "{hostile} is an attacker's host, not loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn a_port_that_no_browser_accepts_is_not_a_loopback_url() {
+        // `[::1]:99999` is out of `u16` range and `[::1]:0x10` is not decimal. Neither is a URL
+        // a browser will follow, so treating either as loopback is an answer about a redirect
+        // that cannot happen — and, worse, a validator that says "yes" for a URL the client will
+        // refuse to use teaches a developer the wrong thing about their own configuration.
+        for bad in [
+            "http://[::1]:99999/cb",
+            "http://[::1]:0x10/cb",
+            "http://[::1]:/cb",
+        ] {
+            assert!(!loopback_host(bad), "{bad} is not a usable loopback URL");
+        }
+        // And the boundary that does work.
+        assert!(loopback_host("http://[::1]:65535/cb"));
     }
 
     #[test]
