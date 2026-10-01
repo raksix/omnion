@@ -25,12 +25,14 @@
 pub mod attendance;
 pub mod dates;
 pub mod departments;
+pub mod documents;
 pub mod employees;
 pub mod error;
 pub mod leave;
 pub mod me;
 pub mod model;
 pub mod onboarding;
+pub mod reports;
 pub mod requests;
 pub mod store;
 
