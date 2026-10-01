@@ -10046,3 +10046,150 @@ holder has been holding since 02:25, its newest artifact directory (`20261001-02
 mtime of **02:28:49** — a hundred minutes without a single write — while the process still burns
 CPU (1–5 ticks per 10 s) with Chrome up. That is the wedged-pass signature from lesson 33, and it
 is w3's process to reap, not mine. I did not touch it, and I TERMed only my own orphaned waiters.
+
+## Tick 90 — REQ-012, the security centre's permission gate (2026-10-01)
+
+**What.** `apps/api/tests/security.rs`, four walks over the live database driving the router in
+process, closing the criterion that every `/security` endpoint enforces its catalogue key. The
+box had carried a note since the request was written: the four keys are in the catalogue, every
+route is behind a guard, "the 403 itself is unproven until a pass calls an endpoint without the
+key". That note was the **seventh instance of this REQ's defect class** — the security centre
+already spent one bug on an inherited `route_layer` that put it behind `analytics.read`, and the
+only reason that surfaced was a backup walk signing in as a reader.
+
+**What it proves.**
+
+1. anonymous is `401` on all fifteen `/security` routes, never a page of data;
+2. an organization member with no security key is `403 permission_denied` on all fifteen, and the
+   body **names the missing key** — a route whose guard named a key outside the catalogue is
+   caught rather than looking identical to a correct refusal;
+3. an account holding only `security.read` reaches the read routes and is refused every `scan`
+   and `manage` route — the walk that catches an inherited layer;
+4. the full three-key holder passes the guard everywhere, so walks 1–3 are about guards and not
+   about a centre whose routes are broken.
+
+**The suite was proven to fail before it was believed.** Walk 3 was run against a router with
+`/security/overview`'s `guards::require` layer deleted:
+
+```text
+test a_member_without_the_key_is_refused_everywhere ... FAILED
+```
+
+and it named that route. The `route_layer` was restored from a backup afterwards and the tree is
+byte-identical to `23228200`'s parent. The route table in the suite is hand-written rather than
+scraped out of `routes/mod.rs`, because a census reads the path and the guard from the same line:
+a route that lost its guard would be compared against itself and pass.
+
+**Proof.**
+
+```text
+cargo test -p omnion-api --test security -- --test-threads=1    4 passed  (30.6 s, live PostgreSQL)
+cargo test -p omnion-permissions --lib                           63 passed
+bun x tsc -p apps/admin/tsconfig.json --noEmit                   exit 0
+```
+
+**Disk first.** `/mnt/apopic` was at 99 % (970 MB free) when the tick opened — the documented
+build-killer, where `rustc` reports `IO failure on output stream` with **no** `error[]` line and a
+build that looks like an ordinary compile error. `target/debug/deps` in this worktree held 1 096
+crate/hash pairs for 5.21 GiB; keeping the newest `rlib`+`rmeta` of each pair reclaimed **0.77 GiB**
+across 756 stale artifacts. `/mnt/apopic` is now at 96 %.
+
+**Not done this tick.** The browser pass. It was started first, as tick 89's hint asked, and has
+been queued behind a **live** sibling holder for the whole tick — `w6`, then `w3`, re-taking the
+place between passes (`qa-slot.sh` sees `max 1 concurrent pass` and waits). Nine passes are queued
+on this box at once, so the one global slot is the scarce resource and a writer's pass is now the
+thing most likely to time out rather than the thing most likely to fail. REQ-010, REQ-021 and
+REQ-016 all have code-complete screens whose only open boxes are browser legs, so this queue is
+the bottleneck, not the code.
+
+Next: the pass itself if it can take the slot, then REQ-021's keyboard and mobile legs, then
+REQ-016's form-validation and payload-inspector legs.
+
+## Tick 90 (continued) — why the pass died, and it was not the product
+
+**The pass was queued for 2400 s and then proceeded, and it died at the wizard.** The log said
+`installation already exists`, then `FATAL: could not sign in after wizard`. Read naively that
+is a broken first-run flow. It was not: **two passes of the same stack ran at once.**
+
+```text
+/tmp/omnion-qa-tick89.log   the PREVIOUS tick's pass — started 01:28, still walking at 02:52
+  pid 564604  bash scripts/qa/run.sh
+  pid 2089155  node scripts/qa/walkthrough.cjs --out .../20261001-012813   (writing at 02:52)
+/tmp/qa-main-tick90.log      this tick's pass — started 02:07, queued 2400 s, then proceeded
+```
+
+Both use `QA_STACK=main`, so both target database `omnion_qa` and ports 18080/3100/3200. The
+sequence, read out of the database rather than guessed:
+
+```text
+02:47:57  tick-89 pass: reset-db.sh drops and recreates omnion_qa
+02:48:07  tick-89 pass: API boots, "no accounts exist yet"
+02:48:14  a user appears: qa-sample@omnion.test / "QA Provider" / organization_id NULL
+02:48:16  tick-89 pass: session created for that user
+```
+
+`qa-sample@omnion.test` and `"QA Provider"` are literal return values of the walkthrough's own
+`sampleValueFor()` / `fillSubtree()` helpers — the generic form filler, not a credential. Tick-89
+had filled some provider-or-user dialog on its way past. So by the time this tick's pass opened
+`/`, the database already had an account, `GET /onboarding` answered `needs_setup: false`, the
+login screen's own `router.replace("/setup")` never fired, the wizard was correctly skipped — and
+this pass then tried to sign in as `CREDS.email` (`qa-owner@omnion.test`), an account that did
+not exist. Sign-in failed for a reason that has nothing to do with sign-in.
+
+**The defect is in the harness, and it is a hole in `qa-slot.sh`.** The slot script counts places
+globally, so it correctly serialises two *different* stacks — but nothing in it stops a second
+pass taking **the same** stack. `run.sh` has no flock and no pidfile. Two passes on one stack do
+not merely duplicate work: one of them **drops the other's database mid-walkthrough**, which is
+precisely the "QA report says N high findings" failure the whole harness exists to prevent — the
+report would have been measured against a floor that was pulled out from under it.
+
+**The one good piece of news in this log.** `guards` on `/login` are not involved, the product's
+first-run behaviour is correct at every step (`/` → `/login` → `needs_setup` → `/setup`), and
+the API log shows the session for the *right* account being created for the pass that owned the
+stack. The tick-89 pass is healthy and still producing clicks; it was not killed. Its own log
+records three honest `"ok": false` lines (`media presets: the presets screen did not render`,
+`media duplicates: no file input`, `media retention: the retention tab did not render`) — the
+harness reporting rather than hiding, which is the behaviour this project wants.
+
+Next: a per-stack lock in `run.sh` so this cannot recur, then the pass.
+
+### The fix, and the two bugs inside it
+
+`run.sh` now takes a per-stack `flock` before `reset-db.sh` and refuses a second pass with exit
+4. It is taken around the **whole** pass, not only the reset: the second pass would otherwise
+`pm2 delete` the first pass's servers a few lines further down, so the reset is only the first of
+several ways two passes on one stack destroy each other.
+
+Writing it produced two defects in the fix itself, both found by *running* it rather than reading
+it, which is the argument for running it:
+
+1. **`exec 9>"$lock"` truncates the file on open.** A waiter therefore emptied the lock file *as
+   it opened it* and read back the zero bytes it had just written — the holder's recorded pid was
+   destroyed by the act of asking who the holder was, and the refusal said `unknown` in exactly the
+   situation where an operator most wants the pid. Opened with `9>>` instead. Diagnosed by dumping
+   the file's bytes (`od -c`) inside a script that reproduced the waiter's own open.
+2. **`$$` is the pid of the shell and does not change inside a subshell or a `bash -c`.** A pass
+   launched through either recorded its *parent's* pid, so the refusal named a process that had
+   nothing to do with the stack. Recorded `BASHPID` instead. Found because the debug script's
+   subshell wrote `2806959` while `$!` reported `2806959` and the holder was in fact `2806953`.
+
+**Proof.**
+
+```text
+bash -n scripts/qa/run.sh                      clean
+held main's lock, started a second pass         exit 4, "already has a pass running (pid 2811250)"
+a second pass on a DIFFERENT stack (w3)         still TAKEN — the lock does not leak across stacks
+after the holder exits                          TAKEN — the lock is released, not leaked
+```
+
+The orphaned tick-89 pass was terminated rather than left clicking against servers my aborted
+diagnostic pass had already torn down: its API answered `000`, so any further report it produced
+would have been measured against a dead stack. Its process group was killed (pids 564604 and
+2089155), which is this loop's own pass — no sibling stack was touched.
+
+**Why this mattered more than the box it was found on.** Every browser-leg box in wave 1 — REQ-010's
+screen states, REQ-021's keyboard and mobile legs, REQ-016's form validation and payload
+inspector — is written and unmeasured, and for three ticks each has been "the browser pass has not
+run". The reason was never that the pass was slow. It was that consecutive ticks were starting
+competing passes that destroyed each other, and the resulting failure mode is a report full of
+findings measured against a database that was dropped underneath the walk.
