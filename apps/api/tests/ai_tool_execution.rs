@@ -203,6 +203,23 @@ impl PipelineStore {
         }
     }
 
+    /// A user to record as the decider. `ai_approvals.decided_by` is a `users` reference, so a
+    /// decision has to be attributable to somebody — a walk that passed a fresh uuid would be
+    /// refused by the foreign key, and one that passed `None` would be testing nothing.
+    async fn user(&self, label: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "insert into users (id, email, display_name) values ($1, $2, $3)",
+        )
+        .bind(id)
+        .bind(format!("{label}-{}@example.invalid", Uuid::new_v4().simple()))
+        .bind(format!("{label} reviewer"))
+        .execute(&self.pool)
+        .await
+        .expect("the fixture reviewer must be created");
+        id
+    }
+
     /// The rows this run's call log holds for one tool, straight from SQL.
     async fn rows_for(&self, run_id: Uuid, tool_key: &str) -> Vec<(String, Option<String>)> {
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
@@ -1584,6 +1601,291 @@ async fn a_seeded_tool_answered_as_wired_names_its_rows_own_permission() {
         planned > 0,
         "the build has documented-but-unbuilt surfaces, so at least one tool must be planned; a \
          walk that saw none would mean the split is not being exercised at all"
+    );
+    store.dispose().await;
+}
+
+// -------------------------------------------------------------------------------------------
+// The approval round trip (REQ-099's last open box, REQ-101 slice 3h's other half)
+// -------------------------------------------------------------------------------------------
+//
+// REQ-099's criterion is "a tool on the approval list parks the run; **approving from the trace
+// resumes it to completion**, rejecting ends it". The park half and the decision half each had a
+// walk. The round trip did not, and the reason it did not is the finding:
+//
+//   A park that files no `ai_approvals` row is a park nobody can decide. `io::request` had
+//   exactly one production caller — the change-set editor — so a run that parked on a gated tool
+//   wrote nothing. Approving anything could not release it, because there was nothing to approve.
+//   And the version that *did* file a row would then re-park on the requeued run, because the
+//   approval list on the agent still names the tool: an approved run would burn one provider
+//   call, one park and one requeue for ever.
+//
+// So these walks drive the whole thing rather than a half of it, and the fixture is a real gated
+// tool (`content.publish`, a `content_publish` class with a seeded `require` policy) rather than
+// a hand-made class — a fixture invented for the test would pass even if the store refused it.
+
+/// A revision reader that answers "the call is the same one" for a tool-call request.
+///
+/// A parked tool call *is* the resource (`tool_call` + `tool@hash`), and its `base_revision` is
+/// `None`, so the decision's freshness check compares nothing and any answer is accepted. The
+/// reader still returns the resource's own identity rather than a constant, so that the walk is
+/// exercising the real path: a reader answering a fixed string would pass even if the row named a
+/// resource the store could not resolve, which is exactly the failure the first version of this
+/// walk hit — the store refused the decision with "names no resource".
+struct AnyRevision;
+
+impl omnion_ai_hub::approvals::io::RevisionReader for AnyRevision {
+    async fn read(
+        &self,
+        _pool: &PgPool,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> omnion_ai_hub::error::Result<String> {
+        assert_eq!(
+            resource_type, "tool_call",
+            "the filed request must name the call as its resource"
+        );
+        assert!(
+            !resource_id.is_empty(),
+            "a request whose resource id is empty cannot be decided at all"
+        );
+        Ok(resource_id.to_owned())
+    }
+}
+
+/// The gated tool, registered under a key the catalogue really gates.
+fn gated_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::empty();
+    registry.register(Arc::new(
+        FnTool::new(
+            "content.publish",
+            "Publish content",
+            "content.publish",
+            |_| ToolOutcome::ok("published"),
+        )
+        .with_schema(json!({
+            "type": "object",
+            "properties": { "slug": { "type": "string" } },
+            "required": ["slug"],
+            "additionalProperties": false
+        })),
+    ));
+    registry
+}
+
+/// A pipeline whose agent parks `content.publish`, for a run the walk already owns.
+///
+/// The agent id is a **parameter** rather than something created here. The first version created
+/// one, and the walks created one too — which failed the unique `(organization_id, key)` index,
+/// and would have been worse than a failure had the key differed: the "approved call is released"
+/// walk needs the *same* agent on both sides, and a helper that minted a fresh one would have
+/// handed the second pipeline a different agent entirely, so the release would have been proved
+/// against an agent nobody approved anything for.
+async fn gated_pipe(
+    store: &PipelineStore,
+    agent_id: Uuid,
+    run_id: Uuid,
+    attempt: &str,
+) -> omnion_ai_hub::tool_exec::Pipeline {
+    // The identity key carries the attempt, because each pipeline build creates a real identity
+    // row and the key is unique per organization. Two builds sharing one key would fail on the
+    // second — and the release walk *must* build two pipelines, so a shared key would have made
+    // the most important walk in the file untestable.
+    let identity = store
+        .identity(&format!("publisher-identity-{attempt}"), &[("content.publish", GrantEffect::Allow)])
+        .await;
+    let mut gate = allow_all();
+    // `content.publish` is not in `allow_all`'s list, and the pipeline checks the gate *before*
+    // the approval branch — so without this the call would be refused with
+    // `permission_denied` and never reach the park at all. The walk would then prove a refusal
+    // rather than a park, which is the failure an assertion on the variant name cannot see.
+    gate.0.insert("content.publish".to_owned(), true);
+    Pipeline::new(
+        std::sync::Arc::new(gated_registry()),
+        Some(identity),
+        vec!["content.publish".to_owned()],
+        // The agent's own approval list — the thing that parks the call at all.
+        vec!["content.publish".to_owned()],
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
+        std::sync::Arc::new(gate),
+        store.caller(agent_id, run_id),
+    )
+}
+
+#[tokio::test]
+async fn a_parked_call_files_a_request_somebody_can_actually_decide() {
+    let store = pipe!();
+    let agent_id = store.agent("publisher-filer", &["content.publish"]).await;
+    let run_id = store.run(agent_id, "publish").await;
+    let pipe = gated_pipe(&store, agent_id, run_id, "first").await;
+
+    let outcome = pipe
+        .call(
+            &store.pool,
+            &ToolCall::new("content.publish", json!({ "slug": "pricing" })),
+        )
+        .await
+        .expect("the pipeline must answer");
+    assert!(
+        matches!(outcome, CallOutcome::Parked { .. }),
+        "the call must park, got {outcome:?}"
+    );
+
+    // **The half that did not exist.** Before this, a run that parked on a gated tool wrote no
+    // `ai_approvals` row at all, so the inbox had nothing to decide, the trace had nothing to
+    // render and REQ-099's criterion could not be met by any amount of clicking.
+    let requests: i64 = sqlx::query_scalar(
+        "select count(*) from ai_approvals where run_id = $1 and status = 'pending'",
+    )
+    .bind(run_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("the request rows must be countable");
+    assert_eq!(
+        requests, 1,
+        "a park must file exactly one request; a run that parks with nothing to decide is a run \
+         an operator can only watch"
+    );
+
+    // The row describes the *call*, so a reviewer can see what they are approving rather than
+    // being asked about an operation nobody could identify.
+    let (title, tool_key, tool_class, phrase): (String, String, String, Option<String>) =
+        sqlx::query_as(
+            "select title, tool_key, tool_class, confirmation_phrase from ai_approvals \
+             where run_id = $1 and status = 'pending'",
+        )
+        .bind(run_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("the filed request must be readable");
+    assert!(title.contains("content.publish"), "the title names the tool: {title}");
+    assert_eq!(tool_key, "content.publish");
+    assert_eq!(tool_class, "content_publish", "the class is resolved, not invented");
+    assert!(
+        phrase.as_deref().is_some_and(|p| !p.trim().is_empty()),
+        "a class whose policy asks for a typed confirmation cannot be approved with an empty \
+         phrase — the row would be refused by `ai_approvals_confirmation_phrase_shape`"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn approving_releases_exactly_the_call_that_was_approved_and_no_other() {
+    let store = pipe!();
+    let agent_id = store.agent("publisher-decider", &["content.publish"]).await;
+    let run_id = store.run(agent_id, "publish").await;
+    let pipe = gated_pipe(&store, agent_id, run_id, "first").await;
+
+    let call = ToolCall::new("content.publish", json!({ "slug": "pricing" }));
+    let parked = pipe.call(&store.pool, &call).await.expect("the call must answer");
+    assert!(matches!(parked, CallOutcome::Parked { .. }));
+
+    // The reviewer decides. `approve` is REQ-101's, and the walk is here to prove the *tool
+    // pipeline* honours it — the two halves were written by two slices and nothing had ever
+    // run them against each other.
+    let request_id: Uuid = sqlx::query_scalar(
+        "select id from ai_approvals where run_id = $1 and status = 'pending'",
+    )
+    .bind(run_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("the filed request must be readable");
+    // The stored phrase is the row's own `confirmation_phrase`, and the walk types it back: a
+    // decision made with a phrase the reviewer could not have read is not a decision anybody
+    // could make, so the phrase is read rather than assumed.
+    let phrase: String = sqlx::query_scalar(
+        "select confirmation_phrase from ai_approvals where id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("the filed request must carry its phrase");
+    let decider = store.user("fiona").await;
+    let decided = omnion_ai_hub::approvals::io::approve(
+        &store.pool,
+        store.organization_id,
+        request_id,
+        decider,
+        Some(&phrase),
+        &AnyRevision,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    .expect("the approval must be an answer, not an error");
+    assert_eq!(
+        decided.approval().map(|row| row.status.as_str()),
+        Some("approved"),
+        "the stored row must be the approval the reviewer just made"
+    );
+
+    // The released call: the same tool, the same arguments, through a freshly built pipeline —
+    // which is what a requeued run does. The agent still parks `content.publish`, so the only
+    // thing that can let this through is the decision itself.
+    let again = gated_pipe(&store, agent_id, run_id, "after-decision").await;
+    let outcome = again
+        .call(&store.pool, &call)
+        .await
+        .expect("the pipeline must answer");
+    assert!(
+        matches!(outcome, CallOutcome::Ran { .. }),
+        "an approved call must run; parking it again is the loop this walk exists to catch, got \
+         {outcome:?}"
+    );
+
+    // **And the single-use half.** The approval released the call it named, not the tool: the
+    // same tool with *different* arguments is a different question, and a reviewer who approved
+    // a publish of `pricing` did not approve a publish of `salaries`.
+    let other = again
+        .call(
+            &store.pool,
+            &ToolCall::new("content.publish", json!({ "slug": "salaries" })),
+        )
+        .await
+        .expect("the pipeline must answer");
+    assert!(
+        matches!(other, CallOutcome::Parked { .. }),
+        "an approval is for one call's arguments, not for the tool in general; got {other:?}"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_policy_switched_to_allow_stops_a_pre_parked_tool_from_parking() {
+    let store = pipe!();
+    let agent_id = store.agent("publisher-policy", &["content.publish"]).await;
+    let run_id = store.run(agent_id, "publish").await;
+    let pipe = gated_pipe(&store, agent_id, run_id, "first").await;
+    assert!(matches!(
+        pipe.call(&store.pool, &ToolCall::new("content.publish", json!({ "slug": "p" })))
+            .await
+            .expect("the call must answer"),
+        CallOutcome::Parked { .. }
+    ));
+
+    // The agent's `approvals` array is the agent's own list; the policy row is the platform's.
+    // When they disagree, the policy is the later word — the same precedence the change-set
+    // bridge already reads per operation. Without it, an operator who switched a class to `allow`
+    // on the policy screen could never clear a run that parked before they did.
+    sqlx::query(
+        "update ai_approval_policies set mode = 'allow' where tool_class = 'content_publish' \
+         and organization_id is null",
+    )
+    .execute(&store.pool)
+    .await
+    .expect("the policy must be switchable");
+
+    let after = gated_pipe(&store, agent_id, run_id, "after-policy").await;
+    let outcome = after
+        .call(
+            &store.pool,
+            &ToolCall::new("content.publish", json!({ "slug": "p" })),
+        )
+        .await
+        .expect("the pipeline must answer");
+    assert!(
+        matches!(outcome, CallOutcome::Ran { .. }),
+        "an `allow` policy must run the call even though the agent still names it in its own \
+         approval list; got {outcome:?}"
     );
     store.dispose().await;
 }
