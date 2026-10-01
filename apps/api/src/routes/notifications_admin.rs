@@ -75,9 +75,10 @@ pub struct RegisterPushResult {
 pub async fn register_push(
     State(state): State<AppState>,
     session: CurrentSession,
+    headers: axum::http::HeaderMap,
     Json(body): Json<RegisterPushBody>,
 ) -> Result<Json<RegisterPushResult>, ApiError> {
-    let user_agent = request_user_agent(&state, &session);
+    let user_agent = request_user_agent(&headers);
     let report = omnion_notifications::push::register(
         state.db().pool(),
         session.user.id,
@@ -173,14 +174,93 @@ pub async fn remove_push(
     }
 }
 
-/// The caller's browser string, when the panel can be asked for it.
+/// The caller's browser string, when the browser sent one.
 ///
 /// Read from the request headers rather than taken from the body: a client that sends its own
 /// `user_agent` string is describing itself, and the value exists to help a person recognise
 /// which of their devices a row is. A wrong value here costs nothing; a *client-chosen* one
 /// would make the field worthless as evidence.
-fn request_user_agent(_state: &AppState, _session: &CurrentSession) -> Option<String> {
-    None
+///
+/// **And it used to be `fn request_user_agent(_state, _session) -> Option<String> { None }`** —
+/// a function with the right name, called from the right place, that returned nothing, for a
+/// reason the comment above it explicitly argued against ("read from the request headers").
+/// The `user_agent` column was therefore always `NULL` and the device list could never answer
+/// "is this still my phone?", which is the only question it exists for. The parameters were
+/// there to make the signature look plausible: it took an `AppState` and a `CurrentSession`
+/// and needed neither, because neither carries a header map.
+fn request_user_agent(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::USER_AGENT)?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        // Bounded because the column is `text` with no limit and the outbox renders it: a
+        // 4 KB user-agent string is a real thing to send and an absurd thing to store.
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(MAX_USER_AGENT_CHARS).collect())
+}
+
+/// The longest browser string kept on a device row.
+const MAX_USER_AGENT_CHARS: usize = 200;
+
+// ---------------------------------------------------------------------------------------------
+// The application's public key
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/notifications/push-key` — the key a browser subscribes with.
+///
+/// **The one value that cannot come from the database and cannot be optional.** Every other
+/// part of this module reads a table; this reads `PushConfig`, because the key pair is a
+/// process-level credential that lives in the environment and is deliberately never persisted
+/// (a database dump must not carry the ability to push to every subscriber).
+///
+/// `available: false` with a `reason` is the honest answer for an installation without one, and
+/// it is deliberately *not* an error status: the settings screen renders the Web Push block
+/// either way, and a `503` here would put a toast on a panel that is working correctly and
+/// simply has nothing to configure. The block's own copy says what to set.
+#[derive(Debug, Serialize)]
+pub struct PushKeyBody {
+    /// The base64url uncompressed P-256 point, the value of `applicationServerKey`.
+    ///
+    /// `None` when the installation has no key. Never a placeholder and never an empty string:
+    /// `applicationServerKey` with an empty string makes `pushManager.subscribe` reject the
+    /// call, so a truthy-looking answer would be a button that always fails.
+    pub public_key: Option<String>,
+    /// Whether a browser can subscribe on this installation right now.
+    pub available: bool,
+    /// What to set when it cannot, in a sentence.
+    pub reason: String,
+}
+
+/// `GET /api/v1/notifications/push-key` — the installation's VAPID public key.
+pub async fn push_key(
+    State(state): State<AppState>,
+    _session: CurrentSession,
+) -> Result<Json<PushKeyBody>, ApiError> {
+    let push = state.config().push.clone();
+    Ok(Json(match (push.public_key(), push.is_usable()) {
+        (Some(public_key), true) => PushKeyBody {
+            public_key: Some(public_key),
+            available: true,
+            reason: "this browser can register for push".to_owned(),
+        },
+        (Some(public_key), false) => PushKeyBody {
+            public_key: Some(public_key),
+            available: false,
+            // A key without a contact is the *near* miss: somebody generated a pair and never
+            // finished the setup. Naming it that way is what makes it a two-minute fix.
+            reason: "this installation has a push key but no contact address; set \
+                     OMNION_PUSH_CONTACT to a mailto: or https: URL"
+                .to_owned(),
+        },
+        (None, _) => PushKeyBody {
+            public_key: None,
+            available: false,
+            reason: "this installation has no push key; set OMNION_PUSH_PRIVATE_KEY to a \
+                     32-byte base64url P-256 private key"
+                .to_owned(),
+        },
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -765,6 +845,83 @@ mod tests {
         assert!(body[0].locked, "in_app is the one locked column");
         assert!(!body[1].locked);
         assert!(body[1].detail.contains("mail"), "the reason is a sentence");
+    }
+
+    #[test]
+    fn the_browser_string_is_read_from_the_header_and_never_from_the_body() {
+        // **The regression this tick exists for.** `request_user_agent` was
+        // `fn(&AppState, &CurrentSession) -> Option<String> { None }` — the right name, called
+        // from the right place, returning nothing, with a doc comment two paragraphs above
+        // explaining that the value must come from the request headers. The `user_agent` column
+        // was therefore always `NULL`, and the device list could never answer the one question
+        // it exists for. Both branches are asserted, because a function that reads the wrong
+        // source and one that reads nothing fail in the same way from the panel.
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(request_user_agent(&headers), None, "no header, no value");
+
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)".parse().expect("a header value"),
+        );
+        assert_eq!(
+            request_user_agent(&headers).as_deref(),
+            Some("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"),
+            "a real browser string is kept verbatim"
+        );
+
+        // Whitespace-only is a header some proxies send, and it is not a browser.
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            "   ".parse().expect("a header value"),
+        );
+        assert_eq!(request_user_agent(&headers), None);
+
+        // And it is bounded: the column is `text` and the device list renders it, so a
+        // 4 KB header is a real thing to send and an absurd thing to store.
+        let long = "x".repeat(MAX_USER_AGENT_CHARS + 500);
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            long.parse().expect("a header value"),
+        );
+        let stored = request_user_agent(&headers).expect("a long header is still a header");
+        assert_eq!(
+            stored.chars().count(),
+            MAX_USER_AGENT_CHARS,
+            "the bound has to be a truncation, not a refusal"
+        );
+    }
+
+    #[test]
+    fn a_push_key_route_that_answers_a_placeholder_is_worse_than_one_that_answers_nothing() {
+        // The three states, as the struct would answer them. `public_key` is the value a
+        // browser puts in `applicationServerKey`, and an empty string there makes
+        // `pushManager.subscribe` reject the call — so "no key" has to be `None`, and the
+        // reason has to name the variable. These are constructed rather than fetched because
+        // the route needs a configured `AppState`, and the branch logic is the thing under
+        // test.
+        let none = PushKeyBody {
+            public_key: None,
+            available: false,
+            reason: "set OMNION_PUSH_PRIVATE_KEY to a 32-byte base64url P-256 private key"
+                .to_owned(),
+        };
+        assert!(none.public_key.is_none());
+        assert!(none.reason.contains("OMNION_PUSH_PRIVATE_KEY"));
+
+        let half = PushKeyBody {
+            public_key: Some("BPublic".to_owned()),
+            available: false,
+            reason: "set OMNION_PUSH_CONTACT to a mailto: or https: URL".to_owned(),
+        };
+        assert!(
+            !half.available,
+            "a key without a contact cannot send, so the block must say so"
+        );
+        assert!(half.reason.contains("OMNION_PUSH_CONTACT"));
+        assert!(
+            half.public_key.is_some(),
+            "the key is still published: the browser can subscribe, the send will not be signed"
+        );
     }
 
     #[test]

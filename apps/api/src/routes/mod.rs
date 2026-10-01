@@ -956,6 +956,13 @@ pub fn router(state: AppState) -> Router {
         .route_layer(guards::require(&state, "notifications.manage"));
     let notifications_channels =
         get(notifications_admin::channels).layer(guards::require(&state, "notifications.manage"));
+    // The installation's VAPID public key: what a browser subscribes with. `notifications.manage`
+    // for the same reason the device list is — a person who can manage their own notifications
+    // needs the key to register the browser they are sitting in front of, and the key is public
+    // by definition (it is the half the push service sees). Declared beside `channels` and
+    // before the `{id}` routes so the literal segment wins the rank.
+    let notifications_push_key =
+        get(notifications_admin::push_key).layer(guards::require(&state, "notifications.manage"));
     // The settings screen's per-channel `Test delivery`. Declared next to the other
     // `notifications.manage` surface and, like `preferences` above, before the `{id}` routes:
     // `POST /notifications/preferences/test` is two static segments, and axum ranks static
@@ -1353,6 +1360,7 @@ pub fn router(state: AppState) -> Router {
         // fifth endpoint joins the right one by being added inside its block.
         .merge(notifications_push)
         .route("/notifications/channels", notifications_channels)
+        .route("/notifications/push-key", notifications_push_key)
         .merge(notifications_outbox)
         .merge(notifications_routes)
         .route("/notifications/{id}", notifications_entry)
