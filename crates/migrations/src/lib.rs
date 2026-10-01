@@ -45,7 +45,9 @@
 pub mod down;
 pub mod error;
 pub mod ledger;
+pub mod lint;
 
 pub use down::DownScript;
 pub use error::{MigrationSafetyError, Result};
 pub use ledger::{Drift, LedgerRow, NewLedgerRow, checksum, detect_drift};
+pub use lint::{PATTERNS, Pattern, Violation, gate_fails, lint};
