@@ -7939,3 +7939,121 @@ re-plans on the client, so the hash now exists and nothing displays it. Then the
 *files* a change set (the entry point for the "lands in the same inbox" box). The QA pass from
 slice 2c is still outstanding and is the only thing that can close the stale-banner and
 viewer-permission boxes.
+## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
+
+test(events): revive the whole suite. feat(events): catalogue four names the drift gate
+found already on the bus.
+
+**This tick started as two open REQ-016 boxes about a delivery row's `duration_ms` and the
+retry ladder's `next_attempt_at`, and turned into the discovery that the file which was
+supposed to prove them had not run a single assertion for twenty ticks.**
+
+I went looking for the two boxes because they name claims no walk measured: the main bus walk
+asserts `delivered`, `attempts == 1`, `response_status == 200` and a readable terminal error, and
+nothing anywhere asserted that a *successful* delivery carries a duration or that the retries are
+**increasingly spaced**. The second is not assertable by a walk that waits a fixed sleep between
+ticks — such a walk cannot tell "the ladder backed off" from "the runner happened to tick again
+later" — so it needed a walk of its own. Writing it meant running the suite, and the suite
+reported:
+
+```text
+1 passed; 10 failed          # every failure: 403 csrf_unavailable / csrf_failed
+```
+
+**Ten of eleven walks were re-proving one refusal, and none of them was testing the event bus.**
+
+### The root cause: a fixture that could not present a credential
+
+Tick 59 made the session cookie *ambient* authority. A cookie-authenticated **write** must now
+present a double-submit token beside it, and sign-in is the only place the product issues one.
+This suite never had either half of what it needed:
+
+1. it built its `Config` from the environment and **never set a CSRF secret**, so
+   `refuse_if_needed` returned `csrf_unavailable` — *"a test process has no
+   `OMNION_CSRF_SECRET`"*, and
+2. it minted sessions straight through `sessions::create_session` rather than signing in, so
+   **no token was ever issued**, which turns the same refusal into `csrf_failed` — *"this
+   request carries no CSRF token"*.
+
+Both refusals are the **product working correctly**. The defect was the fixture, and it was
+total: with no credential in hand, every `POST /webhooks`, every page publish, every delivery
+tick was refused before `crates/events` saw a request. `support::walk_auth` already lifts this
+shape for every other suite and its own doc comment records this exact failure — *"a red suite
+that blames the product is the most expensive kind of red"* — and `--test media` had already
+been repaired. This suite was simply never migrated.
+
+The fix is the mechanical one that helper prescribes: `with_csrf_secret(&mut config)` on the
+fixture, `account()` deriving each session's token with
+`omnion_security::derive_csrf_token(secret, session_id)` and **packing** it beside the session
+id, and `request()` calling `apply_credential` so the cookie and the `x-omnion-csrf` header are
+set together. Packing is why the twenty-odd call sites did not change: a walk's `token` argument
+never became a pair.
+
+```text
+cargo test -p omnion-api --test events -- --test-threads=1   11 passed  (was 1 passed, 10 failed)
+cargo test -p omnion-events --lib                             49 passed
+cargo test -p omnion-api --lib                               258 passed
+tsc -p apps/admin/tsconfig.json --noEmit                     clean
+```
+
+### The walk the two boxes needed
+
+`a_delivery_row_measures_its_own_duration_and_its_backoff_grows` reads its rows **out of the HTTP
+body**, because that is the path the screen takes: `duration_ms` and `next_attempt_at` are both
+columns on the deliveries table, so a value present in PostgreSQL but dropped by
+`DeliveryBody::build` would be invisible to an operator while every crate test stayed green. The
+ladder is climbed one attempt at a time — each reschedule strictly later than the one before it,
+and the gaps asserted **exponential** rather than merely monotone. A measured run:
+
+```text
+attempt 1 → +112 ms · attempt 2 → +197 ms · attempt 3 → +358 ms     (retry_base 40 ms)
+```
+
+**The assertion I wrote first was wrong and the ladder was right.** "The schedule is in the
+future" read *after* the walk has slept through the delay is asserting that the test slept long
+enough: with a 40 ms base and an HTTP round trip inside the tick, every collected timestamp is
+legitimately due by the time it is checked. Two earlier versions of that check failed while the
+backoff was doubling perfectly. The distance between consecutive schedules is the deterministic
+measurement of the same fact, and it is what the walk asserts.
+
+### Four blind spots in the drift gate, each pointing the registry the wrong way
+
+With the suite alive, its two pre-existing source-scan failures became visible — and both had the
+same shape as the notification queue defect from tick 88: **a measurement that cannot see what it
+is measuring, whose only "fix" is to make the registry lie in the other direction.** Three of the
+four were in the gate; one was a real gap in the table.
+
+| what the gate could not see | what it then claimed | the honest fix |
+|---|---|---|
+| a **doc comment** quoting `NewEvent::new("health.service.degraded")` as the *wrong* implementation | a name `health.service` was emitted that nothing emits | strip `//` before matching — a false emission would push a row for a sentence |
+| `Announcement::new(…)`, REQ-014's emitter, which **cannot** call `NewEvent::new` (health is platform-level and fans out per listening tenant) | 5 live names with no emitter | teach the gate the second constructor |
+| a name on the **next line** (`json!(…)` payloads) or three lines down (`if hold { … } else { … }`) | `health.*` and `media.hold_released` unbacked | a three-line lookahead, reading *every* line in the window for the marker |
+| a **dotted name inside `#[cfg(test)]`** (`health.service.exploded`, built to prove the catalogue check refuses it) | a catalogue row demanded for a name nothing emits | skip `#[cfg(test)]` modules — granting that row is a **lie** in the registry |
+
+Every one of those four pushes toward demoting real, working events to `Reserved`, which makes
+the picker say "a module ships this" about events the platform already emits. **The gate was not
+protecting the registry from drift; it was demanding the registry stop telling the truth.**
+
+The one real gap it did find: `backup.restored`, `notification.delivery.succeeded`,
+`media.hold_placed` and `media.hold_released` were all **Live facts on the bus that no operator
+could subscribe to**, because the picker reads this table and the table had never heard of them.
+`8d6b5b21` adds the four rows. `notification.delivery.succeeded` requires `test` rather than
+offering it — a receiver that read "succeeded" as a production delivery and paged somebody for a
+message a person deliberately asked the platform to send is the worst outcome of that row — and
+both `media.hold_*` require `reason`, because a retention decision nobody can defend later is not
+a retention decision.
+
+### Not done this tick
+
+The browser pass. `scripts/qa/run.sh` was queued behind live siblings for the whole tick — w4
+first, then w3 — and `QA_SLOT_WAIT=3600` held it rather than letting it collide, which is what
+that limit is for. **It then died at its own 2400 s timeout still queued** (the log's last line is
+`waiting for a QA slot`), so this tick has **no** browser pass and every screen-leg box below
+stays open. That is two consecutive ticks now, and the queue behind a single shared slot is long
+enough that the next tick should not assume it will get one either. So REQ-016's screen legs (the
+endpoint form's field messages, the payload inspector's clipboard contents, and the walkthrough
+inventory line) remain unticked with the reason in the box, and REQ-021's keyboard and mobile legs
+are still written-but-unmeasured.
+
+Next: the QA pass, then the remaining REQ-016 screen legs, then REQ-021's.
+
