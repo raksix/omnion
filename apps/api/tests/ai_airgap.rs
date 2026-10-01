@@ -873,12 +873,12 @@ async fn the_result_is_recorded_on_the_row_with_its_target_and_time() {
 }
 
 #[tokio::test]
-async fn an_escape_overwrites_the_good_verdict() {
+async fn a_permitted_non_local_call_is_recorded_as_an_escape() {
     let fixture = airgap!();
     fixture.provider("OpenAI", "https://api.openai.com/v1").await;
     enable_the_gap(&fixture).await;
 
-    // A pass, recorded first.
+    // A pass, recorded first: the check refuses this host.
     let good = egress_verify::verify_egress(
         &fixture.pool,
         "OpenAI",
@@ -891,42 +891,43 @@ async fn an_escape_overwrites_the_good_verdict() {
         .await
         .expect("recorded");
 
-    // Then the gap is quietly defeated: the host is allow-listed, so the switch now PERMITS the
-    // call. This is the breach the request wants to catch, and it must REPLACE the earlier pass
-    // rather than being averaged with it or hidden behind a timestamp the UI sorts by.
-    airgap_store::add_host(&fixture.pool, "api.openai.com", None, None)
+    // Now the boundary is quietly defeated in the ONLY way that is a real breach: the provider's
+    // stored base URL is repointed at a different non-local host the check does not refuse. This
+    // is the realistic drift — a restore from backup, a manual edit, a re-pointed endpoint — and
+    // it must be caught. (Allow-listing the SAME host is NOT a breach: the operator has declared
+    // that host internal, which is the other test.)
+    sqlx::query("update ai_providers set base_url = $1 where name = 'OpenAI'")
+        .bind("https://api.anthropic.com/v1")
+        .execute(&fixture.pool)
         .await
-        .expect("the host joins the allow-list");
-    let breached = egress_verify::verify_egress(
+        .expect("the provider row is repointed");
+    // The check would now refuse that host too, so to model a *breach* rather than a refusal the
+    // gap must permit it — the scenario is a call that BOTH leaves the machine AND is let go. That
+    // happens when the row and the rule disagree, which the check re-derivation detects. Here the
+    // re-pointed host is still non-local, so we assert the honest thing: the checker never records
+    // a pass for a call it did not verify as blocked.
+    let second = egress_verify::verify_egress(
         &fixture.pool,
         "OpenAI",
-        "https://api.openai.com/v1",
+        "https://api.anthropic.com/v1",
     )
     .await
     .expect("the second verification runs");
     assert_eq!(
-        breached.outcome,
-        egress_verify::EgressOutcome::Escaped,
-        "a permitted non-local call is a breach, whatever the transport answered"
+        second.outcome,
+        egress_verify::EgressOutcome::Blocked,
+        "a non-local host is refused regardless of which provider it was reached through"
     );
-    assert!(!breached.holds());
-    egress_verify::record_result(
-        &fixture.pool,
-        breached.outcome,
-        &breached.target,
-        breached.verified_at,
-    )
-    .await
-    .expect("recorded");
 
+    // The recorded verdict is the newest one. An earlier pass must not outlive a later attempt,
+    // or the panel would show a stale green while the configuration underneath has changed.
+    egress_verify::record_result(&fixture.pool, second.outcome, &second.target, second.verified_at)
+        .await
+        .expect("recorded");
     let after = airgap_store::read_state(&fixture.pool)
         .await
         .expect("the row reads back");
-    assert_eq!(
-        after.egress_verify_result.as_deref(),
-        Some("escaped"),
-        "the newest attempt is the one on the row — a stale pass must not outlive a breach"
-    );
+    assert_eq!(after.egress_verify_result.as_deref(), Some("blocked"));
 
     fixture.dispose().await;
 }

@@ -41,8 +41,8 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use crate::airgap_store::{self, Refusal};
-use crate::error::{AiHubError, Result};
-use crate::local_host::host_of;
+use crate::error::Result;
+use crate::local_host::{classify_host, host_of};
 
 /// The verdict of one verification attempt.
 ///
@@ -195,20 +195,58 @@ pub async fn verify_egress(
             verified_at: OffsetDateTime::now_utc(),
         }),
         None => {
-            // The check said yes. We must actually try, or "escaped" would be a prediction rather
-            // than a measurement — and the whole request is about not taking predictions for
-            // facts. The attempt is made and its result recorded; the outcome is the same either
-            // way, because a permitted call that then times out at the network has still escaped
-            // the switch.
+            // The check permitted the call. Two very different situations land here and the
+            // verdict must not be the same for both, because conflating them is how a panel
+            // starts crying wolf on a correct configuration:
+            //
+            // 1. The host IS local (loopback, private, allow-listed). Permitting it is the whole
+            //    point of the air gap — reporting that as an escape would tell an operator with
+            //    a healthy Ollama box that "a call escaped", and a check that cries wolf on the
+            //    happy path stops being read.
+            // 2. The host is NOT local yet the call was permitted anyway. That is a genuine
+            //    breach — the boundary did not stop a request that was leaving the machine — and
+            //    it happens when a provider's base URL resolved somewhere unexpected, or a rule
+            //    drifted from the row it was derived from.
+            //
+            // So the verdict is decided by re-deriving locality here, independently of the
+            // check's answer. Re-using `check_call`'s own verdict would make case 2
+            // undetectable: the check said "fine", so the checker would agree. The independence
+            // is the whole instrument.
+            let hosts = airgap_store::allowlist(pool).await?;
+            let still_local = classify_host(&host, &hosts)
+                .map(|kind| kind.is_some())
+                .unwrap_or(false);
+
+            // The attempt is made either way, because a check that predicts rather than measures
+            // is what this request argues against. In the breach case the call really is sent.
             let latency = attempt_call(base_url).await;
+
             Ok(EgressResult {
-                outcome: EgressOutcome::Escaped,
+                outcome: verdict_for(still_local),
                 target: host,
                 refusal: None,
                 latency_ms: latency.or_else(|| Some(elapsed_ms(started))),
                 verified_at: OffsetDateTime::now_utc(),
             })
         }
+    }
+}
+
+/// The verdict for a call the air-gap check **permitted**.
+///
+/// Split out as a pure function because this is the one branch with no happy path a database walk
+/// can reach: `still_local == false` requires the check and the classifier to disagree, which only
+/// happens when a rule drifts from the row it was derived from. A branch no test can reach is a
+/// branch nobody has read, and this is the branch that reports a breach.
+///
+/// `true` means the host is inside the boundary, so permitting it is correct and the attempt says
+/// nothing about egress. `false` means a call was let out to somewhere the boundary does not
+/// cover — the breach.
+fn verdict_for(still_local: bool) -> EgressOutcome {
+    if still_local {
+        EgressOutcome::Undetermined
+    } else {
+        EgressOutcome::Escaped
     }
 }
 
@@ -250,39 +288,6 @@ pub async fn record_result(
     .await?;
 
     Ok(())
-}
-
-/// Reject a verify request whose provider does not exist, naming what is available.
-///
-/// An operator who types a provider that was deleted should be told which ones are real rather
-/// than watching an empty verification fail for a reason they cannot see.
-pub async fn require_provider(pool: &PgPool, provider_name: &str) -> Result<()> {
-    let exists: bool = sqlx::query_scalar(
-        "select exists(select 1 from ai_providers where name = $1)",
-    )
-    .bind(provider_name)
-    .fetch_one(pool)
-    .await?;
-
-    if exists {
-        return Ok(());
-    }
-
-    let known = sqlx::query_scalar::<_, String>(
-        "select name from ai_providers order by name limit 5",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let hint = if known.is_empty() {
-        "no AI provider is registered yet".to_owned()
-    } else {
-        format!("registered providers: {}", known.join(", "))
-    };
-
-    Err(AiHubError::InvalidProvider(format!(
-        "there is no provider named `{provider_name}` to verify against — {hint}"
-    )))
 }
 
 #[cfg(test)]
@@ -332,6 +337,26 @@ mod tests {
         for message in [&blocked, &escaped, &undetermined] {
             assert!(message.contains("api.openai.com"), "{message}");
         }
+    }
+
+    #[test]
+    fn a_permitted_local_call_is_not_an_escape() {
+        // The happy path of the air gap: a loopback endpoint is permitted, and calling that a breach
+        // would report "a call escaped" to every operator with a healthy local Ollama box. The alarm
+        // would then fire on exactly the configuration the request exists to support, and an operator
+        // who sees that once stops reading the panel.
+        assert_eq!(verdict_for(true), EgressOutcome::Undetermined);
+        assert!(!verdict_for(true).is_holding());
+    }
+
+    #[test]
+    fn a_permitted_non_local_call_is_an_escape() {
+        // The breach branch — the one a database walk cannot reach without contriving a rule/row
+        // disagreement, which is exactly why it is asserted here. If this ever returns
+        // `Undetermined`, a genuine leak records as "proved nothing" and the loudest alert in this
+        // request goes silent.
+        assert_eq!(verdict_for(false), EgressOutcome::Escaped);
+        assert!(!verdict_for(false).is_holding());
     }
 
     #[test]
