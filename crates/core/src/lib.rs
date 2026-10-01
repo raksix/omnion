@@ -15,6 +15,7 @@ pub mod base64url;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod push_crypto;
 pub mod redis_client;
 pub mod telemetry;
 pub mod vapid;
