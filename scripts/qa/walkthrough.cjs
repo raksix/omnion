@@ -6841,6 +6841,58 @@ async function runCdnRulesDepth(page, report) {
   // count would otherwise read the table AND the still-mounted card list, while `before` counted
   // the visible ones. Same class as every other count in this function.
   steps.cleanedUp = await page.locator("[data-cdn-rule-row]:visible").count();
+
+  // ---- the gates -------------------------------------------------------------------------
+  // Every claim above this line lands in `summary.json` and, on its own, in nothing else: a
+  // `steps.x = false` produces a report that differs from `steps.x = true` in one word, and
+  // nothing in the harness fails on the difference. So each claim a reader would take for an
+  // assertion is read here and, when it is false, recorded as a finding.
+  //
+  // This is not ceremony. The claims in this function were written over several ticks and the
+  // three that mattered most — `reorderSwapped`, `prioritiesDense` and `testerIsLive` — were all
+  // ungated until now: a reorder control that moved nothing, a renumber that left two rules
+  // claiming one priority, and a tester painting "no match" for every sample would each have
+  // reported a passing pass. `scripts/qa/audit-depth-claims.mjs` now fails on that shape.
+  const gate = (claim, severity, what) => {
+    if (steps[claim] === true || (typeof steps[claim] === "number" && steps[claim] > 0)) return;
+    record({
+      page: "cdn-rules",
+      action: `rule-${claim}`,
+      severity,
+      detail: what,
+      measured: steps[claim],
+    });
+  };
+
+  gate("formOpened", "high", "the create form did not open, so no rule could be created from this screen");
+  gate("testerIsLive", "high", "the pattern tester answered the same for a matching and a non-matching sample, or never said 'no match' — it is decoration, not a tester");
+  gate("ttlRefusalNamesTheBound", "high", "an out-of-range TTL was refused without naming the bound, so an operator cannot tell what to type");
+  gate("createdByApi", "high", "a rule that passed validation was never stored");
+  gate("createdInTable", "high", "the API stored the rule but the table does not show it — the screen and the API disagree about the same set");
+  gate("secondCreated", "high", "the second rule used for the reorder was not created, so the move that follows proves nothing");
+  gate("moverExists", "high", "the last rule in the API order has no row on screen, so the API is returning something the table drops");
+  gate("moverUpEnabled", "high", "'move up' is disabled on the last rule, where it must always be available");
+  gate("reorderSwapped", "high", "pressing 'move up' did not raise the rule exactly one position, or disturbed other rows");
+  gate("prioritiesDense", "high", "the priorities after a move are not a dense ascending run — two rules can share one priority and the matcher breaks the tie by row order rather than by what the panel showed");
+  gate("toggled", "high", "the enable/disable control did not change the rule's stored state");
+  gate("duplicated", "high", "duplicate did not produce a second rule");
+  gate("errorState", "high", "a list request that answered 500 rendered no alert — the empty table below it reads as 'this site has no rules'");
+  gate("errorOffersRetry", "high", "the cache-rule error banner offers no control to try again");
+  gate("retryReRunsTheRequest", "high", "the error banner's control exists but pressing it did not re-run the failing request");
+  gate("countMatches", "high", "the table rows, the rules the API returned and the header count are not the same number");
+  gate("headerCountedTheRows", "medium", "the header count does not describe the rows on screen");
+  gate("mobileNoTableScroll", "medium", "the rules table overflows horizontally at 390px");
+  // These two measure the layout, not a claim a reader can hold the pass to: zero rows is a
+  // legitimate state, so they are recorded as facts rather than gated as booleans.
+  if (!steps.mobileTouchTargets) {
+    record({
+      page: "cdn-rules",
+      action: "rule-mobile-touch-targets",
+      severity: "medium",
+      detail: `row controls shorter than the ${TOUCH_TARGET_MIN_PX}px floor at 390px`,
+      measured: steps.mobileTouchTargetDetail,
+    });
+  }
   return steps;
 }
 
