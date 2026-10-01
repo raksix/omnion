@@ -210,8 +210,7 @@ pub fn is_down_heading(body: &str) -> bool {
     };
     // Whatever follows must be empty or a parenthesised reference — `(docs/05-VERSIONING.md)`.
     // A sentence does not match, and neither does a second word.
-    rest.is_empty()
-        || (rest.starts_with('(') && rest.ends_with(')'))
+    rest.is_empty() || (rest.starts_with('(') && rest.ends_with(')'))
 }
 
 /// The heading phrase, without the comment marker.
@@ -360,8 +359,8 @@ create table release_manifests (version text primary key);
     /// written against. So the real files are read, and the assertion is a COUNT.
     #[test]
     fn the_trees_own_migrations_are_read_as_they_are_written() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../database/migrations");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../database/migrations");
         let mut files = std::fs::read_dir(&dir)
             .expect("the migrations directory is embedded, so it is on disk")
             .filter_map(Result::ok)
@@ -389,7 +388,10 @@ create table release_manifests (version text primary key);
                 // A heading with no statement under it is a half-written reversal. Naming the
                 // files is the point: this list is short and every entry is a real defect.
                 headings_without_statements.push(
-                    path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
                 );
             }
         }
@@ -399,18 +401,19 @@ create table release_manifests (version text primary key);
             "a down-script heading with no statements under it is a reversal nobody can run: \
              {headings_without_statements:?}"
         );
-        // SIX is the measured truth, and the number is the point rather than a threshold to be
-        // relaxed until the suite is green: an independent scan of the same 59 files (heading or
-        // marker, then indented comment lines) finds exactly these six with these statement
-        // counts — `0037`, `0040`, `0162`, `0199`, `0207` and `0216`. A parser that reads only
-        // its own marker finds ZERO, and a parser that opened on any line mentioning "down
-        // script" finds ten blocks, five of which are prose.
+        // SEVEN is the measured truth, and the number is the point rather than a threshold to be
+        // relaxed until the suite is green: an independent scan of the same 61 files (heading or
+        // marker, then indented comment lines) finds exactly these seven with these statement
+        // counts — `0037`, `0040`, `0162`, `0199`, `0207`, `0216` and `0221`. A parser that reads
+        // only its own marker finds ZERO, and a parser that opened on any line mentioning "down
+        // script" finds eleven blocks, five of which are prose.
         //
-        // The other 53 migrations have no reversal at all, which is a fact about the repository
+        // The other 54 migrations have no reversal at all, which is a fact about the repository
         // and not about this parser. It is also exactly why the policy's answer for them is a
         // WAIVER and not a pass: a migration with no reversal is "take the backup".
         assert_eq!(
-            with_reversal, 6,
+            with_reversal,
+            7,
             "the parser must read exactly the files that carry a reversal; it read {with_reversal} \
              of {total} files. New migration with a reversal? Raise this number WITH the file.",
             total = files.len()

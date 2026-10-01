@@ -45,6 +45,7 @@
 pub mod backfill;
 pub mod down;
 pub mod error;
+pub mod export;
 pub mod ledger;
 pub mod lint;
 pub mod lock;
@@ -59,6 +60,6 @@ pub use lint::{PATTERNS, Pattern, Violation, gate_fails, lint};
 pub use lock::{LockView, lock_id, lock_id_text};
 pub use policy::Policy;
 pub use runner::{
-    created_objects, reversed_objects, ApplyReport, Direction, Plan, RunActor, VerifyReport,
+    ApplyReport, Direction, Plan, RunActor, VerifyReport, created_objects, reversed_objects,
     structure_restored, verify_down,
 };
