@@ -21,8 +21,8 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use omnion_content::api_token_usage::{self, DailyUsage};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sqlx::Row;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::content_meter;
@@ -58,6 +58,14 @@ pub struct TokenUsage {
     pub pending_requests: i32,
     /// Refusals counted but not yet flushed.
     pub pending_throttled: i32,
+    /// The token's own `last_used_at`, or `null` when it has never been used.
+    ///
+    /// Read from the same query as the name rather than left to the panel: the usage tab is the
+    /// screen a person opens to answer "is this token doing anything", and a per-token table that
+    /// cannot say when it was last used answers the question with a blank cell. It is also the
+    /// one column that can disagree with the rest of the row — a token whose calls all failed
+    /// still has a `last_used_at`, because authentication precedes the handler.
+    pub last_used_at: Option<time::OffsetDateTime>,
 }
 
 /// The whole answer: the durable rows, the live window and the roll-up the chart draws.
@@ -69,6 +77,13 @@ pub struct UsageBody {
     pub rows: Vec<DailyUsageRow>,
     /// Per-token totals, the table under the chart.
     pub tokens: Vec<TokenUsage>,
+    /// The endpoint leaderboard: what the traffic is actually made of.
+    ///
+    /// Derived **on the server from the same two sources as `tokens`**, including the live window.
+    /// A leaderboard the panel sums out of `rows` on its own would be a flushed-only number sitting
+    /// above a flushed-plus-pending table, and the two would not add up — the exact disagreement
+    /// this route refuses to have in `UsageBody`.
+    pub endpoints: Vec<EndpointUsage>,
     /// The chart's series: one bar per day, oldest first, across every token.
     pub series: Vec<DayTotal>,
     /// Whether the live window could be read at all.
@@ -124,6 +139,22 @@ pub struct DayTotal {
     pub throttled: i32,
 }
 
+/// One line of the endpoint leaderboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointUsage {
+    /// The matched route, exactly as the durable rows and the live keys spell it.
+    pub endpoint: String,
+    /// Flushed + pending requests, so this column is comparable with the per-token table's total.
+    pub requests: i32,
+    /// Refusals, same sources.
+    pub throttled: i32,
+    /// How many of the `requests` are durable and how many are still in the live window.
+    ///
+    /// The split is on the row because this is where a person compares it against an access log:
+    /// "312 requests, 12 still counting" is reconcilable, and a single 312 is not.
+    pub flushed_requests: i32,
+}
+
 /// `GET /api/v1/content-api/usage` — every token's usage for the last N days.
 pub async fn usage(
     State(state): State<AppState>,
@@ -143,10 +174,10 @@ pub async fn usage(
             )
         })?;
 
-    // The tokens' names, in one read. A name per row would be a lookup per token, and the usage
-    // view is the one screen where a person reads *many* tokens at once.
-    let names: std::collections::HashMap<Uuid, String> = sqlx::query(
-        "select id, name from api_tokens where organization_id = $1",
+    // The tokens' names and last-used stamps, in one read. A name per row would be a lookup per
+    // token, and the usage view is the one screen where a person reads *many* tokens at once.
+    let names: std::collections::HashMap<Uuid, (String, Option<time::OffsetDateTime>)> = sqlx::query(
+        "select id, name, last_used_at from api_tokens where organization_id = $1",
     )
     .bind(organization_id)
     .fetch_all(state.db().pool())
@@ -162,14 +193,17 @@ pub async fn usage(
     .map(|row| {
         (
             row.get::<Uuid, _>("id"),
-            row.get::<String, _>("name"),
+            (
+                row.get::<String, _>("name"),
+                row.get::<Option<time::OffsetDateTime>, _>("last_used_at"),
+            ),
         )
     })
     .collect();
 
     let mut tokens: Vec<TokenUsage> = names
         .iter()
-        .map(|(id, name)| TokenUsage {
+        .map(|(id, (name, last_used_at))| TokenUsage {
             token_id: *id,
             name: name.clone(),
             flushed_requests: 0,
@@ -177,19 +211,39 @@ pub async fn usage(
             flushed_throttled: 0,
             pending_requests: 0,
             pending_throttled: 0,
+            last_used_at: *last_used_at,
         })
         .collect();
-    let mut index: std::collections::HashMap<Uuid, usize> = names
+    let index: std::collections::HashMap<Uuid, usize> = names
         .keys()
         .enumerate()
         .map(|(position, id)| (*id, position))
         .collect();
 
+    // The leaderboard, accumulated in the same pass as the per-token totals. Two loops over the
+    // same rows would work and would be the shape that drifts: the day filter lives in the query
+    // for the table and in a `if` for the board, and the day the two filters disagree is a day the
+    // two numbers do not add up.
+    let mut per_endpoint: BTreeMap<String, EndpointUsage> = BTreeMap::new();
+
     for row in &rows {
+        let entry = per_endpoint
+            .entry(row.endpoint.clone())
+            .or_insert_with(|| EndpointUsage {
+                endpoint: row.endpoint.clone(),
+                requests: 0,
+                throttled: 0,
+                flushed_requests: 0,
+            });
+        entry.requests += row.requests;
+        entry.flushed_requests += row.requests;
+        entry.throttled += row.throttled;
+
         let Some(position) = index.get(&row.token_id).copied() else {
             // A usage row whose token is not in this organization cannot reach the response: the
             // query joins on `organization_id`, so this arm is a guard, not a case. Skipping beats
-            // a panic on a row the query already filtered.
+            // a panic on a row the query already filtered. It is skipped for the leaderboard too
+            // — a row for somebody else's token must not make an endpoint look busy.
             continue;
         };
         let token = &mut tokens[position];
@@ -212,17 +266,46 @@ pub async fn usage(
         let Some(position) = index.get(&bucket.token_id).copied() else {
             continue;
         };
+        // The live window is only added to the leaderboard when the window could be *read*. A scan
+        // that failed halfway returns the keys it did reach, and adding a partial total to the
+        // per-token table while reporting `pending_readable: false` would leave the panel unable to
+        // tell "312 requests" from "312 requests, at least".
+        if pending_readable {
+            let entry = per_endpoint
+                .entry(bucket.endpoint.clone())
+                .or_insert_with(|| EndpointUsage {
+                    endpoint: bucket.endpoint.clone(),
+                    requests: 0,
+                    throttled: 0,
+                    flushed_requests: 0,
+                });
+            entry.requests += counts.requests;
+            entry.throttled += counts.throttled;
+        }
         tokens[position].pending_requests += counts.requests;
         tokens[position].pending_throttled += counts.throttled;
         pending_requests += counts.requests;
         pending_throttled += counts.throttled;
     }
 
+    // Busiest first, and then by the path so the order is stable across two calls on the same
+    // data. A leaderboard whose order depends on a `HashMap`'s iteration is a leaderboard that
+    // reorders itself on refresh and reads as traffic moving.
+    let endpoints = leaderboard(per_endpoint);
+    debug_assert!(
+        leaderboard_is_at_least_its_own_durable_half(&endpoints),
+        "the leaderboard's total cannot be below the durable part it was built from"
+    );
+
     // The chart's series: one bar per day, oldest first, zero-filled so a quiet day is a short
     // bar and not a gap. A chart whose x-axis skips a day is a chart a person reads as "the
     // integration stopped", which is the opposite of what an empty day means.
     let series = series_for(&rows, days);
 
+    // `then_some` is applied **here**, at the one point the two halves become one answer — not in
+    // the `UsageBody` literal next to it. Both spellings are correct on their own; having both means
+    // the second one shadows the first, and the compiler caught the double `Option` rather than
+    // letting a `pending_requests` of `0` be served to a panel that is told Redis is unreadable.
     let pending_requests = pending_readable.then_some(pending_requests);
     let pending_throttled = pending_readable.then_some(pending_throttled);
 
@@ -230,6 +313,7 @@ pub async fn usage(
         days,
         rows: rows.into_iter().map(DailyUsageRow::from).collect(),
         tokens,
+        endpoints,
         series,
         pending_readable,
         pending_requests,
@@ -248,8 +332,6 @@ async fn live_readable(state: &AppState) -> bool {
 
 /// The chart's bars: one per day over the window, oldest first, gaps filled with zeroes.
 fn series_for(rows: &[DailyUsage], days: i32) -> Vec<DayTotal> {
-    use std::collections::BTreeMap;
-
     let mut per_day: BTreeMap<time::Date, DayTotal> = BTreeMap::new();
     for row in rows {
         let entry = per_day.entry(row.day).or_insert_with(|| DayTotal {
@@ -282,6 +364,28 @@ fn series_for(rows: &[DailyUsage], days: i32) -> Vec<DayTotal> {
 
 /// How many days the usage tab shows when it does not ask for a window.
 pub const DEFAULT_WINDOW_DAYS: i32 = 14;
+
+/// The leaderboard's roll-up, extracted so the property that keeps it honest is testable without
+/// a database.
+fn leaderboard(per_endpoint: BTreeMap<String, EndpointUsage>) -> Vec<EndpointUsage> {
+    let mut endpoints: Vec<EndpointUsage> = per_endpoint.into_values().collect();
+    endpoints.sort_by(|left, right| {
+        right
+            .requests
+            .cmp(&left.requests)
+            .then_with(|| left.endpoint.cmp(&right.endpoint))
+    });
+    endpoints
+}
+
+/// `flushed_requests` is the column a person reconciles against an access log, so `requests` is
+/// allowed to be anything **except** less than it: a total below its own durable part is a chart
+/// that contradicts itself with no way for the reader to tell which half is right.
+fn leaderboard_is_at_least_its_own_durable_half(endpoints: &[EndpointUsage]) -> bool {
+    endpoints
+        .iter()
+        .all(|entry| entry.requests >= entry.flushed_requests && entry.flushed_requests >= 0)
+}
 
 #[cfg(test)]
 mod tests {
@@ -338,5 +442,64 @@ mod tests {
             bars.iter().all(|bar| bar.requests == 0),
             "a row from 40 days ago must not reach a 7-day chart"
         );
+    }
+
+    fn entry(endpoint: &str, requests: i32, flushed: i32) -> EndpointUsage {
+        EndpointUsage {
+            endpoint: endpoint.to_owned(),
+            requests,
+            throttled: 0,
+            flushed_requests: flushed,
+        }
+    }
+
+    #[test]
+    fn the_leaderboard_is_busiest_first_and_stable_between_ties() {
+        // The tie-break is the point of the second clause. Two equal endpoints sorted by a
+        // `HashMap` iteration order re-shuffle on every refresh, and a person watching the panel
+        // reads that reorder as traffic actually moving.
+        let mut map = BTreeMap::new();
+        map.insert("/content/media".to_owned(), entry("/content/media", 4, 4));
+        map.insert("/content/pages".to_owned(), entry("/content/pages", 4, 4));
+        map.insert("/content/posts".to_owned(), entry("/content/posts", 9, 2));
+        let first = leaderboard(map.clone());
+        let second = leaderboard(map);
+        assert_eq!(
+            first.iter().map(|e| e.endpoint.as_str()).collect::<Vec<_>>(),
+            vec!["/content/posts", "/content/media", "/content/pages"],
+            "busiest first, then alphabetically: {:?}",
+            first.iter().map(|e| &e.endpoint).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first.iter().map(|e| &e.endpoint).collect::<Vec<_>>(),
+            second.iter().map(|e| &e.endpoint).collect::<Vec<_>>(),
+            "two calls on the same data must order the same way"
+        );
+    }
+
+    #[test]
+    fn a_leaderboard_row_never_claims_fewer_requests_than_it_already_flushed() {
+        // The failure this guards is not a crash: it is a total of 9 sitting above a "9 durable"
+        // column, on a screen whose whole job is reconciling the two with an access log. Read on
+        // its own each half looks right.
+        assert!(
+            leaderboard_is_at_least_its_own_durable_half(&[
+                entry("/content/pages", 12, 9),
+                entry("/content/media", 4, 4),
+            ]),
+            "a total above its durable half is the only correct shape"
+        );
+        assert!(
+            !leaderboard_is_at_least_its_own_durable_half(&[entry("/content/pages", 3, 9)]),
+            "3 total next to 9 durable must be rejected"
+        );
+    }
+
+    #[test]
+    fn an_empty_window_yields_an_empty_leaderboard_rather_than_a_zero_row() {
+        // The zero-row version is what a "group by what is there" implementation returns when
+        // somebody is watching for a route that has never been called: it invents an endpoint. An
+        // empty list is honest and the panel's own empty state explains it.
+        assert!(leaderboard(BTreeMap::new()).is_empty());
     }
 }

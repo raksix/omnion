@@ -3,21 +3,27 @@
 /**
  * The tab bar every `/content-api/*` screen sits under (REQ-019).
  *
- * Four tabs, three routes so far — the Explorer and Usage tabs are slice 3 and are deliberately
- * **not** listed until they exist. A tab bar that links to a screen that will 404 is the panel's
- * own "coming soon", which the Definition of Done forbids, and an empty tab is worse than a
- * missing one: it advertises a feature that cannot be reached.
+ * Four tabs, four routes. The Explorer tab is slice 3's remaining half and is **not** listed until
+ * it exists — a tab bar that links to a screen that will 404 is the panel's own "coming soon",
+ * which the Definition of Done forbids, and an empty tab is worse than a missing one: it
+ * advertises a feature that cannot be reached.
  *
  * The active tab is derived from the pathname rather than passed in, so a new route that forgets
  * the prop still highlights correctly — the prop version of the same fact is a second answer that
  * eventually disagrees.
  */
-import { FileText, Gauge, KeyRound } from "lucide-react";
+import { Activity, BarChart3, FileText, KeyRound } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 
-/** The routes of the section, in the order a person works through them. */
+/**
+ * The routes of the section, in the order a person works through them.
+ *
+ * Tokens, then Docs (what it is), then Usage (what it has been doing). Usage comes last because
+ * it is the screen you open *after* the other two: a number is only interesting next to the
+ * contract it is a number about.
+ */
 export const CONTENT_API_NAV = [
   {
     href: "/content-api",
@@ -30,6 +36,12 @@ export const CONTENT_API_NAV = [
     href: "/content-api/docs",
     label: "Docs",
     icon: FileText,
+    exact: false,
+  },
+  {
+    href: "/content-api/usage",
+    label: "Usage",
+    icon: BarChart3,
     exact: false,
   },
 ] as const;
@@ -46,7 +58,7 @@ export function ContentApiShell({ children }: { children: ReactNode }) {
         data-content-api-nav
       >
         <span className="mr-1 flex items-center gap-1.5 rounded-lg bg-quiet-soft px-2 py-1 text-[12px] font-medium text-ink">
-          <Gauge className="size-3.5 shrink-0" aria-hidden />
+          <Activity className="size-3.5 shrink-0" aria-hidden />
           Content API
         </span>
         {CONTENT_API_NAV.map((entry) => {

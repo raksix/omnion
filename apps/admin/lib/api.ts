@@ -10,6 +10,7 @@ import type {
   ContentBlock,
   ContentPattern,
   ContentApiToken,
+  ContentApiUsage,
   ContentApiVocabulary,
   CreatedContentApiToken,
   OpenApiDocument,
@@ -6904,6 +6905,17 @@ export function revokeContentApiToken(tokenId: string): Promise<void> {
   return request<void>(`/api/v1/content-api/tokens/${encodeURIComponent(tokenId)}`, {
     method: "DELETE",
   });
+}
+
+/**
+ * `GET /api/v1/content-api/usage` — the Usage tab's data (REQ-019, slice 3).
+ *
+ * The `days` the screen asks for is the window it is *rendering*, and it is sent rather than
+ * configured: the route is also reachable by an integrator, and a client that could only ever ask
+ * for 30 days would make the parameter untestable from anywhere but this screen.
+ */
+export function fetchContentApiUsage(days: number): Promise<ContentApiUsage> {
+  return request<ContentApiUsage>(`/api/v1/content-api/usage?days=${encodeURIComponent(String(days))}`);
 }
 
 /**

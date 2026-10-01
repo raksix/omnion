@@ -3176,6 +3176,83 @@ export type ContentApiVocabulary = {
 };
 
 /**
+ * `GET /api/v1/content-api/usage` — the Usage tab's whole answer (REQ-019, slice 3).
+ *
+ * Three summaries over two sources (the durable table and the live Redis window), and the split is
+ * carried on the wire rather than resolved by the panel. `rows` is raw; `series`, `tokens` and
+ * `endpoints` are the server's roll-ups, and the panel renders those rather than computing its own
+ * — a client-side sum is a second answer to "how much did this token do", and the second answer is
+ * the one that disagrees with the usage route's own numbers.
+ */
+export type ContentApiUsage = {
+  /** Days the answer covers. The server clamps a larger ask rather than refusing it. */
+  days: number;
+  /** The durable rows, newest day first — the raw material behind every roll-up above. */
+  rows: ContentApiUsageRow[];
+  /** Per-token totals, the table under the chart. */
+  tokens: ContentApiUsageToken[];
+  /** What the traffic is made of, busiest first. */
+  endpoints: ContentApiUsageEndpoint[];
+  /** One bar per day, oldest first, zero-filled so a quiet day is a short bar and not a gap. */
+  series: ContentApiUsageDay[];
+  /**
+   * Whether the live window could be read at all.
+   *
+   * `false` means `pending_requests` is `null` — **not** `0`. A panel that rendered it as zero would
+   * be telling an operator nothing is in flight while the counter is unreachable.
+   */
+  pending_readable: boolean;
+  /** Requests counted but not yet flushed, or `null` when the window could not be read. */
+  pending_requests: number | null;
+  /** Refusals in the live window, or `null` when the window could not be read. */
+  pending_throttled: number | null;
+};
+
+/** One durable row. `endpoint` is the matched route, with no `/api/v1` prefix. */
+export type ContentApiUsageRow = {
+  token_id: string;
+  /** ISO day, `YYYY-MM-DD`. */
+  day: string;
+  endpoint: string;
+  requests: number;
+  errors: number;
+  throttled: number;
+};
+
+/** One token's line in the usage table. */
+export type ContentApiUsageToken = {
+  token_id: string;
+  name: string;
+  flushed_requests: number;
+  flushed_errors: number;
+  flushed_throttled: number;
+  /** Counted in the live window, not yet in the table. */
+  pending_requests: number;
+  /** Counted in the live window, not yet in the table. */
+  pending_throttled: number;
+  /** `null` when the token has never authenticated. */
+  last_used_at: string | null;
+};
+
+/** One line of the endpoint leaderboard. */
+export type ContentApiUsageEndpoint = {
+  endpoint: string;
+  /** Flushed **plus** pending, so it is comparable with the per-token total. */
+  requests: number;
+  throttled: number;
+  /** How many of `requests` are already durable. `requests - flushed_requests` is still counting. */
+  flushed_requests: number;
+};
+
+/** One bar of the chart. */
+export type ContentApiUsageDay = {
+  /** ISO day, `YYYY-MM-DD`. */
+  day: string;
+  requests: number;
+  throttled: number;
+};
+
+/**
  * One documented operation, as the Docs tab reads it.
  *
  * A *narrowed* view of the OpenAPI document rather than the document itself typed out. The panel

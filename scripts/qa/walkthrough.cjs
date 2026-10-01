@@ -6492,16 +6492,160 @@ async function runContentApiDepth(page, report) {
   steps.theRevokedRowStaysVisible =
     qaSql(`select coalesce(revoked_at::text, 'NULL') from api_tokens where id = '${tokenId}'`) !== "NULL";
 
+  // ------------------------------------------------------------------ the Usage tab
+  // A fresh token, because the one above has just been revoked and the point of this block is
+  // that the tab shows traffic from a token that *works*. Minting here rather than reusing the
+  // earlier one is also what makes the sequence honest: a revoked token authenticating would be a
+  // 401, and a Usage tab that renders 401s as usage would look identical to a working one.
+  const usageToken = await page
+    .request.post(`${URL_API}/api/v1/content-api/tokens`, {
+      data: { name: `QA Usage ${stamp}`, scopes: ["content:read", "media:read"] },
+    })
+    .then((response) => response.json().catch(() => null))
+    .catch(() => null);
+  const usageSecret = usageToken?.plaintext || "";
+  steps.usageTokenWasMinted = usageSecret.startsWith("omn_");
+
+  // Real calls through the real surface. Three, because "a non-empty chart" and "the bar heights
+  // mean something" are different claims and one call cannot tell them apart.
+  let usageCalls = 0;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const status = await page
+      .request.get(`${URL_API}/api/v1/content/pages?limit=5`, {
+        headers: { authorization: `Bearer ${usageSecret}` },
+      })
+      .then((response) => response.status())
+      .catch(() => 0);
+    if (status === 200) usageCalls += 1;
+  }
+  steps.theUsageTokenActuallyReadTheSurface = usageCalls === 3;
+
+  await page
+    .goto(`${URL_ADMIN}/content-api/usage`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.usageScreenReady =
+    (await page.locator("[data-content-api-usage]").count()) > 0;
+  steps.usageScreenHasNoErrorStrip =
+    (await page.locator("[data-content-api-usage-error]").count()) === 0;
+  steps.usageTabIsLinked =
+    (await page.locator("[data-content-api-tab=\"usage\"]").count()) > 0;
+  // The freshness note is load-bearing, not decoration: without it a reader watches the chart for
+  // a second, sees nothing move, and concludes the feature is broken while it is working.
+  steps.usageExplainsTheFlushLag =
+    (await page.locator("[data-content-api-usage-freshness]").count()) > 0;
+
+  const chartState = await page
+    .locator("[data-content-api-usage-chart]")
+    .getAttribute("data-content-api-usage-chart")
+    .catch(() => null);
+  steps.usageChartIsOneOfTwoRealStates =
+    chartState === "bars" || chartState === "empty";
+  const barCount = await page
+    .locator("[data-content-api-usage-bar]")
+    .count()
+    .catch(() => 0);
+  // One bar per day over the window, zero-filled — **thirty**, because that is the window the tab
+  // opens on and the control was left there by the step above. A "group by what is there" chart
+  // returns a bar per day *that has traffic*, which is exactly the shape a reader mistakes for
+  // "the integration stopped", so the count is the assertion rather than a non-emptiness check.
+  steps.usageChartHasOneBarPerDay = chartState === "empty" || barCount === 30;
+  steps.usageChartDrewRealTraffic =
+    chartState === "empty" || Number((await page
+      .locator("[data-content-api-usage-chart]")
+      .getAttribute("data-content-api-usage-max")
+      .catch(() => "0")) || 0) > 0;
+  await shot(page, "content-api-usage");
+
+  // The per-token table: the criterion asks for per-token rows whose counts match what the caller
+  // produced. The three calls above are the "what the caller produced" side and the row is the
+  // other side, so the assertion is an equality rather than a non-emptiness.
+  const usageRow = usageToken?.token?.id
+    ? page.locator(`[data-content-api-usage-token="${usageToken.token.id}"]`)
+    : null;
+  steps.usageTokenHasARow = usageRow !== null && (await usageRow.count().catch(() => 0)) === 1;
+  const rowText = usageRow === null ? "" : await usageRow.innerText().catch(() => "");
+  steps.usageRowNamesTheToken = rowText.includes(`QA Usage ${stamp}`);
+  // `1` of the three calls is not in the durable table yet (the flush is on an interval), which is
+  // why the screen has two columns rather than one. Both must be visible, and the *sum* must be at
+  // least the number of calls actually made.
+  const flushedCell = Number(
+    (rowText.match(/Requests\s*([\d,]+)/) || [])[1]?.replace(/,/g, "") ?? "0",
+  );
+  const countingCell = Number(
+    (rowText.match(/Counting\s*([\d,]+)/) || [])[1]?.replace(/,/g, "") ?? "0",
+  );
+  steps.usageRowCountsTheCalls =
+    flushedCell + countingCell >= usageCalls && flushedCell + countingCell > 0;
+  // A token that has never been called must still appear — "this token is idle" is exactly what
+  // somebody opens this screen to find, so a table that filters idle tokens out answers nothing.
+  steps.idleTokensAreStillListed =
+    (await page.locator("[data-content-api-usage-token]").count()) >=
+    (await page.locator("[data-content-api-usage-table] tbody tr").count().catch(() => 0));
+
+  // The leaderboard must agree with the per-token table, because both are the same two sources
+  // (durable rows + live window) rolled up twice. A leaderboard summed from the durable rows only
+  // would be short by exactly the pending count, and the two numbers would sit one screen apart.
+  const leaderboardTotal = await page
+    .locator("[data-content-api-usage-endpoint] .font-mono")
+    .first()
+    .innerText()
+    .catch(() => "");
+  const leaderboardNumber = Number((leaderboardTotal.match(/[\d,]+/) || ["0"])[0].replace(/,/g, ""));
+  steps.usageLeaderboardHasRows =
+    (await page.locator("[data-content-api-usage-endpoint]").count()) > 0;
+  steps.usageLeaderboardIsNotBelowTheTable =
+    leaderboardNumber > 0 && leaderboardNumber >= flushedCell;
+  // The panel must not sum the two halves into one number: that is the property the whole screen
+  // exists for, and it is asserted against the *rendered* text rather than the API shape, because a
+  // client that computed its own total would still return the right JSON.
+  steps.usageDoesNotSumFlushedAndPending =
+    (await page.locator("[data-content-api-usage-freshness]").innerText().catch(() => "")).includes(
+      "never summed",
+    );
+
+  // The window control is a real control: changing it must re-ask, not relabel.
+  await page.selectOption("[data-content-api-usage-window]", "7").catch(() => {});
+  await page.waitForTimeout(2000);
+  const sevenDayBars = await page
+    .locator("[data-content-api-usage-bar]")
+    .count()
+    .catch(() => 0);
+  steps.usageWindowControlChangesTheChart =
+    sevenDayBars === 0 ? chartState === "empty" : sevenDayBars === 7;
+  await page.selectOption("[data-content-api-usage-window]", "30").catch(() => {});
+  await page.waitForTimeout(1200);
+
   // ------------------------------------------------------------------ the mobile layout
+  // Measured on BOTH screens, and the docs one is measured first: the Docs tab's own overflow is
+  // asserted by the steps above, and the Usage tab's mobile claim is a *different* layout (a table
+  // at `sm` and a card list below it), so one measurement cannot stand for the other.
   await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
   await page.waitForTimeout(1600);
-  const overflow = await page
+  const usageOverflow = await page
     .evaluate(() => {
       const el = document.scrollingElement || document.documentElement;
       return el.scrollWidth - el.clientWidth;
     })
     .catch(() => -1);
-  steps.noHorizontalScrollAt390 = overflow <= 1;
+  steps.noHorizontalScrollAt390 = usageOverflow <= 1;
+  // The card list is the layout a phone actually shows; assert it is the one present, so the
+  // overflow above cannot have been measured on a hidden table.
+  steps.theMobileLayoutIsTheCardList =
+    (await page.locator("[data-content-api-usage-cards]").isVisible().catch(() => false)) === true;
+  await shot(page, "content-api-usage-390");
+
+  await page
+    .goto(`${URL_ADMIN}/content-api/docs`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(1600);
+  const docsOverflow = await page
+    .evaluate(() => {
+      const el = document.scrollingElement || document.documentElement;
+      return el.scrollWidth - el.clientWidth;
+    })
+    .catch(() => -1);
+  steps.docsNoHorizontalScrollAt390 = docsOverflow <= 1;
   await shot(page, "content-api-docs-390");
   await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
 
@@ -11656,6 +11800,10 @@ async function main() {
     // found no endpoint rows would be measuring a failed request rather than an empty screen.
     { path: "/content-api", name: "content-api" },
     { path: "/content-api/docs", name: "content-api-docs" },
+    // The Usage tab (REQ-019, slice 3) — in the inventory AND the 390 px list below, because the
+    // screen's own mobile claim is a card list next to a table that is `sm:hidden`/`hidden`, and
+    // measuring the overflow on the table layout would be measuring the wrong layout.
+    { path: "/content-api/usage", name: "content-api-usage" },
     // The theme gallery (REQ-062, slice 1) — walked here so the screen is in the inventory,
     // and driven by `runThemesDepth` below, which activates a theme, reads the badge, restores
     // the previous one and requires the button to disappear when there is nothing to restore.
@@ -12165,7 +12313,7 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/members", name: "members" }, { path: "/members/settings", name: "member-settings" }, { path: "/content-api", name: "content-api" }, { path: "/content-api/docs", name: "content-api-docs" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/members", name: "members" }, { path: "/members/settings", name: "member-settings" }, { path: "/content-api", name: "content-api" }, { path: "/content-api/docs", name: "content-api-docs" }, { path: "/content-api/usage", name: "content-api-usage" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
