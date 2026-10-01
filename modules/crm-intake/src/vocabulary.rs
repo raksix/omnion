@@ -154,9 +154,139 @@ pub fn is_open(status: &str) -> bool {
     matches!(status, "new" | "assigned" | "contacted" | "qualified")
 }
 
+/// The SQL spelling of `is_open`, for a column named `column`: a lead status predicate the
+/// planner can prove.
+///
+/// **This exists because the Rust half cannot reach a query.** `is_open` is what every sweep,
+/// count and badge asks in Rust; six statements ask the same question in SQL by hand, and the
+/// two halves can disagree in the one direction nothing else catches — a fourth status added to
+/// `is_open` changes the Rust answer and leaves the SQL reading a row the clock has stopped on.
+/// `PHONE_DIGITS_SQL` is the same argument for the phone rule; this is the same argument one
+/// level up.
+///
+/// **The column is a parameter rather than a constant because three of the six call sites read an
+/// aliased table** (`from crm_leads l`, `… and l.status in (…)`) and the other three do not, and
+/// a caller that forgot the alias gets a query that names a column no relation in the `from`
+/// clause provides. `column` is a plain argument, so the caller has to type the name its own
+/// query uses — which is the only place the alias is knowable.
+///
+/// A previous version of this was a `&'static str` plus `.replace("status ", "l.status ")` at the
+/// aliased sites. That is the same defect class one level down: a textual rewrite of a SQL string
+/// is invisible to the compiler, and it rewrites *every* `status ` it finds — including the
+/// `u.status` a neighbouring statement happens to select. A function that formats the predicate
+/// cannot accidentally rewrite something the caller did not ask it to.
+///
+/// **The negated form has a different meaning and is used only where an index's partial
+/// predicate demands it.** `not_closed_statuses_sql` covers every status the platform does not
+/// know, while `open_statuses_sql` names four of them — so a lead whose status is somehow
+/// neither is swept by one spelling and not the other. Both live next to each other on purpose,
+/// and `crm_leads_sla_idx`'s partial predicate is written in the negated form, which is why the
+/// sweep's first read must use it: PostgreSQL offers a partial index only when the planner can
+/// prove every row the query would read satisfies the predicate, and "no status mentioned"
+/// proves nothing about it.
+#[must_use]
+pub fn open_statuses_sql(column: &str) -> String {
+    format!("{column} in ('new', 'assigned', 'contacted', 'qualified')")
+}
+
+/// The same rule as [`open_statuses_sql`], negated — the shape an index's partial predicate
+/// uses, and the shape that admits a status nobody has defined yet.
+#[must_use]
+pub fn not_closed_statuses_sql(column: &str) -> String {
+    format!("{column} not in ('spam', 'rejected', 'duplicate')")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SQL predicate and the Rust predicate are two spellings of one rule, and this is the
+    /// assertion that can fail when they drift.
+    ///
+    /// **Every status `is_open` accepts must appear in the SQL, and every status it rejects must
+    /// be absent** — checked as sets rather than as text, because the two forms are ordered
+    /// differently in their own sources and a text comparison would be a false pass on a
+    /// reordering. A status added to `STATUSES` without being added here is exactly the defect
+    /// the constant exists to prevent, and nothing else in the crate notices it: the sweeps keep
+    /// reading the row in SQL and the badges keep asking `is_open` in Rust, so the two disagree
+    /// only on a status nobody has shipped yet.
+    #[test]
+    fn the_sql_predicate_names_exactly_the_statuses_is_open_accepts() {
+        let in_sql: std::collections::BTreeSet<String> = open_statuses_sql("status")
+            .split('(')
+            .nth(1)
+            .expect("the predicate lists its statuses in parentheses")
+            .split(')')
+            .next()
+            .expect("the list is closed")
+            .split(',')
+            .map(|status| status.trim().trim_matches('\'').to_string())
+            .collect();
+
+        let in_rust: std::collections::BTreeSet<String> = STATUSES
+            .iter()
+            .copied()
+            .filter(|status| is_open(status))
+            .map(String::from)
+            .collect();
+
+        assert_eq!(
+            in_sql, in_rust,
+            "the SQL status predicate and is_open name different statuses — a lead in one and \
+             not the other is swept by one read and ignored by the other"
+        );
+    }
+
+    /// The negated form must be the exact complement of the open form.
+    ///
+    /// They are not interchangeable, and the reason they are both kept is the point: an index's
+    /// partial predicate is written in the negated form, so a sweep that used the open form
+    /// would be correct and would not use the index. This test cannot prove which is which — only
+    /// `run-crm-sla-sweep-plan.sh` can ask the planner — so it asserts the weaker thing that IS
+    /// true everywhere: no status is in both lists, and every status the platform knows is in one
+    /// of them. A status in neither would be swept by neither spelling, silently.
+    #[test]
+    fn the_two_sql_predicates_partition_the_statuses_the_platform_knows() {
+        let open: std::collections::BTreeSet<&str> = STATUSES
+            .iter()
+            .copied()
+            .filter(|status| is_open(status))
+            .collect();
+        let closed: std::collections::BTreeSet<&str> = STATUSES
+            .iter()
+            .copied()
+            .filter(|status| !is_open(status))
+            .collect();
+
+        assert!(
+            open.is_disjoint(&closed),
+            "a status is both open and closed: {}",
+            open.intersection(&closed)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            open.len() + closed.len(),
+            STATUSES.len(),
+            "a status is in neither predicate, so neither spelling of the sweep would read it"
+        );
+    }
+
+    /// The column name is the caller's, and a caller that forgets its alias gets a query naming a
+    /// column no relation provides — which the planner answers with `42703`, on the sweep, once a
+    /// minute. A predicate function is the one place that has to be honest about both spellings.
+    #[test]
+    fn the_predicate_is_asked_for_the_column_the_query_uses() {
+        assert_eq!(
+            open_statuses_sql("l.status"),
+            "l.status in ('new', 'assigned', 'contacted', 'qualified')"
+        );
+        assert_eq!(
+            not_closed_statuses_sql("status"),
+            "status not in ('spam', 'rejected', 'duplicate')"
+        );
+    }
 
     #[test]
     fn the_lists_have_no_duplicates() {
@@ -224,8 +354,14 @@ mod tests {
         // The two non-key kinds are named explicitly because they are the reason the rule
         // exists: a form source is authenticated by the form's own submission validation, and
         // an import source is not addressable by any caller at all.
-        assert!(!carries_endpoint_key("form"), "a form source authenticates by its form");
-        assert!(!carries_endpoint_key("import"), "an import source has no caller to key");
+        assert!(
+            !carries_endpoint_key("form"),
+            "a form source authenticates by its form"
+        );
+        assert!(
+            !carries_endpoint_key("import"),
+            "an import source has no caller to key"
+        );
         assert!(carries_endpoint_key("endpoint"));
         // An unknown kind is never key-bearing. The closed list is the default: a typo in a
         // `kind` column answers "not key-addressable" rather than reaching for the literal.
@@ -288,7 +424,10 @@ mod tests {
             let expected: std::collections::BTreeSet<&str> = list.iter().copied().collect();
             assert_eq!(
                 found,
-                expected.into_iter().map(str::to_string).collect::<std::collections::BTreeSet<_>>(),
+                expected
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<std::collections::BTreeSet<_>>(),
                 "the panel's {constant} and the crate's list are different vocabularies — a \
                  status the platform accepts and the panel does not know is a lead rendered as \
                  raw snake_case, and a status the panel offers that the database refuses is a \

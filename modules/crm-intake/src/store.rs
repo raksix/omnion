@@ -2058,11 +2058,13 @@ fn push_lead_filters<'args>(builder: &mut QueryBuilder<'args, Postgres>, query: 
 }
 
 async fn count_breached(pool: &PgPool, organization_id: Uuid) -> Result<i64> {
-    let row: (i64,) = sqlx::query_as(
+    let query = format!(
         "select count(*) from crm_leads where organization_id = $1 and first_response_at is null \
          and first_response_due_at is not null and first_response_due_at < now() \
-         and status not in ('spam', 'rejected', 'duplicate')",
-    )
+         and {}",
+        crate::vocabulary::not_closed_statuses_sql("status")
+    );
+    let row: (i64,) = sqlx::query_as(&query)
     .bind(organization_id)
     .fetch_one(pool)
     .await?;
@@ -2070,10 +2072,12 @@ async fn count_breached(pool: &PgPool, organization_id: Uuid) -> Result<i64> {
 }
 
 async fn count_unassigned(pool: &PgPool, organization_id: Uuid) -> Result<i64> {
-    let row: (i64,) = sqlx::query_as(
+    let query = format!(
         "select count(*) from crm_leads where organization_id = $1 and owner_user_id is null \
-         and status in ('new', 'assigned', 'contacted', 'qualified')",
-    )
+         and {}",
+        crate::vocabulary::open_statuses_sql("status")
+    );
+    let row: (i64,) = sqlx::query_as(&query)
     .bind(organization_id)
     .fetch_one(pool)
     .await?;
@@ -2096,14 +2100,16 @@ async fn count_unassigned(pool: &PgPool, organization_id: Uuid) -> Result<i64> {
 ///   an existing lead vanish from the screen that explains who owns what, and the trail line
 ///   would render a raw uuid for a colleague who plainly exists. The picker marks it instead.
 pub async fn list_owners(pool: &PgPool, organization_id: Uuid) -> Result<Vec<LeadOwner>> {
-    let rows: Vec<(Uuid, String, String, String, i64)> = sqlx::query_as(
+    let query = format!(
         "select u.id, u.display_name, u.email, u.status, \
                 (select count(*) from crm_leads l where l.organization_id = $1 \
-                   and l.owner_user_id = u.id and l.status in ('new','assigned','contacted','qualified')) \
+                   and l.owner_user_id = u.id and {}) \
          from users u \
          where u.organization_id = $1 \
          order by lower(coalesce(nullif(btrim(u.display_name), ''), u.email)), u.email",
-    )
+        crate::vocabulary::open_statuses_sql("l.status")
+    );
+    let rows: Vec<(Uuid, String, String, String, i64)> = sqlx::query_as(&query)
     .bind(organization_id)
     .fetch_all(pool)
     .await?;

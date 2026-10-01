@@ -685,7 +685,7 @@ pub async fn due_breaches(
         sla_policy_id: Option<Uuid>,
         first_response_due_at: Option<time::OffsetDateTime>,
     }
-    let rows = sqlx::query_as::<_, Row>(
+    let query = format!(
         "select id, owner_user_id, sla_policy_id, first_response_due_at \
          from crm_leads \
          where organization_id = $1 \
@@ -693,15 +693,17 @@ pub async fn due_breaches(
            and escalated_at is null \
            and first_response_due_at is not null \
            and first_response_due_at <= $2 \
-           and status in ('new', 'assigned', 'contacted', 'qualified') \
+           and {} \
          order by first_response_due_at, received_at, id \
          limit $3",
-    )
-    .bind(organization_id)
-    .bind(now)
-    .bind(limit.clamp(1, MAX_PAGE))
-    .fetch_all(pool)
-    .await?;
+        crate::vocabulary::open_statuses_sql("status")
+    );
+    let rows = sqlx::query_as::<_, Row>(&query)
+        .bind(organization_id)
+        .bind(now)
+        .bind(limit.clamp(1, MAX_PAGE))
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|row| Breach {
@@ -768,15 +770,41 @@ pub async fn escalation_target(pool: &PgPool, lead_id: Uuid) -> Result<Option<Uu
 /// column that exists precisely so the read can be scoped. More importantly the list is
 /// bounded and ordered: given the same database and the same `now`, a run escalates the same
 /// organizations in the same order, which is what makes a half-finished run resumable.
+/// **The `status` predicate is not a filter — it is the reason this read can exist at all.**
+///
+/// `crm_leads_sla_idx` is partial on `first_response_at is null and status not in
+/// ('spam','rejected','duplicate')`. PostgreSQL offers a partial index only when the planner can
+/// prove that every row the statement would read satisfies the predicate, so a query that
+/// mentions no status at all — which is what this one said for the whole life of the sweep —
+/// cannot use it and seq-scans every lead on the platform. On a twenty-thousand-row fixture that
+/// is 20 000 rows removed to answer "which tenants have work": 4.01 ms, and it grows with the
+/// installation rather than with the work.
+///
+/// The predicate is spelled [`crate::vocabulary::not_closed_statuses_sql`] rather than the
+/// negated form a reader would reach for, and that is the load-bearing half: both consumer
+/// reads — `due_reminders` and `due_breaches` — filter on `status in ('new', …)`, so a
+/// tenant the current statement names can be walked every minute to produce two empty result
+/// sets. The measured fixture is exactly that: nine tenants holding only spam and rejected
+/// leads, returned by this statement, and `0` rows from both consumers. **The sweep was
+/// spending a round trip per quiet tenant to conclude it had nothing to do there** — and the
+/// `limit` truncates *organizations*, so on a busy platform the quiet tenants at the end of
+/// the ordering can consume the batch a busy tenant needs.
+///
+/// **Why the negated form and not `in ('new', …)`: the index.** `is_open`'s four statuses imply
+/// the negated predicate, but the partial index is written in the negated form, and the planner
+/// proves predicates rather than implications it has to derive through a list of eight.
 pub async fn organizations_with_leads(pool: &PgPool, limit: i64) -> Result<Vec<Uuid>> {
-    Ok(sqlx::query_scalar::<_, Uuid>(
+    let query = format!(
         "select distinct organization_id from crm_leads \
          where first_response_due_at is not null and first_response_at is null \
+         and {} \
          order by organization_id limit $1",
-    )
-    .bind(limit.clamp(1, MAX_PAGE))
-    .fetch_all(pool)
-    .await?)
+        crate::vocabulary::not_closed_statuses_sql("status")
+    );
+    Ok(sqlx::query_scalar::<_, Uuid>(&query)
+        .bind(limit.clamp(1, MAX_PAGE))
+        .fetch_all(pool)
+        .await?)
 }
 
 /// A lead whose deadline is close enough that its owner should be reminded.
@@ -806,7 +834,11 @@ pub async fn due_reminders(
     // predicate is applied in Rust, where the policy's own minutes are available. Narrowing
     // further in SQL would be an optimisation for a table that holds only live leads, and it
     // would put the reminder rule in two places at once.
-    let rows = sqlx::query_as::<_, Row>(
+    // `l.` prefixed because the predicate names a column of an aliased table. The constant is a
+    // bare predicate for one table's `status` column, so the alias is the caller's to add — which
+    // is also why this site and the unaliased ones cannot drift: they read the same constant and
+    // differ only in the prefix, and a reader can see that in the diff.
+    let query = format!(
         "select l.id as lead_id, l.owner_user_id, l.first_response_due_at, \
                 p.reminder_minutes \
          from crm_leads l \
@@ -814,17 +846,23 @@ pub async fn due_reminders(
          where l.organization_id = $1 \
            and l.first_response_at is null \
            and l.first_response_due_at is not null \
-           and l.status in ('new', 'assigned', 'contacted', 'qualified') \
+           and {} \
            and p.reminder_minutes is not null \
            and not exists (select 1 from crm_lead_events e \
                            where e.lead_id = l.id and e.kind = 'sla_reminded') \
          order by l.first_response_due_at, l.received_at, l.id \
          limit $2",
-    )
-    .bind(organization_id)
-    .bind(limit.clamp(1, MAX_PAGE))
-    .fetch_all(pool)
-    .await?;
+        // The table is aliased, so the predicate is asked for the aliased column name. The
+        // alias is the caller's to type — it is the only place it is knowable, and a textual
+        // rewrite of the predicate would rewrite every `status ` in the statement, including
+        // the `p.status` a neighbouring statement selects.
+        crate::vocabulary::open_statuses_sql("l.status")
+    );
+    let rows = sqlx::query_as::<_, Row>(&query)
+        .bind(organization_id)
+        .bind(limit.clamp(1, MAX_PAGE))
+        .fetch_all(pool)
+        .await?;
     // **A deadline that has already passed is not a reminder, it is a breach.** The window
     // opens *before* the deadline, so "inside the window" is true for every lead that is
     // already overdue — and a sweep that offered both would tell the owner "your deadline is
