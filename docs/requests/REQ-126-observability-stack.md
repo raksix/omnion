@@ -231,10 +231,37 @@ The lifecycle pass sends SIGTERM while requests are in flight and asserts the re
    backend answered and a real timestamp had to be written.
 
    **Still open, deliberately:** the REQ close gate — `cargo test --workspace`, `pnpm build` and
-   the private-stack walkthrough — and `apps/api/tests/observability_permissions.rs`, which
-   aborts mid-run on this box both at `4e997ba` and at this tick's HEAD (exit 101, no panic
-   message). That suite is not in this tick's diff and the abort predates it, so it is logged
-   rather than claimed as fixed.
+   the private-stack walkthrough.
+
+   **Resolved in the sixth close-gate tick: the permissions suite was never broken.** It was
+   reported here for two ticks as "aborts mid-run (exit 101, no panic message)" and explicitly
+   logged rather than claimed — a reasonable call, since the suite was in nobody's diff. The
+   cause was neither the suite nor the box: **`OMNION_DATABASE_URL` was unset in the shell, so
+   `Config::from_env()` fell back to `DEFAULT_DATABASE_URL`, whose database is literally named
+   `omnion` — the MAIN WRITER's dev database.** Its `_sqlx_migrations` carries `19 = "cms blocks"`
+   (wave 2's `0019_cms_blocks`) against this tree's `0019_secret_hierarchy`, so `migrate()` refused
+   with a checksum mismatch that reads as a repository defect and is not one. All four walks passed
+   0.26 s in, which is too fast for four multi-second walks and was the tell: a migration refusal
+   is not a walk, and a walk that never ran is a suite that cannot fail for the reason it claims to
+   test. With `OMNION_DATABASE_URL` pointed at `omnion_w6_dev` the suite is **4/4 in 13.86 s**, no
+   code change. The reason it stayed hidden for two ticks is that the panic text was already
+   written to name the database — `walk_state.rs` gained a paragraph about exactly this during an
+   earlier tick — and the recorded reading of "exit 101, no panic message" never opened the file
+   to see it. **A suite that fails in under a second did not test anything**, and the number of
+   failures (4/4) never distinguished "four assertions failed" from "four setup calls failed".
+
+   The same tick found why no browser pass had run at all, and it was in this writer's own file:
+   **`walkthrough.cjs` could not be loaded at all.** `module.exports` names `DEPLOYMENT_SCREENS`
+   and `module.exports` is evaluated at LOAD time, while the `const` declaring it sat 570 lines
+   lower, still in its temporal dead zone — so every invocation threw
+   `ReferenceError: Cannot access 'DEPLOYMENT_SCREENS' before initialization` at line 8161 before
+   walking a single route. `55c420bd` hoists the list above both the guard and the export block.
+   This is the same reading twice: a harness that dies at load and a pass that finds a screen
+   missing both produce no artifact, so four consecutive ticks attributed "the box was too slow" to
+   a file that had never executed. Proven load-bearing rather than merely fixed — deleting one
+   route entry from the desktop list makes the guard throw
+   `deployment screens missing from the route list: /deployment/upgrade`, and the unmutated file
+   loads and exports all three paths.
 
 ### Risks / notes
 
