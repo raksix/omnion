@@ -9704,3 +9704,51 @@ which is the same wasted hour as never starting.
 
 **Next.** That pass (`--only=block-editor,members`, now able to run both depth passes in one run
 and report both), then REQ-063 criterion 17, REQ-064's 18 and REQ-019's content-api criterion.
+
+## 2026-10-01 · wave 2 · tick 48 (cont.) — the filter fix took four passes to buy one measurement
+
+**What.** `0dae5a35` made `--only` select and compose at 04:02. The measurement it unblocked took
+until 06:48, across four passes, and only the last one reached the members module. Three of the
+four died on something that was not the thing under test. The filter was the cause; the passes
+were the cost, and fixing the instrument does not make the measurement free.
+
+**Five harness defects, all found by running the pass rather than by reading it.** Each is now
+gated by `scripts/qa/test-only-filter.cjs` (38/38 on the fix; 2–14 checks fail against each of
+five deliberately broken variants, including the exact ones that shipped):
+
+1. **`arg()` never matched `--only=a,b`.** Whole-token `indexOf` against a token nobody passes.
+   Fixed with a prefix search. `indexOf("--only=")` is the tempting wrong fix: it parses, it runs,
+   and it silently falls through — which is what the first attempt did.
+2. **The 14 entry points compared a literal `--only=<name>`.** `--only=a,b` matched none, and each
+   block ends in `return`, so the pass neither skipped nor reported them.
+3. **`finishScopedPass` did not exist.** Each entry closed the browser and exited, so only the
+   first could ever run. The merge, the last-entry teardown and the carried exit code are all in
+   that one function, because each fails in a different direction.
+4. **`page.request` is not the browser's `fetch`.** It carries cookies but never sends
+   `x-omnion-csrf`, so four fixture mutations were refused with `csrf_unavailable` — the
+   documented behaviour of a secretless deployment, indistinguishable from a broken route.
+5. **The fatal handler overwrote `summary.json`.** A crash erased everything already measured.
+   `fatal` is now additive with `fatalAfter`.
+
+**Two of my own bugs, both shipped and both found only by running statements.** `uuidOrNull`
+quoted its output while the call sites quoted it too (`where id = ''`), then — fixed "unquoted" —
+broke every VALID uuid, because Postgres reads `0f0f0f0f-1111-…` as arithmetic on the literal `0`.
+A guard that handles the degenerate case is not evidence it still handles the normal one. The
+right shape quotes once and casts (`'0f0f…'::uuid` / `null`), and the probe runs the RENDERED
+statement against real Postgres: a helper-only test cannot see call-site quoting, and the
+double-quoted variant came back green through a whole helper-only table.
+
+**Not measured.** Criterion 17 stays unticked. The run that got furthest died with the shared
+Postgres in recovery (`pg_isready`: rejecting connections) — a container restart under another
+writer, not this branch. The test now skips that section loudly instead of reporting thirteen
+checks the guard never got to run.
+
+**Disk note.** The volume hit 98% with 1.2 G free mid-tick, which per invariants is the gate
+that kills: a pass that starts with no room dies halfway and reports nothing. `lsof +D` showed 0
+handles on this worktree's target, so `deps`+`build` went and the binary stayed. The next pass then
+spent ~50 minutes recompiling the workspace while six other writers compiled alongside it — freeing
+the cache buys disk and costs the next pass an hour on a box this crowded. Trade it at a tick
+boundary, not mid-tick.
+
+**Next.** One more `--only=block-editor,members` pass now that Postgres is back, then criterion 17,
+REQ-064's 18 and REQ-019's content-api criterion.
