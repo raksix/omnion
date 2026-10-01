@@ -486,6 +486,19 @@ fn viewport_of(blocks: &[Block], block_id: Uuid) -> Viewport {
 /// A block whose file is *live*, or whose prop holds a URL rather than an id, is returned
 /// untouched. `states` therefore only has to carry the files it is told about, which is what lets
 /// the preview frame simulate a deletion by adding one entry.
+///
+/// **A container is filtered the way the viewport filter filters one, because it is the same
+/// walk one step later.** The public route filters for the viewport first and degrades after, so
+/// a `columns` block can lose cells twice over — once to `hide_on` and once to a deleted file.
+/// This used to recurse into children, keep whatever came back and touch nothing else, which left
+/// two ways the tree could say a layout that is no longer drawn: a container whose every child was
+/// dropped still shipped as an empty grid section, and a container that kept one of three cells
+/// still claimed three, so the theme laid out three tracks over one. `filter_for_viewport`
+/// already answers both in one place and this is now that rule again: a child container that
+/// HAD blocks and now has none is dropped, and a `columns` prop is rewritten to the count that
+/// survived. A column the author left empty stays — that gap was a decision, not an accident, and
+/// removing it here would make the same cell vanish or not depending on whether a file elsewhere
+/// was deleted.
 #[must_use]
 pub fn degrade_tree(blocks: &[Block], states: &HashMap<Uuid, FileState>) -> Vec<Block> {
     blocks
@@ -493,6 +506,17 @@ pub fn degrade_tree(blocks: &[Block], states: &HashMap<Uuid, FileState>) -> Vec<
         .filter_map(|block| {
             let mut kept = block.clone();
             kept.children = degrade_tree(&block.children, states);
+            if !block.children.is_empty() && kept.children.is_empty() {
+                return None;
+            }
+            if kept.kind == "columns" {
+                if let Some(object) = kept.props.as_object_mut() {
+                    object.insert(
+                        "columns".to_owned(),
+                        json!(i64::try_from(kept.children.len()).unwrap_or(i64::MAX)),
+                    );
+                }
+            }
             match block.kind.as_str() {
                 IMAGE_BLOCK => {
                     let broken = block
@@ -827,6 +851,66 @@ mod tests {
         assert_eq!(degraded.len(), 2);
         assert_eq!(degraded[0].kind, IMAGE_BLOCK);
         assert_eq!(degraded[1].kind, "text");
+    }
+
+    #[test]
+    fn a_container_that_lost_every_column_is_not_left_holding_an_empty_grid() {
+        // The renderer lays a `columns` block out from its `columns` PROP and draws one cell per
+        // CHILD. So a container that ends up with fewer cells than its prop claims renders an
+        // empty grid cell — a gap the size of a column, on a page whose whole point is that the
+        // missing content is gone.
+        //
+        // `filter_for_viewport` already answers this, in exactly one place: it drops a child
+        // container whose filtering emptied it (`had blocks, now has none` — deliberately NOT
+        // dropping one the author left empty) AND rewrites `columns` to the count that survived.
+        // `degrade_tree` is the SAME walk one step later — it runs after the viewport filter on
+        // the public route — and it does neither: it recurses into children and keeps whatever
+        // comes back, with no emptiness rule and no prop rewrite.
+        //
+        // The emptying case is a gallery that lost every file and had no caption: `degrade_tree`
+        // drops it on purpose ("a gallery of nothing is not a gallery"), which leaves its column
+        // holding zero children while the container still says two columns.
+        let gone = Uuid::new_v4();
+        let tree = container(vec![
+            vec![block(GALLERY_BLOCK, json!({ "images": [gone.to_string()] }))],
+            vec![block(GALLERY_BLOCK, json!({ "images": [gone.to_string()] }))],
+        ]);
+        let degraded = degrade_tree(&tree, &states(&[(gone, FileState::Purged)]));
+        assert!(
+            degraded.is_empty(),
+            "a container left with no cells at all is the shell of a layout with nothing in it: {:?}",
+            degraded.iter().map(|b| (&b.kind, b.children.len())).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_column_the_author_left_empty_stays_where_they_put_it() {
+        // The other half, and it is why the rule above is not "drop every empty column". An
+        // author who typed nothing into a column made that gap on purpose; the validator reports
+        // it as a warning and the page publishes with it. Degrading files must not quietly
+        // remove a decision the author made, or the same empty cell disappears on a page
+        // depending on whether a file elsewhere was deleted.
+        let tree = container(vec![vec![block("text", json!({ "text": "x" }))], vec![]]);
+        let degraded = degrade_tree(&tree, &HashMap::new());
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(degraded[0].children.len(), 2, "the deliberate gap is still a cell");
+    }
+
+    #[test]
+    fn a_container_that_lost_one_column_says_it_drew_one() {
+        let gone = Uuid::new_v4();
+        let tree = container(vec![
+            vec![block(GALLERY_BLOCK, json!({ "images": [gone.to_string()] }))],
+            vec![block("text", json!({ "text": "Still here" }))],
+        ]);
+        let degraded = degrade_tree(&tree, &states(&[(gone, FileState::Purged)]));
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(degraded[0].children.len(), 1, "one cell survives");
+        assert_eq!(
+            degraded[0].props["columns"].as_i64(),
+            Some(1),
+            "a prop of 2 over one cell draws an empty grid column"
+        );
     }
 
     #[test]

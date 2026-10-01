@@ -533,6 +533,31 @@ fn gallery_block(ids: &[Uuid]) -> Value {
     })
 }
 
+/// A `columns` container whose cells are the given block trees.
+///
+/// The `column` wrappers are what the validator requires and what the renderer reads one grid
+/// cell per, so a walk that built the container any other way would not be testing the shape a
+/// stored page actually has.
+fn columns_block(cells: Vec<Value>) -> Value {
+    let children: Vec<Value> = cells
+        .into_iter()
+        .map(|blocks| {
+            json!({
+                "id": Uuid::new_v4().to_string(),
+                "type": "column",
+                "props": {},
+                "children": blocks,
+            })
+        })
+        .collect();
+    json!({
+        "id": Uuid::new_v4().to_string(),
+        "type": "columns",
+        "props": { "columns": children.len() },
+        "children": children,
+    })
+}
+
 /// Whether a media id appears anywhere in a served tree.
 ///
 /// Deliberately a whole-subtree search rather than a check of one prop: the failure being hunted
@@ -765,6 +790,103 @@ async fn a_gallery_keeps_what_survived_and_does_not_draw_an_empty_grid() {
     assert_eq!(
         empty.body["visible_count"], 0,
         "a gallery that lost every image draws nothing — an empty grid saying '0 images' is a lie"
+    );
+}
+
+/// A container whose cells lost their files serves the layout it actually has, not the one it lost.
+///
+/// The renderer reads a `columns` block's grid from its `columns` PROP and draws one cell per
+/// CHILD, so those two have to agree. The public route filters for the viewport and *then*
+/// degrades, which means a container can lose cells twice — once to `hide_on` and once to a file
+/// somebody deleted — and the degradation walk did neither half of what its sibling already did:
+/// a container that kept one cell of two still shipped `columns: 2`, and one that kept none
+/// shipped as an empty grid section.
+///
+/// Asserted on the payload a VISITOR receives, because "the page lays out correctly" is a claim
+/// about what the theme receives. The unit tests next door cover the walk's rule; this one is
+/// what proves the rule is on the serving path at all.
+#[tokio::test]
+async fn a_container_that_lost_a_cell_serves_the_layout_it_still_has() {
+    let Some(fx) = Fixture::new().await else {
+        return;
+    };
+    let gone = fx.media("gone.png").await;
+    fx.published_page(
+        "half-empty-columns",
+        json!([columns_block(vec![
+            // This cell's only content was a file that is about to be trashed.
+            json!([gallery_block(&[gone])]),
+            json!([json!({
+                "id": Uuid::new_v4().to_string(),
+                "type": "text",
+                "props": { "text": "This cell survives" },
+            })]),
+        ])]),
+    )
+    .await;
+
+    // The state BEFORE the deletion, so this walk cannot pass on a payload that never carried
+    // two cells in the first place.
+    let before = fx.public_page("half-empty-columns").await;
+    assert!(before.status.is_success());
+    assert_eq!(
+        before.body["revision"]["blocks"][0]["props"]["columns"].as_i64(),
+        Some(2),
+        "the page starts as a two-cell layout: {}",
+        before.body["revision"]["blocks"]
+    );
+
+    fx.trash(gone).await;
+
+    let served = fx.public_page("half-empty-columns").await;
+    assert!(served.status.is_success());
+    let block = &served.body["revision"]["blocks"][0];
+    let cells = block["children"]
+        .as_array()
+        .expect("the container keeps its surviving cells");
+    assert_eq!(cells.len(), 1, "one cell left: {block}");
+    assert_eq!(
+        block["props"]["columns"].as_i64(),
+        Some(1),
+        "the prop has to say what is drawn — a prop of 2 over one cell leaves an empty grid track: {block}"
+    );
+
+    // And the half that is not about counts: the file the visitor must not receive is gone, while
+    // the text of the cell that did not use a file is untouched.
+    assert!(
+        !tree_mentions(&served.body["revision"]["blocks"], gone),
+        "the dead id must not reach the visitor"
+    );
+    assert!(
+        block.to_string().contains("This cell survives"),
+        "degrading a file must not take a neighbouring cell with it: {block}"
+    );
+}
+
+/// A container that lost every cell is not served as an empty grid section.
+#[tokio::test]
+async fn a_container_that_lost_every_cell_is_not_served_at_all() {
+    let Some(fx) = Fixture::new().await else {
+        return;
+    };
+    let gone = fx.media("all-gone.png").await;
+    fx.published_page(
+        "empty-columns",
+        json!([columns_block(vec![
+            json!([gallery_block(&[gone])]),
+            json!([gallery_block(&[gone])]),
+        ])]),
+    )
+    .await;
+    fx.trash(gone).await;
+
+    let served = fx.public_page("empty-columns").await;
+    assert!(served.status.is_success());
+    let blocks = served.body["revision"]["blocks"].as_array().expect("an array");
+    assert!(
+        blocks.is_empty(),
+        "a container with no cells is the shell of a layout with nothing in it: {}",
+        served.body["revision"]["blocks"]
     );
 }
 

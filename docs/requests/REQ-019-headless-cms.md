@@ -212,7 +212,6 @@ Migration `0014_content_api_tokens.sql` (number is a placeholder — renumber to
   panel row needs the QA pass)*
 - [x] Rotation invalidates the previous secret immediately (old secret → `401`) and returns a new plaintext exactly once.
   *(`rotation_kills_the_previous_secret_immediately`, slice 1)*
-- [ ] Rotation invalidates the previous secret immediately (old secret → `401`) and returns a new plaintext exactly once.
 - [ ] Revoking a token answers `401` on the next call, and the panel row reads `revoked`. *(the API half is proven —
   a_revoked_token_stops_reading_immediately — the panel row needs the QA pass)*
 - [x] The 121st request inside a minute at the Standard tier answers `429` with a `Retry-After` header, and the usage table records one throttled request.
