@@ -5017,10 +5017,22 @@ async function runCrmAssignmentDepth(page, report) {
   // The editor: add a country rule and save it through the form.
   await page.locator('[data-testid="assignment-add"]').click({ timeout: 6000 }).catch(() => {});
   await page.waitForSelector('[data-testid="rule-editor"]', { timeout: 6000 }).catch(() => {});
-  await page.locator('[data-testid="rule-name"]').fill(`QA country ${tag}`).catch(() => {});
-  await page.locator('[data-testid="rule-condition-country"]').check({ timeout: 4000 }).catch(() => {});
-  await page.locator('[data-testid="rule-condition-input-country"]').fill("TR").catch(() => {});
-  await page.locator('[data-testid="rule-target"]').selectOption("queue").catch(() => {});
+  await page
+    .locator('[data-testid="rule-name"]')
+    .fill(`QA country ${tag}`, { timeout: 6000 })
+    .catch(() => {});
+  await page
+    .locator('[data-testid="rule-condition-country"]')
+    .check({ timeout: 4000 })
+    .catch(() => {});
+  await page
+    .locator('[data-testid="rule-condition-input-country"]')
+    .fill("TR", { timeout: 6000 })
+    .catch(() => {});
+  await page
+    .locator('[data-testid="rule-target"]')
+    .selectOption("queue", { timeout: 6000 })
+    .catch(() => {});
 
   // The refusal the editor makes before the round trip: a ticked but blank condition.
   await page.locator('[data-testid="rule-condition-region"]').check({ timeout: 4000 }).catch(() => {});
