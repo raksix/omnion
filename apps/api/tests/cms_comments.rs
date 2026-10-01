@@ -36,6 +36,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -150,19 +153,17 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
-async fn live_state() -> Option<(AppState, Db)> {
+async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
     let config = Config::from_env().expect("environment must be valid");
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "SKIP: PostgreSQL is not reachable ({error}) — start it with \
-                 `docker compose -f infra/compose/docker-compose.dev.yml up -d`"
-            );
-            return None;
-        }
+    let isolated = IsolatedDb::open(&config.database.url, 4, "cms_comments")
+        .await
+        .expect("the throwaway database must open");
+    let Some(isolated) = isolated else {
+        announce_skip("no throwaway database, this walk did not run");
+        return None;
     };
-    db.migrate().await.expect("migrations must apply");
+    let db = isolated.db.clone();
+    // Migrations are applied by `IsolatedDb::open`, before the router is built.
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
         BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -171,7 +172,7 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
-    Some((state, db))
+    Some((state, db, isolated))
 }
 
 async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String) {
@@ -280,6 +281,7 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], lab
 struct Fixture {
     state: AppState,
     db: Db,
+    isolated: IsolatedDb,
     org: Uuid,
     site: Uuid,
     host: String,
@@ -290,7 +292,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        let (state, db) = live_state().await?;
+        let (state, db, isolated) = live_state().await?;
         seed::ensure(db.pool())
             .await
             .expect("the IAM seed must run");
@@ -379,6 +381,7 @@ impl Fixture {
         Some(Self {
             state,
             db,
+            isolated,
             org,
             site,
             host,
@@ -473,7 +476,7 @@ impl Fixture {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_comment_is_queued_and_appears_only_after_a_moderator_approves_it() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.owner().await;
@@ -566,7 +569,7 @@ async fn a_comment_is_queued_and_appears_only_after_a_moderator_approves_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_comment_tripping_a_heuristic_lands_in_spam_with_the_reason_and_no_moderator() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.owner().await;
@@ -690,7 +693,7 @@ async fn a_comment_tripping_a_heuristic_lands_in_spam_with_the_reason_and_no_mod
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reply_answers_a_comment_and_a_reply_to_a_reply_is_refused_by_the_schema() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.owner().await;
@@ -777,7 +780,7 @@ async fn a_reply_answers_a_comment_and_a_reply_to_a_reply_is_refused_by_the_sche
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_moderator_reply_is_published_immediately_and_a_hidden_parent_hides_its_reply() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.owner().await;
@@ -858,7 +861,7 @@ async fn a_moderator_reply_is_published_immediately_and_a_hidden_parent_hides_it
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_ban_refuses_the_submission_and_writes_no_row_at_all() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.owner().await;
@@ -956,7 +959,7 @@ async fn a_ban_refuses_the_submission_and_writes_no_row_at_all() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_hourly_limit_is_counted_against_the_fingerprint_not_the_address() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.owner().await;
@@ -1030,7 +1033,7 @@ async fn the_hourly_limit_is_counted_against_the_fingerprint_not_the_address() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reading_the_inbox_is_not_the_power_to_change_it() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let manager = fixture.manager().await;
@@ -1089,7 +1092,7 @@ async fn reading_the_inbox_is_not_the_power_to_change_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_inbox_counts_every_tab_and_a_bulk_action_reports_what_it_skipped() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.owner().await;
@@ -1216,7 +1219,7 @@ async fn the_inbox_counts_every_tab_and_a_bulk_action_reports_what_it_skipped() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_duplicate_body_from_one_address_is_spam_rather_than_a_second_row() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     // No moderator touches the inbox in this walk, on purpose: the point is that the STORE
@@ -1264,7 +1267,7 @@ async fn a_duplicate_body_from_one_address_is_spam_rather_than_a_second_row() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_honeypot_and_a_disabled_site_are_the_two_submissions_that_write_nothing() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.owner().await;
@@ -1335,7 +1338,7 @@ async fn a_honeypot_and_a_disabled_site_are_the_two_submissions_that_write_nothi
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_address_the_owner_trusts_skips_the_queue_and_another_sites_comments_are_not_ours() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.owner().await;
@@ -1457,4 +1460,15 @@ async fn an_address_the_owner_trusts_skips_the_queue_and_another_sites_comments_
         theirs.body
     );
     assert_ne!(fixture.org, other_org, "the two tenants are distinct");
+}
+
+/// A walk in this file that declined to run is a run that measured nothing.
+///
+/// Cargo reports a skipped walk as `ok` and captures the message that said so, so the summary
+/// a person or a CI job reads cannot tell it apart from success. This file returns early when
+/// its database cannot be opened, so that is a state it can reach; asserting the count is what
+/// turns it red instead.
+#[test]
+fn no_walk_in_this_file_skipped() {
+    assert_nothing_skipped();
 }

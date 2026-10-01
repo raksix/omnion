@@ -46,6 +46,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -167,16 +170,17 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
-async fn live_state() -> Option<(AppState, Db)> {
+async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
     let config = Config::from_env().expect("environment must be valid");
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!("SKIP: PostgreSQL is not reachable ({error})");
-            return None;
-        }
+    let isolated = IsolatedDb::open(&config.database.url, 4, "cms_members")
+        .await
+        .expect("the throwaway database must open");
+    let Some(isolated) = isolated else {
+        announce_skip("no throwaway database, this walk did not run");
+        return None;
     };
-    db.migrate().await.expect("migrations must apply");
+    let db = isolated.db.clone();
+    // Migrations are applied by `IsolatedDb::open`, before the router is built.
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
         BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -185,7 +189,7 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
-    Some((state, db))
+    Some((state, db, isolated))
 }
 
 async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String) {
@@ -292,6 +296,7 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], lab
 struct Fixture {
     state: AppState,
     db: Db,
+    isolated: IsolatedDb,
     org: Uuid,
     site: Uuid,
     host: String,
@@ -301,7 +306,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        let (state, db) = live_state().await?;
+        let (state, db, isolated) = live_state().await?;
 
         // **The limiter is loosened before anything else, and the fact it took is asserted.**
         //
@@ -377,6 +382,7 @@ impl Fixture {
         Some(Self {
             state,
             db,
+            isolated,
             org,
             site,
             host,
@@ -568,7 +574,7 @@ fn cookie_value(raw: &str) -> &str {
 /// verified member, and is 404 again for a member missing the role.
 #[tokio::test]
 async fn a_gated_page_is_404_to_a_visitor_and_404_to_a_member_without_the_role() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -725,7 +731,7 @@ async fn a_gated_page_is_404_to_a_visitor_and_404_to_a_member_without_the_role()
 /// session, and a panel session is not a member session.
 #[tokio::test]
 async fn a_member_cookie_is_not_a_panel_session() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -792,7 +798,7 @@ async fn a_member_cookie_is_not_a_panel_session() {
 /// address are one answer.
 #[tokio::test]
 async fn the_password_is_hashed_and_a_refusal_says_nothing_about_which_half_was_wrong() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -886,7 +892,7 @@ async fn the_password_is_hashed_and_a_refusal_says_nothing_about_which_half_was_
 /// the replay.
 #[tokio::test]
 async fn the_verification_token_is_hashed_single_use_and_expires() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -1154,7 +1160,7 @@ async fn the_verification_token_is_hashed_single_use_and_expires() {
 /// block the operator believes they applied and did not.
 #[tokio::test]
 async fn blocking_a_member_drops_the_session_they_are_already_using() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -1268,7 +1274,7 @@ async fn blocking_a_member_drops_the_session_they_are_already_using() {
 /// The public surface never says who exists.
 #[tokio::test]
 async fn the_public_signup_and_the_reset_form_never_say_who_exists() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -1460,7 +1466,7 @@ async fn the_public_signup_and_the_reset_form_never_say_who_exists() {
 /// Reading the table is not the power to change it.
 #[tokio::test]
 async fn reading_the_members_is_not_the_power_to_change_them() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -1563,7 +1569,7 @@ async fn reading_the_members_is_not_the_power_to_change_them() {
 /// A member of another site is a 404, and the page gate refuses a page that names no role.
 #[tokio::test]
 async fn tenancy_is_concealed_and_an_unreachable_gate_is_refused_by_the_schema() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -1653,7 +1659,7 @@ async fn tenancy_is_concealed_and_an_unreachable_gate_is_refused_by_the_schema()
 /// and both are proved.
 #[tokio::test]
 async fn the_site_chooses_between_a_sign_in_prompt_and_a_silent_404() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -1807,7 +1813,7 @@ async fn the_site_chooses_between_a_sign_in_prompt_and_a_silent_404() {
 /// Signing out clears the cookie, and signing back in works.
 #[tokio::test]
 async fn signing_out_drops_the_session_and_the_cookie() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("SKIP: no database");
         return;
     };
@@ -1860,4 +1866,15 @@ async fn signing_out_drops_the_session_and_the_cookie() {
     // The 401's cookie value, when present, must be the one just cleared — not a stale one.
     assert!(cleared.starts_with("omnion_member="));
     let _ = cookie_value(&cookie);
+}
+
+/// A walk in this file that declined to run is a run that measured nothing.
+///
+/// Cargo reports a skipped walk as `ok` and captures the message that said so, so the summary
+/// a person or a CI job reads cannot tell it apart from success. This file returns early when
+/// its database cannot be opened, so that is a state it can reach; asserting the count is what
+/// turns it red instead.
+#[test]
+fn no_walk_in_this_file_skipped() {
+    assert_nothing_skipped();
 }

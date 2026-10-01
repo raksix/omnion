@@ -50,6 +50,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -165,16 +168,17 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
-async fn live_state() -> Option<(AppState, Db)> {
+async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
     let config = Config::from_env().expect("environment must be valid");
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!("SKIP: PostgreSQL is not reachable ({error})");
-            return None;
-        }
+    let isolated = IsolatedDb::open(&config.database.url, 4, "content_block_media")
+        .await
+        .expect("the throwaway database must open");
+    let Some(isolated) = isolated else {
+        announce_skip("no throwaway database, this walk did not run");
+        return None;
     };
-    db.migrate().await.expect("migrations must apply");
+    let db = isolated.db.clone();
+    // Migrations are applied by `IsolatedDb::open`, before the router is built.
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
         BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -183,7 +187,7 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
-    Some((state, db))
+    Some((state, db, isolated))
 }
 
 async fn create_account(db: &Db, organization_id: Uuid) -> (Uuid, String) {
@@ -293,6 +297,7 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], lab
 struct Fixture {
     state: AppState,
     db: Db,
+    isolated: IsolatedDb,
     site: Uuid,
     host: String,
     owner_email: String,
@@ -300,7 +305,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        let (state, db) = live_state().await?;
+        let (state, db, isolated) = live_state().await?;
 
         // The limiter runs loose before anything else, and the fact it took is asserted: without
         // this the first sign-ins hit the `sign_in` ceiling and the failure reads as a 429 in a
@@ -358,6 +363,7 @@ impl Fixture {
         Some(Self {
             state,
             db,
+            isolated,
             site,
             host,
             owner_email,
@@ -619,7 +625,7 @@ fn ref_for(body: &Value, media_id: Uuid) -> (String, String, String) {
 /// A trashed file leaves the page renderable, the dead id off the wire, and the author told.
 #[tokio::test]
 async fn a_trashed_image_leaves_the_page_renderable_and_the_visitor_never_gets_the_dead_id() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let media_id = fx.media("hero.png").await;
@@ -700,7 +706,7 @@ async fn a_trashed_image_leaves_the_page_renderable_and_the_visitor_never_gets_t
 /// A purged file and a trashed one are different problems with different answers.
 #[tokio::test]
 async fn a_purged_file_and_a_trashed_one_are_answered_differently() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let trashed_id = fx.media("trashed.png").await;
@@ -748,7 +754,7 @@ async fn a_purged_file_and_a_trashed_one_are_answered_differently() {
 /// A gallery keeps the files that survived, and a gallery that lost them all is not an empty grid.
 #[tokio::test]
 async fn a_gallery_keeps_what_survived_and_does_not_draw_an_empty_grid() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let alive = fx.media("keep.png").await;
@@ -807,7 +813,7 @@ async fn a_gallery_keeps_what_survived_and_does_not_draw_an_empty_grid() {
 /// what proves the rule is on the serving path at all.
 #[tokio::test]
 async fn a_container_that_lost_a_cell_serves_the_layout_it_still_has() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let gone = fx.media("gone.png").await;
@@ -866,7 +872,7 @@ async fn a_container_that_lost_a_cell_serves_the_layout_it_still_has() {
 /// A container that lost every cell is not served as an empty grid section.
 #[tokio::test]
 async fn a_container_that_lost_every_cell_is_not_served_at_all() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let gone = fx.media("all-gone.png").await;
@@ -893,7 +899,7 @@ async fn a_container_that_lost_every_cell_is_not_served_at_all() {
 /// A URL the author typed is not a file, and the platform does not nag about it.
 #[tokio::test]
 async fn a_hand_written_url_is_not_a_file_and_is_never_reported() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let page_id = fx
@@ -938,7 +944,7 @@ async fn a_hand_written_url_is_not_a_file_and_is_never_reported() {
 /// The frame can ask "what if this file were gone?" without touching the library.
 #[tokio::test]
 async fn the_frame_simulates_a_deletion_without_touching_the_media_row() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let media_id = fx.media("simulated.png").await;
@@ -1004,7 +1010,7 @@ async fn the_frame_simulates_a_deletion_without_touching_the_media_row() {
 /// A filter that is not a list of ids is refused by name, and a truncated one is refused outright.
 #[tokio::test]
 async fn a_bad_simulation_filter_is_refused_rather_than_ignored() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let media_id = fx.media("filter-target.png").await;
@@ -1046,7 +1052,7 @@ async fn a_bad_simulation_filter_is_refused_rather_than_ignored() {
 /// A block hidden from one screen is not that screen's problem, and the report says which.
 #[tokio::test]
 async fn a_hidden_blocks_file_is_reported_with_the_viewport_it_draws_on() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let desktop_only = fx.media("desktop.png").await;
@@ -1113,4 +1119,15 @@ async fn a_hidden_blocks_file_is_reported_with_the_viewport_it_draws_on() {
         !tree_mentions(&served.body["revision"]["blocks"], phone_only),
         "a block hidden from phones must not be served to a phone"
     );
+}
+
+/// A walk in this file that declined to run is a run that measured nothing.
+///
+/// Cargo reports a skipped walk as `ok` and captures the message that said so, so the summary
+/// a person or a CI job reads cannot tell it apart from success. This file returns early when
+/// its database cannot be opened, so that is a state it can reach; asserting the count is what
+/// turns it red instead.
+#[test]
+fn no_walk_in_this_file_skipped() {
+    assert_nothing_skipped();
 }

@@ -51,6 +51,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -173,16 +176,17 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
-async fn live_state() -> Option<(AppState, Db)> {
+async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
     let config = Config::from_env().expect("environment must be valid");
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!("SKIP: PostgreSQL is not reachable ({error})");
-            return None;
-        }
+    let isolated = IsolatedDb::open(&config.database.url, 4, "cms_featured_media")
+        .await
+        .expect("the throwaway database must open");
+    let Some(isolated) = isolated else {
+        announce_skip("no throwaway database, this walk did not run");
+        return None;
     };
-    db.migrate().await.expect("migrations must apply");
+    let db = isolated.db.clone();
+    // Migrations are applied by `IsolatedDb::open`, before the router is built.
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
         BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -191,7 +195,7 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
-    Some((state, db))
+    Some((state, db, isolated))
 }
 
 async fn create_account(db: &Db, organization_id: Uuid) -> (Uuid, String) {
@@ -302,6 +306,7 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], lab
 struct Fixture {
     state: AppState,
     db: Db,
+    isolated: IsolatedDb,
     org: Uuid,
     site: Uuid,
     host: String,
@@ -312,7 +317,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        let (state, db) = live_state().await?;
+        let (state, db, isolated) = live_state().await?;
 
         // The limiter is loosened before anything else and the fact it took is asserted. Without
         // this the first sign-ins of the suite hit REQ-012's `sign_in` ceiling of 10 per 300
@@ -393,6 +398,7 @@ impl Fixture {
         Some(Self {
             state,
             db,
+            isolated,
             org,
             site,
             host,
@@ -560,7 +566,7 @@ async fn write_featured(
 /// The criterion's first sentence: the fields round-trip, and a partial write keeps the rest.
 #[tokio::test]
 async fn the_alt_legend_and_focal_point_round_trip_and_a_partial_write_keeps_the_rest() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let owner = fx.owner().await;
@@ -704,7 +710,7 @@ async fn the_alt_legend_and_focal_point_round_trip_and_a_partial_write_keeps_the
 /// The criterion's second sentence: the renderer uses it, and the public payload is the proof.
 #[tokio::test]
 async fn the_public_payload_carries_the_image_and_the_visitor_gets_it() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let owner = fx.owner().await;
@@ -766,7 +772,7 @@ async fn the_public_payload_carries_the_image_and_the_visitor_gets_it() {
 /// by reading a status code.
 #[tokio::test]
 async fn a_trashed_featured_image_leaves_the_page_renderable_and_warns_the_operator() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let owner = fx.owner().await;
@@ -874,7 +880,7 @@ async fn a_trashed_featured_image_leaves_the_page_renderable_and_warns_the_opera
 /// The rules the store owes the schema, each refused with a message that says what to do.
 #[tokio::test]
 async fn the_rules_are_refused_with_a_message_that_says_what_to_do() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let owner = fx.owner().await;
@@ -1056,7 +1062,7 @@ async fn the_rules_are_refused_with_a_message_that_says_what_to_do() {
 /// Reading the library and setting a page's image are two different powers.
 #[tokio::test]
 async fn the_picker_and_the_write_are_two_powers_and_the_page_stays_someone_elses() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let page_id = fx.page("two-powers").await;
@@ -1279,7 +1285,7 @@ async fn the_picker_and_the_write_are_two_powers_and_the_page_stays_someone_else
 /// The picker's own contract: the reuse count, the image-only filter, the page cap.
 #[tokio::test]
 async fn the_picker_offers_images_with_a_reuse_count_and_honours_its_page_cap() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let owner = fx.owner().await;
@@ -1387,4 +1393,15 @@ async fn the_picker_offers_images_with_a_reuse_count_and_honours_its_page_cap() 
         "an absurd limit is clamped, not honoured: {}",
         huge.body
     );
+}
+
+/// A walk in this file that declined to run is a run that measured nothing.
+///
+/// Cargo reports a skipped walk as `ok` and captures the message that said so, so the summary
+/// a person or a CI job reads cannot tell it apart from success. This file returns early when
+/// its database cannot be opened, so that is a state it can reach; asserting the count is what
+/// turns it red instead.
+#[test]
+fn no_walk_in_this_file_skipped() {
+    assert_nothing_skipped();
 }

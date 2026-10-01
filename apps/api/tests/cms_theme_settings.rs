@@ -42,6 +42,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+
 const PASSWORD: &str = "correct horse battery";
 const CSRF_SECRET: &str = "w2-theme-settings-suite-csrf-secret";
 

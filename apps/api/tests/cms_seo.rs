@@ -36,6 +36,9 @@ use sqlx::Row;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -133,19 +136,17 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
-async fn live_state() -> Option<(AppState, Db)> {
+async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
     let config = Config::from_env().expect("environment must be valid");
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "SKIP: PostgreSQL is not reachable ({error}) — start it with \
-                 `docker compose -f infra/compose/docker-compose.dev.yml up -d`"
-            );
-            return None;
-        }
+    let isolated = IsolatedDb::open(&config.database.url, 4, "cms_seo")
+        .await
+        .expect("the throwaway database must open");
+    let Some(isolated) = isolated else {
+        announce_skip("no throwaway database, this walk did not run");
+        return None;
     };
-    db.migrate().await.expect("migrations must apply");
+    let db = isolated.db.clone();
+    // Migrations are applied by `IsolatedDb::open`, before the router is built.
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
         BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -154,7 +155,7 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
-    Some((state, db))
+    Some((state, db, isolated))
 }
 
 async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String) {
@@ -267,6 +268,7 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], lab
 struct Fixture {
     state: AppState,
     db: Db,
+    isolated: IsolatedDb,
     site: Uuid,
     host: String,
     page: Uuid,
@@ -277,7 +279,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        let (state, db) = live_state().await?;
+        let (state, db, isolated) = live_state().await?;
         seed::ensure(db.pool())
             .await
             .expect("the IAM seed must run");
@@ -333,6 +335,7 @@ impl Fixture {
         Some(Self {
             state,
             db,
+            isolated,
             site,
             host,
             page,
@@ -381,7 +384,7 @@ async fn published_page(db: &Db, site: Uuid, slug: &str, title: &str) -> Uuid {
 
 #[tokio::test]
 async fn a_page_with_metadata_emits_the_right_tags_and_lands_in_the_sitemap() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -518,7 +521,7 @@ async fn a_page_with_metadata_emits_the_right_tags_and_lands_in_the_sitemap() {
 
 #[tokio::test]
 async fn a_noindex_page_is_emitted_with_the_directive_and_kept_out_of_the_sitemap() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -564,7 +567,7 @@ async fn a_noindex_page_is_emitted_with_the_directive_and_kept_out_of_the_sitema
 
 #[tokio::test]
 async fn a_redirect_fires_counts_its_hit_and_a_rule_that_closes_a_loop_is_refused() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -679,7 +682,7 @@ async fn a_redirect_fires_counts_its_hit_and_a_rule_that_closes_a_loop_is_refuse
 
 #[tokio::test]
 async fn a_path_two_rules_match_is_reported_as_ambiguous_and_a_test_does_not_count_a_hit() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -765,7 +768,7 @@ async fn a_path_two_rules_match_is_reported_as_ambiguous_and_a_test_does_not_cou
 
 #[tokio::test]
 async fn reading_seo_is_not_the_power_to_change_it() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let reader = fixture.reader().await;
@@ -834,7 +837,7 @@ async fn reading_seo_is_not_the_power_to_change_it() {
 
 #[tokio::test]
 async fn a_robots_txt_that_blocks_the_whole_site_is_saved_with_the_warning_naming_it() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -923,7 +926,7 @@ async fn a_robots_txt_that_blocks_the_whole_site_is_saved_with_the_warning_namin
 
 #[tokio::test]
 async fn the_broken_link_crawl_finds_a_link_to_a_page_that_does_not_exist() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -1102,7 +1105,7 @@ async fn rule_count(db: &Db, site: Uuid) -> i64 {
 
 #[tokio::test]
 async fn a_csv_round_trips_through_export_and_back() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -1218,7 +1221,7 @@ async fn a_csv_round_trips_through_export_and_back() {
 
 #[tokio::test]
 async fn a_file_with_one_bad_row_writes_nothing_and_names_the_line() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -1274,7 +1277,7 @@ async fn a_file_with_one_bad_row_writes_nothing_and_names_the_line() {
 
 #[tokio::test]
 async fn a_file_that_closes_a_loop_is_refused_before_a_single_rule_is_written() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -1304,7 +1307,7 @@ async fn a_file_that_closes_a_loop_is_refused_before_a_single_rule_is_written() 
 
 #[tokio::test]
 async fn a_dry_run_reports_the_file_and_writes_nothing() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -1333,7 +1336,7 @@ async fn a_dry_run_reports_the_file_and_writes_nothing() {
 
 #[tokio::test]
 async fn a_reader_may_export_but_may_not_import() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let reader = fixture.reader().await;
@@ -1370,7 +1373,7 @@ async fn a_reader_may_export_but_may_not_import() {
 
 #[tokio::test]
 async fn an_import_for_another_organizations_site_is_refused() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -1409,7 +1412,7 @@ async fn an_import_for_another_organizations_site_is_refused() {
 
 #[tokio::test]
 async fn a_file_with_no_usable_header_is_refused_with_the_names_it_needs() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.editor().await;
@@ -1441,4 +1444,15 @@ async fn a_file_with_no_usable_header_is_refused_with_the_names_it_needs() {
         "the refusal must say which columns it needs: {rendered}"
     );
     assert_eq!(rule_count(&fixture.db, fixture.site).await, 0);
+}
+
+/// A walk in this file that declined to run is a run that measured nothing.
+///
+/// Cargo reports a skipped walk as `ok` and captures the message that said so, so the summary
+/// a person or a CI job reads cannot tell it apart from success. This file returns early when
+/// its database cannot be opened, so that is a state it can reach; asserting the count is what
+/// turns it red instead.
+#[test]
+fn no_walk_in_this_file_skipped() {
+    assert_nothing_skipped();
 }

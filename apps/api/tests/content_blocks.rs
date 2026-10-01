@@ -27,6 +27,10 @@ use sqlx::Row;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+use support::walk_auth;
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -47,7 +51,8 @@ const CONTENT_PERMISSIONS: [&str; 8] = [
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
     status: StatusCode,
-    set_cookie: Option<String>,
+    /// Every `Set-Cookie` on the response, in order. Sign-in sets two.
+    set_cookies: Vec<String>,
     body: Value,
 }
 
@@ -59,11 +64,25 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .expect("router must answer");
 
     let status = response.status();
-    let set_cookie = response
+    // **Every** `Set-Cookie`, not the first.
+    //
+    // Sign-in answers with TWO: the session and the CSRF token beside it. `headers().get()`
+    // returns one value, so the original expression here silently discarded the token and
+    // every cookie-authenticated write in this file was refused with `csrf_failed` — a code
+    // whose message names the token rather than this suite's own loss of it, so the suite
+    // read as broken rather than incomplete.
+    //
+    // It did not read as broken before this tick because the environment had no CSRF secret
+    // configured, which makes the same request answer `csrf_unavailable` — still a refusal,
+    // but a different one, and the walks that survived were the ones that never wrote. Setting
+    // the secret is what made these nineteen failures visible; they were there all along.
+    let set_cookies: Vec<String> = response
         .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_owned))
+        .collect();
+    let set_cookie = set_cookies.first().cloned();
     let bytes = response
         .into_body()
         .collect()
@@ -78,16 +97,21 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 
     TestResponse {
         status,
-        set_cookie,
+        set_cookies,
         body,
     }
 }
 
-/// Build a request; `token` becomes the session cookie and `body` the JSON payload.
+/// Build a request; `token` is the packed credential and `body` the JSON payload.
+///
+/// The credential is packed rather than a bare session token so this builder cannot re-open
+/// the half-sign-in the module documents: `walk_auth::Session::apply` sets the session cookie,
+/// the CSRF cookie **and** the header in one place, and every authenticated request here goes
+/// through it.
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(token) => walk_auth::apply_credential(token, builder),
         None => builder,
     };
     match body {
@@ -106,25 +130,36 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
-/// Connect to the compose PostgreSQL; `None` means the stack is not running.
-async fn live_db(config: &Config) -> Option<Db> {
-    match Db::connect(&config.database).await {
-        Ok(db) => Some(db),
-        Err(error) => {
-            eprintln!(
-                "SKIP: PostgreSQL is not reachable ({error}) — start it with \
-                 `docker compose -f infra/compose/docker-compose.dev.yml up -d`"
-            );
-            None
-        }
-    }
-}
+/// A state over a throwaway database, with the IAM seed loaded.
+///
+/// **This suite used to run in whatever `OMNION_DATABASE_URL` named**, which on a writer's
+/// box is the shared QA database — the same rows every other stack and every other writer
+/// points at. The consequence that reached a test result rather than an error message:
+/// `seed::ensure` binds the built-in Owner role to the *earliest user in the database*, so
+/// this file's walks inherited whichever walk inserted first, and a walk asserting a
+/// permission refusal could pass on one writer's box and fail on every other. A database of
+/// its own removes the question: the earliest user is always this walk's own.
+///
+/// The skip branch is still there for an unreachable PostgreSQL, but it now announces itself
+/// and the gate at the bottom of this file turns any skip into a red run. A walk that declined
+/// to do anything used to report `ok`, and cargo captures the `eprintln!` that said so.
+async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
+    let mut config = Config::from_env().expect("environment must be valid");
+    // A deployment with no CSRF secret refuses every cookie-authenticated write, so a suite
+    // that leaves it to the environment measures refusals rather than the product.
+    walk_auth::with_csrf_secret(&mut config);
+    let isolated = IsolatedDb::open(&config.database.url, 4, "blocks")
+        .await
+        .expect("the throwaway database must open");
+    let Some(isolated) = isolated else {
+        announce_skip("no throwaway database, this walk did not run");
+        return None;
+    };
+    let db = isolated.db.clone();
 
-/// A state whose database has all migrations applied and the IAM seed loaded.
-async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().expect("environment must be valid");
-    let db = live_db(&config).await?;
-    db.migrate().await.expect("migrations must apply");
+    seed::ensure(db.pool())
+        .await
+        .expect("the IAM seed must run");
 
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
@@ -134,26 +169,47 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
-    Some((state, db))
+
+    // Sign-in is limited to ten per five minutes per peer address, and every walk in this file
+    // signs in three accounts, so the eleventh sign-in is refused with a `429` naming a rate
+    // limit on a suite that was never testing rate limits. The counters live in one Redis
+    // shared with every other writer's worktree, so a database per walk does nothing for this
+    // one; raising the ceiling is the other half of the same problem.
+    walk_auth::give_the_process_its_own_sign_in_budget(|| {
+        let policies: Vec<omnion_security::RatePolicy> = omnion_security::RatePolicy::defaults()
+            .into_iter()
+            .map(|mut policy| {
+                if policy.scope == "sign_in" {
+                    policy.limit = 10_000;
+                    policy.burst = 0;
+                }
+                policy
+            })
+            .collect();
+        omnion_api::rate_limit_middleware::install(
+            omnion_api::rate_limit_middleware::RateLimiter::new(&state, policies),
+        );
+    });
+
+    Some((state, db, isolated))
 }
 
 /// A page, a site, an organization and the accounts that drive them.
 struct Fixture {
     state: AppState,
     db: Db,
+    isolated: IsolatedDb,
     org: Uuid,
     site: Uuid,
     site_key: String,
     platform_email: String,
     editor_email: String,
     member_email: String,
-    accounts: Vec<Uuid>,
-    organizations: Vec<Uuid>,
 }
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        let (state, db) = live_state().await?;
+        let (state, db, isolated) = live_state().await?;
         seed::ensure(db.pool())
             .await
             .expect("the IAM seed must run");
@@ -231,19 +287,18 @@ impl Fixture {
             .expect("the binding must be granted");
 
         // A plain member of the same organization, without a content permission.
-        let (member_id, member_email) = create_account(&db, Some(org)).await;
+        let (_member_id, member_email) = create_account(&db, Some(org)).await;
 
         Some(Self {
             state,
             db,
+            isolated,
             org,
             site,
             site_key,
             platform_email,
             editor_email,
             member_email,
-            accounts: vec![platform_id, editor_id, member_id],
-            organizations: vec![org],
         })
     }
 
@@ -285,17 +340,15 @@ impl Fixture {
         response.body["id"].as_str().expect("an id").to_owned()
     }
 
-    async fn cleanup(&self) {
-        sqlx::query("delete from users where id = any($1)")
-            .bind(&self.accounts)
-            .execute(self.db.pool())
-            .await
-            .expect("account cleanup must run");
-        sqlx::query("delete from organizations where id = any($1)")
-            .bind(&self.organizations)
-            .execute(self.db.pool())
-            .await
-            .expect("organization cleanup must run");
+    /// Drop the walk's own database.
+    ///
+    /// **The row deletions this used to do are gone, and their absence is the point.** They
+    /// existed because the walk shared a database with every other suite on the box, so
+    /// tidying up was the price of being allowed in. With a database per walk there is nothing
+    /// to tidy: dropping the database removes every row the walk wrote at once, which is both
+    /// fewer statements and the only cleanup that cannot miss a table.
+    async fn cleanup(&mut self) {
+        self.isolated.dispose().await;
     }
 }
 
@@ -337,19 +390,10 @@ async fn login(state: &AppState, email: &str) -> String {
         response.status,
         response.body
     );
-    // The `Set-Cookie` header is `name=value; Path=/; HttpOnly; …`; only the value is the
-    // session token, and sending the attributes back would be a cookie no browser accepts.
-    response
-        .set_cookie
-        .as_deref()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("the cookie has a value")
-        .split_once('=')
-        .expect("the cookie is name=value")
-        .1
-        .to_owned()
+    // Both cookies, packed. The old expression took `.split(';').next()` of the FIRST
+    // `Set-Cookie` alone, which is correct for one cookie and silently discards every cookie
+    // after it — see the note on `call`.
+    walk_auth::Session::from_set_cookies(&response.set_cookies).pack()
 }
 
 /// One block entry with a fresh id, in the payload shape the editor sends.
@@ -395,7 +439,7 @@ fn sample_tree() -> Value {
 
 #[tokio::test]
 async fn the_block_registry_is_read_only_and_permission_gated() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -536,7 +580,7 @@ async fn the_block_registry_is_read_only_and_permission_gated() {
 
 #[tokio::test]
 async fn a_dry_run_reports_issues_without_writing_anything() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -641,7 +685,7 @@ async fn a_dry_run_reports_issues_without_writing_anything() {
 
 #[tokio::test]
 async fn a_page_keeps_one_block_of_every_type_through_a_save_and_a_publish() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -800,7 +844,7 @@ async fn a_page_keeps_one_block_of_every_type_through_a_save_and_a_publish() {
 
 #[tokio::test]
 async fn reordering_keeps_block_ids_and_duplicating_gives_the_copy_a_new_one() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -916,7 +960,7 @@ async fn reordering_keeps_block_ids_and_duplicating_gives_the_copy_a_new_one() {
 
 #[tokio::test]
 async fn a_required_prop_stops_a_publish_but_not_a_draft_save() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -1045,7 +1089,7 @@ async fn a_required_prop_stops_a_publish_but_not_a_draft_save() {
 
 #[tokio::test]
 async fn a_block_save_is_recorded_as_an_event_and_an_audit_row() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -1134,7 +1178,7 @@ async fn a_block_save_is_recorded_as_an_event_and_an_audit_row() {
 
 #[tokio::test]
 async fn restoring_an_earlier_revision_brings_its_blocks_back_too() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -1196,7 +1240,7 @@ async fn restoring_an_earlier_revision_brings_its_blocks_back_too() {
 
 #[tokio::test]
 async fn a_blocks_only_save_from_a_member_without_the_key_is_refused() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let platform = fixture.platform_token().await;
@@ -1248,7 +1292,7 @@ async fn a_blocks_only_save_from_a_member_without_the_key_is_refused() {
 /// there for a phone. The test reads the API rather than the HTML because the API is what decides.
 #[tokio::test]
 async fn a_block_hidden_on_phones_is_absent_from_the_mobile_render() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -1362,7 +1406,7 @@ async fn a_block_hidden_on_phones_is_absent_from_the_mobile_render() {
 /// a warning because nothing in a published page should be able to contradict what it says.
 #[tokio::test]
 async fn a_hide_on_value_outside_the_list_cannot_be_saved() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -1423,7 +1467,7 @@ async fn a_hide_on_value_outside_the_list_cannot_be_saved() {
 /// function nothing calls.
 #[tokio::test]
 async fn a_heading_that_skips_back_to_an_h1_is_reported_by_the_dry_run() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let editor = fixture.editor_token().await;
@@ -1496,7 +1540,7 @@ async fn a_heading_that_skips_back_to_an_h1_is_reported_by_the_dry_run() {
 /// a struct the handler happens to return.
 #[tokio::test]
 async fn two_revisions_compare_block_by_block() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("skipping: the development PostgreSQL is not reachable");
         return;
     };
@@ -1702,7 +1746,7 @@ async fn two_revisions_compare_block_by_block() {
 /// rewritten wholesale.
 #[tokio::test]
 async fn a_body_only_page_compares_its_text() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("skipping: the development PostgreSQL is not reachable");
         return;
     };
@@ -1752,7 +1796,7 @@ async fn a_body_only_page_compares_its_text() {
 /// reports the whole page as rewritten.
 #[tokio::test]
 async fn a_reorder_reads_as_a_move_not_as_a_rewrite() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("skipping: the development PostgreSQL is not reachable");
         return;
     };
@@ -1812,7 +1856,7 @@ async fn a_reorder_reads_as_a_move_not_as_a_rewrite() {
 /// only `content.blocks.read` cannot use a page's history through the compare route.
 #[tokio::test]
 async fn comparing_revisions_needs_the_pages_read_key() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("skipping: the development PostgreSQL is not reachable");
         return;
     };
@@ -1860,7 +1904,7 @@ async fn comparing_revisions_needs_the_pages_read_key() {
 /// `PATCH` that appends a draft revision; and there is no publish verb anywhere on the route.
 #[tokio::test]
 async fn the_preview_frame_reads_the_draft_and_filters_it_server_side() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("skipping: the development PostgreSQL is not reachable");
         return;
     };
@@ -1995,7 +2039,7 @@ async fn the_preview_frame_reads_the_draft_and_filters_it_server_side() {
 /// the answer.
 #[tokio::test]
 async fn the_preview_frame_survives_a_publish_and_falls_back_to_the_live_revision() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("skipping: the development PostgreSQL is not reachable");
         return;
     };
@@ -2065,7 +2109,7 @@ async fn the_preview_frame_survives_a_publish_and_falls_back_to_the_live_revisio
 /// that also published, which is the failure that matters here.
 #[tokio::test]
 async fn an_inline_save_writes_one_draft_revision_and_leaves_the_page_alone() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("skipping: the development PostgreSQL is not reachable");
         return;
     };
@@ -2174,7 +2218,7 @@ async fn an_inline_save_writes_one_draft_revision_and_leaves_the_page_alone() {
 /// The frame carries the pages read key, like the screen it draws.
 #[tokio::test]
 async fn the_preview_frame_needs_the_pages_read_key() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         eprintln!("skipping: the development PostgreSQL is not reachable");
         return;
     };
@@ -2223,7 +2267,7 @@ async fn the_preview_frame_needs_the_pages_read_key() {
 /// so adding a query parameter did not turn the gallery into a cross-tenant read.
 #[tokio::test]
 async fn the_galleries_answer_the_owner_and_still_refuse_a_foreign_tenant() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let owner = fixture.platform_token().await;
@@ -2366,4 +2410,23 @@ async fn the_galleries_answer_the_owner_and_still_refuse_a_foreign_tenant() {
         "and it returns no patterns: {}",
         editor_refused.1
     );
+
+    // **This walk had no cleanup call at all, and the shared database is why that was silent.**
+    // Twenty-one sibling walks each ended in `fixture.cleanup()`, so this one's omission read as
+    // an oversight in a file where tidying up is the rule. It leaked: the `foreign_org` row
+    // above stayed behind, and a walk in another suite that counts organizations read it. With
+    // the database dropped instead, a walk that forgets cannot leak — the drop removes every
+    // row it wrote, so "every walk ends in cleanup" stops being a rule a walk has to remember.
+    fixture.cleanup().await;
+}
+
+/// A walk in this file that declined to run is a run that measured nothing.
+///
+/// Cargo reports a skipped walk as `ok` and captures the message that said so, so the summary
+/// a person or a CI job reads cannot tell it apart from success. This file returns early on an
+/// unreachable database, so that is a state this file can reach; asserting the count is what
+/// turns it red instead.
+#[test]
+fn no_walk_in_this_file_skipped() {
+    assert_nothing_skipped();
 }

@@ -38,6 +38,9 @@ use time::OffsetDateTime;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -140,19 +143,17 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
-async fn live_state() -> Option<(AppState, Db)> {
+async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
     let config = Config::from_env().expect("environment must be valid");
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "SKIP: PostgreSQL is not reachable ({error}) — start it with \
-                 `docker compose -f infra/compose/docker-compose.dev.yml up -d`"
-            );
-            return None;
-        }
+    let isolated = IsolatedDb::open(&config.database.url, 4, "cms_newsletter")
+        .await
+        .expect("the throwaway database must open");
+    let Some(isolated) = isolated else {
+        announce_skip("no throwaway database, this walk did not run");
+        return None;
     };
-    db.migrate().await.expect("migrations must apply");
+    let db = isolated.db.clone();
+    // Migrations are applied by `IsolatedDb::open`, before the router is built.
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
         BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -161,7 +162,7 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
-    Some((state, db))
+    Some((state, db, isolated))
 }
 
 async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String) {
@@ -269,6 +270,7 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], lab
 struct Fixture {
     state: AppState,
     db: Db,
+    isolated: IsolatedDb,
     org: Uuid,
     site: Uuid,
     host: String,
@@ -278,7 +280,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        let (state, db) = live_state().await?;
+        let (state, db, isolated) = live_state().await?;
         seed::ensure(db.pool())
             .await
             .expect("the IAM seed must run");
@@ -326,6 +328,7 @@ impl Fixture {
         Some(Self {
             state,
             db,
+            isolated,
             org,
             site,
             host,
@@ -407,7 +410,7 @@ async fn deliverable(db: &Db, list_id: Uuid) -> Vec<String> {
 
 #[tokio::test]
 async fn a_new_subscriber_is_pending_and_only_the_confirmation_link_subscribes_them() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Weekly News").await;
@@ -484,7 +487,7 @@ async fn a_new_subscriber_is_pending_and_only_the_confirmation_link_subscribes_t
 
 #[tokio::test]
 async fn a_replayed_confirmation_link_is_refused_and_the_row_stays_confirmed() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Replay Probe").await;
@@ -559,7 +562,7 @@ async fn a_replayed_confirmation_link_is_refused_and_the_row_stays_confirmed() {
 
 #[tokio::test]
 async fn a_confirmation_link_that_expired_is_refused_and_names_the_reason() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Expiry Probe").await;
@@ -618,7 +621,7 @@ async fn a_confirmation_link_that_expired_is_refused_and_names_the_reason() {
 
 #[tokio::test]
 async fn unsubscribe_flips_the_status_and_keeps_the_row() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Leaving Probe").await;
@@ -678,7 +681,7 @@ async fn unsubscribe_flips_the_status_and_keeps_the_row() {
 
 #[tokio::test]
 async fn a_token_that_matches_nothing_says_nothing_about_the_list() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
 
@@ -708,7 +711,7 @@ async fn a_token_that_matches_nothing_says_nothing_about_the_list() {
 
 #[tokio::test]
 async fn a_list_key_is_the_public_signup_address_and_a_second_list_gets_its_own() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let first = fx.create_list("Weekly News").await;
@@ -729,7 +732,7 @@ async fn a_list_key_is_the_public_signup_address_and_a_second_list_gets_its_own(
 
 #[tokio::test]
 async fn reading_the_subscribers_is_not_the_power_to_change_them() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Scoped Probe").await;
@@ -815,7 +818,7 @@ async fn reading_the_subscribers_is_not_the_power_to_change_them() {
 
 #[tokio::test]
 async fn a_list_of_another_organization_is_not_reachable_through_the_read() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Owned Probe").await;
@@ -945,7 +948,7 @@ async fn a_list_of_another_organization_is_not_reachable_through_the_read() {
 
 #[tokio::test]
 async fn a_csv_import_adds_the_new_addresses_and_reports_the_ones_it_refused() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Import Probe").await;
@@ -1020,7 +1023,7 @@ async fn a_csv_import_adds_the_new_addresses_and_reports_the_ones_it_refused() {
 
 #[tokio::test]
 async fn an_export_returns_exactly_the_filtered_rows() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Export Probe").await;
@@ -1076,7 +1079,7 @@ async fn an_export_returns_exactly_the_filtered_rows() {
 
 #[tokio::test]
 async fn a_sent_issue_lands_in_the_archive_with_a_slug_the_public_page_can_address() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Archive Probe").await;
@@ -1176,7 +1179,7 @@ async fn a_sent_issue_lands_in_the_archive_with_a_slug_the_public_page_can_addre
 
 #[tokio::test]
 async fn a_list_without_double_opt_in_subscribes_immediately_and_says_so() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let owner = fx.owner().await;
@@ -1247,7 +1250,7 @@ async fn a_list_without_double_opt_in_subscribes_immediately_and_says_so() {
 
 #[tokio::test]
 async fn an_address_that_is_already_unsubscribed_may_come_back() {
-    let Some(fx) = Fixture::new().await else {
+    let Some(mut fx) = Fixture::new().await else {
         return;
     };
     let list = fx.create_list("Comeback Probe").await;
@@ -1307,4 +1310,15 @@ async fn an_address_that_is_already_unsubscribed_may_come_back() {
     .await;
     assert_eq!(imported.status, StatusCode::OK, "{}", imported.body);
     assert_eq!(imported.body["added"], json!(0), "an import never revives: {}", imported.body);
+}
+
+/// A walk in this file that declined to run is a run that measured nothing.
+///
+/// Cargo reports a skipped walk as `ok` and captures the message that said so, so the summary
+/// a person or a CI job reads cannot tell it apart from success. This file returns early when
+/// its database cannot be opened, so that is a state it can reach; asserting the count is what
+/// turns it red instead.
+#[test]
+fn no_walk_in_this_file_skipped() {
+    assert_nothing_skipped();
 }

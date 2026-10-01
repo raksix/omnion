@@ -30,6 +30,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -166,20 +169,18 @@ fn test_storage() -> omnion_storage::Storage {
 /// reason that had nothing to do with forms.
 const CSRF_SECRET: &str = "forms-suite-csrf-secret";
 
-async fn live_state() -> Option<(AppState, Db)> {
+async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
     let mut config = Config::from_env().expect("environment must be valid");
     config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "SKIP: PostgreSQL is not reachable ({error}) — start it with \
-                 `docker compose -f infra/compose/docker-compose.dev.yml up -d`"
-            );
-            return None;
-        }
+    let isolated = IsolatedDb::open(&config.database.url, 4, "cms_forms")
+        .await
+        .expect("the throwaway database must open");
+    let Some(isolated) = isolated else {
+        announce_skip("no throwaway database, this walk did not run");
+        return None;
     };
-    db.migrate().await.expect("migrations must apply");
+    let db = isolated.db.clone();
+    // Migrations are applied by `IsolatedDb::open`, before the router is built.
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
         BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -188,7 +189,7 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
-    Some((state, db))
+    Some((state, db, isolated))
 }
 
 async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String) {
@@ -323,6 +324,7 @@ fn all_answers() -> Value {
 struct Fixture {
     state: AppState,
     db: Db,
+    isolated: IsolatedDb,
     org: Uuid,
     site: Uuid,
     /// The site's own key — the public surface addresses a site by key or host, never by uuid.
@@ -335,7 +337,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Option<Self> {
-        let (state, db) = live_state().await?;
+        let (state, db, isolated) = live_state().await?;
         seed::ensure(db.pool())
             .await
             .expect("the IAM seed must run");
@@ -375,6 +377,7 @@ impl Fixture {
         Some(Self {
             state,
             db,
+            isolated,
             org,
             site,
             site_key,
@@ -463,21 +466,15 @@ impl Fixture {
         .await
     }
 
-    async fn cleanup(&self) {
-        for account in &self.accounts {
-            let _ = sqlx::query("delete from users where id = $1")
-                .bind(account)
-                .execute(self.db.pool())
-                .await;
-        }
-        let _ = sqlx::query("delete from sites where id = $1")
-            .bind(self.site)
-            .execute(self.db.pool())
-            .await;
-        let _ = sqlx::query("delete from organizations where id = $1")
-            .bind(self.org)
-            .execute(self.db.pool())
-            .await;
+    /// Drop the walk's own database.
+    ///
+    /// **The row deletions this used to do are gone, and their absence is the point.** They
+    /// existed because the walk shared a database with every other suite on the box, so
+    /// tidying up was the price of being allowed in. With a database per walk there is nothing
+    /// to tidy: dropping it removes every row the walk wrote at once, which is both fewer
+    /// statements and the only cleanup that cannot miss a table.
+    async fn cleanup(&mut self) {
+        self.isolated.dispose().await;
     }
 }
 
@@ -487,7 +484,7 @@ impl Fixture {
 /// keeps the consent sentence is a form whose *definitions* are honoured end to end.
 #[tokio::test]
 async fn all_eight_field_types_accept_their_answers_and_keep_the_consent_text() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.inbox().await;
@@ -542,7 +539,7 @@ async fn all_eight_field_types_accept_their_answers_and_keep_the_consent_text() 
 /// trip turns a six-field form into six submissions and the fifth is what trips the rate limit.
 #[tokio::test]
 async fn validation_answers_with_every_field_error_at_once() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.inbox().await;
@@ -625,7 +622,7 @@ async fn validation_answers_with_every_field_error_at_once() {
 /// work around.
 #[tokio::test]
 async fn a_filled_honeypot_stores_nothing_and_is_not_told() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.inbox().await;
@@ -675,7 +672,7 @@ async fn a_filled_honeypot_stores_nothing_and_is_not_told() {
 /// A submission filled in under the floor is refused, and the floor is the form's own column.
 #[tokio::test]
 async fn a_too_fast_submission_is_refused_by_the_forms_own_floor() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.inbox().await;
@@ -724,7 +721,7 @@ async fn a_too_fast_submission_is_refused_by_the_forms_own_floor() {
 /// submissions would otherwise be the cheapest way to fill an owner's inbox.
 #[tokio::test]
 async fn the_hourly_limit_is_per_sender_and_does_not_stop_the_next_one() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.inbox().await;
@@ -904,7 +901,7 @@ async fn the_hourly_limit_is_per_sender_and_does_not_stop_the_next_one() {
 /// history through a button labelled "Export".
 #[tokio::test]
 async fn the_export_of_a_filtered_inbox_returns_exactly_the_filtered_rows() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.inbox().await;
@@ -993,7 +990,7 @@ async fn the_export_of_a_filtered_inbox_returns_exactly_the_filtered_rows() {
 /// Designing a form and reading its replies are two different powers.
 #[tokio::test]
 async fn designing_a_form_does_not_grant_the_inbox() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     // The builder account holds forms.manage but NOT forms.submissions.read.
@@ -1027,7 +1024,7 @@ async fn designing_a_form_does_not_grant_the_inbox() {
 /// Another tenant's form is not reachable, and not even as an existence oracle.
 #[tokio::test]
 async fn another_organizations_form_is_not_reachable() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let inbox = fixture.inbox().await;
@@ -1107,7 +1104,7 @@ async fn another_organizations_form_is_not_reachable() {
 /// A draft form answers 404 to the public route, so the endpoint cannot confirm it exists.
 #[tokio::test]
 async fn a_draft_form_is_invisible_to_the_public_route() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let inbox = fixture.inbox().await;
@@ -1139,7 +1136,7 @@ async fn a_draft_form_is_invisible_to_the_public_route() {
 /// A form with no fields cannot be created, and a form with a duplicate key is refused by name.
 #[tokio::test]
 async fn a_form_that_cannot_work_is_refused_at_creation() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.inbox().await;
@@ -1246,7 +1243,7 @@ async fn a_form_that_cannot_work_is_refused_at_creation() {
 /// A submission stores no address, only a hash — the inbox is not a log of visitors.
 #[tokio::test]
 async fn the_inbox_stores_a_hash_of_the_sender_and_not_the_address() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.inbox().await;
@@ -1287,7 +1284,7 @@ async fn the_inbox_stores_a_hash_of_the_sender_and_not_the_address() {
 /// A submission emits `content.form.submitted`, which is the contract an automation subscribes to.
 #[tokio::test]
 async fn a_submission_emits_the_event_the_req_names_as_contract() {
-    let Some(fixture) = Fixture::new().await else {
+    let Some(mut fixture) = Fixture::new().await else {
         return;
     };
     let token = fixture.inbox().await;
@@ -1322,4 +1319,15 @@ async fn a_submission_emits_the_event_the_req_names_as_contract() {
         "the submission must reach the bus: {emitted} rows"
     );
     fixture.cleanup().await;
+}
+
+/// A walk in this file that declined to run is a run that measured nothing.
+///
+/// Cargo reports a skipped walk as `ok` and captures the message that said so, so the summary
+/// a person or a CI job reads cannot tell it apart from success. This file returns early when
+/// its database cannot be opened, so that is a state it can reach; asserting the count is what
+/// turns it red instead.
+#[test]
+fn no_walk_in_this_file_skipped() {
+    assert_nothing_skipped();
 }
