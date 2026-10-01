@@ -92,8 +92,13 @@ pub async fn tick(state: &AppState) -> Result<usize, omnion_backup::BackupError>
 
     let mut started = 0;
     for schedule in due {
-        match run_one(state, &schedule.id, schedule.organization_id, schedule.scopes.clone())
-            .await
+        match run_one(
+            state,
+            &schedule.id,
+            schedule.organization_id,
+            schedule.scopes.clone(),
+        )
+        .await
         {
             Ok(Some(backup_id)) => {
                 started += 1;
@@ -165,7 +170,8 @@ async fn run_one(
         // retention window and fill the destination for ever.
         protected: false,
         retain_until: Some(
-            OffsetDateTime::now_utc() + time::Duration::days(i64::from(schedule.retention_count.max(1))),
+            OffsetDateTime::now_utc()
+                + time::Duration::days(i64::from(schedule.retention_count.max(1))),
         ),
         // `created_by` is deliberately null: the row records who *created the schedule*,
         // which is not who produced this run. A worker has no actor, and a run attributed to
@@ -189,7 +195,9 @@ async fn run_one(
     let next = match omnion_backup::Cadence::from_schedule(&schedule) {
         Ok(cadence) => cadence
             .next_after(OffsetDateTime::now_utc())
-            .unwrap_or_else(|_| OffsetDateTime::now_utc() + time::Duration::days(REARM_HORIZON_DAYS)),
+            .unwrap_or_else(|_| {
+                OffsetDateTime::now_utc() + time::Duration::days(REARM_HORIZON_DAYS)
+            }),
         Err(error) => {
             tracing::warn!(
                 schedule = %schedule.name,

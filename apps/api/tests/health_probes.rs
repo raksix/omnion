@@ -213,12 +213,11 @@ async fn every_table_a_probe_reads_really_exists() {
         "health_incidents",
         "health_maintenance_windows",
     ] {
-        let exists: bool =
-            sqlx::query_scalar("select to_regclass($1) is not null as present")
-                .bind(table)
-                .fetch_one(pool)
-                .await
-                .unwrap_or_else(|err| panic!("to_regclass must run for {table}: {err}"));
+        let exists: bool = sqlx::query_scalar("select to_regclass($1) is not null as present")
+            .bind(table)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|err| panic!("to_regclass must run for {table}: {err}"));
         assert!(exists, "the schema has no table named {table}");
     }
 
@@ -228,7 +227,10 @@ async fn every_table_a_probe_reads_really_exists() {
         .fetch_one(pool)
         .await
         .expect("the settings row must be readable");
-    assert_eq!(settings, 1, "health_settings is a singleton and ships with one row");
+    assert_eq!(
+        settings, 1,
+        "health_settings is a singleton and ships with one row"
+    );
 
     harness.dispose().await;
 }
@@ -250,8 +252,7 @@ async fn a_fresh_database_has_every_service_row_and_no_samples() {
         8,
         "the registry probes the seven services of the request plus the host"
     );
-    let overview =
-        omnion_health::build_overview(results.into_iter().map(to_report).collect());
+    let overview = omnion_health::build_overview(results.into_iter().map(to_report).collect());
 
     assert_eq!(
         overview.services.len(),
@@ -418,7 +419,9 @@ async fn workers_are_unknown_until_one_registers_a_heartbeat() {
     let with_workers = omnion_health::probe_workers(&ctx).await;
     assert_eq!(with_workers.outcome.state(), "degraded");
     assert_eq!(with_workers.detail["alive"], 2);
-    let stale = with_workers.detail["stale"].as_array().expect("stale is a list");
+    let stale = with_workers.detail["stale"]
+        .as_array()
+        .expect("stale is a list");
     assert_eq!(stale.len(), 1, "exactly one kind is stale");
     assert_eq!(stale[0], "runner");
     assert!(
@@ -736,7 +739,11 @@ async fn a_series_comes_back_oldest_first() {
     // by `id desc`, and the name, the comment above it, and the query's own `order by sampled_at
     // asc` all say the opposite. It had been red since it was committed; a disk failure in the
     // same run was reported instead.
-    assert_eq!(values, vec![30.0, 20.0, 10.0], "oldest first, not insertion order");
+    assert_eq!(
+        values,
+        vec![30.0, 20.0, 10.0],
+        "oldest first, not insertion order"
+    );
 
     // A window that excludes everything is an empty series, not an error.
     let outside = omnion_health::samples_in_window(

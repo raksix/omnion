@@ -6659,6 +6659,145 @@ walkthrough. A third browser pass into that is the documented 29-September failu
 passes OOM-killing each other), and killing a sibling's pass to make room for mine trades one
 loop's evidence for another's. The boxes that name a screen stay unticked until a tick finds the
 box idle, which is the same condition `run.sh`'s own `flock` was added to protect.
+
+
+## Tick 94 — REQ-012 slice 4: a denied CIDR is refused, and the screen that was always linked
+
+**What.** Slice 4's IP-access half, done: the rules, the table, the evaluator, the request-path
+layer, the four routes and `/security/ip-access`. Six atomic commits, pushed. The events screen
+and the secret inventory are slice 4's other two thirds and are **not** started.
+
+**The defect this closes, stated once.** `/security/ip-access` has been linked from the posture
+overview's IP-allow-list row since the check registry was written — a link to a route that did not
+exist. And once the routes did exist, nothing read them: an operator could deny `203.0.113.0/24`,
+watch the row appear, and go on being served from it. The criterion is worded *"a denied CIDR
+cannot reach the API"*, which asks for a **refusal**, not a configuration.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-security --lib` | 159 passed (was 137) |
+| `cargo test -p omnion-api --lib` | 269 passed (was 261) |
+| `cargo test -p omnion-api --test security -- --test-threads=1` | 7 passed (42.1 s) |
+| `cargo test -p omnion-api --test migration_gap` | 4 passed, fresh database |
+| `tsc --noEmit` (apps/admin) | exit 0 |
+
+**Proven to fail before it was believed.** Removing the layer application from the router turns
+`a_denied_network_cannot_reach_the_api` red naming the criterion. **The failure payload is the
+best argument in this entry**: with the layer gone, the same response carried
+`{"key":"ip_rules","state":"pass","detail":{"fact":1,"summary":"1 IP access rules are configured"}}`
+— the screen reporting the access list as healthy while the platform served the very network it
+described. Screen and platform disagreeing inside one payload is the ninth instance of this REQ's
+defect class, and it is why the walk drives the **router** rather than the crate.
+
+**Three decisions worth keeping.**
+
+1. **A request with no address is refused, not waved through.** With rules in force it answers
+   `403 ip_unknown`. That is what makes the criterion a claim about the platform: if every
+   in-process request were allowed for want of an address, the walk that proves a CIDR is refused
+   would pass for the wrong reason. The harnesses opt in through a named env var, off by default.
+2. **A rule that blocks the caller is warned about, not refused** — `blocks_you` comes from the
+   server because only the server knows the address the request came from, and the rule is saved
+   either way. Locking yourself out of one route is legitimate; refusing it would only teach the
+   operator which input avoids the check.
+3. **The host-bit CIDR is refused, and the message names the network meant.** `ipnet` accepts
+   `10.0.0.1/8` and answers `contains()` correctly; **Postgres's `cidr` column refuses the same
+   value** with "bits set to right of mask". A range-check-only parser would have accepted it and
+   turned a typo into a `500` from inside the database, and canonicalising it would have silently
+   widened a rule that reads like one address to sixteen million.
+
+**A trap the walk found in itself, and one it found in the product.** The self-lockout walk
+deadlocked on its first draft: its cleanup `DELETE` came from the address it had just blocked, and
+the layer refused it before the route was reached — **once a deny covers your own address you
+cannot delete that rule from the panel.** The walk now uses a third address, and the comment names
+the escape the REQ's own risk note asks for. The *assertion* that was wrong is the other half: it
+expected a `DELETE` to succeed from an already-blocked address, which is a statement about
+nothing; correcting it is what exposed the trap.
+
+**Browser pass deliberately not started (recorded, not skipped silently).** Load 8–25 across the
+tick, two to three sibling walkthroughs at any moment, 45–46 Chrome processes, 0 GB free RAM, and
+the one-pass-per-box slot held live by `omnion-w3` for its whole duration. A fourth pass into that
+is the documented 29-September OOM failure. The boxes that name a screen stay unticked — that now
+includes `/security/ip-access`, whose walkthrough entry is written and registered in both the
+desktop and the mobile pass, and which will be visited the first time the box is idle.
+
+**Next.** The browser pass owed for slices 1–4, then slice 4's remaining two thirds: the
+security-event view over the audit trail and the secret-inventory projection.
+
+## Tick 95 — the secret inventory, and the box that could have leaked a credential
+
+**REQ-012 slice 4, third piece.** Two ships this tick: the security-event view (finished by the
+previous tick and committed here) and the secret inventory, which is the REQ's one
+**release-blocker** box.
+
+**What shipped.** `crates/security/src/{secrets,secrets_store}.rs`, `GET /security/secrets`
+(read-only, `security.read`), `features/security/security-secrets.tsx`, the tab, the walkthrough
+entry. Plus the events view's four commits, which the previous tick left uncommitted in the tree.
+
+**The requirement reads as a request for a secrets table, and there is no secrets table.** This is
+a projection over references, and its entire value is being the one screen in the security centre
+from which no secret can be read. So the guarantee is structural rather than a comment:
+
+- `SecretRef` has no `value`/`ciphertext`/`hash`/`preview` field — adding one would make the
+  struct able to carry a credential, and that ability *is* the risk.
+- There is **no `healthy` state and no `present` one**. The platform can see that a reference
+  exists and can read nothing about the value behind it. The first draft carried a `Present`
+  variant no row produced, which would have let a future contributor render "present = fine"; it
+  was removed and the test rewritten to pin the whole vocabulary.
+- The store selects explicit columns, **never `*`** — `*` re-reads a source's schema, so a source
+  gaining a value column upstream would start appearing in a security screen with no code change
+  here. The three sources holding material are read as **counts**.
+
+**Proof (commands and results).**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-security --quiet` | **208 passed**, 0 failed (18 new) |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **9/10**, the 10th a `dispose()` teardown flake (`UnexpectedEof`) that passes in isolation — a harness fault, not an assertion |
+| types | `pnpm typecheck` | **0 errors** (admin + web) |
+
+The containment walk is `no_secret_value_reaches_the_inventory_response`. It **probes the values,
+not the column names** — a name scan would pass an aliased column or a value inlined into a note,
+while a literal scan only fails when the actual leak happens. It seeds a webhook secret, a
+service-account hash and a TOTP ciphertext into a live database and asserts all three literals are
+absent from the response **while the reference name is present**. The positives matter as much: an
+empty body satisfies every containment check in the test while showing an operator a blank screen.
+
+**Three defects this tick, and the two that were not the code.**
+
+1. **A real one, found by the walk on its first run:** `column reference "expires_at" is
+   ambiguous` — `service_account_keys` and `service_accounts` both carry that column. The query
+   read correctly in review and answered `500` on *every* inventory load. **The tenth instance of
+   this REQ's defect class**, and the argument for why a walk drives the router rather than reading
+   the SQL.
+2. **A harness fault, twice:** the walk built its own `Bearer` header when the test credential is a
+   packed `session\x1fcsrf` pair, so the request failed at header parsing instead of at the route
+   — which reads as a product defect and is not one. `the_inventory_cannot_be_written_through`
+   now goes through the shared `request()` helper.
+3. **The blocker was the linker, not the code.** The first run died in `collect2` with
+   `ld terminated with signal 7 [Bus error]`. `/mnt/apopic` was at **100% (193 MiB free)** with
+   load 13–27 and 30/32 GiB RAM used. Reclaiming **only this worktree's** `target/debug/incremental`
+   (795 MiB) and then grouping `target/debug/deps` by `lib<crate>-<16 hex>` and keeping only the
+   newest of each (835 stale artifacts, 2 691 MiB) returned the disk to 95% and the suite to
+   green in one run. **Rule worth keeping: a linker bus error on this box is a disk symptom until
+   proven otherwise, and the reclaim must be scoped by `readlink /proc/<pid>/cwd`** — a sibling
+   writer had live cargo in `omnion-w6`.
+
+**One decision worth carrying forward.** `unverifiable` is rendered **neutral**, not amber.
+Almost every row on this screen is unverifiable, because that is the honest state for almost every
+secret; painting it amber would paint the whole screen amber and train the operator to ignore the
+tone. Only `missing` and `expired` are coloured, because only those are actionable.
+
+**Browser pass: still owed, and it is now a standing risk rather than bad luck.** Two consecutive
+ticks recorded a deferral for the same reason. This tick the slot was held by `w4`
+(`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd`, not
+by the age of the placeholder), load 12.9, 45 Chrome processes. **Six screen boxes in this REQ now
+turn on a pass that has not run**, and the definition of done forbids closing a REQ on tests alone.
+
+**Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
+a free slot.
 ## Tick 36 — REQ-004/REQ-046 harness: a guard on 12 of 23 call sites, and a dead tab that decided the run
 
 **What.** Merged six commits from `origin/main` and then made the QA pass survive the box it runs

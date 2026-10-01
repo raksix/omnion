@@ -110,8 +110,8 @@ pub async fn tick(state: &AppState) -> std::result::Result<usize, omnion_backup:
     // queue read is the only thing that advances a job, a dead worker is by definition not
     // going to, and the partial unique index refuses a new restore of the run while it
     // stands. One deploy mid-restore and the run becomes unrestorable by anybody.
-    let stale = omnion_backup::restore_jobs::fail_stale_restore_jobs(pool, QUEUE_MAX_AGE_MINUTES)
-        .await?;
+    let stale =
+        omnion_backup::restore_jobs::fail_stale_restore_jobs(pool, QUEUE_MAX_AGE_MINUTES).await?;
     if stale > 0 {
         tracing::warn!(
             stale,
@@ -141,7 +141,10 @@ pub async fn tick(state: &AppState) -> std::result::Result<usize, omnion_backup:
 }
 
 /// Run one job to a terminal state. Every exit path writes the row.
-async fn run_one(state: &AppState, job_id: Uuid) -> std::result::Result<(), omnion_backup::BackupError> {
+async fn run_one(
+    state: &AppState,
+    job_id: Uuid,
+) -> std::result::Result<(), omnion_backup::BackupError> {
     let pool = state.db().pool();
 
     let job = match omnion_backup::restore_jobs::claim_restore_job(pool, job_id).await {
@@ -245,9 +248,18 @@ async fn run_one(state: &AppState, job_id: Uuid) -> std::result::Result<(), omni
     // moment the platform begins changing, and a cancel after it could not undo what has
     // already landed. The safety backup is what the operator goes back to instead, which is
     // why it is taken before this line and not after.
-    let media = if preview.parts.iter().any(|part| part.part == "media" && part.available) {
-        match crate::routes::backups::restore_media_part(&state, &row, &settings, job.organization_id)
-            .await
+    let media = if preview
+        .parts
+        .iter()
+        .any(|part| part.part == "media" && part.available)
+    {
+        match crate::routes::backups::restore_media_part(
+            &state,
+            &row,
+            &settings,
+            job.organization_id,
+        )
+        .await
         {
             Ok(media) => media,
             Err(error) => {
@@ -272,7 +284,10 @@ async fn run_one(state: &AppState, job_id: Uuid) -> std::result::Result<(), omni
     } else if restored.is_empty() {
         "nothing was written — this run offered no restorable part".to_owned()
     } else {
-        format!("{} recorded from this run; no live bytes were written", restored.join(", "))
+        format!(
+            "{} recorded from this run; no live bytes were written",
+            restored.join(", ")
+        )
     };
 
     let outcome = serde_json::json!({
@@ -327,15 +342,8 @@ async fn fail(
     job_id: Uuid,
     reason: &str,
 ) -> std::result::Result<(), omnion_backup::BackupError> {
-    omnion_backup::restore_jobs::finish_restore_job(
-        pool,
-        job_id,
-        false,
-        None,
-        None,
-        Some(reason),
-    )
-    .await?;
+    omnion_backup::restore_jobs::finish_restore_job(pool, job_id, false, None, None, Some(reason))
+        .await?;
 
     crate::routes::restore_jobs::record_restore_job_refused(pool, job_id, reason).await;
     Ok(())

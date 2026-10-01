@@ -67,13 +67,34 @@ struct Harness {
 impl Harness {
     /// Open a fresh database with every migration applied and the IAM seed loaded.
     async fn fresh() -> Option<Self> {
+        // `oneshot` carries no `ConnectInfo`, so a request through this harness has no peer
+        // address — and the IP access layer refuses an address-less request with `ip_unknown`
+        // while any rule is in force. That refusal is **correct** and is asserted deliberately by
+        // `a_denied_network_cannot_reach_the_api`; it is simply not what the other walks are
+        // measuring, so they would all be refused before reaching the guard they test.
+        //
+        // Set here, once, rather than in each walk: a suite that only passes when an operator
+        // remembers an environment variable is a suite that silently stops testing. The flag is
+        // off in every deployed configuration and `security_ip` logs it at boot when it is on.
+        //
+        // It is set inside the test process only — `std::env::set_var` is unsafe in a multi
+        // threaded program, so the harness does it once before the router exists and the walks
+        // are `--test-threads=1` throughout this file.
+        unsafe {
+            std::env::set_var("OMNION_IP_ACCESS_ALLOW_UNADDRESSED", "1");
+        }
+
         let mut config = Config::from_env().expect("environment must be valid");
         // The CSRF secret, for the same reason `tests/events.rs` sets one: a cookie write with
         // no double-submit token is refused `403 csrf_failed` before the permission layer is
         // ever consulted, and a suite that measured the wrong refusal would look like a guard
         // that works.
         support::walk_auth::with_csrf_secret(&mut config);
-        let csrf_secret = config.csrf.as_bytes().expect("the suite just set a secret").to_vec();
+        let csrf_secret = config
+            .csrf
+            .as_bytes()
+            .expect("the suite just set a secret")
+            .to_vec();
         live_db(&config).await?;
 
         let database = format!("omnion_security_{}", Uuid::new_v4().simple());
@@ -324,7 +345,12 @@ async fn create_organization_row(db: &Db, name: &str) -> Uuid {
 fn peer_address() -> String {
     // `as_u128` rather than `simple()` — the latter is a Display formatter, not a value.
     let draw = Uuid::new_v4().as_u128();
-    format!("127.{}.{}.{}", 1 + (draw % 200) as u8, 0 + ((draw >> 8) % 250) as u8, 1 + ((draw >> 16) % 250) as u8)
+    format!(
+        "127.{}.{}.{}",
+        1 + (draw % 200) as u8,
+        0 + ((draw >> 8) % 250) as u8,
+        1 + ((draw >> 16) % 250) as u8
+    )
 }
 
 /// An account whose **password** is what the walk drives, rather than a pre-made session.
@@ -333,10 +359,7 @@ fn peer_address() -> String {
 /// a permission walk and the wrong one here: this walk has to guess a password and be refused, so
 /// it needs the address and the password, not a session that would sail past the very layer under
 /// test.
-async fn login_account(
-    harness: &Harness,
-    organization_id: Option<Uuid>,
-) -> (Uuid, String, String) {
+async fn login_account(harness: &Harness, organization_id: Option<Uuid>) -> (Uuid, String, String) {
     let email = format!("lockout-{}@omnion.test", Uuid::new_v4().simple());
     let user = users::create_user(
         harness.db.pool(),
@@ -357,12 +380,7 @@ async fn login_account(
 /// The request goes through `request` (so the credential packing stays in one place) and then has
 /// the peer inserted into its extensions, which is what `call` cannot do for a caller that needs
 /// a specific address.
-async fn login_from(
-    harness: &Harness,
-    peer: &str,
-    email: &str,
-    password: &str,
-) -> TestResponse {
+async fn login_from(harness: &Harness, peer: &str, email: &str, password: &str) -> TestResponse {
     let payload = json!({ "email": email, "password": password }).to_string();
     let builder = Request::builder()
         .method(Method::POST)
@@ -373,13 +391,9 @@ async fn login_from(
         .expect("request must build")
         .into_parts();
     if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
-        parts
-            .extensions
-            .insert(axum::extract::ConnectInfo(address));
+        parts.extensions.insert(axum::extract::ConnectInfo(address));
     }
-    harness
-        .call(Request::from_parts(parts, body))
-        .await
+    harness.call(Request::from_parts(parts, body)).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -394,10 +408,30 @@ async fn login_from(
 /// compared against itself and pass. Here the path and the key are two claims about the code
 /// that a person made, and each walk checks both: the refusal below must name the key.
 const SURFACE: &[(&str, Method, &str, &str)] = &[
-    ("/api/v1/security/overview", Method::GET, "security.read", "read"),
-    ("/api/v1/security/findings", Method::GET, "security.read", "read"),
-    ("/api/v1/security/findings.csv", Method::GET, "security.read", "read"),
-    ("/api/v1/security/headers", Method::GET, "security.read", "read"),
+    (
+        "/api/v1/security/overview",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/findings",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/findings.csv",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/headers",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
     (
         "/api/v1/security/rate-limits",
         Method::GET,
@@ -423,7 +457,41 @@ const SURFACE: &[(&str, Method, &str, &str)] = &[
         "read",
     ),
     (
+        "/api/v1/security/ip-rules",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/ip-rules/test",
+        Method::POST,
+        "security.read",
+        "write",
+    ),
+    (
         "/api/v1/security/sign-in-protection/probe",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    // Security events (REQ-012 slice 4). The export is `read` too, deliberately: it changes
+    // nothing, and an operator whose role is to audit must be able to take the trail with them.
+    (
+        "/api/v1/security/events",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/events.csv",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    // The secret inventory (REQ-012 slice 4). Read-only: management belongs to the secrets
+    // manager request, so there is no write method to guard and nothing to widen.
+    (
+        "/api/v1/security/secrets",
         Method::GET,
         "security.read",
         "read",
@@ -478,7 +546,12 @@ const SURFACE: &[(&str, Method, &str, &str)] = &[
 /// would get a validation error, which is still a refusal and still not a `403`. What these
 /// walks assert is that the request is turned away **before** the body is looked at — a guard
 /// is a gate, not a parser.
-fn surface_request(method: Method, uri: &str, kind: &str, credential: Option<&str>) -> Request<Body> {
+fn surface_request(
+    method: Method,
+    uri: &str,
+    kind: &str,
+    credential: Option<&str>,
+) -> Request<Body> {
     let uri = uri.replace("{id}", &Uuid::new_v4().to_string());
     let body = match kind {
         "write" => Some(json!({ "note": "walk" })),
@@ -649,8 +722,7 @@ async fn the_full_holder_passes_the_guard_on_every_route() {
             .await;
 
         assert!(
-            response.status != StatusCode::UNAUTHORIZED
-                && response.status != StatusCode::FORBIDDEN,
+            response.status != StatusCode::UNAUTHORIZED && response.status != StatusCode::FORBIDDEN,
             "{method} {uri} refuses the account that holds {key}; the route is unreachable for \
              everybody. Body: {}",
             response.text
@@ -714,7 +786,8 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
     // The account whose lockout is measured, and the operator who tunes the policy. Two
     // accounts on purpose: the one being locked must not be the one holding the permission, or a
     // walk that signed in as the wrong account would be measuring itself.
-    let (victim, victim_email, victim_password) = login_account(&harness, Some(organization_id)).await;
+    let (victim, victim_email, victim_password) =
+        login_account(&harness, Some(organization_id)).await;
     let (operator_id, operator_token) = account(&harness, Some(organization_id)).await;
     // Both keys, deliberately: the probe is `security.read` while the save is
     // `security.manage`. Granting only the write key looked tidier and then read as a broken
@@ -777,7 +850,10 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
         .expect("the sign_in policy must exist in the defaults");
     let limiter_client = omnion_security::ClientId {
         user_id: None,
-        ip: peer.parse::<std::net::SocketAddr>().ok().map(|address| address.ip()),
+        ip: peer
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|address| address.ip()),
     };
 
     let mut locked_at: Option<u32> = None;
@@ -789,7 +865,13 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
             time::OffsetDateTime::now_utc().unix_timestamp(),
         )
         .await;
-        let response = login_from(&harness, &peer, &victim_email, "definitely-not-the-password").await;
+        let response = login_from(
+            &harness,
+            &peer,
+            &victim_email,
+            "definitely-not-the-password",
+        )
+        .await;
         match response.body["error"]["code"].as_str() {
             Some("account_locked") => {
                 locked_at = Some(attempt);
@@ -824,13 +906,12 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
 
     // And the account is genuinely locked, read from the row rather than inferred from the
     // refusal: a response code and a stored lock are two different claims.
-    let (locked_until, counter): (Option<time::OffsetDateTime>, i32) = sqlx::query_as(
-        "select locked_until, failed_sign_in_count from users where id = $1",
-    )
-    .bind(victim)
-    .fetch_one(harness.db.pool())
-    .await
-    .expect("the account row must be readable");
+    let (locked_until, counter): (Option<time::OffsetDateTime>, i32) =
+        sqlx::query_as("select locked_until, failed_sign_in_count from users where id = $1")
+            .bind(victim)
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the account row must be readable");
     assert!(
         locked_until.is_some_and(|until| until > time::OffsetDateTime::now_utc()),
         "the lock must be in the future, not a timestamp in the past"
@@ -870,5 +951,942 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
     );
 
     let _ = victim_password;
+    harness.dispose().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4: the IP access list on the request path
+// ---------------------------------------------------------------------------------------------
+
+/// A request that presents itself as coming from `address`.
+///
+/// The access layer reads the peer address out of the `ConnectInfo` extension — the same source
+/// the rate limiter uses — so the walk has to install that extension or it would be testing the
+/// `ip_unknown` branch (which refuses too, for the wrong reason). This is the detail that makes
+/// the difference between a walk that proves a CIDR is refused and one that proves requests
+/// without an address are refused.
+fn from_address(mut request: Request<Body>, address: std::net::IpAddr) -> Request<Body> {
+    use axum::extract::ConnectInfo;
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(std::net::SocketAddr::new(address, 40_000)));
+    request
+}
+
+fn address(text: &str) -> std::net::IpAddr {
+    text.parse().expect("a fixture address must parse")
+}
+
+/// **The criterion: a denied CIDR cannot reach the API.**
+///
+/// Every other part of slice 4 is a table, a form and a route. This is the walk that would fail
+/// if any of them were inert: a deny rule is written through the panel's own `POST`, and a real
+/// request from inside that network is driven over the router — not the evaluator called directly,
+/// not a unit test — and must come back refused, with the rule named in the body.
+///
+/// Two halves that are different from each other, because either alone would pass for the wrong
+/// reason:
+///
+/// * The refusal must be **`ip_denied` naming the rule**, not `ip_unknown` and not the route's
+///   own permission `403`. A request from an address *inside* a denied network and a request with
+///   no address at all are both refused by the same layer; only the first proves the rule.
+/// * The same request from *outside* the network must be served, proving the rule narrows rather
+///   than the screen breaking everything — a layer that refused every caller would satisfy the
+///   first half of this assertion on its own.
+#[tokio::test]
+async fn a_denied_network_cannot_reach_the_api() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "IP Access").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        operator_id,
+        organization,
+        &["security.read", "security.manage", "security.ip.manage"],
+    )
+    .await;
+
+    let inside = address("203.0.113.7");
+    let outside = address("198.51.100.7");
+    // A third address no rule covers, for the calls made *after* the self-blocking rule
+    // exists. It stands for the operator who noticed they had locked themselves out and walked
+    // to the CLI — see the note on the removal below.
+    let elsewhere = address("192.0.2.7");
+
+    // The premise, asserted rather than assumed: before the rule exists, the request is served.
+    // A walk that only checked the "after" would pass just as well if the route were refusing
+    // everything for some unrelated reason.
+    let before = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            inside,
+        ))
+        .await;
+    assert_eq!(
+        before.status,
+        StatusCode::OK,
+        "the premise: nothing is denied yet, so this must be served: {}",
+        before.text
+    );
+
+    // The rule is written through the panel's own endpoint — not inserted with SQL — so the walk
+    // also covers the route, the audit row and the event.
+    let created = harness
+        .call(from_address(
+            post(
+                "/api/v1/security/ip-rules",
+                json!({
+                    "kind": "deny",
+                    "cidr": "203.0.113.0/24",
+                    "note": "the walk's own denied network",
+                }),
+                Some(&operator),
+            ),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "the rule must be created: {}",
+        created.text
+    );
+    assert_eq!(created.body["rule"]["cidr"], "203.0.113.0/24");
+    assert_eq!(created.body["rule"]["kind"], "deny");
+
+    // Now the criterion.
+    let denied = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            inside,
+        ))
+        .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::FORBIDDEN,
+        "a request from inside the denied network must be refused: {}",
+        denied.text
+    );
+    assert_eq!(
+        denied.body["error"]["code"], "ip_denied",
+        "the refusal must come from the access list and not from some other guard: {}",
+        denied.text
+    );
+    assert!(
+        denied.body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("203.0.113.0/24")),
+        "the refusal must name the rule, or the operator cannot remove it: {}",
+        denied.text
+    );
+
+    // The other half: everything outside the network is still served. Without this, a layer that
+    // refused every caller would satisfy the assertions above.
+    let served = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        served.status,
+        StatusCode::OK,
+        "a request from outside the denied network must still be served: {}",
+        served.text
+    );
+
+    // And the rule is listed, so the screen shows what is doing the refusing.
+    let listed = harness
+        .call(from_address(
+            get("/api/v1/security/ip-rules", Some(&operator)),
+            outside,
+        ))
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text);
+    assert_eq!(listed.body["deny_count"], 1, "{}", listed.text);
+
+    // The tester answers the same question the layer does, for the same address.
+    let tested = harness
+        .call(from_address(
+            post(
+                "/api/v1/security/ip-rules/test",
+                json!({ "address": "203.0.113.7" }),
+                Some(&operator),
+            ),
+            outside,
+        ))
+        .await;
+    assert_eq!(tested.status, StatusCode::OK, "{}", tested.text);
+    assert_eq!(
+        tested.body["blocked"], true,
+        "the tester must agree with the layer: {}",
+        tested.text
+    );
+    assert_eq!(tested.body["decision"], "deny", "{}", tested.text);
+    assert_eq!(
+        tested.body["matched_rule"]["cidr"], "203.0.113.0/24",
+        "the tester must name the rule it matched: {}",
+        tested.text
+    );
+
+    // The self-lockout warning. This half of the criterion is a *different* claim from the
+    // refusal above — that a rule which blocks the caller is stored and warned about rather than
+    // refused — and it needs its own rule, because the rule written above deliberately does NOT
+    // cover this session's address (that is what let the walk keep driving requests at all).
+    let self_blocking = harness
+        .call(from_address(
+            post(
+                "/api/v1/security/ip-rules",
+                json!({
+                    "kind": "deny",
+                    // 198.51.100.0/24 is the address the walk is calling from.
+                    "cidr": "198.51.100.0/24",
+                    "note": "the walk's own address, deliberately",
+                }),
+                Some(&operator),
+            ),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        self_blocking.status,
+        StatusCode::CREATED,
+        "a rule that blocks the caller must still be saved: {}",
+        self_blocking.text
+    );
+    assert_eq!(
+        self_blocking.body["blocks_you"], true,
+        "the response must say the rule covers this session: {}",
+        self_blocking.text
+    );
+    assert!(
+        self_blocking.body["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("198.51.100.0/24")),
+        "the warning must name the network that is about to refuse this session: {}",
+        self_blocking.text
+    );
+
+    // And the warning was honest: the very next request from that address is refused.
+    let caught = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        caught.status,
+        StatusCode::FORBIDDEN,
+        "the warning promised this; the layer must keep the promise: {}",
+        caught.text
+    );
+
+    // Remove it, so the rest of the walk is not run from a locked-out session.
+    let self_rule_id = self_blocking.body["rule"]["id"]
+        .as_str()
+        .expect("the created rule must carry an id")
+        .to_owned();
+    let removed_self = harness
+        .call(from_address(
+            request(
+                Method::DELETE,
+                &format!("/api/v1/security/ip-rules/{self_rule_id}"),
+                Some(&operator),
+                None,
+            ),
+            // Driven from a third address, and the reason is worth recording. The rule this
+            // walk just created covers `outside`, so a request from there would be refused
+            // before the layer reached the route — which is the feature working correctly, and
+            // not what the assertion is about. It is also the real operator experience: once a
+            // deny covers your own address, you cannot remove it from the panel, and the only
+            // way back is another network or the CLI. The REQ's risk note asks for exactly that
+            // escape to keep working, and this is the walk that keeps it honest.
+            elsewhere,
+        ))
+        .await;
+    assert_eq!(
+        removed_self.status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        removed_self.text
+    );
+
+    // Removing the rule restores the address on the *next* request, not at the next boot.
+    let rule_id = created.body["rule"]["id"]
+        .as_str()
+        .expect("the created rule must carry an id")
+        .to_owned();
+    let deleted = harness
+        .call(from_address(
+            request(
+                Method::DELETE,
+                &format!("/api/v1/security/ip-rules/{rule_id}"),
+                Some(&operator),
+                None,
+            ),
+            elsewhere,
+        ))
+        .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{}", deleted.text);
+
+    let restored = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            inside,
+        ))
+        .await;
+    assert_eq!(
+        restored.status,
+        StatusCode::OK,
+        "removing the rule must take effect now, not at the next restart: {}",
+        restored.text
+    );
+
+    harness.dispose().await;
+}
+
+/// The security-event timeline shows BOTH real sources, and the walk that would have caught
+/// the audit-only projection (REQ-012, slice 4).
+///
+/// **What this is for.** The REQ words the screen as "a security-event table **from the audit
+/// trail**", and a route built over `audit_log` alone answers `200` with an empty table on a
+/// platform where every one of its own requirements is met — the empty table looks like a
+/// working filter. Sign-ins live in `sign_in_attempts`, which no amount of auditing produces
+/// rows in, because a failed sign-in happens before there is a session and therefore before
+/// there is an actor to write an audit entry for.
+///
+/// So this walk seeds **one row in each of the two tables** and asserts both come back, and then
+/// asserts the *filters* keep working across the seam — a category that matches on the audit side
+/// and nothing on the sign-in side is exactly the defect this screen is built to avoid, and it is
+/// only visible if both halves are checked.
+#[tokio::test]
+async fn the_timeline_merges_the_audit_trail_and_the_sign_in_log() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "Events").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        operator_id,
+        organization,
+        &["security.read", "security.manage"],
+    )
+    .await;
+
+    // One audit row, written through the API's own route so the action name is a real one rather
+    // than a string the test invented.
+    //
+    // The policy store refuses a CSP that is not a policy: `default-src` is what every other
+    // source list is measured against, and one of `script-src` / `script-src-elem` is required
+    // because without it scripts are unconstrained. Both refusals happened here first — the walk
+    // was seeding a row that the product correctly declined to write, and reading that as "the
+    // save worked" would have been the same mistake in a new place.
+    let header = harness
+        .call(put(
+            "/api/v1/security/headers",
+            json!({
+                "csp_mode": "enforce",
+                "csp": [
+                    { "directive": "default-src", "values": ["'self'"] },
+                    { "directive": "script-src", "values": ["'self'"] },
+                ],
+            }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        header.status,
+        StatusCode::OK,
+        "the header save must land an audit row to project: {}",
+        header.text
+    );
+
+    // One sign-in row, written the way the platform writes it: a wrong password against a real
+    // account. This is the row an audit-only projection cannot see.
+    let victim = format!("events-victim-{}@omnion.test", Uuid::new_v4().simple());
+    sqlx::query(
+        "insert into sign_in_attempts (email, organization_id, ip_address, user_agent, outcome) \
+         values ($1, $2, '198.51.100.9', 'Mozilla/5.0 (Windows NT 10.0)', 'failed')",
+    )
+    .bind(&victim)
+    .bind(organization)
+    .execute(harness.db.pool())
+    .await
+    .expect("the sign-in attempt must be recorded");
+
+    let page = harness
+        .call(get("/api/v1/security/events", Some(&operator)))
+        .await;
+    assert_eq!(
+        page.status,
+        StatusCode::OK,
+        "the timeline must answer: {}",
+        page.text
+    );
+
+    let events = page.body["events"].as_array().expect("events is an array");
+    let sources: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["source"].as_str())
+        .collect();
+
+    assert!(
+        sources.contains(&"audit"),
+        "the audit row is missing from the timeline: {}",
+        page.text
+    );
+    assert!(
+        sources.contains(&"sign_in"),
+        "THE BUG THIS WALK EXISTS FOR: the failed sign-in does not appear. The screen would \
+         render an empty sign-in list on a platform where nothing is wrong. events={:?}",
+        events
+            .iter()
+            .map(|event| event["action"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+
+    // The counters agree with the rows, so "50 of 312" is a true sentence.
+    assert!(page.body["total"].as_i64().unwrap_or(0) >= 2);
+    assert!(page.body["audit_count"].as_i64().unwrap_or(0) >= 1);
+    assert!(page.body["sign_in_count"].as_i64().unwrap_or(0) >= 1);
+
+    // A sign-in row has NO actor, and that absence is a fact rather than a rendering fault:
+    // nobody was authenticated. The address is the identity the operator hunts with.
+    let sign_in_row = events
+        .iter()
+        .find(|event| event["source"] == "sign_in")
+        .expect("the sign-in row is present");
+    assert!(
+        sign_in_row["actor"].is_null(),
+        "a failed sign-in has no actor: {}",
+        sign_in_row
+    );
+    // `ip_address::text` on an `inet` column keeps the prefix, so a single address reads as
+    // `/32`. That is Postgres's own canonical text and is what an operator copying the value
+    // out of the screen gets — asserting the bare address would force the query to strip a
+    // prefix the column is supposed to carry.
+    assert_eq!(sign_in_row["client_ip"], "198.51.100.9/32");
+    assert_eq!(
+        sign_in_row["refused"], true,
+        "a wrong password is a refusal. PAYLOAD: {sign_in_row}"
+    );
+
+    // The id carries its source, because both tables have an identity column starting at 1 and
+    // an identity without it would drop one of two real rows as a duplicate.
+    for event in events {
+        let id = event["id"].as_str().expect("every row has an id");
+        assert!(
+            id.starts_with("audit:") || id.starts_with("sign_in:"),
+            "{id} does not name its source"
+        );
+    }
+
+    // -- the filters, across the seam -----------------------------------------------------------------
+    //
+    // Each of these is a claim that a filter on the audit vocabulary cannot silently ignore the
+    // sign-in vocabulary. A category returning rows from one side only is the exact defect.
+
+    let sign_ins_only = harness
+        .call(get(
+            "/api/v1/security/events?category=sign_in",
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        sign_ins_only.status,
+        StatusCode::OK,
+        "category=sign_in must be answerable. BODY: {}",
+        sign_ins_only.text
+    );
+    let sign_in_events = sign_ins_only.body["events"]
+        .as_array()
+        .expect("events is an array");
+    assert!(
+        sign_in_events
+            .iter()
+            .any(|event| event["source"] == "sign_in" && event["action"] == "failed"),
+        "category=sign_in must find the failed attempt: {}",
+        sign_ins_only.text
+    );
+
+    let audit_only = harness
+        .call(get(
+            "/api/v1/security/events?category=settings_change",
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(audit_only.status, StatusCode::OK);
+    let audit_events = audit_only.body["events"]
+        .as_array()
+        .expect("events is an array");
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event["action"] == "security.headers.updated"),
+        "category=settings_change must find the header save: {}",
+        audit_only.text
+    );
+    // The two halves do not bleed into each other.
+    assert!(
+        !audit_events
+            .iter()
+            .any(|event| event["source"] == "sign_in"),
+        "a settings change cannot be a sign-in attempt: {}",
+        audit_only.text
+    );
+
+    // The source filter decides before any query runs.
+    let sign_in_source = harness
+        .call(get(
+            "/api/v1/security/events?source=sign_in",
+            Some(&operator),
+        ))
+        .await;
+    assert!(
+        sign_in_source.body["events"]
+            .as_array()
+            .expect("events is an array")
+            .iter()
+            .all(|event| event["source"] == "sign_in"),
+        "source=sign_in must not return audit rows: {}",
+        sign_in_source.text
+    );
+
+    // An unknown filter value is refused **by name**, never silently dropped into "no filter" —
+    // an unparsed category shows the operator an unfiltered list they read as a filtered one.
+    let unknown = harness
+        .call(get(
+            "/api/v1/security/events?category=denials",
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        unknown.status,
+        StatusCode::BAD_REQUEST,
+        "an unknown category must be refused: {}",
+        unknown.text
+    );
+    assert_eq!(unknown.body["error"]["code"], "invalid_security_input");
+
+    // -- the export -------------------------------------------------------------------------------
+    //
+    // It is the **whole** filter, not the page: an operator who filters and exports 50 of 300 has
+    // produced a document that reads as a complete list and is not one.
+    let export = harness
+        .call(get("/api/v1/security/events.csv?limit=1", Some(&operator)))
+        .await;
+    assert_eq!(
+        export.status,
+        StatusCode::OK,
+        "the export must answer: {}",
+        export.text
+    );
+    let header_line = export.text.lines().next().unwrap_or_default();
+    for column in ["occurred_at", "category", "action", "outcome", "client_ip"] {
+        assert!(
+            header_line.contains(column),
+            "the export header is missing {column}: {header_line}"
+        );
+    }
+    let exported_rows = export.text.lines().count().saturating_sub(1);
+    assert!(
+        exported_rows >= 2,
+        "limit=1 must NOT page the export — it carries the whole filter. rows={exported_rows}: {}",
+        export.text
+    );
+    assert!(
+        export.text.contains("sign_in"),
+        "the export must carry both sources: {}",
+        export.text
+    );
+
+    // A credential in the audit metadata must not reach the file. A settings change writes the
+    // policy it changed into its metadata, and this file is the thing an operator emails.
+    //
+    // Checked as a **key** in the digest column rather than as a substring of the whole file:
+    // the first version of this assertion was `!export.text.contains("password")`, which is red
+    // on every correct export, because the sign-in outcome renders as the prose "wrong password
+    // or unknown account". Prose that describes an attack is not a credential, and a test that
+    // cannot distinguish the two trains an operator to distrust the export.
+    //
+    // The digest is the only column that carries key *names*, and the shape a leaked one takes is
+    // `secret=<value>` — a bare `=` after a credential-shaped key.
+    for leak in [
+        "secret=",
+        "password=",
+        "token=",
+        "authorization=",
+        "credential=",
+    ] {
+        assert!(
+            !export.text.contains(leak),
+            "the audit metadata leaked {leak} into the export: {}",
+            export.text
+        );
+    }
+    // The digest that *is* present proves the column works rather than being blank. It renders as
+    // `key=shape` pairs sorted and capped, so the assertion matches the first pair rather than
+    // the whole digest — `csp_mode=set, directive_count=2`, not `csp_mode=set` on its own.
+    assert!(
+        export.text.contains("csp_mode=set"),
+        "the header save's digest should be present. DIGEST FORMAT: {}",
+        export.text
+    );
+
+    harness.dispose().await;
+}
+#[tokio::test]
+async fn a_malformed_cidr_is_refused_with_a_field_level_message() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "IP Validation").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(&harness, operator_id, organization, &["security.ip.manage"]).await;
+
+    for (cidr, why) in [
+        ("not-an-ip", "not an address"),
+        ("203.0.113.0/33", "a v4 prefix past 32"),
+        ("2001:db8::/129", "a v6 prefix past 128"),
+        ("203.0.113.1/8", "host bits set outside the prefix"),
+        ("", "empty"),
+    ] {
+        let refused = harness
+            .call(post(
+                "/api/v1/security/ip-rules",
+                json!({ "kind": "deny", "cidr": cidr, "note": "validation walk" }),
+                Some(&operator),
+            ))
+            .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "{cidr:?} ({why}) must be refused: {}",
+            refused.text
+        );
+        assert_eq!(refused.body["error"]["code"], "invalid_security_input");
+    }
+
+    // The two forms that are *not* errors, so the refusals above cannot be an artefact of a
+    // parser that refuses everything.
+    for (cidr, stored) in [
+        ("203.0.113.0/24", "203.0.113.0/24"),
+        ("203.0.113.7", "203.0.113.7/32"),
+        ("2001:db8::/32", "2001:db8::/32"),
+    ] {
+        let created = harness
+            .call(post(
+                "/api/v1/security/ip-rules",
+                json!({ "kind": "deny", "cidr": cidr, "note": "accepted form" }),
+                Some(&operator),
+            ))
+            .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "{cidr:?} is valid and must be accepted: {}",
+            created.text
+        );
+        assert_eq!(created.body["rule"]["cidr"], stored);
+    }
+
+    // A note is required, for the reason the migration's check constraint gives.
+    let blank = harness
+        .call(post(
+            "/api/v1/security/ip-rules",
+            json!({ "kind": "deny", "cidr": "198.51.100.0/24", "note": "   " }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        blank.status,
+        StatusCode::BAD_REQUEST,
+        "an unexplained rule must be refused: {}",
+        blank.text
+    );
+
+    // The same network twice is refused rather than silently replacing the first.
+    let duplicate = harness
+        .call(post(
+            "/api/v1/security/ip-rules",
+            json!({ "kind": "deny", "cidr": "203.0.113.0/24", "note": "second try" }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        duplicate.status,
+        StatusCode::BAD_REQUEST,
+        "a duplicate must be refused, not silently upserted: {}",
+        duplicate.text
+    );
+
+    harness.dispose().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The secret inventory (REQ-012, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/// **The walk this slice exists for: no secret value reaches the inventory response.**
+///
+/// It is not enough for the row type to lack a `value` field — a `select *` in the store can
+/// put one in the response regardless. So the claim is made against the bytes the route returns
+/// from a database that really holds material:
+///
+/// 1. a webhook endpoint whose signing secret is a recognisable literal;
+/// 2. a service-account key whose hash is another;
+/// 3. a confirmed TOTP factor whose ciphertext is a third;
+/// 4. an identity provider naming a credential reference.
+///
+/// Then the response body is walked field by field and every one of those literals must be
+/// absent. A scan for the *column names* would not be enough on its own: a store that selected
+/// the column under an alias, or a renderer that inlined it into the note text, would pass it.
+/// So the values themselves are the probe, which is the only version of this test that fails
+/// when the actual leak happens.
+///
+/// The positives are asserted too, because a route that answers an empty object satisfies every
+/// containment check in this test while showing an operator a blank screen.
+#[tokio::test]
+async fn no_secret_value_reaches_the_inventory_response() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    const WEBHOOK_SECRET: &str = "whsec_LIVEVALUE_webhook_signing_0123456789";
+    const KEY_HASH: &str = "$argon2id$v=19$LIVEVALUE$serviceaccountkeyhashvalue";
+    const TOTP_CIPHERTEXT: &str = "enc:v1:LIVEVALUE:totpciphertext";
+
+    let organization = create_organization_row(&harness.db, "Secrets").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(&harness, operator_id, organization, &["security.read"]).await;
+
+    // One row per source that holds real material, written the way the platform writes them.
+    sqlx::query(
+        "insert into webhook_endpoints (organization_id, name, url, secret, events) \
+         values ($1, 'inventory-walk', 'https://example.test/hook', $2, array['security.lockout.triggered'])",
+    )
+    .bind(organization)
+    .bind(WEBHOOK_SECRET)
+    .execute(harness.db.pool())
+    .await
+    .expect("the webhook endpoint must exist for the walk to mean anything");
+
+    let service_account: Uuid = sqlx::query_scalar(
+        "insert into service_accounts (organization_id, name, prefix) \
+         values ($1, 'inventory-walk', 'sa_walk') returning id",
+    )
+    .bind(organization)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the service account must exist");
+    sqlx::query(
+        "insert into service_account_keys (service_account_id, prefix, secret_hash) \
+         values ($1, 'sk_walk_live', $2)",
+    )
+    .bind(service_account)
+    .bind(KEY_HASH)
+    .execute(harness.db.pool())
+    .await
+    .expect("the key must exist");
+
+    let (victim_id, victim_email) = account(&harness, Some(organization)).await;
+    sqlx::query(
+        "insert into mfa_factors (user_id, kind, secret_ciphertext, confirmed_at) \
+         values ($1, 'totp', $2, now())",
+    )
+    .bind(victim_id)
+    .bind(TOTP_CIPHERTEXT)
+    .execute(harness.db.pool())
+    .await
+    .expect("the factor must exist");
+    assert!(
+        !victim_email.is_empty(),
+        "the account helper must have created a real account"
+    );
+
+    sqlx::query(
+        "insert into auth_providers (organization_id, slug, kind, name, secret_ref) \
+         values ($1, 'walk-sso', 'oidc', 'Walk SSO', 'OMNION_WALK_PROVIDER_SECRET')",
+    )
+    .bind(organization)
+    .execute(harness.db.pool())
+    .await
+    .expect("the provider must exist");
+
+    let response = harness
+        .call(get("/api/v1/security/secrets", Some(&operator)))
+        .await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "the inventory must load: {}",
+        response.text
+    );
+
+    // -- the containment claim ------------------------------------------------------------------
+    for literal in [WEBHOOK_SECRET, KEY_HASH, TOTP_CIPHERTEXT] {
+        assert!(
+            !response.text.contains(literal),
+            "THE LEAK THIS WALK EXISTS FOR: the inventory response contains a stored secret \
+             ({literal:.12}…). The store selected a value column."
+        );
+    }
+    // The reference — a *name* — must be present, because that is the difference between a
+    // projection over references and a dump: the operator can see what is configured without
+    // being able to read it.
+    assert!(
+        response.text.contains("OMNION_WALK_PROVIDER_SECRET"),
+        "the credential NAME must be reported — a reference is not a secret: {}",
+        response.text
+    );
+
+    // No row may declare a field that could hold material, whatever the value.
+    let body: Value = serde_json::from_str(&response.text).expect("the body is JSON");
+    let rows = body["secrets"].as_array().expect("`secrets` is an array");
+    assert!(!rows.is_empty(), "the inventory must not be empty");
+    for row in rows {
+        let object = row.as_object().expect("each row is an object");
+        for key in object.keys() {
+            let lowered = key.to_lowercase();
+            for forbidden in [
+                "value",
+                "secret",
+                "ciphertext",
+                "hash",
+                "token",
+                "preview",
+                "plaintext",
+                "password",
+            ] {
+                assert!(
+                    !lowered.contains(forbidden),
+                    "the inventory row declares a {forbidden} field: {key}"
+                );
+            }
+        }
+    }
+
+    // -- the positives, or the test above passes on an empty screen --------------------------
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "WEBHOOK_SIGNING_KEY"),
+        "the webhook material must be counted, not hidden: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "SERVICE_ACCOUNT_KEY"),
+        "the service-account material must be counted: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "MFA_TOTP_SECRET"),
+        "the MFA material must be counted: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "OMNION_CSRF_SECRET"),
+        "the environment secrets must be listed: {names:?}"
+    );
+
+    // The count is what replaced the material, so it must be a real number and not a constant.
+    let webhooks = rows
+        .iter()
+        .find(|row| row["name"] == "WEBHOOK_SIGNING_KEY")
+        .expect("the webhook row exists");
+    assert!(
+        webhooks["material_count"].as_i64().unwrap_or_default() >= 1,
+        "the count must reflect the endpoint this walk created: {webhooks}"
+    );
+    assert!(
+        !webhooks["note"].as_str().unwrap_or_default().is_empty(),
+        "a material row must explain what it counts: {webhooks}"
+    );
+
+    // And the screen must be told what it cannot see — a limitation field the panel renders as a
+    // permanent note, because an inventory that looks exhaustive when it is not is the defect.
+    let limitation = body["limitation"].as_str().unwrap_or_default();
+    assert!(
+        limitation.contains("never values") && limitation.contains("maintained by hand"),
+        "the response must state its own limits: {limitation}"
+    );
+
+    // -- no state reads as healthy --------------------------------------------------------------
+    for state in ["healthy", "ok", "valid", "good"] {
+        assert!(
+            !response.text.contains(&format!("\"{state}\"")),
+            "the inventory offers a {state} state"
+        );
+    }
+
+    harness.dispose().await;
+}
+
+/// The inventory is read-only: a mutation is refused by the router, not by the client.
+///
+/// Management belongs to the secrets manager request. A screen that could edit a reference would
+/// invite an operator to believe it can rotate a secret, and rotating one means replacing a value
+/// in an environment and redeploying.
+#[tokio::test]
+async fn the_inventory_cannot_be_written_through() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "SecretsWrite").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        operator_id,
+        organization,
+        &["security.read", "security.manage", "security.scan"],
+    )
+    .await;
+
+    // Every write verb, with the **full** key set so the refusal cannot be mistaken for a
+    // permission problem: this is the route shape refusing, not the guard.
+    for (method, path) in [
+        ("POST", "/api/v1/security/secrets"),
+        ("PUT", "/api/v1/security/secrets"),
+        ("DELETE", "/api/v1/security/secrets"),
+        ("PATCH", "/api/v1/security/secrets"),
+    ] {
+        let request = match method {
+            "POST" => post(path, json!({ "name": "X" }), Some(&operator)),
+            "PUT" => put(path, json!({ "name": "X" }), Some(&operator)),
+            // Auth goes through the shared credential helper rather than a
+            // hand-built `Bearer` header: the walk credential is a packed
+            // session+csrf pair, and assembling one by hand here produced a
+            // request that failed at header parsing instead of at the route —
+            // which reads as a product defect and is not one.
+            other => request(
+                Method::from_bytes(other.as_bytes()).expect("a known method"),
+                path,
+                Some(&operator),
+                None,
+            ),
+        };
+        let response = harness.call(request).await;
+        assert!(
+            matches!(
+                response.status,
+                StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_FOUND
+            ),
+            "{method} {path} must not exist, but answered {}: {}",
+            response.status,
+            response.text
+        );
+    }
+
     harness.dispose().await;
 }
