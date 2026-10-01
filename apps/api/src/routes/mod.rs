@@ -920,6 +920,15 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "appbuilder.read"))
         .merge(delete(app_builder::delete_plan).layer(guards::require(&state, "appbuilder.review")));
 
+    // The plan as a downloadable file. Its own path rather than a `?format=json` on the
+    // detail, for the same reason the decisions above have their own paths: a content
+    // negotiation parameter is invisible to anybody reading the route table, and the one
+    // caller that must not take the inline branch — the browser, which would open a tab
+    // instead of downloading a file — is exactly the caller that does not read the query
+    // string. `appbuilder.read`, not `.review`: exporting is reading.
+    let app_builder_plan_export =
+        get(app_builder::export_plan).layer(guards::require(&state, "appbuilder.read"));
+
     // The whole plan's own decisions, on their own paths rather than merged onto
     // `/plans/{id}`. A `POST /plans/{id}` that silently meant "reject this plan" is a verb a
     // REST client cannot discover, and a review screen that guesses the wrong one destroys a
@@ -1936,6 +1945,7 @@ pub fn router(state: AppState) -> Router {
         .route("/app-builder/examples", app_builder_examples)
         .route("/app-builder/generate", app_builder_generate)
         .route("/app-builder/plans/{id}", app_builder_plan)
+        .route("/app-builder/plans/{id}/export", app_builder_plan_export)
         .route("/app-builder/plans/{id}/reject", app_builder_plan_reject)
         .route(
             "/app-builder/plans/{id}/artifacts/{artifact_id}",

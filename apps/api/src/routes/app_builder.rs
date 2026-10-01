@@ -32,6 +32,7 @@ use std::convert::Infallible;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use omnion_ai_hub::resolve;
 use omnion_audit::NewAuditEntry;
@@ -753,6 +754,94 @@ pub async fn delete_plan(
     .await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/v1/app-builder/plans/{id}/export` — the plan as a JSON file.
+///
+/// **A download, not a JSON body.** The console's bulk bar offers "Export plan JSON" next to
+/// the delete, and an endpoint that answers `application/json` inline makes the browser open
+/// a tab the operator then has to save by hand. `Content-Disposition: attachment` is what
+/// turns "the request succeeded" into "a file arrived", and it is why this returns a raw
+/// `Response` rather than `Json<PlanExport>`.
+///
+/// **Three decisions, each of which could have produced a file that lies.**
+///
+/// 1. **The document is built from the four reads the review screen already makes** — plan,
+///    artifacts, counts, blockers — rather than from a narrower query written for the
+///    export. An export assembled from *different* reads is a second view of the same plan
+///    that can disagree with the first, and a reviewer comparing a file against the screen
+///    would be comparing a real inconsistency the platform introduced.
+/// 2. **The plan's tenant is resolved before a single row is read**, through the same
+///    `plan_in_scope` every other route uses. An export that read first and checked after
+///    would have written another tenant's plan to a download before refusing.
+/// 3. **`appbuilder.read` is the permission, not `appbuilder.review`.** Exporting is
+///    reading: a reviewer who may not change anything must still be able to take a plan
+///    away, or "review, then hand the file on" is impossible for the least-privileged
+///    account that is meant to exist. The audit row names the account either way.
+///
+/// The filename comes from the plan's short id, never its title — the title is free text
+/// and free text inside a response header is a header-injection vector (see
+/// `builder::export_filename`).
+pub async fn export_plan(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let plan = plan_in_scope(&state, &current, plan_id).await?;
+
+    let artifacts = builder::list_artifacts(state.db().pool(), plan.id)
+        .await
+        .map_err(store_error)?;
+    let counts = builder::artifact_counts(state.db().pool(), plan.id)
+        .await
+        .map_err(store_error)?;
+    let blockers = builder::blockers(state.db().pool(), plan.id)
+        .await
+        .map_err(store_error)?;
+
+    let body = builder::render_plan_export(&builder::build_plan_export(
+        &plan,
+        &artifacts,
+        counts,
+        &blockers,
+    ))
+    .map_err(store_error)?;
+    let filename = builder::export_filename(&plan);
+
+    // Read-only by name, and `no-store` so a second export of the same plan after a review
+    // is not answered from the browser's cache: an export is a snapshot of a moment, and a
+    // cached one is a snapshot of a moment somebody has since moved on from.
+    let headers = [
+        (
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8".to_owned(),
+        ),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        ),
+        (axum::http::header::CACHE_CONTROL, "no-store".to_owned()),
+    ];
+
+    let mut response = Response::new(axum::body::Body::from(body));
+    for (name, value) in headers {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "app_builder.plan.exported")
+            .organization(plan.organization_id)
+            .target("app_builder_plan", plan.id.to_string())
+            .metadata(json!({ "artifacts": artifacts.len(), "filename": filename }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok(response)
 }
 
 /// `POST /api/v1/app-builder/generate` — a prompt becomes a plan, streamed.

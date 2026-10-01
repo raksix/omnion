@@ -159,6 +159,10 @@ struct TestResponse {
     /// session and the CSRF token) and reading only the first gives every write a session and
     /// no token, which the double-submit check correctly refuses.
     set_cookies: Vec<String>,
+    /// Response headers, lowercased. The export walk asserts `Content-Disposition`, and a
+    /// download's whole contract is in its headers — a JSON body served inline and a JSON
+    /// body served as an attachment are the same bytes and completely different features.
+    headers: Vec<(String, String)>,
     body: Value,
     text: String,
 }
@@ -233,6 +237,16 @@ impl Harness {
             .filter_map(|value| value.to_str().ok())
             .map(str::to_owned)
             .collect();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((
+                    name.as_str().to_ascii_lowercase(),
+                    value.to_str().ok()?.to_owned(),
+                ))
+            })
+            .collect();
         let bytes = response
             .into_body()
             .collect()
@@ -248,6 +262,7 @@ impl Harness {
         TestResponse {
             status,
             set_cookies,
+            headers,
             body,
             text,
         }
@@ -1302,6 +1317,185 @@ async fn an_applied_plan_is_not_deletable_and_the_two_refusals_are_different() {
         refused.body
     );
     assert_eq!(refused.body["error"]["code"], "plan_applied");
+}
+
+/// The plan exports as a **file**, and the file is the same plan the screen shows.
+///
+/// Four claims, each of which is a way this could have been answered by a JSON body on a
+/// path and still looked finished:
+///
+/// * **It is an attachment.** `Content-Disposition: attachment` is the whole difference
+///   between "the request succeeded" and "a file arrived", and a test that only parsed the
+///   body would pass against an endpoint that opens a browser tab and hands the operator
+///   nothing to save.
+/// * **The bytes are the plan.** The artifact count in the file is read out of the downloaded
+///   body and compared against the count the review endpoint reports — a file built from
+///   different reads than the screen is a second view of the same plan, and a reviewer
+///   comparing the two would be comparing an inconsistency the platform introduced.
+/// * **Another tenant's plan is `404`, not `403`, and carries no bytes.** An export that
+///   checked tenancy after reading would have written the file first and refused second.
+/// * **`read` alone is enough.** Exporting is reading; the least-privileged reviewer is
+///   exactly the account that has to be able to take a plan away.
+#[tokio::test]
+async fn a_plan_exports_as_an_attachment_carrying_the_plan_the_screen_shows() {
+    let harness = harness!();
+    let tenant = tenant_with_tenant(&harness, "export").await;
+    grant_reviewer(&harness, &tenant).await;
+
+    let plan_id = seed_plan(&harness, tenant.organization_id, tenant.user_id).await;
+
+    let response = harness
+        .call(get(
+            &format!("/api/v1/app-builder/plans/{plan_id}/export"),
+            Some(&tenant.token),
+        ))
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+
+    // The download contract is in the headers. A body-only assertion cannot see any of it.
+    let header = |name: &str| {
+        response
+            .headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default()
+    };
+    let disposition = header("content-disposition");
+    assert!(
+        disposition.starts_with("attachment;"),
+        "an export served inline opens a tab the operator must save by hand: {disposition}"
+    );
+    assert!(
+        disposition.contains(&format!("{}.json", &plan_id.to_string()[..8])),
+        "the file name comes from the plan's own short id, never its title: {disposition}"
+    );
+    assert_eq!(header("cache-control"), "no-store");
+
+    // The file must be the same plan the review screen reads — same id, same artifacts, same
+    // counts — or the reviewer is comparing two views that were never meant to agree.
+    let document: Value = serde_json::from_str(&response.text).expect("the download is JSON");
+    let screen = harness
+        .call(get(
+            &format!("/api/v1/app-builder/plans/{plan_id}"),
+            Some(&tenant.token),
+        ))
+        .await;
+
+    assert_eq!(
+        document["id"], plan_id.to_string(),
+        "the file is the plan the caller asked for"
+    );
+    assert_eq!(document["schema"], "omnion.app-builder.plan/1");
+    assert_eq!(
+        document["artifacts"].as_array().map(Vec::len),
+        screen.body["artifacts"].as_array().map(Vec::len),
+        "the export and the review screen must count the same rows"
+    );
+    assert_eq!(document["counts"], screen.body["counts"]);
+    assert_eq!(
+        document["blockers"].as_array().map(Vec::len),
+        screen.body["blockers"].as_array().map(Vec::len),
+        "a plan that cannot be applied is an export a reader can act on"
+    );
+    assert!(
+        document["prompt"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("leave requests"),
+        "the request travels with the file: it is the only thing saying what the plan was for"
+    );
+    // Every artifact carries the token counts' siblings verbatim — a `spec` the exporter
+    // normalised would be a second normaliser, and the one that disagrees with the validator
+    // is the one nobody reads. The entity's stored body is the one in the file.
+    let entity = document["artifacts"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["kind"] == "entity"))
+        .expect("the entity artifact travels with the plan");
+    assert_eq!(
+        entity["spec"]["plural_label"], "Leave requests",
+        "spec is exported verbatim, never re-normalised: {entity}"
+    );
+    assert_eq!(
+        entity["validation"].as_array().map(Vec::len),
+        screen.body["artifacts"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["kind"] == "entity"))
+            .and_then(|row| row["validation"].as_array())
+            .map(Vec::len),
+        "the validator's findings travel with the artifact, not re-derived by the exporter"
+    );
+    // The counts the exporter carries are the store's, and `cost_cents` is the stored
+    // number — a fabricated currency figure would be a claim this platform cannot make.
+    assert_eq!(
+        document["cost_cents"], screen.body["plan"]["cost_cents"],
+        "the file must not price the plan on its own"
+    );
+}
+
+/// Another tenant's plan exports as `404` with **no body**, and an account with no
+/// app-builder key is refused — two separate refusals, and the second is the guard's answer
+/// rather than the tenancy one.
+#[tokio::test]
+async fn an_export_is_refused_across_a_tenant_and_without_the_read_key() {
+    let harness = harness!();
+    let owner = tenant_with_tenant(&harness, "export-owner").await;
+    grant_reviewer(&harness, &owner).await;
+    let plan_id = seed_plan(&harness, owner.organization_id, owner.user_id).await;
+
+    let stranger = other_tenant_with_tenant(&harness, "export-stranger").await;
+    // The stranger needs `appbuilder.read` **in its own tenant**, or the walk would measure the
+    // permission guard instead of the tenancy one: a caller holding no key at all is refused
+    // `403` before any plan is looked up, so asserting `404` here without this grant would be
+    // asserting that the guard does not run — the mirror of the mistake this REQ keeps making,
+    // where a red row reads as a product defect and is really a probe that never reached the
+    // code under test.
+    grant_keys(
+        &harness,
+        stranger.user_id,
+        stranger.organization_id,
+        &["appbuilder.read"],
+    )
+    .await;
+    let across = harness
+        .call(get(
+            &format!("/api/v1/app-builder/plans/{plan_id}/export"),
+            Some(&stranger.token),
+        ))
+        .await;
+    assert_eq!(
+        across.status,
+        StatusCode::NOT_FOUND,
+        "another tenant's plan is absent, not forbidden: a 403 would tell the caller which \
+         ids exist somewhere: {:?}",
+        across.body
+    );
+    assert!(
+        !across.text.contains("leave request"),
+        "the refusal must not carry any part of the plan: {}",
+        across.text
+    );
+
+    // The same surface, refused by the **permission** rather than by tenancy. The member
+    // holds no app-builder key at all, so this is `appbuilder.read` speaking.
+    let member = member_without_keys(&harness, &owner).await;
+    let unkeyed = harness
+        .call(get(
+            &format!("/api/v1/app-builder/plans/{plan_id}/export"),
+            Some(&member.token),
+        ))
+        .await;
+    assert_eq!(
+        unkeyed.status,
+        StatusCode::FORBIDDEN,
+        "exporting without the key is the guard's refusal: {:?}",
+        unkeyed.body
+    );
+    assert!(
+        !unkeyed.text.contains("leave request"),
+        "a refusal that leaked the body would be a worse leak than the 403: {}",
+        unkeyed.text
+    );
 }
 
 /// The list's filters and the `examples` vocabulary are the landing page's own inputs.
