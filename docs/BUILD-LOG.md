@@ -11094,3 +11094,46 @@ over this build reports, the screen-level boxes stay unticked — including the 
 something and impossible to prove without the browser.
 
 **Next.** The pass, then tick slices 1, 2, 3 and 4 in one go, then the next wave-5 request.
+
+---
+
+## Tick 100 — the gate that passed with a flag nobody types
+
+**The crate's own test command did not build the crate.** `cargo test -p omnion-deployment
+--quiet` — the exact command this loop's gate names, and the one the crate's own documentation
+names — failed with **34 errors and not a single test run**. Tick 99 recorded that crate's tests
+as 103 green; that number was true only of a command with a flag on it.
+
+`pub mod jobs;` was ungated in `lib.rs` while `jobs.rs` is 692 lines of `sqlx` and
+`crate::store`, both of which exist only when the `store` feature is on. `maintenance.rs` had the
+same shape and put `sqlx::PgPool` on line 270 of an otherwise ungated file. The cause is not
+carelessness in one place: `apps/api` is what enables the feature, so **the API built, the
+workspace built, and the only command that could have said otherwise was never the one that
+ran.** A gate that passes with a flag nobody types is a note.
+
+**Fixed, and the split is the point.** `jobs` now carries the gate its siblings had, and
+`maintenance_store` takes the four queries. The two database-free cursor helpers move to a new
+ungated `log_cursor` so the log-stream edge cases keep their tests on the build that has no
+database: a cursor landing mid-character returns the whole log rather than panicking on a
+`&str` slice, and a cursor from a *longer* log returns that log rather than nothing for ever —
+the second is the one that turns a stale tab into a pane that silently stops updating. Both are
+re-exported from their old paths, so not one call site in `apps/api` moved.
+
+**Proof.** `cargo test -p omnion-deployment --quiet` **97 passed, 0 failed** (the command that
+did not compile an hour ago). `cargo test -p omnion-deployment --features store` 103 passed.
+`cargo test -p omnion-api --lib` 339 passed. `cargo check -p omnion-api` exit 0, zero errors.
+`pnpm typecheck` 2/2.
+
+**Audited for the same shape.** `omnion-deployment` is the *only* crate in the workspace with an
+optional `sqlx` — the other twelve either always have it or never touch SQL — so this was a local
+defect, not a house style.
+
+**Still owed, unchanged: the browser pass.** The tick-96 run I found holding the w5 stack had
+started at 08:26, two and a half hours *before* slices 2–4 were committed, so it was measuring
+slice 1's five screens and nothing else — it could never have closed these boxes, and letting it
+run to completion would have cost an hour to confirm that. Killed my own process group, verified
+the port 3104 listener is my own pm2 child rather than an orphan, and started a fresh pass over
+the current tree. It is queued behind a live w3 pass on the global slot, which is the discipline
+the slot exists to enforce.
+
+**Next.** That pass, which closes slices 1, 2, 3 and 4 together, then the next wave-5 request.
