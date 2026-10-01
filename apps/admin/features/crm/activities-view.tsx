@@ -464,8 +464,25 @@ export function ActivitiesView() {
           )}
         </section>
 
-        {/* The form. A field's refusal renders under the field, never in a banner. */}
-        <section aria-label="Log an activity" className="h-fit space-y-3 rounded-xl border border-line p-3">
+        {/* The form. A field's refusal renders under the field, never in a banner.
+
+            This is a `<form>` and not another `<section>`, for two reasons that are the same
+            reason. A section is a box; a form is a form: pressing Enter in the record-id field has
+            to log the activity, because the alternative is a data-entry screen where the only way
+            to submit is to find the button with the mouse. And the mobile gate measures
+            `form label` geometry — this screen's fields sat in a section, so the measurement found
+            zero fields and the one form in the module that carried the two-up pair was the one
+            form nobody measured. The filter labels above stay outside it: they are three controls
+            on one toolbar row, not fields of this form, and letting them in would make the
+            single-column assertion measure the toolbar instead. */}
+        <form
+          aria-label="Log an activity"
+          className="h-fit space-y-3 rounded-xl border border-line p-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
           <h2 className="text-[13px] font-medium">Log an activity</h2>
           <label className="block text-[12px] text-muted">
             Kind
@@ -564,16 +581,15 @@ export function ActivitiesView() {
             </label>
           ) : null}
           <button
-            type="button"
+            type="submit"
             data-qa="activity-form-submit"
-            onClick={() => void submit()}
             disabled={saving}
             className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white disabled:opacity-60"
           >
             {saving ? <Loader2 aria-hidden className="h-3.5 w-3.5 animate-spin" /> : <Plus aria-hidden className="h-3.5 w-3.5" />}
             Log it
           </button>
-        </section>
+        </form>
       </div>
     </div>
   );
