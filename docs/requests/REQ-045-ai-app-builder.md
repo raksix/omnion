@@ -1,24 +1,24 @@
 # REQ-045 — AI App Builder *(headline)*
 
-> **Status:** in-progress (slice 2 · `65bdf683` — **the review surface on the wire, and the four
-> permission keys** · `apps/api/src/routes/app_builder.rs` (nine routes: list, detail, examples,
-> edit, accept, reject, regenerate, reject-plan, delete, generate), migrations `0226` (a decision
-> carries its reason) and `0227` (one **live** version per `(plan, kind, key)`), plus four keys in
-> `crates/permissions`. Slice 1's store is unchanged in shape; slice 2 extended it with
-> `reject_artifact`, `reject_plan`, `accept_artifact` and the two reason columns.
-> **The four keys are catalogued and three of them guard routes; `appbuilder.apply` guards nothing
-> yet on purpose** — the apply runner is slice 3 and a route answering "coming soon" is exactly
-> what the Definition of Done forbids. `generate` writes the plan before the provider is asked and
-> fails with the reason on the row; it does **not** fake the typed generator, and a walk asserts
-> the mock provider was called **zero** times.
-> **Three defects closed, two of them pre-existing in slice 1:** (1) a `permission` artifact could
-> **never** be written — the store applied the storage key rule to a `domain.action` key whose dot
-> is vocabulary, so a REQUIRED kind was un-fillable and no plan could ever be applicable; (2)
-> regeneration raised duplicate-key against the absolute `(plan_id, kind, key)` constraint, so the
-> "kept plan versions" the request asks for was a 500 — `0227` makes the index partial over live
-> versions; (3) a filter refusal answered `500` where the caller's input deserves `422`.
-> **41 module unit tests · 10 route walks (were 0) · permissions 64/64 · `pnpm typecheck` pending** ·
-> previous: **Status:** pending)
+> **Status:** in-progress (slice 3 · `a98bb248` — **THE SCREENS**, and the one box that
+> could not be ticked without them · `/app-builder` (composer with three click-to-fill chips, the
+> plans table with status/text/mine filters) and `/app-builder/plans/{id}` (artifact tree by kind,
+> detail pane, accept/reject/edit/regenerate, named blockers, footer counters, keyboard
+> `j/k/a/r/e/g`), the client in `apps/admin/lib/api.ts` + `lib/types.ts`, both routes in
+> `scripts/qa/walkthrough.cjs` and a depth pass that opens a **real** plan).
+> **No Apply button, on purpose.** The runner is slice 4; a button answering "coming soon" is
+> exactly what the Definition of Done forbids, so the footer names every blocker instead and the
+> pass asserts the button is **absent**.
+> **One defect the typecheck could not have found:** the search box was bound straight to the `q`
+> query parameter, which makes it untypeable — every keystroke round-trips through
+> `router.replace` and the field loses focus mid-word. It is a draft against the URL now, settled
+> by a 300 ms debounce and re-seeded whenever the URL changes underneath it.
+> **Blockers are the server's and are rendered verbatim** — a client that re-derived readiness
+> would eventually disagree with apply, and the reviewer would be told a plan is ready that apply
+> then refuses.
+> **`pnpm typecheck` clean · `node --check scripts/qa/walkthrough.cjs` clean · 41 module unit tests ·
+> 10 route walks · permissions 64/64** · previous: slice 2 · `65bdf683` — the review surface on the
+> wire, and the four permission keys)
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -244,6 +244,7 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
    key/type validation, persistence, four permission keys, tests. **Done when:** a generated plan validates.
 2. **Review workspace** — `/app-builder` landing and the plan workspace tree, artifact detail, accept/reject/
    edit/regenerate, blocking summary, keyboard and mobile. **Done when:** a plan reaches a fully accepted state.
+   — **Code complete (`a98bb248`)**; the walkthrough pass that ticks its boxes is running.
 3. **Apply pipeline** — ordered application (entity → fields → screens → permissions → roles → workflow →
    notifications → report), approval gate, SSE progress. **Done when:** the plan creates a working app end to end.
 4. **Safety net** — per-application rollback, failure retry, applied filters, JSON export, cost attribution.
