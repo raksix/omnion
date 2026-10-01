@@ -11907,3 +11907,88 @@ states, and it is not closed on tests alone.
 
 **Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
 hook to REQ-011.
+
+## Tick 67 — the two red steps that were the harness, and a suite that hung at 24 minutes
+
+Two findings from tick 66's void run were on the board, and both of them turned out to be
+**defects in the pass rather than in the product**. That is the second time this module's browser
+harness has produced confident defects out of its own preconditions, so the shape is now written
+down rather than fixed twice.
+
+### 1. `j` / `k` never moved a cursor because the caret was in the search box
+
+`jMovesTheVisibleCursor`, `kMovesBack` and `exactlyOneCursor` all read `false` with
+`theCursorIsVisible: true` — three red steps beside a drawn cursor.
+
+The product is right. `useCrmKeyboard` returns early when the key target is an `INPUT`
+(`crm-parts.tsx:238`), which is exactly what lets a person type a contact named **Jack**: the `j`
+and the `k` are letters, not commands, while you are typing.
+
+The step above is wrong. It ends with `/`, whose whole purpose is to leave the caret in the search
+box, and nothing took focus back — so `j` and `k` were **typed into the field**. The list filtered
+itself down to nothing, no cursor moved anywhere, and `exactlyOneCursor` then counted **zero** rows
+rather than the two competing claims it exists to catch. A step written to detect one failure mode
+reported a different one, and both looked like product defects.
+
+The tell was already in the file: the `n` step and the per-screen `e` loop both click `body` at
+5,5 first, because their authors assumed no focus. This step sat between two steps that got it
+right and inherited the assumption instead of the behaviour. It now blurs, and records that
+precondition as a step of its own (`theKeysAreNotTypedIntoTheSearch`).
+
+### 2. Three "broken" screens were a stub that never fired
+
+`crmStates` reported contacts, companies and deals failing **all five** questions —
+`doesNotClaimToBeEmpty` included, the one question that had always cleared them — while
+activities, leads and stages, walked immediately after, answered every one.
+
+Three screens cannot lose five unrelated behaviours in a row and have the next three keep them.
+The failing block's commonality was **positional, not semantic**: the stub answers one exact path,
+and after a few screens it stopped matching, so from then on the pass asked five questions of a
+screen that was never in trouble. All five answered `false`. That is a fabricated defect, and it is
+the most expensive kind to leave in a harness, because it points the next reader at three files
+that need no change.
+
+The sweep now counts its own deliveries, records the exact request it answered
+(`steps.<screen>_delivered`), and — the part that matters — leaves a screen **unset rather than
+broken** when the refusal it is measuring never arrived. Unset becomes a `medium` finding in the
+roll-up; `false` becomes `high`. A refusal-based step must assert its own stimulus.
+
+### 3. The suite hung, and a hang is not a result
+
+The outstanding proof from tick 66 — a full `cargo test -p omnion-api --test crm`, 53/55 with two
+date failures since fixed — did not finish. It ran **24 minutes**: real work first (CPU ticks
+650 → 963, three active backends), then nothing. Two samples 45 s apart both read 1056, with
+`wchan=futex_do_wait`, **0 ungranted locks** and every backend parked at `ClientRead`.
+
+That is the hang signature, not slow progress, so it was killed rather than waited on. **A killed
+suite proves nothing** — 24 minutes of mostly-working is not 53/55 either, and reporting it as
+anything else would be the same mistake as a pass that reports itself green because it wrote a
+`summary.json`. It is recorded as inconclusive.
+
+One process note that cost real time: the run was piped to `tail -40`, so the buffer died with the
+process and **the name of the test it hung in went with it**. A hang diagnosis needs the last test
+that started; anything that filters a long background test run destroys exactly that.
+
+### Process
+
+* `/` was checked **before** anything scarce was spent: 95%, 5.9 G free. Tick 66 lost a whole pass
+  to a disk that filled mid-run, and the disk is the cheap thing to check.
+* The QA slot was checked and found **live-held by w7** — pid 506615, `/proc/506615/cwd` =
+  `/mnt/apopic/omnion-w7`, with a walkthrough on its own 3106 stack. Not taken. The code audit of
+  the two red steps ran in that window instead of idling, which is where both diagnoses came from.
+* `origin/main` merged at the **start** of the tick (7 commits); the only conflict was the
+  append-only `BUILD-LOG.md`, resolved with `scripts/qa/merge-build-log.py` —
+  `base=7014 ours=11827 theirs=7096 merged=11910`, 0 entries missing.
+
+| gate | command | result |
+| --- | --- | --- |
+| types | `pnpm typecheck` | **2/2** |
+| harness | `node --check scripts/qa/walkthrough.cjs` | clean |
+| module | `cargo test -p omnion-api --test crm` | **hung at 24 min**, killed — inconclusive |
+
+**No acceptance box is ticked.** Two of tick 66's reds are explained and fixed in the harness; none
+of the three browser-only boxes is proved, and REQ-051 stays `in-progress`.
+
+**Next:** re-run the suite **unbuffered** (to a file, not through `tail`) so a hang is diagnosable,
+naming the test it stops in; and take the first free QA slot for `QA_STACK=w4 … run.sh --only=crm`
+to answer the three browser boxes with the harness now fixed.
