@@ -9054,20 +9054,46 @@ async function runIamSecurityDepth(page, report) {
   note({ step: "sessions-list", rows: sessionRows, currentRows: liveBadges });
   await shot(page, "page-iam-sessions");
 
-  // Revoking the row that is not the browser's own: the oldest sign-in is this walk, so the
-  // newest live row (the session opened above) is the one to end.
+  // Revoking the row that is NOT the browser's own. The comment above used to say the oldest
+  // sign-in is this walk and take the newest live row — but the list is not sorted by anything
+  // the walk controls, and `.first()` is the browser's own session as often as not. That is how
+  // the walk revoked the session it was walking on: sixteen routes after this then measured the
+  // login screen and every depth pass below reported an empty one, all of it filed as a defect on
+  // screens that were never opened. The refusal it hit is now the product's answer too
+  // (`cannot_revoke_current_session`), so a row that says `current` is a legitimate thing to find
+  // — what is not legitimate is ending the walk with it. The row is chosen by the field that says
+  // "this one is mine", not by its position, and "none to revoke" is recorded as its own answer
+  // rather than passing silently.
   const revokeButtons = page.locator("table [data-session-revoke]");
   const revokeCount = await revokeButtons.count();
-  if (revokeCount > 0) {
+  const ownRows = await page
+    .locator("table [data-session-row]")
+    .evaluateAll((nodes) => nodes.filter((node) => /this one/.test(node.innerText)).length);
+  if (revokeCount > 0 && ownRows < revokeCount) {
     await revokeButtons.first().click({ timeout: 5000 }).catch(() => {});
     await page.waitForTimeout(1300);
     const revokeNotice = (
       await page.locator("[data-sessions-notice]").first().innerText().catch(() => "")
     ).replace(/\s+/g, " ");
-    note({ step: "session-revoked", notice: revokeNotice.slice(0, 110) });
+    note({
+      step: "session-revoked",
+      notice: revokeNotice.slice(0, 110),
+      // The revoked row must be gone from the table: a click that reported success while the row
+      // stayed revocable would leave the walk believing it exercised the control.
+      rowsAfter: await page.locator("table [data-session-row]").count(),
+      rowsBefore: revokeCount,
+    });
     await shot(page, "page-iam-sessions-revoked");
   } else {
-    note({ step: "session-revoked", notice: "", skipped: "no revocable row" });
+    // Either there is nothing revocable, or every revocable row is this walk's own session. Both
+    // are honest answers and neither is a defect, so the note says which instead of skipping.
+    note({
+      step: "session-revoked",
+      notice: "",
+      skipped: revokeCount === 0 ? "no revocable row" : "every revocable row is this browser's own session",
+      revocableRows: revokeCount,
+      ownRows,
+    });
   }
 
   // The filters are real: a state filter narrows the list to the rows whose badge matches.
