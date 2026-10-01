@@ -7712,3 +7712,77 @@ volume; a pass or two from now this branch will need the same sweep.
 **Next.** `undo-selection` off the DOM and onto the product's own rules — `deleteTarget(selection)`
 and the status-bar string, which move for a stale edge and would not move for a stale node. Then
 the run-from-here / pill / table-mode rows. The plugin row stays BLOCKED on REQ-121.
+
+## Tick 55 — the row that could not go red on the half of the prune that WAS the defect
+
+**What.** The tick-53 fix gave `pruneSelection` an optional third argument for the edge ids,
+and tick 54 found the two callers that had been left off. The product is right. What is still
+missing is any *measurement* of it: the `undo-selection` walkthrough row asserts
+`postRead.selectedCount === 0`, read off `[data-node-id][data-node-selected='true']`.
+
+**An edge selection is a different object, so that count is zero either way.** `selectEdge`
+sets `nodes: []` and `focus: null` and puts the id in `edge`. A selection left naming a
+connection the undo just removed therefore reads `selectedCount: 0` — the same number the
+fixed product produces. The row cannot go red on this half of the defect, and it reports
+`selectionPruned: true` off it regardless. This is the tick-48 shape exactly one level over:
+there a row read the Undo button on a page where no reload had ever happened; here a row reads
+the node marker on a canvas whose surviving selection is a connection.
+
+**It is not cosmetic.** An edge outranks every node selection in `deleteTarget` and in
+`whatEscapeClears`, so a surviving edge id is what `Del` resolves to — `removeEdge` then finds
+no such edge and returns having changed nothing, which is a key that looks broken — and it is
+what the status bar prints as "1 connection selected (Del removes it)" over a canvas drawing no
+such line. So the new row reads the product's OWN claims: the `data-edge-selected` marker the
+SVG `<g>` writes, and the sentence the status bar prints. Both move for a stale edge; neither
+moves for a stale node, which is what makes the reading able to go red where the first cannot.
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **307
+passed** (297 before, +10) · `pnpm typecheck` → 2/2 successful · the walkthrough re-parsed
+after a 122-line insertion (14,280 lines) · `cargo test -p omnion-workflows --lib` → **157
+unchanged**. **Twelve mutations red**, one per assertion, named in the harness.
+
+**The instrument was wrong four times before it was right, and three were the same mistake.**
+The harness came back 7/12, and every failure was one class: a name that appears in two places
+satisfies an assertion made about one of them. `getPointAtLength` also appears in the row's
+*guard*, so replacing the measurement with a bounding box stayed green; `getScreenCTM` also
+appears in the null check; `[data-edge-selected='true']` appears in *both* the pre-undo and the
+post-undo read; `readout` is a variable *name*, and naming it `null` still satisfies "the row
+reads the status bar"; `edgeWasSelected` is declared as a `const` and also reported, so deleting
+the report left the name in the window. Every assertion now names the construct that does the
+work — the assignment, not the mention, and the read inside the block that performs it.
+
+Three more, of the shape `undo-selection.test.ts` already documents for bracket matching: a
+window that ends at the *first* match rather than the next. `POST` searched from the top of
+the window and its needle's first occurrence sits in the `if` branch above it, so the slice
+came from a negative index and came back empty. The row reports twice — a miss and a reading —
+so the note is two windows, and the evidence assertions belong to the miss. And the note uses
+the object *shorthand*, so an assertion demanding `edgeWasSelected: edgeWasSelected` went red
+against a correct row; both spellings report it, so the check is `[:,]`. **This is the ninth
+check in this REQ to go red for a reason unrelated to what it claimed to measure** — the one
+class this branch keeps re-learning, and the reason every one is now mutation-proved.
+
+**The harness itself was wrong first, and the way it was wrong is the point.** It replaced
+text across the whole walkthrough, and `String.replace` hits the FIRST occurrence — which for
+three mutations was the `edge-delete` row's identical four lines further down the file. So M2,
+M3 and M4 mutated *another row* and printed an honest result for a test that had not been
+touched. A mutation harness that measures the wrong row is worse than none: it prints a number,
+the number is meaningless, and "12/12 red" is the most reassuring sentence a person can be
+handed. Edits are now scoped to the row's own window, and the harness asserts the window is the
+one it expected *before* mutating. It restores byte-for-byte on every path including a throw,
+and verifies the restore — the first draft left the backup behind and the run aborted on a
+mutation whose target had been mis-written.
+
+**No browser pass.** The slot's holder is a live pass, not a stale file: pid 2502049, alive,
+`/proc/2502049/cwd` = `/mnt/apopic/omnion-w4`. Load 24 on six cores, 35 Chrome, 7G free of 32G,
+24G of swap in use. Fourth tick in a row spent on work the unit gate can settle rather than
+queueing for a slot that was never going to free.
+
+**Disk.** `/mnt/apopic` was at 100% last tick and is at 90% now — a sibling reclaimed about 4G.
+`qa-artifacts/` here is empty (4K) and `target` is a symlink to `/dev/shm/w3-target`, so neither
+is this branch's doing.
+
+**Next.** Run the pass, and read `undo-selection-edge` for `edgeRemovedByUndo: true` alongside
+`edgeSelectionPruned: true` — the conjunction is the point, and the first without the second is
+a row that measured nothing. Then the run-from-here / pill / table-mode rows, all written and
+none measured. The plugin row stays BLOCKED on REQ-121. REQ-004 is far from close: the QA pass
+has not run in four ticks and every criterion needing one is open.
