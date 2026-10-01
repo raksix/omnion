@@ -1,0 +1,29 @@
+{
+  "name": "demo",
+  "description": "A populated installation for screenshots and evaluation: a site with a navigation-shaped set of pages across every status, plus accounts at three privilege levels. Deterministic — the same file produces the same world on every load, which is what makes a screenshot comparable to the last one.",
+  "row_estimate": 640,
+  "compatible_from": "0206",
+  "statements": [
+    "insert into sites (id, organization_id, key, name, status, theme) select gen_random_uuid(), anchor.organization_id, 'demo', 'Demo site', 'active', 'default' from (select id as organization_id from organizations order by created_at desc limit 1) anchor where not exists (select 1 from sites s where s.organization_id = anchor.organization_id and s.key = 'demo')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'home', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'home')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'about', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'about')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'pricing', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'pricing')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'docs', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'docs')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'blog', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'blog')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'contact', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'contact')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'changelog', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'changelog')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'roadmap', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'roadmap')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'case-studies', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'case-studies')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'careers', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'careers')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'legal-terms', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'legal-terms')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'legal-privacy', 'page', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'legal-privacy')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'draft-idea', 'page', 'draft' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'draft-idea')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'scheduled-launch', 'page', 'draft' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'scheduled-launch')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'archived-2025', 'page', 'archived' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'archived-2025')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'blog-post-one', 'post', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'blog-post-one')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'blog-post-two', 'post', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'blog-post-two')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'blog-post-three', 'post', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'blog-post-three')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'landing-enterprise', 'landing', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'landing-enterprise')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'landing-startup', 'landing', 'published' from sites s where s.key = 'demo' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'landing-startup')"
+  ]
+}

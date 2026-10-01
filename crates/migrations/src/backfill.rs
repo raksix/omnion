@@ -265,7 +265,7 @@ pub fn batch_statement(
         "with batch as ( \
            select ctid, {key_column} as k from {table_name} \
            where {column_name} is null \
-             and {key_column} > ($1::{key_type}) \
+             and ($1::{key_type} is null or {key_column} > $1::{key_type}) \
            order by {key_column} \
            limit $2 \
          ), \
@@ -284,10 +284,22 @@ pub fn batch_statement(
 
 /// The cursor a job starts from when it has never run.
 ///
-/// Empty string, not NULL, and the reason is the comparison: `key > NULL` is NULL, which is not
-/// true, so a NULL cursor would select **no rows at all** and every job would report itself
-/// finished before touching anything.
-pub const INITIAL_CURSOR: &str = "";
+/// **NULL, not the empty string** — and the second half of that sentence is the defect this
+/// constant used to carry.
+///
+/// The reasoning for an empty string was sound and the conclusion was wrong: a `NULL` cursor makes
+/// `key > NULL` NULL, which is not true, so the first batch would select nothing and every job
+/// would report itself finished before touching a row. The empty string fixed that *for a text
+/// key*, and the batch statement casts the bind to the key column's own type — so for a `bigint`
+/// key, `''::bigint` is `invalid input syntax for type bigint: ""` and **every first batch of
+/// every integer-keyed backfill fails at the database**. `text` is the only supported key type for
+/// which a sentinel exists; `bigint`, `integer`, `smallint` and `uuid` all refuse it.
+///
+/// So the lower bound is expressed as a PREDICATE rather than a value: `$1 is null or key > $1`.
+/// A null cursor then means "no lower bound" in every key type, which is what "never run" means,
+/// and the comparison still happens in the key's own type once there IS a cursor — the property
+/// that keeps `'99'` from sorting after `'100'`.
+pub const INITIAL_CURSOR: Option<&str> = None;
 
 /// Register a descriptor. Returns `false` when the same `(version, name)` already exists.
 ///
@@ -426,12 +438,16 @@ pub async fn transition(pool: &PgPool, id: Uuid, to: &str, error: Option<&str>) 
     }
     let current = read(pool, id).await?;
     if !can_transition(&current.state, to) {
-        return Err(MigrationSafetyError::PolicyViolation(format!(
-            "backfill job {} is `{}` and cannot become `{to}` — a job that is paused or failed has \
-             not finished its work, so completing it would record rows that were never written. \
-             Resume it first.",
-            current.name, current.state
-        )));
+        return Err(MigrationSafetyError::IllegalTransition {
+            subject: "backfill job",
+            state: current.state.clone(),
+            requested: to.to_owned(),
+            reason: format!(
+                "a job that is paused or failed has not finished its work, so completing it would \
+                 record rows that were never written. Resume it first. (this job is `{}`)",
+                current.name
+            ),
+        });
     }
     // `failed` requires a message and `paused`/`completed` require their timestamps; the table's
     // CHECK enforces all three, and writing them here is what keeps a route from producing a
@@ -511,17 +527,52 @@ pub async fn run_once(pool: &PgPool, id: Uuid) -> Result<BatchOutcome> {
     // The cursor is a BIND, never an interpolation. It comes from the database, but it also
     // arrives through every edit of a job, and building the statement with format! of a value a
     // caller chose is how a string becomes a statement.
-    let cursor = job
-        .resume_key
-        .clone()
-        .unwrap_or_else(|| INITIAL_CURSOR.to_string());
+    //
+    // `None` — not `Some("")` — when the job has never run. See [`INITIAL_CURSOR`]: the lower
+    // bound is a predicate (`$1 is null or key > $1`), so "no cursor" is representable in every
+    // key type, while `Some("")` would be `''::bigint` at the database.
+    let cursor = job.resume_key.clone();
 
     let mut transaction = pool.begin().await?;
-    let row = sqlx::query(&sql)
+    // The batch is executed inside a transaction so the rows, the cursor and the counter all come
+    // from ONE statement. But a statement that ERRORS still has to leave the job in a state a
+    // human can read: without this the error propagates, the transaction rolls back, and the job
+    // stays `running` with `last_error` null — indistinguishable from a job that is quietly
+    // working. The `failed` state is reachable in `can_transition` and nothing ever set it.
+    //
+    // The rollback is deliberate: a half-applied batch would move rows the counter does not
+    // describe, and the cursor would then point PAST work that never happened. Failing loudly and
+    // re-running from the last good cursor is the only pair that stays consistent.
+    let batch = sqlx::query(&sql)
         .bind(&cursor)
         .bind(job.batch_size)
         .fetch_one(&mut *transaction)
-        .await?;
+        .await;
+
+    let row = match batch {
+        Ok(row) => row,
+        Err(source) => {
+            let message = source.to_string();
+            // A transaction that failed its statement is aborted; roll it back explicitly so the
+            // connection returns to the pool usable rather than in a failed state.
+            transaction.rollback().await.ok();
+
+            // Through the crate's OWN transition, not a hand-written update. This version of the
+            // code did write its own `update … set state='failed', stopped_at=now()` — and there is
+            // no `stopped_at` column: the table has `paused_at`, `completed_at` and `last_error`,
+            // with a CHECK tying `failed` to a non-null `last_error`. The statement therefore failed
+            // with 42703, and because the write was `let _ =` — "best effort" — **the second
+            // failure was silent** and the job stayed `pending`, which is what this walk caught.
+            // A swallowed error in a failure path is not a detail: the path exists for when things
+            // are already broken.
+            transition(pool, id, "failed", Some(&message)).await.ok();
+
+            return Err(MigrationSafetyError::BatchFailed {
+                job: job.name.clone(),
+                error: message,
+            });
+        }
+    };
 
     let rows: i64 = row.get("rows");
     let last: Option<String> = row.get("cursor");
@@ -696,7 +747,10 @@ mod tests {
         let sql = batch_statement("users", "display_name", "id", "bigint", "'(none)'");
         assert!(sql.contains("limit $2"), "the batch size must be a bind: {sql}");
         assert!(sql.contains("where display_name is null"), "{sql}");
-        assert!(sql.contains("id > ($1::bigint)"), "{sql}");
+        assert!(
+            sql.contains("$1::bigint is null or id > $1::bigint"),
+            "the batch starts above the cursor, and above nothing when there is no cursor: {sql}"
+        );
         assert!(sql.contains("order by id"), "{sql}");
         assert!(sql.contains("update users set display_name = "), "{sql}");
     }
@@ -719,9 +773,9 @@ mod tests {
     #[test]
     fn the_cursor_is_compared_in_the_key_columns_own_type() {
         let numeric = batch_statement("t", "c", "id", "bigint", "'x'");
-        assert!(numeric.contains("($1::bigint)"), "{numeric}");
+        assert!(numeric.contains("$1::bigint"), "{numeric}");
         let textual = batch_statement("t", "c", "uuid", "uuid", "'x'");
-        assert!(textual.contains("($1::uuid)"), "{textual}");
+        assert!(textual.contains("$1::uuid"), "{textual}");
         assert!(!numeric.contains("::text >"), "text order is the defect: {numeric}");
     }
 
@@ -734,15 +788,27 @@ mod tests {
         assert!(!sql.contains("''"), "an empty string was interpolated: {sql}");
     }
 
-    // A `NULL` cursor would make `> NULL` NULL, which selects nothing, and every job would
-    // report itself complete before touching a row. The empty string is the fix.
+    // A `NULL` cursor makes `> NULL` NULL, which selects nothing, and every job would report itself
+    // complete before touching a row. The empty string was the old answer and it was wrong for every
+    // key type except `text`: the bind is CAST to the key's own type, so `''::bigint` is rejected by
+    // the database. The predicate form is what makes "never run" expressible everywhere.
     #[test]
     fn a_never_run_job_starts_from_a_cursor_that_matches_every_key() {
-        assert_eq!(INITIAL_CURSOR, "");
-        // In text order every key's rendering is greater than the empty string, which is exactly
-        // the property that makes "first batch" mean "from the beginning".
-        assert!("1" > INITIAL_CURSOR);
-        assert!("00000000-0000-0000-0000-000000000001" > INITIAL_CURSOR);
+        assert_eq!(INITIAL_CURSOR, None, "no cursor, not an empty-string cursor");
+        // The lower bound must be a PREDICATE, not a value comparison against a sentinel: only the
+        // predicate form is valid for `bigint`, `integer`, `smallint` and `uuid` alike.
+        for key_type in RESUMABLE_KEY_TYPES {
+            let sql = batch_statement("t", "c", "k", key_type, "'x'");
+            assert!(
+                sql.contains(&format!("$1::{key_type} is null or k > $1::{key_type}")),
+                "a `{key_type}` key needs a null-aware lower bound or the first batch casts a \
+                 sentinel the type cannot hold: {sql}"
+            );
+            assert!(
+                !sql.contains(&format!("k > ($1::{key_type})")),
+                "a bare comparison to $1 makes an absent cursor select nothing: {sql}"
+            );
+        }
     }
 
     // The key column must not be the column being filled: that one is NULL for every row still

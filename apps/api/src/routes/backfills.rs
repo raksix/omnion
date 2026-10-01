@@ -297,9 +297,33 @@ pub async fn run_batch(
     // different events and collapsing them would lose the cursor from `backfill.started`.
     let resuming = !matches!(before.state.as_str(), "pending");
 
-    let outcome = omnion_migrations::backfill::run_once(pool, id)
-        .await
-        .map_err(migration_error)?;
+    // A batch that fails records `backfill.failed` BEFORE the error is returned. The crate has
+    // already written the job's state and message; without this the operator's only trace of a
+    // broken migration would be the 500 in their browser, and a receiver subscribed to failures
+    // would never hear about the one that matters.
+    let outcome = match omnion_migrations::backfill::run_once(pool, id).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let omnion_migrations::MigrationSafetyError::BatchFailed { error: reason, .. } = &error {
+                if let Ok(stopped) = omnion_migrations::backfill::read(pool, id).await {
+                    emit_backfill(
+                        pool,
+                        "backfill.failed",
+                        id,
+                        &stopped.name,
+                        stopped.rows_done,
+                        json!({
+                            "column_name": stopped.column_name,
+                            "resume_key": stopped.resume_key.clone().unwrap_or_default(),
+                            "error": reason,
+                        }),
+                    )
+                    .await;
+                }
+            }
+            return Err(migration_error(error));
+        }
+    };
 
     let after = omnion_migrations::backfill::read(pool, id)
         .await
@@ -438,9 +462,31 @@ pub async fn resume_backfill(
         .await
         .map_err(migration_error)?;
 
-    let (ran, rows) = omnion_migrations::backfill::drain(pool, id, batches)
-        .await
-        .map_err(migration_error)?;
+    // Same rule as the one-batch route: the failure event is recorded before the 500 leaves, and
+    // the job's own row already carries the message the event repeats.
+    let (ran, rows) = match omnion_migrations::backfill::drain(pool, id, batches).await {
+        Ok(tally) => tally,
+        Err(error) => {
+            if let omnion_migrations::MigrationSafetyError::BatchFailed { error: reason, .. } = &error {
+                if let Ok(stopped) = omnion_migrations::backfill::read(pool, id).await {
+                    emit_backfill(
+                        pool,
+                        "backfill.failed",
+                        id,
+                        &stopped.name,
+                        stopped.rows_done,
+                        json!({
+                            "column_name": stopped.column_name,
+                            "resume_key": stopped.resume_key.clone().unwrap_or_default(),
+                            "error": reason,
+                        }),
+                    )
+                    .await;
+                }
+            }
+            return Err(migration_error(error));
+        }
+    };
 
     let job = omnion_migrations::backfill::read(pool, id)
         .await

@@ -106,14 +106,18 @@ run_batch() { # run_batch <db> <cursor>
         '') ;;
         *[!0-9]*) echo "the proof's cursor must be digits or empty, got '$2'" >&2; return 1 ;;
     esac
-    # Empty becomes 0, which is below every positive key — the same property as the crate's
-    # INITIAL_CURSOR, and the reason an empty cursor must not become NULL.
-    local bound="${2:-0}"
+    # Empty becomes NULL, and the lower bound is the crate's PREDICATE (`$1 is null or k > $1`)
+    # rather than a sentinel value. That is the shape `batch_statement` produces: the previous
+    # `${2:-0}` rewrite in this script was valid only for a bigint key and, worse, it kept this
+    # proof passing while the crate itself sent `''::bigint` — the fixture and the product had
+    # drifted into measuring two different statements. A proof that re-implements the thing it
+    # proves is a second definition of it.
+    local bound="${2:-null}"
     "${PSQL[@]}" -d "$1" >/dev/null 2>&1 <<SQL
 begin;
 with batch as (
     select ctid, id as k from proof_rows
-    where id > $bound::bigint
+    where ($bound::bigint is null or id > $bound::bigint)
     order by id
     limit 100
 ),

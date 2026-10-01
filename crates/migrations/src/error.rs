@@ -74,6 +74,41 @@ pub enum MigrationSafetyError {
         /// Its identifier.
         id: String,
     },
+    /// A batch's statement failed and the job was stopped in `failed` carrying the message.
+    ///
+    /// Its own variant because the API has to answer **500 with the job's name**, not a bare
+    /// database error: a backfill is the migration author`'s SQL, so nobody but the platform's own
+    /// logs can say which statement broke, and "the migration failed" is not actionable. The
+    /// `WHERE state in ('pending','running')` guard in the writer is what makes the state honest —
+    /// a job an operator paused in the same second keeps its `paused` state and its cursor, because
+    /// the failure never got to run against it.
+    #[error("backfill job `{job}` failed: {error}")]
+    BatchFailed {
+        /// The job's name, which is the migration author's identifier for their own statement.
+        job: String,
+        /// The database's own message, kept verbatim: it names the constraint or the column.
+        error: String,
+    },
+    /// A request that is well-formed but illegal from the row's current state.
+    ///
+    /// Its own variant rather than a `PolicyViolation`, because the two answer different questions
+    /// and an API body cannot: a policy violation is "this installation's rules forbid this" —
+    /// `422`, and no retry changes it — while an illegal transition is "the resource moved" —
+    /// `409`, and the caller's correct next move is to re-read the state and decide. Resuming a
+    /// `completed` backfill is not a malformed request; it is a request that arrived one state too
+    /// late. Folding it into `PolicyViolation` also read as an operator misconfiguration, which
+    /// sends someone to the policy screen instead of back to the job.
+    #[error("{subject} is `{state}` and cannot become `{requested}`: {reason}")]
+    IllegalTransition {
+        /// What the transition is about (`backfill job`, …).
+        subject: &'static str,
+        /// The state the row is actually in.
+        state: String,
+        /// The state that was asked for.
+        requested: String,
+        /// Why that pair is refused, in words an operator can act on.
+        reason: String,
+    },
 }
 
 impl MigrationSafetyError {

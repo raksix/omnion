@@ -70,6 +70,27 @@ pub fn migration_error(error: omnion_migrations::MigrationSafetyError) -> ApiErr
         }
         E::UnknownMigration { version } => ApiError::not_found("migration", version),
         E::NotFound { what, id } => ApiError::not_found(what, id),
+        E::IllegalTransition {
+            subject,
+            state,
+            requested,
+            reason,
+        } => ApiError::new(
+            StatusCode::CONFLICT,
+            "illegal_state_transition",
+            format!("{subject} is `{state}` and cannot become `{requested}` — {reason}"),
+        ),
+        // 500, not 422: nothing about the request was wrong, and no retry of the SAME request will
+        // help. The message carries the job name because a backfill's statement belongs to the
+        // migration author and nobody else can identify it from a generic database error.
+        E::BatchFailed { job, error } => {
+            tracing::error!(backfill = %job, error = %error, "a backfill batch failed");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backfill_batch_failed",
+                format!("backfill job `{job}` failed and was stopped: {error}"),
+            )
+        }
         E::AlreadyVerified { version } => ApiError::new(
             StatusCode::CONFLICT,
             "migration_already_verified",

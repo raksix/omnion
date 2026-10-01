@@ -1,0 +1,21 @@
+{
+  "name": "fixture",
+  "description": "The deterministic dataset the integration tests and the QA walkthrough read. Generated from the same descriptors as minimal and demo, so a test and a walkthrough see the same world and a failure can be told from fixture drift.",
+  "row_estimate": 23,
+  "compatible_from": "0206",
+  "compatible_to": "0207",
+  "statements": [
+    "insert into sites (id, organization_id, key, name, status, theme) select gen_random_uuid(), anchor.organization_id, 'fixture', 'Fixture site', 'active', 'minimal' from (select id as organization_id from organizations order by created_at desc limit 1) anchor where not exists (select 1 from sites s where s.organization_id = anchor.organization_id and s.key = 'fixture')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'home', 'page', 'published' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'home')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'about', 'page', 'published' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'about')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'pricing', 'page', 'published' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'pricing')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'docs', 'page', 'published' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'docs')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'blog', 'page', 'published' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'blog')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'contact', 'page', 'published' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'contact')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'changelog', 'page', 'published' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'changelog')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'draft-note', 'page', 'draft' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'draft-note')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'old-post', 'post', 'archived' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'old-post')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'fixture-post-one', 'post', 'published' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'fixture-post-one')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'fixture-post-two', 'post', 'published' from sites s where s.key = 'fixture' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'fixture-post-two')"
+  ]
+}
