@@ -130,8 +130,8 @@ pub async fn resolve(pool: &PgPool, organization_id: Option<Uuid>) -> Result<Enf
         // `{}` and `null` both parse as the default, and both mean "nobody has saved one here".
         // That is the one case where the default IS the answer rather than a last resort, so it
         // is checked by hand rather than inferred from the parse succeeding.
-        let unwritten = stored.is_null()
-            || stored.as_object().is_some_and(serde_json::Map::is_empty);
+        let unwritten =
+            stored.is_null() || stored.as_object().is_some_and(serde_json::Map::is_empty);
         if !unwritten {
             return Ok(EnforcedLockout::from(&policy));
         }
@@ -200,7 +200,10 @@ mod tests {
             lockout_minutes: 15,
             window_seconds: 3_600,
         };
-        let day = EnforcedLockout { window_seconds: 86_400, ..hour };
+        let day = EnforcedLockout {
+            window_seconds: 86_400,
+            ..hour
+        };
         assert_ne!(hour.window_seconds, day.window_seconds);
     }
 }

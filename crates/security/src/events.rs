@@ -297,7 +297,10 @@ pub fn query_spec(query: &EventQuery) -> QuerySpec {
         push("action ilike", Some(format!("%{term}%")));
     }
     if let Some(category) = query.category {
-        push("action like", Some(format!("{}%", category_prefix(category))));
+        push(
+            "action like",
+            Some(format!("{}%", category_prefix(category))),
+        );
     }
     if let Some(since) = query.since {
         values.push(Some(format!("{since}")));
@@ -308,10 +311,7 @@ pub fn query_spec(query: &EventQuery) -> QuerySpec {
         clauses.push(format!("created_at <= ${}", values.len()));
     }
 
-    QuerySpec {
-        clauses,
-        values,
-    }
+    QuerySpec { clauses, values }
 }
 
 /// The SQL fragment and the values it binds, with their placeholders already numbered.
@@ -486,7 +486,10 @@ mod tests {
 
     #[test]
     fn the_category_filter_prefixes_the_audit_namespace() {
-        assert_eq!(category_prefix(EventCategory::IpRuleChange), "security.ip_rule%");
+        assert_eq!(
+            category_prefix(EventCategory::IpRuleChange),
+            "security.ip_rule%"
+        );
         assert_eq!(category_prefix(EventCategory::Lockout), "security.lockout%");
         assert_eq!(category_prefix(EventCategory::SettingsChange), "security.%");
     }
@@ -512,7 +515,14 @@ mod tests {
         });
         let summary = summarise_metadata(&metadata).expect("the safe keys remain");
         assert!(summary.contains("cidr="), "{summary} lost a safe key");
-        for needle in ["secret", "authorization", "password", "whsec", "Bearer", "hunter2"] {
+        for needle in [
+            "secret",
+            "authorization",
+            "password",
+            "whsec",
+            "Bearer",
+            "hunter2",
+        ] {
             assert!(
                 !summary.contains(needle),
                 "{summary} still mentions {needle} — a credential must leave nothing behind"
@@ -525,7 +535,10 @@ mod tests {
         let metadata = serde_json::json!({ "token": "abc" });
         assert_eq!(summarise_metadata(&metadata), None);
         assert_eq!(summarise_metadata(&serde_json::json!({})), None);
-        assert_eq!(summarise_metadata(&serde_json::json!("not an object")), None);
+        assert_eq!(
+            summarise_metadata(&serde_json::json!("not an object")),
+            None
+        );
     }
 
     #[test]

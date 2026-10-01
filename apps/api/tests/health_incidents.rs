@@ -36,7 +36,7 @@
 #![allow(clippy::too_many_lines)]
 
 use omnion_health::{
-    BREACH_WINDOW_SECONDS, SettingsUpdate, Threshold, Transition, breach_window, Thresholds,
+    BREACH_WINDOW_SECONDS, SettingsUpdate, Threshold, Thresholds, Transition, breach_window,
 };
 use omnion_identity::{NewUser, users};
 use sqlx::PgPool;
@@ -101,10 +101,12 @@ impl Harness {
         // outlives the `drop database` and the drop blocks on its own backend.
         self.db.pool().close().await;
         let database = self.database;
-        sqlx::query(&format!(r#"drop database if exists "{database}" with (force)"#))
-            .execute(self.maintenance.pool())
-            .await
-            .expect("the temporary database must be removed");
+        sqlx::query(&format!(
+            r#"drop database if exists "{database}" with (force)"#
+        ))
+        .execute(self.maintenance.pool())
+        .await
+        .expect("the temporary database must be removed");
     }
 }
 
@@ -148,10 +150,14 @@ async fn emit(
     report: &omnion_health::ServiceReport,
     at: OffsetDateTime,
 ) -> Option<Transition> {
-    let suppressed = omnion_health::is_suppressed(pool, &report.service, at).await.unwrap();
+    let suppressed = omnion_health::is_suppressed(pool, &report.service, at)
+        .await
+        .unwrap();
     match omnion_health::detect(pool, report).await.unwrap() {
         Some(transition) => {
-            omnion_health::apply(pool, &transition, suppressed).await.unwrap();
+            omnion_health::apply(pool, &transition, suppressed)
+                .await
+                .unwrap();
             Some(transition)
         }
         None => None,
@@ -208,10 +214,15 @@ async fn a_steady_outage_opens_one_incident_and_not_one_per_run() {
     // Three runs of the same state, exactly what a 60-second interval produces for a disk that
     // stays over the line. The first opens; the other two find an open incident and do nothing.
     let first = emit(&pool, &report("redis", "down", "connection refused"), now()).await;
-    assert!(first.is_some(), "the first failing run has to open an incident");
+    assert!(
+        first.is_some(),
+        "the first failing run has to open an incident"
+    );
     for _ in 0..2 {
         assert!(
-            emit(&pool, &report("redis", "down", "connection refused"), now()).await.is_none(),
+            emit(&pool, &report("redis", "down", "connection refused"), now())
+                .await
+                .is_none(),
             "a second run of the same state is not an event"
         );
     }
@@ -223,15 +234,24 @@ async fn a_steady_outage_opens_one_incident_and_not_one_per_run() {
         "360 runs of one outage must be one row, not 360 — otherwise the table's duration \
          column answers with the check interval"
     );
-    assert!(rows[0].is_open(), "it must still be open: nothing has recovered");
-    assert_eq!(rows[0].from_state, "healthy", "the platform had no record of it being broken");
+    assert!(
+        rows[0].is_open(),
+        "it must still be open: nothing has recovered"
+    );
+    assert_eq!(
+        rows[0].from_state, "healthy",
+        "the platform had no record of it being broken"
+    );
     assert_eq!(rows[0].to_state, "down");
 
     // The mechanism, not just the outcome: a `detect` that returned `None` for everybody would
     // leave zero rows and pass the "no duplicates" half of this assertion while hiding the
     // feature entirely. So the read is asked for one incident by id as well.
     let by_id = omnion_health::incident(&pool, rows[0].id).await.unwrap();
-    assert_eq!(by_id.id, rows[0].id, "the list row and the detail read are the same incident");
+    assert_eq!(
+        by_id.id, rows[0].id,
+        "the list row and the detail read are the same incident"
+    );
 
     harness.dispose().await;
 }
@@ -259,13 +279,21 @@ async fn recovery_resolves_with_a_duration_the_database_computed() {
         .await
         .unwrap()
         .expect("a recovery from a worse state is an event");
-    assert!(outcome.is_recovery(), "degraded → healthy closes the incident");
+    assert!(
+        outcome.is_recovery(),
+        "degraded → healthy closes the incident"
+    );
     omnion_health::apply(&pool, &outcome, false).await.unwrap();
 
     let row = open_incidents(&pool, "postgres").await.remove(0);
-    assert!(!row.is_open(), "the open incident is the one the recovery closed");
+    assert!(
+        !row.is_open(),
+        "the open incident is the one the recovery closed"
+    );
 
-    let resolved_at = row.resolved_at.expect("a recovery stores a resolution time");
+    let resolved_at = row
+        .resolved_at
+        .expect("a recovery stores a resolution time");
     let elapsed = (resolved_at - row.started_at).whole_seconds();
     assert!(
         (400..=460).contains(&elapsed),
@@ -299,7 +327,11 @@ async fn an_acknowledgement_names_the_actor_and_survives_a_reread() {
     let acked = omnion_health::acknowledge(&pool, id, actor, "restarting the bucket now")
         .await
         .unwrap();
-    assert_eq!(acked.acknowledged_by, Some(actor), "the note records who looked");
+    assert_eq!(
+        acked.acknowledged_by,
+        Some(actor),
+        "the note records who looked"
+    );
     assert!(acked.acknowledged_at.is_some());
     assert_eq!(acked.note.as_deref(), Some("restarting the bucket now"));
 
@@ -307,22 +339,35 @@ async fn an_acknowledgement_names_the_actor_and_survives_a_reread() {
     // screen opens the incident in a new request, and a value that only existed in the PATCH's
     // response would render as "not acknowledged" on every open.
     let reread = omnion_health::incident(&pool, id).await.unwrap();
-    assert_eq!(reread.acknowledged_by, Some(actor), "it has to persist, not just return");
-    assert!(reread.is_open(), "acknowledging is not resolving — the outage is still open");
+    assert_eq!(
+        reread.acknowledged_by,
+        Some(actor),
+        "it has to persist, not just return"
+    );
+    assert!(
+        reread.is_open(),
+        "acknowledging is not resolving — the outage is still open"
+    );
 
     // A second acknowledgement **takes over** rather than being refused, because a shift handover
     // is the ordinary case and not an attack: the newest claim is the current one, and the screen
     // shows that operator. The alternative (`and acknowledged_by is null`) reads like a lock and
     // refuses the one interaction this table exists to support.
     let other = account(&pool).await;
-    omnion_health::acknowledge(&pool, id, other, "handing over").await.unwrap();
+    omnion_health::acknowledge(&pool, id, other, "handing over")
+        .await
+        .unwrap();
     let handover = omnion_health::incident(&pool, id).await.unwrap();
     assert_eq!(
         handover.acknowledged_by,
         Some(other),
         "the newest claim is the one on the row"
     );
-    assert_eq!(handover.note.as_deref(), Some("handing over"), "and its note replaces the old one");
+    assert_eq!(
+        handover.note.as_deref(),
+        Some("handing over"),
+        "and its note replaces the old one"
+    );
     assert!(
         handover.resolved_at.is_none(),
         "acknowledging never resolves — a handover claims the incident, it does not close the \
@@ -331,7 +376,9 @@ async fn an_acknowledgement_names_the_actor_and_survives_a_reread() {
 
     // An acknowledgement of a row that does not exist is refused by id, not silently a no-op.
     assert!(
-        omnion_health::acknowledge(&pool, Uuid::new_v4(), actor, "ghost").await.is_err(),
+        omnion_health::acknowledge(&pool, Uuid::new_v4(), actor, "ghost")
+            .await
+            .is_err(),
         "a missing incident must be an error rather than a successful no-op"
     );
 
@@ -362,7 +409,9 @@ async fn a_maintenance_window_suppresses_the_incident_and_keeps_the_state() {
     .unwrap();
 
     assert!(
-        omnion_health::is_suppressed(&pool, "redis", at).await.unwrap(),
+        omnion_health::is_suppressed(&pool, "redis", at)
+            .await
+            .unwrap(),
         "an empty services array covers every service — it is the deploy case"
     );
 
@@ -370,7 +419,9 @@ async fn a_maintenance_window_suppresses_the_incident_and_keeps_the_state() {
         .await
         .unwrap()
         .expect("the outage still happened");
-    let outcome = omnion_health::apply(&pool, &transition, true).await.unwrap();
+    let outcome = omnion_health::apply(&pool, &transition, true)
+        .await
+        .unwrap();
     let incident = outcome.incident().expect("the incident is still recorded");
 
     assert!(
@@ -393,18 +444,24 @@ async fn a_maintenance_window_suppresses_the_incident_and_keeps_the_state() {
     .execute(&pool)
     .await
     .unwrap();
-    let state: String =
-        sqlx::query_scalar("select state from health_samples where service = 'redis' order by sampled_at desc limit 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(state, "down", "the sample still records the outage the window suppressed");
+    let state: String = sqlx::query_scalar(
+        "select state from health_samples where service = 'redis' order by sampled_at desc limit 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        state, "down",
+        "the sample still records the outage the window suppressed"
+    );
 
     // Outside the window the same service is not suppressed — a window that never expires is a
     // mute switch.
     let later = at + time::Duration::hours(1);
     assert!(
-        !omnion_health::is_suppressed(&pool, "redis", later).await.unwrap(),
+        !omnion_health::is_suppressed(&pool, "redis", later)
+            .await
+            .unwrap(),
         "the window ends; suppression cannot be permanent"
     );
 
@@ -446,11 +503,16 @@ async fn a_breach_fires_once_per_window_and_a_return_clears_it() {
     // been happening for 12 runs" instead of listing three identical rows.
     let mut announced = 0;
     for _ in 0..3 {
-        let check = omnion_health::record_breach(&pool, "disk_percent", 93.0, at).await.unwrap();
+        let check = omnion_health::record_breach(&pool, "disk_percent", 93.0, at)
+            .await
+            .unwrap();
         if check.should_announce() {
             announced += 1;
         }
-        assert_eq!(check.crit_limit, 90.0, "the row carries the limit it crossed");
+        assert_eq!(
+            check.crit_limit, 90.0,
+            "the row carries the limit it crossed"
+        );
     }
     assert_eq!(
         announced, 1,
@@ -458,18 +520,23 @@ async fn a_breach_fires_once_per_window_and_a_return_clears_it() {
          forgets itself on restart and re-fires on the first run after a deploy"
     );
 
-    let rows: i64 =
-        sqlx::query_scalar("select count(*)::bigint from health_breaches where metric = 'disk_percent'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(rows, 1, "the counter updates one row rather than inserting one per interval");
+    let rows: i64 = sqlx::query_scalar(
+        "select count(*)::bigint from health_breaches where metric = 'disk_percent'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows, 1,
+        "the counter updates one row rather than inserting one per interval"
+    );
 
-    let observations: i32 =
-        sqlx::query_scalar("select observations from health_breaches where metric = 'disk_percent'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let observations: i32 = sqlx::query_scalar(
+        "select observations from health_breaches where metric = 'disk_percent'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(observations, 3, "and it knows how many runs it has seen");
 
     // The next window is its own event: the disk came back, then filled again.
@@ -483,14 +550,19 @@ async fn a_breach_fires_once_per_window_and_a_return_clears_it() {
     );
 
     // Recovery resolves the row rather than deleting it, so "how long was it over" survives.
-    omnion_health::clear_breach(&pool, "disk_percent", at).await.unwrap();
+    omnion_health::clear_breach(&pool, "disk_percent", at)
+        .await
+        .unwrap();
     let resolved: Option<OffsetDateTime> =
         sqlx::query_scalar("select resolved_at from health_breaches where metric = 'disk_percent' and window_start = $1")
             .bind(breach_window(at))
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(resolved.is_some(), "the history is the product — a delete would lose the count");
+    assert!(
+        resolved.is_some(),
+        "the history is the product — a delete would lose the count"
+    );
 
     harness.dispose().await;
 }
@@ -546,11 +618,12 @@ async fn an_unconfigured_threshold_never_breaches() {
         "the refusal names the metric: {err}"
     );
 
-    let rows: i64 =
-        sqlx::query_scalar("select count(*)::bigint from health_breaches where metric = 'memory_percent'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let rows: i64 = sqlx::query_scalar(
+        "select count(*)::bigint from health_breaches where metric = 'memory_percent'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         rows, 0,
         "and nothing was written — defaulting to the suggestion would open incidents on a \
@@ -627,12 +700,20 @@ fn the_threshold_pair_refuses_what_the_database_refuses() {
     // pair is `Threshold::new("workers", 2.0, 1.0, "below")` — 2 above 1 — and a validator that
     // demands warn < crit unconditionally refuses every valid `below` threshold in the product.
     let above = Threshold::new("disk_percent", 80.0, 90.0, "above").unwrap();
-    assert_eq!(above.classify(10.0), None, "under the warn line is 'no opinion'");
+    assert_eq!(
+        above.classify(10.0),
+        None,
+        "under the warn line is 'no opinion'"
+    );
     assert_eq!(above.classify(85.0), Some("degraded"));
     assert_eq!(above.classify(95.0), Some("down"));
 
     let below = Threshold::new("workers", 2.0, 1.0, "below").unwrap();
-    assert_eq!(below.classify(4.0), None, "four workers out of four is fine");
+    assert_eq!(
+        below.classify(4.0),
+        None,
+        "four workers out of four is fine"
+    );
     assert_eq!(below.classify(2.0), Some("degraded"));
     assert_eq!(below.classify(0.0), Some("down"));
 
@@ -644,12 +725,20 @@ fn the_threshold_pair_refuses_what_the_database_refuses() {
     );
 
     // A non-finite reading is **not** classified at all. This is the deliberate early return rather
-// than an accident of comparison: `NaN >= 90` is false and `inf.is_finite()` is false, so a
-// classifier that relied on the comparisons alone would put `NaN` in the same bucket as a healthy
-// reading — "no opinion" — which is precisely the reading that must never come from a broken
-// sensor. Asserted on purpose so the guard is not removed as dead code.
-assert_eq!(above.classify(f64::NAN), None, "a broken sensor is not a healthy metric");
-assert_eq!(above.classify(f64::INFINITY), None, "and infinity is not a reading either");
+    // than an accident of comparison: `NaN >= 90` is false and `inf.is_finite()` is false, so a
+    // classifier that relied on the comparisons alone would put `NaN` in the same bucket as a healthy
+    // reading — "no opinion" — which is precisely the reading that must never come from a broken
+    // sensor. Asserted on purpose so the guard is not removed as dead code.
+    assert_eq!(
+        above.classify(f64::NAN),
+        None,
+        "a broken sensor is not a healthy metric"
+    );
+    assert_eq!(
+        above.classify(f64::INFINITY),
+        None,
+        "and infinity is not a reading either"
+    );
 }
 
 fn now() -> OffsetDateTime {
