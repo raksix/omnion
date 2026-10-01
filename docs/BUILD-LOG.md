@@ -6959,3 +6959,49 @@ findings measured against a database that was dropped underneath the walk.
   concurrency proof, the CI gate job on a seeded fixture with a hand-broken down fixture, then the
   policy and lock screens. The w6 walkthrough ran this tick (120 pages) but its result has not
   been read; this tick's changes are CLI- and crate-side and add no screen.
+
+## Tick 48 · REQ-129 slice 1: the ledger's HTTP surface, and a future that was never `Send` (660c689a, cfed4cad, 012ba0cd, 80043692)
+
+- **What.** `apps/api/src/routes/migrations.rs` — eight routes over the runner the CLI and the
+  deploy job already use: the ledger, one migration, the plan, the lock, the violations, the
+  policy, the apply and the reversal rehearsal. Three permission keys rather than one
+  (`deployment.migrations.read` / `.apply` / `.verify`), because applying DDL is not
+  `deployment.deploy` and proving the rollback path is neither. `/deployment/migrations` and
+  `/deployment/migrations/{version}` in the panel, in the desktop and 390px route lists and in
+  `DEPLOYMENT_SCREENS`, plus a depth pass that opens the detail screen from a row the ledger
+  actually rendered.
+- **Proof.** `cargo test -p omnion-migrations` → **66 passed, 0 failed**. `cargo test
+  -p omnion-permissions` → **67 passed, 0 failed** (the new catalogue test is load-bearing).
+  `cargo check -p omnion-api --lib` → clean. `pnpm typecheck` (apps/admin) → clean.
+  `apps/api/tests/migration_ledger.rs` walks the router: the three powers are three powers, the
+  pending set is non-empty on a fully migrated database, the plan writes no ledger row and no
+  journal row, a rejected policy save leaves the previous policy in place, and a rehearsal aimed
+  at the live database is refused with the live tables still there.
+- **The defect this tick cost most of its time, and it is worth the whole tick.** `runner::apply`
+  was **not `Send`**, and nothing in the crate could see it: the CLI awaits it on the current
+  thread, and every unit test does too. The first caller that needs `Send` is an HTTP handler,
+  and the error it produces is `the trait Handler<_, _> is not implemented` — which names no
+  argument, no line and no cause. The real complaint is `implementation of Send is not general
+  enough`, and four separate borrows held across the runner's await points each produced it:
+  `sqlx::query(&format!(...))` for the two `set local` statements, `&plan.pending` iterated by
+  reference with `&MigrationFile` looked up by reference, `&PgPool` / `&str` / `&Value` on the
+  journal and ledger helpers, and `pool.acquire()` then `begin()` holding a `&mut PgConnection`
+  across the migration. Taking each by value fixed three of the four.
+- **The fourth is sqlx's, not ours, and the answer is architectural.** `sqlx::Transaction<'_, Postgres>`
+  is `!Send` in sqlx 0.8 — the transaction holds a connection borrow the compiler cannot prove
+  `Send` — so no future owning one can be spawned, and `spawn_blocking` needs `Send` too. The
+  apply and the rehearsal therefore run on a **dedicated thread with its own runtime**. That is
+  also the right shape for the work rather than a workaround: DDL blocks a thread by design, and
+  a migration holding `ACCESS EXCLUSIVE` for 400 ms should not sit on an async worker while it
+  does.
+- **A measurement trap worth recording twice.** The obvious assertion — `fn is_send<T: Send>(_: &T)`
+  — is itself a higher-ranked bound over a *borrowed* argument, which is a stricter and different
+  question, and it reports the identical "not general enough" error against a future that IS
+  `Send`. It cost several rounds of bisection before the difference between "the future is not
+  `Send`" and "my checker cannot express the question" was separated. A checker has to be able to
+  fail for the right reason or it is not a checker.
+- **Next.** The two-concurrent-runners proof against one database, then the CI gate job on a
+  seeded fixture with a hand-broken down script (`up → down → up` and a structure comparison that
+  catches it), then the upgrade-helper's no-rollback marking. The browser pass over the two new
+  screens has not run yet: five sibling writers hold QA passes on this box and this loop's own
+  slot holder from tick 47 died without releasing, so the pass is queued rather than contended.

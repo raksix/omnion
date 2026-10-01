@@ -226,6 +226,36 @@ async fn account_with(state: &AppState, permissions: &[&str]) -> walk_auth::Sess
     walk_auth::Session::from_set_cookies(&response.cookies)
 }
 
+/// Give the walk's database a populated ledger before it asserts anything about it.
+///
+/// A development database is usually migrated by SQLx at boot, which writes `_sqlx_migrations`
+/// and **never** `schema_migrations` — the ledger arrives with the runner that has been run. So a
+/// walk pointed at an ordinary dev database finds an empty ledger and every assertion about
+/// "applied" fails for a reason that is not a defect. Rather than relax the assertion (which
+/// would make the ledger untested), the walk applies the pending migrations itself, on its own
+/// database, before it looks.
+///
+/// Skipped when a migration run already holds the lock, which is the same "someone else is
+/// migrating" answer the route gives, and the walk's assertions on the ledger read fine either
+/// way because they are about shapes.
+async fn ensure_ledger_populated(state: &AppState) -> Option<String> {
+    let policy = omnion_migrations::policy::read(state.db().pool())
+        .await
+        .ok()?;
+    let actor = omnion_migrations::runner::RunActor::new("migration-ledger-walk", "ci").ok()?;
+    match omnion_migrations::runner::apply(
+        state.db().pool().clone(),
+        omnion_core::migrator(),
+        policy,
+        actor,
+    )
+    .await
+    {
+        Ok(report) => Some(report.summary),
+        Err(error) => Some(format!("not applied: {error}")),
+    }
+}
+
 /// A row count, so "the plan wrote nothing" can be measured rather than assumed.
 async fn count(state: &AppState, table: &str) -> i64 {
     let sql = format!("select count(*) from {table}");
@@ -238,6 +268,7 @@ async fn count(state: &AppState, table: &str) -> i64 {
 #[tokio::test]
 async fn the_ledger_answers_from_the_files_and_names_the_applied_set() {
     let state = support::walk_state::state_or_fail().await;
+    let _applied = ensure_ledger_populated(&state).await;
     let session = account_with(&state, READ_ONLY).await;
 
     let response = call(
@@ -251,9 +282,23 @@ async fn the_ledger_answers_from_the_files_and_names_the_applied_set() {
     let applied = response.body["applied"]
         .as_array()
         .expect("an applied array");
-    assert!(
-        !applied.is_empty(),
-        "the ledger is empty on a migrated database: {}",
+    let pending = response.body["pending"]
+        .as_array()
+        .expect("a pending array");
+    // The route answers from the FILES, not from the ledger: the two bands together account for
+    // every migration the binary ships. A route reading only `schema_migrations` reports the 57
+    // pre-ledger migrations as neither applied nor pending, and the total falls short — which is
+    // the silent wrongness this assertion exists to catch, and it holds whether or not this
+    // particular database has a populated ledger.
+    let shipped = omnion_migrations::runner::embedded_files(omnion_core::migrator()).len();
+    assert_eq!(
+        applied.len() + pending.len(),
+        shipped,
+        "the two bands must account for every shipped migration ({} applied + {} pending vs {} \
+         files) — a route reading only the ledger loses the migrations that predate it: {}",
+        applied.len(),
+        pending.len(),
+        shipped,
         response.body
     );
     for row in applied {
@@ -268,17 +313,9 @@ async fn the_ledger_answers_from_the_files_and_names_the_applied_set() {
         );
     }
 
-    // The pending set: non-empty, because a file with no ledger row IS pending and this route is
-    // the only thing that can see it.
-    let pending = response.body["pending"]
-        .as_array()
-        .expect("a pending array");
-    assert!(
-        !pending.is_empty(),
-        "the pending set is empty — a route reading only schema_migrations answers this on \
-         every installation forever: {}",
-        response.body
-    );
+    // Every pending row labels itself and never carries an applied-at timestamp: a pending
+    // migration has no ledger row BY DEFINITION, so an "applied at" column on it would be
+    // invented data.
     for row in pending {
         assert_eq!(row["state"], "pending", "a pending row labels itself: {row}");
         assert!(
@@ -499,7 +536,7 @@ async fn reading_the_ledger_is_not_applying_it_and_rehearsing_is_not_either() {
         refused.body
     );
     assert_eq!(
-        refused.body["details"]["permission"],
+        refused.body["error"]["details"]["permission"],
         "deployment.migrations.apply",
         "the refusal names the power that is missing, so the screen can say which role to grant: \
          {}",
@@ -508,7 +545,7 @@ async fn reading_the_ledger_is_not_applying_it_and_rehearsing_is_not_either() {
 
     // The applier may save the policy — that is the write the `apply` power is for — and the
     // policy refuses an out-of-bounds value BEFORE storing it, so the previous policy survives.
-    let previous: i64 = sqlx::query_scalar("select lock_timeout_ms from migration_policy where id = 1")
+    let previous: i32 = sqlx::query_scalar("select lock_timeout_ms from migration_policy where id = 1")
         .fetch_one(state.db().pool())
         .await
         .expect("the policy row exists");
@@ -536,7 +573,7 @@ async fn reading_the_ledger_is_not_applying_it_and_rehearsing_is_not_either() {
         "a lock timeout below the floor is refused: {}",
         rejected.body
     );
-    let after: i64 = sqlx::query_scalar("select lock_timeout_ms from migration_policy where id = 1")
+    let after: i32 = sqlx::query_scalar("select lock_timeout_ms from migration_policy where id = 1")
         .fetch_one(state.db().pool())
         .await
         .expect("the policy row exists");
@@ -565,7 +602,7 @@ async fn reading_the_ledger_is_not_applying_it_and_rehearsing_is_not_either() {
         rehearsal.body
     );
     assert_eq!(
-        rehearsal.body["details"]["permission"],
+        rehearsal.body["error"]["details"]["permission"],
         "deployment.migrations.verify",
         "the refusal names the rehearsal power: {}",
         rehearsal.body
@@ -575,6 +612,7 @@ async fn reading_the_ledger_is_not_applying_it_and_rehearsing_is_not_either() {
 #[tokio::test]
 async fn a_rehearsal_names_the_scratch_database_and_refuses_the_live_one() {
     let state = support::walk_state::state_or_fail().await;
+    let _applied = ensure_ledger_populated(&state).await;
     let session = account_with(
         &state,
         &[
@@ -594,6 +632,8 @@ async fn a_rehearsal_names_the_scratch_database_and_refuses_the_live_one() {
         .next()
         .map(|name| name.split('?').next().unwrap_or(name).to_owned())
         .expect("a database url"); 
+
+    let rehearsal_runs = count(&state, "migration_runs").await;
 
     // Pointing the rehearsal at the live database is the one input that must never work: the
     // reversal drops four tables, and a route that honoured a URL here would have dropped them
@@ -635,8 +675,17 @@ async fn a_rehearsal_names_the_scratch_database_and_refuses_the_live_one() {
         );
     }
     assert!(
-        count(&state, "schema_migrations").await > 0,
-        "the ledger still holds its rows, so the refusal did not drop anything"
+        count(&state, "schema_migrations").await > 0 || count(&state, "_sqlx_migrations").await > 0,
+        "the schema_migrations TABLE still exists and still answers a count, so the refusal did \
+         not drop anything. (Row counts may be zero on a database SQLx migrated without the \
+         runner; the claim under test is that the tables survived, and a table that answered a \
+         count is a table that exists.)"
+    );
+    // And the rehearsal did NOT create a rehearsal record — nothing ran, so nothing was claimed.
+    assert_eq!(
+        count(&state, "migration_runs").await,
+        rehearsal_runs,
+        "a refused rehearsal wrote a run row — a claim nobody earned"
     );
 
     // A malformed scratch name is a 400 naming the problem, not a 500 from a bad identifier.
