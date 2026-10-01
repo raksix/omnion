@@ -80,6 +80,7 @@ pub mod cdn_purge;
 pub mod commands;
 pub mod content;
 pub mod deployment;
+pub mod deployment_ops;
 pub mod deployment_run;
 pub mod environments;
 pub mod health;
@@ -1140,6 +1141,25 @@ pub fn router(state: AppState) -> Router {
             get(deployment_run::poll_log).layer(guards::require(&state, "deployment.read")),
         );
 
+    // Rollback and the maintenance window (REQ-024, slice 3).
+    //
+    // Rollback is `deployment.rollback` — its own key, not `deployment.manage`, because the
+    // request's permission table says so and because the two deserve different answers when
+    // they are missing: an operator who may deploy but not roll back is a normal configuration
+    // (they fix forward), and an operator who may roll back but not deploy is another (they
+    // handle incidents). One key for both would make one of those configurations impossible.
+    let deployment_rollback = post(deployment_ops::start_rollback)
+        .layer(guards::require(&state, "deployment.rollback"));
+    // The window is read by every admin session (the shell banner) and written by
+    // `deployment.maintenance`, which is a *different* key from `deployment.manage` on purpose:
+    // opening a maintenance window is what an operator does *instead of* deploying, and
+    // requiring the deploy key to stop the world would mean the only people allowed to pause a
+    // release are the ones allowed to start one.
+    let deployment_maintenance = get(deployment_ops::list_maintenance)
+        .layer(guards::require(&state, "deployment.read"));
+    let deployment_maintenance_one = put(deployment_ops::update_maintenance)
+        .layer(guards::require(&state, "deployment.maintenance"));
+
     // Staging environments (REQ-017). Reading the list and one environment is `deployment.read`;
     // creating one, re-cloning it and cancelling a clone is `deployment.preview`; archiving one
     // is `deployment.rollback`. Three keys rather than one, because looking at a staging copy,
@@ -2025,6 +2045,15 @@ pub fn router(state: AppState) -> Router {
         .route("/deployment/checks/run", deployment_checks_run)
         .route("/deployment/jobs/{id}", deployment_job)
         .route("/deployment/jobs/{id}/log", deployment_job_log)
+        .route("/deployment/environments/{environment}/rollback", deployment_rollback)
+        .route("/deployment/maintenance", deployment_maintenance)
+        // The per-environment window is a `PUT` on its own path rather than a body field on the
+        // list route: the shell banner polls the list in every session, and a poll that could
+        // change a window would be a `GET` with a side effect.
+        .route(
+            "/deployment/maintenance/{environment}",
+            deployment_maintenance_one,
+        )
         .route("/environments", environments)
         .route("/environments/{id}", environment_one)
         .route("/environments/{id}/clone", environment_one_clone)

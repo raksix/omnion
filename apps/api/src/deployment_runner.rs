@@ -324,10 +324,82 @@ fn storage_to_step(error: omnion_deployment::StoreError) -> StepRefusal {
     StepRefusal::Storage(error.to_string())
 }
 
+/// Start a rollback in the background.
+///
+/// Same contract as [`spawn_deploy`] and the same `verify` step, because a rollback that cannot
+/// be verified is the one thing worse than no rollback: an operator who has just moved the
+/// instance back needs the history row to say whether it worked.
+///
+/// The three steps are [`ROLLBACK_STEPS`](omnion_deployment::plan_steps) — `backup`, `deploy`,
+/// `verify` — and **not** the deploy's four. A rollback has no `migrate` step, and that absence
+/// is load-bearing twice over: the older binary reads the append-only schema without any
+/// down-migration, and the cancel rule (`may_cancel`) treats a plan with no migrate step as
+/// cancellable throughout, so a rollback that has gone wrong can still be stopped instead of
+/// leaving the operator with only a second rollback to think about.
+pub fn spawn_rollback(pool: PgPool, id: Uuid, backup_first: bool) {
+    tokio::spawn(async move {
+        if let Err(error) = run_rollback(&pool, id, backup_first).await {
+            tracing::error!(deployment = %id, %error, "the rollback runner stopped");
+            let _ = jobs::mark_failed(&pool, id, &format!("the rollback runner stopped: {error}")).await;
+        }
+    });
+}
+
+/// Run a rollback's three steps, in order, to a terminal status.
+async fn run_rollback(pool: &PgPool, id: Uuid, backup_first: bool) -> Result<(), StepRefusal> {
+    let job = jobs::load_job(pool, id).await.map_err(storage_to_step)?;
+    let to_version = job
+        .to_version
+        .clone()
+        .unwrap_or_else(|| "the target version".to_string());
+    let environment = job.environment.clone();
+    let reason = job.reason.clone().unwrap_or_default();
+
+    // The reason goes into the log as the first line. It is mandatory in the route and in the
+    // table, and writing it here is what makes it readable three months later from the log pane
+    // alone — the history row is filtered, exported and eventually archived; the log is what an
+    // operator opens at 3am.
+    jobs::append_log(
+        pool,
+        id,
+        "backup",
+        &format!("rolling back: {reason}\n"),
+    )
+    .await?;
+
+    step(pool, id, "backup", || backup_step(pool, id, backup_first)).await?;
+
+    // A rollback does not "deploy the old build" — it records that it was asked to, and the
+    // release pipeline performs the switch, exactly as for a deploy. The wording says so, so an
+    // operator reading the pane is never told a binary moved when it did not.
+    step(pool, id, "deploy", || deploy_step(pool, id, &to_version)).await?;
+
+    let healthy = step(pool, id, "verify", || verify_step(pool, id, &environment, &to_version)).await?;
+
+    if healthy {
+        jobs::mark_succeeded(pool, id).await.map_err(storage_to_step)?;
+        let _ = audit_event(pool, "deployment.rolled_back", json_env(&environment, &to_version, id)).await;
+    } else {
+        let reason = format!(
+            "the verify step did not find {to_version} running; the log says which version this \
+             instance reports"
+        );
+        jobs::mark_failed(pool, id, &reason).await.map_err(storage_to_step)?;
+        let _ = audit_event(pool, "deployment.failed", json_env(&environment, &to_version, id)).await;
+    }
+    Ok(())
+}
+
 /// The step names a deploy of this kind runs, for the runner's own assertions and the docs.
 #[must_use]
 pub fn deploy_steps() -> &'static [&'static str] {
     omnion_deployment::plan_steps(JobKind::Deploy)
+}
+
+/// The step names a rollback runs.
+#[must_use]
+pub fn rollback_steps() -> &'static [&'static str] {
+    omnion_deployment::plan_steps(JobKind::Rollback)
 }
 
 #[cfg(test)]

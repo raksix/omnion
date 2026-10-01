@@ -134,7 +134,10 @@ pub struct DeployResponse {
 }
 
 /// A job, as the wizard's step 3 and the history expansion read it.
-#[derive(Debug, Serialize)]
+///
+/// `Clone` because the deploy and rollback responses both embed it, and a wrapper that cannot
+/// hold the body forces the second route to hand-roll a parallel struct that drifts.
+#[derive(Debug, Clone, Serialize)]
 pub struct JobBody {
     /// The job's id.
     pub id: Uuid,
@@ -171,7 +174,10 @@ pub struct JobBody {
 }
 
 /// One step of a job.
-#[derive(Debug, Serialize)]
+///
+/// `Clone` with its parent: `JobBody` derives it, and a step is the part a caller most often
+/// copies out on its own (the history expansion holds one job's steps beside another's).
+#[derive(Debug, Clone, Serialize)]
 pub struct StepBody {
     /// 0-based position.
     pub position: u32,
@@ -264,6 +270,12 @@ pub async fn start_deploy(
 ) -> Result<(StatusCode, Json<DeployResponse>), ApiError> {
     let pool = state.db().pool();
     let target = Target::new(environment);
+
+    // Before anything else, including the pre-flight: a deploy refused for a window must not
+    // have taken a backup or written an audit row saying it started. The window's own message
+    // is the `503` body, so the wizard can show the operator's words and not "service
+    // unavailable".
+    crate::routes::deployment_ops::refuse_deploy_during_window(&state, &target.environment).await?;
 
     let from_version = store_version(pool, &target.environment).await?;
     let to_version = body.to_version.trim().to_string();
@@ -1030,6 +1042,42 @@ async fn job_body(created: &CreatedJob, pool: &sqlx::PgPool) -> Result<JobBody, 
 }
 
 /// The version an environment is running, from its health row.
+/// The version an environment is running, from its health row.
+///
+/// `pub(crate)` because the rollback route needs the same read and must not grow a second
+/// query for it: two queries for one fact is how the two start disagreeing.
+pub(crate) async fn current_version(
+    pool: &sqlx::PgPool,
+    environment: &str,
+) -> Result<Option<String>, ApiError> {
+    store_version(pool, environment).await
+}
+
+/// The API body for a job that was just created, before the runner has moved it on.
+///
+/// Takes the environment explicitly because [`CreatedJob`] does not carry it — the row has it,
+/// but the struct is built from the step plan. Reading it back would be one more query on the
+/// hot path of every deploy, and a field that is already known to the caller.
+pub(crate) async fn created_job_body(
+    created: &CreatedJob,
+    pool: &sqlx::PgPool,
+    environment: &str,
+) -> Result<JobBody, ApiError> {
+    let mut body = job_body(created, pool).await?;
+    // Three fields the caller already knows and the body would otherwise leave empty: the
+    // freshly built body is synthesised from the step plan, so its versions and reason are
+    // `None`. A rollback banner that says "rolling back" with no reason and no from → to is
+    // the one screen where those three are the entire content.
+    let row = omnion_deployment::store::load_deployment(pool, created.id).await?;
+    body.environment = environment.to_string();
+    body.kind = JobKind::parse(&row.kind).unwrap_or(JobKind::Deploy);
+    body.from_version = row.from_version;
+    body.to_version = row.to_version;
+    body.reason = row.reason;
+    body.started_by = row.started_by;
+    Ok(body)
+}
+
 async fn store_version(
     pool: &sqlx::PgPool,
     environment: &str,
