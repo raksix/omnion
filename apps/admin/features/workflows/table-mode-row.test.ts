@@ -93,15 +93,17 @@ const REVERSE_READ = (() => {
   // harness test is a CONTRACT with the row, and the fix that satisfies the contract is
   // allowed to rename the row's variables.
   // The window OPENS at the navigation, not at the read. The waits that make the read safe sit
-  // BETWEEN the `goto` and the `evaluate`, so a window starting at the read excludes them and
-  // the assertion "the read must wait for the inspector" was red against a row that does — the
+  // BETWEEN the `goto` and the read, so a window starting at the read excludes them and the
+  // assertion "the read must wait for the inspector" was red against a row that does — the
   // tenth instance in this REQ of the one class this file keeps rediscovering: a window that
   // does not contain the construct its assertion is about.
-  // The `goto` is the LAST one before the read, so the search starts from the read's own
-  // position and walks BACK to the navigation that opened this direction. A forward search
-  // would find the block's FIRST `goto` (the one to the builder to read the table-mode link)
-  // and produce a window that spans the whole forward-direction section.
-  const readAt = BLOCK.indexOf("const canvasRead = await page");
+  //
+  // The anchor is now `const holder = perNode.find` — the read's REDUCTION, and the last thing
+  // before the note. It was `const canvasRead = await page`, and tick 59 replaced the `evaluate`
+  // with a click loop plus a plain-object reduction, so the anchor went stale. The fourth
+  // instance of this file's own rule: a fix may rename the row's variables, and an anchor pinned
+  // to one reports "the row is missing" when the row is right there.
+  const readAt = BLOCK.indexOf("const holder = perNode.find");
   assert.notEqual(readAt, -1, "the reverse-direction read must exist");
   const start = BLOCK.lastIndexOf(
     "await page.goto(`${admin}/workflows/${workflowId}/builder`",
@@ -115,6 +117,21 @@ const REVERSE_READ = (() => {
   return BLOCK.slice(start, end);
 })();
 
+/**
+ * The same window with the PROSE removed.
+ *
+ * The `waitForTimeout(1500)` assertion below was red against a row that has no fixed delay,
+ * because the window's own comment quotes the delay in order to say why it is wrong. A harness
+ * test that greps a window containing its own explanation will always find the mistake it is
+ * warning about — the test was reporting the comment, not the code, which is the same
+ * category as the prefix collision this file opened on (`data-inspector` inside
+ * `data-inspector-field`), one level up: a token that appears in a *mention* satisfies a claim
+ * made about a *use*.
+ */
+const REVERSE_CODE = REVERSE_READ.split("\n")
+  .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+  .join("\n");
+
 test("the reverse direction is read off the CANVAS, not off the server", () => {
   // The whole point of this file. The criterion's clause is about the canvas; a `fetch` answers
   // a different question and the `goto` above it makes the note look like it consulted one.
@@ -125,6 +142,54 @@ test("the reverse direction is read off the CANVAS, not off the server", () => {
   assert.ok(
     !/fetch\(`\/api\/v1\/workflows\/\$\{id\}\/graph`/.test(REVERSE_READ),
     "a fetch of the graph is a claim about the server; the criterion's clause is about the canvas",
+  );
+});
+
+test("the row SELECTS a card before reading the inspector — the gate is otherwise unsatisfiable", () => {
+  // THE FINDING OF THIS FILE'S THIRD DRAFT, and it is the same defect the other two tests here
+  // were written for, one level down: the read was moved off the wire but never made *possible*.
+  //
+  // `NodeInspector` renders under `{selectedNode ? <NodeInspector …/> : null}` — builder-view.tsx
+  // line 2745. Nothing selects a node when the builder opens, so on a **correct** product
+  // `document.querySelector('[data-inspector="…"]')` matches nothing: `inspected: 0`,
+  // `builderSeesTableEdit: false`, forever. A gate that no product state can satisfy is worse than
+  // no gate, because the next tick reads it as a defect and goes to "fix" correct code — the
+  // eighth reading in this REQ that was green-or-red against something other than the claim.
+  //
+  // M4 is the proof and it is the reason this test exists: deleting the click loop left every
+  // other assertion in this file green. Each of them asks *how* the panel is read; none asks
+  // *whether the row puts a node in a state where the panel exists at all*.
+  assert.ok(
+    /for \(const nodeId of cardIds\)/.test(REVERSE_READ),
+    "the row must walk the cards rather than inspect them all at once",
+  );
+  assert.ok(
+    /\.locator\(`\[data-node-id="\$\{nodeId\}"\]`\)[\s\S]*?\.click\(/.test(REVERSE_READ),
+    "each card must be CLICKED: the inspector only exists for a selected node, so a read that never selects one can never be satisfied",
+  );
+  assert.ok(
+    /waitForSelector\(`\[data-inspector="\$\{nodeId\}"\]`/.test(REVERSE_READ),
+    "and the wait must be for THAT node's panel, not for any inspector on the page",
+  );
+});
+
+test("the read reports CLICKED and MOUNTED separately, so the two failures stop sharing a number", () => {
+  // A canvas that drew no card at all and an inspector that refuses to mount both used to print
+  // `inspected: 0` — the same number for "nothing to inspect" and "inspecting found nothing" — so
+  // a red row could not say which half was broken and the next tick had to guess. This is the
+  // `inRunButNotPainted` lesson from tick 56 applied to a different row: a count that collapses
+  // two causes is not a diagnosis.
+  assert.ok(
+    /clicked: perNode\.length/.test(REVERSE_READ),
+    "the note must say how many cards the row actually opened",
+  );
+  assert.ok(
+    /inspected: perNode\.filter\(\(entry\) => entry\.mounted\)\.length/.test(REVERSE_READ),
+    "and how many of those showed an inspector — otherwise `0` means both 'empty canvas' and 'broken inspector'",
+  );
+  assert.ok(
+    /builderSeesTableEdit: holder !== null/.test(REVERSE_READ),
+    "the verdict must come from a node that was actually opened, not from a page-wide search",
   );
 });
 
@@ -156,13 +221,26 @@ test("the panel read is scoped to the NODE, not to the page", () => {
   // The distinguishing construct is the node-scoped SELECTOR, and the attribute name is not
   // enough: the fix here must interpolate the node id, because an inspector that rendered one
   // panel for whatever was last selected answers the same question for every node.
+  //
+  // The interpolating name moved with tick 59's rewrite. The read used to be one `evaluate` over
+  // the whole page and closed over `nodeId`; it is now a per-card call that receives
+  // `{ id, value }` as its argument — a page-side function cannot close over a Node-side loop
+  // variable, and had the id stayed implicit the callback would have thrown `nodeId is not
+  // defined` inside the browser rather than failing the assertion. So the assertion matches the
+  // SELECTOR SHAPE (an id interpolated into the attribute) and not one variable's spelling, which
+  // is what a harness test should be about anyway. M3 is the proof: `const panel = document`
+  // still leaves this red, because it interpolates nothing.
   assert.ok(
-    /document\.querySelector\(`\[data-inspector="\$\{nodeId\}"\]`\)/.test(REVERSE_READ),
+    /document\.querySelector\(`\[data-inspector="\$\{\w+\}"\]`\)/.test(REVERSE_READ),
     "the read must resolve the panel FOR THE NODE, or every node answers with the last selection",
   );
   assert.ok(
+    /\{ id, value \}/.test(REVERSE_READ),
+    "and the node id must reach the page-side function explicitly — a page context cannot close over a Node-side loop variable",
+  );
+  assert.ok(
     !/const panel = document;/.test(REVERSE_READ),
-    "and it must not fall back to the whole document, which makes nodeId meaningless",
+    "and it must not fall back to the whole document, which makes the id meaningless",
   );
 });
 
@@ -278,14 +356,23 @@ test("the row navigates to the builder BEFORE reading it, in the same window", (
   // and the read waits for the marker it needs rather than a fixed delay.
   const goto = BLOCK.indexOf("await page.goto(`${admin}/workflows/${workflowId}/builder`", BLOCK.indexOf('step: "canvas-save-visible"'));
   assert.notEqual(goto, -1, "the row must open the builder before reading it");
-  const readAt = BLOCK.indexOf("const canvasRead = await page");
+  // The same anchor as `REVERSE_READ`, for the same reason: this window had `const canvasRead =
+  // await page` pinned and tick 59 replaced that statement, so it reported "the read must exist"
+  // with `actual: -1, expected: -1` against a read sitting twelve lines above it. Two windows in
+  // one file carrying the same stale anchor is the failure mode this file exists to catch, so
+  // the two windows now share the constant rather than repeating the search.
+  const readAt = BLOCK.indexOf("const holder = perNode.find");
   assert.notEqual(readAt, -1, "the read must exist");
   assert.ok(
     goto < readAt,
     "the navigation must precede the read, or the read is of whatever was on screen before",
   );
   assert.ok(
-    /waitForSelector\("\[data-inspector\]"/.test(REVERSE_READ),
-    "the read must wait for the inspector to mount rather than a fixed delay",
+    !/waitForTimeout\(\s*(1[0-9]{3}|[2-9][0-9]{3})\s*\)/.test(REVERSE_CODE),
+    "the read must wait for the marker it needs rather than a fixed delay — a delay is green against a page that has not drawn yet",
+  );
+  assert.ok(
+    /waitForSelector\(`\[data-inspector="\$\{nodeId\}"\]`/.test(REVERSE_CODE),
+    "and the wait is for THIS node's panel, because no inspector exists until a card is selected",
   );
 });

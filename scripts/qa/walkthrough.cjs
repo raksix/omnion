@@ -14094,34 +14094,75 @@ async function runWorkflowTableDepth(page, report) {
   // spent itself on, here in its quietest form: a fixed delay is the only kind of wait that is
   // wrong in the same direction every time and only on a slow machine.
   await page.waitForSelector("[data-node-id]", { timeout: 20000 }).catch(() => {});
-  await page.waitForSelector("[data-inspector]", { timeout: 20000 }).catch(() => {});
-  const canvasRead = await page.evaluate((value) => {
-    const cards = Array.from(document.querySelectorAll("[data-node-id]"));
-    const seen = [];
-    for (const card of cards) {
-      const nodeId = card.getAttribute("data-node-id");
-      // A card is only a card the author can inspect if clicking it opens the inspector; with
-      // nothing selected the inspector holds the RULE settings, so its fields are the wrong
-      // answer to "does this node show the table's value".
-      const panel = document.querySelector(`[data-inspector="${nodeId}"]`);
-      if (!panel) continue;
-      const fields = Array.from(panel.querySelectorAll("[data-inspector-field]")).map((el) => ({
-        key: el.getAttribute("data-inspector-field"),
-        value: el.value ?? null,
-      }));
-      seen.push({ nodeId, found: fields.some((f) => f.value === value) });
+  // Wait for ONE card to have been selected and its inspector mounted — NOT for `[data-inspector]`
+  // to merely exist. `NodeInspector` is rendered under `{selectedNode ? … : null}`
+  // (builder-view.tsx:2745), so on a *correct* product with nothing selected that selector never
+  // matches and this row is unsatisfiable: `inspected: 0`, `builderSeesTableEdit: false`, and a
+  // read that no defect can turn red. This is the tick-57 defect one block up, third instance and
+  // the same one — the read was moved off the wire but never made *possible*.
+  //
+  // So the card is CLICKED first. Which card is not guessed: the criterion does not say which node
+  // the table edit landed on, and a probe that picked one would be asserting an assumption. Every
+  // card is clicked in turn and the first whose inspector carries the literal is the answer. A
+  // product that renders the value in a field the table never wrote would still fail this, and a
+  // product whose inspector never mounts is `inspected: 0` rather than a false negative dressed
+  // as a `true`.
+  const cardIds = await page
+    .locator("[data-node-id]")
+    .evaluateAll((cards) => cards.map((card) => card.getAttribute("data-node-id")))
+    .catch(() => []);
+  const perNode = [];
+  for (const nodeId of cardIds) {
+    // A real pointer click through Playwright, not a dispatchEvent: the card's handler is a
+    // React `onPointerDown` and the port gesture above shows what a synthetic event costs.
+    await page
+      .locator(`[data-node-id="${nodeId}"]`)
+      .first()
+      .click({ timeout: 5000 })
+      .catch(() => {});
+    await page.waitForSelector(`[data-inspector="${nodeId}"]`, { timeout: 4000 }).catch(() => {});
+    const read = await page
+      .evaluate(
+        ({ id, value }) => {
+          const panel = document.querySelector(`[data-inspector="${id}"]`);
+          if (!panel) return { mounted: false, found: false, fields: [] };
+          const fields = Array.from(panel.querySelectorAll("[data-inspector-field]")).map((el) => ({
+            key: el.getAttribute("data-inspector-field"),
+            value: el.value ?? null,
+          }));
+          return { mounted: true, found: fields.some((f) => f.value === value), fields };
+        },
+        { id: nodeId, value: "qa.table.edited" },
+      )
+      .catch(() => ({ mounted: false, found: false, fields: [] }));
+    perNode.push({ nodeId, ...read });
+    if (read.found) break;
+    // A card that did not open its inspector is a card the click missed — a port dot, an
+    // overlay, an off-screen card. Escape, because the alternative is worse than a red row: a
+    // half-armed connect gesture survives into the run and unfinished-save rows below and turns
+    // their clicks into edge targets. Escape is the documented "that gesture is finished" key.
+    if (!read.mounted) {
+      await page.keyboard.press("Escape").catch(() => {});
     }
-    return {
-      cards: cards.length,
-      inspected: seen.length,
-      // The node the value is on, so a `false` says WHICH node failed rather than only that
-      // something did. A count of zero is the same number whether the canvas is empty or the
-      // value is on a node the row never clicked.
-      nodeShowingValue: seen.find((entry) => entry.found)?.nodeId ?? null,
-      builderSeesTableEdit: seen.some((entry) => entry.found),
-      inspectedIds: seen.map((entry) => entry.nodeId),
-    };
-  }, "qa.table.edited");
+  }
+  const holder = perNode.find((entry) => entry.found) ?? null;
+  const canvasRead = {
+    cards: cardIds.length,
+    // How many cards were actually opened, and of those how many showed an inspector. Two
+    // different failures otherwise print one number: a canvas that drew nothing (`cards: 0`) and
+    // an inspector that refuses to mount (`mounted: 0` on six clicked cards).
+    clicked: perNode.length,
+    inspected: perNode.filter((entry) => entry.mounted).length,
+    // The node the value is on, so a `false` says WHICH node failed rather than only that
+    // something did. A count of zero is the same number whether the canvas is empty or the
+    // value is on a node the row never clicked.
+    nodeShowingValue: holder?.nodeId ?? null,
+    builderSeesTableEdit: holder !== null,
+    // Every card that was opened and what its inspector held, so a red row names the field that
+    // was wrong instead of only that a field was.
+    inspectedIds: perNode.filter((e) => e.mounted).map((entry) => entry.nodeId),
+    fieldsByNode: perNode.map((e) => ({ nodeId: e.nodeId, keys: e.fields.map((f) => f.key) })),
+  };
   note({ step: "table-save-survives", ...canvasRead });
   await shot(page, "page-workflow-table-final");
 
