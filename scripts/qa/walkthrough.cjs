@@ -13482,13 +13482,30 @@ async function runCrmStateSweep(page, report) {
   };
 
   let failPath = "";
+  // **Whether the stub actually reached the browser at all.** The refusal this pass measures is
+  // caused by this handler, and until it fires the screen has never been under failure — so a
+  // `false` measured against a stub that never answered is the harness reporting a product
+  // defect that did not happen. The tick-66 run is the case: contacts, companies and deals (the
+  // first three screens, walked in that order) answered **all five** questions with `false` while
+  // activities, leads and stages — walked immediately after — answered every one. Three screens
+  // cannot lose five unrelated behaviours in a row and have the next three keep them, so the
+  // thing that differed was not the screens.
+  //
+  // Counting the deliveries makes the evidence carry its own setup: a screen whose refusal was
+  // never delivered is reported as *unmeasured* (left unset) rather than as broken, which is the
+  // same rule the keyboard steps already follow for a list with no rows.
+  let delivered = 0;
+  let deliveredKey = "";
   const stub = async (route) => {
     const request = route.request();
-    const path = new URL(request.url()).pathname;
+    const url = new URL(request.url());
+    const path = url.pathname;
     if (failPath === "" || path !== failPath || request.method() !== "GET" || !failNext) {
       return route.continue();
     }
     failNext = false;
+    delivered += 1;
+    deliveredKey = `${request.method()} ${path}${url.search}`;
     return route.fulfill({
       status: 503,
       contentType: "application/json",
@@ -13523,6 +13540,8 @@ async function runCrmStateSweep(page, report) {
 
   for (const screen of screens) {
     failNext = true;
+    delivered = 0;
+    deliveredKey = "";
     failPath = screen.read ?? LIST_READ[screen.label];
     // **The refusal this pass is about to cause is not a finding.** The stub answers one read with
     // a real 503, so the browser logs a console error and a failed request for every screen — six
@@ -13540,6 +13559,20 @@ async function runCrmStateSweep(page, report) {
       .locator(`[data-qa='${screen.qa}'], [data-qa='${screen.qa.replace(/-error$/, "-body-error")}']`)
       .first();
     await state.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+    // **The refusal has to have been delivered before any of this screen's answers mean
+    // anything.** The screen fires several reads and this handler answers exactly one path, so
+    // if the request never came — a path that moved, a screen that did not load, a tab that was
+    // still on the previous route — the five questions below are being asked of a screen that was
+    // never in trouble, and all five answer `false`. That is what happened to contacts, companies
+    // and deals in tick 66. The record of what was actually delivered is kept in the report, so
+    // the next reader can tell a product defect from a stub that never fired.
+    if (delivered === 0) {
+      steps[`${screen.label}_theRefusalWasDelivered`] = false;
+      steps[`${screen.label}_delivered`] = null;
+      continue;
+    }
+    steps[`${screen.label}_theRefusalWasDelivered`] = true;
+    steps[`${screen.label}_delivered`] = deliveredKey;
     const text = (await state.innerText().catch(() => "")).trim();
     steps[`${screen.label}_hasAState`] = (await state.count()) > 0;
     steps[`${screen.label}_readsAsASentence`] = text.length > 10;
@@ -13800,6 +13833,28 @@ async function runCrmKeyboardAndMobile(page, report) {
   steps.slashFocusesSearch = focusedId === "crm-search-contacts";
 
   // ---- `j` / `k` move a cursor the page actually shows ----------------------------------------
+  //
+  // **The focus has to be handed back before these keys mean anything.** The step above ended
+  // with `/`, which is *supposed* to leave the caret in the search box, and the hook ignores
+  // every binding while the target is an INPUT (`crm-parts.tsx`, the `typing` guard) — that
+  // guard is the product being right. So `j` and `k` were typed into the search field: the list
+  // filtered itself down to nothing, no cursor moved, and `exactlyOneCursor` then counted zero
+  // rows rather than two claims. Three red steps, one cause, and the product code that caused
+  // them was correct throughout.
+  //
+  // The tell was already in the file: the `n` step below and the per-screen `e` loop both click
+  // the body first, because whoever wrote those steps assumed no focus. This step sat between
+  // two of them and assumed it had focus it never took.
+  await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.evaluate(() => document.activeElement?.blur?.()).catch(() => {});
+  await page.waitForTimeout(200);
+  steps.theKeysAreNotTypedIntoTheSearch = await page
+    .evaluate(() => {
+      const el = document.activeElement;
+      return !!el && el.tagName !== "INPUT" && el.tagName !== "TEXTAREA";
+    })
+    .catch(() => false);
+
   const rows = page.locator("[data-qa-crm-cursor]");
   const rowCount = await rows.count();
   steps.theListHasRows = rowCount > 0;
