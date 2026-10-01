@@ -10139,3 +10139,50 @@ panel, and none of those ran.
 **Next.** Re-run the pass on a quiet box to close REQ-106's owed rows and REQ-107's closing row
 together. Then slice 2: the judge path, `ai_eval_runs` and `ai_eval_case_results`, and the run
 screens — which is the first slice that can tick an acceptance row.
+
+### w7 · tick 68 · REQ-107 slice 2 — the runs are real and two new screens exist
+
+**What.** `e154d732` mounts the run surface (start, read, diff, cancel, baseline) that slice 1
+left written-but-unreachable, and splits `ai.evals.run` from `ai.evals.read`: reading a run is a
+QA read, starting one spends real inference tokens, and an audience that may read results is not
+automatically an audience that may cause them. Setting a baseline is a write and sits behind
+`ai.evals.manage` alongside deleting a case — the person who may weaken the ruler must not be the
+person who presses it. `ed03200f` adds the run history, the run detail, the mandatory baseline
+picker and a `Run now` that works. `0280029a` pins the panel's key list to the mount guards.
+
+**Proof.**
+- `cargo build -p omnion-api` exit 0, no new warnings.
+- `cargo test -p omnion-api --test ai_eval_runs -- --test-threads=1` **10 passed** (37.8s) against
+  a throwaway database on `omnion_qa_w7`.
+- `cargo test -p omnion-api --test ai_evals -- --test-threads=1` **12 passed** (47.1s).
+- `cargo test -p omnion-api --lib routes::ai_evals` **9 passed**.
+- `pnpm typecheck` **2/2 successful**; `node --check scripts/qa/walkthrough.cjs` clean.
+
+**Two facts about the box worth writing down, because both cost time and neither is a code bug.**
+
+1. **The database port in the ledger was wrong.** It said 5432; the container publishes 5433
+   (`docker port omnion-postgres`). Every walk failed on `password authentication failed` before
+   I read the harness, which resolves the URL from `.env` and the port mapping alike. The nine
+   runs were not red — they had never reached the database.
+2. **Root was at 100% (131 MB free) on arrival.** `write_file` on a full filesystem returns
+   success and writes a 0-byte file, so the first honest move is `df`, not an edit. Reclaimed 9 GB
+   from `journalctl --vacuum-size=50M` (28.5 MB), stale nginx logs, `npm cache clean` and
+   `apt-get clean` — 123 G at 100% → 93%. None of it was mine.
+
+**The QA pass is queued, not run.** w3 holds the slot (`/tmp/omnion-qa-slot/2914326-1790889478`,
+`QA_SLOTS=1` from `/etc/profile.d/omnion-qa-limits.sh`), so this pass is waiting rather than
+barging in — which is the whole point of that guard, and the direct fix for the neighbour-kill
+recorded last tick. **No acceptance row is ticked on it**, and none is ticked on a pass that has
+not executed: the two new screens are listed in `walkthrough.cjs` and asserted in
+`runAiEvalsDepth`, but "the test is written" is not "the screen was seen".
+
+**The old `Run now` assertion was rewritten rather than kept.** It read `Run now must be disabled
+— slice 2`, which would have passed unchanged in a world where the route is real, because a
+suite with no enabled case is *also* disabled. It now asserts the reason is on the page, which is
+the property that actually distinguishes the two worlds.
+
+**Next.** The pass completes (or is re-run) and, if it is green, tick the rows it can speak to:
+cancel-keeps-partial-results, the cross-tenant 404 and the gate/baseline rows are already proved
+by the store walks; `/ai/telemetry` and the roll-up runner are slice 4. Slice 3's runner — the
+thing that claims a queued run and scores it — is still the real gap: the route enqueues, and a
+`queued` run that nothing claims is a screen that is honest about being stuck.
