@@ -423,6 +423,18 @@ const SURFACE: &[(&str, Method, &str, &str)] = &[
         "read",
     ),
     (
+        "/api/v1/security/ip-rules",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/ip-rules/test",
+        Method::POST,
+        "security.read",
+        "write",
+    ),
+    (
         "/api/v1/security/sign-in-protection/probe",
         Method::GET,
         "security.read",
@@ -870,5 +882,300 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
     );
 
     let _ = victim_password;
+    harness.dispose().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4: the IP access list on the request path
+// ---------------------------------------------------------------------------------------------
+
+/// A request that presents itself as coming from `address`.
+///
+/// The access layer reads the peer address out of the `ConnectInfo` extension — the same source
+/// the rate limiter uses — so the walk has to install that extension or it would be testing the
+/// `ip_unknown` branch (which refuses too, for the wrong reason). This is the detail that makes
+/// the difference between a walk that proves a CIDR is refused and one that proves requests
+/// without an address are refused.
+fn from_address(mut request: Request<Body>, address: std::net::IpAddr) -> Request<Body> {
+    use axum::extract::ConnectInfo;
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(std::net::SocketAddr::new(address, 40_000)));
+    request
+}
+
+fn address(text: &str) -> std::net::IpAddr {
+    text.parse().expect("a fixture address must parse")
+}
+
+/// **The criterion: a denied CIDR cannot reach the API.**
+///
+/// Every other part of slice 4 is a table, a form and a route. This is the walk that would fail
+/// if any of them were inert: a deny rule is written through the panel's own `POST`, and a real
+/// request from inside that network is driven over the router — not the evaluator called directly,
+/// not a unit test — and must come back refused, with the rule named in the body.
+///
+/// Two halves that are different from each other, because either alone would pass for the wrong
+/// reason:
+///
+/// * The refusal must be **`ip_denied` naming the rule**, not `ip_unknown` and not the route's
+///   own permission `403`. A request from an address *inside* a denied network and a request with
+///   no address at all are both refused by the same layer; only the first proves the rule.
+/// * The same request from *outside* the network must be served, proving the rule narrows rather
+///   than the screen breaking everything — a layer that refused every caller would satisfy the
+///   first half of this assertion on its own.
+#[tokio::test]
+async fn a_denied_network_cannot_reach_the_api() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "IP Access").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        operator_id,
+        organization,
+        &["security.read", "security.manage", "security.ip.manage"],
+    )
+    .await;
+
+    let inside = address("203.0.113.7");
+    let outside = address("198.51.100.7");
+
+    // The premise, asserted rather than assumed: before the rule exists, the request is served.
+    // A walk that only checked the "after" would pass just as well if the route were refusing
+    // everything for some unrelated reason.
+    let before = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            inside,
+        ))
+        .await;
+    assert_eq!(
+        before.status,
+        StatusCode::OK,
+        "the premise: nothing is denied yet, so this must be served: {}",
+        before.text
+    );
+
+    // The rule is written through the panel's own endpoint — not inserted with SQL — so the walk
+    // also covers the route, the audit row and the event.
+    let created = harness
+        .call(from_address(
+            post(
+                "/api/v1/security/ip-rules",
+                json!({
+                    "kind": "deny",
+                    "cidr": "203.0.113.0/24",
+                    "note": "the walk's own denied network",
+                }),
+                Some(&operator),
+            ),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "the rule must be created: {}",
+        created.text
+    );
+    assert_eq!(created.body["rule"]["cidr"], "203.0.113.0/24");
+    assert_eq!(created.body["rule"]["kind"], "deny");
+
+    // Now the criterion.
+    let denied = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            inside,
+        ))
+        .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::FORBIDDEN,
+        "a request from inside the denied network must be refused: {}",
+        denied.text
+    );
+    assert_eq!(
+        denied.body["error"]["code"], "ip_denied",
+        "the refusal must come from the access list and not from some other guard: {}",
+        denied.text
+    );
+    assert!(
+        denied.body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("203.0.113.0/24")),
+        "the refusal must name the rule, or the operator cannot remove it: {}",
+        denied.text
+    );
+
+    // The other half: everything outside the network is still served. Without this, a layer that
+    // refused every caller would satisfy the assertions above.
+    let served = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        served.status,
+        StatusCode::OK,
+        "a request from outside the denied network must still be served: {}",
+        served.text
+    );
+
+    // And the rule is listed, so the screen shows what is doing the refusing.
+    let listed = harness
+        .call(from_address(
+            get("/api/v1/security/ip-rules", Some(&operator)),
+            outside,
+        ))
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text);
+    assert_eq!(listed.body["deny_count"], 1, "{}", listed.text);
+
+    // The tester answers the same question the layer does, for the same address.
+    let tested = harness
+        .call(from_address(
+            post(
+                "/api/v1/security/ip-rules/test",
+                json!({ "address": "203.0.113.7" }),
+                Some(&operator),
+            ),
+            outside,
+        ))
+        .await;
+    assert_eq!(tested.status, StatusCode::OK, "{}", tested.text);
+    assert_eq!(
+        tested.body["blocked"], true,
+        "the tester must agree with the layer: {}",
+        tested.text
+    );
+    assert_eq!(tested.body["decision"], "deny", "{}", tested.text);
+    assert_eq!(
+        tested.body["matched_rule"]["cidr"], "203.0.113.0/24",
+        "the tester must name the rule it matched: {}",
+        tested.text
+    );
+
+    // Removing the rule restores the address on the *next* request, not at the next boot.
+    let rule_id = created.body["rule"]["id"]
+        .as_str()
+        .expect("the created rule must carry an id")
+        .to_owned();
+    let deleted = harness
+        .call(from_address(
+            request(Method::DELETE, &format!("/api/v1/security/ip-rules/{rule_id}"), Some(&operator), None),
+            outside,
+        ))
+        .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{}", deleted.text);
+
+    let restored = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            inside,
+        ))
+        .await;
+    assert_eq!(
+        restored.status,
+        StatusCode::OK,
+        "removing the rule must take effect now, not at the next restart: {}",
+        restored.text
+    );
+
+    harness.dispose().await;
+}
+
+/// A malformed CIDR is refused with a message that names the field's input, for both families.
+#[tokio::test]
+async fn a_malformed_cidr_is_refused_with_a_field_level_message() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "IP Validation").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(&harness, operator_id, organization, &["security.ip.manage"]).await;
+
+    for (cidr, why) in [
+        ("not-an-ip", "not an address"),
+        ("203.0.113.0/33", "a v4 prefix past 32"),
+        ("2001:db8::/129", "a v6 prefix past 128"),
+        ("203.0.113.1/8", "host bits set outside the prefix"),
+        ("", "empty"),
+    ] {
+        let refused = harness
+            .call(post(
+                "/api/v1/security/ip-rules",
+                json!({ "kind": "deny", "cidr": cidr, "note": "validation walk" }),
+                Some(&operator),
+            ))
+            .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "{cidr:?} ({why}) must be refused: {}",
+            refused.text
+        );
+        assert_eq!(refused.body["error"]["code"], "invalid_security_input");
+    }
+
+    // The two forms that are *not* errors, so the refusals above cannot be an artefact of a
+    // parser that refuses everything.
+    for (cidr, stored) in [
+        ("203.0.113.0/24", "203.0.113.0/24"),
+        ("203.0.113.7", "203.0.113.7/32"),
+        ("2001:db8::/32", "2001:db8::/32"),
+    ] {
+        let created = harness
+            .call(post(
+                "/api/v1/security/ip-rules",
+                json!({ "kind": "deny", "cidr": cidr, "note": "accepted form" }),
+                Some(&operator),
+            ))
+            .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "{cidr:?} is valid and must be accepted: {}",
+            created.text
+        );
+        assert_eq!(created.body["rule"]["cidr"], stored);
+    }
+
+    // A note is required, for the reason the migration's check constraint gives.
+    let blank = harness
+        .call(post(
+            "/api/v1/security/ip-rules",
+            json!({ "kind": "deny", "cidr": "198.51.100.0/24", "note": "   " }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        blank.status,
+        StatusCode::BAD_REQUEST,
+        "an unexplained rule must be refused: {}",
+        blank.text
+    );
+
+    // The same network twice is refused rather than silently replacing the first.
+    let duplicate = harness
+        .call(post(
+            "/api/v1/security/ip-rules",
+            json!({ "kind": "deny", "cidr": "203.0.113.0/24", "note": "second try" }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        duplicate.status,
+        StatusCode::BAD_REQUEST,
+        "a duplicate must be refused, not silently upserted: {}",
+        duplicate.text
+    );
+
     harness.dispose().await;
 }
