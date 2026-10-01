@@ -178,7 +178,14 @@ impl CaseTurn for LiveTurn {
                 completion_tokens,
             )
             .map_or(0, |cost| cost.total_micros);
-            self.record_usage(prompt_tokens, completion_tokens).await;
+            self.record_usage(
+                self.provider.id,
+                &self.model_key,
+                "eval",
+                prompt_tokens,
+                completion_tokens,
+            )
+            .await;
             Ok(Turn {
                 text: outcome.content,
                 prompt_tokens,
@@ -218,7 +225,17 @@ impl CaseTurn for LiveTurn {
             .map_or(0, |cost| cost.total_micros);
             self.judge_cost_micros
                 .fetch_add(billed, std::sync::atomic::Ordering::SeqCst);
-            self.record_usage(prompt_tokens, completion_tokens).await;
+            // The judge's own provider, under `eval:judge` — not the model under test's row,
+            // and not `eval`. A cost screen that attributes grading to the graded model cannot
+            // answer "what did this suite cost to run".
+            self.record_usage(
+                provider.id,
+                key,
+                "eval:judge",
+                prompt_tokens,
+                completion_tokens,
+            )
+            .await;
             Some(parse_verdict(&outcome.content))
         })
     }
@@ -266,16 +283,31 @@ fn tokens_of(outcome: &ChatOutcome) -> (Option<i32>, Option<i32>) {
 }
 
 impl LiveTurn {
-    /// Write the call onto `ai_usage` under the `eval` feature.
+    /// Write a call onto `ai_usage`, under the feature it was spent on.
+    ///
+    /// **`task` and the model are parameters, not constants.** The first version hardcoded
+    /// `task: "eval"` and this struct's own `provider`/`model_key`, so the judge's call was
+    /// billed to — and attributed to — the model under test. That is wrong twice over: the run's
+    /// spend is misattributed to a model that was never asked, and the judge's cost never
+    /// appears under `eval:judge`, which is the acceptance row's own requirement. The caller
+    /// passes the feature it means; the answer call passes `eval`, the judge passes
+    /// `eval:judge`.
     ///
     /// Best-effort by design: the run's cost is already snapshotted onto the run row and the
     /// case result, so a usage row that failed to write is a gap in REQ-104's *view* of spend,
     /// not a reason to fail a run whose work is already done and paid for.
-    async fn record_usage(&self, prompt_tokens: Option<i32>, completion_tokens: Option<i32>) {
+    async fn record_usage(
+        &self,
+        provider_id: Uuid,
+        model_key: &str,
+        task: &str,
+        prompt_tokens: Option<i32>,
+        completion_tokens: Option<i32>,
+    ) {
         let usage = omnion_ai_hub::health_store::NewUsage {
-            provider_id: self.provider.id,
-            model_key: Some(self.model_key.clone()),
-            task: "eval".to_owned(),
+            provider_id,
+            model_key: Some(model_key.to_owned()),
+            task: task.to_owned(),
             outcome: "ok".to_owned(),
             http_status: Some(200),
             prompt_tokens,
@@ -286,7 +318,7 @@ impl LiveTurn {
             cost: None,
         };
         if let Err(error) = omnion_ai_hub::health_store::record_usage(&self.pool, usage).await {
-            tracing::warn!(%error, "an eval usage row could not be written");
+            tracing::warn!(%error, task, "an eval usage row could not be written");
         }
     }
 }
@@ -911,8 +943,68 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {})
 }
 
+/// The model this run grades, read from **its own snapshot**.
+///
+/// **This is the reader `snapshot["model"]` never had.** `start_run` writes the suite's pinned
+/// `provider/model` into the snapshot and keeps the row id in `run.model_id`, and the other two
+/// snapshot fields the runner reads — `prompt` and `temperature` — have readers. `model` did
+/// not: `build_turn` asked the router with `requested: None`, and `lookup`'s `None` arm is
+/// `default_model(pool)`. So every run was graded by the installation's default while its own row
+/// claimed a different model, and a suite's `model`-target pin was decoration. The three ways a
+/// field gets written and never read are all invisible to `cargo test`, `pnpm typecheck` and the
+/// walkthrough, which is why the fix needed a reader-shaped assertion rather than another gate.
+///
+/// The order is snapshot first, then `run.model_id`, then the default — and the fallback is the
+/// *last* step on purpose:
+///
+/// - **snapshot first**, because it is what `start_run` promised this run would use. A suite
+///   edited after the run was queued must not silently retarget a run that is already in flight,
+///   which is the same rule the judge already follows (see `build_turn`'s judge comment).
+/// - **`model_id` second**, because it is the same pin as an id and survives a snapshot written
+///   before the key was readable. It cannot be first: the id alone is not reproducible once the
+/// /// row is gone, which is exactly why the snapshot keeps the string.
+/// - **the default last**, and only when neither is present — a copilot or `task`-targeted suite,
+///   which `resolve_under_test` deliberately snapshots with no model so it is resolved at run
+///   time. For those the router's answer is the intended answer, not a fallback.
+pub async fn resolve_model_under_test(pool: &PgPool, run: &RunRow) -> String {
+    if let Some(key) = run
+        .snapshot
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        return key.to_owned();
+    }
+    // `AiModel` carries `provider_id`, not the provider's name, so the key has to be joined. The
+    // snapshot exists precisely because this join can stop answering: a deleted provider row
+    // leaves the string readable and the id dead.
+    if let Some(id) = run.model_id
+        && let Some(key) = key_of_model(pool, id).await
+    {
+        return key;
+    }
+    // A suite with no pin: ask the router, and let `default_model`'s own error settle it.
+    omnion_ai_hub::router::default_model(pool)
+        .await
+        .ok()
+        .map(|resolved| format!("{}/{}", resolved.provider.name, resolved.model.model_key))
+        .unwrap_or_default()
+}
+
+/// One model's `provider/model` key, or `None` when either half of the join is gone.
+async fn key_of_model(pool: &PgPool, model_id: Uuid) -> Option<String> {
+    let model = omnion_ai_hub::store::find_model(pool, model_id).await.ok().flatten()?;
+    let provider = omnion_ai_hub::store::find_provider(pool, model.provider_id)
+        .await
+        .ok()
+        .flatten()?;
+    Some(format!("{}/{}", provider.name, model.model_key))
+}
+
 /// The live turn for a run: the router's answer, plus the judge if the suite pins one.
 async fn build_turn(pool: &PgPool, run: &RunRow) -> Option<LiveTurn> {
+    let model_key = resolve_model_under_test(pool, run).await;
     let resolved = resolve_and_record(
         pool,
         DecisionContext {
@@ -922,7 +1014,11 @@ async fn build_turn(pool: &PgPool, run: &RunRow) -> Option<LiveTurn> {
             run_id: None,
             task: Some("eval"),
             feature: Some("eval"),
-            requested: None,
+            // **The pin, not `None`.** `lookup`'s `None` arm is `default_model(pool)`, so a
+            // runner that asked the router without naming the suite's model graded every run
+            // with whichever model the installation had marked default — the model under test
+            // was never the model asked. See `resolve_model_under_test`.
+            requested: Some(&model_key),
             requirements: &[],
         },
         Scope::Organization(run.organization_id),
@@ -933,7 +1029,6 @@ async fn build_turn(pool: &PgPool, run: &RunRow) -> Option<LiveTurn> {
     let model = resolved.model?;
 
     let prices = Arc::new(load_model_prices(pool).await);
-    let model_key = format!("{}/{}", model.provider.name, model.model.model_key);
 
     // The judge is resolved from the run's own snapshot rather than from the suite's column: the
     // snapshot is what the run recorded it would use, so a suite edited after the run was
@@ -952,7 +1047,7 @@ async fn build_turn(pool: &PgPool, run: &RunRow) -> Option<LiveTurn> {
     Some(LiveTurn {
         pool: pool.clone(),
         organization_id: run.organization_id,
-        model_key,
+        model_key: model_key.clone(),
         provider: ProviderTarget::from_provider(&model.provider),
         judge_key,
         judge_provider,

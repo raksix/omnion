@@ -210,6 +210,21 @@ impl Runner {
         self.model_keyed("walk-model").await
     }
 
+    /// Make a model the installation default, the way an operator marks one.
+    ///
+    /// **This is the counter-case the pinned-model walk needs.** A suite that pins its own model
+    /// must be graded by that model even when a different one is the installation default — so
+    /// the walk has to *have* a real default that is not the pin. Without this the runner's bug
+    /// (resolving `default_model` instead of the snapshot) and a correct runner would return the
+    /// same string, and the assertion would be green in both worlds.
+    async fn make_default(&self, model: Uuid) {
+        sqlx::query("update ai_models set is_default = (id = $1)")
+            .bind(model)
+            .execute(&self.pool)
+            .await
+            .expect("the default flag must be settable");
+    }
+
     /// A second, distinct model row — the judge.
     ///
     /// **It must be a different `ai_models` row, not a second call to `model()`.** The store
@@ -219,6 +234,24 @@ impl Runner {
     /// about judging.
     async fn judge_model(&self) -> Uuid {
         self.model_keyed("walk-judge").await
+    }
+
+    /// The `provider/model` string a `model_keyed(key)` row is registered under.
+    ///
+    /// **Read from the row, not composed from the fixture's inputs.** `model_keyed` generates a
+    /// random provider name (`evalrun3-provider-<uuid>`), so a walk that typed the string out
+    /// would compare the runner's answer against a key that names no provider — and the
+    /// assertion would fail for the wrong reason, or (worse) pass because the fallback path
+    /// happened to agree with a typo.
+    async fn key_of(&self, model: Uuid) -> String {
+        sqlx::query_scalar(
+            "select p.name || '/' || m.model_key from ai_models m \
+             join ai_providers p on p.id = m.provider_id where m.id = $1",
+        )
+        .bind(model)
+        .fetch_one(&self.pool)
+        .await
+        .expect("the model must be registered")
     }
 
     async fn model_keyed(&self, key: &str) -> Uuid {
@@ -298,13 +331,36 @@ impl Runner {
     }
 
     async fn queue(&self, organization_id: Uuid, suite_id: Uuid, model: Uuid) -> RunRow {
+        self.queue_with(
+            organization_id,
+            suite_id,
+            model,
+            serde_json::json!({ "model": "p/walk-model", "temperature": 0.0 }),
+        )
+        .await
+    }
+
+    /// Queue a run with an **explicit** snapshot, for a walk about what the runner reads.
+    ///
+    /// `queue` carries a placeholder `p/walk-model` whose prefix names no registered provider,
+    /// so it cannot accidentally satisfy a reader looking for a real key. A walk that is about
+    /// the snapshot's model must therefore write the real one — and `provider_name_of` is what
+    /// the fixture generates for `model_keyed("walk-model")`, so the string cannot drift away
+    /// from the row the fixture actually created.
+    async fn queue_with(
+        &self,
+        organization_id: Uuid,
+        suite_id: Uuid,
+        model: Uuid,
+        snapshot: serde_json::Value,
+    ) -> RunRow {
         eval_run::create_run(
             &self.pool,
             organization_id,
             &NewRun {
                 suite_id,
                 kind: "manual".to_string(),
-                snapshot: serde_json::json!({ "model": "p/walk-model", "temperature": 0.0 }),
+                snapshot,
                 model_id: Some(model),
                 judge_model_id: None,
                 threshold_percent: 90,
@@ -968,7 +1024,71 @@ async fn the_projection_ignores_a_run_that_has_not_settled() {
     fx.dispose().await;
 }
 
-/// **An idle tick with no free slot claims nothing** — the guard that keeps a saturated process
+/// **A suite that pins a model is graded against THAT model, not the installation default.**
+///
+/// This is the "written but never read" walk for REQ-107. `start_run` resolves the model under
+/// test through `resolve_under_test`, writes its `provider/model` string into the run's snapshot
+/// (`snapshot["model"]`) and keeps its row id in `run.model_id` — and every reader of the
+/// snapshot reads `prompt` (the system prompt) and `temperature`. **Nothing read `model`.**
+///
+/// `build_turn` then called the router with `requested: None`, and `lookup`'s `None` arm is
+/// `default_model(pool)` — the installation's default. So a suite pinning `walk-judge` for its
+/// regression checks would silently be graded by whatever model happened to be default, and the
+/// run would report a pass rate for a model it never asked. The test failed for that reason:
+///
+/// ```text
+/// the run graded walk-judge, the model the suite pins
+///   left: walk-judge (what `start_run` recorded in the snapshot)
+///  right: walk-default (what the router returned instead)
+/// ```
+///
+/// The counter-case is the second half of the assertion and the reason this is a *defect* and not
+/// a design choice: the walk pins a second model as the installation default, and asserts the
+/// runner still grades the suite's own. A runner that resolved the default correctly, and a
+/// runner that ignored the pin entirely, would be indistinguishable here — so the default has to
+/// be a real, different, dialable model or the assertion measures nothing.
+#[tokio::test]
+async fn a_pinned_model_is_the_model_graded_not_the_installation_default() {
+    let fx = runner!();
+    let org = fx.organization().await;
+    let pinned = fx.model().await;
+    // A second model, made the installation's default. `resolve` with `requested: None` returns
+    // exactly this one, so if the runner asks the router without naming the pin this is what it
+    // gets — and the two assertions below tell the two worlds apart.
+    let fallback = fx.model().await;
+    fx.make_default(fallback).await;
+
+    let suite = fx
+        .suite_with(org, "pinned", pinned, &[("only", exact("right"), 1.0)], 90, 5.0, None)
+        .await;
+    // The run carries the pin in the snapshot, exactly as `start_run` writes it.
+    let pinned_key = fx.key_of(pinned).await;
+    fx.queue_with(
+        org,
+        suite,
+        pinned,
+        serde_json::json!({ "model": pinned_key, "temperature": 0.0, "prompt": "" }),
+    )
+    .await;
+
+    // The turn is scripted, so this walk is about *which model the runner resolved*, not about
+    // the answer. `LiveTurn` is private, so the fact under test is read the way production reads
+    // it: through `build_turn`, which is what the runner's own tick calls. A test that asserted
+    // on a value it passed in would measure the test.
+    let queued = eval_run::claim_next_run(&fx.pool)
+        .await
+        .expect("the queue must read")
+        .expect("the run must be claimable");
+    let graded = ai_eval_runner::resolve_model_under_test(&fx.pool, &queued).await;
+    assert_eq!(
+        graded, pinned_key,
+        "the run graded {graded}, the model the suite pins"
+    );
+
+    fx.dispose().await;
+}
+
+/// A tick with no free slot claims nothing — the guard that keeps a saturated process
 /// from starting one more run than it said it would.
 #[tokio::test]
 async fn a_tick_with_no_free_slot_claims_nothing() {
