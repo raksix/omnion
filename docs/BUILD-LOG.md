@@ -11862,3 +11862,70 @@ measured**, because a screenshot is not a leg and an unrun assertion is not a pr
 
 Next tick runs the pass first — it is the cheapest outstanding work and everything else in
 slice 6 is already committed, tested and pushed.
+
+
+## Tick 55 — REQ-117 slice 25: a reservation the worker declined was never released, so it was declined again on every tick for ever
+
+**What.** `autoresponder_store::due_reservations` ends a reservation in three ways and only one of
+them gave the claim back. The `other =>` arm released the row for `Delivery::AlreadySent` and
+merely *noted* every other verdict — and **`AlreadySent` could not be produced on that path at
+all**, because `deliver` is called there with `already_sent` hardcoded `false`. The releasing
+branch was a comment with an arm on it. Both declines a sweep actually makes therefore fell to
+the `else`, which wrote a skip note and left the row exactly as it found it: `sent = false` with
+a `due_at` in the past — which is *this sweep's own WHERE clause*.
+
+Consequences, all live before this change and none of them a crash:
+
+* Every worker tick re-offered the same reservation, declined it on the same grounds and wrote
+  the same `autoresponder_sent` note again — **one trail line per minute, for ever**, on the
+  table this REQ's lead-detail screen and every audit export read.
+* A source switched off inside its delay did the same, which is the worse of the two: the
+  operator cancelled the autoresponder and the platform kept doing work for it.
+* `crm_lead_autoresponder_due_idx` (partial, on exactly these rows) kept a permanently-due
+  entry that every pass re-read.
+
+**The lesson, and it is the branch's seventh comment-against-code find in seven ticks.** The
+arm's own comment said *"The reservation is released rather than left pending, so the trail stops
+promising a mail that will never be justified to answer"* — true for `AlreadySent`, and the
+comment sits on the branch that handles every *other* case. The header of `release_claim` says
+*"a failed send does not silence the lead forever"* and the worker's says *"a refused mailer
+releases the reservation and the next tick retries"*: all three describe a path that existed. The
+one sentence nobody had checked was the one that was false — **"released rather than left
+pending"**, which is exactly what the code did.
+
+**Why a full-green suite missed it.** Both decline paths were already *tested*, and both tests
+passed, because both asserted the lead is **not answered** — which is true whether or not the
+claim was taken back. That is this branch's signature test defect for the **fourth** time: a test
+named for a recovery that never performs the recovery. The two new tests assert the claim is
+*gone* instead, which is the sentence the old tests were standing in for.
+
+**Proof.**
+
+* `bash scripts/qa/run-crm-autoresponder.sh` → **13 passed, 0 failed** (was 11).
+* **Proven to fail at 11/13**: with only the two added `release_claim` calls removed and every
+  other change left in place, exactly the two new assertions go red
+  (*"a reservation the sweep declined must be released, not left pending for ever"*, *"a source
+  that will never answer must not leave its reservation pending for ever"*) and all eleven
+  unrelated tests stay green — which is what shows the gate names this defect and not its
+  neighbourhood. The control was applied with a scripted removal of exactly those two calls, not
+  a revert.
+* `bash scripts/qa/run-crm-autoresponder-claim.sh` → **10 passed, 0 failed**.
+* `cargo test -p omnion-module-crm-intake --lib` → **174 passed**.
+  `cargo build -p omnion-api` green. clippy 0 on both touched files. Admin `tsc --noEmit` exit 0.
+
+**The fix, and why it is two arms and not one.** Both decline paths now record the note and then
+release, with the recipient read **once** from the claim into `claimed_to` so neither path can
+disagree about whose row it is giving back (`release_claim` itself matches on `to`). The note is
+written **first**, because `release_claim` deletes the claim row and a note written afterwards
+would describe a reservation that no longer exists. `AlreadySent` is now an unreachable variant
+at this call site and the two-way `if` it justified is gone — the arm is one straight line
+because both of its outcomes were the same action.
+
+**No browser pass, and none claimed.** The QA slot is held by a live w4 pass (holder pid alive,
+cwd `/mnt/apopic/omnion-w4`), and no screen changed: this is two function bodies and a trail
+column, not anything a person touches.
+
+**Next.** REQ-117's last open screen remains slice 3's REQ-064 form-editor card, which needs a
+module that exists on **no branch** — a cross-writer dependency, not something this loop can
+resolve by writing harder. The dead-caller sweep stays empty of new findings; the detector
+earning defects is still the comment-against-code read, now seven for seven.
