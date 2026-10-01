@@ -95,6 +95,58 @@ trap release EXIT INT TERM
 # turn each QA pass into a cold Turbopack build.
 QA_KEEP_NEXT=1 stop_stack
 
+# A place in the global slot is not the same thing as the right to use *this* stack.
+#
+# `qa-slot.sh` counts places in one shared directory, so it correctly serialises two passes
+# that want two DIFFERENT stacks — each stack owns its own database and its own ports, and
+# they are safe to run side by side. What nothing stopped was a second pass taking the SAME
+# stack, and that is destructive rather than merely wasteful: both passes resolve to
+# `QA_DB_NAME` and to ports 18080/3100/3200, so the later one runs `reset-db.sh` —
+# `DROP DATABASE … WITH (FORCE)` — while the earlier one is mid-walkthrough.
+#
+# Observed on 2026-10-01 (tick 90). Tick 89's pass was still walking when the tick ended,
+# so tick 90 started a second pass on the same stack:
+#
+#   02:47:57  tick-89 pass: reset-db.sh drops and recreates omnion_qa
+#   02:48:07  tick-89 pass: API boots, "no accounts exist yet"
+#   02:48:14  a user appears: qa-sample@omnion.test / "QA Provider" / organization_id NULL
+#   02:48:16  tick-89 pass: session created for that user
+#
+# `qa-sample@omnion.test` and "QA Provider" are literal return values of the walkthrough's own
+# `sampleValueFor()` / `fillSubtree()` helpers — the generic form filler, not a credential.
+# Tick-89 had filled a dialog on its way past. Tick 90 then opened `/`, found an account
+# already present, was told `needs_setup: false`, correctly skipped the wizard, and failed to
+# sign in as `CREDS.email` — an account that had never been created. The sign-in failure had
+# nothing to do with sign-in, and every browser box in wave 1 stayed open for a reason that
+# reads exactly like a broken product.
+#
+# The lock is per stack, so sibling stacks keep their parallelism and only the same stack is
+# serialised. It is taken around the whole pass rather than just the reset, because the second
+# pass would otherwise `pm2 delete` the first pass's servers three lines later — the reset is
+# only the first of several ways two passes on one stack destroy each other.
+QA_STACK_LOCK="${QA_STACK_LOCK_DIR:-/tmp/omnion-qa-stack}-${STACK}.lock"
+# `9>>` and not `9>`: the redirect mode is the whole bug. `9>` truncates on open, so a waiter
+# empties the file *as it opens it* and then reads back the zero bytes it just wrote — the
+# holder's recorded pid is destroyed by the act of asking who the holder is, and the refusal
+# degrades to "unknown" in exactly the situation where an operator wants the pid most. Appending
+# opens without truncating, so the waiter's read sees what the holder wrote.
+exec 9>>"$QA_STACK_LOCK"
+if ! flock -n 9; then
+  holder="$(head -n 1 "$QA_STACK_LOCK" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+    holder="unknown (the pass holding this stack did not record a live pid)"
+  fi
+  echo "[qa] stack '${STACK}' already has a pass running (pid ${holder}); refusing to start a second one" >&2
+  echo "[qa] two passes on one stack reset the database out from under each other — wait for the running pass to finish" >&2
+  exit 4
+fi
+# Written after the lock is held, so a waiter reports the pass that actually owns the stack
+# rather than the one that merely got there first. `BASHPID`, not `$$`: `$$` is the pid of the
+# *shell* and does not change inside a subshell or a `bash -c`, so a pass launched through one
+# would record its parent's pid and the refusal would name a process that has nothing to do
+# with the stack.
+printf '%s\n' "$BASHPID" >&9
+
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
