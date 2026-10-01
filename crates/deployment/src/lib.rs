@@ -17,6 +17,7 @@
 pub mod error;
 pub mod job;
 pub mod jobs;
+pub mod maintenance;
 pub mod manifest;
 pub mod preflight;
 pub mod version;
