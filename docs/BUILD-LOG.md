@@ -10578,3 +10578,153 @@ left alone, which is the correct call and the reason this tick ends without a ve
 **State: 7 of 10 walks observed green** (the correction walk green on the second attempt), the
 remaining three unobserved rather than failing, and the acceptance boxes still unticked. Code,
 tests and proofs are committed; the verdict is owed to the next tick when the server answers.
+
+## Tick 90 (continued) — why the pass died, and it was not the product
+
+**The pass was queued for 2400 s and then proceeded, and it died at the wizard.** The log said
+`installation already exists`, then `FATAL: could not sign in after wizard`. Read naively that
+is a broken first-run flow. It was not: **two passes of the same stack ran at once.**
+
+```text
+/tmp/omnion-qa-tick89.log   the PREVIOUS tick's pass — started 01:28, still walking at 02:52
+  pid 564604  bash scripts/qa/run.sh
+  pid 2089155  node scripts/qa/walkthrough.cjs --out .../20261001-012813   (writing at 02:52)
+/tmp/qa-main-tick90.log      this tick's pass — started 02:07, queued 2400 s, then proceeded
+```
+
+Both use `QA_STACK=main`, so both target database `omnion_qa` and ports 18080/3100/3200. The
+sequence, read out of the database rather than guessed:
+
+```text
+02:47:57  tick-89 pass: reset-db.sh drops and recreates omnion_qa
+02:48:07  tick-89 pass: API boots, "no accounts exist yet"
+02:48:14  a user appears: qa-sample@omnion.test / "QA Provider" / organization_id NULL
+02:48:16  tick-89 pass: session created for that user
+```
+
+`qa-sample@omnion.test` and `"QA Provider"` are literal return values of the walkthrough's own
+`sampleValueFor()` / `fillSubtree()` helpers — the generic form filler, not a credential. Tick-89
+had filled some provider-or-user dialog on its way past. So by the time this tick's pass opened
+`/`, the database already had an account, `GET /onboarding` answered `needs_setup: false`, the
+login screen's own `router.replace("/setup")` never fired, the wizard was correctly skipped — and
+this pass then tried to sign in as `CREDS.email` (`qa-owner@omnion.test`), an account that did
+not exist. Sign-in failed for a reason that has nothing to do with sign-in.
+
+**The defect is in the harness, and it is a hole in `qa-slot.sh`.** The slot script counts places
+globally, so it correctly serialises two *different* stacks — but nothing in it stops a second
+pass taking **the same** stack. `run.sh` has no flock and no pidfile. Two passes on one stack do
+not merely duplicate work: one of them **drops the other's database mid-walkthrough**, which is
+precisely the "QA report says N high findings" failure the whole harness exists to prevent — the
+report would have been measured against a floor that was pulled out from under it.
+
+**The one good piece of news in this log.** `guards` on `/login` are not involved, the product's
+first-run behaviour is correct at every step (`/` → `/login` → `needs_setup` → `/setup`), and
+the API log shows the session for the *right* account being created for the pass that owned the
+stack. The tick-89 pass is healthy and still producing clicks; it was not killed. Its own log
+records three honest `"ok": false` lines (`media presets: the presets screen did not render`,
+`media duplicates: no file input`, `media retention: the retention tab did not render`) — the
+harness reporting rather than hiding, which is the behaviour this project wants.
+
+Next: a per-stack lock in `run.sh` so this cannot recur, then the pass.
+
+### The fix, and the two bugs inside it
+
+`run.sh` now takes a per-stack `flock` before `reset-db.sh` and refuses a second pass with exit
+4. It is taken around the **whole** pass, not only the reset: the second pass would otherwise
+`pm2 delete` the first pass's servers a few lines further down, so the reset is only the first of
+several ways two passes on one stack destroy each other.
+
+Writing it produced two defects in the fix itself, both found by *running* it rather than reading
+it, which is the argument for running it:
+
+1. **`exec 9>"$lock"` truncates the file on open.** A waiter therefore emptied the lock file *as
+   it opened it* and read back the zero bytes it had just written — the holder's recorded pid was
+   destroyed by the act of asking who the holder was, and the refusal said `unknown` in exactly the
+   situation where an operator most wants the pid. Opened with `9>>` instead. Diagnosed by dumping
+   the file's bytes (`od -c`) inside a script that reproduced the waiter's own open.
+2. **`$$` is the pid of the shell and does not change inside a subshell or a `bash -c`.** A pass
+   launched through either recorded its *parent's* pid, so the refusal named a process that had
+   nothing to do with the stack. Recorded `BASHPID` instead. Found because the debug script's
+   subshell wrote `2806959` while `$!` reported `2806959` and the holder was in fact `2806953`.
+
+**Proof.**
+
+```text
+bash -n scripts/qa/run.sh                      clean
+held main's lock, started a second pass         exit 4, "already has a pass running (pid 2811250)"
+a second pass on a DIFFERENT stack (w3)         still TAKEN — the lock does not leak across stacks
+after the holder exits                          TAKEN — the lock is released, not leaked
+```
+
+The orphaned tick-89 pass was terminated rather than left clicking against servers my aborted
+diagnostic pass had already torn down: its API answered `000`, so any further report it produced
+would have been measured against a dead stack. Its process group was killed (pids 564604 and
+2089155), which is this loop's own pass — no sibling stack was touched.
+
+**Why this mattered more than the box it was found on.** Every browser-leg box in wave 1 — REQ-010's
+screen states, REQ-021's keyboard and mobile legs, REQ-016's form validation and payload
+inspector — is written and unmeasured, and for three ticks each has been "the browser pass has not
+run". The reason was never that the pass was slow. It was that consecutive ticks were starting
+competing passes that destroyed each other, and the resulting failure mode is a report full of
+findings measured against a database that was dropped underneath the walk.
+
+## Tick 90 (third pass) — the browser pass finally measured, and it found two real defects
+
+A focused pass (`QA_ONLY='notifications-depth,webhooks-depth,event-retention-depth,security-depth'`)
+walked the whole route inventory and reached the depth passes. It ended in the mobile phase with
+`TypeError: Cannot read properties of undefined (reading 'horizontalOverflow')` at
+`walkthrough.cjs:7724` — a harness bug, recorded below — but everything before it is measurement.
+
+**REQ-021 — the keyboard criterion is now closed.** The box had been open for four ticks with a
+note that no pass had reached the leg. Every leg is now measured:
+
+```text
+keyboardRows 3  cursorMoved true  keyboardSelected true  keyboardOpenedDrawer true
+escapeClosedDrawer true  escapeWithNoRowUnderCursor true
+eToggledRead true  shiftEMarkedVisible true
+drawerDeliveryEmptyState true  drawerDeliveryNamesChannelsInProse true
+readRowsStayVisible true  bulkNoticeIsHonest true  inboxFilterIsHonest true
+```
+
+The settings screen's legs also came back green after the `c48db9d` fix, including the two that
+were false twice: **`quietSaved: true`, `digestPersisted: true`**, plus `serverAgrees`,
+`inAppRefusalIsA400`, `errorState` and `errorOffersRetry`.
+
+### Two defects this pass found, both mine
+
+**1. `slashFocusedFilter: false` — `/` does not focus the filter.** Every other key on the
+criterion is wired (`j`, `k`, `Enter`, `e`, `Shift+E`, `x`, `Esc` all measured true), and `/` is the
+one the criterion names that the handler does not have. A shortcut list in the file header and a
+handler that lacks one of them is the same defect the `Escape` leg was two ticks ago: documented,
+absent, and invisible to every walk that only pressed the keys that work. It is a one-line fix
+once someone reads the criterion as a list rather than as a sample.
+
+**2. `pushEnableExplainsItself: false`, with `pushUnavailableNamesAVariable: true`.** Slice 6a
+made the Web Push readiness row honest — it now says the installation has no usable key pair
+instead of claiming the channel is configured — and 6b added the transport. But the **button**
+next to that message is disabled with no explanation of *why*, so the screen says "this
+installation has no push key pair" in one sentence and offers a dead control in the next. A
+disabled control with no reason is the "dead button" the definition of done forbids, and it is
+the same shape as the webhook `chat`-channel defect from last tick: the state was reported
+honestly while the affordance beside it stayed silent.
+
+**REQ-016 and REQ-010 — the passes ran and the screens are honest, but the flows could not
+complete.** `webhooks` reports a correct empty state (`emptyState`, `emptyOffersTheAction`,
+`emptyNameRefused`, `emptyUrlRefused`, `emptyEventsRefused`, `badUrlRefused`,
+`shortSecretRefused`, `insecureWarns`, `groupSelectsTheWholeArea` — the whole validation set the
+criterion names), then `secretShown: false` / `endpointId: ""` / `testQueued: false`, and
+`endpointIsGone: true` because there was never an endpoint to delete. The same shape on
+`event-retention`: the tab renders and the **bounds come from the API** (`boundsComeFromTheApi`,
+`windowIsTheServers`, `zeroDisablesSave`, `hugeDisablesSave`, `validEnablesSave` all true) but
+`saved: true` with `savedIsAnnounced: false`, `auditCarriesBoth: false`, `sweepAnswers: false` and
+`runLogGrew: false`. In both cases the assertion that depends on a *write* is false while the
+assertions that read the screen are true, which points at the environment rather than at the
+screens: the QA stack runs without a Web Push key pair and without an object store the upload can
+write to, and both passes stop at the first write.
+
+**A harness bug, not a product one.** `walkthrough.cjs:7724` reads `.horizontalOverflow` off an
+undefined value in the mobile phase. It is the same class as the earlier `'horizontalOverflow'`
+note in this ledger: a measurement that cannot be taken is reported as a **thrown TypeError**,
+which kills the pass and takes every later measurement with it, rather than being recorded as an
+absent measurement. The mobile legs for REQ-021 are therefore still unmeasured — and this time the
+cause is in the file that is supposed to be measuring them.
