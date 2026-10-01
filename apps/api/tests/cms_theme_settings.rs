@@ -714,6 +714,173 @@ async fn publishing_low_contrast_tokens_needs_an_acknowledgement() -> TestResult
     .await
 }
 
+/// The dry run the panel calls on every edit. It exists because the screen was printing the
+/// findings of the last SAVE beside a preview of the palette being typed, and the publish
+/// refusal told the operator to read that stale panel.
+///
+/// The three properties this walk proves, in order, and each one is a separate way the feature
+/// could be a no-op that still returns 200:
+///
+/// 1. **It measures the UNSAVED palette.** A site with no draft at all answers `[]`; the walk
+///    submits a failing palette and requires findings back, so a route that quietly answered
+///    from the stored revision would fail here rather than looking correct.
+/// 2. **It writes nothing.** Counted on the table, because a route called on every drag frame
+///    that appended a revision would fill the history with the operator's colour picking.
+/// 3. **It merges the theme defaults.** A palette that overrides only `accent` still renders
+///    every other token from the theme; measuring the bare overrides would report a palette the
+///    site never paints.
+#[tokio::test]
+async fn a_dry_run_measures_an_unsaved_palette_and_writes_nothing() -> TestResult {
+    walk!(state, |state: AppState, db: Db| async move {
+        let organization_id = create_organization(&db).await;
+        let site = create_site(&db, organization_id, "ts-contrast-check").await;
+        mirror_theme(&db, "minimal").await;
+        let (user_id, email) = create_account(&db, organization_id).await;
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
+        let auth = login(&state, &db, &email).await;
+
+        // BEFORE anything is saved: a site with no draft has no stored palette, so any finding
+        // this returns came from the body. That is the assertion that separates a real
+        // measurement from a read of the stored revision.
+        let revisions_before: i64 = sqlx::query_scalar(
+            "select count(*) from theme_settings_revisions where site_id = $1",
+        )
+        .bind(site.id)
+        .fetch_one(db.pool())
+        .await?;
+        assert_eq!(revisions_before, 0, "the site starts with no settings at all");
+
+        let measured = call(
+            &state,
+            request(
+                Method::POST,
+                &format!(
+                    "/api/v1/sites/{}/theme-settings/contrast-check",
+                    site.id
+                ),
+                Some(&auth),
+                Some(serde_json::json!({
+                    "themeKey": "minimal",
+                    "tokens": low_contrast_tokens(),
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(measured.status, StatusCode::OK, "{}", measured.body);
+
+        let findings = measured.body["findings"].as_array().expect("findings is a list");
+        assert!(
+            !findings.is_empty(),
+            "an unsaved failing palette must report findings: {:#}",
+            measured.body
+        );
+        assert_eq!(measured.body["themeKey"], json!("minimal"));
+
+        // The same palette through the REAL save path produces the same findings, so the badge
+        // the operator saw before saving is the badge that will refuse the publish.
+        let saved = save(&state, &auth, site.id, save_body(low_contrast_tokens())).await;
+        let after_save = saved.body["contrast"].as_array().expect("contrast is a list");
+        assert_eq!(
+            findings.len(),
+            after_save.len(),
+            "the dry run and the save must be one measurement: dry {:?} vs save {:?}",
+            findings,
+            after_save
+        );
+
+        // And the refusal is still the refusal: acknowledging a dry run is not a licence, the
+        // publish guard runs on the draft it reads back.
+        let refused = publish(&state, &auth, site.id, false).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            refused.body
+        );
+
+        // Nothing was written by the measurement itself.
+        let revisions_after: i64 =
+            sqlx::query_scalar("select count(*) from theme_settings_revisions where site_id = $1")
+                .bind(site.id)
+                .fetch_one(db.pool())
+                .await?;
+        assert_eq!(
+            revisions_after, 1,
+            "the one revision is the save above; the dry run must add none"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// The dry run is a READ. Gating it on the edit permission would answer "your palette is fine"
+/// with a 403 to an account that can read the very draft being measured — which reads as "your
+/// palette is broken", and is the opposite of what the route is for.
+#[tokio::test]
+async fn a_dry_run_needs_no_edit_power_and_writes_no_audit_trail() -> TestResult {
+    walk!(state, |state: AppState, db: Db| async move {
+        let organization_id = create_organization(&db).await;
+        let site = create_site(&db, organization_id, "ts-check-reader").await;
+        mirror_theme(&db, "minimal").await;
+        let (user_id, email) = create_account(&db, organization_id).await;
+        // A reader: `themes.read` and nothing else.
+        grant(&db, organization_id, user_id, &["themes.read"], "Reader").await;
+        let auth = login(&state, &db, &email).await;
+
+        let measured = call(
+            &state,
+            request(
+                Method::POST,
+                &format!(
+                    "/api/v1/sites/{}/theme-settings/contrast-check",
+                    site.id
+                ),
+                Some(&auth),
+                Some(serde_json::json!({
+                    "themeKey": "minimal",
+                    "tokens": low_contrast_tokens(),
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            measured.status,
+            StatusCode::OK,
+            "a measurement is a read; refusing it for lacking edit power is a 403 that reads \
+             as a broken palette: {}",
+            measured.body
+        );
+        assert!(
+            !measured.body["findings"].as_array().expect("a list").is_empty(),
+            "and it still measures: {:#}",
+            measured.body
+        );
+
+        // It is called on every keystroke of a colour picker, so it must not leave an audit row
+        // per keystroke — the audit log is for what a person did, not for what a panel asked.
+        // `target_id` is TEXT, so the id is cast rather than bound as a uuid.
+        let audit_rows: i64 = sqlx::query_scalar(
+            "select count(*) from audit_log where target_type = 'site' and target_id = $1",
+        )
+        .bind(site.id.to_string())
+        .fetch_one(db.pool())
+        .await?;
+        assert_eq!(
+            audit_rows, 0,
+            "a dry run is not an action and must not appear in the audit trail"
+        );
+        Ok(())
+    })
+    .await
+}
+
 /// The second half of the criterion: restoring revision 1 reverts the tokens AND is itself
 /// recorded as a new revision, with the number it came from.
 #[tokio::test]
