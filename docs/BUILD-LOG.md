@@ -7172,3 +7172,74 @@ spent its budget and proceeded without a place because the shared slot belongs t
 (`/tmp/omnion-qa-slot` holder alive, cwd `/mnt/apopic/omnion-w5`). So this tick ends with the
 three fixes committed and every gate green, and the browser leg **still owed** — which is the
 honest state, not the "I ran a pass" reading of the same log.
+
+
+---
+
+**wave6 · tick 50 · PostgreSQL is back, and it was worth waiting for.** `pg_isready` on 5433 has
+been refusing since 06:47 for the last four ticks; it answers `accepting connections` now. Two
+things that had been blocked on it are now measured, and one of them was a product defect.
+
+**1. The `omnion migrate` CLI had not compiled since the surface landed.** `runner::apply` and
+`runner::plan` take the pool, the policy and the actor **by value**; the CLI passed
+`&pool, &policy, &actor`. Every operator-facing `omnion migrate` command was broken and nothing
+said so — the tick gate is `cargo test -p omnion-migrations`, and the CLI is a different crate,
+so the gate that runs every single tick never built it. Three of my acceptance criteria had been
+ticked with "proved by the proof script" while the binary that script invokes could not be
+produced. Fixed in `1cb0e6f6` (`PgPool` is an Arc'd handle, so `.clone()` shares one pool).
+
+**2. The down rehearsal had no `lock_timeout` at all — measured, not inferred.** `verify_down`
+executes the reversal's DDL on a bare pool; the `set local lock_timeout` /
+`statement_timeout` pair lives only in `apply_locked`. With `migration_policy.lock_timeout_ms`
+pinned to 1000 and an `ACCESS EXCLUSIVE` lock held against the table the reversal drops, the
+rehearsal **waited 17.9 s** and then failed for an unrelated reason. The one path an operator runs
+to ask "is my rollback safe" was the one path with no bound on it, and `lock_timeout` exists for
+exactly that condition. Fixed in `ad4064ba`: the reversal runs in a transaction (because `set
+local` has nothing to scope to otherwise) and is **committed before `after` is read back** — that
+ordering is load-bearing, since a still-open transaction rolls the `drop table` back on drop and
+the comparison would then read a structure the reversal never made. The failure path deliberately
+does not commit.
+
+**3. The new proof found three defects in itself, and each is recorded where it bit.** A bare
+`psql -c` returns when the statement ends and PostgreSQL drops session locks at session end — so
+the "held" advisory lock was held for microseconds and the section **SKIPped itself into a false
+pass**. `pg_advisory_lock` takes a bigint but the key overflows an OID parameter, and a bigint
+advisory key is stored as two 32-bit halves in `classid`/`objid`, so matching `objid` alone never
+matches. And the blocker was held in the *primary* database while `verify-down` rehearses in the
+*scratch* one, so it blocked nothing and the rehearsal reported a clean success. `scripts/qa/
+migration-concurrency-proof.sh`, 12 checks, and the elapsed-time assertion is compared as a
+**boolean**: `"0 (took 17s…)"` contains `"1"`, so the substring helper passed the exact run it was
+written to catch.
+
+**4. A fifty-minute pass that ended with no summary at all.** `runDeploymentMigrationsDepth` closed
+with `report.push({...})`, and `report` is the run's **object**, not an array — so the line threw
+on the pass's LAST statement, after every check had run and every screenshot had been taken, and
+the throw unwound the process and took the three depth passes queued behind it. The second half is
+worse: the pass was wired as a **third argument** to `runDepthPass(name, pass)`, and JavaScript
+evaluates arguments eagerly at the call site, so it ran **outside** the helper's try/catch — the
+guard existed and protected nothing. `0c23dc3d` reports through `note` and runs both passes inside
+one thunk. `2289a479` bans the class (no `report.push` in any depth pass, every `runDepthPass` call
+exactly two arguments), differentially proven: three checks fail against the previous tree and
+name `runDeploymentMigrationsDepth`; reintroducing only the eager third argument fails exactly the
+arity check. Two bugs in that gate were found by running it — a trailing comma is not an argument
+(it reported **sixteen** phantom violations), and `m[2]` on a two-group regex is `undefined`, not
+`null`, so the failure named no function at all.
+
+**5. The preferences restore never restored anything** (`a41c3a7f`). It was a cookie-authenticated
+`PUT` with no `x-omnion-csrf`, so the API refused it with `csrf_unavailable` before the handler
+ran — inside a `.catch(() => {})`, with the result then hardcoded `steps.restored = true`. The next
+pass inherited the leftovers, met a row that already held the values it was about to write, and its
+unconditional toggle click *unchecked* an already-checked box: fields unmounted, Save was correctly
+disabled, and `locator.click` on Save timed out fifty minutes later as if the product were broken.
+`9da8607f` pins all three invariants; 7/7 fail against the previous tree, 7/7 pass against this one.
+
+Proof this tick: `cargo build -p omnion-cli -p omnion-migrations` exit 0 (first time) · `cargo test
+-p omnion-migrations` **71 passed, 0 failed** · `cargo test -p omnion-permissions` **67 passed** ·
+`migration-down-gate.sh` **21 passed, 0 failed** with 5 load-bearing mutations · `migration-
+concurrency-proof.sh` **12 passed, 0 failed**, and **9/12 with `ad4064ba` reverted** ·
+`preferences-restore.test.cjs` **7/7** · `depth-pass-thunk.test.cjs` **5/5**.
+
+Next: read the re-run pass (it was started at 09:29 with the depth-pass fix in the tree, and the
+tick began with an uncommitted tree from tick 49 that had a syntax error in its new test file — a
+tree that was never run). Two REQ-129 criteria are now tickable; the zero-downtime recipe, the
+backfill restart/pause proofs, the seeds and the anonymised export remain.
