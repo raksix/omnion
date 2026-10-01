@@ -79,6 +79,7 @@ pub mod cdn_cache;
 pub mod cdn_purge;
 pub mod commands;
 pub mod content;
+pub mod deployment;
 pub mod environments;
 pub mod health;
 pub mod health_incidents;
@@ -1081,6 +1082,34 @@ pub fn router(state: AppState) -> Router {
         post(cdn_purge::test_settings).layer(guards::require(&state, "cdn.manage"));
     let cdn_adapters = get(cdn_purge::adapters).layer(guards::require(&state, "cdn.read"));
 
+    // The deployment centre (REQ-024, slice 1). Six reads and one write, and the write is
+    // `deployment.manage` because "check for updates now" reaches out to the network and
+    // rewrites the release cache — it is not a read even though it answers a question.
+    //
+    // `deployment.read` covers all six, rather than one key per surface: every value they
+    // return is already visible on the environment cards, which the same key gates. A finer
+    // split would create a key that means "may see what is installed" and a second that means
+    // "may see what could be installed", and the second is the one an operator needs to compare
+    // a release's notes against the running core — so it would be the key nobody holds.
+    let deployment_version =
+        get(deployment::get_version).layer(guards::require(&state, "deployment.read"));
+    let deployment_environments =
+        get(deployment::list_environments).layer(guards::require(&state, "deployment.read"));
+    let deployment_environment_one =
+        get(deployment::get_environment).layer(guards::require(&state, "deployment.read"));
+    let deployment_releases =
+        get(deployment::list_releases).layer(guards::require(&state, "deployment.read"));
+    let deployment_release_one =
+        get(deployment::get_release).layer(guards::require(&state, "deployment.read"));
+    let deployment_history =
+        get(deployment::list_history).layer(guards::require(&state, "deployment.read"));
+    let deployment_checks =
+        get(deployment::get_checks).layer(guards::require(&state, "deployment.read"));
+    // The one write in slice 1. Named `checks/run` rather than merged onto the checks route so
+    // a panel that links to `/deployment/checks` can never turn a GET into a network call.
+    let deployment_checks_run =
+        post(deployment::run_check_now).layer(guards::require(&state, "deployment.manage"));
+
     // Staging environments (REQ-017). Reading the list and one environment is `deployment.read`;
     // creating one, re-cloning it and cancelling a clone is `deployment.preview`; archiving one
     // is `deployment.rollback`. Three keys rather than one, because looking at a staging copy,
@@ -1956,6 +1985,14 @@ pub fn router(state: AppState) -> Router {
         .route("/cdn/settings", cdn_settings)
         .route("/cdn/settings/test", cdn_settings_test)
         .route("/cdn/adapters", cdn_adapters)
+        .route("/deployment/version", deployment_version)
+        .route("/deployment/environments", deployment_environments)
+        .route("/deployment/environments/{environment}", deployment_environment_one)
+        .route("/deployment/releases", deployment_releases)
+        .route("/deployment/releases/{version}", deployment_release_one)
+        .route("/deployment/history", deployment_history)
+        .route("/deployment/checks", deployment_checks)
+        .route("/deployment/checks/run", deployment_checks_run)
         .route("/environments", environments)
         .route("/environments/{id}", environment_one)
         .route("/environments/{id}/clone", environment_one_clone)

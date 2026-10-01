@@ -215,6 +215,34 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "deployment",
         description: "Roll a deployment back",
     },
+    // `deployment.manage`, distinct from `deployment.deploy` on purpose. "Manage" is the
+    // operator's own instruments on the centre: run an update check, configure a maintenance
+    // window, restart a workload. "Deploy" is the thing that changes what a tenant runs. They
+    // are different amounts of trust and an account that may prepare a deployment — a release
+    // engineer checking whether a version exists before the window opens — must not thereby be
+    // able to put it in production.
+    PermissionDef {
+        key: "deployment.manage",
+        category: "deployment",
+        description: "Run update checks, configure maintenance windows and restart workloads",
+    },
+    // Cluster visibility is its own key, and not a fourth degree of the same axis: reading
+    // replica counts and CPU limits is a fact about infrastructure that an operator investigating
+    // an incident needs without the ability to restart anything, and merging it into
+    // `deployment.manage` would mean the read arrives with the write.
+    PermissionDef {
+        key: "deployment.cluster.read",
+        category: "deployment",
+        description: "Read cluster replicas, resource usage and rollout status",
+    },
+    // Maintenance windows change whether every write route on the platform answers 503, so they
+    // are separated from both: an account that may deploy a version must not thereby be able to
+    // freeze the panel for everybody else.
+    PermissionDef {
+        key: "deployment.maintenance",
+        category: "deployment",
+        description: "Configure maintenance windows",
+    },
     // Identity and access management.
     PermissionDef {
         key: "iam.permissions.read",
@@ -736,6 +764,14 @@ mod tests {
             "deployment.preview",
             "deployment.deploy",
             "deployment.rollback",
+            // The three the deployment centre adds. Named here explicitly because an
+            // uncatalogued key is the worst failure this catalogue has: `guards::require`
+            // resolves a key against it, so a route guarded by a name the catalogue does not
+            // know answers 403 for *everybody*, the owner included, and the screen looks like a
+            // permissions bug rather than a typo.
+            "deployment.manage",
+            "deployment.cluster.read",
+            "deployment.maintenance",
         ] {
             assert!(is_known(family), "{family} must be in the catalogue");
         }

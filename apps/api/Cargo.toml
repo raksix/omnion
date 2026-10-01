@@ -30,6 +30,10 @@ tokio-stream = { version = "0.1", features = ["sync", "time"] }
 omnion-audit = { path = "../../crates/audit" }
 omnion-cdn = { path = "../../crates/cdn" }
 omnion-environment = { path = "../../crates/environment" }
+# The deployment centre (REQ-024). `store` is on because `routes/deployment.rs` and
+# `deployment_check.rs` are its persistence layer; the feature is off by default so the
+# decision types can be unit-tested with no pool.
+omnion-deployment = { path = "../../crates/deployment", features = ["store"] }
 omnion-ai-hub = { path = "../../crates/ai-hub" }
 omnion-automation = { path = "../../crates/automation" }
 omnion-content = { path = "../../crates/content" }
