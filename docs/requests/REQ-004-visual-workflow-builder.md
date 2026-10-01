@@ -1,6 +1,6 @@
 # REQ-004 — Visual Workflow Builder
 
-> **Status:** in-progress (tick 51 · **two gestures shared one press of undo — the coalesce key named the ACTION, not the subject** · `57d20ebe` fix, `eacd5fa9` guard · 273 admin tests (+14), pnpm typecheck clean, omnion-workflows --lib 157 unchanged, five mutations all red · the 50-step depth claim still rests on the constant `HISTORY_LIMIT = 100` and is NOT ticked) · previous: in-progress (tick 50 · **undo and redo replaced the graph without pruning the selection** — the two handlers that replace the graph WHOLESALE restored `nodes`/`edges` and nothing else, so the selection went on naming a card the canvas no longer had. **Reachable with the keyboard alone** — no second tab, no conflict: the palette's click-add ends in `setSelection(selectNode(...))`, so add a card, add another, press ⌘Z, and the undo removes the card the selection names. The inspector looks its node up with `nodes.find(...) ?? null` and went blank, which is what a correct empty inspector looks like; the toolbar did not, because Duplicate and Copy read `disabled={!selected}` on a string that survived, so both stayed ENABLED for a node that did not exist, the status bar printed "1 selected" over a canvas whose remaining card was not that one, and `Del` resolved to an id the restored graph lacks. It is the **same hole `load()` closed one tick earlier from the other direction** — the loader adopts a NEWER graph and prunes, undo adopts an OLDER one and did not, so the rule had two callers and the earlier fix left one behind, which is the tell that it belongs in a shared step. `applyHistoryStep` now stores the cursor, restores, prunes and saves, and both handlers route through it; the alive set is read off `restored` and not off `nodes`, because `nodes` in the closure is the graph being REPLACED, so pruning against it keeps exactly the nodes the undo removes and is a no-op on the only case the prune exists for. Pruned rather than cleared: undoing a `remove` should leave the card selected, since Del-on-the-wrong-card then ⌘Z is the most likely sequence in this builder. **259 admin tests (+14), all five halves proven to bite** (prune removed 2 red · pruned against the replaced graph 1 · clear instead of prune 2 · a PARTIAL fix where only `doUndo` restores inline 1 · `pruneSelection` degraded 8), `pnpm typecheck` clean, `omnion-workflows --lib` 157 unchanged, `node --check` clean. The `undo-selection` walkthrough row and its guard are written; all three row mutations red one assertion each. **NOT MEASURED in a browser** — the slot is held by a live `omnion-w5` pass (holder 1822938, cwd confirmed by `/proc/<pid>/cwd`), 35 Chrome, /dev/shm 85%, swap 24G, and w7 + w2 are also running, so no second pass was forced) · > **Status:** in-progress (tick 48
+> **Status:** in-progress (tick 52 · **the depth claim is now walked, and the trim that decides which fifty survive was unguarded** · `478589e4` · 280 admin tests (+7), pnpm typecheck clean, omnion-workflows --lib 157 unchanged, eight mutations red · 50 gestures across all five kinds replayed press by press against the canvas, plus a `HISTORY_LIMIT + 50` overflow walk; `entries.slice(0, LIMIT)` kept the OLDEST hundred and passed 278 green · the sheet's "50 steps deep" is now derived from the constant · **NOT ticked**: no browser pass (slot held by a live w5 pass) and four other rows unmeasured) · previous: in-progress (tick 51 · two gestures shared one press of undo — the coalesce key named the ACTION, not the subject)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -176,7 +176,73 @@ slot file's holder is a dead two-pid concatenation again (both pids gone, reapab
 **three** live passes hold 30 Chrome (w7, w5, main), `/dev/shm` 85% and **0 free RAM** with
 24G of 31G swap. The depth criterion is still not ticked in any part — see the note above it.
 
-**Next.** The 50-step claim still rests on the constant `HISTORY_LIMIT = 100`, and this tick
+**TICK 52: THE DEPTH CLAIM IS NOW WALKED, AND THE TRIM WAS UNGUARDED
+(`2f2b5f1d`, `9d0e2c47`).** The 50-step claim rested on `HISTORY_LIMIT = 100` and on the
+tick-51 removal of one reason it was hollow. What was still missing is the part nobody had done:
+*press undo fifty times*. `history-depth.test.ts` (7 tests) performs **50 gestures across all
+five kinds** — add, move, edit, connect, delete — in a fixed rotation, then replays the presses
+and compares the reconstructed graph against the canvas as it stood at five checkpoints and at
+the end. Three properties make it a claim about presses rather than about an array:
+
+- **The clock cannot be what separates them.** The whole run spans 500ms inside a 600ms window,
+  and the test asserts that arithmetic, so only the coalesce key keeps the gestures apart.
+- **The world must not end where it started.** Each cycle deletes the *oldest* card, so the
+  final graph is a different graph; a stack that undid nothing would fail the premise before
+  the walk even starts. An earlier draft deleted the card it had just added and the premise was
+  vacuous.
+- **The control must be able to fail.** The same fifty gestures under one bare action key
+  collapse to a *single* entry — asserted as a fact about the product, not left implicit.
+
+**Two real defects surfaced, and the first is the one a depth claim exists to rule out.** Fifty
+gestures fit *inside* the limit, so nothing above ever reached the trim — and the trim is the
+one line that decides which fifty survive when the stack is full. `entries.slice(0, LIMIT)`
+instead of `entries.slice(entries.length - LIMIT)` keeps the **oldest** hundred, which passed
+the entire suite: **278 green with the trim inverted.** Every retained entry still undoes
+correctly, the count is right, and the author's last fifty edits are gone while the first fifty
+stay resurrectable — a 100-deep history that is useless. The overflow test walks
+`HISTORY_LIMIT + 50` gestures and presses undo fifty times, comparing each press against the
+canvas that was on screen when that gesture was made. The second defect is smaller and is the
+same shape as the first: the keyboard sheet read "the history is 50 steps deep" as a **string
+literal**, answering to nothing, so lowering the limit would leave the sheet promising a depth
+the stack no longer has. `historyDepthLabel()` derives it from the constant and the ⌘Z row
+carries the function, with a test reading the row out of the catalogue.
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **280
+passed** (273 before, +7), `pnpm typecheck` clean, `cargo test -p omnion-workflows --lib` **157
+unchanged**. **Eight mutations red across the whole suite:** limit lowered to 20 (5), trim
+inverted (1), coalesce disabled (1), `undoTarget` off-by-one (2), `redoTarget` off-by-one (1),
+label decoupled from the constant (1), row hardcoded again (1), flattened catalogue emptied (1).
+Two mutations survive *in this file* and were checked rather than waved through: dropping the
+no-op guard is caught by the sibling `builder-history.test.ts`, and the redo-discard line is
+behaviourally inert here because the cursor gates both `redo` and `redoTarget` and the trim
+still bounds the array.
+
+**Four of the seven tests were wrong before they were right**, and each was wrong the same way:
+a check written about the array rather than about the press.
+
+- The checkpoint index was inverted — `checkpoints[k]` is the graph *before* gesture `k*10`, so
+  it is reached after `50 − k*10` presses, not `49 − press`. It read the state one gesture late
+  and reported a cursor defect that was not there.
+- The control used **five rotating** bare keys. Five names never match each other, so nothing
+  merged and the control passed on a broken product — the tick-48 mistake in a new place.
+- The redo walk read `entries[cursor + 1].after` directly instead of calling `redoTarget`, and
+  was green with `redoTarget` itself off by one. A test that reaches past the function under
+  test is testing its caller, and here the caller is the thing not written yet.
+- The overflow walk compared card *counts*, and a stack holding the oldest hundred has the same
+  count. The identity of the surviving entry (`add:x50` must be the oldest) is the assertion.
+
+**Not measured in a browser.** The slot is held by a live `omnion-w5` pass (holder 1822875,
+`/proc/1822875/cwd` = `/mnt/apopic/omnion-w5`, the other half of the file `1822897` is dead),
+and w7 and main are running too: 45 Chrome, 0 free RAM, 24G of 31G swap. No second pass forced.
+**The criterion is still NOT ticked** — the depth is now unit-proven, and the criterion's other
+half (`cmd-s-writes-once`) was measured in tick 37, but the REQ's own gate requires a QA pass
+before a box closes, and this REQ has four other rows still unmeasured.
+
+**Next.** `undo-selection` (unmeasured since tick 50, and the two rows now disagree with each
+other about the same toolbar button), then the REDO half of `reload-rebase`, then the
+run-from-here / pill / table-mode rows. The plugin row stays BLOCKED on REQ-121.
+
+**Next (tick 51 note, now done).** The 50-step claim still rests on the constant `HISTORY_LIMIT = 100`, and this tick
 removed one reason it was hollow: the stack no longer merges unrelated gestures, so 50 entries
 is 50 gestures. What is missing is a *test* that presses 50 distinct gestures and walks them
 back — and it must be five kinds, not 50 adds, or it re-derives the tick-48 mistake. Then

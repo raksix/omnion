@@ -7499,3 +7499,44 @@ second pass was forced.
 still the constant `HISTORY_LIMIT = 100` and nothing else, and a test of 50 adds would re-derive
 the tick-48 mistake of measuring one thing for a claim about another. Then `undo-selection`, then
 the REDO half of `reload-rebase`.
+
+
+## 2026-10-01 · tick 52 · omnion-wave3 · REQ-004 · the 50-step depth claim, walked
+
+**What.** `history-depth.test.ts` (7 tests) performs 50 gestures across all five kinds — add,
+move, edit, connect, delete — and replays the presses, comparing the reconstructed graph against
+the canvas as it stood at five checkpoints and at the end. The run spans 500ms inside the 600ms
+coalesce window (asserted, so the clock cannot be what separates the gestures), and each cycle
+deletes the *oldest* card so the final graph differs from the first. Two product defects fell out
+and both are fixed or now guarded:
+
+- **The trim that decides which fifty survive was unguarded.** Fifty gestures fit *inside*
+  `HISTORY_LIMIT = 100`, so no test reached the trim. Inverting it to
+  `entries.slice(0, HISTORY_LIMIT)` — keeping the OLDEST hundred — passed the entire suite with
+  **278 green**: every retained entry still undoes, the count is right, and the author's last
+  fifty edits are gone while the first fifty stay resurrectable. The overflow test walks
+  `HISTORY_LIMIT + 50` and asserts the *identity* of the oldest surviving entry, not the length.
+- **The keyboard sheet's "50 steps deep" was a string literal.** `historyDepthLabel()` derives it
+  from `HISTORY_LIMIT` and the ⌘Z row carries the function, so the two cannot drift.
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **280 passed**
+(273 before, +7) · `pnpm typecheck` → clean · `cargo test -p omnion-workflows --lib` → **157
+unchanged** · `node --check` clean. **Eight mutations red:** limit→20 (5), trim inverted (1),
+coalesce disabled (1), `undoTarget` off-by-one (2), `redoTarget` off-by-one (1), label decoupled
+(1), row hardcoded (1), catalogue emptied (1). Two survivors checked rather than waved through:
+the no-op guard is caught by `builder-history.test.ts`, and the redo-discard line is inert here
+because the cursor gates both `redo` and `redoTarget` and the trim still bounds the array.
+
+**Four of the seven tests were wrong before they were right**, all the same way — a check written
+about the array instead of the press: the checkpoint index was inverted; the control used five
+*rotating* bare keys, which never match each other and so could not fail; the redo walk read
+`entries[cursor+1].after` instead of calling `redoTarget` and was green with `redoTarget` itself
+off by one; the overflow walk compared counts, which a wrong-end stack satisfies.
+
+**No browser pass.** Slot holder 1822875 is live (`/proc/1822875/cwd` = `/mnt/apopic/omnion-w5`;
+the other pid in the file, 1822897, is dead), and w7 + main are running too — 45 Chrome, 0 free
+RAM, 24G of 31G swap. The criterion stays unticked.
+
+**Next.** `undo-selection` (unmeasured since tick 50, and `drag-undo`'s row now contradicts it on
+the same toolbar button), then the REDO half of `reload-rebase`, then the run-from-here / pill /
+table-mode rows. The plugin row stays BLOCKED on REQ-121.
