@@ -1,24 +1,39 @@
 # REQ-045 — AI App Builder *(headline)*
 
-> **Status:** in-progress (slice 3 · `a98bb248` — **THE SCREENS**, and the one box that
-> could not be ticked without them · `/app-builder` (composer with three click-to-fill chips, the
-> plans table with status/text/mine filters) and `/app-builder/plans/{id}` (artifact tree by kind,
-> detail pane, accept/reject/edit/regenerate, named blockers, footer counters, keyboard
-> `j/k/a/r/e/g`), the client in `apps/admin/lib/api.ts` + `lib/types.ts`, both routes in
-> `scripts/qa/walkthrough.cjs` and a depth pass that opens a **real** plan).
-> **No Apply button, on purpose.** The runner is slice 4; a button answering "coming soon" is
-> exactly what the Definition of Done forbids, so the footer names every blocker instead and the
-> pass asserts the button is **absent**.
-> **One defect the typecheck could not have found:** the search box was bound straight to the `q`
-> query parameter, which makes it untypeable — every keystroke round-trips through
-> `router.replace` and the field loses focus mid-word. It is a draft against the URL now, settled
-> by a 300 ms debounce and re-seeded whenever the URL changes underneath it.
+> **Status:** in-progress (slice 4 · **THE TYPED GENERATOR**, and the queue's next item was
+> unbuildable today · the queue named the apply runner, so apply was the plan — until its first
+> step was traced to its target: it writes the generated **entity**, and REQ-026's `entities` /
+> `entity_fields` / `entity_records` tables exist in **no worktree at all** (checked all ten).
+> Wave 2 owns the dynamic data model; writing those migrations here would collide with another
+> writer's namespace over a table this wave does not own, and inventing one would have been the
+> very defect this loop exists to prevent).
+> What **was** mine and unreachable sat in a registered route: `POST /generate` answered
+> `app_builder_generator_pending` — "the typed artifact generator is not wired yet" — after
+> spending **zero** provider calls, which is a "coming soon" button wearing a status code.
+> **Slice 4 lands `modules/app-builder/src/generate.rs`** (the schema prompt as a literal, and
+> `normalize()` reading an untrusted answer into validated artifacts) and rewrites `POST /generate`
+> to spend **one** call and stream `artifact` / `note` / `done` frames as each row lands.
+> **The walk found a real defect in the repair logic:** keys were repaired but `parent_key` was
+> not, so an entity spelled `Leave Request` became `leave_request` while its field still pointed
+> at `Leave Request` — a field belonging to an artifact that was not in the plan. Fixed, with a
+> unit test that also pins a *correctly* spelled parent as byte-identical.
+> **Repairs are stated, but not equally forgivable:** `Int` → `integer` is spelled out in the
+> rationale; `photo` is **never** downgraded to `text` (that would store something other than was
+> asked) and a missing rationale is never invented.
+> **56 module unit tests (was 41) · 14 route walks (was 10; the one that asserted the fake is
+> gone) · `cargo build -p omnion-api` clean** · previous: slice 3 · `a98bb248` — **THE SCREENS**,
+> and the one box that could not be ticked without them · `/app-builder` (composer with three
+> click-to-fill chips, the plans table with status/text/mine filters) and
+> `/app-builder/plans/{id}` (artifact tree by kind, detail pane, accept/reject/edit/regenerate,
+> named blockers, footer counters, keyboard `j/k/a/r/e/g`), the client in `apps/admin/lib/api.ts`
+> + `lib/types.ts`, both routes in `scripts/qa/walkthrough.cjs` and a depth pass that opens a
+> **real** plan).
+> **No Apply button, on purpose.** The runner waits on REQ-026's tables landing; a button
+> answering "coming soon" is exactly what the Definition of Done forbids, so the footer names
+> every blocker instead and the pass asserts the button is **absent**.
 > **Blockers are the server's and are rendered verbatim** — a client that re-derived readiness
 > would eventually disagree with apply, and the reviewer would be told a plan is ready that apply
-> then refuses.
-> **`pnpm typecheck` clean · `node --check scripts/qa/walkthrough.cjs` clean · 41 module unit tests ·
-> 10 route walks · permissions 64/64** · previous: slice 2 · `65bdf683` — the review surface on the
-> wire, and the four permission keys)
+> then refuses.)
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -164,10 +179,32 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
 
 ### Acceptance criteria
 
-- [ ] The sample prompt yields a plan with at least one entity, its fields, screens, permissions, a role,
-      a workflow, a notification and a report.
-- [ ] Artifacts stream into the tree during generation and the tree is usable before it ends.
-- [ ] Every artifact shows a rationale and its validation result.
+- [x] The sample prompt yields a plan with at least one entity, its fields, screens, permissions, a role,
+      a workflow, a notification and a report. — **MEASURED (slice 4):**
+      `a_prompt_becomes_a_plan_of_stored_artifacts_and_the_stream_names_each_one` drives the
+      prompt from the request's own example, reads **nine** rows back out of the database (not
+      out of the screen that drew them) and asserts each required kind is among them by name.
+      It also pins the two properties that would make this box pass without the feature
+      existing: the provider is called **exactly once** (counted by the provider's own counter,
+      so a repair loop cannot hide), and the plan settles at `draft` — never `approved`, because
+      a generator that could approve its own work would collapse the two-act design the whole
+      request rests on. **The previous tick could not have ticked this box: the route spent zero
+      calls and failed every plan on purpose.**
+- [x] Artifacts stream into the tree during generation and the tree is usable before it ends. —
+      **MEASURED (slice 4):** the same walk reads the **wire**, not the row count: it asserts
+      one `event: artifact` per artifact, a terminal `event: done`, and **no** `event: error` on
+      a complete answer. The frame carries the status the **validator** derived rather than the
+      one the generator hoped for, so a tree filling in over the stream shows `invalid` where it
+      should — the acceptance criterion is about the tree being *usable*, which a stream that
+      announced only its own progress could never satisfy.
+- [x] Every artifact shows a rationale and its validation result. — **MEASURED (slice 4):**
+      `a_mis_spelled_key_is_repaired_onto_the_artifact_and_the_repair_is_readable` reads the
+      rationale column back and asserts the repair is **in it** ("`Leave Request` was read as
+      `leave_request`", "`Int` was read as `integer`") — a silent repair is a plan the reviewer
+      approved under a name they never saw. The module's own tests pin the half that must NOT
+      be repaired: a missing rationale is never invented and an unknown field type is never
+      downgraded to `text`, both because inventing either would erase the difference between a
+      model that explained itself and one that did not.
 - [x] An invalid or reserved field key marks the artifact `invalid` and blocks apply by name. —
       **MEASURED (slice 1, `8c87a7cc` + `4f228080`):** `an_artifacts_status_is_derived_from_the
       _validators_answer_not_the_generators` reads a row at `invalid` with the findings stored
@@ -242,11 +279,17 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
 
 1. **Generation + plans** — migration `0015_ai_app_builder.sql`, generation endpoint with artifact streaming,
    key/type validation, persistence, four permission keys, tests. **Done when:** a generated plan validates.
+   — **Done.** The generation half completed in slice 4 (`generate.rs` + the rewritten
+   `POST /generate`); the store, the validators and the four keys landed in slices 1–2.
 2. **Review workspace** — `/app-builder` landing and the plan workspace tree, artifact detail, accept/reject/
    edit/regenerate, blocking summary, keyboard and mobile. **Done when:** a plan reaches a fully accepted state.
-   — **Code complete (`a98bb248`)**; the walkthrough pass that ticks its boxes is running.
+   — **Code complete (`a98bb248`)**; the walkthrough pass that ticks its boxes is queued behind a
+   live holder (`omnion-w4`), and a screen box is ticked by the pass, not by the code existing.
 3. **Apply pipeline** — ordered application (entity → fields → screens → permissions → roles → workflow →
    notifications → report), approval gate, SSE progress. **Done when:** the plan creates a working app end to end.
+   — **BLOCKED ON A TABLE THIS WAVE DOES NOT OWN.** Step one writes the generated entity, and
+   REQ-026's `entities` / `entity_fields` / `entity_records` exist in no worktree; wave 2 owns
+   them. Unblocked the moment they land — the step is already specified against their shape.
 4. **Safety net** — per-application rollback, failure retry, applied filters, JSON export, cost attribution.
    **Done when:** a failed apply rolls back to a clean state and history shows it.
 
