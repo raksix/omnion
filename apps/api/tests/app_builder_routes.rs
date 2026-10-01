@@ -24,10 +24,20 @@
 //!   tenant's plan id answers `404` on the detail and contributes **zero rows** to the other
 //!   tenant's list — asserted against the list body rather than against a status code.
 //! * **`appbuilder.apply` guards nothing yet, and that is visible.** The four keys are
-//!   catalogued (the crate test proves it) while the apply runner is slice 3, so the suite
-//!   proves the *other* three actually refuse an account that holds none of them: a caller
-//!   with no app-builder keys gets `403` from the list, which is what makes the key a
-//!   power rather than a label.
+//!   catalogued (the crate test proves it) while the apply runner is the next slice, so the
+//!   suite proves the *other* three actually refuse an account that holds none of them: a
+//!   caller with no app-builder keys gets `403` from the list, which is what makes the key
+//!   a power rather than a label.
+//! * **`generate` was the one route that answered with its own absence.** It used to spend
+//!   zero provider calls and fail the plan with "the typed artifact generator is not wired
+//!   yet" — a status code wearing the costume of a "coming soon" button. It now asks once
+//!   and stores what came back, so the walks below assert the plan **exists** (nine rows,
+//!   one per required kind) rather than asserting the shape of an apology. Three properties
+//!   the walks pin because each was a way this could have looked finished and not been:
+//!   the plan settles at `draft` and never `approved` (a generator must not accept its own
+//!   work); the provider is called **once** (a repair loop would double the cost of a plan
+//!   that was merely mis-spelled); and an answer missing a required kind keeps its
+//!   artifacts and names the gap rather than reading as a finished generation.
 //!
 //! The harness — CSRF-aware credential, scratch database, mock provider — is the sibling
 //! decision suite's, copied rather than reinvented, for the reason its own header states.
@@ -591,41 +601,104 @@ async fn seed_plan(harness: &Harness, organization_id: Uuid, created_by: Uuid) -
         .expect("the plan row must be written");
 
     let drafts: Vec<NewArtifact> = vec![
-        artifact("entity", "leave_request", None, 0, json!({
-            "key": "leave_request", "label": "Leave request", "plural_label": "Leave requests"
-        }), "Leave requests are what the app is for."),
-        artifact("field", "start_date", Some("leave_request"), 1, json!({
-            "key": "start_date", "label": "Start date", "type": "date"
-        }), "A request has a start."),
-        artifact("field", "days", Some("leave_request"), 2, json!({
-            "key": "days", "label": "Days", "type": "integer", "required": true
-        }), "The approver needs the length."),
-        artifact("ui", "leave_request_list", Some("leave_request"), 3, json!({
-            "key": "leave_request_list", "label": "Leave requests", "entity": "leave_request",
-            "columns": ["start_date", "days"]
-        }), "Operators list what is pending."),
-        artifact("permission", "leave.approve", None, 4, json!({
-            "key": "leave.approve", "description": "Approve a leave request"
-        }), "Approving is a separate power from reading."),
-        artifact("role", "leave_manager", None, 5, json!({
-            "key": "leave_manager", "label": "Leave manager",
-            "permissions": ["leave.approve"]
-        }), "One role for the approvers."),
-        artifact("workflow", "leave_approval", None, 6, json!({
-            "key": "leave_approval", "trigger": "leave_request.created",
-            // `action` is REQUIRED on every step — the validator refuses a step the engine has
-            // nothing to run, and an `approval` step is an action like any other. The fixture
-            // shipped without it and the walk caught it by naming the offender, which is the
-            // one thing a bare count ("8 pending, not 9") could never have told us.
-            "steps": [{ "name": "approve", "kind": "task", "action": "leave.approve",
-                        "params": { "entity": "leave_request" } }]
-        }), "Every request needs a human decision."),
-        artifact("notification", "leave_decided", None, 7, json!({
-            "key": "leave_decided", "channel": "email", "event": "leave_request.decided"
-        }), "The requester learns the outcome."),
-        artifact("report", "leave_summary", None, 8, json!({
-            "key": "leave_summary", "group_by": "days"
-        }), "Managers count days, not rows."),
+        artifact(
+            "entity",
+            "leave_request",
+            None,
+            0,
+            json!({
+                "key": "leave_request", "label": "Leave request", "plural_label": "Leave requests"
+            }),
+            "Leave requests are what the app is for.",
+        ),
+        artifact(
+            "field",
+            "start_date",
+            Some("leave_request"),
+            1,
+            json!({
+                "key": "start_date", "label": "Start date", "type": "date"
+            }),
+            "A request has a start.",
+        ),
+        artifact(
+            "field",
+            "days",
+            Some("leave_request"),
+            2,
+            json!({
+                "key": "days", "label": "Days", "type": "integer", "required": true
+            }),
+            "The approver needs the length.",
+        ),
+        artifact(
+            "ui",
+            "leave_request_list",
+            Some("leave_request"),
+            3,
+            json!({
+                "key": "leave_request_list", "label": "Leave requests", "entity": "leave_request",
+                "columns": ["start_date", "days"]
+            }),
+            "Operators list what is pending.",
+        ),
+        artifact(
+            "permission",
+            "leave.approve",
+            None,
+            4,
+            json!({
+                "key": "leave.approve", "description": "Approve a leave request"
+            }),
+            "Approving is a separate power from reading.",
+        ),
+        artifact(
+            "role",
+            "leave_manager",
+            None,
+            5,
+            json!({
+                "key": "leave_manager", "label": "Leave manager",
+                "permissions": ["leave.approve"]
+            }),
+            "One role for the approvers.",
+        ),
+        artifact(
+            "workflow",
+            "leave_approval",
+            None,
+            6,
+            json!({
+                "key": "leave_approval", "trigger": "leave_request.created",
+                // `action` is REQUIRED on every step — the validator refuses a step the engine has
+                // nothing to run, and an `approval` step is an action like any other. The fixture
+                // shipped without it and the walk caught it by naming the offender, which is the
+                // one thing a bare count ("8 pending, not 9") could never have told us.
+                "steps": [{ "name": "approve", "kind": "task", "action": "leave.approve",
+                            "params": { "entity": "leave_request" } }]
+            }),
+            "Every request needs a human decision.",
+        ),
+        artifact(
+            "notification",
+            "leave_decided",
+            None,
+            7,
+            json!({
+                "key": "leave_decided", "channel": "email", "event": "leave_request.decided"
+            }),
+            "The requester learns the outcome.",
+        ),
+        artifact(
+            "report",
+            "leave_summary",
+            None,
+            8,
+            json!({
+                "key": "leave_summary", "group_by": "days"
+            }),
+            "Managers count days, not rows.",
+        ),
     ];
 
     let store = PlanStore::new(harness.db.pool());
@@ -734,7 +807,9 @@ async fn an_account_without_an_app_builder_key_is_refused_the_whole_surface() {
         (Method::GET, "/api/v1/app-builder/plans"),
         (Method::GET, "/api/v1/app-builder/examples"),
     ] {
-        let response = harness.call(request(method, uri, Some(&tenant.token), None)).await;
+        let response = harness
+            .call(request(method, uri, Some(&tenant.token), None))
+            .await;
         assert_eq!(
             response.status,
             StatusCode::FORBIDDEN,
@@ -900,8 +975,7 @@ async fn a_rejection_without_a_reason_is_refused_and_the_row_stays_pending() {
     );
     let stored = status_of(&harness, report).await;
     assert_eq!(
-        stored,
-        "pending",
+        stored, "pending",
         "a refused rejection must leave the artifact exactly where it was"
     );
 
@@ -915,8 +989,7 @@ async fn a_rejection_without_a_reason_is_refused_and_the_row_stays_pending() {
     assert_eq!(refused.status, StatusCode::OK, "{:?}", refused.body);
     assert_eq!(refused.body["artifact"]["status"], "rejected");
     assert_eq!(
-        refused.body["artifact"]["rejected_reason"],
-        "managers count days, not rows",
+        refused.body["artifact"]["rejected_reason"], "managers count days, not rows",
         "the reason is stored beside the row, not only in the audit log"
     );
 }
@@ -965,8 +1038,7 @@ async fn a_regeneration_keeps_the_previous_version_and_says_which_kind_of_reject
 
     let stored = status_of(&harness, report).await;
     assert_eq!(
-        stored,
-        "rejected",
+        stored, "rejected",
         "the previous version is retired, not deleted"
     );
     let retired_reason: Option<String> =
@@ -1035,16 +1107,15 @@ async fn an_invalid_artifact_cannot_be_accepted_and_the_refusal_names_the_findin
         accepted.body
     );
     assert_eq!(
-        accepted.body["error"]["message"].as_str().unwrap_or_default().contains("leave_summary"),
+        accepted.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("leave_summary"),
         true,
         "the refusal names the artifact by name, not by id"
     );
     let stored = status_of(&harness, report).await;
-    assert_eq!(
-        stored,
-        "invalid",
-        "a refused acceptance changes nothing"
-    );
+    assert_eq!(stored, "invalid", "a refused acceptance changes nothing");
 
     // And the plan is still blocked, by name, because of it.
     let detail = harness
@@ -1053,7 +1124,9 @@ async fn an_invalid_artifact_cannot_be_accepted_and_the_refusal_names_the_findin
             Some(&tenant.token),
         ))
         .await;
-    let blockers = detail.body["blockers"].as_array().expect("blockers must be a list");
+    let blockers = detail.body["blockers"]
+        .as_array()
+        .expect("blockers must be a list");
     let invalid_blocker = blockers
         .iter()
         .find(|blocker| blocker["key"] == "leave_summary")
@@ -1115,8 +1188,7 @@ async fn another_tenants_plan_is_absent_rather_than_forbidden() {
     assert_eq!(attack.status, StatusCode::NOT_FOUND);
     let stored = status_of(&harness, report).await;
     assert_eq!(
-        stored,
-        "pending",
+        stored, "pending",
         "an out-of-scope acceptance must leave the row untouched"
     );
 }
@@ -1340,13 +1412,51 @@ async fn the_list_filters_and_the_vocabulary_endpoint_answer_the_composer() {
 
 /// `generate` writes the plan **before** the provider is asked, so a failed attempt is a row
 /// the reviewer can read rather than a spinner that never ends.
+/// A complete, well-formed answer: one artifact of every required kind, keys already in the
+/// platform's spelling, so the walk measures the **generator** rather than its repairs.
+const COMPLETE_PLAN: &str = r#"{
+  "title": "Leave requests",
+  "artifacts": [
+    {"kind": "entity", "key": "leave_request",
+     "spec": {"label": "Leave request", "plural_label": "Leave requests"},
+     "rationale": "The request is about one kind of record: an employee's leave request."},
+    {"kind": "field", "key": "leave_type", "parent_key": "leave_request",
+     "spec": {"key": "leave_type", "label": "Leave type", "type": "enum",
+              "options": ["annual", "sick"]},
+     "rationale": "A request is classified by the kind of leave it asks for."},
+    {"kind": "field", "key": "days", "parent_key": "leave_request",
+     "spec": {"key": "days", "label": "Days", "type": "integer"},
+     "rationale": "How many days are taken decides whether a manager must approve it."},
+    {"kind": "ui", "key": "leave_request_list", "parent_key": "leave_request",
+     "spec": {"screen": "list", "columns": ["leave_type", "days"]},
+     "rationale": "A manager approves from a list, so the list is the entry point."},
+    {"kind": "permission", "key": "leave_request.read", "parent_key": "leave_request",
+     "spec": {"key": "leave_request.read", "description": "Read leave requests"},
+     "rationale": "Reading the app is the base capability and nothing works without it."},
+    {"kind": "role", "key": "leave_approver",
+     "spec": {"name": "Leave approver", "permissions": ["leave_request.read"]},
+     "rationale": "Somebody decides, and that somebody is a role rather than every user."},
+    {"kind": "workflow", "key": "leave_approval", "parent_key": "leave_request",
+     "spec": {"trigger": "record.created",
+              "steps": [{"name": "Notify manager", "action": "notify"}]},
+     "rationale": "A request nobody is told about is a request nobody approves."},
+    {"kind": "notification", "key": "leave_requested", "parent_key": "leave_approval",
+     "spec": {"title": "Leave requested", "body": "A leave request needs approval",
+              "channel": "in_app"},
+     "rationale": "The workflow fires an event; the template is what a person reads."},
+    {"kind": "report", "key": "leave_request_summary", "parent_key": "leave_request",
+     "spec": {"title": "Leave requests", "group_by": "leave_type", "metric": "count"},
+     "rationale": "HR asks how much leave was taken, by type."}
+  ]
+}"#;
+
 #[tokio::test]
-async fn generate_writes_the_plan_before_the_provider_and_fails_with_the_reason_on_it() {
+async fn a_prompt_becomes_a_plan_of_stored_artifacts_and_the_stream_names_each_one() {
     let harness = harness!();
     let tenant = tenant_with_tenant(&harness, "generate").await;
     grant_reviewer(&harness, &tenant).await;
 
-    let mock = MockProvider::start(Script::of(&[])).await;
+    let mock = MockProvider::start(Script::of(&[COMPLETE_PLAN])).await;
     connect(&harness, &tenant, &mock).await;
 
     let response = harness
@@ -1363,28 +1473,310 @@ async fn generate_writes_the_plan_before_the_provider_and_fails_with_the_reason_
         response.body
     );
 
-    let plan_id: Uuid =
-        sqlx::query_scalar("select id from app_builder_plans limit 1")
-            .fetch_one(harness.db.pool())
+    // The provider is asked **once**. A second call would double the cost of a plan that was
+    // merely mis-spelled, and every repair this platform makes is visible in the artifact's
+    // rationale — so a walk that counts calls is also the walk that proves there is no
+    // silent repair loop.
+    assert_eq!(mock.script.calls(), 1, "one prompt, one provider call");
+
+    // Every artifact landed, and it landed in the database — not just on the stream.
+    let plan_id: Uuid = sqlx::query_scalar("select id from app_builder_plans limit 1")
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the plan row must exist");
+    let stored: Vec<(String, String, String)> = sqlx::query_as(
+        "select kind, key, status from app_builder_artifacts
+          where plan_id = $1 order by ordinal, kind",
+    )
+    .bind(plan_id)
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the artifacts must read back");
+    assert_eq!(
+        stored.len(),
+        9,
+        "every artifact the answer proposed is a row a reviewer can open: {stored:?}"
+    );
+    for kind in [
+        "entity",
+        "field",
+        "ui",
+        "permission",
+        "workflow",
+        "notification",
+        "report",
+    ] {
+        assert!(
+            stored.iter().any(|(k, _, _)| k == kind),
+            "the `{kind}` artifact is stored"
+        );
+    }
+
+    // The plan settled as a **draft**: validated, not reviewed. `approved` here would let a
+    // generator approve its own work, which the whole two-act design exists to prevent.
+    let status: String = sqlx::query_scalar("select status from app_builder_plans where id = $1")
+        .bind(plan_id)
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the plan row must exist");
+    assert_eq!(
+        status, "draft",
+        "a generated plan is a draft; nothing is approved without a person"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "select error from app_builder_plans where id = $1"
+        )
+        .bind(plan_id)
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the error column must read"),
+        None,
+        "a successful generation leaves no error on the plan"
+    );
+
+    // The model named the plan, and the name is the model's own.
+    let title: String = sqlx::query_scalar("select title from app_builder_plans where id = $1")
+        .bind(plan_id)
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the title must read");
+    assert_eq!(title, "Leave requests");
+
+    // The stream told the reviewer what landed, one frame per artifact, and ended with the
+    // plan id — the acceptance criterion "artifacts stream into the tree", measured on the
+    // wire rather than inferred from the row count.
+    assert!(
+        response.text.contains("event: artifact"),
+        "each artifact is announced while the stream is open: {}",
+        response.text
+    );
+    assert!(
+        response.text.contains("event: done"),
+        "the stream ends with a terminal frame, never a spinner that cannot be ended: {}",
+        response.text
+    );
+    assert!(
+        !response.text.contains("event: error"),
+        "a complete answer produces no error frame: {}",
+        response.text
+    );
+}
+
+#[tokio::test]
+async fn a_plan_that_is_missing_a_required_kind_still_lands_and_names_what_is_absent() {
+    // The interesting half. A plan with no report is a plan a reviewer must be *told* about,
+    // and the difference between "the generator produced something" and "the generator
+    // produced a complete application" is exactly the missing-kind list.
+    let harness = harness!();
+    let tenant = tenant_with_tenant(&harness, "partial").await;
+    grant_reviewer(&harness, &tenant).await;
+
+    let partial = r#"{
+      "title": "Half an app",
+      "artifacts": [
+        {"kind": "entity", "key": "vehicle", "spec": {"label": "Vehicle"},
+         "rationale": "The request is about vehicles."},
+        {"kind": "field", "key": "plate", "parent_key": "vehicle",
+         "spec": {"key": "plate", "label": "Plate", "type": "text"},
+         "rationale": "A vehicle is identified by its plate."}
+      ]
+    }"#;
+    let mock = MockProvider::start(Script::of(&[partial])).await;
+    connect(&harness, &tenant, &mock).await;
+
+    let response = harness
+        .call(post(
+            "/api/v1/app-builder/generate",
+            json!({ "prompt": "Track company vehicles" }),
+            Some(&tenant.token),
+        ))
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+
+    // The two artifacts that were proposed are kept: they are inert drafts a reviewer can
+    // keep working on, and dropping them would throw away the answer for being incomplete.
+    let count: i64 = sqlx::query_scalar("select count(*) from app_builder_artifacts")
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the count must read");
+    assert_eq!(count, 2, "the artifacts that were proposed are still there");
+
+    // And the gap is named on the wire, kind by kind — not as a count.
+    assert!(
+        response.text.contains("report") && response.text.contains("workflow"),
+        "the terminal frame names the kinds the answer left out: {}",
+        response.text
+    );
+
+    // The plan is a draft, and apply is still blocked: the store's own answer, read from the
+    // database rather than from the screen that drew it.
+    let plan_id: Uuid = sqlx::query_scalar("select id from app_builder_plans limit 1")
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the plan row must exist");
+    let applicable: bool = sqlx::query_scalar(
+        "select exists (
+             select 1 from unnest($1::text[]) required
+              where not exists (
+                    select 1 from app_builder_artifacts
+                     where plan_id = $2 and kind = required
+              )
+         ) is not true",
+    )
+    .bind(
+        [
+            "entity",
+            "field",
+            "ui",
+            "permission",
+            "workflow",
+            "notification",
+            "report",
+        ]
+        .map(str::to_owned),
+    )
+    .bind(plan_id)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the applicability must read");
+    assert!(
+        !applicable,
+        "a plan missing required kinds is not applicable — this is the same question the \
+         blockers list answers"
+    );
+}
+
+#[tokio::test]
+async fn a_mis_spelled_key_is_repaired_onto_the_artifact_and_the_repair_is_readable() {
+    // The repair the generator performs, measured from the database. A silently corrected
+    // key is a plan the reviewer approved under a name they never saw.
+    let harness = harness!();
+    let tenant = tenant_with_tenant(&harness, "repair").await;
+    grant_reviewer(&harness, &tenant).await;
+
+    let sloppy = r#"{
+      "title": "Leave requests",
+      "artifacts": [
+        {"kind": "entity", "key": "Leave Request", "spec": {"label": "Leave request"},
+         "rationale": "One kind of record."},
+        {"kind": "field", "key": "Days", "parent_key": "Leave Request",
+         "spec": {"key": "Days", "label": "Days", "type": "Int"},
+         "rationale": "How many days are taken."}
+      ]
+    }"#;
+    let mock = MockProvider::start(Script::of(&[sloppy])).await;
+    connect(&harness, &tenant, &mock).await;
+
+    let response = harness
+        .call(post(
+            "/api/v1/app-builder/generate",
+            json!({ "prompt": "Create an app to manage employees' leave requests" }),
+            Some(&tenant.token),
+        ))
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("select kind, key, rationale from app_builder_artifacts order by kind")
+            .fetch_all(harness.db.pool())
             .await
-            .expect("the plan row must exist before the provider is asked");
-    let status: String =
-        sqlx::query_scalar("select status from app_builder_plans where id = $1")
-            .bind(plan_id)
+            .expect("the artifacts must read back");
+    let entity = rows
+        .iter()
+        .find(|(kind, _, _)| kind == "entity")
+        .expect("the entity is stored");
+    assert_eq!(
+        entity.1, "leave_request",
+        "the key is repaired into the platform's spelling"
+    );
+    assert!(
+        entity
+            .2
+            .contains("`Leave Request` was read as `leave_request`"),
+        "and the repair is in the rationale the reviewer reads: {}",
+        entity.2
+    );
+
+    let field = rows
+        .iter()
+        .find(|(kind, _, _)| kind == "field")
+        .expect("the field is stored");
+    assert!(
+        field.2.contains("`Int` was read as `integer`"),
+        "a changed field type is the repair that changes behaviour, so it is stated: {}",
+        field.2
+    );
+    // The parent was repaired too, or the field would hang off a parent that does not exist.
+    let parent: Option<String> = sqlx::query_scalar(
+        "select parent_key from app_builder_artifacts where kind = 'field' limit 1",
+    )
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the parent must read");
+    assert_eq!(
+        parent.as_deref(),
+        Some("leave_request"),
+        "a repaired key and its repaired parent agree — otherwise the field hangs off \
+         nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_a_plan_fails_the_plan_with_the_reason_on_the_row() {
+    // A model that answers in prose is not a plan, and the reviewer's console must say so
+    // on the plan row — not just as a frame that scrolled past.
+    let harness = harness!();
+    let tenant = tenant_with_tenant(&harness, "unreadable").await;
+    grant_reviewer(&harness, &tenant).await;
+
+    let mock = MockProvider::start(Script::of(&[
+        "Sure! Here is an application you could build. First, create an entity called ...",
+    ]))
+    .await;
+    connect(&harness, &tenant, &mock).await;
+
+    let response = harness
+        .call(post(
+            "/api/v1/app-builder/generate",
+            json!({ "prompt": "Create an app to manage employees' leave requests" }),
+            Some(&tenant.token),
+        ))
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "a stream, still");
+
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("select status, error from app_builder_plans limit 1")
             .fetch_one(harness.db.pool())
             .await
             .expect("the plan row must exist");
-    assert!(
-        matches!(status.as_str(), "generating" | "failed"),
-        "the row exists in one of the two states a real answer can leave it in, not absent: {status}"
-    );
     assert_eq!(
-        mock.script.calls(),
-        0,
-        "the typed generator is slice 3; this tick does not fake it by spending a call"
+        status, "failed",
+        "an unreadable answer is a failed plan, never a draft that reviews as empty"
     );
+    let error = error.unwrap_or_default();
+    assert!(
+        error.contains("did not answer with a JSON object"),
+        "and the row names the reason: {error}"
+    );
+    assert!(
+        response.text.contains("ai_provider_unreadable_answer"),
+        "the stream carries the same stable code: {}",
+        response.text
+    );
+}
 
-    // A prompt too short is refused before a row is written.
+#[tokio::test]
+async fn a_refused_prompt_writes_no_plan_and_a_missing_provider_is_a_409() {
+    let harness = harness!();
+    let tenant = tenant_with_tenant(&harness, "refusals").await;
+    grant_reviewer(&harness, &tenant).await;
+
+    let mock = MockProvider::start(Script::of(&[])).await;
+    connect(&harness, &tenant, &mock).await;
+
+    // A prompt too short is refused **before** the row is written and before the provider is
+    // asked: a refused request must not cost a call or litter the console with attempts.
     let before: i64 = sqlx::query_scalar("select count(*) from app_builder_plans")
         .fetch_one(harness.db.pool())
         .await
@@ -1404,6 +1796,11 @@ async fn generate_writes_the_plan_before_the_provider_and_fails_with_the_reason_
     assert_eq!(
         before, after,
         "a refused prompt writes no plan, so the list is not littered with empty attempts"
+    );
+    assert_eq!(
+        mock.script.calls(),
+        0,
+        "and it spends no provider call: the refusal is before the model is asked"
     );
 
     // And with no provider connected at all, the composer gets a `409` it can render.
