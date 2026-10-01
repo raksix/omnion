@@ -13,7 +13,8 @@ use omnion_api::state::AppState;
 use omnion_api::{
     analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
     crm_autoresponder_runner, crm_sla_runner, event_retention_runner, event_runner,
-    notification_runner, project_limit_runner, restore_job_runner, search_runner,
+    notification_retention_runner, notification_runner, project_limit_runner,
+    restore_job_runner, search_runner,
     workflow_runner,
 };
 use omnion_core::config::Config;
@@ -119,13 +120,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The event-retention sweeper ticks in this process too (REQ-016, slice 3), under its own
     // flag: it deletes history rather than sending it, so an installation that drains the
     // queue from a dedicated worker and not at all from the web nodes still wants retention
-    // where it is — and vice versa. The window is each organization's own, read inside the
+    // where it is — and vice versa.
+    // And so does the delivery-log sweeper (REQ-021, slice 7), for the same reason and with the
+    // same flag-of-its-own: `push::prune_deliveries` and `prune_stale` had zero call sites for
+    // their whole life, so the outbox screen has been publishing a 60-day window that nothing
+    // enforced since the day it shipped. The window is each organization's own
+    // (`organizations.notification_retention_days`), so one tenant's compliance policy never
+    // shortens another's log. The window is each organization's own, read inside the
     // delete, so one tenant's compliance policy never shortens another's history.
     if state.config().events.retention_enabled {
         let _sweeper = event_retention_runner::spawn(state.clone());
     } else {
         tracing::info!(
             "the event retention sweeper is disabled (OMNION_EVENT_RETENTION_RUNNER=false)"
+        );
+    }
+    if state.config().notification_retention.runner_enabled {
+        let _delivery_sweeper = notification_retention_runner::spawn(state.clone());
+    } else {
+        tracing::info!(
+            "the notification retention sweeper is disabled \
+             (OMNION_NOTIFICATION_RETENTION_RUNNER=false)"
         );
     }
 

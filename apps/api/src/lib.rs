@@ -25,6 +25,7 @@ pub mod headers_middleware;
 pub mod health_events;
 pub mod health_runner;
 pub mod intent_resolver;
+pub mod notification_retention_runner;
 pub mod notification_runner;
 pub mod rate_limit_middleware;
 pub mod restore_job_runner;
