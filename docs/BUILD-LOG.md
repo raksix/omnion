@@ -10702,3 +10702,81 @@ cause. The rule that follows: never edit a file this size with `write_file`; use
 python script, and **compare the line count before and after** rather than trusting the write.
 The commit was never reached, so nothing was lost — `git checkout --` restored the merged file
 whole — but the next writer who trusts a `write_file` on a large file will lose a merge.
+
+## Tick 96 — REQ-024 slice 2: the deploy wizard, and what the runner refuses to pretend
+
+**What.** Slice 1 shipped the deployment centre's reads and slice 2's `Deploy` button was a
+permanently disabled span whose tooltip said "arrives with slice 2". This tick makes that
+tooltip false in the right direction: the job write side (`crates/deployment/src/jobs.rs`, the
+five routes in `apps/api/src/routes/deployment_run.rs`, the runner in
+`apps/api/src/deployment_runner.rs`) and the three-step wizard
+(`apps/admin/features/deployment/deploy-wizard.tsx`) both ship, in two commits.
+
+**The decision worth reading.** The runner does not deploy. It takes the backup, applies each
+migration *naming it in the log*, records the rollout, and then its `verify` step compares the
+version the instance **reports** against the version it was asked to move to. The binary swap is
+`infra/deploy/deploy-omnion-live.sh`'s job and the log says so in those words. Two shortcuts
+around that would each have produced the most dangerous row in this table: a runner that claimed
+to swap the process and did not writes a *succeeded* deploy that changed nothing, and a `verify`
+that read back its own target instead of asking the instance makes every such deploy green. So
+on a QA instance, where nothing runs the release pipeline, every deploy **fails its verification
+and says which version the instance actually reports** — which is the truth, and is the first
+thing worth knowing before the next writer tries to "fix" it.
+
+**Four bugs, three of them mine, and the third is the one I would have shipped.**
+
+1. `Target` derived `Copy` while holding a `String`. A derive that looks harmless and stops the
+   build.
+2. `map_err(|_| StepRefusal::NoJob)` at fourteen call sites laundered every database failure into
+   "the job does not exist" — a `500` that answers as a `404` sends an operator to check an id
+   that exists. `StepRefusal::Storage` is its own variant now, and the twelve that had been
+   rewritten to `.map_err(storage)` were found by `grep`, not by reading.
+3. `StepStatus` had no `parse`, and `JobStatus` and `JobKind` both had one with the rule
+   *"`None` for anything unknown"*. I mapped the parse result with `?` inside a non-`Result`
+   closure, which does not compile, and the version I reached for next was
+   `unwrap_or(StepStatus::Pending)` — which would have made a step written by a newer release
+   **startable again**, because pending is the state the wizard offers to press. `Unknown` is its
+   own variant for the same reason `preflight::CheckState::Unknown` is: an unanswered question
+   must not read as a yes, and here it must not read as "not started yet" either.
+4. `#[derive(Copy)]` on a struct with a `String` is a compile error, but *`clap`/`axum` shadowing*
+   is not: renaming the closure parameters in `step()` fixed the E0515 at the call sites while
+   leaving the E0308 underneath, because the closure's `pool` was resolving to the enclosing
+   function's `&PgPool`. The fix that actually worked was removing the parameter entirely —
+   `F: FnOnce() -> Fut` with each step a named `async fn` that captures what it needs.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-deployment --features store` | **51/51** |
+| `cargo test -p omnion-api --lib` | **315/315** |
+| `cargo clippy -p omnion-api --all-targets` | clean on `deployment_run.rs`, `deployment_runner.rs`; the two remaining `omnion-deployment` warnings are slice 1's (`preflight.rs:341`, `version.rs:502`) and are not mine to change |
+| `tsc --noEmit` (admin) | clean |
+| `node --check scripts/qa/walkthrough.cjs` | clean, **+6 lines, 11800 → 11806** |
+| browser pass | **still owed, and this tick did not fix that** — see below |
+| `git status` | clean; both commits pushed to `wave5` |
+
+**The browser gate: what actually happened.** The tick-93 pass I went looking for is gone, and
+its `summary.json` says why — `fatal: page.goto: net::ERR_CONNECTION_REFUSED at
+http://127.0.0.1:3104/login`. It ran for three hours, walked IAM pages, and died when the admin
+panel it was pointed at stopped answering. So the *honest* reading of that pass is: **nothing
+about slice 1 is proved either.** It is not a partial pass, it is a pass with a fatal at the end
+and no `summary.json` verdict.
+
+So this tick started a new one on the private stack (`:18084/:3104/:3204`, `QA_OUT_ROOT` on tmpfs,
+`CARGO_TARGET_DIR=/dev/shm/w5-target`). It is healthy — DB reset, API up, tenant seeded, sixteen
+pages walked so far. **It cannot see slice 2**: it was started from a tree built before these
+commits, so it measures slice 1's five screens and the wizard is not in its binary. That is not a
+reason to stop the tick, but it is the reason the wizard's boxes are unticked, and the next tick's
+first job is a pass over *this* commit.
+
+**Next.** Read the running pass's verdict for real, then a pass over `0e22b88b` that can see the
+wizard, then slice 3 — rollback with its reason and pre-backup, and the maintenance window's
+`503`-with-message enforcement.
+
+**A note on the box, again.** `/mnt/apopic` is at 90% and `/dev/shm` at 95%, with 30G of
+`wN-target` directories in tmpfs across five writers. `CARGO_INCREMENTAL=0` is what keeps a
+115-crate retry from becoming 11, and putting the QA artifacts on tmpfs is what keeps a pass's
+screenshots off the disk that fills up. Neither is optional at this level, and neither is mine
+alone to fix.
+

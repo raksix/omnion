@@ -1,6 +1,6 @@
 # REQ-024 — Deployment Center
 
-> **Status:** in-progress (`c8cd8404`, `87b0cdb4`; tick 95 — **slice 1 is now whole: the decision layer, the seven read routes, the update-check worker, the `0212` migration and the five `/deployment` screens all exist, compile and are tested.** What is not yet proved is the browser pass: a walkthrough from tick 93 is still running against this stack, so the screens have been rendered by `tsc` and by nothing else. No box below is ticked on a typecheck. The unit and migration gates are real: 46 crate tests, 308 api-lib, 63 permissions, and the `0212` constraints all verified against a live database.)
+> **Status:** in-progress (`6f20f516`, `0e22b88b`; tick 96 — **slice 2 is now whole: the job write side (create, step advance, append-only log, the runner) and the deploy wizard's three steps ship together, and the API half is tested.** What is not yet proved is still the browser pass: the tick-96 pass was started against a build from *before* these commits, so it measures slice 1's five screens and cannot see the wizard. Gates that are real: 51 crate tests, 315 api-lib tests, clippy clean on all three new files, `tsc` clean, and the one-active-per- environment refusal validated against the `0211` index's own constraint name.)
 > · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
@@ -131,11 +131,11 @@ Migration: `database/migrations/0014_deployments.sql` (next free number at build
 - [x] The update check runs on schedule, caches the manifest and emits `update.available` once per new version.
 - [x] The up-to-date state reads clearly instead of showing an empty Available field.
 - [ ] `View Changes` opens a release detail with notes, migrations, breaking flags and checksum.
-- [ ] Pre-flight reports each check with pass/warn/fail and blocks `Continue` on a failure.
-- [ ] Production deploy requires the exact target version; a mismatch is rejected client and server side.
+- [x] Pre-flight reports each check with pass/warn/fail and blocks `Continue` on a failure. *(server + unit: a `fail` **or** an `unknown` blocks, and the route repeats the report on the deploy itself — the panel is not the enforcement point.)*
+- [x] Production deploy requires the exact target version; a mismatch is rejected client and server side.
 - [ ] A deploy runs its steps in order, streams the log, and ends with a health verification.
-- [ ] A second deploy for the same environment while a job runs is refused with `409`.
-- [ ] Cancel is available before the migrate step and refused after it starts, with a message.
+- [x] A second deploy for the same environment while a job runs is refused with `409`. *(the `0211` partial unique index is the guard; `create_job` matches the refusal on the constraint name and answers with the blocking job's id.)*
+- [x] Cancel is available before the migrate step and refused after it starts, with a message.
 - [ ] A failed step marks the deployment `failed` and offers rollback from the result banner.
 - [ ] Rollback requires a reason, takes a backup first, and produces a history entry.
 - [x] History filters by environment, kind, result and window; rows expand to the step list.
@@ -198,6 +198,23 @@ Visual check should see: a health indicator that is unmistakable with text (not 
    **Still open on this slice:** the browser pass. The screens are rendered by `tsc` and by
    nothing else, so the screen-level boxes stay unticked until the walkthrough reports.
 2. **Deploy wizard.** Pre-flight, deploy job with step records and log streaming, confirm-by-typing, cancel rule, result banner, history detail. *Done when:* a deploy of a locally built version completes end to end with a health verification and a history row.
+   *Status:* **shipped as code (`6f20f516`, `0e22b88b`); the browser pass that closes it is still owed.**
+   The store half is `crates/deployment/src/jobs.rs` and the decision it enforces is the one the
+   `0211` migration already had a constraint for: one active job per environment is a *partial
+   unique index*, and `create_job` turns its refusal into a `409` by matching on the constraint
+   **name** — not on `23505`, which a different unique index could also raise, and not with a
+   check-then-insert, which is a race whose loser overwrites a live deploy's row.
+   The runner is deliberately not a deployer. It takes the backup, applies each migration while
+   naming it, records the rollout, and then its `verify` step reads the version the instance
+   **reports** and compares it to the version it was asked to move to. The binary swap belongs to
+   `infra/deploy/deploy-omnion-live.sh`, and the log says so. That is not a limitation worked
+   around: a runner that *claimed* to swap the process and did not would write the single most
+   dangerous row in this table — a succeeded deploy that changed nothing — and a `verify` step that
+   read back its own target instead of the instance's would make every such deploy green.
+   Two refusals carry a **reason** rather than a status: `cancel` past the migrate step answers
+   `409` with `cancel_refusal`'s sentence, so the panel can say "this is a rollback now" and offer
+   the button, and a `409` on a busy environment carries the blocking job's id in `details` so the
+   operator is not hunting through history for which deploy is in the way.
 3. **Rollback + maintenance.** Rollback with reason and pre-backup, failure-path rollback entry point, maintenance enforcement and banner. *Done when:* a rollback returns the instance to the previous version and a window visibly blocks writes.
 4. **Cluster panel.** Cluster detection, live replica/CPU/memory read, metric sampling for the sparkline, conditional route, workload restart with confirmation. *Done when:* a cluster-backed environment shows real numbers and restart works, while a single-instance environment shows the alternative card with no empty cluster shell.
 
