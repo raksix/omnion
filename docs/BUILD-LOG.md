@@ -10172,3 +10172,63 @@ desktop and the mobile pass, and which will be visited the first time the box is
 
 **Next.** The browser pass owed for slices 1–4, then slice 4's remaining two thirds: the
 security-event view over the audit trail and the secret-inventory projection.
+
+## Tick 51 (wave2-cms) — a correct wait is still a zero, and the place file lies about its own name
+
+**Merge first.** `origin/main` had moved 8 commits (REQ-012's IP-access slice: `ip_rules.rs`,
+`ip_store.rs`, `security_ip.rs`, migration `0217_security_ip_rules.sql`, the admin screen).
+Two conflicts, both resolved by *union* rather than by picking a side:
+
+* `docs/BUILD-LOG.md` — the append-only splice (`scripts/qa/merge-build-log.py`), verified by
+  its **entry-level** check: `base=6661 ours=10109 theirs=6726 merged=10174`, 0 entries lost from
+  either side. The line-frequency delta printed one advisory line (`pnpm typecheck` (apps/admin)),
+  which is the normal artefact of two writers appending the same fence/rule text.
+* `scripts/qa/walkthrough.cjs` — the mobile route list had both writers editing the same line:
+  main added `/security/ip-access`, this branch carried `/members`, `/members/settings` and the
+  four `/content-api*` screens. Merged as the **union, 33 routes**, and `node --check` is clean.
+
+**The route merge nearly shipped a silent, total regression — and the instrument hid it.** My
+first resolution script regex-matched `{ path: "…", name: "…" }` with a pattern that did not match
+the file's actual spacing, so it found **zero** routes on both sides and wrote
+`const mobileRoutes = [];`. The script printed `ours 0 theirs 0 union 0` and exited 0, and
+`node --check` **passed**, because an empty array is syntactically valid JavaScript. The merge
+would have silently removed all 33 phone measurements from every future pass, and the syntax gate
+would have called the run green. It was caught only by grepping the written line back.
+**A merge resolution that can produce an empty collection needs a `assert O and T`, and a
+post-write `grep` for the thing it was supposed to preserve** — `node --check` proves the file
+parses, never that it still contains what it did. Rebuilt from the git index stages (`:2:` and
+`:3:`, not the working tree) and the union was re-verified: 33 routes, both sides' exclusive
+entries present.
+
+**Gates on the merged tree.** `cargo test -p omnion-content` **314 passed / 0 failed**.
+`pnpm typecheck` (sterile `env -i`, 14 packages) **exit 0**. `node --check` on the pass: clean.
+
+**The `--only=forms` pass was started, waited 18 minutes honestly, and killed — the box was not
+the slot's fault.** The place file's *name* is a dead pid (2624035), which makes the queue look
+stale and reclaimable, but the liveness test reads the **holder** beside it: 2624054, alive, cwd
+`/mnt/apopic/omnion-w3`, mid-walkthrough (696 artifacts, last seen on `iam-security`). That is a
+sibling genuinely holding the place, so the reaper is right to leave it and this writer is right
+to wait. Meanwhile the volume fell 4.9G → 3.7G as that pass consumed it, and this writer's
+`QA_SLOT_WAIT` (1800s) was about to expire — which would have let this pass **proceed without a
+place** into a box already running another Chromium walkthrough, the documented 29-September
+failure mode. Killed the process group instead, per the invariant that says a pass which expires
+into a full volume is the same wasted hour as never starting one.
+
+**A killed pass must leave nothing, and it did.** No `run.sh`/walkthrough orphan survives from
+this group, `pm2 list | grep w2` is empty (no half-started stack), and the sibling's place file
+is untouched — still the only one in `/tmp/omnion-qa-slot`. The 40-odd long-lived `qa-slot.sh`
+processes box-wide are waiters that hold **no** place (a place is named after the script's own
+pid, and none of their names appears in the lock directory); they are not this pass's residue.
+
+**Space reclaimed first, so the queued pass had a chance at all.** 351 stale duplicate artifacts
+under this worktree's own `deps/` (keeping the newest per crate and every file the live binary
+maps) freed **1.30 GB**: 95% / 3.4G → 92% / 4.6G. Another writer's target was never touched.
+
+**No acceptance criterion is ticked by this tick and none should be.** Criterion 8 (`~`, all eight
+field types render and submit) still has no measurement behind it: the instrument is fixed and the
+gates are green, but a pass that never ran measures nothing. Ticking it now would be the exact
+"assertion that cannot fail" defect this loop keeps finding in its own harness.
+
+**Next.** One `--only=forms` pass at the first tick that finds the slot free **and** the volume
+with room — the harness is proven, only the run is owed. Then `--only=block-editor` and
+`--only=members` for criteria 17 and 18, then REQ-019's content-api criterion.
