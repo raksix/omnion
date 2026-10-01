@@ -67,12 +67,12 @@ export interface Rebase {
  * something for them, which is the one behaviour that would make a reload feel like a
  * different tab taking the wheel.
  *
- * ## The edges, and why this function is the only place that can judge them
+ * ## The edges, and why this function is one of the callers that must pass them
  *
- * `aliveEdges` is **optional** because two of the three callers cannot answer the question.
- * `removeNodes` prunes against a node id list and has no edge list in hand, and a prune that
- * answered "no" for an unknown would discard a selection nobody had reason to doubt. So the
- * optionality is the "do not guess" rule, kept in one place instead of restated per caller.
+ * `aliveEdges` is **optional** because a caller holding only a node id list genuinely cannot
+ * answer the question, and a prune that answered "no" for every unknown would discard a
+ * selection nobody had reason to doubt. That is the whole reason for the optionality, and it
+ * is a statement about the argument's contract rather than about who is currently sloppy.
  *
  * It is *this* caller that must pass it, and the reason is the whole point of the Reload
  * button: the graph being adopted is the **other editor's**. Their removed connections are the
@@ -86,6 +86,16 @@ export interface Rebase {
  * about**: "a reload cannot invent an edge" is true, and it is an argument about not creating
  * a false positive — it says nothing about the false negative this function was leaving
  * behind, which is keeping an edge id the adopted graph does not have.
+ *
+ * **Two other wholesale replacements carried the same omission, and one of them had the list
+ * in hand.** `applyHistoryStep` (undo/redo) and `removeNodes` both call `pruneSelection` with
+ * two arguments, and a comment written alongside the first fix named `removeNodes` as the
+ * caller that "has no edge list in hand" — it does, two lines above its own prune. The undo
+ * path was the reachable one and needed no second editor at all: draw a connection, select it,
+ * press ⌘Z, and the restored graph is the one from *before* the connection existed. So this
+ * function is no longer the only caller that passes the set, which is worth recording here —
+ * a rule enforced at one call site and documented as though it were the rule is what left two
+ * paths behind in the first place.
  */
 export function rebaseAfterReload(
   current: CanvasSelection,

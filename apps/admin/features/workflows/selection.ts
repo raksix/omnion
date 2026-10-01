@@ -211,13 +211,25 @@ export function membersOf(current: CanvasSelection): string[] {
  * what `Del` resolves to, and the status bar renders "1 connection selected (Del removes it)"
  * from it.
  *
- * `aliveEdges` is **optional**, and that is the design rather than an oversight. A caller that
- * only knows the node set — `removeNodes` prunes against `nextNodes.map(n => n.id)` and has no
- * edge list in hand — cannot answer the question, and a prune that answered "no" for every
- * unknown would throw away a selection the caller had no reason to doubt. So: handed the set,
- * decide; handed nothing, do not guess. `rebaseAfterReload` is the caller that has it, and it
- * is the one that must, because the graph it just adopted is **the other editor's** and their
- * removed connections are the ordinary case.
+ * `aliveEdges` is **optional**, and that is the design rather than an oversight. A prune that
+ * answered "no" for every unknown would throw away a selection the caller had no reason to
+ * doubt, so a caller that genuinely cannot answer is better off saying nothing than guessing.
+ * So: handed the set, decide; handed nothing, do not guess — and both halves are asserted, so
+ * the fix cannot quietly turn "cannot answer" into "answer no".
+ *
+ * **Which caller was which turned out to be a defect, and the documentation is what carried
+ * it.** The rule claimed for a while that `removeNodes` was the caller that "has no edge list
+ * in hand" — it does have one: `nextEdges` sits two lines above its prune, computed on the
+ * same breath as `nextNodes`, because removing a node removes the connections ending on it.
+ * And a second call site with the same omission (`applyHistoryStep`, the undo/redo restore)
+ * held the whole answer in `restored.edges`. Reading the call site instead of its comment is
+ * the only thing that tells the two apart, and a comment naming the wrong caller is worse
+ * than no comment at all — it reads as the *reason* the argument was left off.
+ *
+ * The argument stays optional because the rule is what is worth stating here, and the rule is
+ * stated by the one caller that must not guess. If a future caller holds only node ids,
+ * omitting it is correct and this comment says so — but that is a statement about the
+ * argument's contract, never a permission to skip it where the answer is the next local over.
  */
 export function pruneSelection(
   current: CanvasSelection,

@@ -746,7 +746,27 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       historyRef.current = next;
       setNodes(restored.nodes);
       setEdges(restored.edges);
-      setSelection((current) => pruneSelection(current, restored.nodes.map((node) => node.id)));
+      // The EDGE ids go in for the same reason the loader passes them, and this is the second
+      // caller that had been left behind. Undo and redo replace the graph wholesale, and a
+      // connection is one of the two things that can be selected at all — it outranks every
+      // node selection in `deleteTarget` and in `whatEscapeClears`. So a surviving edge id
+      // after ⌘Z is what `Del` resolves to (`removeEdge` then finds no such edge and changes
+      // nothing) and it is what the status bar prints ("1 connection selected (Del removes
+      // it)") over a canvas drawing no such line.
+      //
+      // The direction that makes this reachable is ordinary and needs no second tab: draw a
+      // connection, select it, press ⌘Z. The restored snapshot is the graph from *before* the
+      // connection existed, so the restored edge list is empty and the selection named a line
+      // the undo had just taken away. The reverse is the reason the argument is not a blanket
+      // clear: undoing an edge DELETE restores the graph *with* that edge, and the author is
+      // looking straight at it.
+      setSelection((current) =>
+        pruneSelection(
+          current,
+          restored.nodes.map((node) => node.id),
+          restored.edges.map((edge) => edge.id),
+        ),
+      );
       setHistoryTick((n) => n + 1);
       queueSave();
     },
@@ -1044,7 +1064,27 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       // that still exists. The old code cleared the group and guarded the focus
       // independently, so deleting a focused node left the inspector holding a dead id and
       // the toolbar's Duplicate button still enabled.
-      setSelection((current) => pruneSelection(current, nextNodes.map((node) => node.id)));
+      //
+      // The edge ids go in as well, and this corrects a claim the previous tick made about
+      // this call site: it was documented as the caller that "has no edge list in hand" and
+      // therefore cannot judge a connection. `nextEdges` is computed two lines above, on the
+      // same breath as `nextNodes` — this function removes the edges whose endpoint is
+      // gone, so the edge set it is about to install is already on screen. The one that
+      // genuinely cannot answer is a caller holding only node ids, and there is none here.
+      //
+      // Today the argument is inert rather than load-bearing: every writer of a non-null
+      // `edge` is `selectEdge`, which clears the node group, so `Del` routes a selected
+      // connection to `removeEdge` and never reaches here. It is passed because a
+      // connection deleted by THIS call would otherwise survive it, and because leaving a
+      // selection field unpruned at a call site that can judge it is how the same
+      // half-prune arrives again on the next path.
+      setSelection((current) =>
+        pruneSelection(
+          current,
+          nextNodes.map((node) => node.id),
+          nextEdges.map((edge) => edge.id),
+        ),
+      );
     },
     [commit, currentSnapshot, edges, nodes],
   );

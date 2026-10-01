@@ -191,8 +191,18 @@ test("both undo and redo route through the one step that prunes", () => {
     );
   }
   const step = useCallbackBody("applyHistoryStep");
+  // `\s*` across the arrow, not a literal space. The claim is the ROUTE — "the shared step
+  // replaces the whole graph, so the selection is pruned there" — and a guard that also pins
+  // the formatter's line breaking reports a reformat as a defect. That is the same lesson as
+  // the arg counter in `undo-edge-prune.test.ts`, in its other form: a check written about the
+  // TEXT goes red for a reason that has nothing to do with the thing it claims to measure, and
+  // the cheap repair — loosening it until it agrees — is how that becomes permanent.
+  //
+  // What is deliberately NOT relaxed: `setSelection`, the functional update, and the call to
+  // `pruneSelection` all still have to be there, so this stays red against a step that drops
+  // the prune entirely (mutation M1) rather than red against a line break.
   assert.ok(
-    /setSelection\(\(current\) => pruneSelection\(/.test(step),
+    /setSelection\(\(current\) =>\s*pruneSelection\(/.test(step),
     "the shared step replaces the whole graph, so the selection must be pruned there",
   );
   // Both halves of the write, not just the prune: a step that prunes but never stores the
