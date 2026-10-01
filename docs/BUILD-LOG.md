@@ -12193,3 +12193,65 @@ dependency on a module that exists on no branch (checked this tick: `cms_forms` 
 `wave2-cms` only, and `database/migrations/0125_cms_forms.sql` is not on this branch). REQ-118
 (catalogue/cart/checkout) stays unstarted behind REQ-008's commerce engine, `commerce_products`
 being in zero migrations on any branch.
+
+## 2026-10-01 — REQ-117 slice 27 · the worker arbitrated the send AFTER the mailer
+
+feat(crm-intake) + fix(crm-api) + test(crm-intake), commits `eb28a15f`, `12805e83`, `a3c12572`.
+
+**The defect.** `apps/api/src/crm_autoresponder_runner.rs` states the rule in its own header,
+one line above the code that broke it: *"a claim is taken **before** the send, and a completion
+is recorded **after** it, or two workers both mail."* `send_one` did the opposite —
+`mail::send` first, `mark_sent` second, and `mark_sent` **is** the completion.
+
+`due_reservations` is a plain read (`sent = 'false' and due_at <= now`, no lock, no
+`skip locked`), so two app instances on one database both receive the same due row. Both
+then reached the mailer. The `Ok(false)` branch was real and useless: it logged *"another
+worker had already completed this reservation"* — after its own copy had left. One send on
+the timeline, two copies in the visitor's inbox, and a reassuring log line. **The arbiter
+existed, was correct, and was consulted one irreversible step too late.**
+
+**The fix.**
+- `autoresponder_store::claim_delivery` — compare-and-swap on `delivery_claimed_at`,
+  `for update skip locked`. The loser learns "not yours" *without touching the socket*.
+  `skip locked` rather than a plain guarded update: the latter would block the loser behind
+  an SMTP conversation that may take `OMNION_SMTP_TIMEOUT_MS`, so the record would end up
+  right while the mail still went out twice.
+- A worker that loses the claim neither sends **nor releases** — the reservation belongs to
+  the winner, and deleting a row another worker is mid-send on is how a lead loses its
+  answer entirely.
+- `DELIVERY_CLAIM_STALE_AFTER` = 1 minute: past the SMTP timeout, so recovery lands on the
+  next worker tick rather than on a restart. Same stated bias as `claims.rs` — a duplicate
+  is a permanent invisible defect, a delayed send is a temporary visible one.
+- Migration **`0205_crm_autoresponder_delivery_claim.sql`**: a nullable `timestamptz` plus a
+  partial index. Nullable, so every existing row reads as unclaimed without a backfill.
+
+**Why a column and not a jsonb key.** The rest of this file's jsonb carries RFC 2822 strings
+and relies on lexical order being chronological within one zone. The recovery comparison
+cannot: a claim written under another session timezone sorts to the wrong side of the
+threshold, and *that* failure is a lead never answered. The due sweep can afford the trick
+(being early costs nothing); a send claim cannot.
+
+**Proof.**
+- `scripts/qa/run-crm-autoresponder.sh` — **16/16** (was 15).
+- **PROVEN TO FAIL at 15/16**: `claim_delivery` reduced to the pre-fix body (every caller
+  proceeds) — the arbitration assertion red, fifteen unrelated green.
+- `cargo test -p omnion-module-crm-intake --lib` — **174**.
+- `cargo build -p omnion-api` green · clippy **0** on both touched files · admin
+  `tsc --noEmit` exit 0.
+- Merged origin/main first (4 commits: the events queue producer and its doc). BUILD-LOG
+  verified intact from both parents by multiset: 165 blocks from wave8, 88 from origin/main,
+  **0 missing after the merge**.
+
+**My own defect, sixth repeat of this branch's signature test defect.** The test's first
+version asserted that the *sweep* withholds the row from a second worker. That is correct
+behaviour for a read, has nothing to do with the fix, and the test stayed **red against
+fixed code**. Run once, I would have "fixed" a correct implementation. The arbitration
+belongs at the send, because the send is the irreversible act. Sixth repeat, and the first
+whose wrong version was red for the *opposite* reason — every previous one passed against
+unmodified source.
+
+**No browser pass, and none claimed:** no screen changed.
+
+**Next.** REQ-117's remaining open work is still slice 3's REQ-064 form-editor card, blocked
+on a module that exists on no branch (`cms_forms` is on `wave2-cms` only). REQ-118
+(catalogue/cart/checkout) stays unstarted behind REQ-008's commerce engine.
