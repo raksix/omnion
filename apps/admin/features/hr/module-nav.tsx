@@ -15,7 +15,16 @@
  */
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Clock, ListChecks, Network, Palmtree, Users, type LucideIcon } from "lucide-react";
+import {
+  Clock,
+  FileBarChart,
+  FileText,
+  ListChecks,
+  Network,
+  Palmtree,
+  Users,
+  type LucideIcon,
+} from "lucide-react";
 
 const LINKS: { href: string; label: string; icon: LucideIcon }[] = [
   // Employees is the module's front door (slice 1). It is first because everything else in HR is a
@@ -35,6 +44,12 @@ const LINKS: { href: string; label: string; icon: LucideIcon }[] = [
   // shelf rather than behind My workspace -- the employee's own clock is the self-service route,
   // and this one answers for everybody at once behind `hr.attendance.read`.
   { href: "/hr/attendance", label: "Attendance", icon: Clock },
+  // Documents (slice 4b) is the filing cabinet across everybody, so it sits with the operator's
+  // screens rather than under My workspace: it answers "whose expires next", which is a question
+  // about the organization and not about the person asking it.
+  { href: "/hr/documents", label: "Documents", icon: FileText },
+  // Reports last, because it is the screen you arrive at when you already know what you want.
+  { href: "/hr/reports", label: "Reports", icon: FileBarChart },
 ];
 
 export function HrModuleNav() {

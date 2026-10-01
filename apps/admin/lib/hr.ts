@@ -851,3 +851,273 @@ export function formatPunch(instant: string | null): string {
   }
   return `${String(parsed.getHours()).padStart(2, "0")}:${String(parsed.getMinutes()).padStart(2, "0")}`;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Documents and reports (REQ-055, slice 4b)
+// ---------------------------------------------------------------------------------------------
+
+/** The four document kinds. The list filter and the attach form both read this, never their own copy. */
+export const DOCUMENT_KINDS = ["contract", "id", "certificate", "other"] as const;
+
+/** One of the four kinds. */
+export type DocumentKind = (typeof DOCUMENT_KINDS)[number];
+
+/** `expired`, `expiring` or `valid` — text from the server, never derived here. */
+export type DocumentStatus = "expired" | "expiring" | "valid";
+
+/** One document, as the cross-employee list shows it and the detail renders it. */
+export type HrDocument = {
+  id: string;
+  employee_id: string;
+  employee_name: string;
+  department_name: string | null;
+  kind: string;
+  title: string;
+  media_id: string;
+  /** Wire form `YYYY-MM-DD`, or `null` for a document that never expires. */
+  expires_on: string | null;
+  acknowledged: boolean;
+  acknowledged_at: string | null;
+  uploaded_by: string | null;
+  created_at: string;
+  /** Negative when it has already expired, `null` when it never will. */
+  days_until_expiry: number | null;
+  status: DocumentStatus;
+};
+
+/** The counts the header shows, over the **filtered** rows. */
+export type DocumentTotals = {
+  total: number;
+  expired: number;
+  expiring: number;
+  permanent: number;
+};
+
+/** One page of documents with the header's numbers. */
+export type DocumentPage = Page<HrDocument> & { totals: DocumentTotals };
+
+/** The list's filters. Every field is optional; absent means "all". */
+export type DocumentFilters = {
+  search?: string;
+  kind?: string;
+  employee_id?: string;
+  department_id?: string;
+  expiring?: boolean;
+  per_page?: number;
+  cursor?: string;
+};
+
+/** An attach's payload. `media_id` is the media pipeline's id — the bytes' address, not the bytes. */
+export type NewHrDocument = {
+  kind: string;
+  title?: string;
+  media_id: string;
+  expires_on?: string;
+};
+
+/** What the expiry sweep considered and what it announced. */
+export type SweepResult = {
+  considered: number;
+  notified: number;
+  documents: HrDocument[];
+};
+
+/** `GET /hr/documents` — the cross-employee list, with the header's counts. Needs `hr.documents.read`. */
+export function fetchDocuments(filters: DocumentFilters = {}): Promise<DocumentPage> {
+  return hrRequest<DocumentPage>(`/api/v1/hr/documents${query(filters)}`);
+}
+
+/** `GET /hr/documents/{id}` — one document. */
+export function fetchDocument(id: string): Promise<HrDocument> {
+  return hrRequest<HrDocument>(`/api/v1/hr/documents/${id}`);
+}
+
+/**
+ * `POST /hr/employees/{id}/documents` — attach. Needs `hr.documents.manage`.
+ *
+ * A POST and not a PUT: the same employee takes several documents, and there is no url that names
+ * one before it exists.
+ */
+export function attachDocument(
+  employeeId: string,
+  body: NewHrDocument,
+): Promise<HrDocument> {
+  return hrRequest<HrDocument>(`/api/v1/hr/employees/${employeeId}/documents`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * `DELETE /hr/documents/{id}` — drop the **reference**. The bytes stay in the media pipeline.
+ *
+ * That is what the route does and the client does not pretend otherwise: a delete button labelled
+ * "delete the file" would be a lie about where the bytes went.
+ */
+export function deleteDocument(id: string): Promise<void> {
+  return hrRequest<void>(`/api/v1/hr/documents/${id}`, { method: "DELETE" });
+}
+
+/**
+ * `POST /hr/documents/sweep` — announce every document inside the window, once.
+ *
+ * Its own key (`hr.documents.sweep`) because it is the one write here that touches every employee's
+ * documents rather than the one somebody is looking at. The window defaults to the module's own
+ * thirty days; the client never invents one.
+ */
+export function sweepDocuments(windowDays?: number): Promise<SweepResult> {
+  return hrRequest<SweepResult>("/api/v1/hr/documents/sweep", {
+    method: "POST",
+    body: JSON.stringify({ window_days: windowDays }),
+  });
+}
+
+/** The report names the **route** serves, plus the export formats it offers. */
+export type ReportNames = { items: string[]; exports: string[] };
+
+/** A resolved period. Both ends are wire form — never an ordinal array (tick 58's `[2026,61]`). */
+export type Period = { from: string; to: string };
+
+/** One headcount row: a department and its people by employment type. */
+export type HeadcountRow = {
+  department_id: string;
+  department_name: string;
+  full_time: number;
+  part_time: number;
+  contract: number;
+  intern: number;
+  total: number;
+};
+
+/** The headcount report. */
+export type HeadcountReport = {
+  period: Period;
+  rows: HeadcountRow[];
+  total: number;
+  on_leave: number;
+};
+
+/** One movement: somebody who joined or left inside the period. */
+export type TurnoverRow = {
+  employee_id: string;
+  employee_name: string;
+  day: string;
+  movement: "joined" | "left";
+  employment_type: string;
+  tenure_days: number | null;
+};
+
+/** The turnover report. */
+export type TurnoverReport = {
+  period: Period;
+  rows: TurnoverRow[];
+  joined: number;
+  left: number;
+  average_headcount: number;
+  /** A **ratio**, not a percentage: the screen multiplies by 100 and the CSV does not. */
+  turnover_rate: number;
+};
+
+/**
+ * One leave type's absence over the period.
+ *
+ * Named `AbsenceReportRow` rather than `AbsenceRow` because the **absence calendar** already owns
+ * an `AbsenceRow` — the one employee line of the month grid — and the two are unrelated shapes
+ * about unrelated subjects. Reusing the name would have made the second definition silently win.
+ */
+export type AbsenceReportRow = {
+  leave_type_id: string;
+  leave_type_name: string;
+  requests: number;
+  approved: number;
+  pending: number;
+  days: number;
+};
+
+/** The absence report. */
+export type AbsenceReport = {
+  period: Period;
+  rows: AbsenceReportRow[];
+  total_requests: number;
+  total_days: number;
+};
+
+/** One employee's worked time over the period. */
+export type AttendanceReportRow = {
+  employee_id: string;
+  employee_name: string;
+  department_name: string | null;
+  days_present: number;
+  minutes_worked: number;
+  overtime_days: number;
+  under_hours_days: number;
+  missing_checkout_days: number;
+};
+
+/** The attendance report. */
+export type AttendanceReport = {
+  period: Period;
+  rows: AttendanceReportRow[];
+  employees: number;
+  minutes_worked: number;
+  missing_checkout_days: number;
+};
+
+/**
+ * Every report the screen can render, as one union.
+ *
+ * The picker is served by the route (`report_names`) rather than hardcoded here for the reason the
+ * route's own doc comment gives: four entries in four places is four chances to add a report and
+ * forget a column. The union is here so the renderer is exhaustive — a fifth report that arrives
+ * without a case here is a **typecheck failure**, not a blank table.
+ */
+export type HrReport =
+  | ({ report: "headcount" } & HeadcountReport)
+  | ({ report: "turnover" } & TurnoverReport)
+  | ({ report: "absence" } & AbsenceReport)
+  | ({ report: "attendance" } & AttendanceReport);
+
+/** The CSV answer: the file's text, plus the period it covers. */
+export type ReportCsv = { report: string; format: "csv"; csv: string; period: Period };
+
+/** The report's query. `from`/`to` are wire form; absent means the current year / today. */
+export type ReportFilters = {
+  from?: string;
+  to?: string;
+  department_id?: string;
+};
+
+/** `GET /hr/reports` — the picker. Needs `hr.reports.read`. */
+export function fetchReportNames(): Promise<ReportNames> {
+  return hrRequest<ReportNames>("/api/v1/hr/reports");
+}
+
+/**
+ * `GET /hr/reports/{report}` — one report as JSON, or its CSV with `format: "csv"`.
+ *
+ * `hr.reports.read` opens the screen; `hr.reports.export` buys the file. They are separate because
+ * reading a report and taking it out of the tenant are different acts, and the screen shows the
+ * export button on the strength of the export key alone — so the 403 lands where the user is
+ * looking instead of on a click that looked available.
+ */
+export function fetchReport<T extends HrReport = HrReport>(
+  report: string,
+  filters: ReportFilters = {},
+): Promise<T> {
+  return hrRequest<T>(`/api/v1/hr/reports/${report}${query(filters)}`);
+}
+
+/** The same report as CSV. Needs `hr.reports.export`; the JSON above needs only `hr.reports.read`. */
+export function fetchReportCsv(
+  report: string,
+  filters: ReportFilters = {},
+): Promise<ReportCsv> {
+  return hrRequest<ReportCsv>(
+    `/api/v1/hr/reports/${report}${query({ ...filters, format: "csv" })}`,
+  );
+}
+
+/** The filename a download gets, from the report and the period it covers. */
+export function reportFilename(report: string, period: Period): string {
+  return `hr-${report}-${period.from}-to-${period.to}.csv`;
+}
