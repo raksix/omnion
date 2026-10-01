@@ -1,8 +1,41 @@
 # REQ-055 — HR
 
-> **Status:** in-progress (slice 2c — the SELF-SERVICE surface: eight `/hr/me/*` routes in the one
-> router with no `route_layer` at all, because an employee holding no `hr.*` key is exactly the
-> person those routes exist for, plus four screens (`/hr/me`, `/hr/me/leave`, `/hr/me/leave/new`,
+> **Status:** in-progress (slice 2d — the CLOCK: migration `0206_hr_attendance.sql` with one row
+> per employee per day, the uniqueness being what makes a second punch answerable without a race
+> and an API retry idempotent; `check_out > check_in` and "a day has a punch" as facts in the schema
+> rather than rules the service is trusted to apply; the module's check-in/check-out/correct plus
+> the month projection with `minutes_worked` derived on read and never accepted as an input; **ten**
+> routes split in two — `/hr/me/*` (check-in, check-out, month, export) with **no `route_layer` at
+> all**, because the person pressing the button is an employee and an employee holds no `hr.*` key,
+> while `/hr/attendance/*` (roster, summary, export, corrections) is behind `hr.attendance.*` and
+> refuses **by key name** rather than a generic code — and two screens, `/hr/me/attendance` (the
+> punch button reflecting the DAY's state rather than being a constant, the 409 rendering the punch
+> the server found) and `/hr/attendance` (the organization's day, with the exception badges never
+> carrying meaning in hue alone). Commits `0c01b1a8`, `242d6aae`, `b0832292`.
+>
+> **Two defects, and the first is the one that mattered.** 1. The migration was **half-guarded**:
+> the table had `if not exists`, the three indexes below it did not, so the file applies on a clean
+> database — and then wedges every database where the schema arrived by another route with
+> `42P07 relation "hr_attendance_employee_day_uniq" already exists`. The error aborts the file, so
+> the ledger never records version 206, so every later `migrate()` walks into it again: **ten
+> walks, all dying in setup before a single assertion ran.** Guarding the indexes makes the file
+> idempotent end to end, proved by applying the whole chain to a fresh database and then applying
+> 0206 a second time by hand (both clean, four indexes). 2. The module nav's "longest href wins"
+> test inherited a `&& false` term, so the whole clause was dead and plain `startsWith` decided
+> everything — a nested route lit the tab a person was not looking at. It now sorts descending and
+> takes the first match on a **segment** boundary.
+>
+> **Proof so far:** `cargo test -p omnion-module-hr` **87/87**; the real `tsc` binary **exit 0**
+> (not `npx tsc | tail`, which has twice now reported green having checked nothing).
+>
+> **Still unticked: the attendance criterion AND every browser box.** The ten DB walks are
+> committed but have never returned a verdict: the box ran at load **215** — four processes in
+> D-state, both disks 95–98 %, ten writers and three Chromes on six cores — and `ss` shows the
+> test process on a Postgres socket with `Recv-Q 325` and **zero CPU ticks over 20 s**, i.e. the
+> client waiting on a server with no cycles. Starved, not failing. The QA slot is held by a live
+> `w6` pass, the third tick running. Previous: slice 2c — the SELF-SERVICE surface: eight
+> `/hr/me/*` routes in the one router with no `route_layer` at all, because an employee holding no
+> `hr.*` key is exactly the person those routes exist for, plus four screens (`/hr/me`, `/hr/me/leave`, `/hr/me/leave/new`,
 > `/hr/me/documents`), a `My workspace` sidebar entry kept **outside** the admin `People` shelf —
 > everything under People answers behind an `hr.*` key, so hiding self-service in there would make
 > it look like it 403s — and `runHrMe` in the walkthrough with the four routes in the ordinary
@@ -28,23 +61,6 @@
 > decision is a double-approve button whose second click 409s. **Still unticked: every browser box**
 > — the pass that would tick them is running. Previous: slice 2a — leave end to end, data + API:
 > migration 0198,
-> `modules/hr::leave` and `::requests` (69 unit tests, 21 new), the `hr.leave.*` quartet (14 keys
-> in `omnion-permissions`, 70/70), eleven guarded routes and **nine DB walks, 9/9 GREEN against a
-> live PostgreSQL**. Five boxes ticked. The slice found a real off-by-one in its own week index —
-> `number_days_from_monday` is zero-indexed, so a constant read as Mon–Fri made the working week
-> Tue–Sat and every request would have charged one day too many with no error anywhere; and a
-> real gap slice 1 left, that there was no serde adapter for an absent *instant*, so an
-> `Option<OffsetDateTime>` could only reach for the DATE adapter and lose its time. Previous:
-> slice 1 — the people core: migration 0196, `modules/hr` (48 unit tests),
-> the `hr.*` permission family (10 keys, 70/70 in `omnion-permissions`), six guarded routers and
-> eight DB walks. Two of the request's own criteria are closed by *construction rather than by a
-> test*: payroll has no columns at all in `hr_employees` (0 salary/bank/tax columns, checked against
-> `information_schema`), and there is no delete route — termination writes a status and an end date
-> and the row is still readable. The migration number is 0196, above the 0193 high-water across all
-> worktrees, and the four case-insensitive uniques are `create unique index` rather than table
-> constraints because Postgres parses the whole file before running any of it)
-> · **Captured:** 2026-09-26 · **Layer:** module (`modules/hr`)
-> **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
 

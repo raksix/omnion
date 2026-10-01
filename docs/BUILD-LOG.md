@@ -10551,3 +10551,30 @@ waiting for a server that has no cycles to answer. The walk is starved, not fail
 Next: the walks when the box breathes (they are the only thing between slice 2d and its
 acceptance box), then the browser pass behind the slot, then slice 3 (onboarding, documents,
 reports).
+
+### Tick 56, continued — what the walks actually said
+
+The migration fix moved the suite from **ten failures in setup** to real assertions, and the first
+full run came back **9 passed / 1 failed in 265 s**. The one failure was the walk's own fault and
+the product was right: `error_message(...).contains("check_out")` against a refusal whose prose is
+"the check-out must be after the check-in" — a hyphen, because the sentence is for a person. The
+body already carries `error.code = invalid_hr_record` and `error.details = { entity, field }`; the
+walk now asserts the structured half and the sentence separately (commit `7629e111`).
+
+**Then the shared database went down underneath the second run, and it is not this writer's to
+fix.** The re-run was killed with **SIGKILL** at test 8 of 10 — `signal: 9`, the OOM killer, on a
+box at 26 of 32 GiB used with 0 free — and the reason is visible from the server side:
+
+```text
+psql: FATAL: the database system is in recovery mode
+docker inspect omnion-postgres → running, restarts=0, oom=false, started 2026-09-30T22:23
+```
+
+The container is alive and not restarting, but it is **wedged in crash recovery** and refusing every
+connection. That is `omnion-postgres` on 5433, the database **all ten writers share**, so
+restarting it is not a local decision — it would take out every sibling's in-flight pass. It was
+left alone, which is the correct call and the reason this tick ends without a verdict.
+
+**State: 7 of 10 walks observed green** (the correction walk green on the second attempt), the
+remaining three unobserved rather than failing, and the acceptance boxes still unticked. Code,
+tests and proofs are committed; the verdict is owed to the next tick when the server answers.
