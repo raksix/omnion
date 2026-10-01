@@ -29,10 +29,10 @@
 
 use std::time::Duration as StdDuration;
 
+use omnion_deployment::StoreError;
 use omnion_deployment::manifest::{self, CheckResult, SeenSet};
 use omnion_deployment::store;
 use omnion_deployment::version::{Channel, Release};
-use omnion_deployment::StoreError;
 use omnion_events::NewEvent;
 use serde_json::json;
 use tokio::task::JoinHandle;
@@ -78,7 +78,10 @@ pub fn interval_seconds() -> i64 {
 #[must_use]
 pub fn spawn(state: AppState) -> JoinHandle<()> {
     let poll_ms = (INTERVAL_SECONDS * 1000) as u64;
-    tracing::info!(interval_hours = INTERVAL_SECONDS / 3600, "the deployment update check started");
+    tracing::info!(
+        interval_hours = INTERVAL_SECONDS / 3600,
+        "the deployment update check started"
+    );
 
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(StdDuration::from_millis(poll_ms));
@@ -283,10 +286,7 @@ async fn read_feed(url: &str) -> Result<(String, String), String> {
             ));
         }
     }
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("{error}"))?;
+    let body = response.text().await.map_err(|error| format!("{error}"))?;
     if body.len() > FEED_MAX_BYTES {
         return Err(format!(
             "the feed sent {} bytes, past the {FEED_MAX_BYTES}-byte cap",
@@ -378,10 +378,7 @@ mod tests {
         let stable = Release::minimal("2.5.0", Channel::Stable);
         let nightly = Release::minimal("2.6.0", Channel::Nightly);
         assert!(all_on_channel(Channel::Stable, &[stable.clone()]));
-        assert!(!all_on_channel(
-            Channel::Stable,
-            &[stable, nightly]
-        ));
+        assert!(!all_on_channel(Channel::Stable, &[stable, nightly]));
     }
 
     #[test]

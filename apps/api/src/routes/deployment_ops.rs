@@ -19,9 +19,9 @@
 //! their own tests, and a route that re-derives "is it active right now" is a second
 //! implementation that will disagree with the first.
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -33,9 +33,9 @@ use omnion_deployment::maintenance::{
     self, Block, MAX_MESSAGE_LEN, Scope, Window, WindowEdit, WindowRefusal,
 };
 
+use crate::auth::CurrentSession;
 use crate::deployment_runner;
 use crate::error::ApiError;
-use crate::auth::CurrentSession;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------------------------
@@ -126,7 +126,8 @@ pub async fn start_rollback(
 
     // What is running right now. Read *before* the busy check so the "already running" refusal
     // is available even when the answer would be a 409 anyway.
-    let from_version = crate::routes::deployment_run::current_version(pool, &target.environment).await?;
+    let from_version =
+        crate::routes::deployment_run::current_version(pool, &target.environment).await?;
     // Only a *known* running version can be "already running". An environment with no health
     // row reports `None`, and refusing the rollback there would be a window whose only way out
     // is to fix the probe — on the one route an operator reaches for when the instance is
@@ -161,6 +162,9 @@ pub async fn start_rollback(
             actor: Some(current.user.id),
             reason: Some(reason),
             backup_id: None,
+            // A rollback names versions; the `0214` constraint refuses one that also names a
+            // workload, so the field is set from the kind and not by the caller.
+            workload: None,
         },
     )
     .await
@@ -185,7 +189,8 @@ pub async fn start_rollback(
     )
     .await?;
 
-    let job = crate::routes::deployment_run::created_job_body(&created, pool, &target.environment).await?;
+    let job = crate::routes::deployment_run::created_job_body(&created, pool, &target.environment)
+        .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(RollbackResponse {
@@ -462,8 +467,12 @@ fn maintenance_error(block: &Block, scope: Scope) -> ApiError {
         reason: block.reason().to_string(),
         scope_applied: scope == Scope::All,
     };
-    ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "maintenance_window", message)
-        .with_details(serde_json::to_value(body).unwrap_or_else(|_| json!({})))
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "maintenance_window",
+        message,
+    )
+    .with_details(serde_json::to_value(body).unwrap_or_else(|_| json!({})))
 }
 
 /// `503` for a deploy during a maintenance window, checked by the wizard's own routes.
@@ -565,14 +574,22 @@ mod tests {
 
     #[test]
     fn the_body_scope_says_which_scope_applied() {
-        let block = Block { message: "m".to_string() };
+        let block = Block {
+            message: "m".to_string(),
+        };
         // `all` blocks public writes; `admin` does not. The client needs to know which, because
         // an API caller refused under `all` is a public outage and one refused under `admin` is
         // an operator's own change.
         let all = maintenance_error(&block, Scope::All);
         let admin = maintenance_error(&block, Scope::Admin);
-        assert_eq!(all.details().and_then(|d| d.get("scope_applied")), Some(&json!(true)));
-        assert_eq!(admin.details().and_then(|d| d.get("scope_applied")), Some(&json!(false)));
+        assert_eq!(
+            all.details().and_then(|d| d.get("scope_applied")),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            admin.details().and_then(|d| d.get("scope_applied")),
+            Some(&json!(false))
+        );
     }
 
     #[test]
@@ -580,9 +597,17 @@ mod tests {
         // A window is open-ended by default, so a `Retry-After` would be a number the server
         // cannot honour. Absent is the honest answer.
         for scope in [Scope::All, Scope::Admin] {
-            let error = maintenance_error(&Block { message: "m".into() }, scope);
+            let error = maintenance_error(
+                &Block {
+                    message: "m".into(),
+                },
+                scope,
+            );
             let serialised = serde_json::to_string(error.details().expect("details")).unwrap();
-            assert!(!serialised.contains("retry_after"), "no Retry-After in {serialised}");
+            assert!(
+                !serialised.contains("retry_after"),
+                "no Retry-After in {serialised}"
+            );
         }
     }
 }

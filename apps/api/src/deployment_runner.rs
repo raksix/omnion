@@ -55,7 +55,8 @@ pub fn spawn_deploy(pool: PgPool, id: Uuid, backup_first: bool, production: bool
             // A runner that dies silently leaves the job `running` for ever, which is the one
             // state that blocks the environment. Stamp the failure and say why.
             tracing::error!(deployment = %id, %error, "the deploy runner stopped");
-            let _ = jobs::mark_failed(&pool, id, &format!("the deploy runner stopped: {error}")).await;
+            let _ =
+                jobs::mark_failed(&pool, id, &format!("the deploy runner stopped: {error}")).await;
         }
     });
 }
@@ -75,7 +76,10 @@ async fn run_deploy(
     production: bool,
 ) -> Result<(), StepRefusal> {
     let job = jobs::load_job(pool, id).await.map_err(storage_to_step)?;
-    let to_version = job.to_version.clone().unwrap_or_else(|| "the target version".to_string());
+    let to_version = job
+        .to_version
+        .clone()
+        .unwrap_or_else(|| "the target version".to_string());
     let environment = job.environment.clone();
 
     // ── backup ───────────────────────────────────────────────────────────────────────────────
@@ -86,11 +90,12 @@ async fn run_deploy(
     // ── migrate ──────────────────────────────────────────────────────────────────────────────
     // Past this line the job is no longer cancellable, and `may_cancel` says so from this step
     // onward rather than after it has run.
-    let migrations: Vec<String> = sqlx::query_scalar("select unnest(migrations) from releases_cache where version = $1")
-        .bind(&to_version)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+    let migrations: Vec<String> =
+        sqlx::query_scalar("select unnest(migrations) from releases_cache where version = $1")
+            .bind(&to_version)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
     step(pool, id, "migrate", || migrate_step(pool, id, &migrations)).await?;
 
     // ── deploy ───────────────────────────────────────────────────────────────────────────────
@@ -100,20 +105,37 @@ async fn run_deploy(
     // The step that decides the outcome, and the only one that can lie if written carelessly: it
     // reads the version the instance actually reports, not the version it was asked to move to.
     // A deploy to 2.5.0 on an instance still running 2.4.1 fails here, which is the truth.
-    let healthy = step(pool, id, "verify", || verify_step(pool, id, &environment, &to_version)).await?;
+    let healthy = step(pool, id, "verify", || {
+        verify_step(pool, id, &environment, &to_version)
+    })
+    .await?;
 
     if healthy {
-        jobs::mark_succeeded(pool, id).await.map_err(storage_to_step)?;
-        let _ = audit_event(pool, "deployment.succeeded", json_env(&environment, &to_version, id)).await;
+        jobs::mark_succeeded(pool, id)
+            .await
+            .map_err(storage_to_step)?;
+        let _ = audit_event(
+            pool,
+            "deployment.succeeded",
+            json_env(&environment, &to_version, id),
+        )
+        .await;
     } else {
         let reason = format!(
             "the verify step did not find {to_version} running; the log says which version this \
              instance reports"
         );
-        jobs::mark_failed(pool, id, &reason).await.map_err(storage_to_step)?;
+        jobs::mark_failed(pool, id, &reason)
+            .await
+            .map_err(storage_to_step)?;
         // The payload carries the environment and the versions — never the log, which is the
         // request's own rule for what a webhook body may contain.
-        let _ = audit_event(pool, "deployment.failed", json_env(&environment, &to_version, id)).await;
+        let _ = audit_event(
+            pool,
+            "deployment.failed",
+            json_env(&environment, &to_version, id),
+        )
+        .await;
     }
 
     // `production` is deliberately not branched on here. The typed-confirmation rule that makes
@@ -203,7 +225,12 @@ async fn deploy_step(pool: &PgPool, id: Uuid, to_version: &str) -> Result<bool, 
 /// It compares the version the instance **reports** with the version it was asked to move to.
 /// Reading back the target instead would make every deploy succeed by construction, which is
 /// the specific lie this request's Definition of Done forbids.
-async fn verify_step(pool: &PgPool, id: Uuid, environment: &str, to_version: &str) -> Result<bool, StepRefusal> {
+async fn verify_step(
+    pool: &PgPool,
+    id: Uuid,
+    environment: &str,
+    to_version: &str,
+) -> Result<bool, StepRefusal> {
     jobs::append_log(
         pool,
         id,
@@ -340,7 +367,8 @@ pub fn spawn_rollback(pool: PgPool, id: Uuid, backup_first: bool) {
     tokio::spawn(async move {
         if let Err(error) = run_rollback(&pool, id, backup_first).await {
             tracing::error!(deployment = %id, %error, "the rollback runner stopped");
-            let _ = jobs::mark_failed(&pool, id, &format!("the rollback runner stopped: {error}")).await;
+            let _ = jobs::mark_failed(&pool, id, &format!("the rollback runner stopped: {error}"))
+                .await;
         }
     });
 }
@@ -359,13 +387,7 @@ async fn run_rollback(pool: &PgPool, id: Uuid, backup_first: bool) -> Result<(),
     // table, and writing it here is what makes it readable three months later from the log pane
     // alone — the history row is filtered, exported and eventually archived; the log is what an
     // operator opens at 3am.
-    jobs::append_log(
-        pool,
-        id,
-        "backup",
-        &format!("rolling back: {reason}\n"),
-    )
-    .await?;
+    jobs::append_log(pool, id, "backup", &format!("rolling back: {reason}\n")).await?;
 
     step(pool, id, "backup", || backup_step(pool, id, backup_first)).await?;
 
@@ -374,18 +396,35 @@ async fn run_rollback(pool: &PgPool, id: Uuid, backup_first: bool) -> Result<(),
     // operator reading the pane is never told a binary moved when it did not.
     step(pool, id, "deploy", || deploy_step(pool, id, &to_version)).await?;
 
-    let healthy = step(pool, id, "verify", || verify_step(pool, id, &environment, &to_version)).await?;
+    let healthy = step(pool, id, "verify", || {
+        verify_step(pool, id, &environment, &to_version)
+    })
+    .await?;
 
     if healthy {
-        jobs::mark_succeeded(pool, id).await.map_err(storage_to_step)?;
-        let _ = audit_event(pool, "deployment.rolled_back", json_env(&environment, &to_version, id)).await;
+        jobs::mark_succeeded(pool, id)
+            .await
+            .map_err(storage_to_step)?;
+        let _ = audit_event(
+            pool,
+            "deployment.rolled_back",
+            json_env(&environment, &to_version, id),
+        )
+        .await;
     } else {
         let reason = format!(
             "the verify step did not find {to_version} running; the log says which version this \
              instance reports"
         );
-        jobs::mark_failed(pool, id, &reason).await.map_err(storage_to_step)?;
-        let _ = audit_event(pool, "deployment.failed", json_env(&environment, &to_version, id)).await;
+        jobs::mark_failed(pool, id, &reason)
+            .await
+            .map_err(storage_to_step)?;
+        let _ = audit_event(
+            pool,
+            "deployment.failed",
+            json_env(&environment, &to_version, id),
+        )
+        .await;
     }
     Ok(())
 }

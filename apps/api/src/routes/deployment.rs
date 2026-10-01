@@ -485,9 +485,7 @@ pub async fn list_releases(
             None => {
                 return Err(ApiError::bad_request(
                     "deployment_channel_unknown",
-                    format!(
-                        "“{raw}” is not a release channel. Choose stable, beta or nightly."
-                    ),
+                    format!("“{raw}” is not a release channel. Choose stable, beta or nightly."),
                 )
                 .with_details(json!({ "channels": ["stable", "beta", "nightly"] })));
             }
@@ -677,10 +675,12 @@ async fn summary(pool: &sqlx::PgPool, channel: Channel) -> Result<VersionSummary
     let check = store::load_check(pool).await?;
     let current_release = Release::minimal(env!("CARGO_PKG_VERSION"), channel);
     let rows = store::list_releases(pool, channel, RELEASE_SCAN_LIMIT).await?;
-    let releases: Vec<Release> = rows.iter().filter_map(store::ReleaseRow::to_release).collect();
+    let releases: Vec<Release> = rows
+        .iter()
+        .filter_map(store::ReleaseRow::to_release)
+        .collect();
     let core = core_version();
-    let availability =
-        omnion_deployment::availability(&current_release, core.as_ref(), &releases);
+    let availability = omnion_deployment::availability(&current_release, core.as_ref(), &releases);
 
     let cached_at = store::newest_checked_at(pool).await?;
     let stale_banner = if check.is_stale() {
@@ -688,7 +688,10 @@ async fn summary(pool: &sqlx::PgPool, channel: Channel) -> Result<VersionSummary
             || "a check that has never run".to_string(),
             |at| format_time(&at),
         );
-        let reason = check.last_error.as_deref().unwrap_or("no successful check yet");
+        let reason = check
+            .last_error
+            .as_deref()
+            .unwrap_or("no successful check yet");
         Some(stale_banner(reason, &stamp))
     } else {
         None
@@ -880,10 +883,7 @@ fn history_body(row: &store::DeploymentRow, steps: Vec<store::StepRow>) -> Histo
 }
 
 /// The newest jobs, for a card's footer and the detail's strip.
-async fn recent_history(
-    pool: &sqlx::PgPool,
-    limit: i64,
-) -> Result<Vec<HistoryRowBody>, ApiError> {
+async fn recent_history(pool: &sqlx::PgPool, limit: i64) -> Result<Vec<HistoryRowBody>, ApiError> {
     let mut filter = HistoryFilter::with_defaults();
     filter.limit = limit;
     let (rows, _) = store::list_history(pool, &filter).await?;
@@ -994,8 +994,7 @@ fn format_time(at: &OffsetDateTime) -> String {
     // a trailing `.0`, neither of which anything else in the platform parses. So the format is
     // written out here rather than borrowed.
     let formatted = time::format_description::well_known::Rfc3339;
-    at.format(&formatted)
-        .unwrap_or_else(|_| format!("{at}"))
+    at.format(&formatted).unwrap_or_else(|_| format!("{at}"))
 }
 
 /// A `window=` chip as an instant, plus the label the filter echoes.
@@ -1013,10 +1012,9 @@ fn window_to_instant(window: Option<&str>) -> Result<(Option<OffsetDateTime>, St
         other => {
             // A bare instant is accepted so the URL is a complete description of the query: a
             // panel that cannot express "since Tuesday" in a chip can still link to it.
-            if let Ok(at) = time::OffsetDateTime::parse(
-                other,
-                &time::format_description::well_known::Rfc3339,
-            ) {
+            if let Ok(at) =
+                time::OffsetDateTime::parse(other, &time::format_description::well_known::Rfc3339)
+            {
                 return Ok((Some(at), other.to_string()));
             }
             return Err(ApiError::bad_request(

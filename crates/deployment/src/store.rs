@@ -74,7 +74,10 @@ impl ReleaseRow {
             notes: self.notes_md.clone(),
             breaking: self.breaking,
             migrations: self.migrations.clone(),
-            core_min: self.core_min.as_deref().and_then(|raw| Version::parse(raw).ok()),
+            core_min: self
+                .core_min
+                .as_deref()
+                .and_then(|raw| Version::parse(raw).ok()),
             artifact_checksum: self.artifact_checksum.clone(),
             released_at: self.released_at.clone(),
         })
@@ -112,9 +115,8 @@ pub async fn load_release(
     channel: Channel,
     version: &str,
 ) -> Result<ReleaseRow, StoreError> {
-    let sql = format!(
-        "select {RELEASE_COLUMNS} from releases_cache where version = $1 and channel = $2"
-    );
+    let sql =
+        format!("select {RELEASE_COLUMNS} from releases_cache where version = $1 and channel = $2");
     let row = sqlx::query_as::<_, ReleaseRow>(&sql)
         .bind(version)
         .bind(channel.as_str())

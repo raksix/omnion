@@ -71,6 +71,14 @@ pub struct NewJob {
     pub reason: Option<String>,
     /// The backup id, when the caller already took one.
     pub backup_id: Option<Uuid>,
+    /// The workload a **restart** targets (REQ-024 slice 4). `None` for every other kind.
+    ///
+    /// Carried on the struct rather than in a separate function because the two are the same
+    /// row: the `0214` constraint `deployments_restart_names_a_workload` refuses a restart with
+    /// no workload *and* a deploy carrying one, so "which column do I set" is decided by the
+    /// kind and cannot be forgotten at a call site. A deploy's versions and a restart's workload
+    /// name are the same question — "what is this row about" — asked in two vocabularies.
+    pub workload: Option<String>,
 }
 
 /// The job the create call produced, with its steps.
@@ -131,10 +139,7 @@ pub async fn active_job(pool: &PgPool, environment: &str) -> Result<Option<Uuid>
 /// wizard timeline with nothing in it, and the operator has no way to tell that apart from a job
 /// that finished instantly. The step list comes from [`plan_steps`], so a caller cannot ship a
 /// deploy whose timeline is missing the `verify` row the wizard promises.
-pub async fn create_job(
-    pool: &PgPool,
-    new_job: &NewJob,
-) -> Result<CreatedJob, StartRefusal> {
+pub async fn create_job(pool: &PgPool, new_job: &NewJob) -> Result<CreatedJob, StartRefusal> {
     let steps = plan_steps(new_job.kind);
     let id = Uuid::new_v4();
 
@@ -145,8 +150,8 @@ pub async fn create_job(
 
     let inserted = sqlx::query(
         "insert into deployments (id, environment, kind, from_version, to_version, status, \
-         started_by, reason, backup_id) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         started_by, reason, backup_id, workload) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(id)
     .bind(&new_job.target.environment)
@@ -157,6 +162,7 @@ pub async fn create_job(
     .bind(new_job.actor)
     .bind(&new_job.reason)
     .bind(new_job.backup_id)
+    .bind(&new_job.workload)
     .execute(&mut *tx)
     .await;
 
@@ -275,11 +281,7 @@ fn storage(error: sqlx::Error) -> StepRefusal {
 /// Refused when the step is not `pending`, when an earlier step is unfinished, or when the job
 /// itself has finished — the three ways a timeline can otherwise claim progress that did not
 /// happen.
-pub async fn start_step(
-    pool: &PgPool,
-    deployment_id: Uuid,
-    name: &str,
-) -> Result<(), StepRefusal> {
+pub async fn start_step(pool: &PgPool, deployment_id: Uuid, name: &str) -> Result<(), StepRefusal> {
     let (status, position) = load_step(pool, deployment_id, name)
         .await?
         .ok_or(StepRefusal::NoSuchStep)?;
@@ -433,13 +435,15 @@ pub async fn finish_step(
         .await
         .map_err(storage)?;
     } else {
-        sqlx::query("update deployments set status = $1, error = coalesce($2, error) where id = $3")
-            .bind(job_status.as_str())
-            .bind(error)
-            .bind(deployment_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
+        sqlx::query(
+            "update deployments set status = $1, error = coalesce($2, error) where id = $3",
+        )
+        .bind(job_status.as_str())
+        .bind(error)
+        .bind(deployment_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
     }
 
     tx.commit().await.map_err(storage)?;
@@ -612,10 +616,12 @@ pub fn log_since(log: &str, cursor: usize) -> (&str, usize) {
 
 /// When a job row was started, for the history screen's sort when a filter is active.
 pub async fn started_at(pool: &PgPool, id: Uuid) -> Result<Option<OffsetDateTime>, StoreError> {
-    Ok(sqlx::query_scalar("select started_at from deployments where id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?)
+    Ok(
+        sqlx::query_scalar("select started_at from deployments where id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
 
 #[cfg(test)]
@@ -635,7 +641,11 @@ mod tests {
     fn refusals_carry_their_reason() {
         assert!(StepRefusal::OutOfOrder.to_string().contains("earlier step"));
         assert!(StepRefusal::NoSuchStep.to_string().contains("no step"));
-        assert!(StartRefusal::Busy(Uuid::nil()).to_string().contains("already holds"));
+        assert!(
+            StartRefusal::Busy(Uuid::nil())
+                .to_string()
+                .contains("already holds")
+        );
     }
 
     #[test]
@@ -662,9 +672,15 @@ mod tests {
         // `é` is two bytes, so offset 1 splits a character and `&log[1..]` would panic. The
         // offset that actually splits one is inside the multi-byte char, not after it.
         let log = "é\n";
-        assert!(!log.is_char_boundary(1), "the test needs a mid-character offset to be meaningful");
+        assert!(
+            !log.is_char_boundary(1),
+            "the test needs a mid-character offset to be meaningful"
+        );
         let (chunk, next) = log_since(log, 1);
-        assert_eq!(chunk, log, "a split cursor returns the whole log, not a panic");
+        assert_eq!(
+            chunk, log,
+            "a split cursor returns the whole log, not a panic"
+        );
         assert_eq!(next, log.len());
     }
 

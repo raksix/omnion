@@ -80,6 +80,7 @@ pub mod cdn_purge;
 pub mod commands;
 pub mod content;
 pub mod deployment;
+pub mod deployment_cluster;
 pub mod deployment_ops;
 pub mod deployment_run;
 pub mod environments;
@@ -1137,9 +1138,7 @@ pub fn router(state: AppState) -> Router {
     // across two keys would make the fallback the path nobody holds.
     let deployment_job_log = get(deployment_run::stream_log)
         .layer(guards::require(&state, "deployment.read"))
-        .merge(
-            get(deployment_run::poll_log).layer(guards::require(&state, "deployment.read")),
-        );
+        .merge(get(deployment_run::poll_log).layer(guards::require(&state, "deployment.read")));
 
     // Rollback and the maintenance window (REQ-024, slice 3).
     //
@@ -1148,15 +1147,31 @@ pub fn router(state: AppState) -> Router {
     // they are missing: an operator who may deploy but not roll back is a normal configuration
     // (they fix forward), and an operator who may roll back but not deploy is another (they
     // handle incidents). One key for both would make one of those configurations impossible.
-    let deployment_rollback = post(deployment_ops::start_rollback)
-        .layer(guards::require(&state, "deployment.rollback"));
+    let deployment_rollback =
+        post(deployment_ops::start_rollback).layer(guards::require(&state, "deployment.rollback"));
     // The window is read by every admin session (the shell banner) and written by
     // `deployment.maintenance`, which is a *different* key from `deployment.manage` on purpose:
     // opening a maintenance window is what an operator does *instead of* deploying, and
     // requiring the deploy key to stop the world would mean the only people allowed to pause a
     // release are the ones allowed to start one.
-    let deployment_maintenance = get(deployment_ops::list_maintenance)
-        .layer(guards::require(&state, "deployment.read"));
+    let deployment_maintenance =
+        get(deployment_ops::list_maintenance).layer(guards::require(&state, "deployment.read"));
+
+    // The cluster panel (REQ-024, slice 4). The read is `deployment.cluster.read` and not
+    // `deployment.read` on purpose: it is a *different kind* of information — host-level replica
+    // and resource numbers, read from the runtime rather than from this database — and an
+    // account allowed to read a deploy's history is not automatically an account whose job is to
+    // see how much CPU the cluster is using. The two writes are `deployment.manage`, the same key
+    // as "check for updates now", because both reach out of the database and change something
+    // outside it.
+    let deployment_cluster = get(deployment_cluster::get_cluster)
+        .layer(guards::require(&state, "deployment.cluster.read"));
+    let deployment_cluster_samples = get(deployment_cluster::get_samples)
+        .layer(guards::require(&state, "deployment.cluster.read"));
+    let deployment_cluster_restart = post(deployment_cluster::restart_workload)
+        .layer(guards::require(&state, "deployment.manage"));
+    let deployment_cluster_sample =
+        post(deployment_cluster::run_sample).layer(guards::require(&state, "deployment.manage"));
     let deployment_maintenance_one = put(deployment_ops::update_maintenance)
         .layer(guards::require(&state, "deployment.maintenance"));
 
@@ -1505,8 +1520,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/health/maintenance-windows/{id}",
-            delete(health_incidents::delete_window)
-                .layer(guards::require(&state, "health.manage")),
+            delete(health_incidents::delete_window).layer(guards::require(&state, "health.manage")),
         )
         .route(
             "/security/overview",
@@ -2037,7 +2051,10 @@ pub fn router(state: AppState) -> Router {
         .route("/cdn/adapters", cdn_adapters)
         .route("/deployment/version", deployment_version)
         .route("/deployment/environments", deployment_environments)
-        .route("/deployment/environments/{environment}", deployment_environment_one)
+        .route(
+            "/deployment/environments/{environment}",
+            deployment_environment_one,
+        )
         .route("/deployment/releases", deployment_releases)
         .route("/deployment/releases/{version}", deployment_release_one)
         .route("/deployment/history", deployment_history)
@@ -2045,7 +2062,10 @@ pub fn router(state: AppState) -> Router {
         .route("/deployment/checks/run", deployment_checks_run)
         .route("/deployment/jobs/{id}", deployment_job)
         .route("/deployment/jobs/{id}/log", deployment_job_log)
-        .route("/deployment/environments/{environment}/rollback", deployment_rollback)
+        .route(
+            "/deployment/environments/{environment}/rollback",
+            deployment_rollback,
+        )
         .route("/deployment/maintenance", deployment_maintenance)
         // The per-environment window is a `PUT` on its own path rather than a body field on the
         // list route: the shell banner polls the list in every session, and a poll that could
@@ -2053,6 +2073,24 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/deployment/maintenance/{environment}",
             deployment_maintenance_one,
+        )
+        // `/deployment/cluster` answers `404` on a single instance rather than an empty cluster,
+        // so there is no disabled card to tease with. The samples and the restart hang off it
+        // rather than off `/cluster/{environment}`: the environment is a path parameter the
+        // routes read from the snapshot, and splitting it across two shapes would let a caller
+        // read one environment's series while restarting another's.
+        .route("/deployment/cluster", deployment_cluster)
+        .route(
+            "/deployment/cluster/{environment}/samples",
+            deployment_cluster_samples,
+        )
+        .route(
+            "/deployment/cluster/{environment}/restart",
+            deployment_cluster_restart,
+        )
+        .route(
+            "/deployment/cluster/{environment}/sample",
+            deployment_cluster_sample,
         )
         .route("/environments", environments)
         .route("/environments/{id}", environment_one)

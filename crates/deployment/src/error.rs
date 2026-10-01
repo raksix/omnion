@@ -72,7 +72,11 @@ impl StoreError {
 /// A storage error and the release feed's failure, rendered the same way for the log.
 impl fmt::Display for FeedContext<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} (last good cache: {})", self.reason, self.cached_at)
+        write!(
+            formatter,
+            "{} (last good cache: {})",
+            self.reason, self.cached_at
+        )
     }
 }
 
@@ -95,7 +99,10 @@ mod tests {
         // shared `internal_error` would render the stale banner as an error page and tell an
         // operator to retry a request that will never succeed while the feed is down.
         assert_eq!(StoreError::NotFound.code(), "not_found");
-        assert_eq!(StoreError::Feed("timeout".into()).code(), "feed_unreachable");
+        assert_eq!(
+            StoreError::Feed("timeout".into()).code(),
+            "feed_unreachable"
+        );
     }
 
     #[test]

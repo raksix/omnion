@@ -26,9 +26,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use omnion_deployment::jobs::{
-    self, CreatedJob, NewJob, StartRefusal, StepRefusal, Target,
-};
+use omnion_deployment::jobs::{self, CreatedJob, NewJob, StartRefusal, StepRefusal, Target};
 use omnion_deployment::preflight::{
     CheckId, CheckOutcome, Confirmation, PreflightReport, confirmation_for, confirmation_matches,
 };
@@ -38,9 +36,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::Infallible;
 use std::time::Duration;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
@@ -310,8 +308,7 @@ pub async fn start_deploy(
             "preflight_blocked",
             format!(
                 "The pre-flight did not pass: {} — {}",
-                blocker.title,
-                blocker.detail
+                blocker.title, blocker.detail
             ),
         ));
     }
@@ -337,6 +334,9 @@ pub async fn start_deploy(
             actor: Some(current.user.id),
             reason: None,
             backup_id: None,
+            // A deploy names versions; only a restart names a workload, and the `0214`
+            // constraint refuses a deploy that carries one.
+            workload: None,
         },
     )
     .await
@@ -429,16 +429,17 @@ pub async fn stream_log(
                             break;
                         }
                     }
-                    match jobs::load_job(&stream_pool, job_id).await.map(|job| job.status) {
+                    match jobs::load_job(&stream_pool, job_id)
+                        .await
+                        .map(|job| job.status)
+                    {
                         Ok(status) if status.is_finished() => {
                             // A final frame carries the terminal status, so a client that reads
                             // only the stream still learns how the run ended.
-                            let frame = Event::default()
-                                .event("end")
-                                .data(format!(
-                                    r#"{{"status":"{}","cursor":{sent}}}"#,
-                                    status.as_str()
-                                ));
+                            let frame = Event::default().event("end").data(format!(
+                                r#"{{"status":"{}","cursor":{sent}}}"#,
+                                status.as_str()
+                            ));
                             let _ = tx.send(Ok(frame)).await;
                             break;
                         }
@@ -447,11 +448,9 @@ pub async fn stream_log(
                         // rather than reconnecting for ever against a 404.
                         Err(_) => {
                             let _ = tx
-                                .send(
-                                    Ok(Event::default()
-                                        .data("this deployment record is no longer available")
-                                        .event("end")),
-                                )
+                                .send(Ok(Event::default()
+                                    .data("this deployment record is no longer available")
+                                    .event("end")))
                                 .await;
                             break;
                         }
@@ -539,13 +538,28 @@ pub async fn cancel_job(
     }
     let refusal = omnion_deployment::cancel_refusal(job.kind, job.current_step());
     if let Some(reason) = refusal {
-        return Err(ApiError::new(StatusCode::CONFLICT, "cancel_too_late", reason));
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "cancel_too_late",
+            reason,
+        ));
     }
 
-    let current_step = job
-        .current_step()
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "no_step_running", "No step is running."))?;
-    let _ = jobs::finish_step(pool, id, current_step, StepStatus::Failed, Some("cancelled by an operator")).await;
+    let current_step = job.current_step().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "no_step_running",
+            "No step is running.",
+        )
+    })?;
+    let _ = jobs::finish_step(
+        pool,
+        id,
+        current_step,
+        StepStatus::Failed,
+        Some("cancelled by an operator"),
+    )
+    .await;
     // The cancelled job's own status is `cancelled`, not `failed` — the table accepts both and
     // the history filter separates them, so a deliberate stop is not counted as a failure in an
     // operator's "how reliable is this" reading of the history.
@@ -561,15 +575,13 @@ pub async fn cancel_job(
     .map_err(db)?;
     // A cancelled job must not hold the environment: the partial unique index covers the active
     // statuses, so leaving it `failed` would keep the next deploy refused with a 409 forever.
-    sqlx::query(
-        "update deployment_steps set status = $1 where deployment_id = $2 and status = $3",
-    )
-    .bind(StepStatus::Skipped.as_str())
-    .bind(id)
-    .bind(StepStatus::Pending.as_str())
-    .execute(pool)
-    .await
-    .map_err(db)?;
+    sqlx::query("update deployment_steps set status = $1 where deployment_id = $2 and status = $3")
+        .bind(StepStatus::Skipped.as_str())
+        .bind(id)
+        .bind(StepStatus::Pending.as_str())
+        .execute(pool)
+        .await
+        .map_err(db)?;
 
     omnion_audit::record(
         pool,
@@ -656,10 +668,7 @@ async fn build_preflight(
     // 7. Core compatibility — whether the running core satisfies the target's minimum.
     rows.push(core_compatibility(pool, to_version).await?);
 
-    Ok(PreflightReport::from_outcomes(
-        target.production,
-        rows,
-    ))
+    Ok(PreflightReport::from_outcomes(target.production, rows))
 }
 
 /// The newest backup's age, in minutes.
@@ -701,13 +710,12 @@ async fn pending_migrations(
     pool: &sqlx::PgPool,
     to_version: &str,
 ) -> Result<CheckOutcome, ApiError> {
-    let declared: Option<i32> = sqlx::query_scalar(
-        "select cardinality(migrations) from releases_cache where version = $1",
-    )
-    .bind(to_version)
-    .fetch_optional(pool)
-    .await
-    .map_err(db)?;
+    let declared: Option<i32> =
+        sqlx::query_scalar("select cardinality(migrations) from releases_cache where version = $1")
+            .bind(to_version)
+            .fetch_optional(pool)
+            .await
+            .map_err(db)?;
     let count = declared.unwrap_or(0);
     if count > 0 {
         Ok(CheckOutcome::warn(
@@ -727,10 +735,7 @@ async fn pending_migrations(
     }
 }
 
-async fn free_disk(
-    pool: &sqlx::PgPool,
-    to_version: &str,
-) -> Result<CheckOutcome, ApiError> {
+async fn free_disk(pool: &sqlx::PgPool, to_version: &str) -> Result<CheckOutcome, ApiError> {
     // `pg_database_size` is the only honest free-space number available from inside the
     // instance; a check that asked the host for a statvfs would be reporting a different
     // machine's disk.
@@ -794,10 +799,7 @@ fn parse_required_mb(notes: &str) -> Option<i64> {
     }
 }
 
-async fn running_job(
-    pool: &sqlx::PgPool,
-    environment: &str,
-) -> Result<CheckOutcome, ApiError> {
+async fn running_job(pool: &sqlx::PgPool, environment: &str) -> Result<CheckOutcome, ApiError> {
     match jobs::active_job(pool, environment).await? {
         Some(id) => Ok(CheckOutcome::fail(
             CheckId::RunningBackgroundJobs,
@@ -883,7 +885,9 @@ async fn core_compatibility(
     let Some(minimum) = core_min else {
         return Ok(CheckOutcome::unknown(
             CheckId::CoreCompatibility,
-            format!("{to_version} is not in the release cache, so its minimum core version is unknown."),
+            format!(
+                "{to_version} is not in the release cache, so its minimum core version is unknown."
+            ),
             "Run an update check, then try again.",
         ));
     };
@@ -924,11 +928,7 @@ fn blocking_row(report: &PreflightReport) -> Option<&CheckOutcome> {
 }
 
 /// Render a report for the wizard.
-fn preflight_body(
-    target: &Target,
-    to_version: &str,
-    report: PreflightReport,
-) -> PreflightResponse {
+fn preflight_body(target: &Target, to_version: &str, report: PreflightReport) -> PreflightResponse {
     // `can_continue` and the acknowledgement both come from the report's own rules, so the
     // route cannot disagree with the crate about what a warning means.
     // The report answers this by whether `can_continue` differs between acknowledged and not —
@@ -985,10 +985,7 @@ fn preflight_token(target: &Target, to_version: &str, report: &PreflightReport) 
 // ---------------------------------------------------------------------------------------------
 
 /// Render a stored job, reading its elapsed time from the row.
-async fn body_of(
-    job: &omnion_deployment::Job,
-    pool: &sqlx::PgPool,
-) -> Result<JobBody, ApiError> {
+async fn body_of(job: &omnion_deployment::Job, pool: &sqlx::PgPool) -> Result<JobBody, ApiError> {
     let elapsed = jobs::elapsed_ms(pool, job.id).await?;
     Ok(JobBody {
         id: job.id,
@@ -1078,10 +1075,7 @@ pub(crate) async fn created_job_body(
     Ok(body)
 }
 
-async fn store_version(
-    pool: &sqlx::PgPool,
-    environment: &str,
-) -> Result<Option<String>, ApiError> {
+async fn store_version(pool: &sqlx::PgPool, environment: &str) -> Result<Option<String>, ApiError> {
     sqlx::query_scalar("select version from environment_health where environment = $1")
         .bind(environment)
         .fetch_optional(pool)
@@ -1138,11 +1132,7 @@ fn step_refusal(refusal: StepRefusal) -> ApiError {
         StepRefusal::Storage(reason) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", reason)
         }
-        other => ApiError::new(
-            StatusCode::CONFLICT,
-            "job_state",
-            other.to_string(),
-        ),
+        other => ApiError::new(StatusCode::CONFLICT, "job_state", other.to_string()),
     }
 }
 
@@ -1156,13 +1146,22 @@ mod tests {
     #[test]
     fn a_note_without_a_requirement_falls_back() {
         assert_eq!(parse_required_mb("Bug fixes and a new importer."), None);
-        assert_eq!(parse_required_mb("This release requires nothing in particular."), None);
+        assert_eq!(
+            parse_required_mb("This release requires nothing in particular."),
+            None
+        );
     }
 
     #[test]
     fn a_requirement_is_read_in_both_units() {
-        assert_eq!(parse_required_mb("This release requires 512 MB of disk."), Some(512));
-        assert_eq!(parse_required_mb("Requires 2 GB for the index rebuild."), Some(2048));
+        assert_eq!(
+            parse_required_mb("This release requires 512 MB of disk."),
+            Some(512)
+        );
+        assert_eq!(
+            parse_required_mb("Requires 2 GB for the index rebuild."),
+            Some(2048)
+        );
     }
 
     #[test]
@@ -1184,7 +1183,11 @@ mod tests {
         };
         let target = Target::new("production");
         let passing = report(CheckOutcome::pass(CheckId::FreeDiskSpace, "ok"));
-        let warning = report(CheckOutcome::warn(CheckId::FreeDiskSpace, "tight", "free some space"));
+        let warning = report(CheckOutcome::warn(
+            CheckId::FreeDiskSpace,
+            "tight",
+            "free some space",
+        ));
         assert_eq!(
             preflight_token(&target, "2.5.0", &passing),
             preflight_token(&target, "2.5.0", &passing),

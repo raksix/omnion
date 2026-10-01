@@ -172,9 +172,7 @@ impl std::fmt::Display for WindowRefusal {
                 f,
                 "The message is {len} characters; the limit is {MAX_MESSAGE_LEN}."
             ),
-            WindowRefusal::EndBeforeStart => {
-                f.write_str("The window ends before it starts.")
-            }
+            WindowRefusal::EndBeforeStart => f.write_str("The window ends before it starts."),
             WindowRefusal::NoMessage => {
                 f.write_str("An enabled window needs a message to show in the banner.")
             }
@@ -186,7 +184,11 @@ impl std::fmt::Display for WindowRefusal {
 ///
 /// Returns the window to store, or the first refusal. Refused **before** anything is written,
 /// so a rejected form never leaves the previous window half-changed.
-pub fn save(environment: &str, stored: &Window, edit: &WindowEdit) -> Result<Window, WindowRefusal> {
+pub fn save(
+    environment: &str,
+    stored: &Window,
+    edit: &WindowEdit,
+) -> Result<Window, WindowRefusal> {
     let message = edit.message.trim().to_string();
     if message.chars().count() > MAX_MESSAGE_LEN {
         return Err(WindowRefusal::MessageTooLong(message.chars().count()));
@@ -226,7 +228,11 @@ pub fn save(environment: &str, stored: &Window, edit: &WindowEdit) -> Result<Win
         // A no-op submission is reported as unchanged so the route can skip the write and the
         // `updated_at` bump — a history of "changed" rows that never changed anything is its
         // own kind of lie.
-        ..if unchanged { stored.clone() } else { Window::unset(environment) }
+        ..if unchanged {
+            stored.clone()
+        } else {
+            Window::unset(environment)
+        }
     })
 }
 
@@ -254,21 +260,29 @@ impl Window {
     /// which is the distinction that decides whether they retry or page someone.
     #[must_use]
     pub fn block_for(&self, target: bool, now: OffsetDateTime) -> Option<Block> {
-        self.blocks(target, now)
-            .then(|| Block { message: self.message.clone() })
+        self.blocks(target, now).then(|| Block {
+            message: self.message.clone(),
+        })
     }
 }
 
 /// Load one environment's window, or the unset shape.
 pub async fn load_window(pool: &sqlx::PgPool, environment: &str) -> Result<Window, StoreError> {
-    let row: Option<(bool, String, Option<OffsetDateTime>, Option<OffsetDateTime>, String, Option<uuid::Uuid>, OffsetDateTime)> =
-        sqlx::query_as(
-            "select enabled, message, starts_at, ends_at, scope, updated_by, updated_at \
+    let row: Option<(
+        bool,
+        String,
+        Option<OffsetDateTime>,
+        Option<OffsetDateTime>,
+        String,
+        Option<uuid::Uuid>,
+        OffsetDateTime,
+    )> = sqlx::query_as(
+        "select enabled, message, starts_at, ends_at, scope, updated_by, updated_at \
              from maintenance_windows where environment = $1",
-        )
-        .bind(environment)
-        .fetch_optional(pool)
-        .await?;
+    )
+    .bind(environment)
+    .fetch_optional(pool)
+    .await?;
 
     let Some((enabled, message, starts_at, ends_at, scope, updated_by, updated_at)) = row else {
         return Ok(Window::unset(environment));
@@ -290,28 +304,38 @@ pub async fn load_window(pool: &sqlx::PgPool, environment: &str) -> Result<Windo
 
 /// Every configured window, for the shell banner and the screen's overview.
 pub async fn list_windows(pool: &sqlx::PgPool) -> Result<Vec<Window>, StoreError> {
-    let rows: Vec<(String, bool, String, Option<OffsetDateTime>, Option<OffsetDateTime>, String, Option<uuid::Uuid>, OffsetDateTime)> =
-        sqlx::query_as(
-            "select environment, enabled, message, starts_at, ends_at, scope, updated_by, updated_at \
+    let rows: Vec<(
+        String,
+        bool,
+        String,
+        Option<OffsetDateTime>,
+        Option<OffsetDateTime>,
+        String,
+        Option<uuid::Uuid>,
+        OffsetDateTime,
+    )> = sqlx::query_as(
+        "select environment, enabled, message, starts_at, ends_at, scope, updated_by, updated_at \
              from maintenance_windows order by environment",
-        )
-        .fetch_all(pool)
-        .await?;
+    )
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows
         .into_iter()
-        .map(|(environment, enabled, message, starts_at, ends_at, scope, updated_by, updated_at)| {
-            Window {
-                environment,
-                enabled,
-                message,
-                starts_at,
-                ends_at,
-                scope: Scope::parse(&scope).unwrap_or(Scope::All),
-                updated_by,
-                updated_at: Some(updated_at),
-            }
-        })
+        .map(
+            |(environment, enabled, message, starts_at, ends_at, scope, updated_by, updated_at)| {
+                Window {
+                    environment,
+                    enabled,
+                    message,
+                    starts_at,
+                    ends_at,
+                    scope: Scope::parse(&scope).unwrap_or(Scope::All),
+                    updated_by,
+                    updated_at: Some(updated_at),
+                }
+            },
+        )
         .collect())
 }
 
@@ -439,7 +463,9 @@ mod tests {
     #[test]
     fn the_block_carries_the_operators_own_message() {
         let w = window();
-        let block = w.block_for(true, at(10)).expect("a window that is open blocks");
+        let block = w
+            .block_for(true, at(10))
+            .expect("a window that is open blocks");
         assert_eq!(block.message, "Upgrading the core.");
         assert!(block.reason().contains("maintenance window"));
     }
