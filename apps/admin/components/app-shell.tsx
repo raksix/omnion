@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, BookMarked, Bot, ClipboardCheck, FileStack, FileText, Fingerprint, Globe, Grid3x3, HardDriveDownload, HeartPulse, History as HistoryIcon, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, Wrench, X } from "lucide-react";
+import { Activity, BarChart3, Bell, BookMarked, Bot, ClipboardCheck, Cpu, FileStack, FileText, Fingerprint, Globe, Grid3x3, HardDriveDownload, HeartPulse, History as HistoryIcon, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, Wrench, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -74,6 +74,13 @@ const NAV = [
   // page. The rules table is reachable from the policy panel's own rows.
   { href: "/ai/guard", label: "Data guard", icon: ShieldCheck },
   { href: "/ai/guard/events", label: "Guard events", icon: ScrollText },
+  // Local inference (REQ-106). Beside the guard rather than under settings/iam because it is an
+  // AI-Hub screen answering the same question the guard does from the other side: the guard asks
+  // "what did the last call contain", this asks "where can a call go at all". The models table is
+  // reachable from the endpoint row rather than from the sidebar, because a screen reached from a
+  // specific endpoint is about that endpoint — listing it beside configuration invites an
+  // operator to pull a model with no endpoint chosen.
+  { href: "/ai/local", label: "Local AI", icon: Cpu },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
