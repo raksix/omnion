@@ -112,6 +112,15 @@ import type {
   WebhookTestReport,
   CreatedMediaShare,
   EventCatalogue,
+  DeviceLookup,
+  DeviceStart,
+  ManifestReport,
+  ScaffoldList,
+  ScaffoldRecord,
+  ScaffoldTree,
+  SdkKind,
+  SdkTarget,
+  SdkTemplate,
   EventFilters,
   EventPage,
   RetentionStatus,
@@ -5730,6 +5739,109 @@ export function fetchWebhookStats(id: string, windowHours?: number): Promise<Web
  */
 export function fetchEventCatalogue(): Promise<EventCatalogue> {
   return request<EventCatalogue>("/api/v1/events/catalogue");
+}
+
+// ---------------------------------------------------------------------------------------------
+// SDK scaffolds and the CLI device code (REQ-033, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** The three template cards, with what each contains. */
+export function fetchSdkTemplates(): Promise<SdkTemplate[]> {
+  return request<SdkTemplate[]>("/api/v1/dev/sdks/templates");
+}
+
+/**
+ * Preview a generated starter's file tree.
+ *
+ * Writes nothing: this is the call the name field makes while somebody is still typing, and a
+ * button that records a row per keystroke would fill `sdk_scaffolds` with previews. The durable
+ * half is {@link recordScaffold}, and the screen makes the difference visible by labelling them
+ * "Preview" and "Generate".
+ */
+export function previewScaffold(
+  kind: SdkKind,
+  name: string,
+  target: SdkTarget,
+): Promise<ScaffoldTree> {
+  return request<ScaffoldTree>("/api/v1/dev/sdks/scaffold", {
+    method: "POST",
+    body: JSON.stringify({ kind, name, target }),
+  });
+}
+
+/** Generate and record a starter, returning the row that was written. */
+export function recordScaffold(
+  kind: SdkKind,
+  name: string,
+  target: SdkTarget,
+): Promise<ScaffoldRecord> {
+  return request<ScaffoldRecord>("/api/v1/dev/sdks/scaffolds", {
+    method: "POST",
+    body: JSON.stringify({ kind, name, target }),
+  });
+}
+
+/** This tenant's recorded generations, newest first. */
+export function fetchScaffolds(): Promise<ScaffoldList> {
+  return request<ScaffoldList>("/api/v1/dev/sdks/scaffolds");
+}
+
+/**
+ * The archive's URL, for a download link.
+ *
+ * A plain `<a href>` rather than a fetch: the browser's own download handling is what puts the
+ * file in the downloads folder with the right name, and a `fetch` + blob would have to
+ * reconstruct `Content-Disposition` on the client to arrive at the same place. The route reads
+ * the session cookie as a first-party same-origin request, so the link needs no token of any kind
+ * in its query — which is also why no key material can leak into a URL, a history entry or a
+ * `Referer`.
+ */
+export function scaffoldDownloadUrl(id: string): string {
+  return `/api/v1/dev/sdks/scaffolds/${id}/download`;
+}
+
+/**
+ * Validate a manifest, with the runtime loader's own rules.
+ *
+ * The report carries a line per issue, and the screen renders them in order: a validator that
+ * only said "invalid" would leave the author guessing which of forty lines to look at.
+ */
+export function validateManifest(
+  kind: SdkKind,
+  manifest: string,
+): Promise<ManifestReport> {
+  return request<ManifestReport>("/api/v1/dev/manifests/validate", {
+    method: "POST",
+    body: JSON.stringify({ kind, manifest }),
+  });
+}
+
+/** Start a CLI device-code login from the signed-in browser session. */
+export function startDeviceCode(clientName: string): Promise<DeviceStart> {
+  return request<DeviceStart>("/api/v1/dev/cli/device-code", {
+    method: "POST",
+    body: JSON.stringify({ client_name: clientName }),
+  });
+}
+
+/**
+ * What a pending code wants, before anybody approves it.
+ *
+ * The screen calls this so a person sees the requesting client's name and the plain-language
+ * scopes rather than a bare code with a confirm button next to it.
+ */
+export function fetchDeviceCode(userCode: string): Promise<DeviceLookup> {
+  return request<DeviceLookup>(
+    `/api/v1/dev/cli/device-code/${encodeURIComponent(userCode)}`,
+  );
+}
+
+/** Approve a pending code. The scopes come from the stored row, never from this call. */
+export function approveDeviceCode(userCode: string): Promise<{ user_code: string }> {
+  return request<{ user_code: string }>("/api/v1/dev/cli/device-code/approve", {
+    method: "POST",
+    body: JSON.stringify({ user_code: userCode }),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------

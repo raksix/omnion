@@ -3779,3 +3779,109 @@ export type MintedOAuthApp = OAuthApp & {
   /** How many days the previous secret stays valid, while a rotation's overlap is open. */
   previous_secret_valid_for_days?: number;
 };
+
+// ---------------------------------------------------------------------------------------------
+// SDK scaffolds + the CLI device code (REQ-033, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/** Which starter a generation is. */
+export type SdkKind = "plugin" | "theme" | "workflow";
+
+/** The three starters a scaffold can produce, and what each is. */
+export type SdkTemplate = {
+  kind: SdkKind;
+  label: string;
+  language: string;
+  description: string;
+};
+
+/** Which environment a starter is aimed at. */
+export type SdkTarget = "live" | "sandbox";
+
+/** One generated file, as the preview shows it. */
+export type ScaffoldFile = {
+  path: string;
+  content: string;
+};
+
+/**
+ * A generated archive's file tree.
+ *
+ * The preview carries only the files marked `shown_in_preview`; the hidden ones (`.env.example`,
+ * `.gitignore`) are in the archive and not here. A panel that showed a tree the download did not
+ * match would be a defect visible only after unzipping, so the Download button is on the same
+ * screen as the tree and the two are the same generation.
+ */
+export type ScaffoldTree = {
+  kind: SdkKind;
+  name: string;
+  target: SdkTarget;
+  files: ScaffoldFile[];
+  byte_size: number;
+  object_key: string | null;
+};
+
+/** One recorded generation, as the history list shows it. */
+export type ScaffoldRecord = {
+  id: string;
+  kind: SdkKind;
+  name: string;
+  target: SdkTarget;
+  file_count: number;
+  byte_size: number;
+  created_at: string;
+};
+
+/** The history list's envelope. */
+export type ScaffoldList = {
+  scaffolds: ScaffoldRecord[];
+};
+
+/** One problem a manifest validator reported. */
+export type ManifestIssue = {
+  /** A stable machine code, e.g. `manifest_not_json`. */
+  code: string;
+  /** A sentence to show under the file. */
+  message: string;
+  /** 1-based line, or 0 when the problem is the document itself. */
+  line: number;
+};
+
+/**
+ * The outcome of validating a manifest.
+ *
+ * `valid` comes from the same `validate_manifest` the runtime loader calls, so a manifest this
+ * reports as loadable is one the platform will attempt to install. A laxer check here — a client
+ * side "does it parse?" — would tell people their extension is fine and then refuse to boot it.
+ */
+export type ManifestReport = {
+  valid: boolean;
+  issues: ManifestIssue[];
+};
+
+/** What a CLI device-code login started, as the terminal and the browser both see it. */
+export type DeviceStart = {
+  device_code: string;
+  verification_uri: string;
+  user_code: string;
+  expires_in: number;
+  interval_seconds: number;
+};
+
+/**
+ * What the approval screen shows *before* anybody approves.
+ *
+ * `scope_sentences` is the platform's own plain-language rendering of each scope. The screen
+ * shows those rather than the raw scope names, because "developer.keys.read" is not something a
+ * person can decide on and "read your API keys" is.
+ */
+export type DeviceLookup = {
+  user_code: string;
+  client_name: string;
+  client_uri: string | null;
+  scopes: string[];
+  scope_sentences: string[];
+  expires_at: string;
+  expired: boolean;
+  already_approved: boolean;
+};

@@ -29,6 +29,7 @@ import {
   LockKeyhole,
   LogOut,
   Menu,
+  Package,
   Rocket,
   Radio,
   Scale,
@@ -123,6 +124,11 @@ const NAV: readonly NavItem[] = [
   // when they do" — which is the next thing a developer building a subscriber needs to read.
   // The same registry is on /events for an operator watching the feed; this is the contract.
   { href: "/developer/events", label: "Developer · Event catalogue", icon: Radio },
+  // The tooling (REQ-033, slice 4) sits *after* the reference surfaces rather than before them,
+  // and the order is the argument: a developer reads what the platform does, then what it emits,
+  // and only then starts building against it. Putting "generate a starter" next to the API keys
+  // would be the same as putting a "create" button above the documentation of what it creates.
+  { href: "/developer/sdks", label: "Developer · SDKs and CLI", icon: Package },
   { href: "/developer/logs", label: "Developer · Logs", icon: ScrollText },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
