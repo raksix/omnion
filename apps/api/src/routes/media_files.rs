@@ -226,6 +226,26 @@ pub struct BreadcrumbCrumb {
     pub name: String,
 }
 
+/// The accounts a site's uploader filter offers.
+#[derive(Debug, Serialize)]
+pub struct UploadersResponse {
+    /// Site the list belongs to.
+    pub site_id: Uuid,
+    /// The candidates, most prolific first.
+    pub uploaders: Vec<UploaderBody>,
+}
+
+/// One account that appears in a site's library as an uploader.
+#[derive(Debug, Clone, Serialize)]
+pub struct UploaderBody {
+    /// The account id, the value the `uploaded_by` filter binds.
+    pub id: Uuid,
+    /// A name for the dropdown — never an empty string, so the control has no blank option.
+    pub label: String,
+    /// How many live files of this site they uploaded.
+    pub files: i64,
+}
+
 /// The folder tree of one site.
 #[derive(Debug, Serialize)]
 pub struct FolderTreeResponse {
@@ -291,6 +311,13 @@ pub struct BulkFailure {
 // ---------------------------------------------------------------------------------------------
 // Requests
 // ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/media/uploaders` — the uploader filter's candidates.
+#[derive(Debug, Deserialize)]
+pub struct SiteQuery {
+    /// Site whose library is read.
+    pub site_id: Uuid,
+}
 
 /// `GET /api/v1/media/files` — the browser listing.
 #[derive(Debug, Deserialize)]
@@ -712,6 +739,33 @@ pub async fn list_files(
     }))
 }
 
+/// `GET /api/v1/media/uploaders` — the accounts a site's library can be filtered by.
+///
+/// Sits beside the file listing rather than inside it: a dropdown of candidates is a *different*
+/// question from the rows that question selects, and a listing that had to carry both would make
+/// every page of the library pay for a filter the operator may never touch. It is read with
+/// `media.read`, the same key as the listing it feeds, and it reads nothing a `media.read`
+/// caller could not already read from the file rows themselves.
+pub async fn list_uploaders(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(query): Query<SiteQuery>,
+) -> std::result::Result<Json<UploadersResponse>, ApiError> {
+    let site = site_in_scope(&state, &current, query.site_id).await?;
+    let uploaders = omnion_media::list_uploaders(state.db().pool(), site.id).await?;
+    Ok(Json(UploadersResponse {
+        site_id: site.id,
+        uploaders: uploaders
+            .into_iter()
+            .map(|uploader| UploaderBody {
+                id: uploader.id,
+                label: uploader.label,
+                files: uploader.files,
+            })
+            .collect(),
+    }))
+}
+
 /// One file of the library, with the folder it sits in.
 pub async fn get_file(
     State(state): State<AppState>,
@@ -906,7 +960,13 @@ pub async fn purge_file(
 
     // The bytes go first: when the store refuses, the row stays and the operator can retry
     // instead of leaving a row that points at nothing.
-    state.storage().delete(&file.storage_key).await?;
+    //
+    // *Every* key the file owns, not `media.storage_key`: a replace moves that column forward, so
+    // the bytes of every superseded version are named only by `media_versions` — which is
+    // `on delete cascade` from `media`. Reading the one key that is not the problem and then
+    // deleting the row orphans every other object this file ever had, and nothing can name them
+    // again. The same holds for the preset cache in `media_derivatives`.
+    remove_owned_objects(&state, pool, &[file_id]).await?;
     if omnion_media::purge_files(pool, &[file_id]).await? == 0 {
         return Err(file_not_found());
     }
@@ -983,7 +1043,7 @@ pub async fn empty_trash(
 
     let ids = omnion_media::trashed_ids(pool, site.id).await?;
 
-    let keys = omnion_media::storage_keys(pool, &ids).await?;
+    let keys = omnion_media::owned_object_keys(pool, &ids).await?;
     for key in keys {
         if let Err(error) = state.storage().delete(&key).await {
             tracing::warn!(error = %error, key, "a trashed object could not be removed");
@@ -1061,7 +1121,7 @@ pub async fn bulk_action(
         "delete" => omnion_media::trash_files(pool, &eligible, current.user.id).await?,
         "restore" => omnion_media::restore_files(pool, &eligible).await?,
         "purge" => {
-            let keys = omnion_media::storage_keys(pool, &eligible).await?;
+            let keys = omnion_media::owned_object_keys(pool, &eligible).await?;
             for key in keys {
                 if let Err(error) = state.storage().delete(&key).await {
                     tracing::warn!(error = %error, key, "a bulk-purged object could not be removed");
@@ -1278,6 +1338,30 @@ fn trash_body(entry: &TrashEntry) -> TrashBody {
 /// Write an audit row; a privileged action is not reported as successful without one.
 async fn record(state: &AppState, entry: NewAuditEntry) -> std::result::Result<(), ApiError> {
     omnion_audit::record(state.db().pool(), entry).await?;
+    Ok(())
+}
+
+/// Remove every object a set of files owns, and refuse the whole operation if one refuses.
+///
+/// The bytes go **before** the row so that a store failure leaves the row and the operator can
+/// retry, rather than leaving a row that points at nothing. The consequence of doing it in that
+/// order is that the answer has to be read *before* the delete, from all three tables the file
+/// appears in — [`omnion_media::owned_object_keys`] is that one answer, and this function is the
+/// only caller of it, so there is no second, narrower query left to reach for by mistake.
+///
+/// A refusal is an error rather than a warning here, and the two are not interchangeable. A
+/// *bulk* purge tolerates a failure per key and still removes the rows (the object is then
+/// orphaned, which the walk below is written to catch), but the single-file purge cannot report
+/// "gone" for a file whose bytes are still in the bucket: it is the one route where the operator
+/// is looking at a single name, and an honest `5xx` is the only answer that can be acted on.
+async fn remove_owned_objects(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    ids: &[Uuid],
+) -> std::result::Result<(), ApiError> {
+    for key in omnion_media::owned_object_keys(pool, ids).await? {
+        state.storage().delete(&key).await?;
+    }
     Ok(())
 }
 

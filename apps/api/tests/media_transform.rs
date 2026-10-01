@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -167,85 +169,12 @@ fn upload_request(
 /// A real PNG, generated rather than embedded so the bytes are certainly decodable.
 ///
 /// 1200x630 with four coloured quadrants: a crop shows two of the four, a fit shows all of them.
+///
+/// The encoder itself is shared (`support::image_bytes`) rather than copied: the copy that lived
+/// here encoded the same bytes in the same way, and a second copy is a second thing that has to
+/// stay correct.
 fn source_png() -> Vec<u8> {
-    let mut pixels = Vec::with_capacity(1200 * 630 * 3);
-    for y in 0..630u32 {
-        for x in 0..1200u32 {
-            let left = x < 600;
-            let top = y < 315;
-            let colour: [u8; 3] = match (left, top) {
-                (true, true) => [255, 0, 0],
-                (false, true) => [0, 255, 0],
-                (true, false) => [0, 0, 255],
-                (false, false) => [255, 255, 0],
-            };
-            pixels.extend_from_slice(&colour);
-        }
-    }
-    encode_png(1200, 630, &pixels)
-}
-
-/// Write a truecolour PNG with no filter bytes (filter type 0 per scanline).
-fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc = 0xffff_ffffu32;
-        for byte in data {
-            crc ^= u32::from(*byte);
-            for _ in 0..8 {
-                let mask = (crc & 1).wrapping_neg();
-                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-            }
-        }
-        !crc
-    }
-    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        let mut framed = kind.to_vec();
-        framed.extend_from_slice(body);
-        out.extend_from_slice(&framed);
-        out.extend_from_slice(&crc32(&framed).to_be_bytes());
-    }
-
-    let mut raw = Vec::with_capacity((width as usize * 3 + 1) * height as usize);
-    for y in 0..height as usize {
-        raw.push(0); // filter: none
-        raw.extend_from_slice(&rgb[y * width as usize * 3..(y + 1) * width as usize * 3]);
-    }
-
-    // zlib stream with stored (uncompressed) deflate blocks.
-    let mut zlib = vec![0x78, 0x01];
-    let mut offset = 0;
-    while offset < raw.len() {
-        let take = (raw.len() - offset).min(0xffff);
-        let last = offset + take == raw.len();
-        zlib.push(u8::from(last));
-        zlib.extend_from_slice(&(take as u16).to_le_bytes());
-        zlib.extend_from_slice(&(!(take as u16)).to_le_bytes());
-        zlib.extend_from_slice(&raw[offset..offset + take]);
-        offset += take;
-    }
-    let mut adler_a = 1u32;
-    let mut adler_b = 0u32;
-    for byte in &raw {
-        adler_a = (adler_a + u32::from(*byte)) % 65521;
-        adler_b = (adler_b + adler_a) % 65521;
-    }
-    zlib.extend_from_slice(&((adler_b << 16) | adler_a).to_be_bytes());
-
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, truecolour
-
-    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    chunk(&mut png, b"IHDR", &ihdr);
-    chunk(&mut png, b"IDAT", &zlib);
-    chunk(&mut png, b"IEND", &[]);
-
-    // The hash must be stable across the whole build, or the upload's checksum differs per run.
-    let _ = Sha256::digest(&png);
-    png
+    support::image_bytes::quadrant_png(1200, 630)
 }
 
 /// Open the object store the library writes into; `None` means it is not running.
