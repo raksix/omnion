@@ -12251,3 +12251,99 @@ session, and resolve their tenant from the *app row* rather than from `organizat
 why they must not share a file with the panel's handlers. Then the panel screen
 (`/developer/oauth-apps`, list + detail + register + rotate + suspend/withdraw), and the
 walkthrough route so it is actually clicked.
+
+## 2026-10-01 — REQ-033 slice 3c: the sessionless OAuth endpoints, and a live XSS the escaping test found
+
+**The sessionless half of OAuth: `GET /oauth/authorize`, `POST /oauth/consent`, `POST /oauth/token`
+and `GET /oauth/introspect`**, in `crates/developer/src/oauth_flow.rs` and
+`apps/api/src/routes/oauth_flow.rs`, plus migration `0232` for the access tokens.
+
+**The tick's real content is three defects in code I wrote in the last hour.** None of them would
+have been found by a test that checked the happy path.
+
+### 1. A live stored XSS in the consent screen
+
+The three hidden form fields were **JSON-encoded**:
+
+```rust
+let state_field = query.state.as_deref()
+    .and_then(|value| serde_json::to_string(value).ok())
+    .unwrap_or_else(|| "null".to_owned());
+```
+
+`serde_json` escapes a double quote as `\"`. **HTML does not recognise that escape** — it wants
+`&quot;`. So a `state` of `"><script>alert(1)</script>` rendered as:
+
+```html
+<input type="hidden" name="state" value="\"><script>alert(1)</script>">
+```
+
+The `"` closes the attribute and the script tag is live markup. The attacker is anybody who can
+register an app in their own tenant; the victim is the person signing in, in their own session, on
+the platform's own origin. The escape looks right — that is what makes it dangerous.
+
+**The test that found it was the boring one**, the "the screen escapes what an app registered"
+assertion, and it could not tell me *which* mistake I had made. So the regression test is a
+standalone one that demonstrates the JSON form **does** break out of the attribute and the HTML
+form does not, and round-trips both through a browser's attribute parser. A general
+"nothing leaked" assertion tells you something is wrong; a test that names the two escapers tells
+you what to write instead.
+
+### 2. An absent value rendered as the four characters `null`
+
+`.unwrap_or_else(|| "null".to_owned())` posts the *string* `"null"`, which `usable_state` accepts,
+and the token endpoint then echoes it back to the client as a `state` it never sent. Absence now
+renders as an empty attribute. This one is worth naming separately from the first because it is not
+a security bug at all — it is the platform inventing a value on the client's behalf, which is the
+kind of defect that only a test asserting the *absent* case finds.
+
+### 3. The borrow checker caught a third, before any test could
+
+`redirect_with_error` takes `&'static str` for the error code and the description. I had written
+`&error.to_string()`. `UnknownGrantType` carries the caller's own `response_type` in its message, so
+that was about to put a client-supplied value into a `Location` header — and from there into browser
+history, proxy logs and the next `Referer`. **The signature was the rule; the type error was the
+compiler enforcing it.** Worth noting because it is the third time in this slice that a type, not a
+test, has been the thing that stopped a leak.
+
+### What was built, and the two things deliberately not built
+
+The four endpoints carry **no permission guard**, and that is the point: a third-party client has no
+Omion account, so `guards::require` would answer `401` to every legitimate call. The guard that does
+apply to `/oauth/consent` is the platform's CSRF layer — a person has to be signed in to consent,
+and consenting is not an administrative act, so requiring `developer.oauth.manage` would mean an
+ordinary user of a site could not sign a third-party app into their own account.
+
+* **No refresh token.** One is a second long-lived credential that needs its own storage,
+  revocation and audit story, and a flow that mints one before it has that story is how a token
+  outlives the grant that produced it. The access token is one hour and the panel says so.
+* **`resolve_token_scopes` takes no provenance argument.** The rule is identical for both grants — a
+  machine token's granted set *is* the app's registered set, and there is no consent to narrow
+  against in either direction — so a provenance parameter would be one that does not change the
+  answer, which is exactly the kind of parameter the next editor branches on.
+
+`oauth_tokens_provenance_is_whole` is the constraint worth naming: a `client_credentials` token with
+a user id is a row that attributes an application's requests to a person, and an audit trail that
+does that is worse than no audit trail, because it is one somebody will believe. Half a pair is
+refused in the database, not only in the application layer.
+
+### Proof
+
+- `cargo test -p omnion-api --lib` — **408** (was 397; +11)
+- `cargo test -p omnion-developer --features store --lib` — **128** (was 104; +24)
+- `tsc --noEmit` (apps/admin) — clean
+- migration `0232` against live PostgreSQL — **6 named refusals across 5 constraints**
+  (`oauth_tokens_provenance_is_whole` in *both* directions, plus
+  `oauth_tokens_expiry_is_future`, `oauth_tokens_grant_known`, `oauth_tokens_scopes_is_array` and the
+  app foreign key) and **4 positive controls** (a user token, a machine token, an empty scope list
+  and a revoked token all insert; a withdrawn app cascades its tokens away). A constraint set that
+  refuses everything passes every refusal test.
+- `scripts/qa/probe-oauth-tokens-migration.sql` is the probe, kept for the next migration.
+- The four sessionless paths appear **zero** times in the OpenAPI document, verified by grep — they
+  must never be sendable from the Explorer, which runs on the caller's session.
+
+### Next
+
+The panel screen: `/developer/oauth-apps` — list, detail, register, rotate, suspend/withdraw — and
+the walkthrough route so it is actually clicked. That is the last thing between slice 3 and a
+browser pass, and the browser pass is owed on the tick that closes the REQ.
