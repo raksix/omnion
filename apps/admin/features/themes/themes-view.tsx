@@ -49,6 +49,28 @@ function describe(theme: ThemeCard): string {
   return parts.join(" · ");
 }
 
+/**
+ * A deterministic colour pair for a theme that ships no preview image.
+ *
+ * Derived from the key rather than picked from a palette, because a swatch that changes when
+ * the list is re-sorted (an index would) makes a card look like it belongs to a different
+ * theme between two loads of the same gallery. It is a placeholder that is always the same
+ * colour for the same theme — never a decoration, and never presented as the theme's look.
+ */
+function swatchColour(key: string, step: number): string {
+  let hash = 0;
+  for (let index = 0; index < key.length; index += 1) {
+    hash = (hash * 31 + key.charCodeAt(index)) >>> 0;
+  }
+  // A second pass with a different multiplier gives the far end a different hue rather than
+  // the same colour lightened, so the two stops are distinguishable without a contrast check.
+  const shifted = (hash + step * 0x9e3779b1) >>> 0;
+  const hue = shifted % 360;
+  const saturation = 45 + (shifted >> 9) % 25;
+  const lightness = step === 0 ? 62 : 46;
+  return `hsl(${hue} ${saturation}% ${lightness}%)`;
+}
+
 export function ThemesView() {
   const { selectedSite, status: siteStatus, error: siteError } = useSites();
   const [gallery, setGallery] = useState<ThemeGallery | null>(null);
@@ -313,6 +335,31 @@ function ThemeCardView({
       data-theme-card={theme.key}
       data-active={isActive ? "true" : "false"}
     >
+      {/* The preview image, or a drawn swatch when the theme names no image this build can
+          serve. `previewUrl` is the server's answer, computed by the same rule the asset route
+          uses — a card that guessed the URL would request a file that 404s, and an <img> with
+          a broken src renders as a browser glyph that looks like a design decision. The swatch
+          is deterministic per key, so a theme without a preview still looks like itself. */}
+      {theme.previewUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element -- a theme's preview is a
+        // bundled SVG served by the API, not a next/image optimisable remote source.
+        <img
+          src={theme.previewUrl}
+          alt=""
+          className="h-28 w-full rounded border border-line bg-canvas object-cover"
+          data-theme-preview={theme.key}
+        />
+      ) : (
+        <div
+          className="h-28 w-full rounded border border-line"
+          data-theme-swatch={theme.key}
+          style={{
+            background: `linear-gradient(135deg, ${swatchColour(theme.key, 0)}, ${swatchColour(theme.key, 1)})`,
+          }}
+          aria-hidden
+        />
+      )}
+
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <h3 className="truncate text-sm font-semibold text-ink" data-theme-name={theme.key}>

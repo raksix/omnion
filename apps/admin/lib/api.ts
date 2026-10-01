@@ -6639,6 +6639,14 @@ export type ThemeCard = {
   slotCount: number;
   tokenCount: number;
   previewImage: string | null;
+  /**
+   * The URL the card should request, or `null` when this build serves no such file.
+   *
+   * Computed by the server with the same rule the asset route uses to decide what it will
+   * serve, so the two cannot disagree — a client that guessed the URL would request a file
+   * that 404s, and the card would show a broken-image glyph as though it were the theme.
+   */
+  previewUrl: string | null;
   source: "bundled" | "uploaded";
   canDelete: boolean;
 };
