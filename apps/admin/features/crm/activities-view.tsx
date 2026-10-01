@@ -283,6 +283,13 @@ export function ActivitiesView() {
         ))}
       </nav>
 
+      {/* `?` toggles this sheet through `useCrmKeyboard`, and this screen called the hook and
+          read the flag into a binding nothing rendered — so the key worked, the state flipped, and
+          no sheet appeared. The module's own shortcut contract advertises `?` on this screen, so a
+          binding that produces no visible answer is a dead control. `/crm/leads` already draws it
+          this way; the omission was this screen alone. */}
+      {showShortcuts ? <CrmShortcutSheet /> : null}
+
       {error ? (
         <ErrorStrip
           error={error}
