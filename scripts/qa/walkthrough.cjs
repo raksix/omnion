@@ -7729,6 +7729,19 @@ async function runEnvironmentsDepth(page, report) {
     // banner mean nothing, and the only way to know is to have measured production first.
     const bannerBefore = await page.locator("[data-qa-staging-banner]").count();
     steps.bannerBeforeSelectingStaging = bannerBefore;
+    // Measured in production first, deliberately, and it was collected and read by nothing. The
+    // banner's whole meaning is "you are editing staging": shown for a production session it
+    // tells an operator their edits are throwaway when they are live, and every other
+    // measurement in this block would still have read true.
+    if (bannerBefore > 0) {
+      record({
+        page: "environments",
+        action: "staging-banner-shown-in-production",
+        severity: "high",
+        detail: "a staging banner is on screen before any staging environment is selected, so the banner does not distinguish the two",
+        measured: bannerBefore,
+      });
+    }
     await shot(page, "environments-chip-production");
 
     await page.click("[data-env-chip]").catch(() => {});
@@ -7830,6 +7843,90 @@ async function runEnvironmentsDepth(page, report) {
     await page.waitForTimeout(1000);
     steps.archivedVisibleUnderFilter = (await page.locator(`[data-env-row][data-env-open="${environmentId}"]`).count()) > 0;
     await shot(page, "environments-archived-filter");
+    if (!steps.archivedVisibleUnderFilter) {
+      record({
+        page: "environments",
+        action: "archived-environment-not-under-the-archived-filter",
+        severity: "high",
+        detail: "the environment archived a moment ago does not appear under ?status=archived, so the one control that gets it back does not work",
+      });
+    }
+
+    // ---- The gates -------------------------------------------------------------------------
+    // The claims above that a reader would take for assertions. Twenty-three of them were
+    // assigned and read by nothing: `steps.wizardOpened = true` and `steps.wizardOpened = false`
+    // produce a summary differing in one word, and the only two things that read this pass's
+    // result are a `log()` line and the `summary.json` file itself. The `ok` this function
+    // returns is likewise only logged — `runDepthPass` hands it to the caller, which prints it
+    // and stores it. So a claim that is not read here gates nothing, however carefully it was
+    // measured.
+    //
+    // The wizard steps matter most: they are the screen's own refusals, and "a clone that
+    // copies nothing is still submittable" is the mistake the API's `require_areas` guard
+    // exists to prevent — a guard the browser must not be the last line of.
+    // Truthiness, not `=== true`: a claim's polarity is per-claim, and a helper that assumed
+    // one of the two would file a finding for every well-formed value. `promotionApplied` is a
+    // status string, `created` a boolean and the counts are tallies that differ per claim.
+    const gate = (claim, severity, what) => {
+      if (steps[claim]) return;
+      record({ page: "environments", action: `env-${claim}`, severity, detail: what, measured: steps[claim] });
+    };
+
+    gate("wizardOpened", "high", "the create wizard did not open");
+    gate("nextBlockedWithoutName", "high", "the wizard advances with an empty name, so the refusal happens server-side instead of on screen");
+    gate("hostRefusedOnScreen", "medium", "a host given as a URL is accepted with no message, although the chip and banner both name a host as a bare name");
+    gate("areasThatCopy", "high", "no clone area claims to copy anything, so a staging environment can be created empty");
+    gate("areaNotePresent", "low", "the area list carries no note explaining what the areas do");
+    gate("nextBlockedWithoutAreas", "high", "the wizard advances with every area unchecked");
+    gate("nextBlockedWithOnlySharedAreas", "high", "the wizard advances when only areas that copy nothing are ticked — the rule is 'at least one thing that copies', not 'at least one box'");
+    gate("submitPresent", "high", "the wizard's final step has no submit control");
+    gate("submitEnabled", "high", "the wizard's submit is disabled, so the environment cannot be created from this screen");
+    gate("created", "high", "the wizard submitted but no environment exists — the screen reports success for a row that was not written");
+    gate("promotionApplied", "high", "an approved promotion did not reach a terminal state in the database — the dialog wrote a record the apply path never finished");
+    gate("archivedVisibleUnderFilter", "high", "the archived environment does not appear under ?status=archived");
+    // `duplicateSlugs` is deliberately NOT gated here: it has the opposite polarity (zero is
+    // the pass, a count is the finding) and a dedicated `if (Number(duplicates) !== 0)` above.
+    // A helper that assumes "truthy is good" would file a second, inverted finding against a
+    // perfectly clean clone — the same class of mistake as an assertion that cannot fail, in
+    // the other direction: one that fails on success.
+    // The promotion frozen set and the wizard's own tallies are recorded as facts: they are
+    // numbers, and a reader needs the number in the report even when it is not a defect.
+    if (steps.promotionFrozen && (!steps.promotionFrozen.timeline || !steps.promotionFrozen.approveRendered)) {
+      record({
+        page: "environments",
+        action: "env-promotion-frozen-incomplete",
+        severity: "high",
+        detail: "the frozen change set does not show its step timeline or an approve control, so 'what the approver saw' is not on screen",
+        measured: steps.promotionFrozen,
+      });
+    }
+    if (steps.changes && steps.changes.rows === 0) {
+      record({
+        page: "environments",
+        action: "env-changes-tab-empty-after-an-edit",
+        severity: "high",
+        detail: "the staging environment holds an edited page and the Changes tab lists none — the diff an operator would promote is missing",
+        measured: steps.changes,
+      });
+    }
+    if (steps.filter && steps.filter.stagedOnly > 0) {
+      record({
+        page: "environments",
+        action: "env-type-filter-keeps-production",
+        severity: "high",
+        detail: "filtering to staging leaves production rows on screen",
+        measured: steps.filter,
+      });
+    }
+    if (steps.list && steps.list.production !== undefined && steps.list.production !== 1) {
+      record({
+        page: "environments",
+        action: "env-not-exactly-one-production",
+        severity: "high",
+        detail: "an organization must hold exactly one production environment; the list reports a different number",
+        measured: steps.list,
+      });
+    }
 
     const ok =
       steps.clone?.cloneCopied === true &&

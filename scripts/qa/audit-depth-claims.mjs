@@ -72,6 +72,14 @@ function auditPass(body) {
   for (const match of body.matchAll(/steps\.([A-Za-z0-9_]+)\s*=(?!=)/g)) {
     assigned.add(match[1]);
   }
+  // Every conditional and every `record(` in the pass — the text a guard can live in.
+  // Comments are stripped first, for the same reason: prose about a claim is not a claim, and
+  // a `// if (steps.x) …` in a comment must not count as the gate that the code lacks.
+  const code = body.replace(/\/\/[^\n]*/g, "");
+  const guarded = (code.match(/if\s*\([^)]*\)/g) ?? []).join("\n") +
+    "\n" +
+    (code.match(/record\(\s*\{[^}]*\}/gs) ?? []).join("\n");
+  const locals = new Set();
   const read = new Set();
   for (const match of body.matchAll(/steps\.([A-Za-z0-9_]+)\s*(=(?!=))?/g)) {
     if (!match[2]) read.add(match[1]);
@@ -83,6 +91,49 @@ function auditPass(body) {
   // measure is worse than no tool.
   for (const match of body.matchAll(/\bgate\(\s*"([A-Za-z0-9_]+)"/g)) {
     read.add(match[1]);
+  }
+  // A pass may also gate through the LOCAL it measured into:
+  //
+  //     const duplicates = qaSql(...);
+  //     steps.duplicateSlugs = Number(duplicates);
+  //     if (Number(duplicates) !== 0) record({...});
+  //
+  // Here `steps.duplicateSlugs` is genuinely gated and a scan for `steps.` would still call it
+  // ungated, so the claim is credited when a LOCAL — and only a local — it was computed from
+  // is read in a condition or inside a `record(`.
+  //
+  // "Only a local" is the whole rule, and it is there because the first version of this
+  // heuristic matched bare words out of the assignment's text: `"/api/v1/webhooks"` in an
+  // expression contributed the identifier `webhooks`, which then matched the `page: "webhooks"`
+  // field of every `record(` in the pass. It credited nineteen claims in runWebhooksDepth that
+  // have no gate at all, and reported 243 gated where 118 was the truth. An audit that
+  // manufactures passes is worse than no audit, because it is believed.
+  //
+  // So the resolution is `const <name> =` and the name must be used as a whole word in the
+  // guard, never as a substring of a string literal.
+  for (const match of body.matchAll(/(?:^|[;\n])\s*const ([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g)) {
+    locals.add(match[1]);
+  }
+  // `steps` is the object every claim is written into, so it appears in the text of every
+  // `steps.x = …` assignment. Left in the local set it makes each claim "reference a local
+  // that is read in a guard" — because the guard reads `steps` — and credits all 36 claims in
+  // a pass that has two `record()` calls in it. It was worth 158 phantom passes across the
+  // file, which is the second time this heuristic invented evidence; the first was bare words
+  // out of string literals. A heuristic that cannot tell the subject from the verb is not a
+  // heuristic.
+  locals.delete("steps");
+  for (const match of body.matchAll(/steps\.([A-Za-z0-9_]+)\s*=(?!=)([^;\n]*)/g)) {
+    // Only real code, not prose: a comment saying "`steps.x = false` produces a report" would
+    // otherwise be read as a claim named `x` that nothing gates — and it is a claim in neither
+    // sense. Line comments are stripped before this runs.
+    const line = match[0].replace(/\/\/.*$/, "");
+    for (const identifier of (line.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? [])) {
+      if (!locals.has(identifier)) continue;
+      if (new RegExp(`\\b${identifier}\\b`).test(guarded)) {
+        read.add(match[1]);
+        break;
+      }
+    }
   }
   const ungated = [...assigned].filter((name) => !read.has(name)).sort();
   return { assigned: assigned.size, gated: assigned.size - ungated.length, ungated };
