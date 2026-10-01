@@ -30,6 +30,7 @@ import {
   LogOut,
   Menu,
   Rocket,
+  Radio,
   Scale,
   ScrollText,
   ShieldCheck,
@@ -117,6 +118,11 @@ const NAV: readonly NavItem[] = [
   // developer arrives here with one of two questions — "how do I authenticate my own server?"
   // (keys) or "let somebody else sign in" (an app) — and only the second one needs a registry.
   { href: "/developer/oauth-apps", label: "Developer · OAuth apps", icon: AppWindow },
+  // The catalogue follows the app registry and not /events, because the question changes: the
+  // registry answers "let somebody else sign in", and the catalogue answers "what will arrive
+  // when they do" — which is the next thing a developer building a subscriber needs to read.
+  // The same registry is on /events for an operator watching the feed; this is the contract.
+  { href: "/developer/events", label: "Developer · Event catalogue", icon: Radio },
   { href: "/developer/logs", label: "Developer · Logs", icon: ScrollText },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
