@@ -85,14 +85,14 @@ impl Catalogue {
 
         // Content.
         add(
-            "articles",
+            "pages",
             Weight::new(
                 120,
                 "a paginated content list: index scan, sort and a total count",
             ),
         );
         add(
-            "article",
+            "page",
             Weight::new(
                 15,
                 "one content row by id, plus its resolved author relation",
@@ -110,10 +110,23 @@ impl Catalogue {
             Weight::new(15, "one page row with its block payload"),
         );
         add(
-            "articleBySlug",
+            "pageBySlug",
             Weight::new(
                 25,
                 "a slug lookup is a unique index hit, but resolves the tenant",
+            ),
+        );
+        // `Query.sites` — added with the restatement of the surface this tick. The schema gained
+        // a `Site` type (and `sites.read` is a real, separate catalogue key), so a cost catalogue
+        // without this entry would have refused every site query as UNPRICED. That is the failure
+        // the two-directional parity test below exists to prevent: an entry for a field that does
+        // not exist is a lie in the audit screen, and a missing entry for one that does is a
+        // refusal on a legitimate query.
+        add(
+            "sites",
+            Weight::new(
+                60,
+                "a site list is one indexed scan per organization, no joins",
             ),
         );
 
@@ -151,16 +164,28 @@ impl Catalogue {
         // Mutations — deliberately dearer than the reads they return, because a write is a
         // transaction, an audit row and a cache invalidation.
         add(
-            "createArticle",
+            "createPage",
             Weight::new(300, "a write: transaction, audit row, cache invalidation"),
         );
         add(
-            "updateArticle",
+            "updatePage",
             Weight::new(320, "a write plus a revision record"),
         );
         add(
-            "deleteArticle",
+            "deletePage",
             Weight::new(340, "a destructive write plus its cascade"),
+        );
+        // `publishPage` — the schema declares it (it has its own permission, `content.pages.publish`)
+        // and the cost catalogue must price it, or `price` refuses the mutation as UNPRICED. Its
+        // weight is the highest of the page writes because publishing is the one that also
+        // invalidates caches, freezes a revision and writes an audit row an editor cannot undo.
+        add(
+            "publishPage",
+            Weight::new(
+                380,
+                "a publish freezes a revision, invalidates the render cache and is not undoable \
+                 by the same role",
+            ),
         );
         add(
             "createOrganization",
@@ -296,6 +321,122 @@ mod tests {
     }
 
     #[test]
+    fn the_cost_catalogue_and_the_schema_catalogue_name_the_same_fields() {
+        // **The defect this tick found, asserted so it cannot come back.** The cost catalogue and
+        // the schema catalogue price and validate the SAME field names, and for four ticks they
+        // had drifted: the schema declared `articles`/`article`/`createArticle` over an `Article`
+        // type, and the cost catalogue priced `articles`/`article`/`createArticle` — names the
+        // platform's content model (`pages`/`page`/`createPage`) has never had. Both tables were
+        // internally consistent and both were fiction, so neither one's own tests could see it.
+        //
+        // The assertion runs in BOTH directions, and that is the part that matters:
+        //
+        // * a price for a field the schema does not declare is a lie an auditor can read — the
+        //   request calls the weights an auditable artifact, and an entry for a field that does
+        //   not exist is not one;
+        // * a schema field with no price is a **refusal on a legitimate query**, because
+        //   `Catalogue::price_of` fails closed rather than defaulting to zero. Adding `Site` and
+        //   `publishPage` to the schema without pricing them would have shipped a surface where
+        //   `{ sites { id } }` and `mutation { publishPage { id } }` are both unpriceable.
+        //
+        // Two scopes, because the two directions ask different questions:
+        //
+        // * every field a schema ROOT declares must have a price — a missing one is a REFUSAL on
+        //   a legitimate query, because `price` fails closed rather than defaulting to zero;
+        // * every priced field must be declared SOMEWHERE in the schema, root or relation,
+        //   because a price for a field no type declares is a claim about nothing.
+        //
+        // The second check spans relations on purpose. `author` is a field of `Page`, not of
+        // `Query`, and the first version of this test compared roots only, so it reported
+        // `author` as fabricated — the test being wrong, not the catalogue. A relation priced by
+        // name is legitimate work: a second query per parent, which is the N+1 the request warns
+        // about being free. A parity test that flags legitimate work gets deleted by the next
+        // reader rather than fixed.
+        let schema = crate::schema::SchemaCatalogue::catalogued();
+        let catalogue = catalogue();
+
+        let priced: std::collections::BTreeSet<String> =
+            catalogue.entries().map(|(key, _)| key.clone()).collect();
+
+        let roots: Vec<(&str, Vec<&str>)> = schema
+            .types
+            .iter()
+            .filter(|type_definition| type_definition.is_query_root)
+            .map(|type_definition| {
+                (
+                    type_definition.name,
+                    type_definition.fields.iter().map(|field| field.name).collect(),
+                )
+            })
+            .collect();
+        assert!(
+            roots.iter().any(|(name, _)| *name == "Query")
+                && roots.iter().any(|(name, _)| *name == "Mutation"),
+            "the schema declares no Query/Mutation root, so this test measures nothing: {roots:?}"
+        );
+
+        for (root, fields) in &roots {
+            for field in fields {
+                assert!(
+                    priced.contains(*field),
+                    "`{root}.{field}` is a real field with no weight, so `price` refuses every \
+                     query selecting it as unpriced — the cost catalogue and the schema catalogue \
+                     have drifted apart again"
+                );
+            }
+        }
+
+        let declared_anywhere: std::collections::BTreeSet<&str> = schema
+            .types
+            .iter()
+            .flat_map(|type_definition| type_definition.fields.iter())
+            .map(|field| field.name)
+            .collect();
+
+        // The exception is spelled out rather than left implicit. `categories` and `tags` are
+        // relations of a taxonomy surface this catalogue ships ahead of its schema: priced, so a
+        // client cannot have them for free, and NAMED here so the "no entry for a field that does
+        // not exist" rule has exactly two named exceptions instead of a filter that quietly
+        // accepts anything. `the_allowlist_in_the_parity_test_is_itself_checked` holds this to it.
+        const NOT_SCHEMA_FIELDS: &[&str] = &["categories", "tags"];
+        for key in &priced {
+            assert!(
+                declared_anywhere.contains(key.as_str())
+                    || NOT_SCHEMA_FIELDS.contains(&key.as_str()),
+                "the cost catalogue prices `{key}`, which no schema type declares — an entry an \
+                 auditor reads as a claim about a field that does not exist"
+            );
+        }
+    }
+
+    #[test]
+    fn the_allowlist_in_the_parity_test_is_itself_checked() {
+        // The parity test above grants two names an exemption by hand. An allowlist nobody checks
+        // is how a fabricated field survives: someone adds a third name to it, the parity test
+        // goes green, and the drift it exists to catch is back.
+        //
+        // So the exemption is asserted to stay EMPTY of anything that looks like a content root.
+        // The two names it holds are relations, not roots, and they appear in no root field list —
+        // so the check that they really are only relations is: the schema has no field by that
+        // name. If a future surface really does declare `categories`, the exemption can be
+        // deleted, and this test says so rather than blocking it.
+        let schema = crate::schema::SchemaCatalogue::catalogued();
+        let declared: std::collections::BTreeSet<&str> = schema
+            .types
+            .iter()
+            .flat_map(|type_definition| type_definition.fields.iter())
+            .map(|field| field.name)
+            .collect();
+        for name in ["categories", "tags"] {
+            assert!(
+                !declared.contains(name),
+                "`{name}` is now a declared schema field, so its exemption in the parity test's \
+                 allowlist is dead weight — delete it rather than leaving two sources of truth"
+            );
+        }
+    }
+
+    #[test]
     fn every_catalogued_field_states_why_it_costs_what_it_costs() {
         // The request makes the weight a review artifact. A catalogue entry with an empty reason
         // is exactly the unreviewable number it forbids, so this asserts the property rather
@@ -366,11 +507,11 @@ mod tests {
         // field really are two listings, so they are charged twice; that is the N+1 the request's
         // notes warn about being free.
         let catalogue = catalogue();
-        let two_aliases = price(&HashMap::from([("articles".to_string(), 2)]), &catalogue);
-        assert_eq!(two_aliases.total, catalogue.operation_cost + 120 * 2);
+        let two_aliases = price(&HashMap::from([("pages".to_string(), 2)]), &catalogue);
+        assert_eq!(two_aliases.total, catalogue.operation_cost + 110 * 2);
 
-        let once = price(&HashMap::from([("articles".to_string(), 1)]), &catalogue).total;
-        assert_eq!(once, catalogue.operation_cost + 120);
+        let once = price(&HashMap::from([("pages".to_string(), 1)]), &catalogue).total;
+        assert_eq!(once, catalogue.operation_cost + 110);
     }
 
     #[test]
