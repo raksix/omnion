@@ -283,12 +283,79 @@ pub async fn mark_sent(pool: &PgPool, lead_id: Uuid, sent_at: OffsetDateTime) ->
     Ok(updated.is_some())
 }
 
-/// Record that the autoresponder was *not* sent, and why.
+/// How long a worker's send claim may stand before another worker may take it.
 ///
-/// A lead whose autoresponder found no address, a broken template or a rejected submission
-/// gets a line saying so. The alternative — no line at all — makes the trail read as "we sent
-/// nothing here" and "we never considered it" as the same event, which is exactly the question
-/// an operator opens a lead to answer.
+/// One minute, and the bound it has to respect is the SMTP timeout
+/// (`OMNION_SMTP_TIMEOUT_MS`, default ten seconds, raiseable by an operator): a claim must
+/// outlive the send it guards, or two workers really do mail. The bias is the module's own —
+/// **a duplicate is a permanent, invisible defect; a delayed send is a temporary, visible one**
+/// — so the window is long rather than tight, and recovery lands on the next worker tick
+/// instead of on a restart.
+pub const DELIVERY_CLAIM_STALE_AFTER: time::Duration = time::Duration::minutes(1);
+
+/// Take the right to send one due reservation, and report whether this caller is the one to send
+/// it.
+///
+/// ## This is the half that makes the worker's exactly-once claim true
+///
+/// The runner's own header states the rule this function implements, one line above the code
+/// that broke it: *"a claim is taken **before** the send, and a completion is recorded **after**
+/// it, or two workers both mail."* `send_one` did the opposite — it called the mailer first and
+/// `mark_sent` (which *is* the completion) second — so the only arbiter the send path had was
+/// consulted **after** the irreversible act. Two app instances on one database both receive the
+/// same due row, because [`due_reservations`] is a plain read with no lock, and both mailed.
+///
+/// **The losing branch was real and useless.** Its comment said the loser "stops here …
+/// sending again would be the duplicate this whole design exists to prevent", and it did stop —
+/// after its own copy had left. The trail then showed one send while the visitor received two,
+/// which is the worst of both halves: a record that is reassuring and false.
+///
+/// The write is a compare-and-swap on the row, and `skip locked` is what makes it *safe* rather
+/// than merely likely: under READ COMMITTED two workers both see the row unlocked and both
+/// attempt the update, and Postgres hands the row to exactly one while the other is skipped
+/// rather than blocking behind an SMTP conversation that may take `OMNION_SMTP_TIMEOUT_MS`.
+/// Without `skip locked` the *record* would still be right — the loser is told "not yours" — but
+/// only after waiting out a send it never should have started.
+///
+/// ## `skip locked` skips a row, not a lead
+///
+/// The bias is deliberate and stated: a skipped reservation is one the winner is already
+/// sending, so the lead is answered by this tick either way. Nothing is lost by the skip, and a
+/// worker blocked behind a ten-second conversation is a worker that cannot answer the
+/// forty-nine reservations behind it.
+///
+/// A claim older than [`DELIVERY_CLAIM_STALE_AFTER`] is claimable again, which is the recovery
+/// half a lock cannot give: a worker that dies between claiming and sending must not leave a
+/// reservation that is skipped for ever by the mechanism meant to answer it.
+pub async fn claim_delivery(
+    pool: &PgPool,
+    lead_id: Uuid,
+    to: &str,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    let claimed: Option<i64> = sqlx::query_scalar(
+        "update crm_lead_events set delivery_claimed_at = $4 \
+         where id = ( \
+           select id from crm_lead_events \
+           where lead_id = $1 and kind = $2 and detail->>'to' = $3 \
+             and detail ? 'sent' and not (detail ? 'delivered_at') \
+             and (delivery_claimed_at is null \
+                  or delivery_claimed_at < $5::timestamptz) \
+           order by id desc limit 1 \
+           for update skip locked \
+         ) returning id",
+    )
+    .bind(lead_id)
+    .bind(SENT_KIND)
+    .bind(to)
+    .bind(now)
+    .bind(now - DELIVERY_CLAIM_STALE_AFTER)
+    .fetch_optional(pool)
+    .await
+    .map_err(crate::error::CrmIntakeError::from)?;
+    Ok(claimed.is_some())
+}
+
 pub async fn record_skip(
     pool: &PgPool,
     lead: &Lead,
