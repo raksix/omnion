@@ -5564,6 +5564,24 @@ async function runCrmIntakeDepth(page, report) {
   await page.waitForTimeout(1200);
   steps.respondedOnce = (await page.locator("[data-lead-respond]").first().isDisabled().catch(() => false));
   steps.respondedLabel = (await page.locator("[data-lead-respond]").first().innerText().catch(() => "")).trim();
+  // **This is the assertion whose absence let the defect ship.** The label was recorded on
+  // every pass and read by nobody, and it read `Responded Invalid Date` for the whole life of
+  // the screen — the value was *captured* and never *judged*, which is the same shape as the
+  // dead-export defects this branch has found thirteen of, wearing a different hat: a
+  // measurement nobody reads is a measurement that cannot fail.
+  //
+  // The assertion is on the rendered text, not on a date parse, because a parse is what the
+  // client does and the words "Invalid Date" are what a person sees. A screen that rendered
+  // the raw ISO string would pass a parse and still be unreadable, so the bar is the same
+  // class of check the rest of this depth pass uses: does the sentence mean anything.
+  steps.respondedLabelIsNotAnInvalidDate = !/invalid\s*date|undefined|NaN/i.test(steps.respondedLabel);
+  steps.respondedLabelNamesAnInstant = /\d/.test(steps.respondedLabel);
+  // The same class of reader, on the two other fields the detail screen formats absolutely.
+  // `Received` sits above the name and every timeline line is stamped; all three went through
+  // the same `new Date(...).toLocaleString()` and all three rendered the same words.
+  steps.detailShowsNoInvalidDates = !/invalid\s*date/i.test(
+    await page.evaluate(() => document.body.innerText),
+  );
   const firstResponse = await page.evaluate(
     () => document.querySelector("[data-lead-timeline]")?.textContent ?? "",
   );
