@@ -152,6 +152,36 @@ impl SetStore {
     }
 
     /// File a set and drive it to `confirmed`, the way the routes do.
+    /// A filed draft, with its targets pinned the way `confirmed_set` pins them.
+    ///
+    /// Split out because the two differ in one line and that line is the point: a draft is
+    /// **editable**, which is what slice 3e's walks need and what the two status arms of
+    /// [`store::replace_operations`] cannot be told apart with otherwise.
+    async fn draft_set(&self, title: &str, operations: Vec<ChangeOp>) -> Uuid {
+        let set = store::append(
+            &self.pool,
+            &NewChangeSet {
+                organization_id: self.organization_id,
+                site_id: Some(self.site_id),
+                title: title.to_owned(),
+                operations: operations.clone(),
+                created_by: None,
+                created_by_agent: None,
+                created_by_run: None,
+                base_revisions: store::current_revisions(
+                    &self.pool,
+                    self.organization_id,
+                    &operations,
+                )
+                .await
+                .expect("the targets must be pinnable to a revision"),
+            },
+        )
+        .await
+        .expect("the set must be filed");
+        set.id
+    }
+
     async fn confirmed_set(&self, title: &str, operations: Vec<ChangeOp>) -> Uuid {
         let set = store::append(
             &self.pool,
@@ -793,6 +823,7 @@ async fn a_delete_is_gated_and_a_plain_title_edit_is_not() {
         status: "draft".to_owned(),
         operations,
         base_revisions: Default::default(),
+        content_hash: String::new(),
         created_by: None,
         created_by_agent: None,
         created_by_run: None,
@@ -871,6 +902,7 @@ async fn one_approval_of_three_gates_does_not_release_the_set() {
             publishes("c", third),
         ],
         base_revisions: Default::default(),
+        content_hash: String::new(),
         created_by: None,
         created_by_agent: None,
         created_by_run: None,
@@ -934,6 +966,7 @@ async fn approving_an_ungated_operation_never_releases_a_gated_set() {
         status: "pending".to_owned(),
         operations: vec![update("a", page, "Plain rename"), publishing],
         base_revisions: Default::default(),
+        content_hash: String::new(),
         created_by: None,
         created_by_agent: None,
         created_by_run: None,
@@ -967,6 +1000,7 @@ async fn a_set_with_no_gates_is_already_released() {
         status: "draft".to_owned(),
         operations: vec![update("a", page, "Retitled")],
         base_revisions: Default::default(),
+        content_hash: String::new(),
         created_by: None,
         created_by_agent: None,
         created_by_run: None,
@@ -1248,6 +1282,7 @@ async fn a_mixed_set_gates_the_delete_and_leaves_the_renames_alone() {
             removing,
         ],
         base_revisions: Default::default(),
+        content_hash: String::new(),
         created_by: None,
         created_by_agent: None,
         created_by_run: None,
@@ -1306,4 +1341,325 @@ async fn publishing_is_gated_but_the_same_update_without_the_status_is_not() {
         None,
         "the request's six classes contain a publish, not an unpublish"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// Slice 3e — the content hash
+// -------------------------------------------------------------------------------------------
+//
+// "Editing a change set records the editor and time, re-renders the diff and updates the
+// preview hash." The stamp landed in 0201; the hash did not, so the sentence had nothing the
+// reviewer could compare. These four walks cover the four things that claim rests on:
+//
+//  1. the stored column equals the hash of the operations it was stored **with** (not a hash
+//     computed over something else, which is the failure a generated `jsonb::text` column has);
+//  2. an edit re-hashes, and a no-op edit does not;
+//  3. reordering changes the hash, because the order is the order they are applied in;
+//  4. an edit carrying a stale hash writes **nothing** and names both hashes.
+//
+// The pure halves (2 and 3) need no database and live in the crate's own unit tests; these
+// drive the store, because "the row it returns equals the row it stored" is a claim about SQL
+// and a `#[test]` in the crate cannot make it.
+
+/// The stored hash is the hash of the operations it was stored with.
+///
+/// The wording is deliberately "stored with" and not "computes to the same value twice": a
+/// walk that called [`ChangeSet::content_hash`] twice and compared the two answers would pass
+/// with a writer that stored `''`, because `''` is constant. This reads the **column** back
+/// through SQL and compares it with the hash computed from the **domain** value — two
+/// different code paths that have to agree, which is the only way a desynchronised row fails.
+///
+/// It is also the walk that would have caught a `generated … digest(operations::text …)`
+/// column: PostgreSQL's `jsonb` orders object keys by length first and then bytewise, so the
+/// two-key `base_revisions` map below serialises to a different string under `jsonb::text`
+/// than under `serde_json`, and the hashes would differ. The map has two keys of **different
+/// lengths** for exactly that reason — a one-key map is where the two agree, and a fixture
+/// that cannot fail is the fixture that ships the bug.
+#[tokio::test]
+async fn the_stored_hash_is_the_hash_of_the_operations_it_was_stored_with() {
+    let store = gate!();
+    let first = store.page("hash-a", "First").await;
+    let second = store.page("hash-b", "Second").await;
+
+    let mut revisions = std::collections::BTreeMap::new();
+    revisions.insert(format!("page:{first}"), "rev-1".to_owned());
+    revisions.insert(format!("page:{second}"), "rev-2".to_owned());
+
+    let filed = store::append(
+        &store.pool,
+        &NewChangeSet {
+            organization_id: store.organization_id,
+            site_id: Some(store.site_id),
+            title: "Two renames".to_owned(),
+            operations: vec![
+                update("a", first, "First renamed"),
+                update("b", second, "Second renamed"),
+            ],
+            created_by: None,
+            created_by_agent: None,
+            created_by_run: None,
+            base_revisions: revisions.clone(),
+        },
+    )
+    .await
+    .expect("the set must be filed");
+
+    assert_ne!(
+        filed.content_hash, "",
+        "a filed set carries a hash; an empty one is a row written before 0204"
+    );
+
+    let stored: String =
+        sqlx::query_scalar("select content_hash from ai_change_sets where id = $1")
+            .bind(filed.id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("the column must answer");
+    assert_eq!(
+        stored,
+        filed.content_hash(),
+        "the column is the hash of the operations it was stored with"
+    );
+
+    // Re-read through the store, which is a third path: decode the two jsonb documents and
+    // hash them. A reader that dropped `content_hash` from `CHANGE_SET_COLUMNS` would leave
+    // the struct's field defaulted and this comparison is what notices.
+    let read = store::read(&store.pool, store.organization_id, filed.id)
+        .await
+        .expect("the read must answer")
+        .expect("the set must be there");
+    assert_eq!(
+        read.content_hash, stored,
+        "a read row keeps the stored hash"
+    );
+    assert_eq!(
+        read.content_hash(),
+        change_sets::ChangeSet::compute_content_hash(&read.operations, &read.base_revisions),
+        "and it is recomputable from what the row carries"
+    );
+    assert_eq!(
+        read.base_revisions, revisions,
+        "the two-key map survives the round trip, so the hash covers what was written"
+    );
+
+    store.dispose().await;
+}
+
+/// An edit re-hashes; a second edit with a stale hash writes nothing.
+///
+/// The two halves are one walk on purpose. Asserting only "the hash changed" passes an
+/// implementation that re-hashes everything including a set nobody edited; asserting only
+/// "the stale edit was refused" passes one that never re-hashes. The pair is the claim.
+#[tokio::test]
+async fn an_edit_re_hashes_and_a_stale_edit_writes_nothing() {
+    let store = gate!();
+    let page = store.page("hash-edit", "Original").await;
+    let actor: Uuid = Uuid::new_v4();
+    sqlx::query("insert into users (id, email, password_hash) values ($1, $2, 'x')")
+        .bind(actor)
+        .bind(format!("hash-{}@example.test", Uuid::new_v4().simple()))
+        .execute(&store.pool)
+        .await
+        .expect("the fixture user must be created");
+
+    let filed = store::append(
+        &store.pool,
+        &NewChangeSet {
+            organization_id: store.organization_id,
+            site_id: Some(store.site_id),
+            title: "One page".to_owned(),
+            operations: vec![update("a", page, "Edited once")],
+            created_by: Some(actor),
+            created_by_agent: None,
+            created_by_run: None,
+            base_revisions: Default::default(),
+        },
+    )
+    .await
+    .expect("the set must be filed");
+
+    // An edit carrying the hash the caller read. This is the shape the editor sends.
+    let edited = store::replace_operations(
+        &store.pool,
+        store.organization_id,
+        filed.id,
+        "One page, edited",
+        &[update("a", page, "Edited twice")],
+        &Default::default(),
+        actor,
+        Some(&filed.content_hash),
+    )
+    .await
+    .expect("the write must answer")
+    .expect("a matching hash is not a refusal");
+    assert_ne!(
+        edited.content_hash, filed.content_hash,
+        "the hash covers the operations, so changing one changes it"
+    );
+    assert_eq!(edited.updated_by, Some(actor), "the editor is stamped");
+
+    // The SAME edit, now carrying the hash the caller read before their own save. This is two
+    // tabs open on one set, and it must be refused rather than silently winning.
+    let stale = store::replace_operations(
+        &store.pool,
+        store.organization_id,
+        filed.id,
+        "Someone else's title",
+        &[update("a", page, "Clobbered")],
+        &Default::default(),
+        actor,
+        Some(&filed.content_hash),
+    )
+    .await
+    .expect("the write must answer");
+    match stale {
+        Err(store::EditRefusal::ContentMoved { read, stored }) => {
+            assert_eq!(read, filed.content_hash, "the refusal names what they read");
+            assert_eq!(stored, edited.content_hash, "and what the row holds");
+        }
+        other => panic!("a stale hash must be refused, got {other:?}"),
+    }
+
+    // And the row is **untouched** — the whole point of putting the guard in the `where`
+    // clause rather than reading first and comparing in Rust.
+    let after = store::read(&store.pool, store.organization_id, filed.id)
+        .await
+        .expect("the read must answer")
+        .expect("the set must be there");
+    assert_eq!(
+        after.content_hash, edited.content_hash,
+        "the refused edit changed nothing"
+    );
+    assert_eq!(after.title, "One page, edited", "including the title");
+    let stored_ops: serde_json::Value =
+        sqlx::query_scalar("select operations from ai_change_sets where id = $1")
+            .bind(filed.id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("the column must answer");
+    let decoded: Vec<ChangeOp> = serde_json::from_value(stored_ops).expect("decodes");
+    assert_eq!(
+        decoded[0].operation.args,
+        json!({ "title": "Edited twice" }),
+        "and the operations; `Clobbered` must not be on the page proposal"
+    );
+
+    store.dispose().await;
+}
+
+/// A set that is not editable is refused with the status it is in now, and a set in another
+/// organization is `NotFound`.
+///
+/// The tenancy half matters because the refusal path reads the row back to tell "decided" from
+/// "moved": that read is scoped, and this walk is what proves it. Without the scope a caller
+/// could learn that a set id exists in another tenant — the exact thing the `404` exists to
+/// prevent, and the thing a "read the row to explain the refusal" refactor is most likely to
+/// introduce.
+#[tokio::test]
+async fn a_refused_edit_names_the_status_and_never_leaks_another_tenants_row() {
+    let store = gate!();
+    let page = store.page("hash-status", "Original").await;
+    let actor: Uuid = Uuid::new_v4();
+    sqlx::query("insert into users (id, email, password_hash) values ($1, $2, 'x')")
+        .bind(actor)
+        .bind(format!("hash-{}@example.test", Uuid::new_v4().simple()))
+        .execute(&store.pool)
+        .await
+        .expect("the fixture user must be created");
+
+    let filed = store
+        .confirmed_set("Confirmed set", vec![update("a", page, "Renamed")])
+        .await;
+
+    let refused = store::replace_operations(
+        &store.pool,
+        store.organization_id,
+        filed,
+        "Too late",
+        &[update("a", page, "Renamed again")],
+        &Default::default(),
+        actor,
+        Some(&""),
+    )
+    .await
+    .expect("the write must answer");
+    assert_eq!(
+        refused,
+        Err(store::EditRefusal::NotEditable {
+            current: "confirmed".to_owned()
+        }),
+        "a confirmed set is a promise; the refusal names the state it is in"
+    );
+
+    // Another organization, same id. The write is scoped, so this is a miss and the refusal
+    // path's read is scoped too, so the answer is "no such row" rather than a status.
+    let other = seed_organization(&store.pool, "other").await;
+    assert_eq!(
+        store::replace_operations(
+            &store.pool,
+            other,
+            filed,
+            "Not yours",
+            &[update("a", page, "Not yours")],
+            &Default::default(),
+            actor,
+            None,
+        )
+        .await
+        .expect("the write must answer"),
+        Err(store::EditRefusal::NotFound),
+        "a set in another tenant does not exist as far as this caller is concerned"
+    );
+
+    store.dispose().await;
+}
+
+/// An edit that would not validate writes nothing.
+///
+/// The store validates the **candidate** before the write, and this is the walk that keeps
+/// that true: an empty list is refused by `validate` and the stored hash must be exactly what
+/// it was. Without the candidate check the write would land and the row would carry a hash of
+/// an invalid set — which is a hash nothing can ever match, so the row is editable by nobody
+/// afterwards.
+#[tokio::test]
+async fn an_edit_that_does_not_validate_is_refused_and_writes_nothing() {
+    let store = gate!();
+    let page = store.page("hash-invalid", "Original").await;
+    let filed = store
+        .draft_set("Draft set", vec![update("a", page, "Original")])
+        .await;
+
+    let before = store::read(&store.pool, store.organization_id, filed)
+        .await
+        .expect("the read must answer")
+        .expect("the set must be there");
+
+    let refused = store::replace_operations(
+        &store.pool,
+        store.organization_id,
+        filed,
+        "Empty",
+        &[],
+        &Default::default(),
+        Uuid::new_v4(),
+        None,
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "an empty operation list is refused before the write, not after it"
+    );
+
+    let after = store::read(&store.pool, store.organization_id, filed)
+        .await
+        .expect("the read must answer")
+        .expect("the set must be there");
+    assert_eq!(
+        after.content_hash, before.content_hash,
+        "no hash was written"
+    );
+    assert_eq!(after.title, before.title, "and no title");
+    assert_eq!(after.operations, before.operations, "and no operations");
+
+    store.dispose().await;
 }
