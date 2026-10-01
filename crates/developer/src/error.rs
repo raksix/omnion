@@ -150,6 +150,12 @@ impl DeveloperError {
             Self::InvalidKey => "invalid_api_key",
             Self::HighTierRefused => "high_tier_refused",
             Self::KeyNotActive(_) => "api_key_not_active",
+            // Gated for the same reason the variant is: without the `store` feature this arm
+            // does not exist, and a match that names it is a compile error. The alternative —
+            // a `_ =>` arm — would swallow a new client-error variant added later without its
+            // code, which is how a `400` silently becomes a `500`. The gate is what makes the
+            // compiler name every arm a new variant needs.
+            #[cfg(feature = "store")]
             Self::Database(_) => "developer_store_unavailable",
         }
     }

@@ -30,6 +30,7 @@
 pub mod authn;
 pub mod error;
 pub mod model;
+pub mod oauth;
 pub mod openapi;
 pub mod secret;
 #[cfg(feature = "store")]
