@@ -525,6 +525,133 @@ pub async fn delete_plan(pool: &PgPool, id: Uuid) -> Result<bool> {
     Ok(plan.is_some())
 }
 
+/// What a bulk delete did, and what it refused.
+///
+/// Two lists rather than a count: "3 of 5 deleted" is a number an operator has to reconstruct,
+/// while the ids say what is gone and the refusals say what stayed and why. A bulk that
+/// reports only a count renders as a complete one even when half of it was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkDelete {
+    /// Plans this call removed.
+    pub deleted: Vec<Uuid>,
+    /// Plans it did not, with the reason each one carries.
+    pub failures: Vec<RefusedPlan>,
+}
+
+impl BulkDelete {
+    /// How many plans the caller asked about.
+    #[must_use]
+    pub fn requested(&self) -> usize {
+        self.deleted.len() + self.failures.len()
+    }
+}
+
+/// One plan a bulk delete would not remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedPlan {
+    /// The plan the caller named.
+    pub id: Uuid,
+    /// Why it is still there.
+    pub message: String,
+}
+
+/// Why a plan stays when a bulk delete names it.
+///
+/// Two sentences, and they are deliberately different: "no such plan" covers both a row that
+/// never existed and one belonging to another tenant, because the tenant predicate is part of
+/// the read and a bulk that answered "that plan belongs to somebody else" would confirm the
+/// existence of every id an operator (or a script) guessed.
+///
+/// The **status** rather than the row, so the sentence can be proven without a database — this
+/// is the one rule a bulk delete has beyond the tenant predicate, and a rule that can only be
+/// checked against a live server is a rule nobody checks.
+#[must_use]
+pub fn refusal_reason(status: Option<&str>, short_id: &str) -> String {
+    match status {
+        Some("applied") => format!(
+            "`{short_id}` was applied — its artifacts are what the live app was built from, so it stays"
+        ),
+        _ => "no such plan in this organization".to_owned(),
+    }
+}
+
+/// Eight hex characters of a plan id, the way the console names one.
+fn short_id(id: &Uuid) -> String {
+    id.as_simple().to_string()[..8].to_owned()
+}
+
+/// Delete several plans at once, refusing each one by its own rule.
+///
+/// **The delete is driven by the scoped read, never by the request.** The rows inside
+/// `organization_id` are read first, the applied ones are dropped from that list, and only what
+/// remains is handed to a single `delete … where id = any(...)`. Writing the delete straight
+/// from the caller's array would be shorter and would be a cross-tenant write: the ids are the
+/// caller's, and nothing in a `delete` looks at an organization.
+///
+/// One round trip for the read and one for the delete, rather than a pair per id: the console
+/// selects a page at a time, and twenty selections must not cost forty statements.
+pub async fn delete_plans(
+    pool: &PgPool,
+    ids: &[Uuid],
+    organization_id: Option<Uuid>,
+) -> Result<BulkDelete> {
+    let mut deleted = Vec::new();
+    let mut failures = Vec::new();
+    if ids.is_empty() {
+        return Ok(BulkDelete { deleted, failures });
+    }
+
+    // Which of the requested plans exist inside this organization, and in what state.
+    let rows = sqlx::query_as::<_, AppBuilderPlan>(&format!(
+        "select {PLAN_COLUMNS} from app_builder_plans
+          where id = any($1)
+            and (organization_id is null or organization_id = $2 or $2 is null)"
+    ))
+    .bind(ids)
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+
+    let eligible: Vec<Uuid> = rows
+        .iter()
+        .filter(|plan| plan.status != "applied")
+        .map(|plan| plan.id)
+        .collect();
+
+    if !eligible.is_empty() {
+        let removed: Vec<Uuid> = sqlx::query_scalar(
+            "delete from app_builder_plans
+              where id = any($1) and status <> 'applied'
+              returning id",
+        )
+        .bind(&eligible)
+        .fetch_all(pool)
+        .await?;
+        deleted = removed;
+    }
+
+    // Everything the caller named and did not get: refused inside the organization, or absent
+    // from it. Both are answered by the same question — was it here? — because the read above
+    // already applied the tenant rule.
+    for id in ids {
+        if deleted.contains(id) {
+            continue;
+        }
+        let short = short_id(id);
+        failures.push(RefusedPlan {
+            id: *id,
+            message: refusal_reason(
+                rows.iter()
+                    .find(|plan| plan.id == *id)
+                    .map(|plan| plan.status.as_str()),
+                &short,
+            ),
+        });
+    }
+
+    Ok(BulkDelete { deleted, failures })
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------------------------
@@ -1093,6 +1220,15 @@ impl<'a> PlanStore<'a> {
         delete_plan(self.pool, id).await
     }
 
+    /// Delete a selection, refusing each plan by its own rule.
+    pub async fn delete_many(
+        &self,
+        ids: &[Uuid],
+        organization_id: Option<Uuid>,
+    ) -> Result<BulkDelete> {
+        delete_plans(self.pool, ids, organization_id).await
+    }
+
     /// One plan by id.
     pub async fn get(&self, id: Uuid) -> Result<Option<AppBuilderPlan>> {
         find_plan(self.pool, id).await
@@ -1328,5 +1464,63 @@ mod tests {
                 .to_string()
                 .contains("leave requests are what the app is for")
         );
+    }
+
+    #[test]
+    fn an_applied_plan_is_refused_by_name_and_everything_else_by_the_same_sentence() {
+        // Two refusals, and they must not be the same one: "it was applied, here it is by name"
+        // tells an operator why the row is still on their screen, while "no such plan" covers
+        // both a row that never existed and one belonging to another tenant — answering that
+        // one differently would confirm the existence of every id a caller guessed.
+        let applied = refusal_reason(Some("applied"), "0123abcd");
+        assert!(
+            applied.contains("0123abcd") && applied.contains("applied"),
+            "{applied}"
+        );
+        for absent in [
+            refusal_reason(None, "0123abcd"),
+            refusal_reason(Some("draft"), "0123abcd"),
+        ] {
+            assert_eq!(absent, "no such plan in this organization");
+        }
+    }
+
+    #[test]
+    fn a_bulk_delete_reports_every_requested_plan_exactly_once() {
+        // The number the console renders comes from here. If `requested()` counted only the
+        // deletions, a selection of three where one was applied would render "1 selected" the
+        // moment the call came back and the operator would learn nothing happened to the rest.
+        let report = BulkDelete {
+            deleted: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            failures: vec![RefusedPlan {
+                id: Uuid::from_u128(3),
+                message: refusal_reason(Some("applied"), "00000003"),
+            }],
+        };
+        assert_eq!(report.requested(), 3);
+        assert_eq!(
+            report.deleted.len() + report.failures.len(),
+            report.requested()
+        );
+        assert_eq!(
+            BulkDelete {
+                deleted: vec![],
+                failures: vec![]
+            }
+            .requested(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_short_id_is_eight_characters_and_never_the_whole_uuid() {
+        // The console names a plan by its short id, and the refusal quotes that name back. A
+        // short id that could carry a `/` or a quote would only ever be safe inside JSON, but
+        // the same string ends up in a `Content-Disposition` filename on the export path.
+        let id = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        assert_eq!(short_id(&id), "01234567");
+        assert_eq!(short_id(&id).len(), 8);
+        assert!(!short_id(&id).contains('/'));
+        assert!(!short_id(&id).contains('"'));
     }
 }

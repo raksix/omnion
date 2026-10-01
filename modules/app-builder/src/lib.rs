@@ -40,10 +40,11 @@ pub use model::{
     plan_status_is_known,
 };
 pub use store::{
-    PlanStore, accept_artifact, apply_answer, apply_failure, artifact_counts, blockers,
-    delete_plan, find_artifact, find_plan, find_plan_in, insert_artifact, insert_plan,
-    list_artifacts, list_plans, reject_artifact, reject_plan, required_kinds_present,
-    set_artifact_status, supersede_artifact, supersede_plan, update_artifact_spec,
+    BulkDelete, PlanStore, RefusedPlan, accept_artifact, apply_answer, apply_failure,
+    artifact_counts, blockers, delete_plan, delete_plans, find_artifact, find_plan, find_plan_in,
+    insert_artifact, insert_plan, list_artifacts, list_plans, refusal_reason, reject_artifact,
+    reject_plan, required_kinds_present, set_artifact_status, supersede_artifact, supersede_plan,
+    update_artifact_spec,
 };
 pub use validate::{
     FIELD_TYPES, Finding, MAX_KEY_LEN, MAX_RATIONALE_LEN, MIN_KEY_LEN, PlanValidation,
