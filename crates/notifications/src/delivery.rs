@@ -270,7 +270,16 @@ pub async fn enqueue(
     // be able to say so.
 
     for channel in enabled {
-        if !is_channel(channel) || channel == crate::preferences::IN_APP {
+        // **The queueable check is load-bearing, and the walk is what proved it.** Without it
+        // this loop writes `chat` as `pending` *before* the loop below reaches it, and since
+        // `insert_delivery` is `on conflict do nothing`, the `skipped` row that follows is a
+        // silent no-op — so the channel lands queued, gets claimed by the runner, finds no
+        // transport, burns its cap and is written `failed`. The skip has to happen here, at the
+        // first loop, not as a repair afterwards.
+        if !is_channel(channel)
+            || channel == crate::preferences::IN_APP
+            || !QUEUEABLE.contains(&channel.as_str())
+        {
             continue;
         }
         if insert_delivery(pool, notification_id, channel, "pending", None).await? {
@@ -279,7 +288,10 @@ pub async fn enqueue(
     }
 
     for channel in disabled {
-        if !is_channel(channel) || channel == crate::preferences::IN_APP {
+        if !is_channel(channel)
+            || channel == crate::preferences::IN_APP
+            || !QUEUEABLE.contains(&channel.as_str())
+        {
             continue;
         }
         if insert_delivery(
@@ -312,7 +324,49 @@ pub async fn enqueue(
         report.queued += 1;
     }
 
+    // **The third loop, and it is the one a caller cannot be trusted to do.** `chat` is in the
+    // closed vocabulary and the default matrix has it on, so a producer that enqueues "every
+    // allowed channel" writes it `pending` — and then the runner claims it, finds no transport,
+    // re-queues it to the cap and writes `failed`. A channel the platform has not built would
+    // spend three attempts and land in the outbox as a failed delivery, on the one screen whose
+    // job is to be believed. The runner's own vocabulary test cannot see this: it asserts what
+    // the runner registers, and the row is written before the runner ever sees it.
+    //
+    // Written `skipped` rather than omitted, for the reason every other row is: the drawer has
+    // to be able to say the channel exists and does not go anywhere, rather than leaving a
+    // reader to infer it from a column that is not there.
+    for channel in channels_without_transport() {
+        if insert_delivery(
+            pool,
+            notification_id,
+            channel,
+            "skipped",
+            Some(NO_TRANSPORT_YET),
+        )
+        .await?
+        {
+            report.skipped += 1;
+        }
+    }
+
     Ok(report)
+}
+
+/// The channels in the closed vocabulary that no runner drains.
+///
+/// Computed rather than hardcoded, so the answer cannot drift from the vocabulary: a channel
+/// added to `CHANNELS` is *not* in this list until a transport is registered for it, which is
+/// the safe direction — it gets a `skipped` row saying so, instead of a `pending` row the
+/// runner burns a cap on. [`remote_channels`] is the other half of the same question: which
+/// channels *need* a transport.
+fn channels_without_transport() -> Vec<&'static str> {
+    CHANNELS
+        .iter()
+        .copied()
+        .filter(|channel| {
+            *channel != crate::preferences::IN_APP && !QUEUEABLE.contains(channel)
+        })
+        .collect()
 }
 
 /// What one enqueue produced. Both numbers, because a caller that only hears "1" cannot tell
@@ -339,6 +393,35 @@ impl EnqueueReport {
 /// shows: two spellings of "the reader turned this off" in two places is one of them wrong
 /// within a month.
 pub const READER_SWITCHED_IT_OFF: &str = "the reader has this channel switched off";
+
+/// The reason a row carries when the platform has no transport for that channel yet.
+///
+/// **Distinct from [`READER_SWITCHED_IT_OFF`] on purpose, because the two mean different
+/// things to the person reading the drawer.** "You switched this off" is a decision they made
+/// and can undo; "this channel is not installed" is a gap in the platform, and telling them
+/// otherwise sends them to a settings screen that cannot help. `chat` is the live case: the
+/// channel is in the closed vocabulary, the matrix renders a column for it, and the runner
+/// deliberately does not drain it (REQ-015 owns the connectors). So a reader whose matrix
+/// leaves `chat` on — which is the default for everybody who never opened the settings screen —
+/// must get a `skipped` row with this reason rather than a `pending` one.
+///
+/// **This is why `enqueue` owns the list and not the caller.** A producer that enqueued "every
+/// allowed channel" would write `chat` as `pending`, and the runner would then claim it, find no
+/// transport, re-queue it to the cap and write `failed` — so a channel that does not exist
+/// would show up in the outbox as a delivery that failed three times, which is both a lie about
+/// the platform and a real alert-shaped noise on a screen whose job is to be believed. The
+/// test that pins the runner's own vocabulary would not catch it, because that test asserts the
+/// *runner's* lists; the row is written long before the runner sees it.
+pub const NO_TRANSPORT_YET: &str = "this channel has no transport installed on this installation";
+
+/// The channels the queue accepts, in the closed vocabulary's order.
+///
+/// Everything except `in_app` (written unconditionally by [`enqueue`]) and the channels with no
+/// transport yet. Kept next to [`crate::delivery::remote_channels`] rather than derived from it,
+/// because `remote_channels` answers "which channels need a transport" and this answers "which
+/// channels may a row exist for" — the second is the smaller set, and deriving it would put
+/// `chat` back.
+const QUEUEABLE: [&str; 3] = ["email", "web_push", "webhook"];
 
 /// One insert, and whether it created a row.
 ///
@@ -840,6 +923,47 @@ pub fn remote_channels() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_channel_with_no_transport_is_skipped_rather_than_queued() {
+        // The producer-path defect this rule exists for. `chat` is in the closed vocabulary and
+        // the default preference matrix has it **enabled** — so a producer that enqueues "every
+        // allowed channel" writes it `pending`, and the runner claims it, finds no transport,
+        // re-queues to the cap and writes `failed`. A channel the platform has not built would
+        // then occupy three attempts and appear in the outbox as a failed delivery.
+        let untransportable = channels_without_transport();
+        assert_eq!(
+            untransportable,
+            vec!["chat"],
+            "chat is the only channel the runner deliberately does not drain"
+        );
+
+        // And the complement: everything else in the vocabulary may carry a `pending` row, so a
+        // channel added to `CHANNELS` without a transport lands in the safe direction (a
+        // `skipped` row that says why) rather than the dangerous one.
+        //
+        // Iterating with `.iter().copied()` normalises both containers to `&str` before any
+        // comparison, which is the whole point of doing it that way: `CHANNELS` is a slice of
+        // references, so a bare `for` binds `&&str` while `QUEUEABLE` (a `[&str; 3]` array)
+        // binds `&str`, and the compiler then rejects the two halves of one `assert_eq!` for
+        // differing by a single dereference. Copying first means neither side can be wrong.
+        let queueable: Vec<&str> = QUEUEABLE.to_vec();
+        for channel in CHANNELS.iter().copied() {
+            if channel == crate::preferences::IN_APP {
+                continue;
+            }
+            assert_eq!(
+                untransportable.contains(&channel),
+                !queueable.contains(&channel),
+                "{channel} is in the vocabulary and must be in exactly one of the two lists"
+            );
+        }
+        // The two reasons are different sentences, because they send the reader to different
+        // places: one to a setting they can change, the other to an administrator.
+        assert_ne!(NO_TRANSPORT_YET, READER_SWITCHED_IT_OFF);
+        assert!(NO_TRANSPORT_YET.contains("no transport"));
+        assert!(READER_SWITCHED_IT_OFF.contains("switched off"));
+    }
 
     #[test]
     fn the_backoff_doubles_and_stops_at_the_cap() {
