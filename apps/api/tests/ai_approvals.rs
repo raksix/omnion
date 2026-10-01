@@ -896,6 +896,189 @@ async fn an_expired_request_cannot_be_decided_and_the_sweeper_hands_the_run_back
 }
 
 #[tokio::test]
+async fn approving_hands_the_parked_run_back_to_the_queue() {
+    let store = gate!();
+    let decider = store.user().await;
+    let run_id = store.parked_run().await;
+    let step_id = store.step(run_id, 1).await;
+    let created = io::request(
+        &store.pool,
+        &store.publish_request(Some(run_id), Some(step_id)),
+    )
+    .await
+    .expect("the request must be stored");
+
+    assert_eq!(
+        store.run_status(run_id).await,
+        "awaiting_approval",
+        "the run is parked until somebody decides"
+    );
+
+    let decided = io::approve(
+        &store.pool,
+        store.organization_id,
+        created.approval().id,
+        decider,
+        Some("Autumn pricing"),
+        &AnyRevision,
+        GateStore::now(),
+    )
+    .await
+    .expect("the approval must be an answer, not an error");
+    // The status is read off the row, not off the enum variant: `code()` answers `None` for a
+    // successful call by design, so asserting the variant would only prove which arm ran, while
+    // the row is what the inbox, the detail screen and the audit trail all read.
+    assert_eq!(
+        decided.approval().map(|row| row.status.as_str()),
+        Some("approved"),
+        "the stored row must be the approval the reviewer just made"
+    );
+    assert!(decided.changed(), "the first decision is the one that counts");
+
+    // **The half that was missing.** The decision is recorded and the run is still parked:
+    // the reviewer saw `approved`, the run row still said `awaiting_approval`, and the step
+    // that asked stayed `running` for ever -- so `resume_point` reported its tool as
+    // "may already have fired" for the rest of the installation's life. The expiry sweeper
+    // already handed the run back on the clock-driven path; a decision is the person-driven
+    // version of the same event and the two paths may not differ on whether the run moves.
+    assert_eq!(
+        store.run_status(run_id).await,
+        "queued",
+        "an approved run must go back on the queue so the runner picks it up"
+    );
+    let (resumes,): (i32,) = sqlx::query_as(
+        "select resume_count from ai_runs where id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("the run row must be readable");
+    assert_eq!(
+        resumes, 1,
+        "the count is the number of times the run actually re-ran, so it moves once"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn rejecting_ends_the_run_as_cancelled_and_leaves_no_step_running() {
+    let store = gate!();
+    let decider = store.user().await;
+    let run_id = store.parked_run().await;
+    let step_id = store.step(run_id, 1).await;
+    let created = io::request(
+        &store.pool,
+        &store.publish_request(Some(run_id), Some(step_id)),
+    )
+    .await
+    .expect("the request must be stored");
+
+    let decided = io::reject(
+        &store.pool,
+        store.organization_id,
+        created.approval().id,
+        decider,
+        "the pricing is not final",
+        &AnyRevision,
+        GateStore::now(),
+    )
+    .await
+    .expect("the rejection must be an answer, not an error");
+    // Read off the row, not the variant — see the sibling walk: `code()` is `None` on success by
+    // design, and the reason a reviewer reads later is the one stored in `decision_note`.
+    let rejection = decided
+        .approval()
+        .expect("a rejection carries the row it refused");
+    assert_eq!(rejection.status, "rejected");
+    assert_eq!(
+        rejection.decision_note.as_deref(),
+        Some("the pricing is not final"),
+        "a person who refuses gets to say why, and the why survives the write"
+    );
+    assert!(decided.changed());
+
+    // A refusal is not a resume. Requeueing would send the run straight back to the same
+    // question, and a run that re-asks every time it is refused burns tokens for ever.
+    // It is finished `cancelled` -- a person pressing stop is not the agent breaking -- and
+    // the reason is on the run so an operator reading the trace sees why.
+    assert_eq!(
+        store.run_status(run_id).await,
+        "cancelled",
+        "a rejected tool must end the run, not send it back to the queue"
+    );
+    let (reason,): (Option<String>,) = sqlx::query_as(
+        "select stop_reason from ai_runs where id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("the run row must be readable");
+    assert_eq!(
+        reason.as_deref(),
+        Some("cancelled"),
+        "REQ-099's criterion names the stop reason explicitly"
+    );
+
+    // The parked step is closed as `skipped` -- deliberately not run. Leaving it `running`
+    // is what makes `resume_point` call a settled question an ambiguous one.
+    let open: i64 = sqlx::query_scalar(
+        "select count(*) from ai_run_steps where run_id = $1 and status = 'running'",
+    )
+    .bind(run_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("the step rows must be countable");
+    assert_eq!(open, 0, "a rejected run must leave no step claiming a tool may have fired");
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_change_set_gate_never_moves_the_run_it_merely_travelled_with() {
+    let store = gate!();
+    let decider = store.user().await;
+    let run_id = store.parked_run().await;
+    let set_id = Uuid::new_v4();
+    // A set files **one row per gated operation**, and every one of them carries the set's own
+    // `created_by_run`. So the first gate of two is not "the tool was allowed" — it is one
+    // half of a decision the release path has not accepted yet.
+    let mut first = store.publish_request(Some(run_id), None);
+    first.change_set_id = Some(set_id);
+    first.operation_key = Some("op-1".to_owned());
+    let filed = io::request(&store.pool, &first)
+        .await
+        .expect("the first gate must be stored");
+
+    let decided = io::approve(
+        &store.pool,
+        store.organization_id,
+        filed.approval().id,
+        decider,
+        Some("Autumn pricing"),
+        &AnyRevision,
+        GateStore::now(),
+    )
+    .await
+    .expect("approving one gate of two is an answer, not an error");
+    assert!(
+        decided.changed(),
+        "the reviewer's own row is decided — that part is the same as any other gate"
+    );
+
+    // **What must not happen.** Requeueing here puts the run back on the queue while the set
+    // it proposed is still blocked on the second gate and cannot be applied at all, so the
+    // runner picks up a run whose entire purpose was to ask a person. Rejecting the first gate
+    // of two would have the mirror defect: ending the run over one operation of a proposal a
+    // reviewer may still approve the rest of. The release (`release_gate`, slice 3d) is the only
+    // path that knows whether the set cleared, and so the only one allowed to move the run.
+    assert_eq!(
+        store.run_status(run_id).await,
+        "awaiting_approval",
+        "a set-bound gate must leave the run parked; the release owns its fate"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
 async fn a_request_the_resource_outgrew_is_stale_and_names_the_current_revision() {
     let store = gate!();
     let decider = store.user().await;
