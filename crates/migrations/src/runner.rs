@@ -1164,16 +1164,57 @@ pub async fn verify_down(
     let started = Instant::now();
 
     let before = table_names(scratch).await?;
-    let outcome = sqlx::raw_sql(&down).execute(scratch).await;
+
+    // The rehearsal runs DDL, so it obeys the SAME timeouts the apply path does — and it used not
+    // to, which was measured rather than assumed: with `migration_policy.lock_timeout_ms` set to
+    // 1000 and an `ACCESS EXCLUSIVE` lock held against the table the reversal drops, the reversal
+    // waited 17.9 s and then failed for an unrelated reason. The timeouts were only ever applied
+    // inside `apply_locked`, on the transaction that applies a migration — so the one code path an
+    // operator runs to find out whether their rollback is SAFE was the one path with no bound on
+    // it. `lock_timeout` is the setting that exists precisely for "a long transaction is holding a
+    // table this DDL needs"; not applying it here meant the rehearsal waited out the very
+    // condition it exists to report.
+    //
+    // `set local` needs a transaction to scope to, so the statements and the reversal share one.
+    // The scratch pool is the operator's throwaway rehearsal database, so wrapping its statements
+    // in a transaction changes nothing an operator can observe — the reversal is DDL either way.
+    let policy = crate::policy::read(ledger_pool).await?;
+    let mut tx = scratch.begin().await?;
+
+    // Same interpolation-and-Send reasoning as `apply_locked`, and for the same reason: a
+    // temporary `&String` here would make the whole future non-`Send` and break the HTTP caller
+    // while leaving every unit test green.
+    let set_lock_timeout = format!("set local lock_timeout = '{}ms'", policy.lock_timeout_ms);
+    sqlx::query(set_lock_timeout.as_str())
+        .execute(&mut *tx)
+        .await?;
+    let set_statement_timeout =
+        format!("set local statement_timeout = '{}ms'", policy.statement_timeout_ms);
+    sqlx::query(set_statement_timeout.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+    let outcome = sqlx::raw_sql(&down).execute(&mut *tx).await;
     let duration_ms = started.elapsed().as_millis().min(u128::from(i32::MAX as u32)) as i32;
 
     match outcome {
         Err(err) => {
             let message = err.to_string();
+            // Dropped uncommitted on purpose: the scratch database is the operator's to throw
+            // away, but a partial reversal is still worth discarding whole.
             finish_run(ledger_pool.clone(), Some(run_id), "failed".to_owned(), duration_ms, Some(message)).await?;
             return Err(MigrationSafetyError::Store(err));
         }
         Ok(_) => {
+            // COMMIT BEFORE reading the structure back. This is load-bearing and the ordering is
+            // the whole fix: `after` is the evidence that the reversal took effect, and a
+            // transaction that is still open would roll the `drop table` back on drop — so
+            // reading through this same pool would compare a structure the reversal never made
+            // and report `restored: false` for every correct reversal. The rollback path above
+            // deliberately does NOT commit: a failed rehearsal should leave the scratch database
+            // as it found it.
+            tx.commit().await?;
+
             let after = table_names(scratch).await?;
             finish_run(ledger_pool.clone(), Some(run_id), "succeeded".to_owned(), duration_ms, None).await?;
             ledger::mark_down_verified(ledger_pool.clone(), version, by).await?;
