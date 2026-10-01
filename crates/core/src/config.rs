@@ -121,6 +121,30 @@ pub const DEFAULT_AI_HEALTH_POLL_MS: u64 = 60_000;
 /// knob exists for the ones that do not.
 pub const DEFAULT_AI_RUNNER_CONCURRENCY: usize = 4;
 
+/// How long a run may stay `running` before the eval runner fails it (`OMNION_AI_EVAL_TIMEOUT`).
+///
+/// 900 s. The arithmetic that produced the number: a suite's cases run one at a time in this
+/// slice, a model turn is on the order of 10 s, and a case carrying `rubric` is two of those
+/// (the one under test plus the judge). 900 s therefore covers roughly forty such cases with
+/// room for a slow provider, which is the largest suite the panel's own import will realistically
+/// produce. Below that the reaper would fail healthy runs; above it a run abandoned by a crashed
+/// process stays `running` past the point where an operator has given up looking.
+pub const DEFAULT_AI_EVAL_TIMEOUT_SECONDS: i64 = 900;
+
+/// How often the eval runner sweeps for suites whose schedule is due (`OMNION_AI_EVAL_SCHEDULER_MS`).
+///
+/// 60 s. A cron string has a one-minute resolution at best, so a faster sweep can only re-check
+/// the same due suites; a slower one makes "hourly" fire up to a minute late, which is inside
+/// the tolerance every other scheduled job in the platform already accepts.
+pub const DEFAULT_AI_EVAL_SCHEDULER_MS: u64 = 60_000;
+
+/// How often stale runs are failed (`OMNION_AI_EVAL_SWEEP_MS`).
+///
+/// Ten minutes. The sweep's predicate is "running longer than the timeout", so once a run has
+/// been found it is already past that window and no second sweep inside the same window could
+/// find anything new — the interval buys recovery speed for the *next* run, nothing else.
+pub const DEFAULT_AI_EVAL_SWEEP_MS: u64 = 600_000;
+
 /// How often the retention worker sweeps (REQ-010, slice 4).
 pub const DEFAULT_RETENTION_POLL_MS: u64 = 900_000;
 
@@ -688,6 +712,35 @@ pub struct AiHubConfig {
     /// var for "do not touch my providers" and another for "do not touch my log" is the only
     /// split that serves both.
     pub log_runner_enabled: bool,
+    /// Whether this process executes queued eval runs (`OMNION_AI_EVAL_RUNNER`).
+    ///
+    /// A **fourth** switch, and the split is the same one the three above already draw: this
+    /// runner is the second background task that **spends money** — a rubric case costs a second
+    /// model call on top of the one under test, so a suite of twenty rubric cases costs twice a
+    /// chat turn twenty times. An installation that lets an agent talk but refuses to let an
+    /// eval burn a judge budget says `OMNION_AI_EVAL_RUNNER=false`, and the API answers
+    /// `503 runner_disabled` on run start rather than queueing runs that will never be picked
+    /// up and that the history would show as permanently `queued`.
+    ///
+    /// It is not a reading of `agent_runner_enabled` on purpose: an eval run is not an agent
+    /// run, it has no identity and may call no tools, and tying the two would let an operator
+    /// who switched off agent autonomy also switch off the evidence that their agents work —
+    /// which is the switch they most need when they are deciding whether to switch it back on.
+    pub eval_runner_enabled: bool,
+    /// How long a run may stay `running` before the runner fails it (`OMNION_AI_EVAL_TIMEOUT`).
+    ///
+    /// 900 s by default: long enough for a twenty-case suite where each case is a slow model
+    /// turn, short enough that a run whose process died between claim and settle is `error`
+    /// before an operator goes looking for it. The unit is seconds and the floor is 30 —
+    /// below that a healthy run on a slow provider would be failed by the reaper while it was
+    /// still working, which is the one failure this number exists to prevent.
+    pub eval_timeout_seconds: i64,
+    /// How often the eval runner sweeps for suites whose schedule is due (`OMNION_AI_EVAL_SCHEDULER_MS`).
+    ///
+    /// 60 s rather than the agent runner's 250 ms tick: a cron schedule has a resolution of a
+    /// minute anyway, and a sweep that reads every enabled suite is a query per suite per tick —
+    /// cheap once a minute, not four times a second.
+    pub eval_scheduler_ms: u64,
 }
 
 impl Default for AiHubConfig {
@@ -699,6 +752,9 @@ impl Default for AiHubConfig {
             agent_runner_enabled: true,
             runner_concurrency: DEFAULT_AI_RUNNER_CONCURRENCY,
             log_runner_enabled: true,
+            eval_runner_enabled: true,
+            eval_timeout_seconds: DEFAULT_AI_EVAL_TIMEOUT_SECONDS,
+            eval_scheduler_ms: DEFAULT_AI_EVAL_SCHEDULER_MS,
         }
     }
 }
@@ -1176,6 +1232,24 @@ impl Config {
                 DEFAULT_AI_RUNNER_CONCURRENCY as u64,
             )?
             .max(1) as usize,
+            eval_runner_enabled: read_flag(&read, "OMNION_AI_EVAL_RUNNER", true)?,
+            // The floor of 30 is enforced here rather than trusted from the operator: the number
+            // decides when the reaper fails a run, and a value under thirty would fail healthy
+            // runs on any provider slower than half a second per case. Clamping is the honest
+            // response — refusing to boot an installation over a too-small timeout is a far
+            // worse outcome than a timeout that ignores their number.
+            eval_timeout_seconds: i64::try_from(read_positive(
+                &read,
+                "OMNION_AI_EVAL_TIMEOUT",
+                DEFAULT_AI_EVAL_TIMEOUT_SECONDS as u64,
+            )?)
+            .unwrap_or(DEFAULT_AI_EVAL_TIMEOUT_SECONDS)
+            .max(30),
+            eval_scheduler_ms: read_positive(
+                &read,
+                "OMNION_AI_EVAL_SCHEDULER_MS",
+                DEFAULT_AI_EVAL_SCHEDULER_MS,
+            )?,
         };
 
         let mail = MailConfig {
@@ -1806,6 +1880,65 @@ mod tests {
         assert!(
             zero.is_err(),
             "a runner with no slots would report itself healthy and run nothing"
+        );
+    }
+
+    #[test]
+    fn the_eval_runner_has_a_switch_of_its_own_and_a_floored_timeout() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.ai_hub.eval_runner_enabled, "the runner is on by default");
+        assert_eq!(
+            config.ai_hub.eval_timeout_seconds, DEFAULT_AI_EVAL_TIMEOUT_SECONDS,
+            "fifteen minutes is the documented default"
+        );
+        assert_eq!(
+            config.ai_hub.eval_scheduler_ms, DEFAULT_AI_EVAL_SCHEDULER_MS,
+            "a schedule is swept once a minute"
+        );
+
+        // The reason this is a fourth switch rather than a reading of the agent runner's: an
+        // eval run is not an agent run — it has no identity and may call no tools — and the
+        // operator who switched off agent autonomy still needs the evidence that their agents
+        // work, which is the thing they most want when deciding whether to switch it back on.
+        let off = config_from(&[("OMNION_AI_EVAL_RUNNER", "false")]).expect("one flag must parse");
+        assert!(!off.ai_hub.eval_runner_enabled);
+        assert!(
+            off.ai_hub.agent_runner_enabled,
+            "switching the eval runner off must leave agent runs working"
+        );
+        assert!(
+            off.ai_hub.runner_enabled,
+            "switching the eval runner off must leave the health probe working"
+        );
+        assert!(
+            config_from(&[("OMNION_AI_RUNNER", "false")])
+            .expect("one flag must parse")
+            .ai_hub
+            .eval_runner_enabled,
+            "switching the agent runner off must leave eval runs working"
+        );
+
+        // A timeout under thirty seconds would fail healthy runs on any provider slower than
+        // half a second a case. It is clamped rather than refused: booting is not the operator's
+        // way to learn their number was too small, and a silent, documented floor is.
+        let tight = config_from(&[("OMNION_AI_EVAL_TIMEOUT", "5")]).expect("a number must parse");
+        assert_eq!(
+            tight.ai_hub.eval_timeout_seconds, 30,
+            "a five-second timeout is clamped to the floor, not honoured"
+        );
+
+        let wide = config_from(&[("OMNION_AI_EVAL_TIMEOUT", "1800")]).expect("a number must parse");
+        assert_eq!(wide.ai_hub.eval_timeout_seconds, 1800, "a real value is kept");
+
+        // 0 is refused by the positive reader: a reaper with a zero window fails the run it is
+        // asked to rescue, on the same statement that finds it.
+        assert!(
+            config_from(&[("OMNION_AI_EVAL_TIMEOUT", "0")]).is_err(),
+            "a zero timeout window would fail every run the sweep found"
+        );
+        assert!(
+            config_from(&[("OMNION_AI_EVAL_SCHEDULER_MS", "0")]).is_err(),
+            "a zero scheduler interval would spin the sweep against every suite"
         );
     }
 
