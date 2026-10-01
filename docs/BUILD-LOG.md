@@ -1333,3 +1333,80 @@ a flag on the plan document and nothing persists it yet. Slice 3's tag pipeline
 **Next.** The migration (`upgrade_plans` + `release_manifests` + `release_artifacts` + the
 REQ-129 slot), the seven routes, and the four admin screens with their empty, error, loading
 and populated states.
+
+# Wave 6 — tick 43 (2026-09-30)
+
+## What
+
+REQ-128 slice 4's **server half**: the release cache, the upgrade plan and the acknowledgement.
+
+- `crates/deployment` — the decision layer (`manifest`, `plan`, `upgrade`, `bundle`) and the store
+  (`release_manifests`, `release_artifacts`, `environment_bundles`, `upgrade_plans`).
+- `database/migrations/0199_deployment_tooling.sql` — four additive tables, three indexes and a
+  partial unique index holding one acknowledged plan per version range.
+- Nine routes under `/deployment/*`, permission-guarded `deployment.read` /
+  `deployment.bundle.generate` / `deployment.deploy`.
+- `deployment.bundle.generate` added to the permission catalogue; three event names added to the
+  events catalogue.
+- `apps/api/tests/deployment_release.rs` — three walks.
+
+## Proof
+
+```text
+cargo test -p omnion-deployment --lib            33 passed, 0 failed
+cargo test -p omnion-events --lib                49 passed, 0 failed
+cargo test -p omnion-permissions --lib           66 passed, 0 failed
+omnion-api --test deployment_release              3 passed, 0 failed   (run 3× consecutively)
+apps/admin pnpm typecheck                        tsc --noEmit, clean
+migration 0199 on a scratch database             up → down → up, all green
+```
+
+The migration's third check is the one that matters: a down script that cannot be re-applied is not
+a reversal.
+
+## What the slice proves
+
+A plan built from two cached manifests reports `unknown` — not `reversible` — for this repository,
+because REQ-129's up → down → up gate has not landed, and it marks the FIRST migration as the point
+of no return rather than the deploy step. The checklist refuses to render as complete until an
+operator acknowledges, the acknowledgement is a durable fact that survives regeneration, and it is
+unique per range.
+
+## The defects
+
+**Four in the product, every one found by running the suite against a database:**
+
+1. The acknowledgement set the actor and THEN cleared the previous holder, so the partial unique
+   index fired on the set and every acknowledgement answered `500 duplicate key`. The `update`
+   written to prevent exactly that never ran. It passed all 33 unit tests — none of them builds a
+   router, and the index only exists in a database.
+2. A `compose` plan validated its stack against `BUNDLE_KINDS` (which includes `helm`) and then
+   resolved the stack file through an `unwrap_or`, so a Helm target produced `docker compose`
+   commands against the wrong stack with no error anywhere.
+3. The acknowledgement route was guarded with `deployment.manage`, which the catalogue does not
+   have. A guard on an uncatalogued key refuses EVERY account including the instance owner; nothing
+   caught it except the walk, on its first run.
+4. The credential rule fired on any URL carrying userinfo, so it fired on
+   `postgres://omnion@postgres/omnion` — a line the compose stack writes on its healthy path.
+
+**Four in the walk, all the same shape.** A uuid's decimal digits overflow `u32`, so
+`parse().unwrap_or(1)` gave every run the SAME target version; the plan's `from_version` is the
+build's, so two walks sharing a target shared a range and one walk's consent answered the other; a
+`{id}` that was never created made a read `GET /deployment/bundles//files/…` and its `400` read as
+a permissions failure; and a `published_kinds` expectation ignored that the coverage query is
+ordered by kind. **A fixture that is silently constant looks exactly like a product that ignores its
+input.**
+
+## Not claimed
+
+No admin screen, no tag pipeline, no QA browser pass. The QA slot was held by a live sibling walkthrough
+(w3, pid 973982) for the whole tick, and a second Chromium on a load-9 box is how a pass destroys
+its own result rather than proving anything — so the pass is queued, and the slice's close gate stays
+unticked until it has measured the screens that exist.
+
+## Next
+
+The four `/deployment/*` admin screens (`/deployment/artifacts`, `/deployment/artifacts/{version}`,
+`/deployment/install`, `/deployment/upgrade`) with their empty, error, loading and populated states,
+the `walkthrough.cjs` route list extended to visit them, and the tag pipeline
+(`.github/workflows/release.yml`). Then the QA pass, which is a close gate and not a formality.

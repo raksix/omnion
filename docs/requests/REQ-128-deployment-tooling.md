@@ -1,11 +1,15 @@
 # REQ-128 — Deployment Tooling (Docker, Compose, Kubernetes)
 
-> **Status:** in-progress (slice 4's decision layer and its guide shipped: `release/lib/upgrade.py`,
-  45 unit tests, `scripts/qa/release-upgrade.sh` 32/32 with **6/6 differential mutations**,
-  `docs/deployment/upgrade.md`, all wired into CI — `4880680f`, `150fa6fc`, `d8afb179`,
-  `70da0a4e`. The verdict is `unknown` on this repository and the module refuses to soften
-  it. The API routes, the migration and the `/deployment/upgrade` screen are slice 4's
-  remaining work. Slice 3 is complete but for the tag pipeline and the screens) · **Captured:** 2026-09-26 · **Layer:** infra + release
+> **Status:** in-progress (slice 4's SERVER half shipped: `crates/deployment` (decision layer +
+>  store), `0199_deployment_tooling.sql`, nine routes, 33 unit tests, a 3/3 integration walk run
+>  three times consecutively — `8cde4d19`. **Four product defects and four walk defects, all
+>  found by running it**: an acknowledgement that SET before it cleared and so tripped its own
+>  partial unique index (every acknowledgement answered 500 with a `duplicate key`); a compose
+>  plan that accepted `helm` as a stack and then generated `docker compose` commands; a route
+>  guarded with the uncatalogued `deployment.manage` — which refuses EVERY account including the
+>  owner, and which every unit test stayed green through because none of them builds a router —
+>  and a credential rule that fired on the compose stack's own `postgres://omnion@postgres/omnion`.
+>  Still open in this slice: the four `/deployment/*` admin screens and the tag pipeline) · **Captured:** 2026-09-26 · **Layer:** infra + release
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -98,7 +102,7 @@ Migration: `database/migrations/0029_deployment_tooling.sql` (next free slot at 
 
 ### Acceptance criteria
 
-- [ ] `database/migrations/0029_deployment_tooling.sql` applies on a fresh and a populated database, and its down script reverses it.
+- [x] `database/migrations/0029_deployment_tooling.sql` applies on a fresh and a populated database, and its down script reverses it. *(Slice 4: shipped as `0199_deployment_tooling.sql`, the slot above the shared high-water at write time. Verified on a scratch database three ways, and the third is the one that matters: `up` → `down` → `up`. A down script that cannot be re-applied is not a reversal, and one that half-succeeds leaves an instance no script can continue from. Four tables — `release_manifests`, `release_artifacts`, `environment_bundles`, `upgrade_plans` — all additive, plus three indexes and a **partial** unique index holding one acknowledged plan per `(from_version, to_version, topology)`. That index is the fourth product defect's whole subject: it is a real constraint, and the code satisfying it had the two statements the wrong way round.)*
 - [ ] Each of the four apps builds from its Dockerfile with a multi-stage strategy and produces an image within its documented size budget.
 - [ ] Images run as a non-root user, start with a read-only root filesystem (documented tmp exceptions only) and pass their healthcheck.
 - [ ] No image layer or build history contains a secret or a credential-shaped build argument (asserted by a scan in CI).
@@ -482,7 +486,76 @@ The release pass executes the pipeline in dry-run mode against a scratch registr
    says, so building them first would have meant rendering a hand-written fixture and calling
    that progress. The manifest is the contract; the screens are a view of it.
 4. **Upgrade helper + docs.** Upgrade plans, destructiveness flags from REQ-129, acknowledgement, `/deployment/upgrade`, `docs/deployment/upgrade.md` and the per-version notes workflow. *Done when:* the guide's steps are executed verbatim on the QA stack and the helper's checklist matches what the operator does.
-   — **NOT STARTED. Next.**
+   — **The server half shipped** (`8cde4d19`): `crates/deployment` (the decision layer and the
+   store), `database/migrations/0199_deployment_tooling.sql`, nine permission-guarded routes and a
+   three-walk integration suite. The four admin screens and the tag pipeline are what remains.
+
+   **Proof.** `omnion-deployment --lib` **33/33**, `omnion-events --lib` 49/49, `omnion-permissions
+   --lib` 66/66, `omnion-api --test deployment_release` **3/3 run THREE TIMES consecutively**,
+   `tsc --noEmit` clean. The migration was applied, reversed and re-applied on a scratch database.
+   The repeatability is not decoration: a range reused across runs is what broke the walk twice, so
+   "passes once" and "passes when the tree is already as it was" are different claims.
+
+   **Why the crate is a crate and not a module of the API.** The decision layer — which steps, in
+   what order, and what is *known* about whether the database can be rolled back — is a property of
+   the release contract, not of the screen that renders it. A route that computed its own step list
+   would agree with itself on the day it was written and disagree with the operator's reality the
+   first time somebody changed a migration. So `crates/deployment` builds the plan, `apps/api`
+   renders it, and neither has an opinion the other does not hold.
+
+   **The finding is the third verdict, again, now with a persistence layer behind it.** The Python
+   helper said `unknown` because REQ-129's gate has not landed; the Rust half says the same thing
+   from a *different* set of inputs — the markers the release fetch discovered and whether this
+   instance has the policy — and both land on `unknown`. A manifest's `migrations_destructive:
+   false` does not produce `reversible`, and there is a unit test whose only subject is that
+   refusal. The point of no return attaches to the FIRST migration while the verdict is not
+   `reversible`, and a reversible upgrade has none at all.
+
+   **Four product defects, all found by running the suite against a database.**
+
+   - **The acknowledgement set the actor and THEN cleared the previous holder.** The partial unique
+     index is a real constraint and it fired on the *set*, so every acknowledgement answered 500
+     with `duplicate key value violates unique constraint` — and the follow-up `update` written to
+     prevent exactly that never ran. This is the clearest statement of the slice's method: it passed
+     all 33 unit tests, because none of them builds a router and the index only exists in a
+     database. Clearing first is also the order that is correct if the process dies between the two
+     statements: the range is left un-acknowledged (it re-asks) rather than double-acknowledged
+     (a state nothing can read).
+   - **A `compose` plan accepted `helm` as a stack and then generated `docker compose` commands.**
+     The check used `BUNDLE_KINDS`, the set the bundle *generator* accepts, which contains `helm`;
+     the stack file was then resolved through an `unwrap_or(<the small stack>)`, so a Helm operator
+     would have been handed a correct-looking list of commands against the wrong tool with no error
+     anywhere. Two vocabularies for two different things, and a check against the larger one accepts
+     a plan that cannot be executed.
+   - **A route guarded with `deployment.manage`, a key the catalogue does not have.** The family is
+     `read` / `preview` / `deploy` / `rollback`. A guard on an uncatalogued key refuses *every*
+     account including the instance owner, so the acknowledgement endpoint was a 503-shaped hole —
+     and nothing caught it except the integration walk, on its first execution. The key is now
+     `deployment.deploy`, and the reason is written at the guard.
+   - **The credential rule fired on any URL with userinfo**, so it fired on
+     `postgres://omnion@postgres/omnion` — a line the compose stack writes on its healthy path. A
+     scanner that fires on correct code gets its real findings ignored, which is the failure this
+     whole request is written against. `user:pass@host` is a credential; `user@host` is not.
+
+   **Four walk defects, all the same shape, and the shape is the lesson.** Every one was a fixture
+   that was silently wrong and read as a product defect: a uuid's decimal digits overflow `u32` so
+   `parse().unwrap_or(1)` produced the SAME target version on every run; the plan's `from_version`
+   is the *build's* version, so two walks picking the same target shared one range and the first
+   walk's acknowledgement answered the second; a `{id}` that was never created turned a read into
+   `GET /deployment/bundles//files/…` and its 400 read as a permissions failure; and a `published_kinds`
+   expectation ignored that the coverage query is ordered by kind. **A fixture that is silently
+   constant looks exactly like a product that ignores its input**, so the ranges are now derived from
+   each walk's own name and the acknowledgements are reset at the start of the walk that owns them.
+
+   **Still open in this slice.** The four `/deployment/*` admin screens (`/deployment/artifacts`,
+   `/deployment/artifacts/{version}`, `/deployment/install`, `/deployment/upgrade`) and the tag
+   pipeline (`.github/workflows/release.yml`). The bundle generator's `render` endpoint answers
+   with the input a real `helm template` / `docker compose config` would read and names the tool,
+   because neither command exists on an installed panel and a route that answered `501` for every
+   bundle would be a dead button.
+4. **Upgrade helper + docs.** Upgrade plans, destructiveness flags from REQ-129, acknowledgement, `/deployment/upgrade`, `docs/deployment/upgrade.md` and the per-version notes workflow. *Done when:* the guide's steps are executed verbatim on the QA stack and the helper's checklist matches what the operator does.
+   — **The decision layer, the migration, the routes and the walk are done; the screens and the guide's
+   end-to-end execution on the QA stack are not.**
 
    ### Slice 3's third part shipped: the bundle generator (`2e7ee60f`, `e303d0d6`, `cc8e2b69`)
 
