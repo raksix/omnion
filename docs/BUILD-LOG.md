@@ -11446,3 +11446,81 @@ is the lever that actually works.
 
 **Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps
 out of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+# Tick 60 — the branding editor, and a stash that belonged to somebody else
+
+Tick 59 closed criterion 9's refusal and left the box open for one reason: the customize screen
+still edited branding as free text. An operator could compose a logo, press Save, and read a
+422 that named a field with no input anywhere near it. This tick built the panel half.
+
+## What shipped
+
+`apps/admin/features/themes/theme-branding-editor.tsx` replaces the shared `FlatEditor` for the
+branding section only:
+
+- **A media library, not a text box.** Images only — a video is storable in the library and is
+  not a logo, and offering it invites the 422 the criterion exists to prevent. Upload goes
+  through `uploadMedia`, and the uploaded row is added to the list rather than waited for,
+  because an operator who just picked a file must see it selected.
+- **One message per field.** The route already sends `details.findings` with a `field` tag on
+  every finding; the panel splits on that tag instead of printing the joined sentence. The
+  joined sentence stays in the banner, because the banner is what explains *why the save
+  failed* while the per-field list is what says *which input*.
+- **The limits are read from the server.** `BrandingLimits` gained `Serialize` and
+  `SettingsView` carries `brandingLimits`, computed by `branding_limits_for()` from the same
+  manifest, through the same `for_theme`, as `check_branding`. A TypeScript copy of the ceiling
+  would be correct for every bundled theme until the first one that narrows it — the case where
+  the operator needs the number.
+- **A refused field retires its message on edit.** The panel cannot know the replacement
+  passes; only the next save measures that. Leaving the message up would claim an input is
+  wrong after the operator has replaced it.
+
+## Proof
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-content --lib` | **346 passed / 0 failed** |
+| `tsc --noEmit` (apps/admin, real tree) | exit 0 |
+| `node scripts/qa/probe-branding-editor-wiring.cjs` | **31/31**, and **9/31 against the pre-change tree** |
+| `node scripts/qa/probe-helper-contract.cjs` | 15/15 |
+| `cargo build -p omnion-content -p omnion-api --lib` | clean (warnings pre-existing) |
+
+The wiring gate reads both boundaries' sources — `BRANDING_KEYS` out of the Rust constant, the
+`derive` off the struct, the `.await` off the route — so renaming a field does not need the
+probe edited to stay true. A missing source file reads as an empty string, so an absent editor
+makes every check fail instead of throwing `ENOENT`: I measured that second way by deleting the
+file, which is also why the gate's own count is trustworthy.
+
+**Three of my own failures were in the probe, not the product.** A `derive` regex that stopped
+at `pub struct`, a route regex that omitted the `.await` and so matched nothing, and a
+`onClear` assertion pointed at the wrong file. Each was a check asserting something I had not
+written; all three were confirmed against the source by hand before the regex changed, because
+the alternative — loosening a gate until it is green — is how a gate stops measuring anything.
+
+**Browser pass: not run, and the criterion is not re-ticked for it.** The slot is held live by
+`w3` (holder pid 2914377, `cwd=/mnt/apopic/omnion-w3`, verified with `kill -0` *and*
+`/proc/<pid>/cwd`), load 18.5 on six cores, 25 Chrome processes. Criterion 9's message is now
+returned and rendered; no pass has watched it appear. `--only=theme-customize` is owed.
+
+## Two hazards worth more than the slice
+
+**A `git stash pop` pulled a sibling's work into my tree.** This repo carries three stashes from
+three other writers. I stashed my own files to measure the "before", the command failed on an
+untracked path, and the follow-up `git stash pop` applied a **sibling's** stash instead — leaving
+`scripts/qa/run.sh` with five conflict markers. `git checkout --` refuses on an unmerged path
+("path is unmerged"), so the fix is `git reset HEAD -- <path>` first, then checkout. All three
+sibling stashes survived; `run.sh` is back at HEAD and parses. **Never `git stash pop` in a
+shared worktree to measure a baseline** — copy the files aside and restore them instead.
+
+**The volume hit 100 % mid-link and the linker said `signal 7 [Bus error]`.** That is what a
+full disk looks like from `cc`, and `rustc-LLVM ERROR: IO failure on output stream` alongside
+it. Reclaiming 1,231 stale duplicate rlibs in **my own** `deps` (keeping the newest per
+crate-name+extension) freed **2.12 GB** and preserved `debug/omnion-api`, which the QA stack
+runs. Reclaim at the START of a tick on a full box, never mid-build — a reclaim that deletes
+`.fingerprint` costs a full rebuild.
+
+## Next
+
+`--only=theme-customize` on a free slot, reading the three `data-theme-branding-error` lists out
+of `summary.json` after a provoked refusal. Then REQ-062's Builder criterion (the screen landed
+in an earlier tick; its pass is still owed).
