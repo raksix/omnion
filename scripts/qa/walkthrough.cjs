@@ -1429,6 +1429,100 @@ async function runStorefrontDepth(page, report) {
   return { ok: Object.values(steps).filter((v) => v === true).length >= 8, steps: Object.keys(steps).length, steps_: steps };
 }
 
+/**
+ * Measure one screen at 390px and answer whether it fits, naming the offender when it does not.
+ *
+ * The narrow measurement is the only part of "the admin screens render at 390 px" that can be
+ * asserted: a screenshot at 1440 shows a layout nobody uses, and a screen that is *never*
+ * visited narrow cannot have its overflow measured at all. This branch's projects depth pass had
+ * six screens and no narrow measurement anywhere, so the criterion that names 390 px could not
+ * have passed even with a perfect layout — the harness had to grow before the CSS could be told
+ * the truth.
+ *
+ * Two numbers, because one of them is a common false pass:
+ *   - `documentElement` overflow is what the *reader* sees (a body that is 420px wide at 390px
+ *     scrolls the whole page sideways);
+ *   - the widest element's `getBoundingClientRect().right` past the viewport names WHICH element
+ *     is responsible, so a failure is a diagnosis rather than a boolean. An element inside an
+ *     `overflow-x-auto` wrapper is deliberately wider than the viewport — that is the table
+ *     pattern this codebase uses — so the offender search skips any node that has a scrolling
+ *     ancestor, and reports the outermost offender rather than every descendant it contains.
+ *
+ * The viewport is restored to 1440 by the caller in a `finally`, because a pass that leaves the
+ * page at 390px measures every LATER screen at phone width and reports it as broken.
+ */
+async function measureNarrow(page, { path, waitFor, label, shotName } = {}) {
+  const out = { label, path, fitsNarrow: false, widestOffender: null, offenders: 0 };
+  try {
+    if (path) {
+      await page.goto(path, { waitUntil: "domcontentloaded" }).catch(() => {});
+    }
+    if (waitFor) {
+      await page
+        .waitForSelector(waitFor, { timeout: 15000 })
+        .catch(() => {});
+    } else {
+      await page.waitForTimeout(1200).catch(() => {});
+    }
+    await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+    await page.waitForTimeout(600).catch(() => {});
+    const measured = await page
+      .evaluate(() => {
+        const vw = document.documentElement.clientWidth;
+        const scrollingAncestor = (node) => {
+          for (let el = node.parentElement; el && el !== document.body; el = el.parentElement) {
+            const ov = getComputedStyle(el).overflowX;
+            if (ov === "auto" || ov === "scroll" || ov === "hidden") return true;
+          }
+          return false;
+        };
+        const offenders = [];
+        for (const el of document.body.querySelectorAll("*")) {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          if (r.right <= vw + 1) continue;
+          if (scrollingAncestor(el)) continue;
+          offenders.push({
+            tag: el.tagName.toLowerCase(),
+            testid: el.getAttribute("data-testid") || el.getAttribute("data-project-table")
+              || el.getAttribute("data-project-members") || "",
+            cls: (el.getAttribute("class") || "").slice(0, 120),
+            right: Math.round(r.right),
+            width: Math.round(r.width),
+            depth: (() => { let d = 0; for (let n = el; n; n = n.parentElement) d += 1; return d; })(),
+          });
+        }
+        // The OUTERMOST offender: a child of a wide box is not the cause of it.
+        offenders.sort((a, b) => a.depth - b.depth);
+        return {
+          docOverflow: document.documentElement.scrollWidth > vw + 1,
+          vw,
+          scrollWidth: document.documentElement.scrollWidth,
+          count: offenders.length,
+          first: offenders[0] || null,
+        };
+      })
+      .catch(() => null);
+    if (measured) {
+      out.fitsNarrow = measured.docOverflow === false;
+      out.offenders = measured.count;
+      out.docScrollWidth = measured.scrollWidth;
+      out.docClientWidth = measured.vw;
+      out.widestOffender = measured.first;
+    }
+    if (shotName) await shot(page, shotName);
+  } catch (err) {
+    out.error = err.message;
+  }
+  return out;
+}
+
+/** Back to desktop width. Every caller puts this in a `finally` for the reason above. */
+async function restoreDesktop(page) {
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+  await page.waitForTimeout(300).catch(() => {});
+}
+
 async function runProjectsDepth(page, report) {
   const steps = {};
   log("projects: discovering a project through the API");
@@ -1669,6 +1763,45 @@ async function runProjectsDepth(page, report) {
   steps.notFoundRendered = /no such project/i.test(notFoundText);
   steps.notFoundLeaksPermission = /not allowed|forbidden|permission|unauthor/i.test(notFoundText);
   await shot(page, "page-project-not-found");
+
+  // 8 · 390px. Six screens, and this is the first tick that ever MEASURED any of them narrow —
+  //     the acceptance line names 390 px and until now nothing in this pass went there, so the
+  //     line could not have passed however the CSS looked. `record` rather than `steps` because
+  //     a layout failure is a finding for the roll-up, not a boolean in this pass's tally: a
+  //     false here is a defect someone has to fix, and hiding it in `steps_` would make the pass
+  //     green for it.
+  const narrow = [];
+  try {
+    for (const screen of [
+      { label: "projects-list", path: `${URL_ADMIN}/automation/projects`, waitFor: "[data-project-table]" },
+      { label: "project-detail", path: `${URL_ADMIN}/automation/projects/${project.id}`, waitFor: "[data-project-members]" },
+      { label: "project-limits", path: `${URL_ADMIN}/automation/projects/${project.id}/limits`, waitFor: null },
+      { label: "project-audit", path: `${URL_ADMIN}/automation/projects/${project.id}/audit`, waitFor: "[data-project-audit]" },
+    ]) {
+      narrow.push(await measureNarrow(page, { ...screen, shotName: `page-${screen.label}-mobile` }));
+    }
+  } finally {
+    await restoreDesktop(page);
+  }
+  for (const m of narrow) {
+    steps[`narrow_${m.label}`] = m.fitsNarrow;
+    record({
+      page: "projects",
+      action: "narrow",
+      step: m.label,
+      rendered: m.fitsNarrow,
+      fitsNarrow: m.fitsNarrow,
+      docScrollWidth: m.docScrollWidth,
+      docClientWidth: m.docClientWidth,
+      offenders: m.offenders,
+      offender: m.widestOffender ? `${m.widestOffender.tag}.${m.widestOffender.testid || m.widestOffender.cls}` : null,
+      reason: m.fitsNarrow
+        ? undefined
+        : `horizontal overflow at 390px (scrollWidth ${m.docScrollWidth} > ${m.docClientWidth})`,
+    });
+  }
+  steps.narrowScreensMeasured = narrow.length;
+  steps.narrowAllFit = narrow.length > 0 && narrow.every((m) => m.fitsNarrow);
 
   return { ok: true, steps: Object.keys(steps).length, steps_: steps };
 }
