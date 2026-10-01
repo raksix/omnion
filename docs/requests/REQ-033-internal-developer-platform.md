@@ -1,53 +1,68 @@
 # REQ-033 — Internal Developer Platform
 
-> **Status:** in-progress (`3d5d299d`; tick 103 — **slice 1's remaining half is shipped as
-> code: the routes, the two screens, the catalogue entries and the authentication path. Slice 1
-> is complete as code and open on exactly one thing, the browser pass, which is queued behind a
-> live w6 holder.** Three commits: `9e597100` the authentication decisions, `d210444b` the routes
-> and screens, `3d5d299d` the key guard itself.
+> **Status:** in-progress (`54853888`; tick 104 — **slice 2 is code-complete: the OpenAPI
+> document, the Explorer runtime, the permission split, the screen and the walkthrough pass all
+> ship.** The browser pass is queued behind a live w7 holder and is the only thing slice 2
+> still waits on.) Three commits: `be241bd2` the document and the drift gate, `de029671` the
+> runtime and the routes, `54853888` the screen and the pass.
 >
-> **The decision this tick turned on: one refusal with two layers.** `authn::decide` returns the
-> *precise* reason a key was refused — revoked, expired, or an address the allowlist excluded —
-> because an operator whose key suddenly stops working needs to be told "your allowlist excluded
-> you" rather than "your secret is wrong", and a log line is where that belongs.
-> `KeyRefusal::into_error` collapses address-not-allowed into the generic answer, because a
-> caller must not be able to learn which keys exist. Both halves are asserted, and the lesson is
-> that **a fix to either one alone regresses the other** — the two tests caught exactly this when
-> they were first written against the wrong layer.
+> **The decision slice 2 turned on: the Explorer dispatches *through the router*, not around
+> it.** `POST /api/v1/dev/explorer/requests` builds an in-process `Request` carrying the
+> caller's own `omnion_session` cookie and a CSRF token derived from that session, and hands it
+> to the same `Router` `main.rs` already serves. Every layer therefore runs for real — the
+> permission guard, CSRF, the rate limiter, the module guard — so the `403` the panel shows is
+> the `403` the caller would get from their own terminal.
 >
-> **Why a key is not a `CurrentSession`, and never becomes one.** `developer_auth::KeyPrincipal`
-> carries an organization, a scope list and a key id — no user id, no session row. A key is a
-> credential pasted into somebody's `.env` by whoever holds that file; manufacturing a synthetic
-> session for it is how a platform ends up with audit rows naming a person who never made the
-> request. `actor_user_id()` returns `None` and a test asserts it.
+> The request file's risk note is the sharpest sentence in the specification: *"The Explorer can
+> resemble a privileged proxy: it must run with the caller's session and permissions only."* Two
+> shortcuts break that, and both look identical in the panel. An outbound HTTP request to
+> localhost with a service credential is a superuser wearing a developer's clothes. Dispatching
+> into handlers while skipping the guards is a hole in every permission on the platform. So
+> there is no path in this code that reaches a handler without passing the layers, and the
+> router is **passed in from `main.rs`** rather than rebuilt — a second `Router::new()` would
+> install a second header layer, a second limiter and a second IP access list into the same
+> process-wide `OnceLock`s, and the second install would be silently ignored, leaving the
+> Explorer running under the outer policy or under none.
 >
-> **Why a key authorises against its own scopes while a service account authorises against its
-> roles.** Different questions, and the module says why: a service account is a person's
-> automation whose power is a *role change* — visible, attributable, reviewed — while a key's
-> scope list is the only place its power is written down anywhere, because nobody necessarily
-> knows the key exists. Scope matching is exact (plus the explicit global `*`); a prefix match
-> would hand a read-only key the write beside it, and a test asserts the same-family case.
+> **Four refusals are decided before anything is sent, in one pure function.** A path outside
+> `/api/v1`; a path parameter that climbs out of it; a body over 128 KB; and any path under
+> `/api/v1/dev/`, which is how the Explorer is stopped from **recursing into itself**. The
+> escape check runs on the *substituted* path rather than the template, because a path parameter
+> is attacker-controlled text and `page_id = "../../admin"` is in the value, not the template. The
+> recursion rule is a **prefix** rather than a list of the Explorer's own two routes, so a third
+> debugging surface added under `/dev/` later is covered without anybody remembering.
 >
-> **Defects the tests caught this tick, all fixed in the same commit.** (1) `u64::from(Ipv4Addr)`
-> does not exist — it needs `u64::from(u32::from(..))`; the `/0` case additionally needs the mask
-> computed in a width that can hold the shift, or `u32::MAX << 32` overflows and every
-> `0.0.0.0/0` allowlist is silently wrong. (2) `::/0` was matching a v4 address, which turns a
-> well-intentioned dual-stack allowlist into a universal bypass. (3) `ApiError: From<sqlx::Error>`
-> does not exist in this API, and the store's error is *not* `sqlx::Error` either — it wraps it —
-> so the three call sites that assumed otherwise were three compile errors, and one of them
-> would have been a `500` where the answer should have been a `400`.
+> **The drift gate is the other half of the slice, and it earned its keep immediately.** A
+> declared operation table can describe a route that does not exist (an operation whose `Send`
+> button 404s) and can omit one that does (a reference that lies by omission). `explorer_openapi`
+> closes both by parsing `routes/mod.rs` and comparing `(method, path)` against the document and
+> against an explicit `UNDOCUMENTED_BASELINE` of 355 entries. The parser had to learn **five**
+> shapes of this router before the check was worth having, and each was found by the tripwire
+> rather than by reading: a `let` split across lines by parentheses, one whose value is on the
+> next line, one carrying a `: MethodRouter<…>` annotation, a `.route(` call written across
+> three lines, and a `.merge(` chain **whose every line is balanced**. Missing any one does not
+> fail loudly — it makes the parse silently smaller than the router, so every drift assertion
+> passes over a subset. That is why `the_parse_still_sees_the_whole_router` asserts a floor on
+> how many routes were seen, and why the floor is **measured** (260 pairs from 256 call sites)
+> rather than guessed.
 >
-> **Gates:** `cargo test -p omnion-api --lib` **375 passed** (339 before this tick, +36),
-> `cargo test -p omnion-developer --features store` **39**, `cargo check -p omnion-api` exit 0,
-> `pnpm typecheck` **2/2**, `node --check` clean on the walkthrough.
+> **Two permissions, and the split is what keeps the reference read-only.** `developer.read` is
+> browsing the document — the same question as reading a key's metadata, so a manager holds it.
+> `developer.explorer.run` is *sending*, which acts as the person at the screen and stays with
+> owner/administrator. Collapsing them would have made a read-only role's Explorer a write
+> capability, which is the same mistake slice 1 made the mistake of not making.
 >
-> **STILL OPEN for slice 1:** the browser pass. Both screens are walked as routes
-> (`/developer/keys`, `/developer/logs`) so their loading and error states have a first paint, but
-> the pass is queued behind a live w6 holder (holder pid 2904616, `/proc/<pid>/cwd` =
-> `/mnt/apopic/omnion-w6`, verified). **No acceptance box is ticked**: every box in this slice is
-> about what a *request* does, and a request path no browser has exercised is not yet proved. ·
-> **Captured:** 2026-09-25 · **Layer:** `apps/admin` + SDKs
-> **Source:** owner brief — platform periphery & headline features (2026-09-25)
+> **Gates:** `cargo test -p omnion-developer --features store` **54** (was 39, +15),
+> `cargo test -p omnion-api --lib` **387** (was 375, +12), `cargo test -p omnion-permissions`
+> **64**, `cargo test -p omnion-api --test explorer_openapi` **5**,
+> `cargo check -p omnion-api` clean, `pnpm typecheck` **2/2**, `node --check` clean.
+>
+> **STILL OPEN for slice 2:** the browser pass, queued behind a live w7 holder (holder pid
+> 1128224, `/proc/<pid>/cwd` = `/mnt/apopic/omnion-w7`, verified live). **No acceptance box is
+> ticked** — the four boxes this slice owns are all about what a *sent request* does, and a
+> request path no browser has exercised is not yet proved. · **Captured:** 2026-09-25 ·
+> **Layer:** `apps/admin` + SDKs · **Source:** owner brief — platform periphery & headline
+> features (2026-09-25)
 
 ## Request
 
@@ -244,7 +259,7 @@ Visual check: the one-time secret dialog is unmistakable (warning icon, explicit
 1. **Keys + logs.** Migration, key CRUD with rotate/revoke, secret hashing, request-log middleware with filters, `/developer/keys` and `/developer/logs`.
    Done: a key created in the UI authenticates a real call, is scope-enforced, and appears in the logs with the correct status and duration.
 2. **API Explorer.** OpenAPI emission, operation browser, schema-driven request form, send-as-caller, snippet drawer, CI drift check.
-   Done: Explorer steps from the walkthrough pass and the drift check runs in the pipeline.
+   **Code-complete** (`be241bd2`, `de029671`, `54853888`): the document, the runtime, the routes, the screen and the depth pass all ship; the drift check is a test that runs in `cargo test --workspace`, which is what CI runs. **Open on the browser pass alone.**
 3. **OAuth apps + events catalog.** App registration and editing, secret rotation with overlap, authorization-code plus PKCE, catalog from the event registry, webhook deep link.
    Done: a local test client completes the flow and every catalog sample validates against its schema.
 4. **SDKs + CLI + polish.** Scaffold generator, manifest validator, CLI device-code, overview cards, permission-hidden controls, mobile layout.

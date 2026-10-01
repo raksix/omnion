@@ -11691,3 +11691,83 @@ the browser pass over this build has not run.
 one-time secret dialog (which refuses to close until the secret is acknowledged), rotation's "the
 old secret stops working immediately" confirmation, the log's filters and its no-bodies
 explanation. Then, once slice 1's box can be ticked, slice 2: the API Explorer.
+
+
+---
+
+## Tick 104 — REQ-033 slice 2: the API Explorer
+
+**What.** The OpenAPI document the Explorer is driven from, the runtime that sends a call as the
+signed-in caller, the two permissions, the screen and a walkthrough depth pass that actually
+sends one. Three commits: `be241bd2` (document + drift gate), `de029671` (runtime + routes),
+`54853888` (screen + pass).
+
+**The decision the slice turned on.** The Explorer dispatches **through the application router**,
+in process, with the caller's own session cookie and a CSRF token derived from that session.
+Every layer runs for real, so the `403` the panel shows is the `403` the caller would get from
+their own terminal. The router is passed in from `main.rs` rather than rebuilt: a second
+`Router::new()` would install a second header layer, limiter and IP access list into the same
+process-wide `OnceLock`s, and the second install would be silently ignored — leaving the Explorer
+under the outer policy or under none.
+
+**Proof.**
+
+- `cargo test -p omnion-developer --features store` — **54 passed** (39 before, +15)
+- `cargo test -p omnion-api --lib` — **387 passed** (375 before, +12)
+- `cargo test -p omnion-permissions` — **64 passed**
+- `cargo test -p omnion-api --test explorer_openapi` — **5 passed**
+- `cargo check -p omnion-api` — clean
+- `pnpm typecheck` — **2/2 successful**
+- `node --check scripts/qa/walkthrough.cjs` — clean
+
+**What the drift gate caught, which is the most useful thing in this entry.** The parser had to
+learn five shapes of this router before the check was worth anything, and the *tripwire* found
+each one — not a failure, which is the dangerous kind:
+
+1. a `let` split across lines by parentheses;
+2. a `let` whose value is on the next line (balanced, so a depth test alone stops there);
+3. a `let` carrying a `: MethodRouter<AppState, Infallible>` annotation, so splitting the name
+   at the first `=` produced `media_raw: MethodRouter<AppState, Infallible> ` as the name;
+4. a `.route(` call written across three lines, where the first `,` in the text is inside a
+   `guards::require(&state, "…")`;
+5. a `.merge(` chain **whose every line is balanced** — so `POST /api-keys` and
+   `DELETE /api-keys/{id}` were invisible, and the check would have *confirmed* a verb the router
+   does not serve on that path.
+
+Each of these does not fail loudly. It makes the parse smaller than the router, so every drift
+assertion passes over a subset — which is the same failure mode as an assertion that cannot
+fail. That is why `the_parse_still_sees_the_whole_router` exists and asserts a floor of 250
+routes against a **measured** 260.
+
+**Two smaller ones, both from a guess that turned out to be a measurement in disguise.** The
+`MINIMUM_ROUTES_SEEN` floor was written as 330 from an estimate and failed against a real 260;
+the `UNDOCUMENTED_BASELINE` was hand-written from a reading of the file and was wrong in *both*
+directions at once — 145 entries for routes that do not exist and 241 real routes missing. Both
+are now generated from the parse, which is the only version of a list that can be correct.
+
+**Also caught:** a path parameter that climbs out of the prefix is checked on the *substituted*
+path, not the template, because the parameter is the attacker-controlled half; and the recursion
+guard is a `/api/v1/dev/` prefix rather than a list of the Explorer's two own routes, so a third
+surface added there later is covered without remembering.
+
+**Not ticked.** No acceptance box. The four boxes this slice owns are all about what a *sent
+request* does, and no browser has sent one through this build yet.
+
+**The pass is queued, and the slot is not mine.** Launched as
+`QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104 QA_WEB_PORT=3204 QA_OUT_ROOT=/dev/shm/…
+CARGO_TARGET_DIR=/dev/shm/w5-target --only=developer,api-explorer`. It is waiting on the QA slot,
+held by a **live** w7 pass — holder pid 1128224, `/proc/1128224/cwd` = `/mnt/apopic/omnion-w7`,
+verified with `kill -0` rather than by the age of the place file. `/mnt/apopic` was at 97%, so
+the artifacts and the build cache are on tmpfs.
+
+**One note carried forward from tick 103 and re-confirmed here.** The pass launched then was
+SIGKILLed and left its waiter reparented to PID 1 with its place file behind. This tick found
+the stale place file, read the holder file, and confirmed the holder was a *different, live*
+pass — so it was left alone. **A place file is not evidence of a stale lock; the holder pid in
+the file is.** Never clean one up by matching a pattern.
+
+**Next.** The queued pass over the three developer screens: the Explorer sends a `GET` and shows
+the answer, a call the caller cannot make comes back `403` naming the permission and not the
+roles, `/api/v1/dev/…` is refused as recursive, a path outside `/api/v1` is refused, and every
+snippet carries `$OMNION_API_KEY` and no credential. Then tick slice 2's boxes and start slice 3
+(OAuth apps + the events catalog).
