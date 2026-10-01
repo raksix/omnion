@@ -14076,15 +14076,53 @@ async function runWorkflowTableDepth(page, report) {
   // The reverse direction: a value the table committed is still there after the builder is
   // opened and closed. A table that wrote to a different projection would pass every check
   // above and fail exactly here.
+  //
+  // READ OFF THE CANVAS, and the naming is the argument. The field is `builderSeesTableEdit`
+  // and the line above it navigates to the builder, so a `fetch` of the graph here was a claim
+  // about Postgres wearing the name of a claim about a screen: a canvas that mounted no node, or
+  // an inspector that never received the graph, reported `true` identically. This is the
+  // tick-57 defect one block up — there the wire was read where the criterion named the panel,
+  // and the fix was the same: read the surface the sentence is about.
+  //
+  // So the read is card → inspector → field. The card that carries the value is found FIRST, by
+  // asking every card's inspector in turn, because the criterion does not say which node the
+  // table edit landed on and a probe that assumed it would be asserting a guess. The node id
+  // travels into the report so a `false` names the node that did not show it.
   await page.goto(`${admin}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1500);
-  const builderSeesTableEdit = await page.evaluate(async (id) => {
-    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
-    return Object.values(current.graph.nodes ?? {}).some((n) =>
-      Object.values(n.params ?? {}).includes("qa.table.edited"),
-    );
-  }, workflowId);
-  note({ step: "table-save-survives", builderSeesTableEdit });
+  // Wait for the MARKER rather than a delay. `waitForTimeout(1500)` is a guess about mount time,
+  // and every assertion below is green against a page that has not drawn yet — the race tick 57
+  // spent itself on, here in its quietest form: a fixed delay is the only kind of wait that is
+  // wrong in the same direction every time and only on a slow machine.
+  await page.waitForSelector("[data-node-id]", { timeout: 20000 }).catch(() => {});
+  await page.waitForSelector("[data-inspector]", { timeout: 20000 }).catch(() => {});
+  const canvasRead = await page.evaluate((value) => {
+    const cards = Array.from(document.querySelectorAll("[data-node-id]"));
+    const seen = [];
+    for (const card of cards) {
+      const nodeId = card.getAttribute("data-node-id");
+      // A card is only a card the author can inspect if clicking it opens the inspector; with
+      // nothing selected the inspector holds the RULE settings, so its fields are the wrong
+      // answer to "does this node show the table's value".
+      const panel = document.querySelector(`[data-inspector="${nodeId}"]`);
+      if (!panel) continue;
+      const fields = Array.from(panel.querySelectorAll("[data-inspector-field]")).map((el) => ({
+        key: el.getAttribute("data-inspector-field"),
+        value: el.value ?? null,
+      }));
+      seen.push({ nodeId, found: fields.some((f) => f.value === value) });
+    }
+    return {
+      cards: cards.length,
+      inspected: seen.length,
+      // The node the value is on, so a `false` says WHICH node failed rather than only that
+      // something did. A count of zero is the same number whether the canvas is empty or the
+      // value is on a node the row never clicked.
+      nodeShowingValue: seen.find((entry) => entry.found)?.nodeId ?? null,
+      builderSeesTableEdit: seen.some((entry) => entry.found),
+      inspectedIds: seen.map((entry) => entry.nodeId),
+    };
+  }, "qa.table.edited");
+  note({ step: "table-save-survives", ...canvasRead });
   await shot(page, "page-workflow-table-final");
 
   // ---- An unfinished rule SAVES, and the run is where it refuses ---------------------------
