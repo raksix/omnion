@@ -28,7 +28,7 @@ use axum::response::{IntoResponse, Response};
 use omnion_content::api_tokens::{self, AuthFailure, AuthenticatedToken};
 use omnion_content::content_read::{
     self, Cursor, DEFAULT_LIMIT, Fields, MAX_FIELDS, MAX_LIMIT, ReadMedia, ReadPage,
-    SELECTABLE_MEDIA_FIELDS, SELECTABLE_PAGE_FIELDS, SortKey,
+    SELECTABLE_MEDIA_FIELDS, SELECTABLE_PAGE_FIELDS, SortKey, SortSource,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -140,15 +140,11 @@ impl FromRequestParts<AppState> for ContentToken {
         // The `Result<_, AuthFailure>` is the same verdict slice 1 hands out: invalid / expired /
         // revoked are three different problems and each has its own code, so a caller whose
         // credential merely expired is not told to rotate a token that was fine.
-        let authenticated = match api_tokens::authenticate_any_organization(
-            state.db().pool(),
-            &raw,
-        )
-        .await
-        {
-            Ok(authenticated) => authenticated,
-            Err(failure) => return Err(auth_failure_response(&failure)),
-        };
+        let authenticated =
+            match api_tokens::authenticate_any_organization(state.db().pool(), &raw).await {
+                Ok(authenticated) => authenticated,
+                Err(failure) => return Err(auth_failure_response(&failure)),
+            };
 
         // A successful call is the moment `last_used_at` means something, and it is written here
         // rather than in a background task: the Tokens tab's "last used" column would otherwise
@@ -321,6 +317,14 @@ struct ListRequest {
     locale: Option<String>,
     limit: i64,
     sort: SortKey,
+    /// The **qualified** SQL expression `sort` resolved to, e.g. `p.updated_at` or `r.title`.
+    ///
+    /// The sort and the column it names are resolved together, by
+    /// [`SortKey::expression`], and this field is the single copy the ORDER BY, the keyset
+    /// predicate and the cursor all read. That is the point: the three used to name the sort
+    /// separately, so a sort could order by one column and page by another, and nothing about
+    /// the request would disagree.
+    column: &'static str,
     fields: Fields,
     cursor: Option<Cursor>,
     updated_since: Option<OffsetDateTime>,
@@ -337,6 +341,7 @@ impl ListRequest {
         // out-of-scope sentinel and it stripped the *wrong* meaning. `site_filter` now returns
         // `SITE_OUT_OF_SCOPE` for that case, so it has to reach the SQL untouched.
         let site_id = token.site_filter(query.site)?;
+        let sort = page_sort_of(query.sort.as_deref())?;
         Ok(Self {
             site_id,
             locale: query
@@ -346,7 +351,10 @@ impl ListRequest {
                 .transpose()
                 .map_err(|error| bad_parameter("locale", error.to_string()))?,
             limit: limit_of(query.limit)?,
-            sort: sort_of(query.sort.as_deref())?,
+            sort,
+            column: sort
+                .expression(SortSource::Pages)
+                .expect("a page sort is checked before it gets here"),
             fields: Fields::parse(query.fields.as_deref(), &SELECTABLE_PAGE_FIELDS)
                 .map_err(|error| bad_parameter("fields", error.to_string()))?,
             cursor: query
@@ -370,11 +378,18 @@ impl ListRequest {
 
     /// Validate a media list call.
     fn for_media(token: &ContentToken, query: &MediaListQuery) -> Result<Self, ApiError> {
+        // A file has no title, so this relation supports two of the three sorts. The refusal is a
+        // `400` naming `sort` and listing the two — previously the third sort was accepted here
+        // and became `m.title` in the query, which is a `500` on a documented parameter.
+        let sort = media_sort_of(query.sort.as_deref())?;
         Ok(Self {
             site_id: token.site_filter(query.site)?,
             locale: None,
             limit: limit_of(query.limit)?,
-            sort: sort_of(query.sort.as_deref())?,
+            sort,
+            column: sort
+                .expression(SortSource::Media)
+                .expect("a media sort is checked before it gets here"),
             fields: Fields::parse(query.fields.as_deref(), &SELECTABLE_MEDIA_FIELDS)
                 .map_err(|error| bad_parameter("fields", error.to_string()))?,
             cursor: query
@@ -425,14 +440,31 @@ fn limit_of(raw: Option<i64>) -> Result<i64, ApiError> {
     }
 }
 
-/// Validate a `sort`, defaulting to the one the docs call the contract.
-fn sort_of(raw: Option<&str>) -> Result<SortKey, ApiError> {
-    match raw {
-        None => Ok(SortKey::UpdatedAt),
-        Some(value) => {
-            SortKey::parse(value).map_err(|error| bad_parameter("sort", error.to_string()))
-        }
-    }
+/// Validate a `sort` for the pages/posts relation, defaulting to the one the docs call the
+/// contract.
+fn page_sort_of(raw: Option<&str>) -> Result<SortKey, ApiError> {
+    page_sort(raw.unwrap_or("updated_at"))
+}
+
+/// Validate a `sort` for the media relation.
+fn media_sort_of(raw: Option<&str>) -> Result<SortKey, ApiError> {
+    media_sort(raw.unwrap_or("updated_at"))
+}
+
+/// `sort` for a page list, as a `400` naming the parameter.
+fn page_sort(raw: &str) -> Result<SortKey, ApiError> {
+    SortKey::parse_for(raw, SortSource::Pages)
+        .map_err(|error| bad_parameter("sort", error.to_string()))
+}
+
+/// `sort` for a media list, as a `400` naming the parameter.
+///
+/// A separate function from [`page_sort`] because the *vocabulary* differs: a file has no title,
+/// so a caller who copy-pasted the pages' `?sort=title` gets told what media actually sorts by
+/// rather than a `500` about a column named `m.title`.
+fn media_sort(raw: &str) -> Result<SortKey, ApiError> {
+    SortKey::parse_for(raw, SortSource::Media)
+        .map_err(|error| bad_parameter("sort", error.to_string()))
 }
 
 /// A `400 invalid_parameter` that names the parameter in both the message and the details.
@@ -563,16 +595,21 @@ async fn list_pages_of_type(
         // The keyset predicate, in the sort's own direction. `or` rather than `and` on the id is
         // what makes rows with an identical sort value come out in a stable, non-repeating
         // order — without the tiebreak, two pages can return the same row twice.
+        //
+        // `request.column` is the *qualified expression* the sort resolved to, not a name this
+        // file assembles. It used to be `format!("p.{}", sort.column())`, which is how a
+        // documented `?sort=title` became `p.title` — a column that has never existed on `pages`,
+        // because the title is the revision's — and every call with it was a 500.
         sql.push_str(&format!(
-            " and (p.{column} < ${index} or (p.{column} = ${index} and p.id < ${next}))",
-            column = request.sort.column(),
+            " and ({column} < ${index} or ({column} = ${index} and p.id < ${next}))",
+            column = request.column,
             next = index + 1
         ));
         index += 2;
     }
     sql.push_str(&format!(
-        " order by p.{column} desc, p.id desc limit ${index}",
-        column = request.sort.column()
+        " order by {column} desc, p.id desc limit ${index}",
+        column = request.column
     ));
 
     let mut statement = sqlx::query(&sql);
@@ -594,25 +631,25 @@ async fn list_pages_of_type(
         // cannot be parsed as the requested sort is refused rather than compared: a caller that
         // changes `sort` mid-walk would otherwise get a page from the wrong ordering that looks
         // like a legitimate one.
-        // The cursor's value is bound as TEXT in both cases, because the keyset predicate
-        // compares a *column* against it and the column's type follows the sort. Binding it
-        // once as a string and letting PostgreSQL cast per the column keeps one code path and
-        // makes the "wrong sort order" refusal a real check rather than a type error.
-        let value = match request.sort {
-            SortKey::Title => Ok(cursor.value.clone()),
-            SortKey::CreatedAt | SortKey::UpdatedAt => OffsetDateTime::parse(
-                &cursor.value,
-                &time::format_description::well_known::Rfc3339,
-            )
-            .map(|parsed| parsed.to_string())
-            .map_err(|_| {
-                bad_parameter(
-                    "cursor",
-                    "this cursor does not belong to this sort order".into(),
-                )
-            }),
-        }?;
-        statement = statement.bind(value).bind(cursor.id);
+        //
+        // **It is bound as the parsed `OffsetDateTime`, never as the string.** It used to be
+        // `map(|parsed| parsed.to_string())` — parsed correctly, then handed to PostgreSQL as
+        // `text`. `timestamptz < text` has no operator, so PostgreSQL answered
+        // `500 operator does not exist: timestamp with time zone < text` and the walk died on
+        // page two. Parsing and then re-stringifying threw away the type it had just recovered.
+        //
+        // The two sorts bind **two different types**, so they cannot be one `match` value: sqlx's
+        // `Query` is typed by the binds it has already seen, and a `String` and an
+        // `OffsetDateTime` are not the same statement. Each arm binds inside its own `if`, which
+        // is also the only way this stays a *compile* error rather than a runtime cast.
+        if matches!(request.sort, SortKey::Title) {
+            statement = statement.bind(cursor.value.clone());
+        } else {
+            let value = content_read::cursor_instant(&cursor.value)
+                .map_err(|error| bad_parameter("cursor", error.to_string()))?;
+            statement = statement.bind(value);
+        }
+        statement = statement.bind(cursor.id);
     }
     let rows = statement
         .bind(request.fetch_limit())
@@ -626,11 +663,21 @@ async fn list_pages_of_type(
             )
         })?;
 
-    // Over-fetch by one so `Page::new` can say "there may be more" from a full page alone.
+    // The over-fetch happens in SQL only. **The row that exists to decide `next_cursor` must not
+    // be rendered**: the two list handlers built `items` from `rows` (which includes it) while
+    // `count` and the cursor were taken from `visible` (which does not), so a `limit=2` call
+    // answered `count: 2` with **three** items, and a caller honouring `count` skipped one of
+    // them and then received it again on the next page. The walk in
+    // `content_read_surface` is what caught it: five rows at two per page produced seven slugs
+    // across four pages.
+    //
+    // `visible` is the whole answer now — items, count, cursor and ETag all come from it, so
+    // "what the caller was told" and "what the caller is sent" cannot disagree.
+    let visible = &rows[..rows.len().min(request.limit as usize)];
     let fetched = rows.len() as i64;
-    let mut items: Vec<Value> = Vec::with_capacity(rows.len());
-    let mut stamps: Vec<(String, Uuid)> = Vec::with_capacity(rows.len());
-    for row in &rows {
+    let mut items: Vec<Value> = Vec::with_capacity(visible.len());
+    let mut stamps: Vec<(String, Uuid)> = Vec::with_capacity(visible.len());
+    for row in visible {
         let page = ReadPage {
             id: row.get("id"),
             slug: row.get("slug"),
@@ -644,16 +691,13 @@ async fn list_pages_of_type(
             summary: row.get("summary"),
             revision: row.get("revision_no"),
         };
-        stamps.push((page.updated_at.to_string(), page.id));
+        stamps.push((content_read::stamp(page.updated_at), page.id));
         items.push(page.to_value(&request.fields, request.locale.as_deref(), &[]));
     }
-    // The cursor is taken from the last row the caller will actually see, which is the
-    // `limit`-th when the query over-fetched.
-    let visible = &rows[..rows.len().min(request.limit as usize)];
-    let next_cursor = if fetched > request.limit {
+    let next_cursor = if content_read::continues(fetched, request.limit) {
         visible.last().map(|row| {
             content_read::encode_cursor(&Cursor::new(
-                sort_value_of(row, request.sort),
+                sort_value_of(row, request.sort, SortSource::Pages),
                 row.get("id"),
             ))
         })
@@ -664,38 +708,35 @@ async fn list_pages_of_type(
     let etag = content_read::list_etag(&stamps);
     Ok(ReadResponse {
         status: StatusCode::OK,
-        etag: etag.clone(),
+        etag,
         body: json!({
             "items": items,
             "next_cursor": next_cursor,
-            "count": visible.len(),
+            "count": items.len(),
         }),
     })
 }
 
 /// The value a cursor stores for a row, in the sort the request asked for.
 ///
-/// **Timestamps go into the cursor as RFC 3339, not as the driver's `Display`.** That is the
-/// whole fix for a pagination walk that returned page one forever: `OffsetDateTime::to_string()`
-/// writes `2026-09-30 21:53:21.509904 +00:00:00`, the consumer above parses with `Rfc3339`, the
-/// parse fails, and — because the failure happens while *building* the keyset predicate — the
-/// request answers `400` for every page after the first. A caller paging through five rows saw
-/// two rows and a `next_cursor: null` and concluded the set was smaller than it was.
+/// **Both timestamp ends go through [`content_read::stamp`].** The pages half of this function
+/// formatted RFC 3339 while the media half used `OffsetDateTime::to_string()` — the driver's
+/// `Display`, which writes `2026-09-30 21:53:21.509904 +00:00:00` — and the media *reader* parsed
+/// RFC 3339. Each half was internally consistent; the walk crossed a format boundary. It has now
+/// been fixed once in each direction across two ticks, which is the proof that a format has to be
+/// a function both halves call, not a convention each half follows.
 ///
-/// The two ends of a round trip live in different files (`encode` in the store, the predicate
-/// here), so the format is pinned on **both** sides by name rather than left to whichever
-/// `Display` happens to be in scope. `sort_value_of` is the writer; the `Rfc3339` parse above is
-/// the reader; this comment is the contract between them.
-fn sort_value_of(row: &sqlx::postgres::PgRow, sort: SortKey) -> String {
-    fn stamp(value: OffsetDateTime) -> String {
-        value
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| value.to_string())
-    }
+/// The row is read by the alias [`SortKey::read_as`] names, not by a name derived here: the
+/// media default sorts on `coalesce(updated_at, created_at)`, and that value is not `updated_at`.
+fn sort_value_of(row: &sqlx::postgres::PgRow, sort: SortKey, source: SortSource) -> String {
+    let alias = sort
+        .read_as(source)
+        .expect("a sort that reached a query can be read back");
     match sort {
-        SortKey::Title => row.get::<String, _>("title"),
-        SortKey::CreatedAt => stamp(row.get::<OffsetDateTime, _>("created_at")),
-        SortKey::UpdatedAt => stamp(row.get::<OffsetDateTime, _>("updated_at")),
+        SortKey::Title => row.get::<String, _>(alias),
+        SortKey::CreatedAt | SortKey::UpdatedAt => {
+            content_read::stamp(row.get::<OffsetDateTime, _>(alias))
+        }
     }
 }
 
@@ -747,7 +788,7 @@ pub async fn get_page(
         revision: row.get("revision_no"),
     };
     let items = vec![page.to_value(&request.fields, request.locale.as_deref(), &[])];
-    let etag = content_read::list_etag(&[(page.updated_at.to_string(), page.id)]);
+    let etag = content_read::list_etag(&[(content_read::stamp(page.updated_at), page.id)]);
     Ok(ReadResponse {
         status: StatusCode::OK,
         etag,
@@ -805,7 +846,7 @@ pub async fn get_post(
         summary: row.get("summary"),
         revision: row.get("revision_no"),
     };
-    let etag = content_read::list_etag(&[(page.updated_at.to_string(), page.id)]);
+    let etag = content_read::list_etag(&[(content_read::stamp(page.updated_at), page.id)]);
     Ok(ReadResponse {
         status: StatusCode::OK,
         etag,
@@ -825,9 +866,18 @@ pub async fn list_media(
     // `media` carries its own `width`/`height` (migration 0025) and an `updated_at` that is
     // NULL for a row written before that column existed — hence the coalesce, which is also the
     // value the cursor and the ETag are built from, so a media list is stable across the upgrade.
+    //
+    // **The coalesce is selected twice under two names.** `cursor_stamp` is what the sort resolves
+    // to, so the cursor is built from the very expression the ORDER BY and the keyset predicate
+    // compare; `updated_at` stays for the item's own `updated_at` field, which is a *different*
+    // question — "when was this file itself changed", not "where does this list sort me". Reading
+    // one out of the other is how a list can be ordered by `created_at` while paginating by
+    // `updated_at`, and neither query would say so.
     let mut sql = String::from(
         "select m.id, m.site_id, m.filename, m.content_type, m.size_bytes, m.storage_key, \
-                coalesce(m.updated_at, m.created_at) as updated_at, m.deleted_at, \
+                coalesce(m.updated_at, m.created_at) as updated_at, \
+                coalesce(m.updated_at, m.created_at) as cursor_stamp, \
+                m.created_at, m.deleted_at, \
                 m.width, m.height, m.alt_text, m.description \
          from media m \
          where m.deleted_at is null",
@@ -853,14 +903,15 @@ pub async fn list_media(
     }
     if let Some(cursor) = &request.cursor {
         sql.push_str(&format!(
-            " and (coalesce(m.updated_at, m.created_at) < ${index} or \
-             (coalesce(m.updated_at, m.created_at) = ${index} and m.id < ${next}))",
+            " and ({column} < ${index} or ({column} = ${index} and m.id < ${next}))",
+            column = request.column,
             next = index + 1
         ));
         index += 2;
     }
     sql.push_str(&format!(
-        " order by coalesce(m.updated_at, m.created_at) desc, m.id desc limit ${index}"
+        " order by {column} desc, m.id desc limit ${index}",
+        column = request.column
     ));
 
     let mut statement = sqlx::query(&sql);
@@ -877,20 +928,14 @@ pub async fn list_media(
         statement = statement.bind(since);
     }
     if let Some(cursor) = &request.cursor {
-        let value = OffsetDateTime::parse(
-            &cursor.value,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .map_err(|_| {
-            bad_parameter(
-                "cursor",
-                "this cursor does not belong to this sort order".into(),
-            )
-        })?;
+        // The parsed instant, bound as the instant. See the pages list for why binding the string
+        // was a 500 — this endpoint had the same shape with the same failure waiting behind it.
+        let value = content_read::cursor_instant(&cursor.value)
+            .map_err(|error| bad_parameter("cursor", error.to_string()))?;
         statement = statement.bind(value).bind(cursor.id);
     }
     let rows = statement
-        .bind(request.limit)
+        .bind(request.fetch_limit())
         .fetch_all(state.db().pool())
         .await
         .map_err(|error| {
@@ -902,9 +947,12 @@ pub async fn list_media(
         })?;
 
     let fetched = rows.len() as i64;
-    let mut items: Vec<Value> = Vec::with_capacity(rows.len());
-    let mut stamps: Vec<(String, Uuid)> = Vec::with_capacity(rows.len());
-    for row in &rows {
+    // As on the pages list: only the rows the caller asked for are rendered, and `count` counts
+    // exactly those. The over-fetched row decides `next_cursor` and is not part of the answer.
+    let visible = &rows[..rows.len().min(request.limit as usize)];
+    let mut items: Vec<Value> = Vec::with_capacity(visible.len());
+    let mut stamps: Vec<(String, Uuid)> = Vec::with_capacity(visible.len());
+    for row in visible {
         let updated_at: OffsetDateTime = row.get("updated_at");
         let item = ReadMedia {
             id: row.get("id"),
@@ -921,14 +969,15 @@ pub async fn list_media(
             description: row.get("description"),
             deleted_at: row.get("deleted_at"),
         };
-        stamps.push((updated_at.to_string(), item.id));
+        stamps.push((content_read::stamp(updated_at), item.id));
         items.push(item.to_value(&request.fields));
     }
-    let visible = &rows[..rows.len().min(request.limit as usize)];
-    let next_cursor = if fetched > request.limit {
+    let next_cursor = if content_read::continues(fetched, request.limit) {
         visible.last().map(|row| {
-            let updated_at: OffsetDateTime = row.get("updated_at");
-            content_read::encode_cursor(&Cursor::new(updated_at.to_string(), row.get("id")))
+            content_read::encode_cursor(&Cursor::new(
+                sort_value_of(row, request.sort, SortSource::Media),
+                row.get("id"),
+            ))
         })
     } else {
         None
@@ -940,7 +989,7 @@ pub async fn list_media(
         body: json!({
             "items": items,
             "next_cursor": next_cursor,
-            "count": visible.len(),
+            "count": items.len(),
         }),
     })
 }
@@ -1142,7 +1191,8 @@ mod tests {
             site: Some(Uuid::from_u128(21)),
             ..MediaListQuery::default()
         };
-        let media_request = ListRequest::for_media(&scoped, &media).expect("a filtered list is valid");
+        let media_request =
+            ListRequest::for_media(&scoped, &media).expect("a filtered list is valid");
         assert_eq!(media_request.site_id, Some(SITE_OUT_OF_SCOPE));
     }
 
