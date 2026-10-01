@@ -1,6 +1,28 @@
 # REQ-045 — AI App Builder *(headline)*
 
-> **Status:** in-progress (slice 4 · **THE TYPED GENERATOR**, and the queue's next item was
+> **Status:** in-progress (slice 4 · **THE PLAN EXPORT, AND THE COST COLUMN ANSWERED** ·
+> the queue said "cost attribution" and that turned out to be the one piece of this slice
+> with **no price source anywhere in the tree** — `ai_models` (migration `0008`) has no price
+> column, no crate holds a rate, and REQ-104's `ai_spend_daily` is wave-3b and belongs to w10.
+> So `settle()` keeps reporting `0` and the export writes the **stored** figure rather than one
+> derived from a rate this platform does not hold; a second pricing table invented here to fill
+> one column is precisely the defect a "the Cost column is rendered" criterion cannot see ·
+> **what landed instead is the other half of the same criterion: `GET /plans/{id}/export`** —
+> `omnion.app-builder.plan/1`, served as an `attachment` with `no-store`, guarded by
+> `appbuilder.read` (exporting is reading, or the least-privileged reviewer cannot hand the
+> file on), built from the **same four reads the review screen makes** so the file and the
+> screen cannot disagree · **the filename comes from the plan's short id and never its title**,
+> because free text inside a `Content-Disposition` header is header injection and eight hex
+> characters cannot be a slash or a quote · **superseded artifacts travel with the chain drawn
+> in both directions** from the one stored edge, and `spec` / `validation` are exported verbatim
+> — a re-normaliser is a second set of tolerances, and the one that disagrees with the validator
+> is the one nobody reads · **the console's note reports what came back out of the file**, so a
+> failed generation that exports a real file with an empty `artifacts` array says so instead of
+> reading as a success · **three mutations red:** `inline` instead of `attachment` fails the
+> header assertion, `find_plan` instead of `plan_in_scope` fails the cross-tenant walk, and the
+> title-derived filename fails the crate test · **65 module unit tests (was 56) · 16 route walks
+> (was 14) · 317 api lib tests · `pnpm typecheck` 0 errors** · previous: slice 4 ·
+> **THE TYPED GENERATOR**, and the queue's next item was
 > unbuildable today · the queue named the apply runner, so apply was the plan — until its first
 > step was traced to its target: it writes the generated **entity**, and REQ-026's `entities` /
 > `entity_fields` / `entity_records` tables exist in **no worktree at all** (checked all ten).
@@ -251,7 +273,29 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
 - [ ] The report renders its grouped table and chart on real (empty) data.
 - [ ] Apply progress streams step transitions and ends with links to the created screens.
 - [ ] A failing step is named, retry is offered, and rollback removes only this application's output.
-- [ ] Plan list, filters, bulk delete of drafts and JSON export work; applied plans are undeletable.
+- [ ] Plan list, filters, bulk delete of drafts and JSON export work; applied plans are undeletable. —
+      **THE EXPORT HALF IS LANDED AND WIRE-PROVEN; THE BOX STAYS UNTICKED, because the criterion
+      is four claims and it is a conjunction.** Bulk delete of drafts does not exist: the console
+      carries no checkbox, no selection state and no bulk action, so "bulk delete" is a control
+      that was never drawn. The list, the filters and "applied plans are undeletable" were already
+      proven on the wire (tick 65's `the_list_filters_and_the_vocabulary_endpoint_answer_the_composer`,
+      `an_applied_plan_is_not_deletable_and_the_two_refusals_are_different`). — **MEASURED tick 72
+      (`c294b788`, `55308693`, `7469649d`): `GET /plans/{id}/export` answers `200` with an
+      `attachment` disposition and `no-store`, and `a_plan_exports_as_an_attachment_carrying_the_plan_
+      _the_screen_shows` reads `schema = omnion.app-builder.plan/1`, the entity's `spec` verbatim,
+      the validator's own `validation` list, and then asserts the file's `artifacts` / `counts` /
+      `blockers` against **the review endpoint's body** — because a file built from different reads
+      than the screen is a second view of the same plan, and a reviewer comparing the two would be
+      comparing an inconsistency this platform introduced.** The console's note reports what came back
+      *out of the file* rather than what the click announced, and an empty `artifacts` array (a
+      failed generation exports a real file) says so instead of reading as a success. **Proven to
+      fail twice:** serving `inline` instead of `attachment` fails the header assertion, and replacing
+      `plan_in_scope` with `find_plan` fails the cross-tenant walk. The third mutation — the filename
+      built from the plan's free-text **title** instead of its short id — is caught by the crate test,
+      and it is the one worth keeping: free text inside a `Content-Disposition` header is header
+      injection, and the file is named `omnion-app-plan-01234567.json` precisely so it cannot be.
+      **NEXT: the bulk delete, which is a checkbox column, a selection that survives a filter change,
+      and a confirmation that names how many drafts are about to go.**
 - [ ] Apply requires explicit confirmation, the keyboard flow works, and mobile keeps actions reachable at 390 px.
 - [x] Keys `appbuilder.read` / `appbuilder.generate` / `appbuilder.review` / `appbuilder.apply` exist in the catalogue. —
       **MEASURED (slice 2, `65bdf683`):** `the_app_builder_family_is_catalogued_and_apply_is_its
@@ -292,6 +336,16 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
    them. Unblocked the moment they land — the step is already specified against their shape.
 4. **Safety net** — per-application rollback, failure retry, applied filters, JSON export, cost attribution.
    **Done when:** a failed apply rolls back to a clean state and history shows it.
+   — **JSON export LANDED and wire-proven (`c294b788`, `55308693`, `7469649d`); cost attribution is
+   NOT BUILDABLE HERE, and the reason is the finding rather than an excuse.** There is no price source
+   anywhere in the tree: `ai_models` (migration `0008`) carries no price column, no pricing table
+   exists in any crate, and REQ-104's `ai_spend_daily` is wave-3b (w10's). So `settle()` keeps writing
+   `cost_cents: 0` and the export carries the **stored** figure rather than one derived from a rate
+   this platform does not hold — building a second pricing table to fill one column is exactly the
+   trap a "cost is displayed" criterion cannot see. When REQ-104 lands, the number becomes real and
+   nothing here has to change but the write. Also landed: the row-level delete already refused
+   applied plans on the wire. **Still open in this slice: bulk delete of drafts** (no checkbox exists),
+   per-application rollback and failure retry — the latter two sit behind slice 3's table.
 
 ### Risks / notes
 

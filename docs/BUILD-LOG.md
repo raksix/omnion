@@ -9499,3 +9499,80 @@ states, and it is not closed on tests alone.
 **Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
 hook to REQ-011.
 
+
+## Tick 72 — REQ-045 slice 4: the plan export, and the cost column answered
+
+The queue said "cost attribution". I went looking for the price first, because the honest
+answer and the convenient one are different code: **`ai_models` has no price column** (migration
+`0008` — the table is `model_key`, capability flags and `enabled`), **no crate in the tree holds a
+rate**, and REQ-104's `ai_spend_daily` is wave-3b. So there is nothing to attribute *from*. The
+convenient answer — a rate table invented here so the Cost column stops rendering `0` — would have
+been a second pricing table owned by nobody, disagreeing with REQ-104 the day it lands, and a
+`"cost is displayed"` criterion cannot tell it apart from the real thing. `settle()` keeps its `0`
+and the export writes the **stored** figure. That is the whole finding, and it is worth more than
+the column would have been.
+
+What landed instead is the other half of the same acceptance line: **`GET /plans/{id}/export`**.
+
+**Four decisions, each a shortcut to a plausible wrong file.**
+
+1. **An attachment, not a JSON body.** `Content-Disposition` is the entire difference between
+   "the request succeeded" and "a file arrived"; served inline, the browser opens a tab the
+   operator then has to save by hand.
+2. **The same four reads the review screen makes.** Plan, artifacts, counts, blockers — not a
+   narrower query written for the export. The walk asserts the file's `artifacts` / `counts` /
+   `blockers` against the **review endpoint's body**, because an export assembled from different
+   reads is a second view of the same plan, and a reviewer comparing the two would be comparing an
+   inconsistency this platform introduced.
+3. **The filename is the plan's short id, never its title.** The title is free text and free text
+   inside a response header is header injection; eight hex characters cannot be a slash or a quote.
+4. **`appbuilder.read`, not `.review`.** Exporting is reading. A reviewer who may change nothing
+   must still be able to take a plan away, or the least-privileged account that is meant to exist
+   cannot hand the file on.
+
+**The document keeps superseded artifacts and draws the chain in both directions** from the one
+stored edge — a reader cannot tell "replaced" from "never had a successor" out of two unlinked
+rows — and exports `spec` and `validation` **verbatim**, because a re-normaliser is a second set of
+tolerances and the one that disagrees with the validator is the one nobody reads. Unreported token
+counts stay `null` and distinct from a reported `0`: one means the answer is unpriced, the other
+means it was free.
+
+**The console's note reads the artifact count out of the downloaded file**, not off a header the
+same code path wrote, and an empty `artifacts` array (a failed generation exports a real file) says
+so rather than reading as a success. The busy state now names the **action**: one `busyPlanId` for
+both buttons spun the delete button during an export, and two controls reporting "working" for one
+request teaches a reviewer to ignore both.
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-module-app-builder --lib --quiet` | **65 passed** (was 56) |
+| api | `cargo test -p omnion-api --lib --quiet` | **317 passed** (was 284) |
+| walk | `cargo test -p omnion-api --test app_builder_routes -- --test-threads=1` | **16 passed** (was 14) |
+| types | `apps/admin` `tsc --noEmit` | **0 errors** |
+
+**Proven to fail, three times.** `attachment` → `inline` fails the header assertion; `plan_in_scope`
+→ `find_plan` fails the cross-tenant walk; the id-derived filename → title-derived fails the crate
+test. Both files restored byte-exact (md5 verified).
+
+**One of my own new assertions was unsatisfiable, and the fixture's doc comment is what caught
+it.** The export walk asserted a `superseded_by` edge — correct for the document, impossible for
+`seed_plan`, which builds no regeneration chain. A test that cannot pass is not a test, and it would
+have read as a product defect three ticks from now. Replaced with claims the fixture really backs:
+the entity's `spec` verbatim and the validator's own `validation` list.
+
+**And one red row was the walk's fault in the most familiar way.** The cross-tenant walk asserted
+`404` and got `403` — because the stranger tenant held no `appbuilder.read` key at all, so the
+permission guard answered before tenancy could. Granting the key *in its own tenant* is what makes
+the row measure the code under test. This is the mirror of the mistake this REQ keeps making: a red
+row read as a product defect when the probe never reached the thing it was measuring.
+
+**Not ticked:** the acceptance line "Plan list, filters, **bulk delete of drafts** and JSON export
+work" is a conjunction of four claims and there is **no checkbox anywhere in the console** — bulk
+delete is a control that was never drawn. The box stays open and says so.
+
+**Browser pass: queued, not yet run.** `w4` still holds the shared QA slot (pid 1782910,
+`cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd` — never by the age
+of the placeholder file). The export's *screen* states still owe a pass.
+
+**Next:** the bulk delete — a checkbox column, a selection that survives a filter change, and a
+confirmation naming how many drafts are about to go.
