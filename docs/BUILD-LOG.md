@@ -10946,3 +10946,36 @@ stack, so the pass over these commits waits behind it.
 **Next.** A pass over `a24c452a`, which is the only thing that can close slice 2's browser gate
 and tell the truth about the window's three states. Then the shell banner, which is the one part
 of slice 3 with no code yet.
+
+### Tick 97, continued — the shell banner, and what it costs to leave it out
+
+Slice 3's last missing part was the one the spec describes in half a line — "a persistent shell
+banner" in every admin session — and it is the part an operator meets *before* they meet the
+screen that sets it. It is now `components/maintenance-window-banner.tsx`, mounted inside the
+sticky header beside the staging strip, which is the same slot and for the same reason.
+
+Three decisions, each of which is the obvious version's opposite:
+
+* **No dismiss control.** An operator who is allowed to hide "your writes are being refused" will
+  hide it, and then they are the person who does not understand the `503`. The staging strip above
+  it has none for the same reason, and consistency here is not cosmetic — it is one rule about
+  notices that outrank the reader.
+* **It renders nothing when no window is open.** A strip that is always present and merely empty
+  is a strip every operator learns to ignore, which spends exactly the attention the feature
+  exists to buy.
+* **A failed poll renders nothing rather than "no window".** The write routes enforce the window
+  server-side, so a poll that cannot read its own state costs *attention*, not safety — and a
+  banner claiming the platform is writable when it is not is the one lie this component could
+  tell. Noise was the cheaper failure.
+
+The pass asserts the banner from `/deployment/history` rather than from the maintenance screen,
+because reading it on the screen that sets it would prove that screen renders rather than that
+the shell does. It then waits one poll interval (30s + 6s of round trip) after the window is
+closed and asserts the banner is **gone** — the failure in the other direction, and the one an
+operator cannot work around: the writes are fine again and the panel keeps saying otherwise.
+
+Gates for this half: `tsc --noEmit` clean, `node --check` clean (11 893 → 11 944 lines).
+
+**Still owed, unchanged:** a pass over `9a77f1c4`. The tick-96 pass that is still running was
+built before all five of this tick's commits and cannot see the wizard, the rollback dialog, the
+maintenance screen or the banner — it measures slice 1 and nothing else.
