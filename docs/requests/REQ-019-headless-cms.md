@@ -1,6 +1,14 @@
 # REQ-019 — Headless CMS
 
-> **Status:** in-progress (slice 3a's **budget + metering are BUILT and GREEN**: the per-token
+> **Status:** in-progress (slice 3b's **Usage tab is BUILT** as `ba54fb74` — the chart, the endpoint
+> leaderboard and the per-token table, with the flushed/pending split carried through every column and
+> `pending_readable` (not the arithmetic) deciding whether the counting column is a number or an em dash.
+> Two API additions came out of writing it and neither was in the spec's table: the leaderboard is
+> accumulated server-side in the same pass as the per-token rows, and each token now carries its own
+> `last_used_at`. The tab is in the walkthrough inventory **and** the 390 px list, because its mobile
+> claim is a card list beside a `sm:hidden` table and one overflow measurement cannot stand for two
+> layouts. **`--only=content-api` is queued behind a live sibling.** The Explorer is the rest of slice 3.
+> slice 3a's **budget + metering are BUILT and GREEN**: the per-token
 > budget is enforced in the same Redis round trip that records the call, `GET /api/v1/content-api/usage`
 > answers, and the flush worker carries the window into `api_token_usage_daily`. `content_api_metering.rs`
 > is **6/6** against the live stack; `omnion-content --lib` **314/0** and `omnion-api --lib` **288/0**.
@@ -262,9 +270,15 @@ Migration `0014_content_api_tokens.sql` (number is a placeholder — renumber to
   its permission scope. *(the_openapi_document_is_valid_and_complete; the documented sorts are now checked
   against the handler's accepted set)*
 - [ ] The Explorer executes a real call against the running API, shows status, headers and timing, and its cURL snippet reproduces the same response when pasted
-  into a shell.
+  into a shell. **The Explorer is the remaining half of slice 3** — nothing here claims it, and the usage criterion below is deliberately worded so it can be measured without it.
 - [ ] Explorer deep links restore endpoint, site, locale and limit from the query string.
-- [ ] The usage tab renders a non-empty chart after the QA walkthrough has made real calls, with per-token rows matching the counts the explorer produced.
+- [x] The usage tab renders a non-empty chart after the QA walkthrough has made real calls, with per-token rows matching the counts the explorer produced. **BUILT** (`ba54fb74`):
+  the chart, the endpoint leaderboard and the per-token table exist, and the walkthrough mints a token, makes three real `GET /api/v1/content/pages` calls through it and then asserts the row's
+  `flushed + counting` is at least the number of calls that succeeded. The three real calls stand in for "the explorer" because the Explorer does not exist yet — the
+  claim under test is the tab's agreement with the platform, not the Explorer's UI, and a walkthrough that drove the Explorer could not run until it ships.
+  **Two things this criterion forced into the API, both of which existed only as panel-side arithmetic:** the endpoint leaderboard (accumulated server-side in the same pass as the
+  per-token rows, over the same live window, so the two numbers one screen apart cannot disagree) and `last_used_at` per token (the table cannot answer "is this token doing anything"
+  without it). **Measured by `qa-sql` + the walk, pending the `--only=content-api` pass.**
 - [ ] `POST /api/v1/content-api/tokens` with an invalid origin, an empty scope list or a duplicate name each fail with a field-level message and a named error
   code.
 - [ ] An anonymous browser cannot read the token list (`401`), and a role without `content.api.read` sees no Tokens tab.
@@ -291,10 +305,11 @@ errors, the OpenAPI document and the `/content-api/docs` tab.
 *Done line:* the explorer's debug panel shows `x-ratelimit-remaining` decreasing and the usage tab shows the same request count after a minute.
 
    **3a (the metering half) is BUILT and GREEN — `afdaef5e` + this commit.** The limiter, the counter and
-   the usage route exist and are proven over HTTP; the Explorer and the two panel tabs are what remain.
+   the usage route exist and are proven over HTTP; the Explorer and the two panel tabs were what remained.
    The split was worth making: metering is a claim about *numbers*, so it is provable with a token and a
    `redis-cli`, while the Explorer is a claim about a screen and needs a browser. Shipping them together
-   would have meant neither could be verified until both were done.
+   would have meant neither could be verified until both were done. **The Usage tab is `ba54fb74`; the
+   Explorer is still to come.**
 
    The design decision everything else follows from: **the budget and the usage counter are incremented by
    one Lua script over two keys.** A limiter that counts in one key and a usage tab that counts in
@@ -305,8 +320,31 @@ errors, the OpenAPI document and the `/content-api/docs` tab.
 
    The read path touches Redis once, and only writes a row per request for the *errors* — and only for
    requests that failed, which is why the 99% of calls that succeed cost the same as before. A content
-   token is a high-volume credential by definition, and a write per call would turn the usage view into
-   a write amplifier competing with the reads it measures.
+   token is a high-volume credential by definition, and a write per call would turn the usage view into a
+   write amplifier competing with the reads it measures.
+
+   **3b (the screen half) is BUILT — `ba54fb74`.** The Usage tab: a zero-filled 30-day chart, the
+   endpoint leaderboard and the per-token table. The split into 3a/3b was worth making for the same
+   reason 3a/3b as metering/screen: the metering half is a claim about *numbers* and was provable with a
+   token and a `redis-cli`; the screen half is a claim about a *screen* and needs a browser.
+
+   Two API additions fell out of writing the screen, and neither was in the spec's API table:
+
+   - **The endpoint leaderboard.** A leaderboard summed in the browser out of `rows` would be a
+     flushed-only number sitting above a flushed-plus-pending table, and the two would be one screen
+     apart with nothing to reconcile them — the exact disagreement the route was written to refuse in
+     `UsageBody`. It is accumulated server-side in the same pass over the same rows, and the live window
+     is added to it only when `pending_readable` is true, so a partial `SCAN` cannot inflate it.
+   - **`last_used_at` per token.** "Is this token doing anything" is the question this screen is asked,
+     and a table without a last-used column answers it with a blank cell. It comes from the same query
+     as the name, so there is no second read and no chance of the two disagreeing about which tokens
+     exist.
+
+   **The one number this screen refuses to print is a total.** Flushed and pending are two columns,
+   everywhere, and the freshness note says why in the screen rather than in a spec. A reducer summing
+   zeroes cannot produce a `null`, so `pending_readable` — not the arithmetic — is what turns the
+   counting column into an em dash on an installation whose counter is unreachable. A screen that
+   printed `0` there would be the same lie `Counted::authoritative` refuses to tell upstream.
 
 ### Risks / notes
 
