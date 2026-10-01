@@ -478,9 +478,12 @@ pub async fn ensure_run_within_limits(
 
 /// The project's key and its owner's display name, for a refusal message.
 ///
+/// Public because the workflow-cap refusal in [`crate::projects`] is the same message about a
+/// different limit, and a second copy of this string is a second sentence an operator sees.
+///
 /// Falls back to a phrase rather than to an id: "ask 6f2c…" is not an instruction anybody can
 /// follow, and the REQ's message requirement is about naming a *person*.
-async fn owner_display(
+pub async fn owner_display(
     connection: &mut sqlx::PgConnection,
     project_id: Uuid,
 ) -> Result<(String, String)> {

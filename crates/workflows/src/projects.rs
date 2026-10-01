@@ -988,6 +988,112 @@ pub async fn set_status(
     Ok(row)
 }
 
+/// Whether this project may take one more workflow definition.
+///
+/// Answers two questions and refuses in the order that makes each remedy the one that works:
+/// the archive rule first (restore it), then the cap (ask the owner to raise it). The archive half
+/// is [`ensure_project_is_writable`], which the update and delete paths call on their own.
+///
+/// **Why one function and not two at the store:** the cap is a question about ADDING a row, so
+/// `delete_workflow` must not ask it — see [`ensure_project_is_writable`] for the reasoning and
+/// for the gate that proved the alternative wrong.
+pub async fn ensure_project_accepts_writes(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<()> {
+    ensure_project_is_writable(connection, project_id).await?;
+
+    // `max_workflows` is a hard cap the REQ promises and the limits screen draws a bar for, so it
+    // is consulted here rather than left to the sweep that only *notices* a crossing. `0` is
+    // unlimited, which is what `read_limits` returns for a project with no row at all — the
+    // `left join` above is what makes a project without a limits row answer "unlimited" instead
+    // of "no limits row", which would otherwise refuse every create on a fresh installation.
+    // `None` from the join means "no limits row", which is the same answer as `0`.
+    let max_workflows: Option<i32> = sqlx::query_scalar(
+        "select max_workflows from automation_project_limits where project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .flatten();
+
+    if let Some(limit) = max_workflows {
+        let current = workflow_count_in(connection, project_id).await?;
+        if let Some((current, limit)) = crate::limits::Limits::exceeded(limit, current) {
+            let (key, owner) = crate::limits::owner_display(connection, project_id).await?;
+            return Err(WorkflowError::invalid(
+                "project_workflow_limit_exceeded",
+                crate::limits::Limits::refusal_message("workflow", current, limit, &key, &owner),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether this project accepts edits at all.
+///
+/// **The archive half of the read-only rule, and nothing else.** *"Archived projects are
+/// read-only — no new runs, no edits"* is one promise with two enforcement points:
+/// [`crate::ensure_run_allowed`] is the run half and this is the write half. Until now only the
+/// first existed, and three gates were green because each measured the clause that had been
+/// implemented.
+///
+/// **`resolve_target` reads `status` nowhere and `permits` asks about a *role*** — neither looks at
+/// whether the container accepts writes. So an editor, an owner **and an instance
+/// administrator** could create, rewrite and delete workflows in an archived project, and the
+/// administrator case is the sharp one: `require_capability` short-circuits to `Owner` before any
+/// project row is read, so the account most likely to reorganise an installation was the one
+/// account for which "archived" did not apply.
+///
+/// **Separate from [`ensure_project_accepts_writes`] on the evidence, not on taste.** The first
+/// version of the fix was one function with a flag, so `delete_workflow` could skip the cap; but a
+/// flag false would then have had to skip the archive rule too, and that one is not negotiable.
+/// `a_delete_is_never_refused_by_the_workflow_cap` in the gate is what forced the split, and it
+/// is the negative control that keeps it honest — a guard that blocks the delete which is the
+/// operator's way back under a cap makes the cap a one-way door.
+pub async fn ensure_project_is_writable(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<()> {
+    let row: Option<String> =
+        sqlx::query_scalar("select status from automation_projects where id = $1 for share")
+            .bind(project_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+
+    match row.as_deref().map(ProjectStatus::parse) {
+        Some(Some(ProjectStatus::Archived)) => Err(WorkflowError::invalid(
+            "project_archived",
+            "this workflow's project is archived — restore it before editing or adding to it",
+        )),
+        // An absent project answers the way it answers absent everywhere on this module: a
+        // write into a container nobody can see is a tenancy question, not an archive one, and
+        // `ensure_run_allowed` gives the identical answer for the identical reason.
+        None => Err(WorkflowError::invalid(
+            "project_not_found",
+            "this workflow's project no longer exists",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The workflow count on an open connection, for the write guard.
+///
+/// [`workflow_count`] takes a pool because the list column and the limits screen call it that
+/// way; borrowing a caller's transaction is the point here, so that the count this guard decides
+/// on is read at the same isolation as the insert that follows it.
+async fn workflow_count_in(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar("select count(*) from workflows where project_id = $1")
+        .bind(project_id)
+        .fetch_one(&mut *connection)
+        .await?;
+    Ok(count)
+}
+
 /// Count the workflows in a project, for the list column and the limit screen.
 pub async fn workflow_count(pool: &PgPool, project_id: Uuid) -> Result<i64> {
     let count: i64 = sqlx::query_scalar("select count(*) from workflows where project_id = $1")

@@ -22,7 +22,27 @@ fn workflow_columns() -> &'static str {
 }
 
 /// Insert a workflow definition.
+///
+/// **The write guard lives here, not in the two handlers.** `POST /workflows` and
+/// `POST /automations` are separate functions in separate files that both reach this one insert,
+/// and a check pasted into each is a check that will be on one of them — the same shape as the
+/// run guard this store already moved away from the handlers. Two questions are asked, in the
+/// order that makes each refusal name a remedy that works:
+///
+/// 1. **Is this project still writable?** An archived project refuses edits as well as runs
+///    (`ensure_project_accepts_writes`), and an editor or owner pressing save on a project that
+///    was archived an hour ago gets told to restore it rather than silently succeeding.
+/// 2. **Is there room for one more?** `max_workflows` is a cap this REQ promises and the limits
+///    screen draws a bar for; the notice sweep only *notices* a crossing, so without this a
+///    project could exceed its cap for ever while the bar read "at the limit".
+///
+/// Both run inside the transaction that writes, so a project archived between the handler's
+/// capability check and this insert cannot slip a save through: the insert sees `archived` and
+/// refuses. That is the check-then-write race this module has now removed from the run path and
+/// the move path, applied to the last write path that did not have it.
 pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow> {
+    let mut tx = pool.begin().await?;
+    crate::projects::ensure_project_accepts_writes(&mut tx, new.project_id).await?;
     let sql = format!(
         "insert into workflows (organization_id, project_id, site_id, name, description, \
          enabled, trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, \
@@ -45,8 +65,10 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
         .bind(new.next_run_at)
         .bind(new.steps)
         .bind(new.created_by)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     Ok(workflow)
 }
@@ -120,11 +142,36 @@ pub struct WorkflowUpdate {
 }
 
 /// Rewrite a workflow definition; `None` when the row is gone.
+///
+/// **The archive half of the read-only rule is here too**, for the reason
+/// [`insert_workflow`] gives in full: an archived project is *"read-only — no new runs, **no
+/// edits**"*, and the edit door was the one with no guard. The project's own row is read in the
+/// same transaction as the write (the workflow's `project_id` is a `not null` column, so it
+/// cannot be absent and cannot be resolved any other way), which is the check-then-write shape
+/// removed from the run path two slices ago.
 pub async fn update_workflow(
     pool: &PgPool,
     id: Uuid,
     update: WorkflowUpdate,
 ) -> Result<Option<Workflow>> {
+    let mut tx = pool.begin().await?;
+    // Read the project this workflow is in and ask the same question the create path asks. A
+    // workflow that does not exist resolves to `None` below exactly as it did before; asking
+    // about a project only after the row is known to exist would be two statements where one
+    // `select … left join` is both, and it cannot answer for a workflow that is not there.
+    let project_id: Option<Uuid> =
+        sqlx::query_scalar("select project_id from workflows where id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(project_id) = project_id {
+        // The **archive** guard only. `ensure_project_accepts_writes` would also refuse this
+        // rewrite because the project is over its workflow cap, and a cap is a statement about how
+        // many definitions may EXIST — refusing a rename because the number is already right would
+        // make an over-cap project uneditable as well as uncapped, which is not what `max_workflows`
+        // says anywhere. The create path is where the cap belongs.
+        crate::projects::ensure_project_is_writable(&mut tx, project_id).await?;
+    }
     let sql = format!(
         "update workflows set name = $2, description = $3, site_id = $4, enabled = $5, \
          trigger_kind = $6, schedule = $7, next_run_at = $8, steps = $9, trigger_event = $10, \
@@ -145,19 +192,41 @@ pub async fn update_workflow(
         .bind(update.steps)
         .bind(update.trigger_event)
         .bind(update.conditions)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     Ok(workflow)
 }
 
 /// Remove a workflow and (through the schema) its executions.
+///
+/// **A delete is a write, and an archived project is read-only.** Removing the last workflow of
+/// an archived project is also the only way an operator could empty it without restoring it, which
+/// is why the guard is asked here and not only on the create and update doors: "keep their
+/// history" (the REQ's own words for archiving) is a promise about rows, and a delete is the
+/// action that breaks it.
 pub async fn delete_workflow(pool: &PgPool, id: Uuid) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let project_id: Option<Uuid> =
+        sqlx::query_scalar("select project_id from workflows where id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(project_id) = project_id {
+        // Archive only, and deliberately: deleting is the operator's way back UNDER a cap, so the
+        // cap here would make an over-quota project unrecoverable without a route nobody wrote.
+        // `a_delete_is_never_refused_by_the_workflow_cap` is the assertion that keeps this honest.
+        crate::projects::ensure_project_is_writable(&mut tx, project_id).await?;
+    }
     let removed = sqlx::query("delete from workflows where id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+
+    tx.commit().await?;
 
     Ok(removed > 0)
 }
