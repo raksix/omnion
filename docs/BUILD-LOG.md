@@ -10091,3 +10091,51 @@ real reclaim was elsewhere.
 
 **Next.** The routes and the suite/case screens for this slice, then slice 2's runner and
 results; the browser pass when the slot frees.
+
+
+## 2026-10-01 · REQ-107 slice 1 — the routes, the keys and the screens
+
+**What.** The eval suite HTTP surface (`apps/api/src/routes/ai_evals.rs`), the four catalogue
+keys it needs (`ai.evals.read`, `ai.evals.manage`, `ai.evals.run`, `ai.telemetry.read`), both
+admin screens, the nav entry, and `runAiEvalsDepth` — the walkthrough pass that drives the
+`[key]` screen, which no route literal can reach.
+
+**Proof.**
+
+- `cargo test -p omnion-api --lib routes::ai_evals` — 9 passed.
+- `cargo test -p omnion-ai-hub --lib` — 654 passed; `-p omnion-permissions` — 63 passed.
+- `pnpm typecheck` — 2 successful, 2 total.
+- `node --check scripts/qa/walkthrough.cjs` — clean.
+- `cargo build -p omnion-api` — exit 0, zero warnings attributable to the new file.
+
+**Runs are not mounted, on purpose.** `POST /suites/{key}/run`, `/runs` and `/telemetry` are
+slices 2 and 4. A route that 404s tells the truth; a route that answered `queued` with no
+runner behind it would be a lie the panel had no way to detect. The `Run now` button ships
+disabled and carries its reason in a `title`.
+
+**`ai.evals.run` and `ai.telemetry.read` are catalogued but unmounted.** That is the honest
+state, recorded in the comment where the guards live: a guard key with nothing behind it is a
+promise the platform cannot keep, so the keys exist (an installation can grant them) and the
+mounts wait for the slice that needs them.
+
+**The refusal-to-field mapping, and the two bugs its own test found.** The store names the field
+in backticks; `field_for` reads it out and the form marks that input. My first version knew only
+the suite columns, so every case-editor refusal arrived with no field. The test walks the *real*
+message strings — taken from `eval_case`'s own format strings — and it is exhaustive over
+`PROPERTIES`, so a property added to the scorer cannot become an unmapped message. It found the
+second gap on its first run: two store messages name their field without backticks.
+
+**The browser pass: ran, and was killed by a neighbour rather than by a defect.** The stack came
+up, 86 routes were walked including the new `/ai/evals`, and the API was deleted at 19:37:47 —
+seventy seconds after boot. `/root/.pm2/pm2.log` shows w3's `stop_stack` deleting its own stack
+at 19:37:05 and mine being deleted by name forty-two seconds later. Each script namespaces its
+delete through `$STACK`, so the name is not a script bug; the w3 lock's mtime (19:21) and its two
+dead pids show no w3 pass was running at 19:37. I did not identify the caller and am not claiming
+to. The w6 stack is three orphaned pm2 processes from 17:41 with no pass behind them, which is
+the likeliest shape. **No acceptance row is ticked on the strength of a pass that lost its API
+at the two-minute mark** — every REQ-107 row speaks about a run, a gate, a diff or a telemetry
+panel, and none of those ran.
+
+**Next.** Re-run the pass on a quiet box to close REQ-106's owed rows and REQ-107's closing row
+together. Then slice 2: the judge path, `ai_eval_runs` and `ai_eval_case_results`, and the run
+screens — which is the first slice that can tick an acceptance row.

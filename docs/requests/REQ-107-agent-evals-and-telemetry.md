@@ -2,8 +2,9 @@
 
 > **Status:** in-progress (slice 1: the scoring core, the suite/case tables, the store and the
 > validation the first acceptance row demands — `de3a1529` the pure scorer, `ddbd42a3` the store,
-> `c439548b` the twelve database walks and the two bugs they found; no API route, no screen, no
-> run yet) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> `c439548b` the twelve database walks and the two bugs they found; then the HTTP surface and the
+> four catalogue keys — `98e18319`; then the screens and the walkthrough pass that drives them —
+> `00755aee`. Runs are slice 2) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
