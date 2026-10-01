@@ -13342,3 +13342,69 @@ turn on a pass that has not run**, and the definition of done forbids closing a 
 
 **Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
 a free slot.
+
+## Tick 63 · REQ-117 slice 31 · the four exits that wrote no reason
+
+**What.** `crm_intake_sources.last_received_at` and `last_error` are the two columns an operator
+reads when nothing is arriving: the editor renders both, the second in red, and
+`record_source_outcome`'s own doc comment says the reader wants the error "from an hour ago".
+`capture` stamped that row on its three **success-shaped** exits — rejected, spam, accepted — and
+on **none of its four refusal exits**: a paused source, an oversized body, the source's hourly
+ceiling and the per-address ceiling.
+
+**Why those four are the worst four.** A ceiling refusal writes *no lead*, which is exactly what
+makes it safe and also exactly why there was nothing to look at afterwards. The source row was
+the only place the answer could live and it said nothing. The loudest case is the rate limit: a
+whole source answers `429` for an hour while the editor reads as though it never received
+anything — the precise question the column was added to answer.
+
+**The shape is new even though the defect is familiar.** The round-robin cursor, the autoresponder
+reservation, the SLA reminder and `SimulateBody::draft` were all *missing callers*, and the fix for
+each was to add a call. Here the caller existed and simply chose not to write. So the fix is not a
+call — it is making the call **unavoidable**: `capture` is now a wrapper around `capture_inner`, so
+the property is structural. The four early returns are guard clauses inside a function that has
+grown exits for three consecutive slices; stamping at each `return` is the shape that guarantees the
+next exit forgets. The write is best-effort by construction — outside any transaction, the lead
+already committed — so a failing diagnostic can neither turn a refusal into a `500` nor lose a stored
+lead. `operator_reason` writes an operator sentence rather than the error's `Display`, because
+`PayloadTooLarge` reads *"submission is too large (max 65536 bytes, got 918273)"*: a fine log line
+and a poor answer.
+
+**Proof.** `scripts/qa/run-crm-source-outcome.sh` **18/18** (8 new + the 10-test address-ceiling
+regression guard), module lib **181**, `cargo check -p omnion-api` clean, admin `tsc --noEmit`
+exit 0. **PROVEN TO FAIL at 7/8** with the wrapper reduced to a pass-through.
+
+**The survivor is the informative one.** `the_two_ceilings_share_nothing_and_stay_distinguishable`
+asserts only that the two budgets are independent and never on a recorded reason, so it stays green
+against code with no recording at all — it is there to catch the *opposite* regression (a fix that
+merged the ceilings), not to witness the fix. A negative control that goes red for the wrong reason
+proves less than one that stays green for the right reason.
+
+**Two gate findings, both mine.** Asserting on the returned `Err` would have passed against the
+pre-fix code in its entirety — `CrmIntakeError::RateLimited` has been returned by that line since
+the ceiling shipped — so every assertion reads the **stored row** back. And the suite's first run
+failed on a premise of mine: a lead's stored status is `new`, and `accepted` is only the word the
+public endpoint tells a *submitter*. A gate that assumed the API's vocabulary for the store would
+have been measuring the wrong layer while looking rigorous.
+
+**Environment, measured before starting.** `pg_isready` accepting connections; load 6.4; `/` at 99%
+(1.7 G free) and `/mnt/apopic` at 94%; 35 Chrome processes. The QA slot is held by a **live** w4
+pass — holder pid 1689806, cwd `/mnt/apopic/omnion-w4`, verified with `kill -0` **and**
+`/proc/<pid>/cwd`, not by the age of the placeholder. **No browser pass was started and none is
+claimed**, because no screen changed.
+
+**Merge, first.** `origin/main` had moved to `10689035`; merged at the start of the tick and the
+three conflicts resolved by the rule that has held all week — **the question is not "whose side is
+newer" but "does this file contain my work"**. `main.rs` was a union of both import lists, the
+BUILD-LOG a union of both journals, and the walkthrough's `unmeasured-page` guard took **main's**,
+which is strictly stronger (it reports `high` and carries `p.failed`, where this branch's reported
+`medium`). My own union-splice mangled `main.rs` into a single over-long `use` line with three
+duplicated names; `cargo check -p omnion-api` would have caught it, and it did not survive long
+either way. The splice also duplicated three security routes into the inventory, which a zero-dupe
+scan over the array found and a re-read of the diff would not have.
+
+**Next tick.** REQ-117's remaining unmeasured half is the `crm-assignment` depth pass, which has
+now failed to measure four ticks running for reasons that are not code. Two of those were this
+branch's own harness and are fixed; the other two were the box. The measurement exists, compiles and
+typechecks, so this tick's job is `pg_isready` **before** starting and a disk check beside it — and
+if the slot is still held, spend the tick on a slice that needs no browser.
