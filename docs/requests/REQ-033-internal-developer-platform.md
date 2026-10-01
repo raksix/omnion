@@ -57,10 +57,26 @@
 > **64**, `cargo test -p omnion-api --test explorer_openapi` **5**,
 > `cargo check -p omnion-api` clean, `pnpm typecheck` **2/2**, `node --check` clean.
 >
-> **STILL OPEN for slice 2:** the browser pass, queued behind a live w7 holder (holder pid
-> 1128224, `/proc/<pid>/cwd` = `/mnt/apopic/omnion-w7`, verified live). **No acceptance box is
-> ticked** — the four boxes this slice owns are all about what a *sent request* does, and a
-> request path no browser has exercised is not yet proved. · **Captured:** 2026-09-25 ·
+> **The pass ran, and it caught two real defects that no unit test could have.** The first
+> paint of the screen carried the notice *"Your role does not hold `developer.explorer.run`, so
+> the Send button is unavailable"* — **on the QA owner, whose role holds every permission.** The
+> panel derived `runnable` by comparing the *selected operation's* permission against the run
+> key, so it was false for every operation: no operation anywhere in the document carries
+> `developer.explorer.run`, so the comparison had no case in which it could be true. Nothing in
+> a unit test could have found that, because the data it read was correct and the *question*
+> was not. `GET /dev/operations` now answers `can_send` beside the list (`3af9a5f9`).
+>
+> The second was the harness's own: three of the eight high findings were the pass filing its
+> own negative assertions — a call it expects to be refused, the recursion probe, the
+> out-of-scope path — as product defects. A report whose high column contains its own negative
+> tests teaches a reader to skim the high column (`81947631`).
+>
+> **No acceptance box is ticked.** The third run queued behind a live w4 pass, started while
+> PostgreSQL was **in recovery mode** on this shared box, and signed in against a `503` — so it
+> measured a login page, not the Explorer (`referenceLoaded: false`, 5 clicks, 27 highs). Those
+> findings are the environment, not the build: `AppShell` renders its `<h1>` unconditionally, so
+> the two `no-h1` findings are the shell never having hydrated. The pass must be re-run on a
+> quiet box; the two defects it *did* find are fixed. · **Captured:** 2026-09-25 ·
 > **Layer:** `apps/admin` + SDKs · **Source:** owner brief — platform periphery & headline
 > features (2026-09-25)
 

@@ -11771,3 +11771,62 @@ the answer, a call the caller cannot make comes back `403` naming the permission
 roles, `/api/v1/dev/…` is refused as recursive, a path outside `/api/v1` is refused, and every
 snippet carries `$OMNION_API_KEY` and no credential. Then tick slice 2's boxes and start slice 3
 (OAuth apps + the events catalog).
+
+
+**Addendum, same tick — the pass ran, and it earned its keep twice.**
+
+The first focused run (`QA_ONLY=developer,api-explorer`) walked all three screens and reported
+**15 findings, 8 high**. Two of those were real and neither was findable by a unit test.
+
+**1. The Send button was dead for everybody, including the owner.** The first paint of
+`/developer/api-explorer` carried the notice *"Your role does not hold `developer.explorer.run`,
+so the Send button is unavailable"* — on the `qa-owner@omnion.test` account, whose role holds
+every permission. The panel derived `runnable` by comparing the **selected operation's**
+permission against the run key. No operation in the document carries `developer.explorer.run`,
+so that comparison was false for every operation and had no case in which it could be true.
+A unit test cannot catch it: the data it reads is correct and the *question* is wrong. Fixed by
+having the server answer `can_send` beside the operation list (`3af9a5f9`).
+
+**2. The pass was filing its own negative assertions as defects.** Three of the eight highs were
+the depth pass's probes: a call it expects to be refused, the recursion guard, and the
+out-of-scope path. The browser logs a console error and a failed request for each, and those are
+the assertions the pass exists to make. Now each is registered with `expectRefusal` immediately
+before the act, with the status it expects (`81947631`).
+
+**The permission probe also had to change shape.** It asked for a `403` the QA owner cannot
+receive — the owner holds every permission, so there was nothing to refuse. That is itself the
+finding: the pre-check answers "yes" honestly for a role that holds everything. What the browser
+*can* prove on this stack is the other half of the criterion, so it now asks for a row that does
+not exist and requires the answer to arrive as a **result carrying a status and an explanatory
+body** — which is the property the criterion is really about: a failed call is not a page error.
+The `403`-names-the-permission half stays with an API unit test; QA step 10 covers it with a
+read-only account.
+
+**The third run measured the environment, not the build.** It queued behind a live w4 pass and
+started while PostgreSQL was **in recovery mode** on this shared box: the sign-in returned `503`,
+the pass measured a login page, and it reported `referenceLoaded: false`, 5 clicks, 27 highs.
+Two of those are `no-h1` on the developer screens — and `AppShell` renders its `<h1>`
+unconditionally (`apps/admin/components/app-shell.tsx:353`), so the shell never hydrated. Those
+are not defects and are not being counted as any.
+
+**Not addressed from this branch:** two `web-page` highs and a `422` on `POST /api/v1/pages` are
+the renderer fixture (`qa-sample` page creation), which fails identically on every writer's stack
+and belongs to whichever writer owns the pages surface. Fixing it from wave 5 would be editing a
+file another wave owns.
+
+**Two process notes, both of which cost a pass.**
+
+- **`run.sh` reads `QA_ONLY` from the environment, not from a flag.** The first run was launched
+  with `bash scripts/qa/run.sh --only=developer,api-explorer`, which `run.sh` ignores — so the
+  pass ran the **entire** walkthrough and the tab died partway through with
+  `locator.count: Target crashed`. A focused pass must be `QA_ONLY=developer,api-explorer bash
+  scripts/qa/run.sh`. The flag form is the one the *inner* script takes, and the two being
+  different is a trap that costs a full pass and produces a crash report that looks like a
+  product defect.
+- **A pass that starts while PostgreSQL is recovering does not fail loudly, it measures a login
+  page.** `referenceLoaded: false` with 27 highs is the signature. Read `referenceLoaded` and the
+  click count *before* reading the findings: 5 clicks across three screens means the pass never
+  signed in, and every finding below it is the login page.
+
+**Next.** Re-run the focused pass on a quiet box and tick slice 2's boxes. Then slice 3 (OAuth
+apps + the events catalog).
