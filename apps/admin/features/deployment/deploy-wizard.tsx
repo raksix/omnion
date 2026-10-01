@@ -173,11 +173,11 @@ export function DeploymentWizard() {
         ) : null}
       </header>
 
-      <ol className="flex items-center gap-2 text-[12px]" aria-label="Deploy steps">
+      <ol className="flex items-center gap-2 text-[12px]" aria-label="Deploy steps" data-testid="deploy-steps">
         {STEPS.map((label, index) => {
           const state = index === step ? "current" : index < step ? "done" : "todo";
           return (
-            <li key={label} className="flex items-center gap-2">
+            <li key={label} className="flex items-center gap-2" data-deploy-step={label} data-step-state={state}>
               <span
                 aria-current={state === "current" ? "step" : undefined}
                 className={
@@ -310,6 +310,7 @@ function PreflightStep({
         <label className="flex items-start gap-2.5 rounded-xl border border-amber-500/40 bg-amber-500/5 px-4 py-3 text-[12.5px]">
           <input
             type="checkbox"
+            data-testid="preflight-acknowledge"
             checked={acknowledged}
             onChange={(event) => onAcknowledge(event.target.checked)}
             className="mt-0.5 size-4 accent-[var(--accent)]"
@@ -324,6 +325,7 @@ function PreflightStep({
       <div className="flex items-center gap-3">
         <button
           type="button"
+          data-testid="preflight-continue"
           onClick={onContinue}
           disabled={!canContinue}
           className="rounded-lg bg-accent px-4 py-2 text-[12.5px] font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
@@ -424,6 +426,7 @@ function ConfirmStep({
             Type the target version to confirm
           </span>
           <input
+            data-testid="confirm-version"
             value={typed}
             onChange={(event) => onTyped(event.target.value)}
             placeholder="e.g. 2.5.0"
@@ -438,6 +441,7 @@ function ConfirmStep({
 
       <button
         type="button"
+        data-testid="confirm-start"
         onClick={onStart}
         disabled={starting || (production && !matches)}
         className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-[12.5px] font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
@@ -531,13 +535,14 @@ function RunStep({
             style={{ width: `${current.progress_percent}%` }}
           />
         </div>
-        <span className="text-[12.5px] text-muted">
+        <span className="text-[12.5px] text-muted" data-testid="run-progress">
           {current.progress_percent}% ·{" "}
           {formatElapsed(current.elapsed_ms)}
           {finished ? "" : " elapsed"}
         </span>
         <button
           type="button"
+          data-testid="log-autoscroll"
           onClick={() => setAutoScroll((value) => !value)}
           aria-pressed={autoScroll}
           className="ml-auto rounded-lg border border-line px-3 py-1.5 text-[12px] font-medium text-ink hover:bg-panel"
@@ -638,6 +643,7 @@ function RunStep({
         <div className="flex items-center gap-3">
           <button
             type="button"
+            data-testid="run-cancel"
             onClick={onCancel}
             disabled={!current.cancellable}
             className="rounded-lg border border-red-500/50 px-4 py-2 text-[12.5px] font-medium text-red-700 disabled:cursor-not-allowed disabled:opacity-50 dark:text-red-300"
