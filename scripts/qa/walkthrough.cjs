@@ -2706,9 +2706,16 @@ async function runAiEvalsDepth(page, report) {
         readiness: row?.querySelector("[data-eval-readiness]")?.getAttribute("data-eval-readiness") ?? null,
         badge: (row?.querySelector("[data-eval-readiness]")?.textContent || "").trim(),
         note: (row?.querySelector("[data-eval-readiness-note]")?.textContent || "").trim(),
-        // The run button is slice 2's. It must be present and disabled rather than a dead button
-        // that posts to a route which 404s.
+        /*
+          `Run now` is slice 2's, and the reason it is disabled on THIS row has changed with it.
+          Before the runner it was "runs do not exist yet"; now the route is real, and a suite
+          with no enabled case is refused by the store — so the button must be disabled because
+          *this suite* cannot run, and the reason must be in the title rather than nowhere. An
+          assertion that only checked "disabled" would have passed in both worlds, which is
+          exactly the assertion that proves nothing.
+        */
         runDisabled: Boolean(row?.querySelector("[data-eval-run-disabled]:disabled")),
+        runReason: (row?.querySelector("[data-eval-run]")?.getAttribute("title") || "").trim(),
       };
     }, suiteKey);
     expect(emptyRow.found, "the suite the pass created is not on the list");
@@ -2722,7 +2729,11 @@ async function runAiEvalsDepth(page, report) {
     );
     expect(
       emptyRow.runDisabled,
-      "Run now is slice 2 and must be disabled with its reason, not a button that 404s",
+      "a suite with no enabled case cannot be run, so Run now must be disabled",
+    );
+    expect(
+      emptyRow.runReason.length > 0,
+      "the disabled Run now must say why — a greyed-out control with no text is a dead button",
     );
     note({ step: "empty-readiness", ...emptyRow });
     await shot(page, "ai-evals-list-populated");
@@ -2937,11 +2948,105 @@ async function runAiEvalsDepth(page, report) {
     await shot(page, "ai-evals-mobile", true);
     await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
 
+    // --- the run history and the run detail (slice 2) --------------------------------------
+    //
+    // The pass starts a run through the API, then visits BOTH new screens and asserts the things
+    // a run list has to get right — most of which are about *not lying* rather than about
+    // looking complete:
+    //
+    //   1. A queued run reads as "nothing has claimed it", NOT as progress. A list that paints
+    //      queued and running the same colour cannot answer "is it stuck", which is the question
+    //      the screen exists for.
+    //   2. The stat tiles count the window they name, and the list carries the tenant's own runs
+    //      rather than an empty table with a spinner still on it.
+    //   3. The diff picker is present and empty for a first run, and the reason is written down —
+    //      a suite with one run has nothing to compare against, and "no baseline yet" is more
+    //      use than a Compare button that is disabled for no visible reason.
+    const started = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/run`, { kind: "manual" });
+    expect(
+      started.status === 202 || started.status === 200 || started.status === 201,
+      `starting a run should enqueue it, saw ${started.status}: ${JSON.stringify(started.body)}`,
+    );
+    const runId = started.body?.run?.id ?? started.body?.id ?? null;
+    note({ step: "start-run", status: started.status, runId });
+
+    await page.goto(`${URL_ADMIN}/ai/evals/runs`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(2000);
+
+    const history = await page.evaluate((id) => {
+      const rows = [...document.querySelectorAll("[data-eval-run]")];
+      const row = rows.find((node) => (node.textContent || "").includes(id ?? "\u0000"));
+      const tiles = [...document.querySelectorAll("[data-eval-runs] p")].map((n) => n.textContent);
+      return {
+        rows: rows.length,
+        found: Boolean(row),
+        state: (row?.textContent || "").trim().slice(0, 200),
+        hasQueuedWord: /queued/i.test(row?.textContent || ""),
+        // A queued run must not be styled as work in progress. The badge is the first span.
+        firstBadge: (row?.querySelector("span")?.textContent || "").trim(),
+        tiles: tiles.slice(0, 8),
+      };
+    }, runId);
+    expect(history.rows > 0, `the run history rendered no rows at all: ${JSON.stringify(history)}`);
+    expect(
+      history.found,
+      `the run the pass started is not on the history: ${JSON.stringify(history)}`,
+    );
+    expect(
+      /queued|running/i.test(history.state),
+      `a run that was only enqueued must say so in words, saw ${JSON.stringify(history.state)}`,
+    );
+    expect(
+      history.tiles.some((text) => /suite/i.test(text ?? "")),
+      "the run list must carry its stat tiles, not only a table",
+    );
+    note({ step: "run-history", ...history });
+    await shot(page, "ai-eval-runs-list");
+
+    await page
+      .goto(`${URL_ADMIN}/ai/evals/runs/${encodeURIComponent(runId ?? "none")}`, {
+        waitUntil: "domcontentloaded",
+      })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    const detail = await page.evaluate(() => {
+      const picker = document.querySelector("[data-eval-baseline-picker]");
+      const compare = document.querySelector("[data-eval-compare]");
+      return {
+        detail: Boolean(document.querySelector("[data-eval-run-detail]")),
+        emptyState: Boolean(
+          document.querySelector("[data-eval-run-detail] p, [data-eval-run-detail] h2"),
+        ),
+        hasPicker: Boolean(picker),
+        compareDisabled: Boolean(compare?.disabled),
+        // The picker is mandatory and a first run has nothing in it — the reason must be on the
+        // page rather than implied by an empty dropdown.
+        reason: (document.body.textContent || "").includes("baseline"),
+      };
+    });
+    expect(detail.detail, "the run detail screen did not render");
+    expect(
+      detail.hasPicker,
+      "the diff picker is mandatory — there is no implicit previous run to compare against",
+    );
+    expect(
+      detail.compareDisabled,
+      "Compare must be disabled until a baseline is chosen, or it would diff against nothing",
+    );
+    expect(
+      detail.reason,
+      "an unrunnable comparison must explain itself on the page, not in an empty dropdown",
+    );
+    note({ step: "run-detail", ...detail });
+    await shot(page, "ai-eval-run-detail");
+
     return { ok: findings.length === 0, steps: steps.length, findings, suiteKey, suiteId };
   } finally {
     endRefusalWindow("/api/v1/ai/evals/suites");
     // Teardown through the API: a suite left behind would make the next pass in this run measure
-    // a populated list while its own assertions describe an empty one. The delete needs its own
+
+    // A populated list while its own assertions describe an empty one. The delete needs its own
     // key as `confirm`, which is exactly the rule the screen enforces by hand.
     if (suiteKey) {
       const removed = await callApi(
@@ -11808,6 +11913,9 @@ async function main() {
     // is the only way a `[key]` screen is ever opened, and it is why the list alone is not
     // enough: the case editor and the config form live entirely on the detail screen.
     { path: "/ai/evals", name: "ai-evals", area: "ai" },
+    // The run history is its own screen and its own route, so it is listed: a screen that is
+    // never walked is a screen nobody can claim works.
+    { path: "/ai/evals/runs", name: "ai-eval-runs", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.

@@ -157,6 +157,15 @@ export type EvalSuiteList = {
    * made a suite gets the empty state, while a filtered list gets "no match".
    */
   is_empty: boolean;
+  /**
+   * The write keys this viewer is missing, so `Run now` can be disabled **with the reason
+   * attached** rather than present-and-403.
+   *
+   * The list is the server's answer, recomputed from the caller's effective permissions. The
+   * panel never derives it from the role's name: two people with the same role can differ, and a
+   * guess either hides a button the caller may use or offers one they cannot.
+   */
+  viewer_missing: string[];
 };
 
 /** A picker option: a row id plus the label a human reads. */

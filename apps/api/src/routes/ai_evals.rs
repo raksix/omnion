@@ -118,6 +118,16 @@ pub struct SuiteList {
     /// `true` when the tenant has no suite at all, so the panel shows its empty state rather
     /// than an empty table it has to guess the meaning of.
     pub is_empty: bool,
+    /// The write keys this viewer is missing, so `Run now` can be disabled **with the reason
+    /// attached** instead of being present and answering 403.
+    ///
+    /// Served beside the rows for the reason the approvals inbox does the same thing: a
+    /// greyed-out button with no text is a dead button, which the definition of done forbids
+    /// outright, while a button that says "you are missing `ai.evals.run`" is a control the
+    /// operator can act on — by asking for the key, which is the actual next step for them.
+    /// Recomputed per request from the caller's effective permissions rather than from the
+    /// role's name, because two people with the same role can differ.
+    pub viewer_missing: std::collections::BTreeSet<String>,
 }
 
 /// One tag and how many cases carry it.
@@ -195,7 +205,10 @@ pub async fn list_suites(
         suites.push(SuiteSummary { suite: suite.clone(), readiness, readiness_note });
     }
 
+    let viewer_missing = viewer_run_keys(pool, &current).await?;
+
     Ok(Json(SuiteList {
+        viewer_missing,
         total: all.len(),
         blocking_count: all.iter().filter(|suite| suite.blocking).count(),
         scheduled_count: all.iter().filter(|suite| suite.schedule.is_some()).count(),
@@ -371,6 +384,31 @@ fn field_for(message: &str) -> Option<&'static str> {
         .iter()
         .find(|property| message.contains(&format!("`{property}`")))
         .copied()
+}
+
+/// The write keys this viewer is missing, for `Run now` and `Make baseline`.
+///
+/// Recomputed per request from the caller's **effective** permissions rather than from the
+/// role's name: two people with the same role can differ, and a panel that guessed from the
+/// role would either hide a button the caller may use or offer one they cannot. The keys are
+/// the same three the write routes are guarded by, read from the mount site rather than written
+/// out again here — a second copy of the list is a list that will drift from the guards.
+async fn viewer_run_keys(
+    pool: &sqlx::PgPool,
+    current: &CurrentSession,
+) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    const KEYS: [&str; 3] = ["ai.evals.run", "ai.evals.manage", "ai.evals.read"];
+    let effective = omnion_permissions::effective_permissions(
+        pool,
+        current.user.id,
+        crate::guards::scope_of(&current.user),
+    )
+    .await?;
+    Ok(KEYS
+        .iter()
+        .filter(|key| !effective.allows(**key))
+        .map(|key| (*key).to_string())
+        .collect())
 }
 
 /// `POST /ai/evals/suites` — create a suite.

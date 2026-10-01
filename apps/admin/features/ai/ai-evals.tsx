@@ -47,6 +47,7 @@ import {
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
 import { ApiError } from "@/lib/api";
+import { startEvalRun } from "@/lib/eval-run-api";
 import {
   createEvalSuite,
   deleteEvalSuite,
@@ -106,6 +107,7 @@ export function AiEvalsView() {
   const [confirming, setConfirming] = useState<string | null>(null);
   const [confirmText, setConfirmText] = useState("");
   const [rowMessage, setRowMessage] = useState<Record<string, string>>({});
+  const [runningKey, setRunningKey] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setBusy(true);
@@ -178,6 +180,38 @@ export function AiEvalsView() {
       setSaving(false);
     }
   }, [draft, load, router]);
+
+  /**
+   * Start a run.
+   *
+   * The route **enqueues**: it resolves the model, writes a `queued` row and returns. It does
+   * not score — a route that scored inline would hold the request open for the length of a
+   * suite, and forty judge calls is minutes. So the button says "queued" rather than "done" and
+   * links to the history, because a panel that waited for a finished result here would hang for
+   * exactly as long as the work takes.
+   */
+  const run = useCallback(
+    async (key: string) => {
+      setRunningKey(key);
+      setRowMessage((state) => ({ ...state, [key]: "" }));
+      try {
+        await startEvalRun(key);
+        setRowMessage((state) => ({
+          ...state,
+          [key]: "Queued. A runner claims it and scores the suite; the history shows progress.",
+        }));
+        load();
+      } catch (cause: unknown) {
+        setRowMessage((state) => ({
+          ...state,
+          [key]: cause instanceof ApiError ? cause.message : "The run could not be started.",
+        }));
+      } finally {
+        setRunningKey(null);
+      }
+    },
+    [load],
+  );
 
   const remove = useCallback(
     async (key: string) => {
@@ -537,12 +571,6 @@ export function AiEvalsView() {
                   {suite.readiness_note}
                 </p>
 
-                {/*
-                  Runs are slice 2. The button is present and disabled with the reason attached,
-                  rather than absent — an operator who cannot find it asks, and one who finds a
-                  dead button stops trusting the screen. The reason is the permission/roadmap
-                  line, and it names what *is* available today.
-                */}
                 <div className="flex flex-wrap items-center gap-2">
                   <Link
                     href={`/ai/evals/${encodeURIComponent(suite.key)}`}
@@ -550,16 +578,53 @@ export function AiEvalsView() {
                   >
                     Open
                   </Link>
-                  <button
-                    type="button"
-                    disabled
-                    data-eval-run-disabled
-                    title="Runs arrive with the eval runner — the cases you author here are ready today."
-                    className="inline-flex cursor-not-allowed items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] text-muted opacity-60"
+                  {/*
+                    Two independent reasons this can be disabled, and both are shown.
+
+                    **A missing key** comes from the server's own `viewer_missing`, so the title
+                    names the exact permission rather than guessing from the role — a control
+                    that refuses with a reason is one the operator can act on (by asking for the
+                    key), while a greyed-out button with no text is a dead button, which the
+                    definition of done forbids outright.
+
+                    **A suite that cannot run** is the other half and it is the one that used to
+                    be missed: a suite with no enabled case, or with a rubric case and no judge
+                    model, would post successfully and then sit queued forever. The readiness
+                    badge already says so on the row; the button repeats it in words.
+                  */}
+                  {(() => {
+                    const missingRun = data.viewer_missing.includes("ai.evals.run");
+                    const blocked = suite.readiness !== "ready";
+                    const reason = missingRun
+                      ? `Missing ${data.viewer_missing.filter((key) => key.startsWith("ai.evals")).join(", ")} — you may read these suites but not spend tokens running them.`
+                      : blocked
+                        ? `This suite is not runnable: ${suite.readiness_note}`
+                        : null;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => void run(suite.key)}
+                        disabled={reason !== null || runningKey === suite.key}
+                        data-eval-run={suite.key}
+                        data-eval-run-disabled={reason !== null ? "true" : undefined}
+                        title={reason ?? "Queue a run of this suite and open the history"}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] transition hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {runningKey === suite.key ? (
+                          <Loader2 aria-hidden size={14} className="animate-spin" />
+                        ) : (
+                          <PlayCircle aria-hidden size={14} />
+                        )}
+                        Run now
+                      </button>
+                    );
+                  })()}
+                  <Link
+                    href="/ai/evals/runs"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] transition hover:bg-canvas"
                   >
-                    <PlayCircle aria-hidden size={14} />
-                    Run now
-                  </button>
+                    Runs
+                  </Link>
                   <button
                     type="button"
                     onClick={() => {

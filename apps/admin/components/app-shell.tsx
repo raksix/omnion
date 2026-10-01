@@ -102,6 +102,10 @@ const NAV = [
   // about locality. It is the only AI entry that measures the platform rather than configuring
   // it, so it reads as the last of the AI group.
   { href: "/ai/evals", label: "Agent evals", icon: ClipboardCheck },
+  // The alias, not the bare `History`: this file also carries Next's `History` type, and the
+  // import has to disambiguate once — reusing the alias the agent-runs entry already made is
+  // the cheaper half of that answer.
+  { href: "/ai/evals/runs", label: "Eval runs", icon: HistoryIcon },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
