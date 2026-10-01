@@ -34,6 +34,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgQueryResult;
 
 use crate::error::Result;
+use crate::push::PrunedSubscription;
 use crate::vocabulary::{CHANNELS, is_channel};
 
 /// The runner's knobs.
@@ -70,7 +71,7 @@ impl Default for DeliveryConfig {
 }
 
 /// What one claimed row is: the delivery, and the notification it carries.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryJob {
     /// The delivery row.
     pub id: Uuid,
@@ -105,6 +106,79 @@ pub struct DeliveryJob {
     /// `None` for every other channel, and `None` for a webhook channel that has neither — a
     /// row that cannot say where to send says so here rather than by sending the in-app link.
     pub webhook_endpoint: Option<String>,
+    /// The `web_push` channel's destinations: this reader's registered browsers.
+    ///
+    /// **A vector, because one person owns several devices and one delivery row is per
+    /// channel.** The webhook field above is a single URL because an organization configures
+    /// one; a person can register a laptop and a phone, and a push transport that sent to
+    /// only the first would deliver half of what the queue asked for while reporting the row
+    /// as `sent`.
+    ///
+    /// Filled by a second query rather than by the claim's `SELECT`, and that is a type-level
+    /// necessity rather than a style choice: `DeliveryJob` derives no `FromRow`, because the
+    /// keys live one-to-many in `push_subscriptions` and there is no column a `Vec<PushTarget>`
+    /// could be decoded from — `sqlx::FromRow` demands every field be a `Type<Postgres>`, and
+    /// a `Vec` of structs is not one.
+    pub push_targets: Vec<PushTarget>,
+}
+
+/// The claim's own row shape: everything `SELECT` can decode, and nothing it cannot.
+///
+/// A separate type rather than `FromRow` on [`DeliveryJob`] for the reason the `push_targets`
+/// field documents. The conversion is one function, [`DeliveryJob::from_row`], and the test
+/// that matters asserts the two shapes agree on the fields they share — a claim query whose
+/// column list drifts from the struct fails to compile, so the risk is a *missing* field, not
+/// a mismatched one.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+struct ClaimedRow {
+    id: Uuid,
+    notification_id: Uuid,
+    user_id: Uuid,
+    channel: String,
+    attempts: i32,
+    max_attempts: i32,
+    title: String,
+    body: String,
+    url: Option<String>,
+    user_email: Option<String>,
+    webhook_endpoint: Option<String>,
+}
+
+impl DeliveryJob {
+    /// Turn a decoded claim row into a job with no devices attached yet.
+    fn from_row(row: ClaimedRow) -> Self {
+        Self {
+            id: row.id,
+            notification_id: row.notification_id,
+            user_id: row.user_id,
+            channel: row.channel,
+            attempts: row.attempts,
+            max_attempts: row.max_attempts,
+            title: row.title,
+            body: row.body,
+            url: row.url,
+            user_email: row.user_email,
+            webhook_endpoint: row.webhook_endpoint,
+            push_targets: Vec::new(),
+        }
+    }
+}
+
+/// One browser a `web_push` delivery is sent to, with the two keys it needs.
+///
+/// **The keys are a capability and never leave the platform.** They are on this struct because
+/// the body cannot be encrypted without them, and they are not on the API's device list,
+/// which renders an endpoint hint for exactly this reason.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct PushTarget {
+    /// The `push_subscriptions` row, so a device the service declares gone can be named.
+    pub id: Uuid,
+    /// The service-worker endpoint this send POSTs to.
+    pub endpoint: String,
+    /// The subscriber's signing public key, `p256dh`.
+    pub p256dh: String,
+    /// The subscriber's authentication secret.
+    pub auth: String,
 }
 
 /// What one tick did. Zero-valued means nothing happened, which is the runner's normal state.
@@ -367,7 +441,88 @@ pub async fn claim_due(pool: &PgPool, batch: i64, lease_seconds: f64) -> Result<
                left join webhook_endpoints w on w.id = c.endpoint_id and w.enabled \
                where d.id = any ($1) \
                order by d.next_attempt_at asc, d.created_at asc";
-    Ok(sqlx::query_as(sql).bind(claimed).fetch_all(pool).await?)
+    let rows: Vec<ClaimedRow> = sqlx::query_as(sql)
+        .bind(claimed)
+        .fetch_all(pool)
+        .await?;
+    let mut jobs: Vec<DeliveryJob> = rows.into_iter().map(DeliveryJob::from_row).collect();
+
+    attach_push_targets(pool, &mut jobs).await?;
+    Ok(jobs)
+}
+
+/// Give every claimed `web_push` job the reader's browsers.
+///
+/// **A separate statement, and the reason is that the claim cannot express it.** The keys live
+/// in `push_subscriptions`, one row per browser, and a claimed job is one row per channel — so
+/// the join that would carry them is one-to-many, and putting it in `claim_due` would multiply
+/// the `notification_deliveries` rows by the number of registered devices. A duplicate job is
+/// not a harmless artefact of a convenient query: each copy carries `attempts` already
+/// incremented once, and the runner settles both, so the delivery would be sent twice and the
+/// second attempt counted against the cap. Reading them per job and leaving the claim alone
+/// keeps one row, one claim and one attempt.
+///
+/// Only `web_push` jobs are filled: the other transports have no use for the keys, and
+/// loading them for every row would put `p256dh`/`auth` into the in-app transport's memory for
+/// no reason.
+async fn attach_push_targets(pool: &PgPool, jobs: &mut [DeliveryJob]) -> Result<()> {
+    let readers: Vec<Uuid> = jobs
+        .iter()
+        .filter(|job| job.channel == crate::preferences::WEB_PUSH)
+        .map(|job| job.user_id)
+        .collect();
+    if readers.is_empty() {
+        return Ok(());
+    }
+
+    // **Every device, not the most recent one.** `distinct on (user_id) … order by user_id,
+    // last_seen_at desc` reads like the right thing to do and quietly delivers to one browser
+    // per person: the second registration is not "an older device to fall back to", it is a
+    // laptop and a phone, and the phone is the one that is on the other side of the house.
+    let rows: Vec<ReaderTarget> = sqlx::query_as(
+        "select user_id, id, endpoint, p256dh, auth \
+         from push_subscriptions where user_id = any ($1) \
+         order by user_id, last_seen_at desc, created_at desc",
+    )
+    .bind(&readers)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    for job in jobs.iter_mut() {
+        if job.channel != crate::preferences::WEB_PUSH {
+            continue;
+        }
+        job.push_targets = rows
+            .iter()
+            .filter(|row| row.user_id == job.user_id)
+            .map(|row| PushTarget {
+                id: row.id,
+                endpoint: row.endpoint.clone(),
+                p256dh: row.p256dh.clone(),
+                auth: row.auth.clone(),
+            })
+            .collect();
+    }
+    Ok(())
+}
+
+/// One registered browser, with the owner still attached so the jobs can be matched.
+#[derive(sqlx::FromRow)]
+struct ReaderTarget {
+    /// Whose device this is.
+    user_id: Uuid,
+    /// The row's id.
+    id: Uuid,
+    /// The service-worker endpoint.
+    endpoint: String,
+    /// The subscriber's signing public key.
+    p256dh: String,
+    /// The subscriber's authentication secret.
+    auth: String,
 }
 
 /// Record that a transport accepted the delivery.
@@ -438,6 +593,15 @@ pub enum TransportOutcome {
     Accepted {
         /// The HTTP status, when the transport speaks HTTP.
         status: Option<i32>,
+        /// Devices the receiver declared gone, for the queue to prune after it settles the row.
+        ///
+        /// **`Accepted` carries them too, not only `Failed`**: a person with two devices where
+        /// one is a dead endpoint has *received* the notification, and the dead row must still
+        /// go. There is no default for this field and no `#[serde(default)]` either — Rust has
+        /// no per-field default on a struct variant, so `Accepted { status }` does not
+        /// compile. [`Self::accepted`] is what keeps that cost off the three transports that
+        /// have no devices to report.
+        pruned: Vec<PrunedSubscription>,
     },
     /// The receiver refused it or could not be reached.
     Failed {
@@ -445,7 +609,70 @@ pub enum TransportOutcome {
         status: Option<i32>,
         /// A sentence, never empty, that a settings screen can show.
         reason: String,
+        /// Devices the receiver declared gone.
+        pruned: Vec<PrunedSubscription>,
     },
+}
+
+impl TransportOutcome {
+    /// The receiver took it, and there were no devices to declare gone.
+    ///
+    /// The constructor the three non-push transports use, so that adding the `pruned` field did
+    /// not have to be a mechanical edit in every match arm in the tree — and, more usefully, so
+    /// that an arm cannot *silently* forget a prune by writing `status: None` and stopping
+    /// there. `TransportOutcome::accepted(status)` reads as the whole story it is.
+    #[must_use]
+    pub fn accepted(status: Option<i32>) -> Self {
+        Self::Accepted {
+            status,
+            pruned: Vec::new(),
+        }
+    }
+
+    /// The receiver refused it, with the sentence the outbox renders.
+    #[must_use]
+    pub fn failed(status: Option<i32>, reason: impl Into<String>) -> Self {
+        Self::Failed {
+            status,
+            reason: reason.into(),
+            pruned: Vec::new(),
+        }
+    }
+
+    /// Record the devices a push service said are gone, on an outcome that does not carry them.
+    ///
+    /// A builder rather than a third `TransportOutcome` variant because *when* to prune is not
+    /// the transport's decision: it collects them, and [`run_due`] prunes after the row has
+    /// been settled. A transport that deleted its own rows mid-send would be iterating over the
+    /// collection it is removing from.
+    #[must_use]
+    pub fn with_pruned(self, pruned: Vec<PrunedSubscription>) -> Self {
+        match self {
+            Self::Accepted { status, .. } => Self::Accepted {
+                status,
+                pruned,
+            },
+            Self::Failed { status, reason, .. } => Self::Failed {
+                status,
+                reason,
+                pruned,
+            },
+        }
+    }
+
+    /// The devices this outcome declared gone.
+    #[must_use]
+    pub fn pruned(&self) -> &[PrunedSubscription] {
+        match self {
+            Self::Accepted { pruned, .. } | Self::Failed { pruned, .. } => pruned,
+        }
+    }
+
+    /// Whether the delivery reached somebody.
+    #[must_use]
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted { .. })
+    }
 }
 
 /// What a transport needs to make one attempt.
@@ -483,7 +710,7 @@ impl Transport for InAppTransport {
         _job: &'a DeliveryJob,
         _config: &'a DeliveryConfig,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransportOutcome> + Send + 'a>> {
-        Box::pin(async { TransportOutcome::Accepted { status: None } })
+        Box::pin(async { TransportOutcome::accepted(None) })
     }
 }
 
@@ -524,12 +751,45 @@ pub async fn run_due(
             continue;
         };
 
-        match transport.deliver(&job, config).await {
-            TransportOutcome::Accepted { status } => {
+        let outcome = transport.deliver(&job, config).await;
+
+        // **Prune after the settle, never during the send.** The transport collects the dead
+        // endpoints and this is where they are deleted, because a delete inside the loop that
+        // is iterating over them is a second bug layered on the first: the collection would be
+        // shrinking under the loop, and on a five-device reader the fourth target could be
+        // skipped without ever being sent to. Settling the row first also means a device that
+        // disappeared mid-delivery cannot turn a delivered notification into a failed one.
+        let outcome = if outcome.pruned().is_empty() {
+            outcome
+        } else {
+            let pruned = outcome.pruned().to_vec();
+            match crate::push::prune_endpoints(pool, &pruned).await {
+                Ok(count) if count > 0 => tracing::info!(
+                    user_id = %job.user_id,
+                    pruned = count,
+                    "removed push endpoints the push service declared gone"
+                ),
+                Ok(_) => {}
+                // A prune that fails must not turn a delivered notification into a retry: the
+                // dead rows cost one extra send each, which is survivable; a re-sent
+                // notification is not.
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "the dead push endpoints could not be pruned; they will be pruned again \
+                         on the next delivery"
+                    );
+                }
+            }
+            outcome
+        };
+
+        match outcome {
+            TransportOutcome::Accepted { status, .. } => {
                 mark_sent(pool, job.id, status).await?;
                 report.sent += 1;
             }
-            TransportOutcome::Failed { status, reason } => {
+            TransportOutcome::Failed { status, reason, .. } => {
                 let reason = trim_error(&reason);
                 if job.attempts < job.max_attempts {
                     let delay = retry_delay(job.attempts, config.retry_base, config.retry_max);
@@ -690,5 +950,139 @@ mod tests {
         assert!(remote.contains(&"web_push"));
         assert!(remote.contains(&"chat"));
         assert!(!remote.contains(&"in_app"));
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Slice 6b — the push destination and the prune contract
+    // ----------------------------------------------------------------------------------------
+
+    /// A claimed row, for the two shape tests below.
+    fn claimed(webhook_endpoint: Option<&str>) -> ClaimedRow {
+        ClaimedRow {
+            id: Uuid::from_u128(1),
+            notification_id: Uuid::from_u128(2),
+            user_id: Uuid::from_u128(3),
+            channel: "web_push".to_owned(),
+            attempts: 1,
+            max_attempts: 3,
+            title: "A page is waiting".to_owned(),
+            body: "Somebody asked for a review.".to_owned(),
+            url: Some("/approvals".to_owned()),
+            user_email: None,
+            webhook_endpoint: webhook_endpoint.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_claimed_row_becomes_a_job_with_no_devices_and_every_other_field_intact() {
+        // The conversion is where a field can be quietly dropped, so it is pinned field by
+        // field rather than by comparing the whole struct — a struct comparison would still
+        // pass if `from_row` and the struct were changed together.
+        let job = DeliveryJob::from_row(claimed(None));
+        assert_eq!(job.channel, "web_push");
+        assert_eq!(job.attempts, 1);
+        assert_eq!(job.max_attempts, 3);
+        assert_eq!(job.title, "A page is waiting");
+        assert_eq!(job.url.as_deref(), Some("/approvals"));
+        assert!(job.webhook_endpoint.is_none());
+        assert!(
+            job.push_targets.is_empty(),
+            "a claim attaches no devices; `attach_push_targets` is the only writer"
+        );
+    }
+
+    #[test]
+    fn the_webhook_destination_survives_the_new_row_shape() {
+        // The regression guard for the refactor above: the conversion must not become the
+        // place a channel's destination gets lost. A webhook delivery that arrives with a
+        // `None` endpoint fails with "no destination", which is the message a reader sees
+        // after a send that used to work.
+        let job = DeliveryJob::from_row(claimed(Some("https://collector.example/hook")));
+        assert_eq!(
+            job.webhook_endpoint.as_deref(),
+            Some("https://collector.example/hook")
+        );
+    }
+
+    #[test]
+    fn a_prune_travels_on_both_outcomes_and_is_readable_from_either() {
+        // `run_due` reads the devices off the outcome before it knows whether the row is
+        // `sent` or `failed`, so both arms have to carry them. A push send that delivered on
+        // one device and found a second one dead must remove that device *and* report success
+        // — losing the prune would leave the dead endpoint in the list forever.
+        let gone = vec![PrunedSubscription {
+            id: Uuid::from_u128(9),
+            endpoint: "https://push.example/gone".to_owned(),
+            status: 410,
+        }];
+
+        let accepted = TransportOutcome::Accepted {
+            status: Some(201),
+            pruned: gone.clone(),
+        };
+        assert_eq!(accepted.pruned().len(), 1);
+        assert!(accepted.is_accepted());
+
+        let failed = TransportOutcome::Failed {
+            status: Some(410),
+            reason: "every registered browser is gone".to_owned(),
+            pruned: gone,
+        };
+        assert_eq!(failed.pruned().len(), 1);
+        assert!(!failed.is_accepted());
+    }
+
+    #[test]
+    fn a_transport_that_prunes_nothing_reports_nothing_rather_than_an_empty_list() {
+        // The constructors. A transport with no devices to report must not have to write a
+        // `pruned` list to answer "nothing was pruned" — that is a change every match arm in
+        // the tree would have to make for no semantic gain, and one that a future arm could
+        // forget. The two constructors are the whole of that fix.
+        let outcome = TransportOutcome::accepted(None);
+        assert!(outcome.pruned().is_empty());
+        assert!(outcome.is_accepted());
+
+        let outcome = TransportOutcome::failed(None, "no address");
+        assert!(outcome.pruned().is_empty());
+        assert!(!outcome.is_accepted());
+
+        // And the sentence survives the constructor's `impl Into<String>`, because that is the
+        // column the outbox renders and a `&str` that did not become a `String` would not
+        // compile here.
+        match TransportOutcome::failed(None, "a bare &str") {
+            TransportOutcome::Failed { reason, .. } => assert_eq!(reason, "a bare &str"),
+            TransportOutcome::Accepted { .. } => panic!("failed() must build a Failed"),
+        }
+    }
+
+    #[test]
+    fn the_builder_does_not_invent_a_prune_and_does_not_lose_one() {
+        let gone = PrunedSubscription {
+            id: Uuid::from_u128(9),
+            endpoint: "https://push.example/gone".to_owned(),
+            status: 404,
+        };
+        let built = TransportOutcome::accepted(Some(201)).with_pruned(vec![gone]);
+        assert_eq!(built.pruned().len(), 1);
+        assert!(built.is_accepted());
+
+        // The failed arm keeps its sentence, which is the column the outbox renders.
+        let built = TransportOutcome::failed(Some(500), "the service answered 500")
+            .with_pruned(Vec::new());
+        match built {
+            TransportOutcome::Failed { reason, .. } => {
+                assert_eq!(reason, "the service answered 500");
+            }
+            TransportOutcome::Accepted { .. } => panic!("the builder changed the outcome's arm"),
+        }
+    }
+
+    #[test]
+    fn the_push_channel_is_the_one_the_row_shape_was_built_for() {
+        // A guard against the vocabulary drifting from the constant the claim filters on: the
+        // claim's `channel = 'web_push'` and [`crate::preferences::WEB_PUSH`] are the same
+        // string, and this is what keeps them so.
+        assert_eq!(crate::preferences::WEB_PUSH, "web_push");
+        assert!(CHANNELS.contains(&crate::preferences::WEB_PUSH));
     }
 }

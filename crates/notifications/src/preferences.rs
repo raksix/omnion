@@ -118,6 +118,9 @@ impl Preferences {
 
 /// The channel a person cannot opt out of, and the reason the settings screen says.
 pub const IN_APP: &str = "in_app";
+/// The browser push channel, named once so the queue and the runner cannot disagree on the
+/// spelling — the same reason [`IN_APP`] exists.
+pub const WEB_PUSH: &str = "web_push";
 
 /// One row of `notification_settings`: quiet hours, timezone and the digest cadence.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

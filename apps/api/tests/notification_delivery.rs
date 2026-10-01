@@ -70,10 +70,7 @@ impl Transport for AlwaysFails {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransportOutcome> + Send + 'a>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async {
-            TransportOutcome::Failed {
-                status: Some(500),
-                reason: "the receiving side refused the message".to_owned(),
-            }
+            TransportOutcome::failed(Some(500), "the receiving side refused the message")
         })
     }
 }
@@ -91,7 +88,7 @@ impl Transport for AlwaysAccepts {
         _job: &'a DeliveryJob,
         _config: &'a DeliveryConfig,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransportOutcome> + Send + 'a>> {
-        Box::pin(async { TransportOutcome::Accepted { status: None } })
+        Box::pin(async { TransportOutcome::accepted(None) })
     }
 }
 
@@ -951,11 +948,13 @@ async fn the_email_transport_refuses_a_reader_with_no_address_instead_of_pretend
         body: "Somebody asked for a review.".to_owned(),
         url: None,
         user_email: None,
+        webhook_endpoint: None,
+        push_targets: Vec::new(),
     };
 
     let transport = EmailTransport::new(&omnion_core::config::MailConfig::default());
     match transport.deliver(&job, &fast_config()).await {
-        TransportOutcome::Failed { reason, status } => {
+        TransportOutcome::Failed { reason, status, .. } => {
             assert!(status.is_none(), "there was no HTTP status to report");
             assert!(
                 reason.contains("no e-mail address"),
