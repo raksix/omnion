@@ -9651,3 +9651,56 @@ inspector — is written and unmeasured, and for three ticks each has been "the 
 run". The reason was never that the pass was slow. It was that consecutive ticks were starting
 competing passes that destroyed each other, and the resulting failure mode is a report full of
 findings measured against a database that was dropped underneath the walk.
+
+## 2026-10-01 · wave 2 · tick 48 — the `--only` filter was never selecting anything
+
+**What.** `origin/main` moved, so this tick opened with the merge: `a930998b`, the append-only
+BUILD-LOG spliced and verified by `merge-build-log.py` (137 `## ` headings, both parents' entries
+present, zero conflict markers). Then the real work, which was not in any REQ.
+
+**A filter that silently matches nothing does not fail a pass — it makes the pass run something
+else.** `run.sh` emits `--only="$QA_ONLY"`, i.e. `--only=block-editor,members`. Three defects sat
+on that one argument:
+
+```js
+process.argv.indexOf(`--only`)        // whole-token match: "--only=…" is never found → ONLY=["all"]
+process.argv.includes("--only=block-editor")   // only matches a pass invoked ALONE
+await browser.close(); process.exit(0);        // so --only=a,b could only ever run the first
+```
+
+The first made the filter expand to everything; the second meant none of the fourteen depth-pass
+entry points matched, and since each ends in `return` they were not skipped either. So a pass
+queued to measure the block editor at two widths walked the whole box for 45 minutes and wrote no
+`summary.json` at all. The only symptom was duration, which reads as a scheduling fact — and
+REQ-063's acceptance 17 sat unmeasured for three ticks under a status line that blamed exactly
+that. The pass was never slow. It was filtered out of its own argument.
+
+**Fixed in `0dae5a35`.** `arg()` uses a prefix search (`indexOf` can only ever match the literal
+string `--only=`, which is not a token anyone passes); the entry points test `onlyEntry(name)`
+against the parsed list; `finishScopedPass` merges each pass's summary — `writeFileSync` of a
+whole document overwrites, which would have deleted the first pass's keys with no error and no
+finding — closes the browser only on the LAST entry, and carries an earlier failure into the final
+exit code so `--only=a,b` cannot exit green because the last module was green.
+
+**Proof.**
+
+```
+node scripts/qa/test-only-filter.cjs                24/24 ok
+  … the same test against a deliberately re-broken copy: 8/24 FAIL
+cargo build -p omnion-api                           exit 0
+cargo test -p omnion-api --lib                      320 passed; 0 failed
+pnpm typecheck (apps/admin)                          clean
+```
+
+The filter test **extracts the real helpers out of `walkthrough.cjs` by name and evaluates
+those**, rather than reimplementing them: a copy keeps passing after the original regresses,
+which is the exact failure it exists to catch. And it was run against the pre-fix code to prove
+it can go red at all — 8 of its 24 checks fail there.
+
+**Not measured.** Criterion 17 stays unticked. The pass queued this tick has not been granted the
+QA slot — a live w3 walkthrough holds it and is still progressing, so it will be released on its
+own and nothing was killed. A pass that starts with no room dies halfway and reports nothing,
+which is the same wasted hour as never starting.
+
+**Next.** That pass (`--only=block-editor,members`, now able to run both depth passes in one run
+and report both), then REQ-063 criterion 17, REQ-064's 18 and REQ-019's content-api criterion.
