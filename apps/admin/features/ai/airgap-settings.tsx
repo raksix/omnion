@@ -53,19 +53,32 @@ import {
   verifyAirgap,
   type AirgapHost,
   type AirgapOverview,
+  type EgressOutcome,
 } from "@/lib/airgap-api";
 import { formatTimestamp } from "@/lib/format";
 
-/** What a verification result renders as. `null` is a third thing, not a pass. */
-function verifyTone(result: string | null): { label: string; tone: string } {
+/**
+ * What a stored verification result renders as.
+ *
+ * `null` is a third thing, not a pass — and so is `undetermined`, which the check writes when the
+ * attempt never reached the switch. Both fall to the "never" branch on purpose: the request calls
+ * a failed verification "the loudest alert in this request", and an unrun check is at least as
+ * worth saying out loud. Rendering either green would be the same lie in softer clothes.
+ *
+ * The three words come from `EgressOutcome`, and the panel reads them rather than inventing its
+ * own: it used to test for `"passed"`, which the checker has never written, so the reassuring
+ * tone was unreachable and a breach rendered as "Never verified" — the most dangerous possible
+ * direction for that bug to point.
+ */
+function verifyTone(result: EgressOutcome | null): { label: string; tone: string } {
   switch (result) {
-    case "passed":
-      return { label: "Verified", tone: "bg-positive-soft text-positive" };
-    case "failed":
+    // A refusal IS the pass. The label says so, because an operator who sees "Blocked" next to a
+    // green pill needs to be told that means working, not broken.
+    case "blocked":
+      return { label: "Verified — a call was refused", tone: "bg-positive-soft text-positive" };
+    case "escaped":
       return { label: "A call escaped", tone: "bg-danger-soft text-danger" };
     default:
-      // Never run is not a pass. The request calls a failed verification "the loudest alert in
-      // this request"; rendering an unrun check green would be the same lie in softer clothes.
       return { label: "Never verified", tone: "bg-quiet-soft text-muted" };
   }
 }
@@ -95,6 +108,14 @@ export function AirgapSettingsView() {
 
   const [verifying, setVerifying] = useState(false);
   const [verifyMessage, setVerifyMessage] = useState<string | null>(null);
+  /**
+   * What the run just now measured, so the sentence can be tinted.
+   *
+   * Kept separate from `verifyMessage` on purpose: the message is the API's sentence and must be
+   * shown verbatim, while the outcome is what decides the colour. Collapsing them into one string
+   * would mean choosing a tone by parsing English, which is how a breach ends up rendered calmly.
+   */
+  const [verifyOutcome, setVerifyOutcome] = useState<EgressOutcome | null>(null);
   const [verifyError, setVerifyError] = useState<string | null>(null);
 
   const reasonRef = useRef<HTMLTextAreaElement | null>(null);
@@ -105,8 +126,6 @@ export function AirgapSettingsView() {
     fetchAirgap()
       .then((answer) => {
         setData(answer);
-        setVerifyMessage(null);
-        setVerifyError(null);
       })
       .catch((cause: unknown) => {
         setData(null);
@@ -116,6 +135,21 @@ export function AirgapSettingsView() {
       })
       .finally(() => setBusy(false));
   }, []);
+
+  /**
+   * Re-read the switch, clearing whatever the last verification said.
+   *
+   * Separate from `load` for one reason: `runVerify` calls `load` right after recording its own
+   * result, and a `load` that cleared the message would wipe the sentence the operator just asked
+   * for — the fetch resolves *after* the message is set, so the button would appear to work and
+   * print nothing. Clearing is a navigation action, not a consequence of every read.
+   */
+  const reloadClearingNotice = useCallback(() => {
+    setVerifyMessage(null);
+    setVerifyOutcome(null);
+    setVerifyError(null);
+    load();
+  }, [load]);
 
   useEffect(load, [load]);
 
@@ -202,7 +236,9 @@ export function AirgapSettingsView() {
           ? `${host} was already on the internal allow-list.`
           : `${host} now counts as an internal host. Providers on it are not refused.`,
       );
-      load();
+      // The allow-list changed, so the last verification's verdict is about a configuration that
+      // no longer exists — it is cleared rather than left sitting above a stale sentence.
+      reloadClearingNotice();
     } catch (cause: unknown) {
       setHostError(
         cause instanceof ApiError ? cause.message : "The host could not be added to the allow-list.",
@@ -210,7 +246,7 @@ export function AirgapSettingsView() {
     } finally {
       setHostBusy(false);
     }
-  }, [hostInput, hostNote, load]);
+  }, [hostInput, hostNote, reloadClearingNotice]);
 
   const removeHost = useCallback(
     async (host: AirgapHost) => {
@@ -220,7 +256,8 @@ export function AirgapSettingsView() {
         setHostMessage(
           `${host.host} is off the allow-list again. A provider on it is now refused while the air gap is on.`,
         );
-        load();
+        // Same reason as adding: the verdict belonged to a configuration that just changed.
+        reloadClearingNotice();
       } catch (cause: unknown) {
         setHostRowState((state) => ({
           ...state,
@@ -228,16 +265,21 @@ export function AirgapSettingsView() {
         }));
       }
     },
-    [load],
+    [reloadClearingNotice],
   );
 
   const runVerify = useCallback(async () => {
     setVerifying(true);
     setVerifyError(null);
     setVerifyMessage(null);
+    setVerifyOutcome(null);
     try {
       const answer = await verifyAirgap();
       setVerifyMessage(answer.message);
+      // The outcome is kept so the sentence can be tinted by what it says. A breach rendered in
+      // the same quiet grey as a pass is the failure mode this whole screen exists to prevent —
+      // the API distinguishes them perfectly and the UI was throwing that distinction away.
+      setVerifyOutcome(answer.outcome);
       // The check does not change the switch, but it does change what the banner is allowed to
       // claim — so the whole screen is re-read rather than patched locally.
       load();
@@ -547,7 +589,7 @@ export function AirgapSettingsView() {
             data-result={data.state.egress_verify_result ?? "never"}
             className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11.5px] font-medium ${verify.tone}`}
           >
-            {data.state.egress_verify_result === "passed" ? (
+            {data.state.egress_verify_result === "blocked" ? (
               <CheckCircle2 aria-hidden size={12} />
             ) : (
               <AlertTriangle aria-hidden size={12} />
@@ -586,8 +628,19 @@ export function AirgapSettingsView() {
         {verifyMessage ? (
           <p
             data-airgap-verify-message
+            data-outcome={verifyOutcome ?? "none"}
             role="status"
-            className="mt-3 rounded-lg bg-quiet-soft px-3 py-2 text-[12px] text-muted"
+            className={`mt-3 rounded-lg px-3 py-2 text-[12px] ${
+              // The colour follows the OUTCOME, never the shape of the sentence. An escaped call
+              // is the loudest alert this request has, so it cannot arrive in the same neutral
+              // grey as a refusal — which would make the screen's colour contradict its badge
+              // directly above it.
+              verifyOutcome === "escaped"
+                ? "bg-danger-soft text-danger"
+                : verifyOutcome === "blocked"
+                  ? "bg-positive-soft text-positive"
+                  : "bg-quiet-soft text-muted"
+            }`}
           >
             {verifyMessage}
           </p>

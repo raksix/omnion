@@ -13,6 +13,22 @@
  */
 import { request } from "./api";
 
+/**
+ * What one egress-verification attempt measured.
+ *
+ * The names describe the ATTEMPT, not the verdict, because a refusal is the pass:
+ *
+ * - `blocked` — the call was refused. **This is the pass.**
+ * - `escaped` — the call was permitted and left. A breach, and the loudest alert in this request.
+ * - `undetermined` — the attempt never reached the check, so it proved nothing. NOT a pass.
+ *
+ * A union rather than `string` on purpose: the screen's badge and the checker's stored word must
+ * not drift, and a widened type is what let them drift in the first place — the panel used to
+ * test for `"passed"`, a word the checker has never written, so the green tone was unreachable
+ * and a breach rendered as "Never verified".
+ */
+export type EgressOutcome = "blocked" | "escaped" | "undetermined";
+
 /** The switch, as the panel reads it. */
 export type AirgapState = {
   /** Whether non-local calls are refused right now. */
@@ -27,8 +43,13 @@ export type AirgapState = {
   egress_verified_at: string | null;
   /** The host the last verification aimed at. */
   egress_verify_target: string | null;
-  /** `passed`, `failed`, or `null` when no verification has run. */
-  egress_verify_result: string | null;
+  /**
+   * The last attempt's outcome, or `null` when no verification has run.
+   *
+   * Same three words as {@link EgressOutcome}, stored rather than re-derived: the banner reads
+   * this column, so it must mean exactly what the checker wrote.
+   */
+  egress_verify_result: EgressOutcome | null;
   /** ISO-8601 of the last write to this row, for any reason. */
   updated_at: string;
 };
@@ -149,17 +170,43 @@ export function removeAirgapHost(id: string): Promise<void> {
 /**
  * Egress verification: attempt a non-local call and expect the refusal.
  *
- * `implemented: false` is the API saying the live check has not landed yet. The screen renders that
- * honestly — "the last recorded result" — because a "verified" badge nobody ran is worse than no
- * badge at all.
+ * # `outcome` names the MEASUREMENT, not the verdict
+ *
+ * A refusal is the **pass** here, so the field reads `blocked` (the call was blocked) rather
+ * than `passed` (a judgement about the installation). The distinction is not pedantry: `blocked`
+ * is a fact about one attempt and stays true even if the switch is broken somewhere else, while
+ * `passed` would assert the whole control is sound from a single call — and a screen rendering
+ * `passed` next to a red banner would be claiming two contradictory things at once.
+ *
+ * `undetermined` is the third value and it is NOT a pass: the attempt never reached the check,
+ * so it proved nothing. Treating it as `passed` is the false reassurance the request warns about.
+ *
+ * `holds` is what the panel branches on; `outcome` is what a human reads. Both are returned so
+ * the screen never has to re-derive the inversion — a client copy of the rule could disagree with
+ * the checker on the one case that matters.
  */
 export function verifyAirgap(target?: string | null): Promise<{
   enabled: boolean;
-  verified_at: number | null;
+  /** `blocked` (the pass), `escaped` (a breach) or `undetermined` (proved nothing). */
+  outcome: EgressOutcome;
+  /** The convenience of `outcome === "blocked"`, computed server-side. */
+  holds: boolean;
+  /** The bare host that was aimed at. */
   target: string | null;
-  result: string | null;
-  implemented: boolean;
+  /** The provider whose stored base URL was used. */
+  provider: string | null;
+  latency_ms: number | null;
+  /** Unix seconds, or `null` when the attempt never completed. */
+  verified_at: number | null;
+  /** One plain-language sentence naming the outcome and the host. */
   message: string;
+  /** The refusal itself, when there was one — the operator sees what they would have hit. */
+  refusal: {
+    code: string;
+    message: string;
+    provider: string;
+    host: string;
+  } | null;
 }> {
   return request("/api/v1/ai/airgap/verify", {
     method: "POST",
