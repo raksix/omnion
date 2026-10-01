@@ -11212,6 +11212,209 @@ async function runOAuthAppsDepth(page, report) {
 }
 
 /**
+ * The developer framing of the event catalogue (REQ-033, slice 3), driven.
+ *
+ * A route walk is not enough here. `/developer/events` is a read-only table, and on a fresh
+ * database a route visit proves the empty state renders and nothing else — the filter, the
+ * payload expansion, the schema/sample pair and above all the **subscribe deep link** are all
+ * invisible to it. The deep link is the feature: it is the only thing on the page that a copy
+ * of `/events` could not have, and a link to a form that ignores its query parameter is a dead
+ * button in the exact sense — the page it lands on is fine, so a route walk reports green.
+ *
+ * **Every claim here is a verdict, not an observation.** `runDepthPass` catches a thrown error
+ * and reports `ok: false`; `run.sh` reads only `summary.json`. A pass that appends booleans to a
+ * `steps` object and returns it therefore produces seventeen numbers that nothing ever reads —
+ * the tick-98 class of gate, and it is worth naming because several older passes in this file
+ * have exactly that shape. So each claim below is `check(name, value)`, and the pass **throws**
+ * naming the claims that did not hold. The steps are still returned for the log line, but the
+ * verdict is the throw.
+ *
+ * The registry is compiled into the platform, so this pass needs no fixture and no teardown: a
+ * fresh database has every name. All the claims are about the screen's claims, not the data's.
+ */
+async function runDevEventsDepth(page, report) {
+  const steps = {};
+  const failures = [];
+  const check = (claim, ok) => {
+    steps[claim] = Boolean(ok);
+    if (!ok) failures.push(claim);
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/developer/events`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector("[data-dev-event-list], [data-dev-event-empty]", { timeout: 15000 })
+    .catch(() => {});
+
+  const rows = page.locator("[data-dev-event-row]");
+  check("theCatalogueRendered", (await rows.count()) > 0);
+
+  // The default scope is "subscribable". If it were not, a developer landing here would be
+  // offered reserved names as though they were real — the one thing this screen exists to
+  // prevent — and the filter's default would be the only place the difference showed.
+  const statuses = await rows
+    .evaluateAll((nodes) => nodes.map((n) => n.getAttribute("data-dev-event-status")))
+    .catch(() => []);
+  check(
+    "theDefaultScopeHidesReserved",
+    statuses.length > 0 && statuses.every((s) => s === "live"),
+  );
+
+  // The inverse claim, because a scope filter that did nothing would satisfy the claim above by
+  // accident: the reserved scope must show *only* reserved names.
+  await page.locator('[data-dev-event-scope="reserved"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  const reservedStatuses = await rows
+    .evaluateAll((nodes) => nodes.map((n) => n.getAttribute("data-dev-event-status")))
+    .catch(() => []);
+  check(
+    "theReservedScopeShowsOnlyReserved",
+    reservedStatuses.every((s) => s === "reserved"),
+  );
+  await shot(page, "page-developer-events-reserved");
+
+  // A reserved name must not offer a Subscribe link, and must say why instead. This is what
+  // makes the badge mean something: a developer who has read the name needs to know it is not
+  // a name they may build against yet.
+  const linksWhileReserved = await page.locator("[data-dev-event-subscribe]").count();
+  const refusals = await page.locator("[data-dev-event-not-subscribable]").count();
+  check(
+    "aReservedNameCannotBeSubscribed",
+    linksWhileReserved === 0 && (reservedStatuses.length === 0 || refusals > 0),
+  );
+
+  await page.locator('[data-dev-event-scope="all"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  // ---- The deep link: the one thing this page does that /events cannot -------------------------
+  const anyName = statuses[0];
+  if (anyName) {
+    const href = await page
+      .locator(`[data-dev-event-subscribe="${anyName}"]`)
+      .getAttribute("href")
+      .catch(() => null);
+    check(
+      "theSubscribeLinkCarriesTheName",
+      Boolean(href && href.includes("event=") && decodeURIComponent(href).includes(anyName)),
+    );
+
+    // Follow it. A link to a form that ignores ?event= lands on a working page and does nothing,
+    // and nothing short of following it can tell the difference.
+    if (href) {
+      await page.goto(`${URL_ADMIN}${href}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(1500);
+      const ticked = await page
+        .locator('input[type="checkbox"]:checked')
+        .evaluateAll((nodes) => nodes.map((n) => n.value || n.name || n.id || ""))
+        .catch(() => []);
+      // The preselect is observable as a box ticked that the operator did not tick. Matching on
+      // the value as well as the count is deliberate: a form that ticks *some other* box would
+      // satisfy a count-only assertion, and the count is the weaker claim.
+      const preselected = ticked.some((v) => decodeURIComponent(String(v)).includes(anyName));
+      check("theDeepLinkPreselectsTheEvent", preselected);
+      await shot(page, "page-developer-events-deeplink");
+    }
+  }
+
+  // ---- The payload, the sample and the schema --------------------------------------------------
+  await page
+    .goto(`${URL_ADMIN}/developer/events`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector("[data-dev-event-row]", { timeout: 15000 }).catch(() => {});
+  const firstName = await rows
+    .first()
+    .getAttribute("data-dev-event-row")
+    .catch(() => null);
+
+  if (firstName) {
+    await page
+      .locator(`[data-dev-event-expand="${firstName}"]`)
+      .click({ timeout: 4000 })
+      .catch(() => {});
+    await page.waitForTimeout(300);
+    check(
+      "thePayloadExpands",
+      (await page.locator(`[data-dev-event-fields="${firstName}"]`).count()) === 1,
+    );
+
+    await page
+      .locator(`[data-dev-event-sample="${firstName}"]`)
+      .click({ timeout: 4000 })
+      .catch(() => {});
+    await page.waitForTimeout(300);
+
+    // The QA plan asks that every sample validate against its own schema. The honest on-screen
+    // reading of that is not "the JSON parses" — it is that the panel shows the *server-generated*
+    // sample for the *server-generated* schema of the same registry row, and that the sample
+    // carries at least the fields the table beside it lists as required. A hand-written sample
+    // would parse just as well and mean nothing.
+    const schemaText = await page
+      .locator(`[data-dev-event-schema="${firstName}"]`)
+      .textContent()
+      .catch(() => "");
+    const sampleText = await page
+      .locator(`[data-dev-event-sample-payload="${firstName}"]`)
+      .textContent()
+      .catch(() => "");
+
+    let schema = null;
+    let sample = null;
+    try {
+      schema = JSON.parse(schemaText || "");
+    } catch {
+      schema = null;
+    }
+    try {
+      sample = JSON.parse(sampleText || "");
+    } catch {
+      sample = null;
+    }
+    check("theSchemaIsJson", Boolean(schema && typeof schema === "object"));
+    check(
+      "theSampleIsJson",
+      Boolean(sample) && typeof sample === "object" && !Array.isArray(sample) &&
+        Object.keys(sample).length > 0,
+    );
+
+    // The sample must cover the schema's REQUIRED properties. This is the check that can fail
+    // when both halves are valid JSON: a server that generated a sample from a different row, or
+    // a required field added to the registry without regenerating the sample, shows up here and
+    // nowhere else on the screen.
+    const required = Array.isArray(schema?.required) ? schema.required : [];
+    const missing = required.filter((key) => !(key in (sample || {})));
+    check("theSampleCoversEveryRequiredField", required.length > 0 && missing.length === 0);
+    await shot(page, "page-developer-events-payload");
+  }
+
+  // ---- The filter, and the empty state it can reach ---------------------------------------------
+  await page.locator("[data-dev-event-filter]").fill("zzz-no-such-event-name").catch(() => {});
+  await page.waitForTimeout(400);
+  check("theEmptyStateNamesItself", (await page.locator("[data-dev-event-empty]").count()) === 1);
+  await shot(page, "page-developer-events-empty");
+
+  // Clear must be reachable *because* a filter is on, and must actually clear.
+  const clearVisible = await page
+    .locator("[data-dev-event-reset]")
+    .isVisible()
+    .catch(() => false);
+  check("clearAppearsOnlyWhenFiltered", clearVisible);
+  if (clearVisible) {
+    await page.locator("[data-dev-event-reset]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    check("clearRestoresTheList", (await rows.count()) > 0);
+  }
+
+  if (failures.length > 0) {
+    throw new Error(
+      `${failures.length} dev-events claim(s) did not hold: ${failures.join(", ")}`,
+    );
+  }
+
+  return { ok: true, claims: Object.keys(steps).length, ...steps };
+}
+
+/**
  * The id of the app this pass just registered, found by its name.
  *
  * Written as a helper because the "the read-back carries no secret" assertion needs the id and
@@ -11704,6 +11907,12 @@ async function main() {
     // a register form, a one-time secret dialog and three confirmations, and a route visit with a
     // fresh database only ever proves the empty state renders.
     { path: "/developer/oauth-apps", name: "developer-oauth-apps" },
+    // The developer framing of the event catalogue (slice 3). Walked as a route *and* driven
+    // below: the screen's whole point is the subscribe deep link, and a route visit on a fresh
+    // database proves the empty state renders and nothing else. The registry itself is already
+    // walked at /events by REQ-016 — this route checks that the developer framing is reachable
+    // from its own nav entry, which is the one thing a second copy of the table could get wrong.
+    { path: "/developer/events", name: "developer-events" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -11960,6 +12169,13 @@ async function main() {
   // in the log screen afterwards, so the read-heavy pass goes first and the mutating one second.
   report.oauthApps = await runDepthPass("oauth-apps", () => runOAuthAppsDepth(page, report));
   log(`oauth-apps: ${JSON.stringify(report.oauthApps)}`);
+
+  // The developer event catalogue (REQ-033, slice 3). Read-only, so its position is not forced —
+  // but it is registered here rather than beside its siblings because its deep link lands on
+  // /webhooks/new, and the claim `theDeepLinkPreselectsTheEvent` is only meaningful if this pass
+  // is the one driving that form into a ticked state rather than walking past it.
+  report.devEvents = await runDepthPass("dev-events", () => runDevEventsDepth(page, report));
+  log(`dev-events: ${JSON.stringify(report.devEvents)}`);
 
   // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
   // because a scan counts the findings those passes have already written, and a scan that ran

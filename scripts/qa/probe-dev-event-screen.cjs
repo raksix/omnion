@@ -39,7 +39,6 @@ const fail = (msg) => {
   console.log(`FAIL  ${msg}`);
 };
 const uniq = (s) => [...new Set(s)];
-
 const view = fs.readFileSync(VIEW, "utf8");
 const walk = fs.readFileSync(WALK, "utf8");
 const css = fs.readFileSync(CSS, "utf8");
@@ -88,31 +87,44 @@ if (/const live = isLive\(entry\);/.test(view) && /\{live \? \(\s*<Link/.test(vi
 }
 
 // ---- 3. Colour tokens actually exist -------------------------------------------------------------
-const defined = new Set(css.match(/--color-([a-z-]+)\s*:/g) || []);
+// The panel's own vocabulary. A colour token in Tailwind v4 is declared as `--color-<name>` in
+// the theme, so the honest test is "is this name declared?" — not "is it on a list I typed", which
+// goes stale the moment the palette is reworked. What must be excluded are the *utility*
+// suffixes that share the `text-`/`bg-`/`border-` prefixes and are not colours at all:
+// alignments (text-center/left/right/justify), sizes (text-[13px], text-xs) and weights.
+const LAYOUT_UTILS = new Set([
+  // alignments
+  "center", "left", "right", "justify", "start", "end",
+  // sizes and weights
+  "xs", "sm", "base", "lg", "xl", "2xl", "3xl",
+  "bold", "semibold", "medium", "normal", "light",
+  // truncation and case
+  "nowrap", "ellipsis", "uppercase", "lowercase", "capitalize", "truncate",
+  // border WIDTH and side utilities share the `border-` prefix with colours; `border-t` is a
+  // one-pixel top rule, not a colour, and it is the single most common false positive here.
+  "t", "r", "b", "l", "x", "y", "s", "e", "w", "2", "4", "8",
+  // misc
+  "clip", "none", "auto", "transparent", "current", "inherit",
+]);
+
+const declared = new Set(
+  [...css.matchAll(/--color-([a-z0-9-]+)\s*:/g)].map((m) => m[1]),
+);
+
 const tokens = uniq(
-  [...view.matchAll(/(?:text|bg|border)-([a-z]+(?:-[a-z]+)*)/g)].map((m) => m[1]),
+  [...view.matchAll(/(?:text|bg|border)-([a-z][a-z0-9-]*)/g)]
+    .map((m) => m[1])
+    .filter((t) => !LAYOUT_UTILS.has(t) && !/^\[/.test(t)),
 ).sort();
 
-// The panel's own vocabulary, not every class in the file: `size-3` and friends are not colours,
-// and the utility names in the file's static class strings are what a reader would assume.
-const PALETTE = ["accent", "caution", "positive", "muted", "line", "ink", "canvas", "surface"];
 for (const token of tokens) {
-  if (!PALETTE.includes(token) && !/^(1|2|3|4|5|6|7|8|9|10|11|12|full|xs|sm|base|lg|xl)$/.test(token)) {
-    // Not a palette token and not a size: only a declared one is safe to trust.
-    const isDeclared = [...defined].some((d) => d === `--color-${token}:`);
-    if (!isDeclared) {
-      fail(
-        `${token} — used as a colour in the view but defined nowhere in globals.css ` +
-          `(it renders in the inherited colour)`,
-      );
-    }
-  }
-}
-if (failures === 0) {
-  for (const token of tokens.filter((t) => PALETTE.includes(t))) {
-    if ([...defined].some((d) => d === `--color-${token}:`)) {
-      pass(`--color-${token} — used and defined in globals.css`);
-    }
+  if (declared.has(token)) {
+    pass(`--color-${token} — used in the view and declared in globals.css`);
+  } else {
+    fail(
+      `${token} — used as a colour in the view but declared nowhere in globals.css ` +
+        `(it renders in the inherited colour)`,
+    );
   }
 }
 
