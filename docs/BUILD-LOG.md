@@ -9977,3 +9977,50 @@ the `hr` module nav, and the `/hr/*` routes in `scripts/qa/walkthrough.cjs` — 
 in the inventory is not accepted. The browser-gated boxes (empty/loading/error, mobile 390×844,
 REQ-051's CRM screen states, REQ-052's mobile) all stay unticked until that pass can run: the QA
 slot was held by a live `omnion-w3` holder for this whole tick.
+
+### Tick 86 — REQ-021 slice 6a · the Web Push key pair (9fa3d805, 4f8081bf)
+
+**What.** The Web Push acceptance box has been open since REQ-021 was written, and the reason
+was never a missing browser pass. `web_push` was in the closed channel vocabulary, in the
+delivery queue, in the settings matrix and in the readiness table — and the installation had
+**no key to sign with at all**:
+
+```console
+$ grep -rni 'vapid' apps/ crates/ database/ modules/ scripts/
+   (nothing)
+```
+
+The runner was honest about it (`UNTRANSPORTED`: *"a signed payload needs the installation's
+key pair (REQ-037)"*), and the readiness table was not: its `web_push` branch reads
+`config.public_key`, and `grep -rn 'public_key'` over the tree finds only WebAuthn and MFA.
+**A readiness branch that reads a value no writer can produce is a green light wired to
+nothing** — the same defect class as the webhook branch closed last tick, one channel over.
+
+**Proof.** `62` core tests, was `45` — 17 new. Every VAPID test verifies its signature against
+the *published public key* with `p256`'s own verifier rather than against itself.
+
+```
+cargo test -p omnion-core --lib   62 passed; 0 failed
+```
+
+**Three defects found by writing it, two in the production code:**
+
+1. **`aud` three characters short.** `origin_of` sliced the string that had already had the
+   scheme stripped and then added `"://".len()`, producing `https://fcm.googleapi` for
+   `https://fcm.googleapis.com/fcm/send/abc`. A push service answers `401` to that on **every
+   send**, and the outbox has no column that says "your audience was malformed".
+2. **`p256::SigningKey::from_slice` left-pads a short slice.** A private key truncated by one
+   character produced a *valid* key for a different scalar: the browser registers against the
+   public key of the padded value, every send verifies against nobody, and the failure
+   surfaces days later as push that silently stopped working. Now refused on `len() != 32`.
+3. **My own test asserted the wrong property.** I asserted two signatures of one message
+   differ, i.e. that the nonce is randomised. `p256` is RFC 6979 **deterministic**, and that is
+   correct for VAPID — a service verifies the token and never sees a signature over a
+   *different* message. **The test was wrong, not the code**, and I rewrote it to assert
+   determinism *and* that a different `exp` changes the token.
+
+**Still open.** The encrypted-body half (`aesgcm`: ECDH → HKDF → AES-128-GCM), the
+`web_push` transport in `notification_runner.rs`, the public-key route the browser subscribes
+against, the `/notifications/settings` device block (three device API functions in
+`api.ts` still have **zero UI callers**), and `prune_endpoints`/`prune_stale` — which still
+have **zero call sites anywhere**, so a revoked endpoint is not yet pruned. Next tick.
