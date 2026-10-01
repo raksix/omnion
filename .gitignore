@@ -30,6 +30,11 @@ pnpm-debug.log*
 
 # QA artifacts (screenshots + raw logs stay on disk, never in git)
 qa-artifacts/
+# `qa-artifacts/` above matches the DIRECTORY, so a symlink pointing at /dev/shm (which is how a
+# pass keeps its screenshots off a 93%-full /mnt/apopic) does NOT match and git stages it as a
+# regular file. Two lines, because git does not treat a trailing slash as "this or a link".
+qa-artifacts
+!qa-artifacts/
 
 # Turbo
 .turbo/
