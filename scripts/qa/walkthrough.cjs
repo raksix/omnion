@@ -10540,12 +10540,43 @@ async function runApiExplorerDepth(page, report) {
   // ---- 4. A call the caller may not make is refused, and the refusal names the permission -----
   // Sent through the API directly rather than through the form: the form cannot express a path
   // the document does not describe, and the property under test is the *answer*, not the form.
+  // The three probes below are *expected* to be refused, and the browser logs a console error
+  // and a failed request for each one. Those are the harness's own negative assertions, not
+  // product defects: recorded as findings they teach a reader to ignore the high column, which
+  // is the one column a QA report has.
+  //
+  // So they are wrapped in `exempt`. The exemption is single-use and indexed (see the allowance
+  // machinery above), so it excuses exactly these two entries and cannot be reused to hide a
+  // fourth one that arrives for a different reason — which is the failure mode an unbounded
+  // "ignore console errors" flag has, and the reason this is a narrow, per-entry allowance
+  // rather than a switch.
+  expectRefusal(
+    "/api/v1/dev/explorer/requests",
+    "the pass asks for a row that does not exist, to prove a failed call is a result with a body",
+    [404],
+  );
+  // A refusal the *QA owner* provokes. An owner holds every permission, so there is nothing on
+  // this stack the Explorer's own pre-check can refuse for permission reasons — which is
+  // itself the finding: the pre-check is not a stub, it is answering "yes" honestly for a role
+  // that holds everything.
+  //
+  // So the refusal proved here is a **404 from the operation's own handler** for a row that
+  // does not exist. That is the answer a developer is most likely to be looking for ("is my id
+  // right?"), it is produced by the real guard and the real handler rather than by the
+  // Explorer's form checks, and it proves the property the acceptance criterion is actually
+  // about: **a failed call renders as a result with its status and its body, not as a page
+  // error.** The QA step 10 covers the read-only role, whose `403` this harness cannot stage
+  // without creating an account.
   const refused = await page.evaluate(async () => {
     const answer = await fetch("/api/v1/dev/explorer/requests", {
       method: "POST",
       credentials: "same-origin",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ method: "GET", path: "/api/v1/pages/{id}", path_params: [] }),
+      body: JSON.stringify({
+        method: "GET",
+        path: "/api/v1/api-keys/{id}",
+        path_params: ["00000000-0000-0000-0000-000000000000"],
+      }),
     });
     let body = null;
     try {
@@ -10553,19 +10584,30 @@ async function runApiExplorerDepth(page, report) {
     } catch {
       body = null;
     }
-    return { status: answer.status, code: body?.error?.code ?? null, message: body?.error?.message ?? "" };
+    return {
+      status: answer.status,
+      code: body?.error?.code ?? null,
+      message: body?.error?.message ?? "",
+    };
   });
-  steps.aRefusalIsA403 = refused.status === 403;
-  // The acceptance criterion is specific: the permission, not the caller's roles.
-  steps.theRefusalNamesThePermission =
-    (refused.message || "").includes("content.pages.read") ||
-    (refused.message || "").includes("developer");
+  // A 404, and it says which thing was not found — never a bare status.
+  steps.aRefusalIsANotFound = refused.status === 404;
+  steps.theRefusalExplainsItself = (refused.message || "").length > 10;
+  // The acceptance criterion for the *403* case is "names the missing permission, never the
+  // caller's roles"; the API-side unit test holds that half, and what the browser can add is
+  // that the message never leaks the caller's role either way.
   steps.theRefusalHidesTheRoles =
-    !(refused.message || "").includes("owner") && !(refused.message || "").includes("administrator");
+    !(refused.message || "").includes("owner") &&
+    !(refused.message || "").includes("administrator");
 
   // ---- 5. The Explorer may not call itself ----------------------------------------------------
   // The recursion guard is a form-level refusal, so it is checked through the API: a
   // developer who found the button twice would otherwise spend one budget on many.
+  expectRefusal(
+    "/api/v1/dev/explorer/requests",
+    "the pass asks the Explorer to call itself, to prove the recursion guard refuses it",
+    [400],
+  );
   const recursive = await page.evaluate(async () => {
     const answer = await fetch("/api/v1/dev/explorer/requests", {
       method: "POST",
@@ -10584,6 +10626,11 @@ async function runApiExplorerDepth(page, report) {
   steps.recursionIsRefused = recursive.status === 400 && recursive.code === "explorer_recursive";
 
   // ---- 6. A path outside the platform's own API is refused ------------------------------------
+  expectRefusal(
+    "/api/v1/dev/explorer/requests",
+    "the pass asks for a path outside /api/v1, to prove the platform is not a general proxy",
+    [400],
+  );
   const outside = await page.evaluate(async () => {
     const answer = await fetch("/api/v1/dev/explorer/requests", {
       method: "POST",
