@@ -350,6 +350,21 @@ pub struct ConsentRequest {
     pub pkce: bool,
 }
 
+impl ConsentRequest {
+    /// The same consent, with PKCE recorded as in play or not.
+    ///
+    /// A builder rather than a public field assignment because `pkce` is a *fact about the
+    /// request that was checked*, not something a caller may choose: it is derived from whether a
+    /// challenge and a method both arrived. Mutating it after `authorize` returned would let a
+    /// caller render a screen claiming a protection the flow does not have, and a caller
+    /// constructing one by hand for a test could do the same in production code.
+    #[must_use]
+    pub fn with_pkce(mut self, pkce: bool) -> Self {
+        self.pkce = pkce;
+        self
+    }
+}
+
 /// Check an authorization request against a registered app.
 ///
 /// `app` carries the row's already-parsed fields (see [`crate::store::app_from_row`]); the app's

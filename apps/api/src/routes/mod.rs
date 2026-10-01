@@ -112,6 +112,7 @@ pub mod media_versions;
 pub mod notifications;
 pub mod notifications_admin;
 pub mod notifications_test;
+pub mod oauth_flow;
 pub mod onboarding;
 pub mod promotions;
 pub mod public;
@@ -1210,6 +1211,31 @@ pub fn router(state: AppState) -> Router {
     let oauth_app_suspend = post(developer_oauth::set_suspended)
         .layer(guards::require(&state, "developer.oauth.manage"));
 
+    // The sessionless OAuth flow (REQ-033, slice 3c). **No permission guard on any of these**,
+    // and that is not an oversight: a third-party client has no Omnion account and no session,
+    // so `guards::require` would answer `401` to every legitimate call. What authenticates each
+    // endpoint is different and is stated where it happens:
+    //
+    // * `/oauth/authorize` — public. It authenticates nothing; it looks up an app by a public
+    //   client id and, if the redirect URI is one that app registered, sends the browser to it.
+    //   The authorization check is the app's own registration, and every refusal that matters
+    //   is a refusal to redirect.
+    // * `/oauth/consent` — needs a **session**, because a person has to be signed in to consent.
+    //   It is guarded by the platform's CSRF layer rather than a permission key: consenting is
+    //   not an administrative act, and requiring `developer.oauth.manage` would mean an ordinary
+    //   user of a site could not sign a third-party app into their own account.
+    // * `/oauth/token` — public, and authenticates the *client* with its secret in the body.
+    //   It never reads the session, so a signed-in person is irrelevant to it.
+    // * `/oauth/introspect` — public, and authenticates the token it is asked about.
+    //
+    // The CSRF layer is the reason `consent` is a POST and not a GET: the layer already knows a
+    // cookie-authenticated mutation needs a token, and a GET would be both a link and unguessable
+    // proof of nothing.
+    let oauth_authorize = get(oauth_flow::authorize_start);
+    let oauth_consent = post(oauth_flow::consent_submit);
+    let oauth_token = post(oauth_flow::token);
+    let oauth_introspect = get(oauth_flow::introspect);
+
     // The deployment centre (REQ-024, slice 1). Six reads and one write, and the write is
     // `deployment.manage` because "check for updates now" reaches out to the network and
     // rewrites the release cache — it is not a read even though it answers a question.
@@ -2232,6 +2258,10 @@ pub fn router(state: AppState) -> Router {
         .route("/oauth-apps/{id}", oauth_app_one)
         .route("/oauth-apps/{id}/rotate", oauth_app_rotate)
         .route("/oauth-apps/{id}/suspend", oauth_app_suspend)
+        .route("/oauth/authorize", oauth_authorize)
+        .route("/oauth/consent", oauth_consent)
+        .route("/oauth/token", oauth_token)
+        .route("/oauth/introspect", oauth_introspect)
         .route("/cdn/status", cdn_status)
         .route("/cdn/purges", cdn_purges)
         .route("/cdn/purges/{id}", cdn_purge_one)

@@ -214,6 +214,10 @@ pub fn usable_state(state: Option<&String>) -> Option<String> {
 
 /// Percent-encode a caller-supplied `state` for a query string.
 ///
+/// Public because the API's *error* redirect needs exactly these rules and a second copy of
+/// five character encodings that must agree with this one is a place they will not. A client
+/// that can parse the code redirect can parse the error redirect, because both call this.
+///
 /// Seven cases, and the set is not arbitrary:
 ///
 /// * `%` first, because it is the escape character itself and encoding it last would let an
@@ -233,7 +237,8 @@ pub fn usable_state(state: Option<&String>) -> Option<String> {
 ///   than the one it sent: `ü` arrives as two raw bytes, and a decoder that treats each as a
 ///   character produces mojibake. The round-trip test in this module is what caught that; an
 ///   assertion on the ASCII cases alone would have passed.
-fn encode_state(state: &str) -> String {
+#[must_use]
+pub fn encode_state(state: &str) -> String {
     let mut out = String::with_capacity(state.len());
     for byte in state.bytes() {
         match byte {
@@ -369,6 +374,21 @@ impl GrantProvenance {
     #[must_use]
     pub fn involves_user(self) -> bool {
         matches!(self, Self::UserConsent)
+    }
+
+    /// The provenance of a grant type, by the one fact that distinguishes them.
+    ///
+    /// Derived from [`GrantType::involves_user`] rather than a second `match`, because the two
+    /// functions answer the same question in two vocabularies and a future third grant would
+    /// otherwise have to be added to both — with the audit row's `for_a_user` and the token row's
+    /// `user_id` disagreeing, which is the exact failure the provenance type exists to prevent.
+    #[must_use]
+    pub fn of(grant: GrantType) -> Self {
+        if grant.involves_user() {
+            Self::UserConsent
+        } else {
+            Self::ClientCredentials
+        }
     }
 }
 

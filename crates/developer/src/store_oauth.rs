@@ -699,6 +699,22 @@ pub async fn purge_codes(pool: &PgPool, before: OffsetDateTime) -> Result<u64> {
     Ok(removed.rows_affected())
 }
 
+/// The public client id of an app, given its internal id.
+///
+/// Narrower than [`find_by_client_id`] on purpose: the token-introspection response needs one
+/// column, and reading the whole `oauth_apps` row to produce it would drag every redirect URI
+/// of every app into a code path whose only job is to answer "which client is this token". It is
+/// the inverse of the lookup `client_credentials` does, and it is here so the two directions of
+/// "id → client_id" live beside each other.
+pub async fn client_id_for(pool: &PgPool, app_id: Uuid) -> Result<String> {
+    let client_id: String = sqlx::query_scalar("select client_id from oauth_apps where id = $1")
+        .bind(app_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(DeveloperError::AppNotFound)?;
+    Ok(client_id)
+}
+
 /// How many live codes an app is holding, for the app's detail screen.
 ///
 /// "Live" means issued and not yet expired, spent or not: an app with forty rows in the table
