@@ -8713,3 +8713,69 @@ a transport the operator did not intend to expose it on.
 **Next.** `0232_graphql_sdk.sql` — numbered above the **union** high-water of 0231 across all ten
 worktrees, not my own branch's 0221 — then the resolver layer over the SAME service functions the
 REST handlers call, then the endpoint.
+
+## Tick 65 — REQ-130 slice 1 gets an endpoint, and the walk catches what tests cannot (wave6)
+
+**What.** `crates/graphql-resolvers` (a new crate: every resolver calls
+`omnion_content::pages::*` / `omnion_identity::*` / `omnion_media::*` — the functions the REST
+handlers call — and holds no SQL of its own), `POST /api/v1/graphql`, and
+`apps/api/tests/graphql_endpoint.rs`. Migration `0232_graphql_sdk.sql`, numbered above the union
+high-water of 0231 (wave 5's developer OAuth) rather than this branch's own 0221.
+
+**Proof.**
+- `cargo test -p omnion-graphql` → **75 passed**.
+- `cargo test -p omnion-graphql-resolvers` → **12 passed**.
+- `cargo test -p omnion-api --test graphql_parity` → **8 passed**.
+- `cargo test -p omnion-api --test graphql_endpoint` → **11 passed** (live PostgreSQL, real roles).
+- `cargo build -p omnion-api` → 0 warnings from this wave. `pnpm typecheck` → 2/2.
+
+**The tick's real result: a guard with no authorization in it passes every unit test.**
+A mutation that made `guard()` `return Ok(())` unconditionally — the authorization system removed
+entirely — left **all twelve unit tests GREEN** and turned **two walks red**
+(`a_refused_publish_returns_forbidden_and_writes_nothing`,
+`graphql_and_rest_refuse_the_same_caller_for_the_same_permission`). Nothing in the pure crate is
+handed a permission store, so no unit test *can* see it; the walk signs in as a reader holding
+`content.pages.read` and not `content.pages.publish`, and asks. **A guard that has never been
+asked to refuse has never been tested.** Two further mutations were red where they should be: a
+root field guarded by the wrong catalogue key (caught by the schema/resolver parity gate) and a
+projection returning the whole row (caught by the selection tests).
+
+**A test that builds its input the way the PRODUCTION caller builds it, or it measures a fiction.**
+That is now four in this repository. First the argument readers took `&[Selection]` — the field's
+sub-selections — instead of the `Field` whose `arguments` the parser actually fills, so
+`pages(siteId: "…")` silently answered with an empty list and `createPage(siteId: "…")` answered
+"`createPage` requires a `siteId`" for a document that had supplied it. Both read as an EMPTY RESULT
+rather than as a defect, and all twelve tests were green because every one of them handed the
+reader the same wrong list the reader was written against. Found by the walk, never by a test.
+
+**Two tests in this tick's own walk were wrong, and both looked like product defects.**
+The parity walk compared `rest_page["pageType"]` — a key the REST body does not have, because it
+is snake_case and that is serde's default and changing it would break every existing REST client.
+`Value` answers `null` for a missing key, so the comparison read as "the transports disagree"
+about a correct implementation. And the naming-convention test asserted "no capitals", which would
+have rejected the very camelCase convention it was written to protect — a rule stricter than the
+rule it names gets satisfied by renaming correct code, one field at a time.
+
+**The endpoint's guard is `content.pages.read`, and that is a REAL catalogue key.** The first draft
+used `developer.graphql.execute`, which this repository does not ship — and an uncatalogued key
+resolves to no permission, so the route answers `403` for every caller including the instance owner
+while looking perfectly healthy. Fourth time this defect has cost this repository a tick (REQ-125,
+REQ-128, REQ-133, here).
+
+**`graphql_query_logs` has no `variables` column at all.** `variable_names text[]` stores NAMES;
+the column that would hold a VALUE does not exist, so *"no ad-hoc variable values are stored"* is a
+property of the schema rather than a promise about a handler. Every request writes one row
+including refusals — a log that only kept successes could never answer "why does my depth limit
+keep firing".
+
+**Not ticked.** The playground, document manager, schema explorer, deprecations and SDK screens —
+slice 2. Acceptance 3's timeout leg and 14's read-back walk are named in the REQ as not yet proven.
+
+**QA pass not run.** The slot is held live by w3 (pid 2044970, `/proc/<pid>/cwd` = `/mnt/apopic/
+omnion-w3`, `kill -0` alive) and `/mnt/apopic` is at 98%. The walkthrough has no new screen to visit
+until slice 2 lands, so the pass would cost a sibling's slot and a DB reset to measure nothing.
+Disk was reclaimed first anyway: 141 stale duplicate dep files (0.15 G) out of my own target.
+
+**Next.** Slice 1's last acceptance line — a walk that READS the query-log row back — then the QA
+pass with the slot free, then slice 2: persisted documents (`graphql_persisted_documents`), the
+allowlist mode, and the four `/developer/graphql/*` screens.
