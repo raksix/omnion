@@ -6979,7 +6979,15 @@ describe a promise nothing on the request path keeps.
 3. **The check happens before the body is read.** Reading first and deciding afterwards costs what
    an unconditional `200` costs, which defeats the entire point.
 
-**Proof.** `cargo test -p omnion-media --lib` → **219 passed** (was 179). The walk
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **219 passed**, 0 failed (was 179) |
+| walk | `cargo test -p omnion-api --test media -- --test-threads=1` | **16 passed**, 0 failed |
+| types | `apps/admin` `tsc --noEmit` | **0 errors** |
+
+The crate's 20 new tests, and the full 16-test walk suite green against a fresh database on port
+5433 (`omnion_cond`) — including the three walks this change touches: the range walk, the replace
+walk and the new conditional one. The walk
 `a_conditional_get_is_answered_from_the_bytes_and_a_replace_moves_the_validator` drives the real
 router over live PostgreSQL: upload, read the validator, revalidate to a `304` with an **empty
 body**, `*`, the date fallback, then **replace** — and assert the stale validator is answered
