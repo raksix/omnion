@@ -6259,3 +6259,61 @@ it collide — which is what that limit exists for. The device-block legs from t
 keyboard/mobile legs are therefore still **written, not measured**. Next tick runs the pass first.
 
 Next: the remaining REQ-021 legs, then REQ-016.
+
+## Tick 90 — REQ-012, the security centre's permission gate (2026-10-01)
+
+**What.** `apps/api/tests/security.rs`, four walks over the live database driving the router in
+process, closing the criterion that every `/security` endpoint enforces its catalogue key. The
+box had carried a note since the request was written: the four keys are in the catalogue, every
+route is behind a guard, "the 403 itself is unproven until a pass calls an endpoint without the
+key". That note was the **seventh instance of this REQ's defect class** — the security centre
+already spent one bug on an inherited `route_layer` that put it behind `analytics.read`, and the
+only reason that surfaced was a backup walk signing in as a reader.
+
+**What it proves.**
+
+1. anonymous is `401` on all fifteen `/security` routes, never a page of data;
+2. an organization member with no security key is `403 permission_denied` on all fifteen, and the
+   body **names the missing key** — a route whose guard named a key outside the catalogue is
+   caught rather than looking identical to a correct refusal;
+3. an account holding only `security.read` reaches the read routes and is refused every `scan`
+   and `manage` route — the walk that catches an inherited layer;
+4. the full three-key holder passes the guard everywhere, so walks 1–3 are about guards and not
+   about a centre whose routes are broken.
+
+**The suite was proven to fail before it was believed.** Walk 3 was run against a router with
+`/security/overview`'s `guards::require` layer deleted:
+
+```text
+test a_member_without_the_key_is_refused_everywhere ... FAILED
+```
+
+and it named that route. The `route_layer` was restored from a backup afterwards and the tree is
+byte-identical to `23228200`'s parent. The route table in the suite is hand-written rather than
+scraped out of `routes/mod.rs`, because a census reads the path and the guard from the same line:
+a route that lost its guard would be compared against itself and pass.
+
+**Proof.**
+
+```text
+cargo test -p omnion-api --test security -- --test-threads=1    4 passed  (30.6 s, live PostgreSQL)
+cargo test -p omnion-permissions --lib                           63 passed
+bun x tsc -p apps/admin/tsconfig.json --noEmit                   exit 0
+```
+
+**Disk first.** `/mnt/apopic` was at 99 % (970 MB free) when the tick opened — the documented
+build-killer, where `rustc` reports `IO failure on output stream` with **no** `error[]` line and a
+build that looks like an ordinary compile error. `target/debug/deps` in this worktree held 1 096
+crate/hash pairs for 5.21 GiB; keeping the newest `rlib`+`rmeta` of each pair reclaimed **0.77 GiB**
+across 756 stale artifacts. `/mnt/apopic` is now at 96 %.
+
+**Not done this tick.** The browser pass. It was started first, as tick 89's hint asked, and has
+been queued behind a **live** sibling holder for the whole tick — `w6`, then `w3`, re-taking the
+place between passes (`qa-slot.sh` sees `max 1 concurrent pass` and waits). Nine passes are queued
+on this box at once, so the one global slot is the scarce resource and a writer's pass is now the
+thing most likely to time out rather than the thing most likely to fail. REQ-010, REQ-021 and
+REQ-016 all have code-complete screens whose only open boxes are browser legs, so this queue is
+the bottleneck, not the code.
+
+Next: the pass itself if it can take the slot, then REQ-021's keyboard and mobile legs, then
+REQ-016's form-validation and payload-inspector legs.
