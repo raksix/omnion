@@ -15,10 +15,14 @@
 #![warn(missing_docs)]
 
 pub mod job;
+pub mod manifest;
 pub mod preflight;
 pub mod version;
 
 pub use job::{Job, JobKind, JobStatus, Step, StepStatus, may_cancel, plan_steps};
+pub use manifest::{
+    CheckResult, Manifest, RejectedEntry, SeenSet, parse_manifest, run_check, stale_banner,
+};
 pub use preflight::{
     CheckId, CheckOutcome, CheckState, Confirmation, PreflightReport, confirmation_for,
     confirmation_matches,

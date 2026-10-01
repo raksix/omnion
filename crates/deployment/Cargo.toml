@@ -9,6 +9,9 @@ publish = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-time.workspace = true
+# `macros` is for one `format_description!`: a feed entry may carry a datetime with no offset,
+# which no well-known description reads, and hand-assembling a FormatDescription for a single
+# layout costs more lines than the feature does.
+time = { workspace = true, features = ["macros"] }
 thiserror.workspace = true
 uuid.workspace = true

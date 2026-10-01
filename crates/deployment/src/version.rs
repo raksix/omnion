@@ -240,6 +240,12 @@ pub struct Release {
     pub core_min: Option<Version>,
     /// The artifact digest, so a deploy can prove it fetched what the feed described.
     pub artifact_checksum: Option<String>,
+    /// When the release was published, when the feed says so.
+    ///
+    /// A `String` and not a parsed timestamp, deliberately: the release list renders the feed's own
+    /// string, and a value that fails to parse must still be *shown* rather than dropped or
+    /// reformatted into a timezone the publisher did not write.
+    pub released_at: Option<String>,
 }
 
 impl Release {
@@ -253,6 +259,7 @@ impl Release {
             migrations: Vec::new(),
             core_min: None,
             artifact_checksum: None,
+            released_at: None,
         }
     }
 
