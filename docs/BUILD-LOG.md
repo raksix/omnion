@@ -14760,3 +14760,58 @@ states, and it is not closed on tests alone.
 
 **Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
 hook to REQ-011.
+
+## Tick 70 · REQ-117 slice 38 — the third spelling was in the schema, and the migration alone did not fix the plan
+
+**What.** `dedupe::PHONE_DIGITS_SQL` had two call sites after the last two slices, and this
+tick's open question was whether a third remained. There was one, and it is not a query:
+`crm_leads_phone_idx`, created by migration `0055`, keys `phone` with a bare
+`regexp_replace(phone, '[^0-9]', '', 'g')` — which strips the leading `+` that
+`dedupe::normalize_phone` keeps. An expression index only serves an identical expression, so
+the index was never offered for the predicate the phone arm compares, and the first-touch
+lookup seq-scanned the whole tenant on every returning visitor's second submission. It was
+correct when it was written and became wrong when the two queries were fixed; two ticks of
+fixing the queries could not have found it, and grepping the queries never would.
+
+**Migration 0228** drops and rebuilds the index with the crate's expression verbatim.
+
+**The second half, and the reason the migration was not enough.** After it, the gate still
+measured a seq scan — on a *correct* index. Both `crm_leads_email_idx` and
+`crm_leads_phone_idx` are partial on their column being not null, and PostgreSQL will not
+offer a partial index unless the query proves every row it would read satisfies the
+predicate. `merge_attribution` had no such conjunct, and the conjunct reads as redundant
+next to the equality beside it, because the expression is null for a null phone anyway —
+which is precisely why it would not survive a well-meaning simplification. It is now one
+predicate covering both arms.
+
+**Proof.** RED first, and the RED was a measurement rather than an assertion:
+`Seq Scan on crm_leads`, `Rows Removed by Filter: 20000`, 41.8 ms on a 20k fixture.
+After: `Bitmap Index Scan on crm_leads_phone_idx`, 0.126 ms; the phone arm alone,
+37.8 ms → 0.031 ms. `scripts/qa/run-crm-phone-index.sh` **6/6 with two proven-to-fail
+controls** — the index dropped in a rolled-back transaction, and the production statement
+with the conjuncts removed. `run-crm-attribution.sh` **5/5** (the first-touch behaviour is
+unchanged, which is the check that the perf work did not alter the answer),
+`run-crm-dedupe.sh` **12/12**, module lib **186/186**, admin `tsc --noEmit` exit 0.
+
+**A query assembled from a named constant is a runtime string, so a type error inside it
+compiles.** `(phone is not null and {stored_phone}) = $3` is `boolean and text`, and
+`cargo test` was 186/186 green with that query in the file. The gate found it because the
+gate asks the planner — a question no Rust test asks.
+
+**The gate's own first run was wrong three times, all in the gate, and each would have
+shipped a false proof.** It matched `like '+%'` against a catalog rendering that spells the
+operator `~~`; it asserted `Index Scan using` where an `or` of two arms correctly produces
+a *Bitmap* Index Scan; and it extracted `PHONE_DIGITS_SQL` with a regex that left the Rust
+line-continuation backslash in the SQL, which is a syntax error wearing a defect's name.
+**Assert the index the plan names, not the node type, and read a rendered value out of a
+catalog rather than matching the spelling a human typed** — the index is still correct when
+a check stops seeing it, and a check that quietly matches nothing is the same failure as a
+gate that quietly passes nothing.
+
+**Not claimed.** No browser pass: no screen changed (all three artifacts are below the
+API), and the QA slot is held by a live w4 pass (holder pid 1782910,
+`cwd=/mnt/apopic/omnion-w4`).
+
+**Next.** `fetch_candidates` is the other consumer of the phone arm and queries
+`crm_contacts`, which REQ-051 owns — the same audit has to be run against whatever index
+that module ships, and the answer is not visible from this branch.
