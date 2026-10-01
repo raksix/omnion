@@ -59,6 +59,7 @@ pub mod skills;
 pub mod store;
 pub mod telemetry;
 pub mod tool_calls;
+pub mod tool_stats;
 pub mod tool_exec;
 pub mod tools;
 pub mod workspace;
