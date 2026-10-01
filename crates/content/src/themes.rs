@@ -58,6 +58,7 @@ pub const DEFAULT_THEME_KEY: &str = "minimal";
 
 /// A theme as the gallery lists it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Theme {
     /// Primary key.
     pub id: Uuid,
@@ -85,6 +86,7 @@ pub struct Theme {
 
 /// One gallery row, joined with the activation state of the site being viewed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct GalleryEntry {
     /// The theme itself.
     pub theme: Theme,
@@ -114,6 +116,7 @@ pub struct Activation {
 /// is a *different state* from "the previous key is the same as the active one", so the panel
 /// hides the button rather than offering an action that changes nothing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GalleryView {
     /// The site's key, for the confirmation copy.
     pub site_key: String,
@@ -138,6 +141,13 @@ pub struct ActivationChange {
     pub previous_theme_key: Option<String>,
     /// Whether this was a restore rather than a forward switch.
     pub restored: bool,
+    /// The settings revision a rollback republished, when it republished one.
+    ///
+    /// `None` for a forward activation (a switch restores nothing) and for a rollback whose
+    /// displaced state had published no settings — the two are different facts and both are
+    /// absent for the same type, which is why this is a number the caller can print rather
+    /// than a boolean that could be read either way.
+    pub restored_settings_revision_no: Option<i32>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -635,10 +645,18 @@ pub async fn gallery(
         // would change nothing" are both `None` on purpose: the button is about an action.
         .filter(|target| target.as_str() != active_key);
 
+    // `is_active` is compared against `active_key` — the site's RESOLVED theme — and not
+    // against `row.active_key`, which is `site_themes.theme_key` and is therefore `null` for
+    // every site that has never run an activation. That made a fresh site's gallery show the
+    // `Active` badge on no card at all, while `activeKey` above it correctly said `minimal`
+    // and the renderer correctly drew `minimal`: a screen that names the active theme and
+    // then badges nothing, with nothing red anywhere. `active_theme_key` is the second read
+    // this module already makes for exactly this reason, and the join cannot stand in for
+    // it — a site has a theme long before it has an activation row.
     let themes: Vec<GalleryEntry> = rows
         .into_iter()
         .map(|row| GalleryEntry {
-            is_active: row.active_key.as_deref() == Some(row.theme_key_value.as_str()),
+            is_active: row.theme_key_value == active_key,
             theme: Theme {
                 id: row.theme_id,
                 organization_id: row.theme_organization_id,
@@ -721,6 +739,29 @@ pub async fn read_activation(pool: &PgPool, site_id: Uuid) -> Result<Option<Acti
     .map_err(ContentError::from)
 }
 
+/// The published settings revision a rollback would bring back, or `None` for a site whose
+/// last activation displaced a state that had published nothing.
+///
+/// A separate read from [`read_activation`] rather than a field on [`Activation`], because the
+/// two answer different questions and are used differently: `read_activation` is the rollback's
+/// *precondition* (there must be a previous key at all), while this is an *extra* thing it does
+/// when it can. Folding the id onto the activation struct would make "no previous key" and
+/// "no previous settings" indistinguishable at the type level, and both are `None`.
+pub async fn pending_rollback_settings_revision(
+    pool: &PgPool,
+    site_id: Uuid,
+) -> Result<Option<Uuid>> {
+    sqlx::query_scalar(
+        "select previous_settings_revision_id from site_themes \
+         where site_id = $1 and previous_theme_key is not null",
+    )
+    .bind(site_id)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.flatten())
+    .map_err(ContentError::from)
+}
+
 /// One theme by key, for the preview and the installer.
 pub async fn find_theme(pool: &PgPool, key: &str) -> Result<Option<Theme>> {
     sqlx::query_as::<_, Theme>(
@@ -772,30 +813,68 @@ pub async fn activate(
         return Err(ContentError::ThemeNotFound(key));
     }
 
+    // The theme being displaced is the site's RESOLVED theme, not the activation row's — and
+    // those are different things for every site that has never run an activation.
+    //
+    // `site_themes` is written by this very function, so a site that has never been activated
+    // has no row, and reading only it made `previous` `None` on the FIRST activation of a
+    // site's life. That is not a harmless null: it is the theme the site is rendering RIGHT
+    // NOW, so the row recorded no rollback target at all, and the operator's
+    // *Restore previous* button stayed hidden while the only switch they had ever made was
+    // fully reversible. `active_theme_key` is the second read this module already makes for
+    // this exact reason — a site has a theme long before it has an activation row, and the
+    // `sites.theme` column plus the bundled default are what it renders in the meantime.
+    let previous = active_theme_key(pool, site_id).await?;
     let current = read_activation(pool, site_id).await?;
-    let previous = current.as_ref().map(|row| row.theme_key.clone());
     // Activating the theme that is already active is not an error, and it is also not a
     // change: writing the row would move `previous_theme_key` to the active key, and the next
     // *Restore previous* would then restore the theme that was already in use.
-    if previous.as_deref() == Some(key.as_str()) {
-        let row = current.expect("`previous` is Some only when the activation row was read");
+    if previous == key {
+        // The activation row is guaranteed here: `previous` came from the RESOLVED theme, and
+        // a resolved theme equal to the requested key means the site is already on it — which
+        // on a site with no activation row cannot happen, because the resolved key would then
+        // be `sites.theme` or the bundled default and the requested key is the theme the
+        // operator picked. The row is therefore read for its CURRENT key, which is the same
+        // string either way.
+        let row = current.expect(
+            "the resolved key equals the requested key only on a site that has been activated",
+        );
+        // The row is NOT touched. A re-activation displaces nothing, and the rollback target
+        // it already carries is a real, spendable target: the operator is on `corporate`,
+        // they asked for `corporate` again, and `minimal` is still what a rollback would
+        // return the site to. Clearing the column here would spend that target on a call that
+        // changed no theme — and my own walk
+        // (`re_activating_the_active_theme_leaves_the_rollback_settings_target_alone`) failed
+        // for exactly that reason, which is why the pointer is left alone here rather than
+        // defended by a comment.
+        //
+        // The RESPONSE reports nothing displaced, because this call displaced nothing. Those
+        // are two different questions and conflating them is what made the gallery offer a
+        // rollback whose target the response claimed did not exist.
         return Ok(ActivationChange {
             site_id,
             theme_key: row.theme_key,
-            previous_theme_key: row.previous_theme_key,
+            previous_theme_key: None,
             restored: false,
+            // Nothing was republished, so there is no revision to name.
+            restored_settings_revision_no: None,
         });
     }
 
     let mut tx = pool.begin().await?;
-    let stored = write_activation(&mut tx, site_id, &key, previous.clone(), activated_by).await?;
+    let stored = write_activation(&mut tx, site_id, &key, Some(previous.clone()), activated_by).await?;
     tx.commit().await?;
 
     Ok(ActivationChange {
         site_id,
         theme_key: stored,
-        previous_theme_key: previous,
+        // Always `Some` now: the resolved theme exists for every site, so a forward
+        // activation displaces something real. The type stays `Option` because
+        // `rollback_target` filters a self-referential target to `None` — "going back would
+        // change nothing" is still a distinct answer from "there was something".
+        previous_theme_key: Some(previous),
         restored: false,
+        restored_settings_revision_no: None,
     })
 }
 
@@ -835,16 +914,43 @@ pub async fn restore_previous(
     }
 
     let displaced = current.theme_key;
+
+    // The settings the displaced state was live with, captured by the activation that
+    // displaced it. Read BEFORE the write below, because that write overwrites the column.
+    //
+    // Restoring it goes through `theme_settings::restore_revision` rather than moving the
+    // published pointer backwards: that function writes a NEW revision with a number, an
+    // author and a place in the history, which is what "the rollback is itself recorded"
+    // means everywhere else in this module. Moving the pointer would produce a history
+    // listing revisions in an order the site never had.
+    //
+    // `null` is a real answer (the site had published nothing when it was displaced) and is
+    // not an error: the theme still comes back, it just renders with the theme's defaults.
+    let previous_settings = pending_rollback_settings_revision(pool, site_id).await?;
+
     let mut tx = pool.begin().await?;
     let stored = write_activation(&mut tx, site_id, &target, Some(displaced.clone()), activated_by)
         .await?;
     tx.commit().await?;
+
+    let restored_settings_revision_no = match previous_settings {
+        // `revision_no()` is itself an `Option` because a draft save publishes nothing —
+        // and this path can only ever produce a `Restored`, so the inner `None` is
+        // unreachable in practice. Flattened rather than `Some(Some(..))` because a nested
+        // `Option` here would need the caller to unwrap twice to learn whether the rollback
+        // republished anything, and the one caller reads it to print a number.
+        Some(id) => crate::theme_settings::restore_revision_by_id(pool, site_id, id)
+            .await?
+            .and_then(|change| change.revision_no()),
+        None => None,
+    };
 
     Ok(ActivationChange {
         site_id,
         theme_key: stored,
         previous_theme_key: Some(displaced),
         restored: true,
+        restored_settings_revision_no,
     })
 }
 
@@ -856,21 +962,40 @@ async fn write_activation(
     previous: Option<String>,
     activated_by: Option<Uuid>,
 ) -> Result<String> {
+    // The published settings revision that is live RIGHT NOW, captured before the pointer
+    // moves. This is the half `previous_theme_key` cannot express and the reason a rollback
+    // that restored only the key left the displaced theme rendering under the incoming
+    // theme's colours — a complete, valid, wrong page. Read inside the same transaction as
+    // the write, so two concurrent activations cannot both claim the same revision as "the
+    // one being displaced".
+    //
+    // `null` is a real answer: a site that has published no settings has no revision to
+    // bring back, and a rollback must not invent one.
+    let published_id: Option<Uuid> = sqlx::query_scalar(
+        "select revision_id from theme_settings_published where site_id = $1",
+    )
+    .bind(site_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
     // Both directions store the key they displaced, which is what makes a rollback reversible
     // in the same way an activation is. The two callers pass exactly that value, so there is
     // no flag to get wrong here.
     sqlx::query(
-        "insert into site_themes (site_id, theme_key, previous_theme_key, activated_by) \
-         values ($1, $2, $3, $4) \
+        "insert into site_themes (site_id, theme_key, previous_theme_key, \
+                                  previous_settings_revision_id, activated_by) \
+         values ($1, $2, $3, $4, $5) \
          on conflict (site_id) do update set \
            theme_key = excluded.theme_key, \
            previous_theme_key = excluded.previous_theme_key, \
+           previous_settings_revision_id = excluded.previous_settings_revision_id, \
            activated_by = excluded.activated_by, \
            activated_at = now()",
     )
     .bind(site_id)
     .bind(theme_key)
     .bind(previous)
+    .bind(published_id)
     .bind(activated_by)
     .execute(&mut **tx)
     .await?;

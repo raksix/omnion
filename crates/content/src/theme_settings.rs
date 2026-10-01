@@ -230,6 +230,23 @@ pub enum SettingsChange {
     },
 }
 
+impl SettingsChange {
+    /// The revision number this change published, when it published one.
+    ///
+    /// `None` for a draft save, which touches nothing a visitor renders. Callers that need a
+    /// number for a message ask for it here rather than matching on the variant and copying
+    /// the field out — a third variant added later would then be a compile error at every
+    /// call site rather than a silently missing number in a toast.
+    #[must_use]
+    pub fn revision_no(&self) -> Option<i32> {
+        match self {
+            Self::Draft { .. } => None,
+            Self::Published { revision_no, .. } => Some(*revision_no),
+            Self::Restored { revision } => Some(revision.revision_no),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reading
 // ---------------------------------------------------------------------------------------------
@@ -356,6 +373,36 @@ pub async fn revision(
 /// `None` is a real answer rather than a programming error.
 pub async fn revision_by_id(pool: &PgPool, id: Uuid) -> Result<Option<SettingsRevision>> {
     read_revision(pool, Some(id)).await
+}
+
+/// Restore a revision **by its id**, for a caller that holds a pointer rather than a number.
+///
+/// The theme rollback is that caller: `site_themes.previous_settings_revision_id` is a uuid,
+/// and converting it to a number to reach [`restore_revision`] would be a read that can fail
+/// for a reason the rollback cannot report usefully — the revision may belong to a different
+/// site, or may have been deleted since the activation that recorded it. Both of those are
+/// `None` here, and both mean the same thing to the rollback: *there is nothing to bring back*.
+///
+/// The `site_id` predicate is not decoration. `id` is a `uuid` and therefore globally unique,
+/// but a rollback must not be able to republish another site's revision if a row were ever
+/// cross-wired: the check is what makes the returned revision provably this site's.
+pub async fn restore_revision_by_id(
+    pool: &PgPool,
+    site_id: Uuid,
+    id: Uuid,
+) -> Result<Option<SettingsChange>> {
+    let Some(source) = read_revision(pool, Some(id)).await? else {
+        return Ok(None);
+    };
+    if source.site_id != site_id {
+        // Not an error: the caller asked "is there a revision of MINE to bring back" and the
+        // answer is no. Refusing the whole rollback over it would leave a site stuck on a
+        // theme nobody can undo.
+        return Ok(None);
+    }
+    Ok(Some(
+        restore_revision(pool, site_id, source.revision_no, None).await?,
+    ))
 }
 
 /// The history, newest first, with the two pointers resolved.
