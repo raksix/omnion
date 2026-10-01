@@ -6598,3 +6598,74 @@ hit test says the point is ON the edge, so the cursor is over a label sitting on
 **Next:** (1) build the `trigger → wait → end` spine through the graph route so the run-from-here
 skip path is measurable at all; (2) read `two-tab-keep-mine` — the second exit stopped resolving;
 (3) `listener` control is not found even though the retarget succeeded.
+
+## 2026-09-30 — REQ-004 · the orphan was not a harness fixture, it was a live button
+
+fix(workflows): an unconnected node offered a live *Run from here* button.
+
+**The last tick called the disagreement "the honest kind to be looking at". It was not.
+It was a defect in the product, and it was in the state the screen spends most of its
+life in.** The canvas decided startability from the only question a card can answer about
+itself — *does any connection leave it* — so a node with none looked like the end of its
+own path, and not being inert, passed. The server's walk never reaches such a node and
+refused it with `unknown_node` on every press. **Every node in this builder is dropped
+from the palette un-wired and connected afterwards**, so "an orphan" was not a shape an
+author might draw; it was the editing state of the screen, with a button on it that
+always failed. That is the outcome `run-from-here.ts`'s own doc calls the worst thing this
+feature can do, and it survived three ticks of reading the note because the server's
+sentence talks about *the path from the trigger* — a fact about the run — rather than
+about the wiring, which is the thing the author can act on.
+
+The two sides were not being careless; each was answering the question it *could*. The
+card could see that no connection leaves it. The server could see that the walk never
+reaches it. Neither could see the other's answer, and nothing checked that they agreed —
+so the client takes the verdict now (`reachedByTrigger`), and `null` still offers the
+button, because "cannot tell" is not "no" and greying out a half-written rule teaches the
+opposite lesson.
+
+**`reachability.ts` reads `terminal` off the palette rather than naming a port**, which
+also refuses the reachable-looking half: a connection on a port that *ends* the run does
+not carry the walk onward, so a condition wired only on `false` is refused as well.
+`follows()` became `followed_port()` = `!terminal`, and the identity is asserted over the
+whole registry. **That is the third copy of a walk rule on this branch, after the node
+type registry and the trigger prefix, and the shape is the generalisable lesson rather
+than the instance: a rule restated in a file nothing compiles is a rule with no compiler,
+and it fails silently because both sides still produce a plausible answer.**
+
+**And the harness's half, which is what made the defect visible at all.** Every step in
+the pass adds a node by clicking the palette, and that gesture drops it **unconnected** —
+there is no gesture here that inserts a node between two wired cards. So the pass's graph
+carried `trigger → end` with `wait-3` beside it, and the criterion about skipping a prefix
+was being measured on a graph where no prefix exists. The spine (`trigger → wait → act →
+end`, with `seconds` on the wait and the trigger's own event name preserved) is now
+written through the graph route, and **the projection is verified before the scan
+measures against it** — `step_count: 3`, `valid: true`. A harness that builds a prefix
+and does not check it has built one the server may not share, which is the same mistake
+as adding a third node beside the spine.
+
+One correction worth writing down: the first draft of the spine leg asserted
+`projection.nodes >= 4`. `ProjectionBody` has no `nodes` — it has `step_count`, and a
+trigger contributes no step, so the spine is **3**. Asserting a field that does not exist
+is a probe that reads `undefined` and compares false, i.e. the `condition.if` and
+`trigger.cron` mistakes for the third time, caught by reading the struct before writing
+the assertion rather than after.
+
+**Proof.** `cargo test -p omnion-workflows --lib` → **155 passed / 0 failed** (152 before).
+`node --test` over the two client files → **25 passed** (13 before). `pnpm typecheck` clean.
+Both guards **proven to bite**: removing the refusal from `startability` turns exactly the
+two client tests red (11/13) and the restore returns 13/13; restoring a port-name list in
+`reachability.ts` turns the cross-language guard red. The merge of `origin/main` into this
+branch resolved `docs/BUILD-LOG.md` with `scripts/qa/merge-build-log.py`, verified as an
+exact multiset (`base=5760 ours=6292 theirs=6068 → merged=6600`, zero lines lost on either
+side) rather than by line count.
+
+**The pass did not run: the QA slot was held by a live sibling** (`/mnt/apopic/omnion-w4`,
+`/proc/4149471/cwd`), not a stale holder — the queueing itself is the correct behaviour and
+the alternative would have been to start a second browser pass on a box already at 18 G
+resident. So the browser reading of `skipped > 0`, `reasonNamesNode` and `pillsPainted`
+against the new spine is **written but not measured**, and the criterion stays unticked.
+
+**Next:** run the pass first and read `run-from-here-spine` / `orphan-run-from-here` /
+`run-from-here` off the rows; then `two-tab-keep-mine`, which regressed to
+`resolved: false` last tick while `two-tab-conflict` stayed healthy; then `listener`
+(`controlFound: false` beside a successful retarget) and `tab-walk.reachedAnEdge`.
