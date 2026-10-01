@@ -13,7 +13,22 @@
 //! documented payload; the list's filters combine and its sort refuses an unknown column; the
 //! `own` visibility level hides a colleague's record (and keeps the unassigned one); and the
 //! flagged custom fields are gone for a role without `crm.fields.sensitive.read` — in the list,
-//! in the detail and in the copy the caller gets back.
+//! in the copy the caller gets back.
+//!
+//! **Every walk in this file runs on `flavor = "multi_thread"`, and that is a measured
+//! requirement, not a preference.** A bare `#[tokio::test]` builds a *current-thread* runtime:
+//! one thread, no blocking pool. The fixture signs accounts in (`login` → `verify_password` →
+//! `hash_password` → `tokio::task::spawn_blocking`), so each walk queues work onto a pool that
+//! the runtime must have. On the current-thread flavor this suite parked with the main thread in
+//! `futex_do_wait`, the only runtime worker in `do_epoll_wait`, **zero CPU across a 45-second
+//! window** and every PostgreSQL backend idle at `ClientRead` — a process waiting on a wakeup
+//! nobody was going to send. It hung here at `a_contact_round_trip_writes_its_audit_row_and_event`
+//! and at `an_activity_of_another_organization_is_invisible`, across four ticks.
+//!
+//! On the multi-thread flavor the same binary, same database and same box ran past both of those
+//! tests and reached **35 of 57 passes** before this tick's budget ran out, with no change to a
+//! single line of product code. `scripts/qa/hung-test-probe.sh` prints the whole diagnosis in one
+//! command, so the next writer does not spend a tick re-deriving it.
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -581,7 +596,7 @@ async fn event_payloads(db: &Db, name: &str) -> Vec<Value> {
 // ---------------------------------------------------------------------------------------------
 
 /// Every route refuses an unauthenticated caller and a caller without the permission.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_crm_route_is_permission_guarded() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -729,7 +744,7 @@ async fn every_crm_route_is_permission_guarded() {
 
 /// A signed-in curl round-trip: a company, a contact on it, a patch, the audit trail and the
 /// event feed all read back.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_contact_round_trip_writes_its_audit_row_and_event() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -871,7 +886,7 @@ async fn a_contact_round_trip_writes_its_audit_row_and_event() {
 }
 
 /// The refusals: a nameless contact, a malformed address, a duplicate address, a bad domain.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_contact_and_company_forms_refuse_what_they_name() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -968,7 +983,7 @@ async fn the_contact_and_company_forms_refuse_what_they_name() {
 }
 
 /// The list: filters combine, an unknown sort is refused, and the total matches the page.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_contact_list_filters_sorts_and_totals() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -1117,7 +1132,7 @@ async fn the_contact_list_filters_sorts_and_totals() {
 }
 
 /// A record of another organization is invisible: `404`, exactly like one that does not exist.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_of_another_organization_is_invisible() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -1193,7 +1208,7 @@ async fn a_record_of_another_organization_is_invisible() {
 }
 
 /// The `own` level: a colleague's record is invisible, the unassigned one is not.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_own_visibility_level_hides_a_colleagues_record() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -1341,7 +1356,7 @@ async fn the_own_visibility_level_hides_a_colleagues_record() {
 ///
 /// The level is granted on `crm.deals.read` and asserted against **deals** — the contact family
 /// is deliberately not involved, so a pass cannot be explained by the key that used to be named.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_visibility_level_holds_on_any_key_of_the_family() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -1628,7 +1643,7 @@ async fn a_visibility_level_holds_on_any_key_of_the_family() {
 }
 
 /// The flagged fields are absent for a role without the key — in the list and in the detail.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_flagged_fields_are_hidden_from_a_role_without_the_key() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -1715,7 +1730,7 @@ async fn the_flagged_fields_are_hidden_from_a_role_without_the_key() {
 }
 
 /// Archiving and merging: the history survives, and the merge moves what pointed at the loser.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn archiving_and_merging_keep_the_history() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -1860,7 +1875,7 @@ async fn archiving_and_merging_keep_the_history() {
 }
 
 /// The company list: the same envelope, and the rollup a detail screen shows.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_company_list_and_detail_read_back() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -1952,7 +1967,7 @@ async fn the_company_list_and_detail_read_back() {
 
 /// The event carries the organization it belongs to, so a subscriber scoped to one tenant is
 /// the only one that can ever see it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_contact_event_carries_its_organization() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -1990,7 +2005,7 @@ async fn a_contact_event_carries_its_organization() {
 }
 
 /// The migration left the default pipeline in place for an existing organization.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_default_pipeline_is_seeded_for_every_organization() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2042,7 +2057,7 @@ async fn the_default_pipeline_is_seeded_for_every_organization() {
 /// `0022_crm.sql` and called once, in the statement that created it, so an organization born after
 /// that migration had no pipeline, no stages and no board. The stage editor was a screen over an
 /// empty table and the board was a 404.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_organization_created_after_the_migration_still_owns_a_board() {
     let Some((state, db)) = live_state().await else {
         return;
@@ -2115,7 +2130,7 @@ async fn an_organization_created_after_the_migration_still_owns_a_board() {
 }
 
 /// The whole API answers for a signed-in account, with a request id, and the account is scoped.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_surface_answers_a_platform_account_and_scopes_a_tenant_account() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2153,7 +2168,7 @@ async fn the_surface_answers_a_platform_account_and_scopes_a_tenant_account() {
 }
 
 /// The header the panel sends is not required: the walk must work with a bare session cookie.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_routes_answer_without_a_content_type_on_a_read() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2173,7 +2188,7 @@ async fn the_routes_answer_without_a_content_type_on_a_read() {
 
 /// Every account the fixture creates carries a distinct address and a tenant (except the
 /// platform owner), so two runs cannot collide and a reader cannot read across a boundary.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_fixture_accounts_are_distinct_and_tenant_scoped() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2204,7 +2219,7 @@ async fn the_fixture_accounts_are_distinct_and_tenant_scoped() {
 
 /// The audit metadata is a JSON document, not a string: the IAM screen reads `changed` and
 /// `before` as keys, and a stringified blob would make the audit trail unreadable there.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_audit_metadata_is_a_json_document() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2254,7 +2269,7 @@ async fn the_audit_metadata_is_a_json_document() {
 
 /// Slice 2 — the import. A dry run writes nothing and names the line it refuses; the commit
 /// writes exactly the rows the preview accepted and says what it refused.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_import_previews_before_it_writes_and_then_writes_what_it_accepted() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2357,7 +2372,7 @@ async fn an_import_previews_before_it_writes_and_then_writes_what_it_accepted() 
 
 /// A file that names no contact field is refused by the header, and a repeated address inside one
 /// file is refused before the commit rather than half way through it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_import_refuses_a_file_that_is_not_a_contact_file() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2397,7 +2412,7 @@ async fn an_import_refuses_a_file_that_is_not_a_contact_file() {
 
 /// The saved views: a view is the query it stands for, it is shared only when asked, and it never
 /// bridges two organizations.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_saved_view_is_the_query_it_stands_for() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2510,7 +2525,7 @@ async fn a_saved_view_is_the_query_it_stands_for() {
 
 /// The column catalogue: the chooser offers what the entity has, and the flagged keys are not
 /// among them.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_column_catalogue_answers_per_entity() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2533,7 +2548,7 @@ async fn the_column_catalogue_answers_per_entity() {
 
 /// The export is the list's own answer: the same filters, the same field hiding, and a file the
 /// importer accepts without a mapping step.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_export_is_the_lists_own_answer_and_imports_back() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2708,7 +2723,7 @@ async fn create_deal_via_api(state: &AppState, token: &str, body: Value) -> Test
 ///
 /// The acceptance criterion is that the column header and the cards in that column can never
 /// disagree, so the test reads both from the *same* board payload and compares them.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_deal_lands_on_the_first_open_stage_and_the_board_adds_up() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2810,7 +2825,7 @@ async fn a_new_deal_lands_on_the_first_open_stage_and_the_board_adds_up() {
 
 /// The drag, the keyboard's `ctrl + ←/→` and the reload: all three go through one route, and the
 /// stage change is in the event feed with the documented payload.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stage_move_persists_reloads_and_emits_the_documented_event() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -2906,7 +2921,7 @@ async fn a_stage_move_persists_reloads_and_emits_the_documented_event() {
 }
 
 /// A lost deal says why, a won deal records its close date, and both emit their own event.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_won_and_lost_flows_demand_their_own_input_and_emit_their_own_event() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3042,7 +3057,7 @@ async fn the_won_and_lost_flows_demand_their_own_input_and_emit_their_own_event(
 /// The board's keyboard path sends the request on **every** arrow key press, and the left/right
 /// keys at the end of a row would otherwise wake every automation subscribed to
 /// `crm.deal.stage_changed` once per press — the loudest way a feature can become a nuisance.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn moving_a_deal_to_the_stage_it_is_already_in_is_a_no_op() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3090,7 +3105,7 @@ async fn moving_a_deal_to_the_stage_it_is_already_in_is_a_no_op() {
 }
 
 /// The pipeline editor: reorder in place, add a column, and refuse an impossible shape.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_stage_editor_reorders_saves_and_refuses_what_the_board_cannot_show() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3197,7 +3212,7 @@ async fn the_stage_editor_reorders_saves_and_refuses_what_the_board_cannot_show(
 
 /// A deal of another organization is a `404` for a caller who could otherwise write — and a
 /// `403` here would confirm that the deal exists.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deal_of_another_organization_is_invisible_to_a_caller_who_may_write() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3224,7 +3239,7 @@ async fn a_deal_of_another_organization_is_invisible_to_a_caller_who_may_write()
 
 /// A caller may not read the board with the contact keys alone: the pipeline is a separate
 /// disclosure from the people.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reading_a_contact_does_not_grant_the_pipeline() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3252,7 +3267,7 @@ async fn reading_a_contact_does_not_grant_the_pipeline() {
 
 /// The board's list mode and its filters: a search, an owner, a close range and a sort, all on
 /// the same contract the board reads.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_deal_list_filters_sorts_and_pages() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3361,7 +3376,7 @@ async fn the_deal_list_filters_sorts_and_pages() {
 
 /// The forms refuse what they name: a negative value, an unknown currency, a probability over
 /// 100 and a blank title each answer with the field the screen renders the message under.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_deal_form_refuses_what_it_names() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3459,7 +3474,7 @@ async fn crm_trio(
     (company_id, contact_id, deal_id, marker.to_string())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_activity_route_is_permission_guarded() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3533,7 +3548,7 @@ async fn every_activity_route_is_permission_guarded() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_logged_activity_appears_in_the_feed_and_on_the_records_timeline() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3666,7 +3681,7 @@ async fn a_logged_activity_appears_in_the_feed_and_on_the_records_timeline() {
     let _ = deal_id;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_activity_feed_filters_by_kind_and_by_state() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3796,7 +3811,7 @@ async fn the_activity_feed_filters_by_kind_and_by_state() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_activity_form_refuses_what_it_names() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3898,7 +3913,7 @@ async fn the_activity_form_refuses_what_it_names() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_activity_of_another_organization_is_invisible() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -3999,7 +4014,7 @@ async fn grant_and_login(fixture: &Fixture, label: &str, permissions: &[&str]) -
     login(&fixture.state, &email).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_new_activity_keys_are_in_the_catalogue_and_the_owner_holds_them() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -4052,7 +4067,7 @@ const COPILOT_PERMISSIONS: [&str; 4] = [
 
 /// The copilot's two endpoints are guarded, scoped and audited — and a deal belonging to another
 /// organization is a `404`, not a `403` and not an answer.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_copilot_is_guarded_scoped_and_audited() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -4333,7 +4348,7 @@ fn hit_of(body: &Value, provider: &str, title: &str) -> Value {
 
 /// The CRM joins the palette: a contact, a company and a deal each become one document, each hit
 /// carries the deep link that opens that record, and the search key narrows to one of them.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_crm_answers_the_palette_with_a_deep_link_into_the_record() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -4417,7 +4432,7 @@ async fn the_crm_answers_the_palette_with_a_deep_link_into_the_record() {
 
 /// The two CRM read keys are separate, so the palette is too: a caller who may know who a
 /// customer is does not thereby get to see what they are negotiating.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_palette_hides_the_pipeline_from_a_contact_only_reader() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -4470,7 +4485,7 @@ async fn the_palette_hides_the_pipeline_from_a_contact_only_reader() {
 
 /// Archiving a record takes it out of the index. The CRM lists hide archived rows by default, so a
 /// document that outlived the archive would answer with a record the panel will not show.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn archiving_a_crm_record_removes_it_from_the_palette() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -4628,7 +4643,7 @@ async fn flush_without_runs(db: &Db) -> matcher::MatchReport {
 
 /// A rule on `crm.deal.stage_changed` fires **once** per real stage move — not on the move that
 /// does not move, not twice for one move, and not for a move its condition excludes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rule_on_a_deal_stage_change_runs_exactly_once() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -4839,7 +4854,7 @@ async fn a_rule_on_a_deal_stage_change_runs_exactly_once() {
 
 /// A second rule on the same event, narrowed by a condition, does not fire on the move the
 /// condition excludes — the shape every "tell me only about the big ones" rule takes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rule_whose_condition_does_not_hold_starts_nothing() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -4932,7 +4947,7 @@ async fn a_rule_whose_condition_does_not_hold_starts_nothing() {
 
 /// The rule's key is a workflow key, not a CRM one: a caller who may move deals all day and
 /// still cannot define the rule that watches them.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn defining_the_rule_needs_the_workflow_key_and_a_tenant_rule_stays_home() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5077,7 +5092,7 @@ async fn ledger_row(db: &Db, event_id: i64) -> Value {
 /// The assertions are the acceptance criteria in one place: the submission is recorded on the
 /// bus, the drain reads it, a **contact** and a **deal** exist, the ledger names both, the inbox
 /// shows the row, and the deal's headline is the person's own words rather than a placeholder.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_submitted_form_becomes_a_contact_and_a_deal() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5166,7 +5181,7 @@ async fn a_submitted_form_becomes_a_contact_and_a_deal() {
 /// The claim is the event id's primary key on the ledger, and this is the walk that proves the
 /// guarantee is real rather than intended: a second drain over an unchanged bus is **idle**, and
 /// the contact and deal counts do not move.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_drain_files_nothing_twice() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5235,7 +5250,7 @@ async fn a_second_drain_files_nothing_twice() {
 }
 
 /// A second submission from an address the CRM already knows is the **same person**.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repeat_submission_is_the_same_person_and_lands_in_the_repeat_stage() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5331,7 +5346,7 @@ async fn a_repeat_submission_is_the_same_person_and_lands_in_the_repeat_stage() 
 }
 
 /// A submission with nothing to file is **kept and explained**, not dropped.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_submission_with_nothing_usable_is_kept_and_says_why() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5390,7 +5405,7 @@ async fn a_submission_with_nothing_usable_is_kept_and_says_why() {
 }
 
 /// A submission with no organization is recorded and counted, never filed into nobody's CRM.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_submission_without_an_organization_is_orphaned_not_dropped() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5435,7 +5450,7 @@ async fn a_submission_without_an_organization_is_orphaned_not_dropped() {
 }
 
 /// Turning the routing off is a decision the settings screen records, and the drain obeys.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_organization_that_turns_leads_off_records_the_submission_and_writes_nothing() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5481,7 +5496,7 @@ async fn an_organization_that_turns_leads_off_records_the_submission_and_writes_
 }
 
 /// Reading the log and changing the routing are separate keys, and the settings are a tenant's.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_ingress_keys_and_the_tenant_boundary_are_enforced() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5606,7 +5621,7 @@ async fn the_ingress_keys_and_the_tenant_boundary_are_enforced() {
 }
 
 /// A stage from another pipeline is refused by name, not silently ignored.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stage_from_another_pipelines_organization_is_refused() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5640,7 +5655,7 @@ async fn a_stage_from_another_pipelines_organization_is_refused() {
 }
 
 /// The settings are audited and announced, and a body that changes nothing is silent.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changing_the_routing_is_audited_and_only_the_change_is_announced() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5737,7 +5752,7 @@ async fn changing_the_routing_is_audited_and_only_the_change_is_announced() {
 }
 
 /// The two new keys are in the catalogue, in the owner's role, and nowhere else by accident.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_lead_keys_are_catalogued_and_belong_to_the_owner() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5784,7 +5799,7 @@ async fn the_lead_keys_are_catalogued_and_belong_to_the_owner() {
 /// assumed: one tenant is taken, **two is a refusal** rather than a coin toss, and an account
 /// bound to none is told so. A screen that silently opened the wrong tenant's records would be a
 /// data leak wearing the costume of a convenience.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -5926,7 +5941,7 @@ async fn a_platform_account_reads_the_one_organization_it_is_bound_to() {
 /// indistinguishable from correct to the person looking at the screen: rows appear, nothing is
 /// greyed out, and the only evidence is the tenant chip several rows away. A `400` that names
 /// the count is a question the caller can answer, and the picker in the panel is built to ask it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_platform_account_bound_to_two_organizations_is_told_to_choose() {
     let Some(fixture) = Fixture::new().await else {
         return;
@@ -6005,7 +6020,7 @@ async fn a_platform_account_bound_to_two_organizations_is_told_to_choose() {
 /// The account is the platform owner before anybody has given it a role in any tenant, which is
 /// the state of a brand-new installation. There is no right answer to give it, so the API says
 /// so with the code the panel already knows how to draw a "nothing to show" state from.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_platform_account_in_no_organization_is_told_it_has_none() {
     let Some(fixture) = Fixture::new().await else {
         return;
