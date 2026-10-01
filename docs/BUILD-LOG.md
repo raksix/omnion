@@ -7076,3 +7076,70 @@ it runs, read `run-from-here-spine` (`usable true`, `step_count 3`, `valid true`
 `two-tab-keep-mine`, `listener`, `tab-walk.reachedAnEdge` and `edge-delete`. If `browser-died` appears
 in the roll-up, that is now one named box event rather than the seventy-six it used to be — and the
 passes it names were never measured, which is a different sentence from "the screens are clean".
+
+### Tick 46 — the disk guard deleted the dev server a pass was walking through
+
+**The finding.** `scripts/qa/disk-guard.sh` runs from a Hermes cron (`fcec6271075b`, every six
+minutes). Its step 2 drops any `apps/*/.next` over `NEXT_MAX_MB`, and **it was the only reclaim
+step with no liveness test** — steps 3b, 4 and 5 all consult `reclaimable` first, because a
+`target/` a live build is writing into is not a victim. At **03:54:07** it removed
+`omnion-w3/apps/admin/.next`, and the admin server logged, in its own error file:
+
+```text
+⨯ The directory at "/mnt/apopic/omnion-w3/apps/admin/.next/dev" was deleted.
+Deleting this directory while Next.js is running can lead to undefined behavior.
+Restarting the server to recover...
+```
+
+The walkthrough walked on into a server that was restarting.
+
+**Why three ticks read this as a tired box.** It **did not throw**. The pass finished and wrote
+`pages: 55` and no findings on the builder — so the notes blamed memory, shared Chrome and the
+queue. But every screen after `/analytics/downloads` came back `chrome-error://chromewebdata/`,
+and **a page that never loaded reports no problems**, so `summary.json` recorded an unmeasured
+remainder as a clean one. `20261001-021614` shows the other half of the same thing: the route loop
+died with `page.waitForTimeout: Target page, context or browser has been closed` on the last
+eleven screens. Both are the one event, seen twice by two passes.
+
+**So the harness was right and the reporting was right; the defect was the deletion.** That is
+the sentence three ticks of notes needed, and none of them had read the admin error log, because
+nothing pointed there — the harness had no finding to point at.
+
+**The fix.** `worktree_under` is a new liveness test, and it is a **prefix over cwd, not an
+equality**. A live QA admin server's cwd is `<worktree>/apps/admin`, never the worktree root, so
+`worktree_busy`'s `[ "$cwd" = "$wt" ]` answered "nobody is working here" on **every pass ever
+run** — the test existed, was correct about its own question, and was being asked of the wrong
+thing. The `.next` step now asks it about the app directory (no process ever has a *cache* as its
+cwd) before deleting, and says which cache it spared and why.
+
+**The half of my own fix that was wrong, and which the proof caught.** The first draft was
+`case "$cwd" in "$wt"/*)` — children only — so asking about the one directory a dev server
+actually sits in answered **idle**, and the guard came back green while deleting. `bash -n` passes
+on both versions; only running it against a *real* `pm2 pid omnion-qa-admin-w5` (cwd
+`/mnt/apopic/omnion-w5/apps/admin`) exposed it. Fixed to `"$wt"|"$wt"/*`, and **the equality half
+is asserted separately** — a guard proven against the wrong argument is a guard proven not at all.
+
+**Three assertion drafts, and each was wrong in the same direction.** The first searched the
+guard for a loop header written twice with a different suffix and reported the step gone. The
+second asserted `rm -rf "$nx"` was **absent** — which would fail against a correct guard (the
+deletion is right for a cache nobody is using) and pass against one that never deletes anything.
+The third asserts the **ORDER**: liveness asked before the deletion, able to skip it. That is the
+same claim the sign-out guard makes one function up, and text-matching a `rm` is theatre either
+way.
+
+**Proof.** `cargo test -p omnion-workflows --lib` → **157 passed** (156 before).
+`pnpm typecheck` clean. `bash -n` clean. **All three halves proven to bite independently:**
+removing the liveness check, removing the equality half, and moving the deletion before the
+question each turn exactly that assertion red and nothing else. Live, end to end: a real guard run
+with `NEXT_MAX_MB=1` spared all six live caches across three worktrees **by name**
+(`keep next cache 962M: omnion-w5/admin`) and freed nothing, where the old guard removed two of
+them. The disk guard is the shared cron every writer's box runs, so this is a fix for all of them.
+
+**Next.** The pass is still queued behind a live `omnion-w5` holder (45 Chrome processes on the
+box) and that queue is behaving correctly — a second concurrent pass is what crashed pass
+`20261001-021909`. When it runs, read `run-from-here-spine` (`usable true`, `step_count 3`,
+`valid true`), `orphan-run-from-here` (`refused`, `namesTrigger`), `run-from-here` (`skipped > 0`,
+`reasonNamesNode`, `firstRunnableNo === firstSkippedNo + 1`, `pillsPainted > 0`), then
+`two-tab-keep-mine`, `listener`, `tab-walk.reachedAnEdge` and `edge-delete`. **`chrome-error://`
+in any page's `url` is now a guard-relevant reading, not a tired box** — it is the signature of
+the disk guard having found a live server after this fix lands on every worktree.
