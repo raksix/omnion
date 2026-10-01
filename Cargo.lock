@@ -1609,6 +1609,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac",
+ "omnion-security",
  "p256",
  "rand 0.8.8",
  "reqwest",
