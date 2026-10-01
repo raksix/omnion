@@ -96,6 +96,41 @@ pub fn refused_recipients(
         .collect()
 }
 
+/// The recipients a sender may address, each with the organization its row must carry.
+///
+/// Returns the **pairs**, not the ids, because the second half of the rule is a *stamp* and a
+/// caller that filtered correctly but stamped the sender's organization would still write a row
+/// whose `organization_id` column names one tenant while `user_id` names an account in another.
+/// Handing the pair back is what makes the correct thing the convenient thing.
+///
+/// **This is [`refused_recipients`]'s other arm, and the two must stay the same rule.** They
+/// are separate functions rather than one because they answer different questions in different
+/// places — a caller that needs to *tell an emitter which ids to drop* wants the refusal, and a
+/// producer that is about to write wants the survivors — but a filter and its complement that
+/// disagreed would refuse a row on one path and write it on the other. A tenant boundary with
+/// two spellings is not a boundary.
+pub fn addressable_recipients(
+    sender_organization: Option<Uuid>,
+    asked: &[Uuid],
+    organization_of: &dyn Fn(Uuid) -> Option<Option<Uuid>>,
+) -> Vec<(Uuid, Option<Uuid>)> {
+    asked
+        .iter()
+        .copied()
+        .filter_map(|id| match organization_of(id) {
+            // Unknown to the database: there is no row to stamp and no person to tell, and the
+            // insert would be refused by `notifications_user_id_fkey` with a constraint name
+            // instead of a sentence. Refusing it here is what turns a payload naming a
+            // fabricated uuid into an unmatched rule rather than a 500.
+            None => None,
+            Some(recipient_organization) if may_address(sender_organization, recipient_organization) => {
+                Some((id, recipient_organization))
+            }
+            Some(_) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +229,89 @@ mod tests {
     #[test]
     fn a_sender_that_asks_for_nobody_is_refused_nobody() {
         assert!(refused_recipients(Some(org(1)), &[], &|_: Uuid| None).is_empty());
+    }
+
+    #[test]
+    fn the_survivors_carry_their_own_organization_not_the_senders() {
+        // The stamp is the half that made the leak look correct in a query, so it is asserted
+        // as a *value* rather than as a boolean. A filter that returned only ids would pass
+        // every other test in this file and still let a caller bind the sender's column.
+        let a = org(1);
+        let b = org(2);
+        let asked = vec![a, b, org(3)];
+        let organizations = |id: Uuid| match id {
+            x if x == a => Some(Some(a)),
+            x if x == b => Some(Some(b)),
+            _ => Some(PLATFORM),
+        };
+        assert_eq!(
+            addressable_recipients(Some(a), &asked, &organizations),
+            vec![(a, Some(a))],
+            "only the in-tenant id survives, and it is handed back WITH its own organization"
+        );
+    }
+
+    #[test]
+    fn a_platform_sender_gets_each_recipients_own_tenant() {
+        // The router's unscoped branch. The whole point of handing back pairs is this: a
+        // platform event addressing two tenants produces two rows in two tenants, and a single
+        // `organization_id` for the batch cannot express that.
+        let a = org(1);
+        let b = org(2);
+        let asked = vec![a, b];
+        let organizations = |id: Uuid| Some(Some(id));
+        assert_eq!(
+            addressable_recipients(PLATFORM, &asked, &organizations),
+            vec![(a, Some(a)), (b, Some(b))],
+            "each survivor carries its own tenant, so one platform event reaches two tenants' \
+             delivery logs instead of neither"
+        );
+    }
+
+    #[test]
+    fn an_id_that_is_no_account_survives_as_nobody() {
+        // Same fact `refused_recipients` states from the other side. Asserted here because the
+        // two functions must not drift, and a fabricated uuid in a payload is the realistic way
+        // to reach it: the id parses, so nothing before the database would have complained.
+        let ghost = org(9);
+        assert!(
+            addressable_recipients(PLATFORM, &[ghost], &|_: Uuid| None).is_empty(),
+            "an id with no row cannot be stamped, and `notifications_user_id_fkey` would refuse \
+             the whole insert with a constraint name"
+        );
+    }
+
+    #[test]
+    fn the_filter_and_its_complement_partition_the_same_list() {
+        // **The drift guard.** The emit route names refused ids back to a caller; the router
+        // keeps the survivors and writes them. If the two ever disagreed, one path would refuse
+        // a row the other wrote, which is the exact failure the pair is documented against — and
+        // it would be invisible, because both are "correct" in isolation.
+        for sender in [PLATFORM, Some(org(1)), Some(org(2))] {
+            let a = org(1);
+            let b = org(2);
+            let asked = vec![a, b, org(3), org(4)];
+            let organizations = |id: Uuid| match id {
+                x if x == a => Some(Some(a)),
+                x if x == b => Some(Some(b)),
+                x if x == org(3) => Some(PLATFORM),
+                _ => None,
+            };
+            let kept = addressable_recipients(sender, &asked, &organizations);
+            let refused = refused_recipients(sender, &asked, &organizations);
+            let kept_ids: Vec<Uuid> = kept.iter().map(|(id, _)| *id).collect();
+            let refused_ids: Vec<Uuid> = refused.to_vec();
+            let mut union = kept_ids.clone();
+            union.extend(refused_ids.iter().copied());
+            union.sort();
+            union.dedup();
+            assert_eq!(union.len(), asked.len(), "every asked id is in exactly one list");
+            assert!(
+                !kept_ids
+                    .iter()
+                    .any(|id| refused_ids.contains(id)),
+                "no id is both kept and refused: sender {sender:?}"
+            );
+        }
     }
 }

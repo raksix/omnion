@@ -28,7 +28,7 @@ pub mod router;
 pub mod store;
 pub mod vocabulary;
 
-pub use audience::{may_address, refused_recipients};
+pub use audience::{addressable_recipients, may_address, refused_recipients};
 pub use delivery::{
     DeliveryConfig, DeliveryJob, EnqueueReport, InAppTransport, NO_TRANSPORT_YET,
     READER_SWITCHED_IT_OFF, RunReport as DeliveryRunReport, Transport, TransportOutcome, claim_due,

@@ -602,6 +602,7 @@ pub async fn run_route(
                 "created": report.created,
                 "deduped": report.deduped,
                 "unmatched_rules": report.unmatched_rules,
+                "dropped_recipients": report.dropped_recipients,
             })),
     )
     .await

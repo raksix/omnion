@@ -1187,6 +1187,17 @@ export type NotificationRouteReport = {
   deduped: number;
   unmatched_rules: number;
   unknown_event: boolean;
+  /**
+   * Recipients a rule resolved and the router then refused: somebody outside the event's
+   * tenant, or an id that is not an account at all.
+   *
+   * Separate from `unmatched_rules` because the two mean different things to whoever wired the
+   * rule. `unmatched_rules` is "wait for the producer" — a rule ahead of its event. This is
+   * "fix the rule": it resolved somebody and the event's tenant does not own them. Both read
+   * `created: 0`, so without this field a mis-wired rule looks like a waiting one for as long
+   * as nobody counts.
+   */
+  dropped_recipients: number;
 };
 
 /** One row of the event feed, as `/api/v1/events` answers it. */

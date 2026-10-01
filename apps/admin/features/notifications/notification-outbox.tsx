@@ -480,6 +480,8 @@ function RouteProbe({ onResult }: { onResult: (message: string | null) => void }
 
   const created = typeof report?.created === "number" ? report.created : null;
   const unmatched = typeof report?.unmatched_rules === "number" ? report.unmatched_rules : null;
+  const dropped =
+    typeof report?.dropped_recipients === "number" ? report.dropped_recipients : null;
   const unknownEvent = report?.unknown_event === true;
 
   return (
@@ -532,6 +534,22 @@ function RouteProbe({ onResult }: { onResult: (message: string | null) => void }
           <li className="text-muted">
             {unmatched ?? 0} rule{unmatched === 1 ? "" : "s"} matched nobody
           </li>
+          {/** The one line that says a rule is mis-wired rather than waiting. Rendered above
+              the "unknown event" note because a dropped recipient is a fact about the rule and a
+              missing producer is a fact about the event, and the two need different fixes. */}
+          {dropped ? (
+            <li
+              className="flex items-start gap-1.5 text-amber-700 dark:text-amber-300"
+              data-probe-dropped={String(dropped)}
+            >
+              <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+              <span>
+                {dropped} recipient{dropped === 1 ? "" : "s"} resolved and then refused — outside
+                this event&rsquo;s organization, or not an account. Nothing was written for them,
+                so check the rule&rsquo;s recipient field.
+              </span>
+            </li>
+          ) : null}
           {unknownEvent ? (
             <li className="flex items-center gap-1.5 text-amber-700 dark:text-amber-300">
               <TriangleAlert className="h-3.5 w-3.5" aria-hidden />
