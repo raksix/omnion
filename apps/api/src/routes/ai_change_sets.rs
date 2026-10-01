@@ -246,53 +246,65 @@ pub async fn update(
         ));
     }
 
-    let sql = format!(
-        "update ai_change_sets set title = $3, operations = $4, base_revisions = $5, \
-         updated_by = $6, updated_at = now() \
-         where id = $1 and organization_id = $2 and status = $7 returning {}",
-        change_sets::CHANGE_SET_COLUMNS
-    );
-    let operations: Vec<ChangeOp> = body.operations.clone();
-    // The write goes through the crate's own error type rather than sqlx's: `ApiError` has
-    // no `From<sqlx::Error>`, and routing it through `AiHubError` means a database failure
-    // here is mapped by the same code that maps it everywhere else in the AI hub rather than
-    // by a local `?` that would need its own arm.
-    let updated: Option<ChangeSetRow> = sqlx::query_as(&sql)
-        .bind(id)
-        .bind(organization)
-        .bind(body.title.trim())
-        .bind(serde_json::to_value(&operations).unwrap_or_default())
-        .bind(serde_json::to_value(&body.base_revisions).unwrap_or_default())
-        .bind(actor)
-        .bind(&existing.status)
-        .fetch_optional(state.db().pool())
-        .await
-        .map_err(|err| ApiError::from(omnion_ai_hub::error::AiHubError::Database(err)))?;
+    // The write is the **store's**, not this handler's (slice 3e). It used to be a hand-written
+    // `update … returning` here, which is where the content hash had to be added — a second
+    // statement that must agree with `append` about how a row is hashed, in a different file,
+    // for no gain. The transaction and the hash are the same kind of guarantee: a property of
+    // the table rather than of one HTTP handler.
+    let stored = change_sets::store::replace_operations(
+        state.db().pool(),
+        organization,
+        id,
+        body.title.trim(),
+        &body.operations,
+        &body.base_revisions,
+        actor,
+        body.base_content_hash.as_deref(),
+    )
+    .await
+    .map_err(ApiError::from)?;
 
-    let Some(updated) = updated else {
-        // Somebody confirmed or discarded it between the read and the write. The `where`
-        // clause is what makes that zero rows, and the message names the state now rather
-        // than returning a generic conflict.
-        let current_row = change_sets::store::read(state.db().pool(), organization, id)
-            .await
-            .map_err(ApiError::from)?
-            .unwrap_or(existing);
-        return Err(ApiError::new(
+    match stored {
+        Ok(set) => Ok(Json(set)),
+        Err(change_sets::store::EditRefusal::NotFound) => Err(ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "change_set_not_found",
+            format!("no change set `{id}` in this organization"),
+        )),
+        // Two different situations, two different messages, both `409`. "Somebody confirmed
+        // it" and "somebody else saved an edit while you were typing" are the same HTTP
+        // answer and nothing like the same sentence — a reviewer who is told the first one
+        // goes looking for a decision that does not exist.
+        Err(change_sets::store::EditRefusal::NotEditable { current }) => Err(ApiError::new(
             axum::http::StatusCode::CONFLICT,
             "not_editable",
+            format!("this change set is now `{current}` and can no longer be edited"),
+        )),
+        Err(change_sets::store::EditRefusal::ContentMoved { read, stored }) => Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "content_moved",
             format!(
-                "this change set is now `{}` and can no longer be edited",
-                current_row.status
+                "this set changed while you were editing it (you read `{}`, the server holds \
+                     `{}`); reload it and re-apply your change",
+                short(&read),
+                short(&stored)
             ),
-        ));
-    };
+        )
+        .with_details(serde_json::json!({
+            "read_content_hash": read,
+            "stored_content_hash": stored,
+            "current_content_hash": existing.content_hash,
+        }))),
+    }
+}
 
-    // Validated **after** the write shape is known, against the same function the store uses
-    // on insert: one validation, so an edit cannot smuggle in an operation an insert refuses.
-    let set = updated.into_domain().map_err(ApiError::from)?;
-    change_sets::validate(&set).map_err(ApiError::from)?;
-
-    Ok(Json(set))
+/// The first twelve characters of a hash, for a message a person reads.
+///
+/// A full sha256 in a `409` is a column of hex in a toast, and the part that identifies it is
+/// the prefix; the whole value is in the error's `details` for a client that wants to compare
+/// it programmatically.
+fn short(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
 }
 
 /// What an edit carries.
@@ -305,6 +317,14 @@ pub struct UpdateBody {
     /// based them on; a set whose stored revision disagrees is refused at confirm time.
     #[serde(default)]
     pub base_revisions: std::collections::BTreeMap<String, String>,
+    /// The `content_hash` the editor was looking at when it started (slice 3e).
+    ///
+    /// `#[serde(default)]` into an `Option` rather than a required field: a client that has
+    /// not implemented the guard keeps saving, and one that has gets the optimistic check the
+    /// request asks for. See [`change_sets::store::replace_operations`] for why an absent
+    /// guard is a deliberate first step and not an oversight.
+    #[serde(default)]
+    pub base_content_hash: Option<String>,
 }
 
 /// `POST /ai/change-sets/{id}/confirm` — confirm a set, and park anything gated.

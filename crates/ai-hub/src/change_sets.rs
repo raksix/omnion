@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -69,6 +69,20 @@ pub const STATUSES: [&str; 7] = [
 
 /// The status a newly proposed set carries.
 pub const INITIAL_STATUS: &str = "draft";
+
+/// The statuses an editor may still change.
+///
+/// `pending` is here because a parked set — one with approvals in the inbox — is still being
+/// reviewed, and a reviewer fixing a typo in a proposed title is editing a proposal, not
+/// rewriting a decision. It is **not** `confirmed`: that set has been agreed, and the next
+/// edge is the apply, which reads the operations it was confirmed with.
+///
+/// One constant rather than a `format!` at two call sites (the `where` clause and the
+/// refusal message): the clause decides what is writable and the message tells the caller what
+/// happened, and a string that appears in only one of the two produces a `409` whose message
+/// disagrees with the query that caused it — which is the same defect class as the doc comment
+/// that contradicted its own SQL in slice 3d.
+pub const EDITABLE: [&str; 2] = ["draft", "pending"];
 
 /// What a set may become, per status.
 ///
@@ -153,6 +167,14 @@ pub struct ChangeSet {
     /// `resource_type:resource_id`. A set is checked against this as a whole rather than
     /// per-operation, so a set whose *second* target moved is refused with the target named.
     pub base_revisions: BTreeMap<String, String>,
+    /// `sha256` over the canonical JSON of `operations` and `base_revisions` (slice 3e).
+    ///
+    /// The set's own answer to "what do these operations say?", and the value a reviewer
+    /// compares against before editing — the counterpart of `ai_approvals.preview_hash`, which
+    /// answers the same question for a single operation. Empty on a row written before
+    /// `0204`; see [`ChangeSet::content_hash`] for why that is distinguishable from a set
+    /// that has not changed.
+    pub content_hash: String,
     pub created_by: Option<Uuid>,
     pub created_by_agent: Option<Uuid>,
     pub created_by_run: Option<Uuid>,
@@ -226,7 +248,71 @@ impl ChangeSet {
             .filter_map(|op| op.gated_class().map(|class| (op, class)))
             .collect()
     }
+
+    /// `sha256` over what this set says — its operations and the revisions they were pinned
+    /// to — recomputed on demand.
+    ///
+    /// # Why a function and not the stored column
+    ///
+    /// The stored [`ChangeSet::content_hash`] is the answer *as of the last write*; this is the
+    /// answer for the operations in hand. Both exist because "the row is stale" is a question
+    /// with two sides: the reviewer compares what they read against what the server holds
+    /// (the column), and the server compares what it is about to store against what it
+    /// already stored (this). A walk that only ever compared a column to itself would pass
+    /// with a hash computed over nothing.
+    ///
+    /// # Why not `jsonb::text` in a generated column
+    ///
+    /// Because it is not the same string. PostgreSQL's `jsonb` orders object keys by
+    /// **length first, then bytewise**; `serde_json::Map` is a `BTreeMap` and orders by
+    /// bytewise alone. The two agree for a one-key object and disagree for anything else, so
+    /// a generated column would produce a hash that never matches this one — and only for
+    /// sets with more than one key, which is why it is a *silent* failure. The full argument
+    /// and the worked example are in `0204_ai_change_set_content_hash.sql`.
+    ///
+    /// # Order-independent
+    ///
+    /// `base_revisions` is already a `BTreeMap` and serialises in key order, and
+    /// `operations` is a **list** — order matters there, because the order is the order they
+    /// are applied in. Reordering a set therefore changes its hash, which is correct: a
+    /// reviewer who read "rename A, then publish B" is not looking at the same proposal as
+    /// one who read "publish B, then rename A".
+    #[must_use]
+    pub fn compute_content_hash(
+        operations: &[ChangeOp],
+        base_revisions: &BTreeMap<String, String>,
+    ) -> String {
+        // `Plan::hash_of` is private, so this is the same construction stated again rather
+        // than a call: a version marker first, then the two documents. A future change to the
+        // set's shape must change the marker too, or two different shapes would hash alike.
+        let canonical = json!({
+            "version": CONTENT_HASH_VERSION,
+            "operations": operations,
+            "base_revisions": base_revisions,
+        });
+        // `ChangeOp` is a struct of owned primitives and `Value`, so this cannot fail. The
+        // fallback is a value no real hash produces, and `validate` refuses a set whose
+        // stored hash is not this one, so an unhashable set fails loudly rather than storing
+        // a string that would compare equal to nothing.
+        serde_json::to_vec(&canonical).map_or_else(
+            |_| String::from("unhashable"),
+            |bytes| sha_hex(&String::from_utf8_lossy(&bytes)),
+        )
+    }
+
+    /// This row's operations, hashed.
+    #[must_use]
+    pub fn content_hash(&self) -> String {
+        Self::compute_content_hash(&self.operations, &self.base_revisions)
+    }
 }
+
+/// The version marker mixed into [`ChangeSet::content_hash`].
+///
+/// Present for the same reason [`crate::approvals::plan::PREVIEW_VERSION`] is: a hash is only
+/// comparable to another hash of the same shape, and nothing in a bare sha256 says which
+/// shape produced it.
+pub const CONTENT_HASH_VERSION: u32 = 1;
 
 /// Which of a parked set's gates the inbox has answered so far.
 ///
@@ -614,6 +700,11 @@ pub struct ChangeSetRow {
     pub status: String,
     pub operations: Value,
     pub base_revisions: Value,
+    /// The stored hash as the last write left it. Read but **not** recomputed here on purpose:
+    /// `into_domain` converts a row, and a converter that silently "fixes" a column is a
+    /// converter that hides the writer that left it wrong. The walk
+    /// `the_stored_hash_is_the_hash_of_the_operations_it_was_stored_with` is the check.
+    pub content_hash: String,
     pub created_by: Option<Uuid>,
     pub created_by_agent: Option<Uuid>,
     pub created_by_run: Option<Uuid>,
@@ -659,6 +750,7 @@ impl ChangeSetRow {
             status: self.status,
             operations,
             base_revisions,
+            content_hash: self.content_hash,
             created_by: self.created_by,
             created_by_agent: self.created_by_agent,
             created_by_run: self.created_by_run,
@@ -678,8 +770,8 @@ impl ChangeSetRow {
 /// and a column added to one of them and not the others is a struct that fails to compile in
 /// a place nobody was looking — which is at least loud, but the fix is a search.
 pub const CHANGE_SET_COLUMNS: &str = "id, organization_id, site_id, title, status, operations, \
-     base_revisions, created_by, created_by_agent, created_by_run, updated_by, confirmed_at, \
-     applied_at, discarded_reason, created_at, updated_at";
+     base_revisions, content_hash, created_by, created_by_agent, created_by_run, updated_by, \
+     confirmed_at, applied_at, discarded_reason, created_at, updated_at";
 
 /// The read/append half of the store.
 ///
@@ -688,7 +780,7 @@ pub const CHANGE_SET_COLUMNS: &str = "id, organization_id, site_id, title, statu
 /// `if` away from an existence oracle: the row exists, the caller does not own it, and the
 /// two cases have to answer differently by hand at every call site.
 pub mod store {
-    use super::{ChangeOp, ChangeSet, ChangeSetRow, validate};
+    use super::{ChangeOp, ChangeSet, ChangeSetRow, EDITABLE, validate};
     use crate::error::{AiHubError, Result};
     use serde_json::Value;
     use sqlx::PgPool;
@@ -862,6 +954,7 @@ pub mod store {
             status: super::INITIAL_STATUS.to_owned(),
             operations: new.operations.clone(),
             base_revisions: new.base_revisions.clone(),
+            content_hash: String::new(),
             created_by: new.created_by,
             created_by_agent: new.created_by_agent,
             created_by_run: new.created_by_run,
@@ -877,14 +970,16 @@ pub mod store {
         let sql = format!(
             "insert into ai_change_sets \
                  (organization_id, site_id, title, status, operations, base_revisions, \
-                  created_by, created_by_agent, created_by_run) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                  content_hash, created_by, created_by_agent, created_by_run) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              returning {CHANGE_SET_COLUMNS}"
         );
         let operations: Value =
             serde_json::to_value(&new.operations).unwrap_or(Value::Array(vec![]));
         let revisions: Value = serde_json::to_value(&new.base_revisions)
             .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+        let content_hash =
+            super::ChangeSet::compute_content_hash(&new.operations, &new.base_revisions);
         let row: ChangeSetRow = sqlx::query_as(&sql)
             .bind(new.organization_id)
             .bind(new.site_id)
@@ -892,12 +987,168 @@ pub mod store {
             .bind(super::INITIAL_STATUS)
             .bind(operations)
             .bind(revisions)
+            .bind(content_hash)
             .bind(new.created_by)
             .bind(new.created_by_agent)
             .bind(new.created_by_run)
             .fetch_one(pool)
             .await?;
         row.into_domain()
+    }
+
+    /// Why an edit was refused.
+    ///
+    /// Three arms, and they are genuinely different situations: the row is not editable
+    /// because it was decided, because the caller edited a **different** list than the one they
+    /// read, or because the row does not exist in this organization at all. The route turns
+    /// each into its own status and message, and merging the second into the first would tell
+    /// a reviewer with two tabs open that their set "was decided" when a colleague had simply
+    /// saved an edit first.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum EditRefusal {
+        /// The `where status = …` clause matched no rows: the set is no longer in a state this
+        /// edit may touch. Carries the status the row is in **now**.
+        NotEditable { current: String },
+        /// The caller's `base_content_hash` does not match what the row holds.
+        ///
+        /// Carries both hashes. The reviewer's is what they read, and naming it lets the
+        /// screen say "reload and re-apply" rather than "somebody changed it" — which is the
+        /// only sentence that tells them their own edit is recoverable.
+        ContentMoved { read: String, stored: String },
+        /// No such row in this organization.
+        NotFound,
+    }
+
+    /// Replace a draft's operations, revisions and title, and re-stamp the hash.
+    ///
+    /// # What moved out of the route, and why
+    ///
+    /// The `PATCH` handler used to write this row with its own `update … returning`, which
+    /// means the **hash was computed wherever the writer lived** — and the first version of
+    /// this slice was going to add a hash to a second hand-written `update` in a route. Two
+    /// statements that must agree, in two files, is how the row ends up carrying a hash of the
+    /// operations it does not have. The write is here instead: the same argument that
+    /// guarantees a change set is applied atomically guarantees that it is hashed atomically.
+    ///
+    /// # The `base_content_hash` guard
+    ///
+    /// A caller passes the hash it read. When it is `None` the edit is unconditional — which
+    /// is what an **admin UI's first save** does, and it is deliberate: a client that has not
+    /// implemented the guard yet keeps working, and a client that has gets the optimistic check
+    /// the request asks for. A caller that passes a hash which does not match gets
+    /// [`EditRefusal::ContentMoved`] and **nothing is written**, so a lost edit is impossible
+    /// rather than merely reported.
+    ///
+    /// A stored hash of `''` (a row from before `0204`) never matches a computed one, so a
+    /// guarded edit against an unhashed set is refused rather than silently accepted — the
+    /// alternative would let a client's stale view win against a row it cannot compare.
+    ///
+    /// # Errors
+    ///
+    /// `Err(InvalidChangeSet)` when the edited set does not validate. The validation runs on
+    /// the value that **would** be stored, before the write, so an invalid edit never lands.
+    pub async fn replace_operations(
+        pool: &PgPool,
+        organization_id: Uuid,
+        id: Uuid,
+        title: &str,
+        operations: &[ChangeOp],
+        base_revisions: &std::collections::BTreeMap<String, String>,
+        actor: Uuid,
+        base_content_hash: Option<&str>,
+    ) -> Result<std::result::Result<ChangeSet, EditRefusal>> {
+        let candidate = ChangeSet {
+            id,
+            organization_id,
+            site_id: None,
+            title: title.trim().to_owned(),
+            status: String::new(),
+            operations: operations.to_vec(),
+            base_revisions: base_revisions.clone(),
+            content_hash: String::new(),
+            created_by: None,
+            created_by_agent: None,
+            created_by_run: None,
+            updated_by: Some(actor),
+            confirmed_at: None,
+            applied_at: None,
+            discarded_reason: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        // The same `validate` the insert runs. Without the status the candidate cannot go
+        // through `validate`'s lifecycle checks — there are none today, and adding one later
+        // must not be silently skipped on this path, so the status is left empty and a future
+        // status check has to be given a real one here.
+        if let Err(err) = validate(&candidate) {
+            return Err(err);
+        }
+        let content_hash = super::ChangeSet::compute_content_hash(operations, base_revisions);
+
+        let sql = format!(
+            "update ai_change_sets set title = $3, operations = $4, base_revisions = $5, \
+             content_hash = $6, updated_by = $7, updated_at = now() \
+             where id = $1 and organization_id = $2 and status = any($8) \
+               and ($9::text is null or content_hash = $9) \
+             returning {CHANGE_SET_COLUMNS}"
+        );
+        let row: Option<ChangeSetRow> = sqlx::query_as(&sql)
+            .bind(id)
+            .bind(organization_id)
+            .bind(candidate.title)
+            .bind(serde_json::to_value(operations).unwrap_or(Value::Array(vec![])))
+            .bind(
+                serde_json::to_value(base_revisions)
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+            )
+            .bind(content_hash)
+            .bind(actor)
+            .bind(EDITABLE)
+            .bind(base_content_hash)
+            .fetch_optional(pool)
+            .await?;
+        if let Some(row) = row {
+            return Ok(Ok(row.into_domain()?));
+        }
+
+        // Zero rows: either the status is wrong, or the hash is. The row is read to tell
+        // them apart, and the read is scoped to the organization so this cannot become an
+        // existence oracle for a set in another tenant.
+        let current: Option<(String, String)> = sqlx::query_as(
+            "select status, content_hash from ai_change_sets where id = $1 and organization_id = $2",
+        )
+        .bind(id)
+        .bind(organization_id)
+        .fetch_optional(pool)
+        .await?;
+        // **Status first, then the hash.** The first version of this read the hash guard
+        // first, and the walk caught it: an edit against a set that was confirmed *and* whose
+        // hash was stale answered `ContentMoved` — "reload it and re-apply your change". That
+        // is the wrong sentence, because a reload shows a `confirmed` set with no editor on
+        // it, so the advice sends a reviewer looking for a control that does not exist. The
+        // two refusals are not peers: `NotEditable` is terminal and `ContentMoved` is
+        // recoverable, and the recoverable answer must never be the one given when the
+        // terminal one is also true.
+        Ok(Err(match current {
+            None => EditRefusal::NotFound,
+            Some((current_status, stored)) => {
+                if !super::EDITABLE.contains(&current_status.as_str()) {
+                    EditRefusal::NotEditable {
+                        current: current_status,
+                    }
+                } else {
+                    match base_content_hash {
+                        Some(read) if read != stored => EditRefusal::ContentMoved {
+                            read: read.to_owned(),
+                            stored,
+                        },
+                        _ => EditRefusal::NotEditable {
+                            current: current_status,
+                        },
+                    }
+                }
+            }
+        }))
     }
 
     /// Move a set from `from` to `to`, or refuse because somebody else moved it first.
@@ -1185,6 +1436,7 @@ mod tests {
             status: INITIAL_STATUS.to_owned(),
             operations,
             base_revisions: BTreeMap::new(),
+            content_hash: String::new(),
             created_by: None,
             created_by_agent: None,
             created_by_run: None,
@@ -1437,6 +1689,7 @@ mod tests {
             status: "draft".to_owned(),
             operations: json!({ "not": "a list" }),
             base_revisions: json!({}),
+            content_hash: String::new(),
             created_by: None,
             created_by_agent: None,
             created_by_run: None,
@@ -1458,6 +1711,7 @@ mod tests {
             status: "draft".to_owned(),
             operations: json!([]),
             base_revisions: json!([1, 2, 3]),
+            content_hash: String::new(),
             created_by: None,
             created_by_agent: None,
             created_by_run: None,
@@ -1487,6 +1741,7 @@ mod tests {
             status: "draft".to_owned(),
             operations: serde_json::to_value(&operations).expect("serialises"),
             base_revisions: json!({ "page:11111111-1111-1111-1111-111111111111": "rev" }),
+            content_hash: String::new(),
             created_by: None,
             created_by_agent: None,
             created_by_run: None,
@@ -1568,5 +1823,170 @@ mod tests {
         assert!(!can_transition("failed", "confirmed"));
         assert!(!can_transition("failed", "applied"));
         assert!(next_statuses("failed").is_empty(), "failed is terminal");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The content hash (slice 3e) — the pure half
+    // ---------------------------------------------------------------------------------------
+    //
+    // These need no database, and the walks in `apps/api/tests/ai_change_sets.rs` need these:
+    // the walk that a *stored* hash equals the computed one is only interesting because these
+    // fix what "the computed one" is. Without them the store walk would pass for a hash over
+    // a constant.
+
+    fn revisioned(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, revision)| ((*key).to_owned(), (*revision).to_owned()))
+            .collect()
+    }
+
+    /// A set's hash is stable, 64 hex characters, and independent of the row it lives on.
+    ///
+    /// The last part is the one that matters: a hash including `id`, `status` or `updated_at`
+    /// would change on every transition without anything about the operations moving, and the
+    /// reviewer's "this is still what I read" would be false every time somebody else opened
+    /// the set.
+    #[test]
+    fn a_set_hashes_its_operations_and_nothing_else() {
+        let operations = vec![
+            op("a", OpKind::Update, "11111111-1111-1111-1111-111111111111"),
+            op("b", OpKind::Update, "22222222-2222-2222-2222-222222222222"),
+        ];
+        let revisions = revisioned(&[("page:1111", "r1"), ("page:2222", "r2")]);
+
+        let hash = ChangeSet::compute_content_hash(&operations, &revisions);
+        assert_eq!(hash.len(), 64, "a sha256 renders as 64 hex characters");
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "and as lowercase hex, or a client comparing it case-insensitively still differs"
+        );
+        assert_eq!(
+            hash,
+            ChangeSet::compute_content_hash(&operations, &revisions),
+            "the same inputs hash the same way"
+        );
+
+        // The same operations on a different set.
+        let mut elsewhere = set_with(operations.clone());
+        elsewhere.id = Uuid::from_u128(9);
+        elsewhere.status = "pending".to_owned();
+        elsewhere.base_revisions = revisions.clone();
+        assert_eq!(
+            elsewhere.content_hash(),
+            hash,
+            "the row's own identity and status are not part of what it says"
+        );
+    }
+
+    /// Reordering changes the hash, because the order is the order they are applied in.
+    ///
+    /// This is the half a "sort the operations before hashing" implementation gets wrong, and
+    /// it gets it wrong in the *safe-looking* direction: sorting makes the hash stable under a
+    /// reorder, which sounds like a feature, and is exactly the bug — a reviewer who read
+    /// "delete A, then rename B" and a reviewer who read "rename B, then delete A" would be
+    /// told they are looking at the same proposal. The first operation is the one that runs
+    /// first inside the single transaction, and on a set where the first one is a delete the
+    /// second may fail against a target that no longer exists.
+    #[test]
+    fn reordering_a_set_changes_its_hash() {
+        let first = op("a", OpKind::Delete, "11111111-1111-1111-1111-111111111111");
+        let second = op("b", OpKind::Update, "22222222-2222-2222-2222-222222222222");
+        let in_order =
+            ChangeSet::compute_content_hash(&[first.clone(), second.clone()], &BTreeMap::new());
+        let reversed = ChangeSet::compute_content_hash(&[second, first], &BTreeMap::new());
+        assert_ne!(
+            in_order, reversed,
+            "the order is the order they are applied in, and the hash says so"
+        );
+    }
+
+    /// A change to **any** of the three inputs changes the hash, and an identical re-send does
+    /// not.
+    ///
+    /// Written as a list of (label, before, after) rather than three separate tests so a
+    /// future input cannot be added to the hash without a row here — the failure mode is a
+    /// hash that quietly stops covering a field, and a table is where that is visible.
+    #[test]
+    fn every_input_is_covered_and_a_resend_is_not_a_change() {
+        let base_ops = || {
+            vec![op(
+                "a",
+                OpKind::Update,
+                "11111111-1111-1111-1111-111111111111",
+            )]
+        };
+        let base_revs = || revisioned(&[("page:1111", "r1")]);
+
+        // Dropping an operation.
+        let dropped = ChangeSet::compute_content_hash(&[], &base_revs());
+        assert_ne!(
+            dropped,
+            ChangeSet::compute_content_hash(&base_ops(), &base_revs()),
+            "an emptied set is a different proposal"
+        );
+
+        // Changing a written value.
+        let mut edited = base_ops();
+        edited[0].operation.args = json!({ "title": "Something else" });
+        assert_ne!(
+            ChangeSet::compute_content_hash(&edited, &base_revs()),
+            ChangeSet::compute_content_hash(&base_ops(), &base_revs()),
+            "a changed value is a changed proposal"
+        );
+
+        // Changing the target.
+        let retargeted = vec![op(
+            "a",
+            OpKind::Update,
+            "33333333-3333-3333-3333-333333333333",
+        )];
+        assert_ne!(
+            ChangeSet::compute_content_hash(&retargeted, &base_revs()),
+            ChangeSet::compute_content_hash(&base_ops(), &base_revs()),
+            "a changed target is a changed proposal"
+        );
+
+        // Changing the revision the set was pinned to. This one is not obvious: re-reading a
+        // target at a new revision is not a change to what the set *says*, and it would be
+        // reasonable to leave it out. It is in because `drifted_targets` reads the same map
+        // and a hash that ignored it could not distinguish "pinned to r1" from "pinned to r2"
+        // — and a re-pinned set is exactly the set whose freshness the reviewer is trusting.
+        assert_ne!(
+            ChangeSet::compute_content_hash(&base_ops(), &revisioned(&[("page:1111", "r2")])),
+            ChangeSet::compute_content_hash(&base_ops(), &base_revs()),
+            "a re-pinned set is a set the reviewer must read again"
+        );
+
+        // Re-sending the identical list, in the identical order, is not a change — otherwise
+        // every save would report "moved" and the guard would be noise.
+        assert_eq!(
+            ChangeSet::compute_content_hash(&base_ops(), &base_revs()),
+            ChangeSet::compute_content_hash(&base_ops(), &base_revs()),
+            "an identical re-send hashes identically"
+        );
+    }
+
+    /// The keys of `base_revisions` are hashed in key order, so two maps that differ only in
+    /// insertion order hash alike.
+    ///
+    /// `BTreeMap` makes this true by construction, and the walk is here because that is a
+    /// property of the *type* rather than of the function: swap the field for a `HashMap` and
+    /// nothing above would fail — the hash would just become non-deterministic, which is a
+    /// failure that only appears as a `409` a reviewer cannot reproduce.
+    #[test]
+    fn the_revision_map_hashes_in_key_order() {
+        let forward = revisioned(&[("page:aaa", "r1"), ("page:bbb", "r2")]);
+        let backward: BTreeMap<String, String> = [("page:bbb", "r2"), ("page:aaa", "r1")]
+            .into_iter()
+            .map(|(key, revision)| (key.to_owned(), revision.to_owned()))
+            .collect();
+        assert_eq!(forward, backward, "the two maps are equal");
+        assert_eq!(
+            ChangeSet::compute_content_hash(&[], &forward),
+            ChangeSet::compute_content_hash(&[], &backward),
+            "and they hash alike, so map order is not part of the proposal"
+        );
     }
 }
