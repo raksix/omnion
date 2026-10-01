@@ -4,7 +4,10 @@
 > validation the first acceptance row demands — `de3a1529` the pure scorer, `ddbd42a3` the store,
 > `c439548b` the twelve database walks and the two bugs they found; then the HTTP surface and the
 > four catalogue keys — `98e18319`; then the screens and the walkthrough pass that drives them —
-> `00755aee`. Runs are slice 2) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> `00755aee`. Slice 2: the routes mounted and the run permission split from the read one —
+> `e154d732`; the run history, the run detail, the mandatory baseline picker and a `Run now` that
+> works — `ed03200f`. The closing browser pass over the two new screens is still owed) ·
+> **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request

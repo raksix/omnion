@@ -783,3 +783,78 @@ async fn the_stat_tiles_count_only_the_window_they_name() {
     assert_eq!(wide.suites, recent.suites, "the suite count is not windowed — it is a total");
     fx.dispose().await;
 }
+
+/// The run screens must not be able to drift from the guards that protect them.
+///
+/// `viewer_missing` exists so `Run now` can be disabled **with its reason** instead of being
+/// present and answering 403. That only works while the key list in `viewer_run_keys` and the
+/// keys the routes are actually mounted behind are the same three strings. Nothing in the type
+/// system connects them: a new `ai.evals.*` key added to the mount site would leave the panel
+/// disabling a button for a permission the guard does not check, and the button would 403.
+///
+/// So this reads both sources and compares them. It is a source test on purpose — a runtime test
+/// would need a session per permission combination, and the drift it guards is a *compile-time*
+/// fact about two lists of literals, which is exactly what reading the source proves.
+#[tokio::test]
+async fn the_disabled_reason_names_a_key_the_mount_actually_guards() {
+    let routes = include_str!("../src/routes/mod.rs");
+    let handler = include_str!("../src/routes/ai_evals.rs");
+
+    // The keys the run surface is mounted behind, taken from the guards themselves.
+    //
+    // The search is over a small window rather than a single line, and that is not a
+    // convenience: `rustfmt` wraps a long `let ... = get(...)` across two lines, so the binding
+    // and its guard can sit on different ones. A single-line search found no
+    // `ai_evals_baseline` at all on the first run and reported it as unmounted — the assertion
+    // was measuring the formatter, not the router.
+    for (binding, key) in [
+        ("ai_evals_runs_read", "ai.evals.read"),
+        ("ai_evals_run_start", "ai.evals.run"),
+        ("ai_evals_baseline", "ai.evals.manage"),
+        ("ai_evals_case_write", "ai.evals.manage"),
+    ] {
+        let at = routes
+            .find(binding)
+            .unwrap_or_else(|| panic!("{binding} must still be mounted"));
+        let window = &routes[at..(at + 200).min(routes.len())];
+        assert!(
+            window.contains("guards::require") && window.contains(&format!("\"{key}\"")),
+            "{binding} must be guarded by {key}, got: {}",
+            window.lines().next().unwrap_or("").trim()
+        );
+    }
+
+    // And every key `viewer_run_keys` reports on must be one of the keys the mount site uses.
+    // A key the panel knows about but no route checks is a reason it will never be able to
+    // disable anything, which is a dead branch in a control that is supposed to explain itself.
+    let list = handler
+        .split("const KEYS: [&str; 3]")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("viewer_run_keys must keep its key list");
+    let declared: Vec<&str> = list
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|key| key.starts_with("ai.evals."))
+        .collect();
+    assert_eq!(
+        declared.len(),
+        3,
+        "the panel must report on exactly the three run keys, got {declared:?}"
+    );
+    for key in declared {
+        assert!(
+            routes.contains(&format!("\"{key}\"")),
+            "{key} is reported to the panel but is guarded nowhere in the mount site"
+        );
+    }
+
+    // The split that makes the control honest: starting a run must NOT be readable with only
+    // the read key. If it were, `viewer_missing` would never contain `ai.evals.run` for anyone
+    // and the button would be permanently enabled.
+    assert!(
+        !routes.contains("ai_evals_run_start = get("),
+        "starting a run must never be a read handler"
+    );
+}
