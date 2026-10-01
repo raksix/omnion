@@ -7642,3 +7642,73 @@ because the card it names is gone from the DOM either way — stays unmeasured.
 made for the edge: `deleteTarget(selection)` and the status-bar string answer "what is selected"
 for a node *and* an edge, and neither moves when a stale id survives. Then the run-from-here / pill
 / table-mode rows. The plugin row stays BLOCKED on REQ-121.
+
+## 2026-10-01 · tick 54 · omnion-wave3 · REQ-004 · the rule had three callers and the fix had one
+
+**What.** Tick 53 gave `pruneSelection` an alive-edge set and wired it into **one** caller of
+three. `rebaseAfterReload` (the Reload exit of a two-tab conflict) got it. `applyHistoryStep` —
+the shared step undo and redo both restore through — still called `pruneSelection(current,
+restored.nodes.map(...))` with two arguments and pruned nodes only. A selection naming a
+connection therefore survived ⌘Z exactly as it survived a reload before the fix.
+
+The undo path is the **reachable** one and needs no second editor, no conflict and no banner:
+draw a connection, select it, press ⌘Z. The restored snapshot is the graph from *before* the
+connection existed, so `restored.edges` is empty — the whole answer was in the next local over,
+unasked. Because an edge outranks every node selection in both `deleteTarget` and
+`whatEscapeClears`, the surviving id is what `Del` resolves to (`removeEdge` finds no such
+edge and returns having changed nothing) and what the status bar prints as "1 connection
+selected (Del removes it)" over a canvas drawing no such line. The reverse direction keeps
+working and is asserted: undoing an edge *DELETE* restores the graph **with** that edge, so the
+selection survives — which is why this is a prune and not a blanket clear.
+
+**The comment is what let it sit.** The rule documented `removeNodes` as the caller that "has
+no edge list in hand" and therefore cannot judge a connection. It can: `nextEdges` is computed
+**two lines above its own prune**, on the same breath as `nextNodes`, because removing a node
+removes the connections that end on it. A comment naming the wrong caller is worse than no
+comment, because the next reader greps the comment rather than the call site. Corrected in
+`selection.ts` and `reload-rebase.ts`. The optional third argument and the "do not guess" half
+of the rule are unchanged and still asserted, so the fix cannot turn "cannot answer" into
+"answer no" — and the *reason* the argument stays optional is now a statement about its
+contract rather than about who is currently sloppy.
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **297 passed**
+(287 before, +10) · `pnpm typecheck` → 2/2 successful · `cargo test -p omnion-workflows --lib`
+→ **157 unchanged**. **Five mutations red:** the undo's third argument dropped (2 rows), the
+undo's third argument built from *nodes* instead of edges (1), `removeNodes`' third argument
+dropped (2), `removeNodes`' third argument built from nodes (1), and the shared step's prune
+deleted entirely (1). The two "built from nodes" mutations are the ones the argument count
+alone cannot see — a call with three arguments and the wrong third one is still three arguments
+— which is why the wiring rows assert *where the third argument comes from* and not only that
+there is one.
+
+**Three instruments of mine were wrong before they were right, all in the same tick, and two
+of them the same way.** (1) The argument counter started its scan *at* the open paren, so every
+separator sat at depth 1 and a correct three-argument call read as 2 — a red row against a
+correct fix. (2) Starting one character later fixes the depth and reintroduces the trailing
+comma, so the count is now taken as top-level *segments* that hold something. (3) The
+inventory of every call was a non-greedy regex, which stopped at the first `)` — the close of
+`map((node) => node.id)` — and is the early-window bug `useCallbackBody` in `undo-selection.test.ts`
+already documents. And a fourth: the *pre-existing* guard in that file asserted
+`setSelection((current) => pruneSelection(` on one line, so reformatting the call turned a
+correct fix into a red suite. Relaxed to `\s*` across the arrow with the comment saying why,
+and re-proved by mutation: dropping the prune entirely is still red. This branch has now written
+five checks about TEXT in one REQ, and every one of them failed for a reason unrelated to the
+thing it claimed to measure.
+
+**No browser pass.** The slot's holder is a live pass, not a stale file: pid 1561646, alive,
+`/proc/1561646/cwd` = `/mnt/apopic/omnion-w4`. Load 15 on six cores, 45 Chrome, 0 free RAM,
+29G of 32G used. `undo-selection` is still unmeasured — the hint's plan for it (read the
+product's own `deleteTarget(selection)` and the status-bar string instead of the DOM) is
+recorded in the state file and is the right next move, since the card the selection names is
+gone from the DOM either way.
+
+**Disk.** `/mnt/apopic` hit **100%** mid-commit ("unable to write loose object file"). The box
+holds nine sibling worktrees and this branch is not the largest of them (`docker-data` 23G,
+`omnion` 13G, `w8build` 3.0G). Reclaimed only this worktree's own `qa-artifacts/` — two stale
+passes from 02:16 and 02:19 that never produced a verdict, 253M — which is enough to commit. The
+`target` here is a symlink to `/dev/shm/w3-target`, so the Rust build is not what filled the
+volume; a pass or two from now this branch will need the same sweep.
+
+**Next.** `undo-selection` off the DOM and onto the product's own rules — `deleteTarget(selection)`
+and the status-bar string, which move for a stale edge and would not move for a stale node. Then
+the run-from-here / pill / table-mode rows. The plugin row stays BLOCKED on REQ-121.
