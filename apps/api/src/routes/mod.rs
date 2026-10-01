@@ -71,6 +71,7 @@
 
 pub mod theme_layouts;
 pub mod theme_settings;
+pub mod theme_assets;
 pub mod themes;
 pub mod ai;
 pub mod analytics;
@@ -1253,6 +1254,12 @@ pub fn router(state: AppState) -> Router {
     let themes_gallery =
         get(themes::list_gallery).layer(guards::require(&state, "themes.read"));
     let theme_read = get(themes::get_theme).layer(guards::require(&state, "themes.read"));
+    // A theme's own preview image (REQ-062 slice 4, acceptance 3). `themes.read`, because it
+    // is the gallery card's own read and the gallery is already that permission — a preview
+    // image is presentation data about a theme, and gating it harder than the theme's own
+    // manifest would make the gallery's card fail for a reason the card cannot explain.
+    let theme_asset =
+        get(theme_assets::theme_asset).layer(guards::require(&state, "themes.read"));
     let theme_activate =
         post(themes::activate_theme).layer(guards::require(&state, "themes.activate"));
     let theme_rollback =
@@ -2235,6 +2242,7 @@ pub fn router(state: AppState) -> Router {
         .route("/public/pages/{slug}", public_pages)
         .route("/themes", themes_gallery)
         .route("/themes/{key}", theme_read)
+        .route("/themes/{key}/assets/{file}", theme_asset)
         .route("/sites/{site_id}/theme", theme_activate)
         .route("/sites/{site_id}/theme/rollback", theme_rollback)
         .route("/sites/{site_id}/theme-settings", theme_settings_read)
