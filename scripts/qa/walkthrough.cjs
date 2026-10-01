@@ -11827,6 +11827,122 @@ async function runWorkflowBuilderDepth(page, report) {
   }
   note({ step: "undo-selection", ...undoSelNote });
 
+  // The EDGE half of the same prune, and the half the row above is structurally blind to.
+  //
+  // That row asserts `postRead.selectedCount === 0`, read off `[data-node-id]
+  // [data-node-selected='true']`. A selection left naming a *connection* the undo just
+  // removed passes that assertion green: an edge selection is `selectEdge`, which sets
+  // `nodes: []` and `focus: null`, so the node count is zero whether or not the prune ran.
+  // It is not cosmetic. An edge OUTRANKS every node selection in `deleteTarget` and in
+  // `whatEscapeClears`, so a surviving edge id is what `Del` resolves to — `removeEdge` then
+  // finds no such edge and returns having changed nothing, which is a key that looks broken
+  // — and it is what the status bar prints as "1 connection selected (Del removes it)" over
+  // a canvas drawing no such line. A row that reports `selectionPruned: true` for that is a
+  // green reading of a defect, which is the tick-48 shape one level over.
+  //
+  // So the second reading is taken on the connection, and it reads the product's OWN claims
+  // rather than a class: the `data-edge-selected` marker the SVG `<g>` writes, and the
+  // sentence the status bar prints. Both move for a stale edge; neither moves for a stale
+  // node. That is what makes this half able to go red where the first half cannot.
+  //
+  // The gesture is the one the `edge-delete` row below already proved, not a new one: a
+  // bezier's bounding box is the rectangle AROUND the arc, so `locator.click()` lands on the
+  // desk and the canvas handler (correctly) clears the selection. The point comes from
+  // `getPointAtLength` at the stroke midpoint through `getScreenCTM`, which is the only
+  // transform that accounts for the viewport's pan and zoom.
+  const undoSelEdgePoint = await page
+    .evaluate(() => {
+      const hit = document.querySelector("[data-edge] path");
+      if (!hit || typeof hit.getPointAtLength !== "function") return null;
+      const ctm = hit.getScreenCTM();
+      if (!ctm) return null;
+      const mid = hit.getPointAtLength(hit.getTotalLength() / 2);
+      const screen = mid.matrixTransform(ctm);
+      const at = document.elementFromPoint(screen.x, screen.y);
+      return {
+        x: screen.x,
+        y: screen.y,
+        onEdge: Boolean(at?.closest("[data-edge]")),
+        inViewport:
+          screen.x >= 0 &&
+          screen.y >= 0 &&
+          screen.x <= window.innerWidth &&
+          screen.y <= window.innerHeight,
+      };
+    })
+    .catch(() => null);
+  let undoSelEdgeNote = { attempted: false };
+  const edgesBeforeUndo = (await readGraph())?.edge_count ?? 0;
+  if (undoSelEdgePoint) {
+    await page.mouse.move(undoSelEdgePoint.x, undoSelEdgePoint.y).catch(() => {});
+    await page.mouse.down().catch(() => {});
+    await page.mouse.up().catch(() => {});
+  }
+  await page.waitForTimeout(500);
+  const edgePre = await page
+    .evaluate(() => {
+      const el = document.querySelector("[data-builder-selection]");
+      return {
+        selected: document.querySelectorAll("[data-edge-selected='true']").length,
+        readout: el ? (el.textContent ?? "").trim() : null,
+      };
+    })
+    .catch(() => ({ selected: 0, readout: null }));
+  // The same precondition discipline as the node half, and for the same reason: "no
+  // connection is selected" is also the answer on a page where the click never landed and on
+  // a rule that has no connections at all. Reported, never assumed.
+  const edgeWasSelected = edgePre.selected > 0;
+  const toolbarClaimedIt = (edgePre.readout ?? "").includes("connection selected");
+  if (!edgeWasSelected) {
+    undoSelEdgeNote = {
+      attempted: true,
+      // A click that missed is a conclusion, so the evidence travels with it: the two
+      // ordinary causes — the point is off-viewport after a pan, and a card is sitting on
+      // the arc — need different fixes, and a note that cannot tell them apart costs a tick
+      // either way.
+      point: undoSelEdgePoint,
+      onEdge: undoSelEdgePoint?.onEdge ?? null,
+      inViewport: undoSelEdgePoint?.inViewport ?? null,
+      edgesOnCanvas: (await page.locator("[data-edge]").count()) ?? 0,
+      reason: edgesBeforeUndo === 0 ? "the rule has no connection to select" : "the click missed the curve",
+    };
+  } else {
+    // The same gesture as the node half — one keypress, and the graph is replaced wholesale.
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(1200);
+    const edgesAfterUndo = (await readGraph())?.edge_count ?? 0;
+    const edgePost = await page
+      .evaluate(() => {
+        const el = document.querySelector("[data-builder-selection]");
+        return {
+          selected: document.querySelectorAll("[data-edge-selected='true']").length,
+          readout: el ? (el.textContent ?? "").trim() : null,
+          drawn: document.querySelectorAll("[data-edge]").length,
+        };
+      })
+      .catch(() => ({ readFailed: true }));
+    undoSelEdgeNote = {
+      attempted: true,
+      edgesBefore: edgesBeforeUndo,
+      // THE PRECONDITION THAT MAKES THE ASSERTION MEANINGFUL. The undo has to have taken
+      // the connection away: if the count did not fall, the row is reading a canvas that
+      // still holds the edge, and `selected === 0` is then the correct answer for a reason
+      // that has nothing to do with the prune.
+      edgeRemovedByUndo: edgesAfterUndo < edgesBeforeUndo,
+      edgeWasSelected,
+      toolbarClaimedIt,
+      // THE ASSERTION. A selection naming a connection the canvas does not draw must not
+      // stay marked, and the status bar must stop claiming it.
+      edgeSelectionPruned:
+        edgePost.selected === 0 && !(edgePost.readout ?? "").includes("connection selected"),
+      selectedAfter: edgePost.selected,
+      readoutAfter: edgePost.readout,
+      edgesAfter: edgesAfterUndo,
+      drawnAfter: edgePost.drawn,
+    };
+  }
+  note({ step: "undo-selection-edge", ...undoSelEdgeNote });
+
   // The connection gesture: press an output port, press a target node, and the server's edge
   // count rises. The refusal is the half that matters — a port the source does not export has
   // to *say so*, and a gesture that refuses silently is indistinguishable from a dead button,
