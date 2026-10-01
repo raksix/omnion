@@ -122,6 +122,53 @@ function assertDeploymentScreensWalked() {
 }
 
 /**
+ * The thirteen wave-5b screens a merge must not be able to delete silently.
+ *
+ * `8c6ab11d` ("merge(origin/main): wave 5b platform extras on top of the restore-jobs and
+ * qa-budget work") resolved a conflict in this file by taking `origin/main`'s copy of the
+ * route list wholesale. That copy predated the platform-extras screens, and the merge diff
+ * shows all thirteen of them as `-` deletions — six `/secrets/*` and all seven
+ * `/observability/*`. Nothing failed: the file parses, the depth passes still exist, and every
+ * focused pass that named one of these screens reported its own `matchedOnly` name as walked,
+ * because a `wants()` block and a route entry are different lists and only the former survived.
+ *
+ * The consequence is precisely the failure this file exists to prevent. The route loop is what
+ * calls `diagnostics()`, so thirteen screens produced no overflow, offscreen, broken-image or
+ * console-error measurement, and never appeared in the mobile pass — while their depth passes
+ * reported green. A depth pass proves the screen's BEHAVIOUR; only the route walk proves its
+ * LAYOUT at two widths. Both halves were lost and only one was noticed.
+ *
+ * `DEPLOYMENT_SCREENS` above is the same idea applied to one request's screens, and it earned
+ * its place the moment it was written. This one generalises it to the whole surface a merge is
+ * most likely to resolve by wholesale deletion, and it is checked at LOAD so the pass refuses
+ * to start rather than reporting a green coverage it does not have.
+ */
+const WAVE5B_SCREENS = [
+  "/secrets/root-key",
+  "/secrets/credentials",
+  "/secrets/slots",
+  "/secrets/leases",
+  "/secrets/deploy-keys",
+  "/secrets/audit",
+  "/observability",
+  "/observability/metrics",
+  "/observability/logs",
+  "/observability/traces",
+  "/observability/exporters",
+  "/observability/alerts",
+  "/observability/settings",
+];
+
+function assertWave5bScreensWalked() {
+  const missing = WAVE5B_SCREENS.filter((path) => !srcHasRoute(path));
+  if (missing.length > 0) {
+    throw new Error(
+      `wave-5b screens missing from the route list: ${missing.join(", ")} — merge 8c6ab11d deleted these and nothing failed. A depth pass proves behaviour, only the route walk proves layout`,
+    );
+  }
+}
+
+/**
  * `true` when the DESKTOP route list walks this exact path.
  *
  * Scoped to the `routes` array on purpose. The first version matched the whole file, and the phone
@@ -10024,6 +10071,7 @@ async function runSecretsAuditDepth(page, report) {
 
 async function main() {
   assertDeploymentScreensWalked();
+  assertWave5bScreensWalked();
   const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
   const browser = await chromium.launch({
@@ -10258,6 +10306,25 @@ async function main() {
     //   `suggestion`, which is the difference between a limit and a placeholder.
     { path: "/health/incidents", name: "health-incidents" },
     { path: "/health/settings", name: "health-settings" },
+    // --- REQ-125/126 (wave 5b platform extras): the secrets centre and the observability centre.
+    // These thirteen entries are BACK, and `assertWave5bScreensWalked` refuses to start a pass in
+    // which any of them is missing — merge `8c6ab11d` deleted all thirteen while leaving the file
+    // syntactically valid, so six ticks of depth passes reported green over screens that no route
+    // walk had ever measured and no mobile pass had ever rendered. A depth pass drives a screen;
+    // only a route entry proves its layout at two widths and collects its diagnostics.
+    { path: "/secrets/root-key", name: "secrets-root-key" },
+    { path: "/secrets/credentials", name: "secrets-credentials" },
+    { path: "/secrets/slots", name: "secrets-slots" },
+    { path: "/secrets/leases", name: "secrets-leases" },
+    { path: "/secrets/deploy-keys", name: "secrets-deploy-keys" },
+    { path: "/secrets/audit", name: "secrets-audit" },
+    { path: "/observability", name: "observability-overview" },
+    { path: "/observability/metrics", name: "observability-metrics" },
+    { path: "/observability/logs", name: "observability-logs" },
+    { path: "/observability/traces", name: "observability-traces" },
+    { path: "/observability/exporters", name: "observability-exporters" },
+    { path: "/observability/alerts", name: "observability-alerts" },
+    { path: "/observability/settings", name: "observability-settings" },
   ];
   // `--only` narrows the route list; the default walks every entry above, unchanged.
   const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
@@ -10373,6 +10440,23 @@ async function main() {
       await runObservabilityOverviewDepth(page);
       await runObservabilityTracesDepth(page, report);
     });
+  }
+  // The metric catalogue's depth pass was an ORPHAN: defined at line 7644 with fourteen `note()`
+  // checks and two screenshots, exported at 8535, and called from nowhere. `grep` for its name
+  // finds the definition and the export and nothing else, because `c0b3a58b` wrote the function and
+  // the route entry but no `wants()` block — so `observability-metrics` was a pass name nothing
+  // answered to, and a focused pass naming it produced the `unknown-pass-name` finding rather than
+  // the chart, the range change, the cap bar or the 390px layout it was written to prove.
+  //
+  // It is separate from `observability-traces` on purpose. The overview is folded into that one
+  // because it shares a page with it; the metric screen shares nothing with the trace screen, and
+  // giving it its own `wants()` name is what makes `--only=observability-metrics` walk the chart
+  // without dragging six other screens along with it.
+  if (wants("observability-metrics")) {
+    matchedOnly.add("observability-metrics");
+    report.observabilityMetrics = await runDepthPass("observability-metrics", () =>
+      runObservabilityMetricsDepth(page, report),
+    );
   }
   if (wants("observability-logs")) {
     matchedOnly.add("observability-logs");
@@ -10907,7 +10991,7 @@ async function runReliabilityBreakersDepth(page) {
 // slice 4, REQ-129) are in this list rather than only measured inside their depth passes: a
 // layout that has never been opened in a 390px context has not been tested on a phone, and the
 // upgrade helper is read at 2am on a phone more often than anybody planned.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }, { path: "/deployment/backfills", name: "deployment-backfills" }, { path: "/deployment/seeds", name: "deployment-seeds" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }, { path: "/deployment/backfills", name: "deployment-backfills" }, { path: "/deployment/seeds", name: "deployment-seeds" }, { path: "/secrets/root-key", name: "secrets-root-key" }, { path: "/secrets/credentials", name: "secrets-credentials" }, { path: "/secrets/slots", name: "secrets-slots" }, { path: "/secrets/leases", name: "secrets-leases" }, { path: "/secrets/deploy-keys", name: "secrets-deploy-keys" }, { path: "/secrets/audit", name: "secrets-audit" }, { path: "/observability", name: "observability-overview" }, { path: "/observability/metrics", name: "observability-metrics" }, { path: "/observability/logs", name: "observability-logs" }, { path: "/observability/traces", name: "observability-traces" }, { path: "/observability/exporters", name: "observability-exporters" }, { path: "/observability/alerts", name: "observability-alerts" }, { path: "/observability/settings", name: "observability-settings" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
