@@ -6908,6 +6908,37 @@ export async function publishThemeSettings(
   );
 }
 
+/**
+ * The contrast findings for a palette that has NOT been saved — the measurement the customize
+ * screen shows while the operator is still editing.
+ *
+ * **This is a route because the panel was measuring the wrong palette.** The screen kept the
+ * draft it was editing beside the last server response and printed the *response's* findings,
+ * so an operator who dragged the accent into a failing pair was told every pair passed while
+ * the preview beside them showed otherwise — and the publish refusal, which instructs the
+ * operator to read that panel, pointed them at the all-clear.
+ *
+ * The measurement stays on the server for the reason it is everywhere else: a ratio computed in
+ * the browser disagrees with the 422 in colour-space rounding and in the large-text threshold,
+ * and a badge that disagrees with the guard is worse than no badge.
+ */
+export type ThemeContrastCheck = {
+  findings: ThemeContrastFinding[];
+  /** The theme the defaults were merged under, so the panel can name what it measured. */
+  themeKey: string;
+};
+
+export async function checkThemeSettingsContrast(
+  siteId: string,
+  themeKey: string,
+  tokens: Record<string, unknown>,
+): Promise<ThemeContrastCheck> {
+  return request<ThemeContrastCheck>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings/contrast-check`,
+    { method: "POST", body: JSON.stringify({ theme_key: themeKey, tokens }) },
+  );
+}
+
 export async function fetchThemeRevision(
   siteId: string,
   revisionNo: number,
