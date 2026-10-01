@@ -723,3 +723,113 @@ async fn a_delay_shortened_to_zero_is_due_at_once() {
 
     drop_org(&pool, org).await;
 }
+
+#[tokio::test]
+async fn a_reservation_the_sweep_declines_is_released_rather_than_left_forever_due() {
+    // The sweep has TWO ways to decline a due reservation — a source switched off inside the
+    // delay, and a lead that turned to spam — and both were answered with a *note* and neither
+    // with a *release*. The claim row therefore stayed exactly as the sweep found it: `sent:
+    // false`, a `due_at` in the past, which is the sweep's own WHERE clause.
+    //
+    // So the same reservation is offered again on the next tick, declined again on the same
+    // grounds, and noted again — once a minute, forever. The trail this REQ's detail screen
+    // reads grows without bound from a lead nobody is going to answer, and
+    // `crm_lead_autoresponder_due_idx` keeps a permanently-due row that every pass re-reads.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder declined").await;
+    let source = source_with_autoresponder(&pool, org, 30).await;
+    let lead = accepted_lead(&pool, org, &source, "declined@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is reserved");
+
+    // Declined for the second reason: the lead turns to spam inside the delay.
+    sqlx::query("update crm_leads set status = 'spam' where id = $1")
+        .bind(lead.id)
+        .execute(&pool)
+        .await
+        .expect("the lead is marked as spam");
+
+    // Two passes, one minute apart — the worker's own cadence.
+    for minute in [31_i64, 32] {
+        let due = ar_store::due_reservations(
+            &pool,
+            now + time::Duration::minutes(minute),
+            50,
+        )
+        .await
+        .expect("the sweep runs");
+        assert!(
+            !due.iter().any(|r| r.lead.id == lead.id),
+            "a lead that turned to spam is not answered (pass at +{minute})"
+        );
+    }
+
+    // THE ASSERTION: a declined reservation is *released*. A note is not a release — the
+    // claim row is what occupies the one slot a lead has, and what the sweep keeps re-reading.
+    assert!(
+        ar_store::existing_claim(&pool, lead.id)
+            .await
+            .expect("reading the claim")
+            .is_none(),
+        "a reservation the sweep declined must be released, not left pending for ever"
+    );
+
+    // And therefore the decline is recorded ONCE. Two passes, one fact.
+    let notes: i64 = sqlx::query_scalar(
+        "select count(*) from crm_lead_events \
+         where lead_id = $1 and kind = $2 and detail->>'reason' = 'not_accepted'",
+    )
+    .bind(lead.id)
+    .bind(ar_store::SENT_KIND)
+    .fetch_one(&pool)
+    .await
+    .expect("the skip line was written");
+    assert_eq!(
+        notes, 1,
+        "one decline is one fact; a reservation left pending re-records it every tick"
+    );
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
+async fn a_reservation_of_a_source_switched_off_inside_its_delay_is_released() {
+    // The same defect on the other decline path. This one `continue`s *before* the message is
+    // rendered, so it never reaches the arm that mentions a release at all — and the test that
+    // already exists (`a_source_switched_off_inside_its_delay_is_not_answered`) asserts the
+    // lead is not answered, which is true whether or not the claim was taken back.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder off, released").await;
+    let source = source_with_autoresponder(&pool, org, 30).await;
+    let lead = accepted_lead(&pool, org, &source, "switched-off@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is reserved");
+
+    sqlx::query("update crm_intake_sources set autoresponder = $2 where id = $1")
+        .bind(source.id)
+        .bind(serde_json::json!({ "enabled": false }))
+        .execute(&pool)
+        .await
+        .expect("the source is switched off");
+
+    let due = ar_store::due_reservations(&pool, now + time::Duration::minutes(31), 50)
+        .await
+        .expect("the sweep runs");
+    assert!(!due.iter().any(|r| r.lead.id == lead.id));
+
+    assert!(
+        ar_store::existing_claim(&pool, lead.id)
+            .await
+            .expect("reading the claim")
+            .is_none(),
+        "a source that will never answer must not leave its reservation pending for ever"
+    );
+
+    drop_org(&pool, org).await;
+}
