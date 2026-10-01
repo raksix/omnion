@@ -7875,3 +7875,67 @@ and viewer-permission boxes). Then the chat entry point that *files* a change se
 the remaining half of the "lands in the same inbox" box, and the entry point rather than the
 pipeline, so it is small. Then the server-side preview hash for the "editing updates the preview
 hash" box: the editor re-plans on the client today, so a reviewer has nothing to compare against.
+
+---
+
+## Wave 7 · tick 45 · REQ-101 slice 3e — the change set's content hash
+
+**What.** "Editing a change set records the editor and time, re-renders the diff and updates the
+preview hash" had two of its three halves: `0201` added `updated_by` and the conditional
+`where status = …`, and the hash was nowhere, so a reviewer had no value to compare against.
+Migration `0204` adds `ai_change_sets.content_hash`; `ChangeSet::content_hash()` is a sha256 over
+the canonical JSON of the operations and the revisions they were pinned to, and
+`store::replace_operations` is now the only writer of either.
+
+**Two decisions, and both of them are about where the code lives.**
+
+1. **The write moved from the route to the store.** The hash must be written wherever the
+   operations are written; "wherever" was a hand-written `update` in the handler and
+   `append` in the crate, in two files. Two statements that must agree about how a row is
+   hashed is how a row ends up carrying a hash of the operations it does not have — the same
+   shape as the all-or-nothing guarantee, which is a property of the table and not of one
+   handler.
+2. **The column is stored, not generated.** A
+   `generated always as (encode(digest(operations::text || base_revisions::text, 'sha256'),
+   'hex')) stored` is the obvious way to make a row impossible to desynchronise from itself, and
+   it is wrong. PostgreSQL's `jsonb` orders object keys by **length first, then bytewise**;
+   `serde_json::Map` is a `BTreeMap` and orders by bytewise alone:
+
+   ```text
+   '{"zz":1,"a":2,"mmm":3,"bb":4}'          -- serde_json, bytewise
+   '{"a": 2, "bb": 4, "zz": 1, "mmm": 3}'   -- jsonb::text, length-first
+   ```
+
+   They agree on a one-key object, which is exactly what makes it a trap: the first fixture
+   would have passed and the first set with a two-character key next to a one-character key would
+   have failed, silently, in production. The full argument and the worked example are in the
+   migration header.
+
+**The walk found a defect in this slice's own first draft.** `replace_operations` read the hash
+guard before the status, so an edit against a set that was confirmed *and* whose hash was stale
+answered `ContentMoved` — "reload it and re-apply your change". That is the wrong sentence: a
+reload shows a `confirmed` set with no editor on it, so the advice sends a reviewer looking for a
+control that does not exist. `NotEditable` is terminal and `ContentMoved` is recoverable, and the
+recoverable answer must never be the one given when the terminal one is also true. The order is
+now status first, and the walk that caught it is
+`a_refused_edit_names_the_status_and_never_leaks_another_tenants_row` (it failed with
+`left: Err(ContentMoved { … })`, `right: Err(NotEditable { current: "confirmed" })`).
+
+**Proof.**
+
+```
+cargo test -p omnion-api --test ai_change_sets   → 16 passed; 0 failed   (12 before)
+cargo test -p omnion-ai-hub --lib                → 511 passed; 0 failed   (507 before)
+pnpm typecheck                                   → 2 successful, 2 total
+rustfmt --edition 2024 --check <the 3 files>    → clean, and the pre-change
+                                                    baseline was clean too, so nothing
+                                                    unrelated was reformatted
+```
+
+Migration `0204` applied to `omnion_qa_w7` and the walks verified against it directly.
+
+**Next.** The **re-render** half of the same box, and the editor UI: the sheet still re-reads and
+re-plans on the client, so the hash now exists and nothing displays it. Then the chat reply that
+*files* a change set (the entry point for the "lands in the same inbox" box). The QA pass from
+slice 2c is still outstanding and is the only thing that can close the stale-banner and
+viewer-permission boxes.
