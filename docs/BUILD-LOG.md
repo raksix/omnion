@@ -6798,6 +6798,163 @@ turn on a pass that has not run**, and the definition of done forbids closing a 
 
 **Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
 a free slot.
+
+## Tick 96 — the `security.finding.opened` webhook, and a store bug behind it
+
+**Picked:** REQ-012 slice 4(d), the last of four. Slices 1–3 and 4(a)–(c) were already
+code-complete, so this was the only piece standing between slice 4 and a REQ whose sole
+remaining work is the browser pass.
+
+**What shipped.** `security.finding.opened` in the catalogue (`e15d1880`), the emitter in the
+import path (`73e890b6`), the walk (`25306c7b`), and the store fix the walk forced (`d6c26218`).
+
+**The payload is an identity, never a content.** This is the first security payload on the
+platform that fans out to a receiver outside the operator's own infrastructure by default, and
+the fields it does *not* carry are the whole design:
+
+- `title`, `description`, `evidence` — all three are content that arrived from outside (a CI
+  vendor's package name, its prose, the raw entry), and the ingest path's credential heuristic
+  is a heuristic on *key names*. A bus is not the place to bet on a heuristic holding.
+- `note` — included in the walk's literals deliberately, because it is the field a future editor
+  would plausibly add without thinking, and no receiver needs it.
+- Carried instead: `finding_id`, `severity`, `source` and the package triple. Severity is the one
+  thing a receiver genuinely cannot compute from an id — its whole decision is *page or file a
+  ticket*. And `finding_id` is enough to act on, because the panel reads the row back through
+  `security.read`, the same guard that protects it.
+
+**The walk found the defect on its first run, and it was not in the new code.**
+
+`upsert_finding` asked `coalesce(xmax, 0)` whether the upsert inserted or updated. `xmax` is an
+`xid`, so Postgres raises `COALESCE types xid and integer cannot be matched` — on every version,
+not a new one. The answer sat in a **second** `select` with `.unwrap_or(true)`, so the error was
+swallowed and **every ingest since the function was written reported every finding as newly
+created.** Verified directly against the box's PostgreSQL 17.11 before touching the code.
+
+The consequence reaches the panel: the findings screen's re-ingest protection has been showing
+`created: N` instead of `created: 0, refreshed: N`, so a nightly CI job re-uploading the same
+report announced every known finding as a new one. And the acceptance criterion *"re-ingesting the
+same report does not duplicate them"* was ticked on 2026-10-01 on a return value that had never
+answered the question — the rows were never duplicated (the fingerprint and unique index do
+that), but the half of the box that reads created-or-refreshed was measuring a constant.
+
+`xmax = 0` now rides the same statement's `RETURNING` clause: one round trip, no second query
+that could see a different row after a concurrent delete, and a failure surfaces as the store
+error it is instead of a plausible-looking `true`.
+
+**Eleventh instance of this REQ's defect class, and the catalogue caught one more thing.**
+`security.ip_rule.changed` shipped in slice 4(a) **with no catalogue row** — the drift gate
+(`every_emitted_name_is_in_the_catalogue`) named it here. An emitter whose name is unlisted
+records an event no endpoint can subscribe to, so the IP rule an operator believes they are
+running applies to nobody. It is green now; nothing in this workspace had asserted that gate on
+the branch it was written on.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-security --quiet` | **208 passed**, 0 failed |
+| catalogue | `cargo test -p omnion-events --quiet` | **49 passed**, 0 failed |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **11/11** (the 10th of last tick's dispose() flake did not recur) |
+| drift | `cargo test -p omnion-api --test events every_emitted_name_is_in_the_catalogue` | **passed** |
+| types | `pnpm typecheck` | **0 errors** (admin + web) |
+
+**The walk's second half is the part containment cannot supply.** Asserting the literals are
+absent is satisfied by an emitter that fires nothing, so the same report is ingested twice and
+the delivery count must stay at **1**. A nightly CI job re-ingests every morning; an endpoint
+that paged on all of those would be muted by the second run, which is the outcome a webhook that
+works perfectly well has silently produced.
+
+**Two process notes.**
+
+* `cargo fmt -p <crate>` sweeps the whole crate's module tree, so it reformatmed three
+  `crates/events` files unrelated to this work. They were committed separately (`a8367bda`) after
+  a `git diff -w` check confirmed they were whitespace-only — the token-level check comes before
+  the style commit, not after.
+* `/mnt/apopic` hit **100%** mid-tick again (`No space left on device` in the linker). Reclaiming
+  only this worktree — `target/debug/incremental` (1.1 GiB) plus the newest-of-each group in
+  `target/debug/deps` (1 239 MiB of stale artifacts) — returned it to 97% with 2.1 GiB free. No
+  sibling held live cargo, confirmed by reading `/proc/<pid>/cwd` rather than by age.
+
+**Browser pass: still owed, now six screen boxes.** The slot was held live by `w4`
+(`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd`,
+not by the age of the placeholder) for the whole tick, with 45 Chrome processes and load 13.
+
+**Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
+REQ-012 can close.
+## Tick 95 — the secret inventory, and the box that could have leaked a credential
+
+**REQ-012 slice 4, third piece.** Two ships this tick: the security-event view (finished by the
+previous tick and committed here) and the secret inventory, which is the REQ's one
+**release-blocker** box.
+
+**What shipped.** `crates/security/src/{secrets,secrets_store}.rs`, `GET /security/secrets`
+(read-only, `security.read`), `features/security/security-secrets.tsx`, the tab, the walkthrough
+entry. Plus the events view's four commits, which the previous tick left uncommitted in the tree.
+
+**The requirement reads as a request for a secrets table, and there is no secrets table.** This is
+a projection over references, and its entire value is being the one screen in the security centre
+from which no secret can be read. So the guarantee is structural rather than a comment:
+
+- `SecretRef` has no `value`/`ciphertext`/`hash`/`preview` field — adding one would make the
+  struct able to carry a credential, and that ability *is* the risk.
+- There is **no `healthy` state and no `present` one**. The platform can see that a reference
+  exists and can read nothing about the value behind it. The first draft carried a `Present`
+  variant no row produced, which would have let a future contributor render "present = fine"; it
+  was removed and the test rewritten to pin the whole vocabulary.
+- The store selects explicit columns, **never `*`** — `*` re-reads a source's schema, so a source
+  gaining a value column upstream would start appearing in a security screen with no code change
+  here. The three sources holding material are read as **counts**.
+
+**Proof (commands and results).**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-security --quiet` | **208 passed**, 0 failed (18 new) |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **9/10**, the 10th a `dispose()` teardown flake (`UnexpectedEof`) that passes in isolation — a harness fault, not an assertion |
+| types | `pnpm typecheck` | **0 errors** (admin + web) |
+
+The containment walk is `no_secret_value_reaches_the_inventory_response`. It **probes the values,
+not the column names** — a name scan would pass an aliased column or a value inlined into a note,
+while a literal scan only fails when the actual leak happens. It seeds a webhook secret, a
+service-account hash and a TOTP ciphertext into a live database and asserts all three literals are
+absent from the response **while the reference name is present**. The positives matter as much: an
+empty body satisfies every containment check in the test while showing an operator a blank screen.
+
+**Three defects this tick, and the two that were not the code.**
+
+1. **A real one, found by the walk on its first run:** `column reference "expires_at" is
+   ambiguous` — `service_account_keys` and `service_accounts` both carry that column. The query
+   read correctly in review and answered `500` on *every* inventory load. **The tenth instance of
+   this REQ's defect class**, and the argument for why a walk drives the router rather than reading
+   the SQL.
+2. **A harness fault, twice:** the walk built its own `Bearer` header when the test credential is a
+   packed `session\x1fcsrf` pair, so the request failed at header parsing instead of at the route
+   — which reads as a product defect and is not one. `the_inventory_cannot_be_written_through`
+   now goes through the shared `request()` helper.
+3. **The blocker was the linker, not the code.** The first run died in `collect2` with
+   `ld terminated with signal 7 [Bus error]`. `/mnt/apopic` was at **100% (193 MiB free)** with
+   load 13–27 and 30/32 GiB RAM used. Reclaiming **only this worktree's** `target/debug/incremental`
+   (795 MiB) and then grouping `target/debug/deps` by `lib<crate>-<16 hex>` and keeping only the
+   newest of each (835 stale artifacts, 2 691 MiB) returned the disk to 95% and the suite to
+   green in one run. **Rule worth keeping: a linker bus error on this box is a disk symptom until
+   proven otherwise, and the reclaim must be scoped by `readlink /proc/<pid>/cwd`** — a sibling
+   writer had live cargo in `omnion-w6`.
+
+**One decision worth carrying forward.** `unverifiable` is rendered **neutral**, not amber.
+Almost every row on this screen is unverifiable, because that is the honest state for almost every
+secret; painting it amber would paint the whole screen amber and train the operator to ignore the
+tone. Only `missing` and `expired` are coloured, because only those are actionable.
+
+**Browser pass: still owed, and it is now a standing risk rather than bad luck.** Two consecutive
+ticks recorded a deferral for the same reason. This tick the slot was held by `w4`
+(`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd`, not
+by the age of the placeholder), load 12.9, 45 Chrome processes. **Six screen boxes in this REQ now
+turn on a pass that has not run**, and the definition of done forbids closing a REQ on tests alone.
+
+**Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
+a free slot.
 ## Tick 90 (continued) — why the pass died, and it was not the product
 
 **The pass was queued for 2400 s and then proceeded, and it died at the wizard.** The log said
@@ -13403,80 +13560,6 @@ which, or the next person spends an hour reading a screen instead of reading a l
 database spent 56 minutes recovering earlier today and went back under the load of nine writers. The
 measurement is written, compiled and typechecked; nothing about it needs another line of code.
 
-## Tick 95 — the secret inventory, and the box that could have leaked a credential
-
-**REQ-012 slice 4, third piece.** Two ships this tick: the security-event view (finished by the
-previous tick and committed here) and the secret inventory, which is the REQ's one
-**release-blocker** box.
-
-**What shipped.** `crates/security/src/{secrets,secrets_store}.rs`, `GET /security/secrets`
-(read-only, `security.read`), `features/security/security-secrets.tsx`, the tab, the walkthrough
-entry. Plus the events view's four commits, which the previous tick left uncommitted in the tree.
-
-**The requirement reads as a request for a secrets table, and there is no secrets table.** This is
-a projection over references, and its entire value is being the one screen in the security centre
-from which no secret can be read. So the guarantee is structural rather than a comment:
-
-- `SecretRef` has no `value`/`ciphertext`/`hash`/`preview` field — adding one would make the
-  struct able to carry a credential, and that ability *is* the risk.
-- There is **no `healthy` state and no `present` one**. The platform can see that a reference
-  exists and can read nothing about the value behind it. The first draft carried a `Present`
-  variant no row produced, which would have let a future contributor render "present = fine"; it
-  was removed and the test rewritten to pin the whole vocabulary.
-- The store selects explicit columns, **never `*`** — `*` re-reads a source's schema, so a source
-  gaining a value column upstream would start appearing in a security screen with no code change
-  here. The three sources holding material are read as **counts**.
-
-**Proof (commands and results).**
-
-| Gate | Command | Result |
-|---|---|---|
-| crate | `cargo test -p omnion-security --quiet` | **208 passed**, 0 failed (18 new) |
-| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
-| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **9/10**, the 10th a `dispose()` teardown flake (`UnexpectedEof`) that passes in isolation — a harness fault, not an assertion |
-| types | `pnpm typecheck` | **0 errors** (admin + web) |
-
-The containment walk is `no_secret_value_reaches_the_inventory_response`. It **probes the values,
-not the column names** — a name scan would pass an aliased column or a value inlined into a note,
-while a literal scan only fails when the actual leak happens. It seeds a webhook secret, a
-service-account hash and a TOTP ciphertext into a live database and asserts all three literals are
-absent from the response **while the reference name is present**. The positives matter as much: an
-empty body satisfies every containment check in the test while showing an operator a blank screen.
-
-**Three defects this tick, and the two that were not the code.**
-
-1. **A real one, found by the walk on its first run:** `column reference "expires_at" is
-   ambiguous` — `service_account_keys` and `service_accounts` both carry that column. The query
-   read correctly in review and answered `500` on *every* inventory load. **The tenth instance of
-   this REQ's defect class**, and the argument for why a walk drives the router rather than reading
-   the SQL.
-2. **A harness fault, twice:** the walk built its own `Bearer` header when the test credential is a
-   packed `session\x1fcsrf` pair, so the request failed at header parsing instead of at the route
-   — which reads as a product defect and is not one. `the_inventory_cannot_be_written_through`
-   now goes through the shared `request()` helper.
-3. **The blocker was the linker, not the code.** The first run died in `collect2` with
-   `ld terminated with signal 7 [Bus error]`. `/mnt/apopic` was at **100% (193 MiB free)** with
-   load 13–27 and 30/32 GiB RAM used. Reclaiming **only this worktree's** `target/debug/incremental`
-   (795 MiB) and then grouping `target/debug/deps` by `lib<crate>-<16 hex>` and keeping only the
-   newest of each (835 stale artifacts, 2 691 MiB) returned the disk to 95% and the suite to
-   green in one run. **Rule worth keeping: a linker bus error on this box is a disk symptom until
-   proven otherwise, and the reclaim must be scoped by `readlink /proc/<pid>/cwd`** — a sibling
-   writer had live cargo in `omnion-w6`.
-
-**One decision worth carrying forward.** `unverifiable` is rendered **neutral**, not amber.
-Almost every row on this screen is unverifiable, because that is the honest state for almost every
-secret; painting it amber would paint the whole screen amber and train the operator to ignore the
-tone. Only `missing` and `expired` are coloured, because only those are actionable.
-
-**Browser pass: still owed, and it is now a standing risk rather than bad luck.** Two consecutive
-ticks recorded a deferral for the same reason. This tick the slot was held by `w4`
-(`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd`, not
-by the age of the placeholder), load 12.9, 45 Chrome processes. **Six screen boxes in this REQ now
-turn on a pass that has not run**, and the definition of done forbids closing a REQ on tests alone.
-
-**Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
-a free slot.
-
 ## Tick 63 · REQ-117 slice 31 · the four exits that wrote no reason
 
 **What.** `crm_intake_sources.last_received_at` and `last_error` are the two columns an operator
@@ -13904,3 +13987,154 @@ The build had to run with CARGO_TARGET_DIR=/dev/shm/w8build. The first attempt
 against /mnt/apopic/w8build died with "No space left on device" on an .rmeta
 write and carried no error[] line, so it reads as an unrelated crate's failure
 rather than as a full filesystem.
+## Tick 96 — the `security.finding.opened` webhook, and a store bug behind it
+
+**Picked:** REQ-012 slice 4(d), the last of four. Slices 1–3 and 4(a)–(c) were already
+code-complete, so this was the only piece standing between slice 4 and a REQ whose sole
+remaining work is the browser pass.
+
+**What shipped.** `security.finding.opened` in the catalogue (`e15d1880`), the emitter in the
+import path (`73e890b6`), the walk (`25306c7b`), and the store fix the walk forced (`d6c26218`).
+
+**The payload is an identity, never a content.** This is the first security payload on the
+platform that fans out to a receiver outside the operator's own infrastructure by default, and
+the fields it does *not* carry are the whole design:
+
+- `title`, `description`, `evidence` — all three are content that arrived from outside (a CI
+  vendor's package name, its prose, the raw entry), and the ingest path's credential heuristic
+  is a heuristic on *key names*. A bus is not the place to bet on a heuristic holding.
+- `note` — included in the walk's literals deliberately, because it is the field a future editor
+  would plausibly add without thinking, and no receiver needs it.
+- Carried instead: `finding_id`, `severity`, `source` and the package triple. Severity is the one
+  thing a receiver genuinely cannot compute from an id — its whole decision is *page or file a
+  ticket*. And `finding_id` is enough to act on, because the panel reads the row back through
+  `security.read`, the same guard that protects it.
+
+**The walk found the defect on its first run, and it was not in the new code.**
+
+`upsert_finding` asked `coalesce(xmax, 0)` whether the upsert inserted or updated. `xmax` is an
+`xid`, so Postgres raises `COALESCE types xid and integer cannot be matched` — on every version,
+not a new one. The answer sat in a **second** `select` with `.unwrap_or(true)`, so the error was
+swallowed and **every ingest since the function was written reported every finding as newly
+created.** Verified directly against the box's PostgreSQL 17.11 before touching the code.
+
+The consequence reaches the panel: the findings screen's re-ingest protection has been showing
+`created: N` instead of `created: 0, refreshed: N`, so a nightly CI job re-uploading the same
+report announced every known finding as a new one. And the acceptance criterion *"re-ingesting the
+same report does not duplicate them"* was ticked on 2026-10-01 on a return value that had never
+answered the question — the rows were never duplicated (the fingerprint and unique index do
+that), but the half of the box that reads created-or-refreshed was measuring a constant.
+
+`xmax = 0` now rides the same statement's `RETURNING` clause: one round trip, no second query
+that could see a different row after a concurrent delete, and a failure surfaces as the store
+error it is instead of a plausible-looking `true`.
+
+**Eleventh instance of this REQ's defect class, and the catalogue caught one more thing.**
+`security.ip_rule.changed` shipped in slice 4(a) **with no catalogue row** — the drift gate
+(`every_emitted_name_is_in_the_catalogue`) named it here. An emitter whose name is unlisted
+records an event no endpoint can subscribe to, so the IP rule an operator believes they are
+running applies to nobody. It is green now; nothing in this workspace had asserted that gate on
+the branch it was written on.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-security --quiet` | **208 passed**, 0 failed |
+| catalogue | `cargo test -p omnion-events --quiet` | **49 passed**, 0 failed |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **11/11** (the 10th of last tick's dispose() flake did not recur) |
+| drift | `cargo test -p omnion-api --test events every_emitted_name_is_in_the_catalogue` | **passed** |
+| types | `pnpm typecheck` | **0 errors** (admin + web) |
+
+**The walk's second half is the part containment cannot supply.** Asserting the literals are
+absent is satisfied by an emitter that fires nothing, so the same report is ingested twice and
+the delivery count must stay at **1**. A nightly CI job re-ingests every morning; an endpoint
+that paged on all of those would be muted by the second run, which is the outcome a webhook that
+works perfectly well has silently produced.
+
+**Two process notes.**
+
+* `cargo fmt -p <crate>` sweeps the whole crate's module tree, so it reformatmed three
+  `crates/events` files unrelated to this work. They were committed separately (`a8367bda`) after
+  a `git diff -w` check confirmed they were whitespace-only — the token-level check comes before
+  the style commit, not after.
+* `/mnt/apopic` hit **100%** mid-tick again (`No space left on device` in the linker). Reclaiming
+  only this worktree — `target/debug/incremental` (1.1 GiB) plus the newest-of-each group in
+  `target/debug/deps` (1 239 MiB of stale artifacts) — returned it to 97% with 2.1 GiB free. No
+  sibling held live cargo, confirmed by reading `/proc/<pid>/cwd` rather than by age.
+
+**Browser pass: still owed, now six screen boxes.** The slot was held live by `w4`
+(`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd`,
+not by the age of the placeholder) for the whole tick, with 45 Chrome processes and load 13.
+
+**Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
+REQ-012 can close.
+
+## Tick 97 — REQ-012 migration box: "fresh" was the easy half
+
+**What.** Closed the migration acceptance criterion of the security centre by proving the half
+nobody had: `0151` and `0217` applied to a database that already holds somebody's data.
+
+The criterion said "fresh **and populated**" and only the first word had ever been walked. The
+gap between those two words is the entire criterion — a migration applied to an empty database
+only proves it can create a table, and none of the failures that stop a platform from booting
+are of that kind. `0151` runs three `alter table` statements against a row that already carries
+an operator's saved header policy; `0217` hangs foreign keys off `users` rows that already
+exist. Both are invisible to a fresh-database test.
+
+**The walk.** `apps/api/tests/migration_gap.rs::the_security_migrations_apply_to_a_populated_database`
+migrates the whole tree, seeds a tenant, an account, **locks that account**, saves
+`{"hsts": true}` and records a finding and a check result — then rolls back *only* versions 151
+and 217 in the ledger and drops their objects by hand, so the two files run against that data.
+Rolling back "everything from 151 on" would have re-run the ~40 migrations between them and
+proved sibling writers' work instead of this criterion.
+
+Assertions: the locked account is **still present and still locked**; the saved policy survived
+the alters with its document intact; `0054`'s two tables kept their rows untouched by a migration
+added beside them; `0217`'s rule keeps its `created_by`. Each is one an empty table cannot
+produce.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| migration walk | `cargo test -p omnion-api --test migration_gap -- --test-threads=1` | **5 passed**, 0 failed |
+| crate | `cargo test -p omnion-security --quiet` | **208 passed** |
+| events | `cargo test -p omnion-events --quiet` | **49 passed** |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed** |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **11/11** |
+| drift | `cargo test -p omnion-api --test events every_emitted_name_is_in_the_catalogue` | **passed** |
+| types | `pnpm typecheck` | **0 errors** |
+
+**Proven to fail twice, because both halves of that setup can silently no-op — which is the
+general hazard here.** An assertion in a walk you built yourself is worth exactly as much as the
+setup is capable of failing.
+
+* Neutralising the ledger rollback means the migration never runs, and the read dies on
+  `column "rate_limits" does not exist`. A green run therefore genuinely required the migrations
+  to have executed — and this is the trap this file is full of: a rollback helper that deleted
+  nothing, or a `drop table if exists` that matched no name, would leave a test that passes
+  against migrations that never executed.
+* A `0151` sabotaged into `update security_settings set headers = '{}'` fails on precisely the
+  assertion written for it: *the upgrade must not revert a policy an operator had already
+  saved: {}*. That is the production disaster this criterion is written against, and **on a fresh
+  database it is undetectable** — `0135` inserts that row itself with `{}`, so "the document
+  survived the upgrade" and "the document is the default" are indistinguishable there.
+
+That second point is the finding worth carrying forward: the fresh-database test was green, and
+it *could not have been otherwise*. A green test on the wrong starting state is not weak
+evidence, it is evidence about nothing.
+
+**Note for the next writer, recorded so it is not re-found.** `cargo fmt -p omnion-api` sweeps
+the crate's whole module tree. It was run this tick and `git diff -w` was checked afterwards to
+confirm it touched nothing but `migration_gap.rs` — the token-level check comes *before* the
+style commit, not after.
+
+**Browser pass: still owed, and still not startable.** The slot is held live by `w8`
+(`pid 3591518`, `cwd=/mnt/apopic/omnion-w8`, verified with `kill -0` **and**
+`/proc/<pid>/cwd` — not by the age of the placeholder file), 25 Chrome processes, load 17. Six
+screen boxes on this REQ still turn on it.
+
+**Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
+REQ-012 can close.
