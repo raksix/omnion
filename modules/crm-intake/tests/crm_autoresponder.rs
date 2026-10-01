@@ -589,6 +589,176 @@ async fn a_delayed_autoresponder_is_sent_when_its_time_comes() {
 }
 
 #[tokio::test]
+async fn a_reservation_whose_source_was_deleted_is_released_rather_than_retried_forever() {
+    // The THIRD arm that can drop out of `due_reservations`, and the only one whose `continue`
+    // is justified — a reservation whose lead or source is gone is *not an error*, and the
+    // comment above it says so and gives the reason: "a sweep that refused to move on would
+    // retry the same dead row on every tick for ever."
+    //
+    // The reasoning is exactly right, and the code does the opposite. Both of these arms
+    // `continue` WITHOUT releasing, so the claim row stays `sent: false` with a `due_at` in
+    // the past — which is the sweep's own WHERE clause. Two things follow, and both are
+    // permanent:
+    //
+    //   1. `crm_lead_autoresponder_due_idx` keeps a permanently-due row that every pass
+    //      re-reads, and every pass writes a `tracing::debug!` line naming it. That is a line
+    //      per minute, forever, per orphaned reservation.
+    //   2. Worse, it is a *starvation* bug and not only a noise bug. `due_reservations` is
+    //      `order by due_at asc limit 50`, and the dead rows are the OLDEST — they have been
+    //      due the longest. So orphans sort to the front of every batch and consume its
+    //      budget: a table with 50 orphaned reservations ahead of a live one means the live
+    //      one is never offered, on every tick, for ever.
+    //
+    // `crm_leads.source_id` is `on delete set null` (0055), so the reachable shape is not
+    // exotic: `DELETE /crm/intake/sources/{id}` — a button the panel has — nulls it, and the
+    // reservation outlives the source. Deleting a source is the ordinary way an operator
+    // retires a form, and it silently stops the autoresponder worker for that lead.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder source deleted").await;
+    let source = source_with_autoresponder(&pool, org, 30).await;
+    let lead = accepted_lead(&pool, org, &source, "orphaned@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is reserved");
+
+    // The panel's own delete button: the lead keeps its row and loses its source.
+    assert!(
+        store::delete_source(&pool, org, source.id).await.expect("the delete runs"),
+        "the source is deleted the way the panel deletes one"
+    );
+    let source_id: Option<Uuid> = sqlx::query_scalar("select source_id from crm_leads where id = $1")
+        .bind(lead.id)
+        .fetch_one(&pool)
+        .await
+        .expect("reading the lead");
+    assert_eq!(
+        source_id, None,
+        "the fixture must reproduce the shape this test is about: a lead whose source is gone"
+    );
+
+    // Two passes, one minute apart — the worker's own cadence.
+    for minute in [31_i64, 32] {
+        let due = ar_store::due_reservations(
+            &pool,
+            now + time::Duration::minutes(minute),
+            50,
+        )
+        .await
+        .expect("the sweep runs");
+        assert!(
+            !due.iter().any(|r| r.lead.id == lead.id),
+            "there is no source left to answer it (pass at +{minute})"
+        );
+    }
+
+    // THE ASSERTION: the orphan is *released*. A dead row is exactly the case the comment
+    // names — a note would be noise, but leaving the row is the retry-forever the comment
+    // refuses, and it is a live reservation occupying a slot in the batch ahead of real work.
+    assert!(
+        ar_store::existing_claim(&pool, lead.id)
+            .await
+            .expect("reading the claim")
+            .is_none(),
+        "a reservation whose source was deleted must be released, not left permanently due"
+    );
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
+async fn orphaned_reservations_do_not_starve_the_batch_the_worker_takes() {
+    // The reason the release above matters beyond tidiness, measured rather than argued: the
+    // sweep is `order by due_at asc, id asc limit N`, so a permanently-due orphan is always
+    // among the *oldest* and therefore always in front of the live work. This test fills the
+    // batch with orphans, leaves exactly one real reservation behind them, and asserts the
+    // live one is offered by the **second** pass.
+    //
+    // **The second pass is the assertion, and getting this wrong is what the first version of
+    // this test did twice.** It reserved the LIVE lead first, so it sorted ahead of the
+    // orphans on both keys and passed against unreleased code. Fixed that, it then asserted
+    // recovery inside ONE pass — which is a promise the fix does not make and cannot: the
+    // `limit` is applied by Postgres *before* Rust sees a row, so a batch of orphans is spent
+    // on orphans on the tick that releases them, whatever the loop does. What a release buys is
+    // that the *next* tick is clean. That is the whole value and it is the only thing
+    // asserted here.
+    //
+    // So: pass 1 spends its budget on the orphans (and ends them), pass 2 offers the live
+    // lead. Against unreleased code both passes return the same five orphans and the live
+    // lead is never offered at all — which is the defect, measured.
+    const BATCH: i64 = 5;
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder orphan starve").await;
+    let source = source_with_autoresponder(&pool, org, 30).await;
+    let now = time::OffsetDateTime::now_utc();
+
+    // The orphans: reserved, then their sources deleted out from under them. Each is due at
+    // `now + 30`, and each is therefore permanently due unless something releases it.
+    for index in 0..BATCH {
+        let orphan_source = source_with_autoresponder(&pool, org, 30).await;
+        let orphan = accepted_lead(
+            &pool,
+            org,
+            &orphan_source,
+            &format!("orphan-{index}@example.com"),
+        )
+        .await;
+        ar_store::prepare(&pool, &orphan, &orphan_source, now)
+            .await
+            .expect("the orphan slot is reserved");
+        assert!(
+            store::delete_source(&pool, org, orphan_source.id)
+                .await
+                .expect("the orphan's source is deleted"),
+            "an orphan is a reservation whose source is gone"
+        );
+    }
+
+    // The live lead arrives AFTER the orphans were already due, so `order by due_at asc` puts
+    // every one of them ahead of it and nothing else in the batch may reach it.
+    let live = accepted_lead(&pool, org, &source, "live@example.com").await;
+    ar_store::prepare(&pool, &live, &source, now + time::Duration::minutes(1))
+        .await
+        .expect("the live slot is reserved");
+
+    // The sweep is a minute past both instants — the worker's own cadence.
+    let sweep = || now + time::Duration::minutes(32);
+
+    // Pass one. Postgres spends the whole `limit` on the five orphans — they are the oldest
+    // rows in the table — and the loop then drops every one of them, because there is no lead
+    // and no source left to answer. So the batch returns **nothing**: five rows read, zero
+    // sendable, and the live lead sitting behind all of them never offered. That zero is the
+    // measurement. The SQL took the batch before the loop ran, which is why recovery is
+    // asserted on the *next* pass rather than this one.
+    let first = ar_store::due_reservations(&pool, sweep(), BATCH)
+        .await
+        .expect("the first sweep runs");
+    assert!(
+        first.is_empty(),
+        "the first sweep reads a full batch of orphans and returns none of them: it carried {} \
+         sendable rows, and the live lead was not among them",
+        first.len()
+    );
+
+    // Pass two — one worker tick later, the ordinary cadence. The orphans are gone from the
+    // table, so the batch is available to the lead that is actually waiting. Against
+    // unreleased code this second pass returns the same five orphans and the live lead is
+    // never offered at all.
+    let second = ar_store::due_reservations(&pool, sweep(), BATCH)
+        .await
+        .expect("the second sweep runs");
+    assert!(
+        second.iter().any(|r| r.lead.id == live.id),
+        "a released orphan stops occupying the batch, so the live lead is offered by the next \
+         pass: the second sweep carried {} rows and none was the live lead",
+        second.len()
+    );
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
 async fn a_source_switched_off_inside_its_delay_is_not_answered() {
     // An operator who turns the autoresponder off has asked for the silence to be real. The
     // message is re-rendered at send time rather than stored on the claim precisely so that
