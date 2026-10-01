@@ -125,6 +125,7 @@ pub mod scim;
 pub mod search;
 pub mod security;
 pub mod security_headers;
+pub mod security_ip;
 pub mod security_limiter;
 pub mod seo;
 pub mod sso;
@@ -1676,6 +1677,32 @@ pub fn router(state: AppState) -> Router {
             "/security/locked-accounts/{user_id}/unlock",
             post(security_limiter::unlock).layer(guards::require(&state, "security.manage")),
         )
+        // IP access lists (REQ-012 slice 4). Reading them is `security.read` — the same read the
+        // overview's IP-allow-list check already makes, and the same read an operator needs to
+        // understand a refusal. Changing them is `security.ip.manage`, its OWN key rather than
+        // `security.manage`, because an allow/deny list is the one screen in the centre that can
+        // lock every administrator out of the platform at once. Splitting it means holding the
+        // "manage findings and settings" power does not silently confer the power to deny the
+        // CEO's office — a grant nobody would think twice about.
+        .route(
+            "/security/ip-rules",
+            get(security_ip::get)
+                .layer(guards::require(&state, "security.read"))
+                .merge(
+                    post(security_ip::post).layer(guards::require(&state, "security.ip.manage")),
+                ),
+        )
+        .route(
+            "/security/ip-rules/test",
+            // The tester changes nothing, so it is `security.read` — the same reasoning as the
+            // rate-limit tester: an operator diagnosing a refusal must not need the power to
+            // change the policy in order to be told what the policy says.
+            post(security_ip::test).layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/ip-rules/{id}",
+            delete(security_ip::delete).layer(guards::require(&state, "security.ip.manage")),
+        )
         .route(
             "/security/findings/{id}",
             get(security::get)
@@ -2300,6 +2327,10 @@ pub fn router(state: AppState) -> Router {
     // built without one (the in-process test harnesses) falls back to the shipped defaults rather
     // than to no limiter at all, which is the failure mode this whole layer exists to remove.
     let limiter_layer = crate::rate_limit_middleware::ensure_installed(&state);
+    // The IP access list is installed the same way and for the same reason (REQ-012 slice 4):
+    // read once, swapped in place by a save, so a rule added on the panel refuses the *next*
+    // request rather than the one after the next restart.
+    let ip_access_layer = crate::security_ip::ensure_installed(&state);
 
     Router::new()
         .route("/healthz", get(health::healthz))
@@ -2320,6 +2351,11 @@ pub fn router(state: AppState) -> Router {
         .layer(crate::rate_limit_middleware::rate_limit(
             limiter_layer.clone(),
         ))
+        // The IP access list runs ahead of the limiter and ahead of every guard, for the same
+        // reason the limiter does: an address rule exists to stop a caller who has no account,
+        // so anything behind `guards::require` would never see one. Ahead of the limiter because
+        // a denied address should cost nothing — not even a Redis round trip.
+        .layer(crate::security_ip::ip_access(ip_access_layer))
         // CSRF sits OUTSIDE the permission guards on purpose: a guard answers 401 for a request
         // with no session and 403 for one whose account lacks the key. The CSRF layer's answer is
         // about the *request*, and it has to be reached only by a request that actually

@@ -28,6 +28,8 @@ pub mod enforce;
 pub mod error;
 pub mod header_store;
 pub mod headers;
+pub mod ip_rules;
+pub mod ip_store;
 pub mod limiter;
 pub mod limiter_redis;
 pub mod limiter_store;
@@ -48,22 +50,29 @@ pub use headers::{
     CSP_DIRECTIVES, CspDirective, CspMode, HeaderLine, HeaderPolicy, HstsPolicy, PostureFacts,
     REFERRER_POLICIES, csp_header_name, is_effective_hsts,
 };
+pub use ip_rules::{
+    IpRule, KINDS as IP_RULE_KINDS, MAX_NOTE as MAX_IP_RULE_NOTE, RuleKind, Verdict as IpVerdict,
+    evaluate as evaluate_ip_rules, network_text, parse_cidr,
+};
+pub use ip_store::remove as remove_ip_rule;
+pub use ip_store::{add as add_ip_rule, counts as ip_rule_counts, list as list_ip_rules};
+pub use ip_store::{find_by_id as find_ip_rule, list_kind as list_ip_rules_of_kind};
 pub use limiter::{
-    ClientId, MAX_BURST, MAX_LIMIT, MAX_WINDOW_SECONDS, RatePolicy, RequestFacts, Verdict,
-    decide, merge_with_defaults, parse_document as parse_rate_limits, scope_of, scope_options,
+    ClientId, MAX_BURST, MAX_LIMIT, MAX_WINDOW_SECONDS, RatePolicy, RequestFacts, Verdict, decide,
+    merge_with_defaults, parse_document as parse_rate_limits, scope_of, scope_options,
     to_document as rate_limits_to_document,
 };
-pub use lockout::{
-    LockoutPolicy, LockoutState, LockedAccount, MAX_ATTEMPTS, MAX_LOCKOUT_MINUTES,
-    MAX_WINDOW_SECONDS as MAX_FAILURE_WINDOW_SECONDS, MIN_ATTEMPTS, MIN_LOCKOUT_MINUTES,
-    MIN_WINDOW_SECONDS as MIN_FAILURE_WINDOW_SECONDS, document as lockout_to_document,
-    evaluate as evaluate_lockout, parse_document as parse_lockout,
-};
+pub use limiter_redis::{Counted, enforce, forget, peek, retention_for};
 pub use limiter_store::{
     StoredDocuments, failures_in_window, load_documents, load_lockout, load_rate_limits,
     locked_accounts, locked_count, save_lockout, save_rate_limits, unlock_account,
 };
-pub use limiter_redis::{Counted, enforce, forget, peek, retention_for};
+pub use lockout::{
+    LockedAccount, LockoutPolicy, LockoutState, MAX_ATTEMPTS, MAX_LOCKOUT_MINUTES,
+    MAX_WINDOW_SECONDS as MAX_FAILURE_WINDOW_SECONDS, MIN_ATTEMPTS, MIN_LOCKOUT_MINUTES,
+    MIN_WINDOW_SECONDS as MIN_FAILURE_WINDOW_SECONDS, document as lockout_to_document,
+    evaluate as evaluate_lockout, parse_document as parse_lockout,
+};
 pub use model::{
     BuiltFinding, CheckResult, Finding, FindingPage, FindingQuery, NewCheckResult, NewFinding,
     SeverityCount, StatusChange, fingerprint_of, is_slug,
