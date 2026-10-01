@@ -29,12 +29,19 @@ next-env.d.ts
 pnpm-debug.log*
 
 # QA artifacts (screenshots + raw logs stay on disk, never in git)
-qa-artifacts/
-# `qa-artifacts/` above matches the DIRECTORY, so a symlink pointing at /dev/shm (which is how a
-# pass keeps its screenshots off a 93%-full /mnt/apopic) does NOT match and git stages it as a
-# regular file. Two lines, because git does not treat a trailing slash as "this or a link".
+#
+# `qa-artifacts/` alone matches the directory, and `qa-artifacts` alone does not match a symlink's
+# TRAILING SLASH, so the two lines below are what covered both spellings. They were written as
+#
+#     qa-artifacts
+#     !qa-artifacts/
+#
+# and the second line **un-ignores the directory**, which is the exact thing the first line was
+# for. The intent — ignore a directory and also the symlink form — is one pattern, because a
+# pattern without a trailing slash matches both. As written, a pass that leaves `qa-artifacts/` as a
+# real directory shows up in `git status` as untracked and a `git add -A` stages 171 MB of PNGs
+# into a PUBLIC repository. One pattern, no negation.
 qa-artifacts
-!qa-artifacts/
 
 # Turbo
 .turbo/
