@@ -608,10 +608,7 @@ pub async fn finish_run(
     let manifest = build_manifest(&backup_id.to_string(), parts, manifest_created_at);
     let checksum = manifest_checksum(&manifest);
     let size: i64 = parts.iter().map(|part| part.size_bytes).sum();
-    let error = parts
-        .iter()
-        .find(|part| part.status == PartStatus::Failed)
-        .and_then(|part| part.error.clone());
+    let error = crate::part::summarise_failure(parts);
 
     sqlx::query_as::<_, BackupRow>(&format!(
         "update backups set status = $2, size_bytes = $3, manifest = $4, checksum = $5, \
