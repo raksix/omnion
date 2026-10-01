@@ -200,6 +200,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
+    // The content usage flush (REQ-019, slice 3). Spawned unconditionally: unlike the analytics
+    // rollup it is cheap when nobody is calling the content surface — one SCAN over a namespace
+    // with no keys — and a feature that silently stops metering when an operator forgets an env
+    // var is a feature whose usage tab is wrong with no indication that anything is off.
+    let _content_usage = omnion_api::content_usage_runner::spawn(state.clone());
+
     if state.config().analytics.runner_enabled {
         let _rollups = analytics_runner::spawn(state.clone());
     } else {

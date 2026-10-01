@@ -487,7 +487,7 @@ pub async fn revoke_token(
 /// an account without one has nothing this surface can answer — a `403` that explains itself
 /// rather than a null that silently produces an empty list. The empty list is the answer that
 /// looks like "you have no tokens" when the truth is "this account is not a tenant".
-fn organization_of(current: &CurrentSession) -> Uuid {
+pub fn organization_of(current: &CurrentSession) -> Uuid {
     current
         .user
         .organization_id

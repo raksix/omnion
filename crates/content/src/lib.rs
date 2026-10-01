@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod api_token_usage;
 pub mod api_tokens;
 pub mod blockdiff;
 pub mod block_media;

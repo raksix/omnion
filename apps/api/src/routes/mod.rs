@@ -83,6 +83,7 @@ pub mod commands;
 pub mod comments;
 pub mod content;
 pub mod content_api;
+pub mod content_usage;
 pub mod content_openapi;
 pub mod content_read;
 pub mod featured_media;
@@ -1102,16 +1103,29 @@ pub fn router(state: AppState) -> Router {
     // duplicate but the only way the screen can render at all.
     let content_api_openapi = get(content_api::openapi_document)
         .layer(guards::require(&state, "content.api.read"));
+    // Reading what the tokens have done is the same power as reading them: a viewer of this
+    // section can already see a token's name, prefix and rate tier, and has lost nothing by also
+    // seeing how much it has been used. There is deliberately no separate "usage" permission — a
+    // permission nobody needs to *act* on only ever surprises an operator by being absent from
+    // someone's role.
+    let content_api_usage = get(content_usage::usage)
+        .layer(guards::require(&state, "content.api.read"));
 
     // The token surface itself. Declared as its own router so the six routes read as one unit
     // next to their permission layer, and merged into the v1 tree below.
     let content_api = Router::new()
+        .route("/content-api/usage", content_api_usage)
         .route("/content-api/tokens", content_api_tokens_list)
         .route("/content-api/tokens", content_api_token_create)
         .route("/content-api/tokens/vocabulary", content_api_vocabulary)
         .route("/content-api/tokens/{id}", content_api_token_update)
         .route("/content-api/tokens/{id}", content_api_token_revoke)
         .route("/content-api/tokens/{id}/rotate", content_api_token_rotate)
+        // Reading what the tokens have done is the same power as reading them: `content.api.read`
+        // is a viewer of this section, and a role that can see a token's name, prefix and rate
+        // tier has lost nothing by also seeing how much it has been used. There is no separate
+        // "usage" permission to add later — a permission nobody needs to *act* on is a permission
+        // that only ever surprises an operator by being missing.
         // A literal path next to the `{id}` siblings: registering it after them would make
         // matchit read `openapi` as a token id.
         .route("/content-api/openapi.json", content_api_openapi);

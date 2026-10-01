@@ -22,7 +22,7 @@
 //!    what is live must not appear, and a caller must not be able to infer that one exists.
 
 use axum::Json;
-use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::extract::{FromRequestParts, MatchedPath, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use omnion_content::api_tokens::{self, AuthFailure, AuthenticatedToken};
@@ -36,6 +36,7 @@ use sqlx::Row;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::content_meter;
 use crate::error::ApiError;
 use crate::routes::content_api::auth_failure_response;
 use crate::state::AppState;
@@ -55,6 +56,17 @@ impl ContentToken {
     /// Whether the token carries a scope.
     pub fn has_scope(&self, scope: &str) -> bool {
         self.0.token.scopes.iter().any(|granted| granted == scope)
+    }
+
+    /// The token's own requests-per-minute budget.
+    ///
+    /// Read from the row rather than from a constant, because the panel's create dialog offers
+    /// two tiers and the whole point of a tier is that the *next request* is decided by the
+    /// number the operator chose — not by the one the code was compiled with. The store already
+    /// validates the range (`validate_rate_limit`), so a hand-edited row is bounded by the
+    /// column's own check.
+    pub fn rate_budget(&self) -> i32 {
+        self.0.token.rate_limit_per_minute
     }
 
     /// Refuse a call the token is not scoped for, naming the scope it needed.
@@ -110,6 +122,17 @@ impl FromRequestParts<AppState> for ContentToken {
         parts: &mut axum::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // The matched route, read BEFORE anything is spent. This is what the usage bucket and the
+        // `X-RateLimit-*` headers name, and it is the only path string on this surface that does
+        // not grow with the caller's data: `/content/pages/{slug}` is one row however many slugs
+        // were read, while `uri.path()` would create a row per slug and make the usage tab
+        // unusable for the one integration it exists to describe. Read here rather than in a
+        // response layer because a layer that is mounted on the router cannot see the template.
+        let route = parts
+            .extensions
+            .get::<MatchedPath>()
+            .map(|path| path.as_str().to_owned());
+
         let raw = bearer_token(&parts.headers)
             .map_err(|error| error)
             .or_else(|primary| {
@@ -146,6 +169,19 @@ impl FromRequestParts<AppState> for ContentToken {
                 Err(failure) => return Err(auth_failure_response(&failure)),
             };
 
+        let token = Self(authenticated);
+
+        // The budget, and then the counter, in that order and both before the handler runs.
+        //
+        // **Why here and not in a middleware:** the platform's own limiter runs outside the
+        // permission guards, and that is right for it — it keys on address and user. A content
+        // token is neither, and a second limiter with its own key would be a second answer to
+        // "has this client spent its budget". So this *is* the content surface's limiter, it
+        // spends the same round trip the meter spends, and the two cannot disagree because the
+        // refusal is recorded by the same call that incremented the counter.
+        let route = route.unwrap_or_else(|| "unknown".to_owned());
+        let verdict = content_meter::spend(state, token.0.token.id, token.rate_budget(), &route).await;
+
         // A successful call is the moment `last_used_at` means something, and it is written here
         // rather than in a background task: the Tokens tab's "last used" column would otherwise
         // lag by however long the flush interval is, and a person debugging an integration is
@@ -153,11 +189,99 @@ impl FromRequestParts<AppState> for ContentToken {
         let _ = sqlx::query(
             "update api_tokens set last_used_at = now(), updated_at = now() where id = $1",
         )
-        .bind(authenticated.token.id)
+        .bind(token.0.token.id)
         .execute(state.db().pool())
         .await;
 
-        Ok(Self(authenticated))
+        // The refusal is the extracter's to answer, and it is answered *before* the handler runs
+        // so a throttled caller never reaches a query at all — a rate limit that still ran the
+        // handler is a rate limit that only spent the database's time.
+        if verdict.limited {
+            return Err(rate_limited(&verdict, &route));
+        }
+
+        parts.extensions.insert(ContentCall {
+            route,
+            rate: verdict,
+        });
+
+        Ok(token)
+    }
+}
+
+/// The `429` a token's exhausted budget answers with.
+///
+/// **`Retry-After` is the rest of the minute the caller is inside, not a constant.** A constant
+/// `Retry-After: 5` on a per-minute budget is the classic limiter bug: a client that honours it
+/// retries 0.8 s before the window rolls, is refused again, and its retry loop becomes the load
+/// the limit exists to shed. The wait is derived from the same bucket index the counter used, so
+/// the two cannot disagree about which minute is open.
+///
+/// The `X-RateLimit-*` headers are stamped here rather than in a response layer, because a layer
+/// would have to re-derive the tier from a database row or trust a request header — and a header
+/// is a value the caller sets.
+pub fn rate_limited(verdict: &content_meter::Verdict, route: &str) -> ApiError {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let retry_after = content_meter::retry_after_seconds(now);
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        format!(
+            "this token's budget of {}/minute is spent; the window resets in {retry_after}s",
+            verdict.limit
+        ),
+    )
+    .with_details(json!({
+        "limit": verdict.limit,
+        "count": verdict.count,
+        "remaining": verdict.remaining(),
+        "retry_after": retry_after,
+        "endpoint": route,
+    }))
+    .with_retry_after(retry_after as i64)
+}
+
+/// What one content request spent, handed to the handler by the extractor.
+///
+/// Inserted into the request extensions so a handler can stamp the *actual* verdict on its
+/// response. A middleware could do that too, but it would have to guess the token's tier (a
+/// database read per request) or read the header the extractor already decided — and the second
+/// of those is a response built from a request header, which is a value a caller can set.
+#[derive(Debug, Clone)]
+pub struct ContentCall {
+    /// The matched route this call spent against.
+    pub route: String,
+    /// The limiter's verdict for this call.
+    pub rate: content_meter::Verdict,
+}
+
+/// Read the [`ContentCall`] the extractor left, if it got that far.
+///
+/// An extractor rather than a field on [`ContentToken`] because Axum runs extractors
+/// **in declaration order** and only the ones a handler lists: a handler that took
+/// `token: ContentToken, call: ContentCall` would work, but six handlers repeating that pair is
+/// six chances to leave the second one out and answer a response with no rate-limit headers. This
+/// way forgetting it is not expressible.
+impl FromRequestParts<AppState> for ContentCall {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<ContentCall>()
+            .cloned()
+            .unwrap_or(ContentCall {
+                route: "unknown".to_owned(),
+                rate: content_meter::Verdict {
+                    count: 0,
+                    limit: 0,
+                    limited: false,
+                    authoritative: false,
+                },
+            }))
     }
 }
 
@@ -511,6 +635,13 @@ pub struct ReadResponse {
     etag: String,
     /// Always `200` today; a `304` path is slice 3's rate-limit work, not this slice's.
     status: StatusCode,
+    /// What the request spent, when the extractor got far enough to know.
+    ///
+    /// `None` is a real case, not a forgotten assignment: `MatchedPath` is absent when a
+    /// handler is called directly (which every unit test does), and a response that stamped
+    /// `X-RateLimit-Remaining: 0` from a missing verdict would be claiming a measurement the
+    /// platform never made. **The headers are therefore omitted entirely rather than guessed.**
+    spent: Option<content_meter::Verdict>,
 }
 
 impl IntoResponse for ReadResponse {
@@ -526,7 +657,46 @@ impl IntoResponse for ReadResponse {
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=0, must-revalidate"),
         );
+        // The rate-limit headers are the surface's contract with a client that wants to back off
+        // politely: it reads `remaining`, and when it reaches 0 it waits for `Retry-After`. Both
+        // come from the extractor's own verdict, so the number a client trusts is the number the
+        // counter holds.
+        if let Some(verdict) = self.spent {
+            if verdict.authoritative {
+                stamp_rate_limit(headers, &verdict);
+            }
+        }
         response
+    }
+}
+
+/// Stamp `X-RateLimit-Limit` / `-Remaining` on a response.
+///
+/// **Only when the verdict was a measurement.** An unreachable counter answers `authoritative:
+/// false` and the headers are then *absent* rather than zero, because a client that reads
+/// `remaining: 0` from a counter nobody could read will back off a token that is not being
+/// limited — the meter failing open would throttle the caller by accident.
+fn stamp_rate_limit(headers: &mut axum::http::HeaderMap, verdict: &content_meter::Verdict) {
+    // `HeaderName::from_static` rather than `&str`: a `&str` key makes the compiler infer a
+    // lifetime, and a closure that captured one `'static` literal and another call site that
+    // passed a computed string are two different types — the closure signature is the only place
+    // that can say both are the same name.
+    fn set(headers: &mut axum::http::HeaderMap, name: axum::http::HeaderName, value: String) {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            headers.insert(name, value);
+        }
+    }
+    set(
+        headers,
+        axum::http::HeaderName::from_static("x-ratelimit-limit"),
+        verdict.limit.to_string(),
+    );
+    if let Some(remaining) = verdict.remaining() {
+        set(
+            headers,
+            axum::http::HeaderName::from_static("x-ratelimit-remaining"),
+            remaining.to_string(),
+        );
     }
 }
 
@@ -538,10 +708,11 @@ impl IntoResponse for ReadResponse {
 pub async fn list_pages(
     State(state): State<AppState>,
     token: ContentToken,
+    call: ContentCall,
     Query(query): Query<ContentListQuery>,
 ) -> Result<ReadResponse, ApiError> {
     token.require_scope("content:read")?;
-    list_pages_of_type(state, token, query, None).await
+    list_pages_of_type(state, token, call, query, None).await
 }
 
 /// `GET /api/v1/content/posts` — the same rows filtered to `page_type = 'post'`.
@@ -552,15 +723,17 @@ pub async fn list_pages(
 pub async fn list_posts(
     State(state): State<AppState>,
     token: ContentToken,
+    call: ContentCall,
     Query(query): Query<ContentListQuery>,
 ) -> Result<ReadResponse, ApiError> {
     token.require_scope("content:read")?;
-    list_pages_of_type(state, token, query, Some("post")).await
+    list_pages_of_type(state, token, call, query, Some("post")).await
 }
 
 async fn list_pages_of_type(
     state: AppState,
     token: ContentToken,
+    call: ContentCall,
     query: ContentListQuery,
     fixed_type: Option<&'static str>,
 ) -> Result<ReadResponse, ApiError> {
@@ -708,6 +881,7 @@ async fn list_pages_of_type(
     let etag = content_read::list_etag(&stamps);
     Ok(ReadResponse {
         status: StatusCode::OK,
+        spent: Some(call.rate),
         etag,
         body: json!({
             "items": items,
@@ -744,6 +918,7 @@ fn sort_value_of(row: &sqlx::postgres::PgRow, sort: SortKey, source: SortSource)
 pub async fn get_page(
     State(state): State<AppState>,
     token: ContentToken,
+    call: ContentCall,
     Path(slug): Path<String>,
     Query(query): Query<ContentListQuery>,
 ) -> Result<ReadResponse, ApiError> {
@@ -791,6 +966,7 @@ pub async fn get_page(
     let etag = content_read::list_etag(&[(content_read::stamp(page.updated_at), page.id)]);
     Ok(ReadResponse {
         status: StatusCode::OK,
+        spent: Some(call.rate),
         etag,
         body: json!({ "item": items[0].clone() }),
     })
@@ -800,6 +976,7 @@ pub async fn get_page(
 pub async fn get_post(
     State(state): State<AppState>,
     token: ContentToken,
+    call: ContentCall,
     Path(slug): Path<String>,
     Query(query): Query<ContentListQuery>,
 ) -> Result<ReadResponse, ApiError> {
@@ -849,6 +1026,7 @@ pub async fn get_post(
     let etag = content_read::list_etag(&[(content_read::stamp(page.updated_at), page.id)]);
     Ok(ReadResponse {
         status: StatusCode::OK,
+        spent: Some(call.rate),
         etag,
         body: json!({ "item": page.to_value(&request.fields, request.locale.as_deref(), &[]) }),
     })
@@ -858,6 +1036,7 @@ pub async fn get_post(
 pub async fn list_media(
     State(state): State<AppState>,
     token: ContentToken,
+    call: ContentCall,
     Query(query): Query<MediaListQuery>,
 ) -> Result<ReadResponse, ApiError> {
     token.require_scope("media:read")?;
@@ -985,6 +1164,7 @@ pub async fn list_media(
 
     Ok(ReadResponse {
         status: StatusCode::OK,
+        spent: Some(call.rate),
         etag: content_read::list_etag(&stamps),
         body: json!({
             "items": items,

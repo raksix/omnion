@@ -13,7 +13,7 @@ publish = false
 # feature.
 reqwest = { workspace = true, features = ["json"] }
 
-axum = { workspace = true, features = ["multipart"] }
+axum = { workspace = true, features = ["multipart", "matched-path"] }
 tokio.workspace = true
 tower.workspace = true
 serde.workspace = true
@@ -23,6 +23,10 @@ serde_json.workspace = true
 # every category and priority filter.
 percent-encoding.workspace = true
 sqlx.workspace = true
+# The content usage meter increments its counters with a Lua script, and the typed `Script`
+# wrapper lives behind a feature this workspace does not enable — so the meter speaks raw `EVAL`
+# (the same choice `crates/security/src/limiter_redis.rs` documents for the same reason).
+redis.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
