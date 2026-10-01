@@ -11500,6 +11500,29 @@ async function runWorkflowBuilderDepth(page, report) {
   }
   note({ step: "drag-undo", ...dragUndoNote });
 
+  // The Reload exit of the two-tab conflict has to REBASE, and the reading is the Undo button's
+  // own `disabled` attribute in the opposite direction from `drag-undo`: that row asserts the
+  // button ENABLES after a drag, this one asserts it DISABLES after a reload. A reload adopts
+  // another editor's graph, so every entry the history still holds describes a graph the author
+  // chose to discard — and `doUndo` ends in `queueSave`, which quotes the version the reload
+  // just took from the server. One press of undo therefore wrote the discarded graph back over
+  // the other tab, and the server ACCEPTED it because the quoted version was current.
+  //
+  // The selection is read too, because it is the second half of the same defect: an inspector
+  // holding a node the loaded graph does not contain is a panel that can be aimed at nothing.
+  const reloadNote = await page
+    .evaluate(() => {
+      const undo = document.querySelector("[data-testid='builder-undo']");
+      return {
+        undoPresent: Boolean(undo),
+        // The attribute is present on a disabled <button>, so presence means disabled.
+        undoDisabled: undo?.hasAttribute("disabled") ?? null,
+        selectedInDom: document.querySelectorAll("[data-node-id][data-selected='true']").length,
+      };
+    })
+    .catch(() => ({ undoPresent: false }));
+  note({ step: "reload-rebase", ...reloadNote });
+
   // The connection gesture: press an output port, press a target node, and the server's edge
   // count rises. The refusal is the half that matters — a port the source does not export has
   // to *say so*, and a gesture that refuses silently is indistinguishable from a dead button,
