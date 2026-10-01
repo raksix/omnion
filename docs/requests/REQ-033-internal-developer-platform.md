@@ -1,84 +1,41 @@
 # REQ-033 — Internal Developer Platform
 
-> **Status:** in-progress (`54853888`; tick 104 — **slice 2 is code-complete: the OpenAPI
-> document, the Explorer runtime, the permission split, the screen and the walkthrough pass all
-> ship.** The browser pass is queued behind a live w7 holder and is the only thing slice 2
-> still waits on.) Three commits: `be241bd2` the document and the drift gate, `de029671` the
-> runtime and the routes, `54853888` the screen and the pass.
+> **Status:** in-progress (`a1840487`; tick 107 — **slice 3a: OAuth client material, the
+> redirect-URI rule, PKCE and the `0229` migration.** The store functions, the routes and the
+> screen are still open, so no acceptance box is ticked.) Slice 2 remains code-complete and
+> waiting only on a browser pass. Two commits this tick: `82d52d55` the main merge,
+> `a1840487` slice 3a.
 >
-> **The decision slice 2 turned on: the Explorer dispatches *through the router*, not around
-> it.** `POST /api/v1/dev/explorer/requests` builds an in-process `Request` carrying the
-> caller's own `omnion_session` cookie and a CSRF token derived from that session, and hands it
-> to the same `Router` `main.rs` already serves. Every layer therefore runs for real — the
-> permission guard, CSRF, the rate limiter, the module guard — so the `403` the panel shows is
-> the `403` the caller would get from their own terminal.
+> **The merge was a real defect, not a text conflict.** `public_media` runs main's conditional
+> machinery and my cache layer, and *both* wrote `ETag` on the same response. The two
+> derivations are not the same string — main's is `W/"<checksum>"`, mine is `"<checksum>"` — so
+> a client revalidating against the tag it was handed was compared against the other one and
+> never matched. It surfaces as a media file that re-downloads on every request, which reads
+> as "caching does not work" rather than as two layers disagreeing about a header. The fix is
+> `Validator::Preserved`: the conditional answer is decided in the handler (next to the `Range`
+> logic that shares its instant) and the cache layer writes only what it owns —
+> `Cache-Control`, `Vary`, `surrogate-key`.
 >
-> The request file's risk note is the sharpest sentence in the specification: *"The Explorer can
-> resemble a privileged proxy: it must run with the caller's session and permissions only."* Two
-> shortcuts break that, and both look identical in the panel. An outbound HTTP request to
-> localhost with a service credential is a superuser wearing a developer's clothes. Dispatching
-> into handlers while skipping the guards is a hole in every permission on the platform. So
-> there is no path in this code that reaches a handler without passing the layers, and the
-> router is **passed in from `main.rs`** rather than rebuilt — a second `Router::new()` would
-> install a second header layer, a second limiter and a second IP access list into the same
-> process-wide `OnceLock`s, and the second install would be silently ignored, leaving the
-> Explorer running under the outer policy or under none.
+> **A `#[cfg]` that was applied to half a match.** Slice 3a's first compile failed on
+> `DeveloperError::code()` naming the `Database` variant without the `store` feature guard
+> that variant itself carries. That is **pre-existing** — `error.rs` is untouched by this
+> slice — and it meant `cargo test -p omnion-developer` could not build, while the crate's own
+> `Cargo.toml` documents that exact command as the one that "needs no database at all". The
+> feature split had been written and the enum had been gated, and the *match* had not. Gated
+> rather than given a `_` arm, so a new variant still has to be given a code.
 >
-> **Four refusals are decided before anything is sent, in one pure function.** A path outside
-> `/api/v1`; a path parameter that climbs out of it; a body over 128 KB; and any path under
-> `/api/v1/dev/`, which is how the Explorer is stopped from **recursing into itself**. The
-> escape check runs on the *substituted* path rather than the template, because a path parameter
-> is attacker-controlled text and `page_id = "../../admin"` is in the value, not the template. The
-> recursion rule is a **prefix** rather than a list of the Explorer's own two routes, so a third
-> debugging surface added under `/dev/` later is covered without anybody remembering.
+> **The IPv6 bug my own test caught on the first run.** `loopback_host` stripped the port by
+> splitting on the first colon, which reduces the IPv6 literal `[::1]` to `[` — so IPv6 loopback
+> was silently refused, and the only symptom was that a developer binding to `::1` could not
+> register a redirect URI. A bracketed authority is now taken whole before any colon is read
+> as a port separator.
 >
-> **The drift gate is the other half of the slice, and it earned its keep immediately.** A
-> declared operation table can describe a route that does not exist (an operation whose `Send`
-> button 404s) and can omit one that does (a reference that lies by omission). `explorer_openapi`
-> closes both by parsing `routes/mod.rs` and comparing `(method, path)` against the document and
-> against an explicit `UNDOCUMENTED_BASELINE` of 355 entries. The parser had to learn **five**
-> shapes of this router before the check was worth having, and each was found by the tripwire
-> rather than by reading: a `let` split across lines by parentheses, one whose value is on the
-> next line, one carrying a `: MethodRouter<…>` annotation, a `.route(` call written across
-> three lines, and a `.merge(` chain **whose every line is balanced**. Missing any one does not
-> fail loudly — it makes the parse silently smaller than the router, so every drift assertion
-> passes over a subset. That is why `the_parse_still_sees_the_whole_router` asserts a floor on
-> how many routes were seen, and why the floor is **measured** (260 pairs from 256 call sites)
-> rather than guessed.
->
-> **Two permissions, and the split is what keeps the reference read-only.** `developer.read` is
-> browsing the document — the same question as reading a key's metadata, so a manager holds it.
-> `developer.explorer.run` is *sending*, which acts as the person at the screen and stays with
-> owner/administrator. Collapsing them would have made a read-only role's Explorer a write
-> capability, which is the same mistake slice 1 made the mistake of not making.
->
-> **Gates:** `cargo test -p omnion-developer --features store` **54** (was 39, +15),
-> `cargo test -p omnion-api --lib` **387** (was 375, +12), `cargo test -p omnion-permissions`
-> **64**, `cargo test -p omnion-api --test explorer_openapi` **5**,
-> `cargo check -p omnion-api` clean, `pnpm typecheck` **2/2**, `node --check` clean.
->
-> **The pass ran, and it caught two real defects that no unit test could have.** The first
-> paint of the screen carried the notice *"Your role does not hold `developer.explorer.run`, so
-> the Send button is unavailable"* — **on the QA owner, whose role holds every permission.** The
-> panel derived `runnable` by comparing the *selected operation's* permission against the run
-> key, so it was false for every operation: no operation anywhere in the document carries
-> `developer.explorer.run`, so the comparison had no case in which it could be true. Nothing in
-> a unit test could have found that, because the data it read was correct and the *question*
-> was not. `GET /dev/operations` now answers `can_send` beside the list (`3af9a5f9`).
->
-> The second was the harness's own: three of the eight high findings were the pass filing its
-> own negative assertions — a call it expects to be refused, the recursion probe, the
-> out-of-scope path — as product defects. A report whose high column contains its own negative
-> tests teaches a reader to skim the high column (`81947631`).
->
-> **No acceptance box is ticked.** The third run queued behind a live w4 pass, started while
-> PostgreSQL was **in recovery mode** on this shared box, and signed in against a `503` — so it
-> measured a login page, not the Explorer (`referenceLoaded: false`, 5 clicks, 27 highs). Those
-> findings are the environment, not the build: `AppShell` renders its `<h1>` unconditionally, so
-> the two `no-h1` findings are the shell never having hydrated. The pass must be re-run on a
-> quiet box; the two defects it *did* find are fixed. · **Captured:** 2026-09-25 ·
-> **Layer:** `apps/admin` + SDKs · **Source:** owner brief — platform periphery & headline
-> features (2026-09-25)
+> **Gates:** `cargo test -p omnion-developer --lib` **73** (was 54, +19),
+> `cargo test -p omnion-api --lib` **391** (was 388, +3 for the preserved validator),
+> `pnpm typecheck` **2/2**. The `0229` migration is proven against a live PostgreSQL: four
+> constraints refuse their bad input and a fifth insert proves they are not simply refusing
+> everything. · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + SDKs · **Source:** owner
+> brief — platform periphery & headline features (2026-09-25)
 
 ## Request
 
@@ -277,6 +234,7 @@ Visual check: the one-time secret dialog is unmistakable (warning icon, explicit
 2. **API Explorer.** OpenAPI emission, operation browser, schema-driven request form, send-as-caller, snippet drawer, CI drift check.
    **Code-complete** (`be241bd2`, `de029671`, `54853888`): the document, the runtime, the routes, the screen and the depth pass all ship; the drift check is a test that runs in `cargo test --workspace`, which is what CI runs. **Open on the browser pass alone.**
 3. **OAuth apps + events catalog.** App registration and editing, secret rotation with overlap, authorization-code plus PKCE, catalog from the event registry, webhook deep link.
+   **Slice 3a in progress** (`a1840487`; tick 107): the client material, the redirect-URI rule, PKCE and the `0229` migration ship. **Open: the store functions, the routes, the screen.** The event catalogue half of this slice is largely already built by REQ-016 — `/api/v1/events/catalogue` reads the same compiled registry `omnion_events::catalogue` — so what remains there is the developer framing, not a second source of truth.
    Done: a local test client completes the flow and every catalog sample validates against its schema.
 4. **SDKs + CLI + polish.** Scaffold generator, manifest validator, CLI device-code, overview cards, permission-hidden controls, mobile layout.
    Done: scaffolds install or load, `omnion login` issues a scoped token, and the read-only role sees no management controls.

@@ -12042,3 +12042,100 @@ states, and it is not closed on tests alone.
 
 **Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
 hook to REQ-011.
+
+## Tick 107 — REQ-033 slice 3a: the OAuth client material, and a merge that was a real defect (branch `wave5`)
+
+Two commits: `82d52d55` the main merge, `a1840487` slice 3a.
+
+### The merge was not a text conflict
+
+Twelve commits had landed on `main`, so the tick began with a merge — and the one real
+conflict was in `public_media`, where main's conditional machinery and my CDN layer both
+write `ETag` on the same response. The two derivations are not the same string: main's is
+`W/"<checksum>"` and mine was `"<checksum>"`. Whichever ran last won, so a client that
+revalidated against the tag it had been handed was compared against the *other* one and never
+matched.
+
+The symptom would have been a media file re-downloading on every request — which reads as
+"caching does not work", not as two layers disagreeing about a header, and it would have
+survived every unit test because both layers are individually correct. The fix is a third
+`Validator` variant: `Preserved`, which means *this body already published a validator, do not
+invent one*. `apply()` reads the carried `ETag` back rather than deriving a second, and with
+nothing to compare it leaves the response alone rather than answering `304` for a `200` nobody
+claimed to have. Three tests state it, because the failure it prevents is silent.
+
+The `BUILD-LOG` conflict is the recurring one and `scripts/qa/merge-build-log.py` resolved it
+by splicing rather than picking: 97 base + 63 ours + 3 theirs = **163 entries**, verified by
+the entry check. A line count adds up perfectly while a whole entry is dropped, which is the
+failure a count cannot see.
+
+### A `#[cfg]` applied to half a match
+
+Slice 3a would not compile, on `DeveloperError::code()` naming the `Database` variant without
+the `store` feature guard the variant itself carries. Two things make this worth a paragraph:
+it is **pre-existing** (`error.rs` is untouched by this slice), and the crate's `Cargo.toml`
+documents `cargo test -p omnion-developer` as the command that "needs no database at all" —
+a claim that had been false since the feature split landed. The enum had been gated and the
+match had not. Gated rather than given a `_` arm, so a new client-error variant still has to
+be given a code; a wildcard would have swallowed it and turned a `400` into a `500` silently.
+
+### The redirect rule, and the bug the test found
+
+A submitted redirect URI is compared to the registered list as a **whole string**. The prefix
+form is the hole this function exists to not have: an app registered at `/callback` accepts
+`/callback-attacker`, and a path a client normalises *after* the check passes is a redirect
+somewhere else entirely. Two normalisations are applied because a browser makes them (a
+trailing slash, a bare `?` or `#`) — without them a legitimate redirect is refused and the
+developer is sent to paste the exact string the panel showed them.
+
+The loopback exception is an exact host match and never `starts_with("localhost")`, so
+`http://localhost.attacker.example` is refused. That check had a genuine bug, found by its own
+test on the first run: stripping the port by splitting on the first colon reduces the IPv6
+literal `[::1]` to `[`, which matches nothing. IPv6 loopback was silently unusable and the only
+symptom was that a developer binding to `::1` could not register a URI at all.
+
+One of my own test expectations was also wrong, and worth recording because it is the *other*
+half of the same function: `https:/app.example.com/cb` (one slash) is not absolute at all, so
+it is reported as `NotAbsolute` rather than `NotRegistered`. Telling a client to register the
+URI would send it away to fix the wrong thing.
+
+### The overlap window lives in the schema
+
+`previous_secret_hash` and `previous_secret_expires_at` are nullable *together* and constrained
+together, because half an overlap is the dangerous case in both directions: a previous hash
+with no expiry is a credential that stays valid after the operator believed it was revoked, and
+an expiry with no hash is a countdown to nothing. Codes are stored as a SHA-256 under a third
+scheme prefix, so the API-key, client-secret and authorization-code spaces cannot be replayed
+into each other — a test asserts the cross-verifications fail in both directions.
+
+### Proof
+
+- `cargo test -p omnion-developer --lib` — **73** (was 54, +19)
+- `cargo test -p omnion-api --lib` — **391** (was 388, +3)
+- `pnpm typecheck` — **2/2**
+- migration `0229` run against a live PostgreSQL: **5/5** — four constraints refuse their bad
+  input and a fifth insert proves they are not simply refusing everything
+
+### One process note, at my own expense
+
+A diagnostic `git stash push`/`pop` pair I ran to prove the `Database` error was pre-existing
+popped a **sibling writer's** stash — `stash@{0}: On wave7: sibling writer's in-flight run.sh
+edit` — into my worktree, and it conflicted, leaving `scripts/qa/run.sh` with conflict markers
+and three unmerged index stages. `git stash pop` on a conflict *keeps* the entry, so all three
+sibling stashes are intact and were verified so afterwards; I restored `run.sh` from HEAD and
+left every stash untouched.
+
+The lesson is narrow and worth stating: **`git stash` in a shared repository is not local.**
+The stashes belonged to w7, w2 and w3 and none of them were mine. The diagnostic was worth
+less than the risk, and the same question is answerable with `git diff --stat
+$(git merge-base ...) HEAD -- <file>`, which touches nothing.
+
+### Next
+
+Slice 3b: the store functions (`oauth_apps` create/list/get/rotate/delete and the code
+ledger), the routes with `developer.oauth.read` / `developer.oauth.manage` — the two keys still
+have to be added to the permission catalogue or the guards refuse **everyone**, which is the
+`guards::require` failure the w6 REQ-133 tick documented — and then the screen. The event
+catalogue half of slice 3 is mostly REQ-016's work already: `/api/v1/events/catalogue` reads
+the same compiled registry, so what is left is the developer framing, not a second source of
+truth.
