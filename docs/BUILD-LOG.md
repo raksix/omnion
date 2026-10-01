@@ -10406,3 +10406,96 @@ turn on a pass that has not run**, and the definition of done forbids closing a 
 
 **Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
 a free slot.
+
+## 2026-10-01 · tick 54 — the attribute that decided which theme painted, written from the wrong fact
+
+**What.** `origin/main` had moved six commits (the `/security/secrets` slice), so the tick opened by
+merging it. Three conflicts, all resolved as unions and then verified **per-parent by
+containment** rather than by line count — `pub mod` declarations, runner names and the
+`mobileRoutes` line in `walkthrough.cjs`: 0 missing from either side, plus the append-only
+BUILD-LOG spliced by `scripts/qa/merge-build-log.py` with **0 entries lost from each parent**
+(`d8bd5b4b`).
+
+Then the queue: REQ-063's only unticked criterion (17) and REQ-019's 9/17/18 are all **browser**
+measurements, and the slot was still held live by w4 (holder 1689806, `/mnt/apopic/omnion-w4`) on a
+box with ~5.8 GB available of 32 and 45 chrome processes. A tick spent queueing behind a live pass
+to run a browser check the box cannot hold is a tick that measures nothing — the decision recorded
+in `state.json` last tick was the right one, and this tick spent itself on code that needs no
+browser instead.
+
+**The defect.** REQ-062 acceptance 1 asks that a site activated on a theme render "with that
+theme's layout, not a colour-swapped copy". Reading the renderer to answer that question is what
+found it, and it is the worst kind this harness can miss.
+
+All ten bundled stylesheets ship in **one** bundle — a CSS import is a static edge in the module
+graph and `resolveTheme()` is a runtime call, so there is no way to load "only the active theme's"
+CSS. Every sheet therefore scopes its rules to `html[data-theme="<key>"]`, and **that one
+attribute decides whether a theme paints anything at all.** `app/[[...slug]]/page.tsx` resolved the
+addressed site's theme; `app/layout.tsx` called `resolveTheme()` **with no argument**, which is
+`OMNION_WEB_THEME` and then the default. So:
+
+```text
+site activated on magazine  →  page draws magazine markup
+                           →  <html data-theme="minimal">   ← from the installation default
+                           →  no magazine sheet matches: every token unset
+                           →  body inherits Minimal's palette and sans stack
+```
+
+Measured in a real Chromium with all ten real sheets, magazine's own markup, and nothing else:
+
+```text
+<html data-theme="magazine">   --ma-magazine-canvas #fffdf9   body rgb(255,253,249)  serif
+<html data-theme="minimal">    --ma-magazine-canvas (UNSET)  body rgb(250,249,245)  ui-sans-serif
+```
+
+The swap was **total, not cosmetic** — every token gone, the display face replaced by the sans
+stack. And the page was still complete, valid and `200`: nothing failed, no log line existed, and
+every screen-level and request-level check in the harness would have passed while the site showed
+the wrong design. That is the shape of defect a green QA report cannot reach, and the reason the
+probe below asserts **agreement between the document and the page** rather than either one alone.
+
+**The fix (`8403f2e8`).** `layout.tsx` resolves the request's site. A layout **cannot** read
+`searchParams` — Next types them apart (`"searchParams" is not a valid layout prop`), and the
+not-found view has no page component under it at all — so `proxy.ts` forwards the visitor's
+`?site=` as `x-omnion-site-hint`. Header, not cookie (a cookie persists the hint across later
+addresses, so a visitor who clicked one `?site=` link would keep drawing that site forever, with no
+visible cause) and not a rewrite (the page already reads `?site=` itself; two readers would have to
+agree a third time). The value passes through **unvalidated** — `classify_hint` and
+`normalizeSiteHint` are two ends of one contract, and a third copy of the rules in a file whose job
+is to forward a string is a third place for them to drift. The page now reads the same header, so
+the two halves of one page resolve one site from one source.
+
+Acceptance 14's warning **did not exist at all**: an unresolvable key resolved to `minimal` in
+silence. `resolveThemeOrWarn` keeps the identical resolution and adds the missing half — the key,
+the fallback, and the keys this build ships — **once per key per process**, because a key is a
+property of the installation and a per-request flood is how an operator learns to ignore the one
+line that would have told them their key was wrong.
+
+**Proof.**
+- `scripts/qa/probe-site-theme.cjs` drives the **real** `proxy.ts` / `lib/api.ts` / `lib/theme.ts`
+  against a fake public API serving three sites on three themes. **8/8**, and **verified to fail
+  first** against the old tree: `layout themes: {"main":"minimal","shop":"minimal","ghost":"minimal"}`
+  for a magazine and a tech site. It runs from `run.sh`, because a test no pass executes measures
+  nothing.
+- `apps/web` and `apps/admin` real `tsc --noEmit` **exit 0**; `omnion-content --lib` **314/0**.
+
+**Three harness traps this tick hit, each of which would have produced a confident wrong report.**
+1. **`execFileSync` + an in-process fake API deadlocks.** The child blocks the event loop that must
+   answer its HTTP request: child waits for server, server waits for child, probe hangs to its own
+   timeout with **no output at all**. Async `execFile` fixed it. A harness that hangs and a harness
+   that passes silently look identical in a cron log.
+2. **`Object.fromEntries(line.split(" "))` on three-column output** keeps only the last pair, so
+   three sites collapsed to one entry and five checks failed with `undefined` while the first two
+   were green — five failures that read as product defects and were the harness's own bug.
+3. **The warning check read stdout; `console.warn` writes stderr.** Themes resolved correctly and
+   that one check failed anyway — which is precisely how a correct renderer gets "fixed" by
+   deleting its warning.
+
+Also: `pnpm typecheck` reported **exit 0 with `cache hit` for `@omnion/web`** twice, and a cache
+hit checks nothing. Deleting `.turbo/cache` changed nothing (turbo's cache is elsewhere), and
+`pnpm typecheck -- --force` forwards `--force` to `tsc`, which rejects it. The only honest
+compiler evidence is `node node_modules/typescript/bin/tsc --noEmit` run directly in the package.
+
+**Next.** Acceptance 1's browser half and REQ-063's criterion 17 both need `--only=block-editor`
+and `--only=theme-builder`, at a tick with the QA slot free **and** RAM above the cliff. Neither is
+a reason to stop writing code while the slot is held: the remaining queue has non-browser slices.
