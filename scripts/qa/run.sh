@@ -179,7 +179,12 @@ printf '%s\n' "$BASHPID" >&9
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
-step "API on :$API_PORT (database omnion_qa)"
+# The real database name, not a literal: a private stack resets and serves `omnion_qa_w4`, and a
+# step line that names `omnion_qa` on that stack is a log that lies about where the pass is
+# pointing — which is the one thing the line exists to say. The port is in it for the same
+# reason: a pass against a private container and one against the shared one look identical
+# otherwise, and "which database" is the first question when a pass dies at sign-in.
+step "API on :$API_PORT (database $QA_DB_NAME, postgres :${QA_PG_PORT:-$DEFAULT_PG_PORT})"
 # A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older

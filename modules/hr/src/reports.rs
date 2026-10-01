@@ -47,10 +47,17 @@ pub struct ReportQuery {
     #[serde(default)]
     pub organization_id: Option<Uuid>,
     /// The period's first day. Absent means the current calendar year.
-    #[serde(default)]
+    ///
+    /// `with = "crate::dates::option"`, and this is the second half of a defect tick 58 found on
+    /// `due_on` and fixed everywhere else: `time::Date`'s own `serde` impl expects a year and an
+    /// **ordinal day**, so `?from=2026-01-01` is refused with "invalid type: string
+    /// "2026-01-01", expected a `Date`" and the report screen's period picker answers 400 on
+    /// every date it offers. The screen sends strings; `Period` below already reads them through
+    /// the module's own adapter, and this is where the query has to say so too.
+    #[serde(default, with = "crate::dates::option")]
     pub from: Option<Date>,
     /// The period's last day, inclusive. Absent means today.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::option")]
     pub to: Option<Date>,
     /// A department and everything under it.
     #[serde(default)]
@@ -202,6 +209,26 @@ impl HeadcountReport {
     }
 }
 
+/// The headcount statement, in one place.
+///
+/// A named function rather than a literal inside [`headcount`] because the unit tests assert a
+/// property of the **text** — that every aggregate is aliased — and a statement inlined in a
+/// query builder cannot be asserted without a live database. Both the query and the test read
+/// this one string, so adding a sixth column without an alias turns the test red.
+const fn headcount_sql() -> &'static str {
+    "select d.id, d.name, \
+            count(*) filter (where e.employment_type = 'full_time')::bigint as full_time, \
+            count(*) filter (where e.employment_type = 'part_time')::bigint as part_time, \
+            count(*) filter (where e.employment_type = 'contract')::bigint as contract, \
+            count(*) filter (where e.employment_type = 'intern')::bigint as intern, \
+            count(e.id)::bigint as total \
+     from hr_departments d \
+     left join hr_employees e on e.department_id = d.id \
+          and e.organization_id = d.organization_id \
+          and e.employee_status <> 'terminated' \
+          and e.start_date <= "
+}
+
 /// Build the headcount report.
 pub async fn headcount(
     pool: &PgPool,
@@ -209,19 +236,7 @@ pub async fn headcount(
     period: Period,
     department_id: Option<Uuid>,
 ) -> Result<HeadcountReport> {
-    let mut builder = QueryBuilder::<Postgres>::new(
-        "select d.id, d.name, \
-                count(*) filter (where e.employment_type = 'full_time')::bigint, \
-                count(*) filter (where e.employment_type = 'part_time')::bigint, \
-                count(*) filter (where e.employment_type = 'contract')::bigint, \
-                count(*) filter (where e.employment_type = 'intern')::bigint, \
-                count(e.id)::bigint \
-         from hr_departments d \
-         left join hr_employees e on e.department_id = d.id \
-              and e.organization_id = d.organization_id \
-              and e.employee_status <> 'terminated' \
-              and e.start_date <= ",
-    );
+    let mut builder = QueryBuilder::<Postgres>::new(headcount_sql());
     builder.push_bind(period.to);
     builder.push(" where d.organization_id = ");
     builder.push_bind(organization_id);
@@ -1211,6 +1226,77 @@ mod tests {
         let json = serde_json::to_value(sample_headcount()).expect("serialisable");
         assert_eq!(json["period"]["from"], "2026-01-01", "{json}");
         assert_eq!(json["period"]["to"], "2026-12-31", "{json}");
+    }
+
+    #[test]
+    fn the_query_reads_the_dates_the_screen_sends() {
+        // The defect this test exists for: `ReportQuery.from`/`to` were bare `Date`s, so the
+        // query string every `<input type="date">` produces was refused with
+        // `invalid type: string "2026-01-01", expected a `Date` — the picker answered 400 on
+        // every date it offered.
+        //
+        // It survived 16/16 walks because **every** one of them built a `ReportQuery` in Rust and
+        // called the store: nothing ever went through `serde` on the way in. A test that
+        // constructs the type it is testing is a test of the constructor, and the wire format is
+        // the part that was wrong.
+        let from: ReportQuery = serde_json::from_str(r#"{"from":"2026-01-01"}"#)
+            .expect("a screen's date must parse");
+        assert_eq!(from.from, Some(day(time::Month::January, 1)));
+
+        let both: ReportQuery =
+            serde_json::from_str(r#"{"from":"2026-01-01","to":"2026-10-01"}"#)
+                .expect("both ends must parse");
+        let period = Period::resolve(&both, day(time::Month::October, 1))
+            .expect("the period the screen asked for");
+        assert_eq!(period.from, day(time::Month::January, 1));
+        assert_eq!(period.to, day(time::Month::October, 1));
+
+        // A cleared date field sends `""`, which is absent rather than a refusal — otherwise the
+        // control is optional in the form and mandatory in the API.
+        let cleared: ReportQuery = serde_json::from_str(r#"{"from":"","to":null}"#)
+            .expect("a cleared field must parse");
+        assert_eq!(cleared.from, None);
+        assert_eq!(cleared.to, None);
+
+        // And a date that is not one is refused **with the format named**, not with serde's
+        // tuple-shaped expectation, which is a message about `Date` the caller cannot act on.
+        let wrong = serde_json::from_str::<ReportQuery>(r#"{"from":"01/01/2026"}"#)
+            .expect_err("a wrong format must refuse");
+        assert!(
+            wrong.to_string().contains("YYYY-MM-DD"),
+            "the refusal must name the format: {wrong}"
+        );
+    }
+
+    #[test]
+    fn the_headcount_query_aliases_every_aggregate_it_reads_back() {
+        // The second defect the browser pass found on this screen: the aggregates carried no
+        // `as`, so Postgres named the column after the expression and sqlx's `FromRow` looked for
+        // a column called `full_time` inside one — "no column found for name: full_time", a 500
+        // on every load.
+        //
+        // A unit test cannot run the query, so it pins the property that caused it: every
+        // aggregate in the headcount statement is aliased, and each alias is a field the row
+        // struct reads. `headcount_sql()` is the one place the statement lives.
+        let sql = headcount_sql();
+        for alias in ["full_time", "part_time", "contract", "intern", "total"] {
+            assert!(
+                sql.contains(&format!("as {alias}")),
+                "{alias} must be aliased or sqlx cannot read it back: {sql}"
+            );
+        }
+        // Every `count(` in the statement is followed by an alias: an unaliased aggregate is the
+        // defect, and counting them is the check that survives somebody adding a sixth column.
+        let unaliased = sql
+            .match_indices("count(")
+            .filter(|(index, _)| {
+                // Walk forward from the opening paren to the alias this count ends with.
+                let rest = &sql[*index..];
+                let end = rest.find(')').unwrap_or(0);
+                !rest[end..].contains(" as ")
+            })
+            .count();
+        assert_eq!(unaliased, 0, "every aggregate needs an alias: {sql}");
     }
 
     #[test]

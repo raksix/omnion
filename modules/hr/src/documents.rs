@@ -205,12 +205,22 @@ pub struct NewDocument {
 /// valid, and the first person to notice is the one whose passport was not chased in time.
 fn push_expiry_predicate(builder: &mut QueryBuilder<'_, Postgres>, expiring: bool) {
     if expiring {
+        // `make_interval(days => $1)` and nothing else. `make_interval` has `secs … weeks`
+        // variants and **no `bigint` one**, and a bound integer arrives as `bigint`, so the
+        // common `make_interval(days => $1::int)` spellings both fail at prepare time with
+        // "function make_interval(days => bigint) does not exist" — a 500 on the document
+        // screen that no unit test could see, because the unit tests pin the *builder* and the
+        // database never binds the parameter.
+        //
+        // The cast to `int` is therefore part of the expression, not decoration: it is what
+        // picks the `days => int` variant. `EXPIRY_WINDOW_DAYS` is a `i64` constant and sqlx
+        // sends it as `bigint`, so the cast has to happen in SQL.
         builder.push(
             "d.expires_on is not null and d.expires_on >= current_date \
              and d.expires_on <= current_date + make_interval(days => ",
         );
         builder.push_bind(EXPIRY_WINDOW_DAYS);
-        builder.push(")");
+        builder.push("::int)");
     } else {
         // `false` is a positive arm, not a negation of the other one: a document with no date at
         // all is not "expiring", so `not (expiring)` written as SQL would drop the entire
