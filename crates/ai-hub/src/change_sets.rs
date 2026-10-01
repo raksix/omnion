@@ -497,36 +497,61 @@ pub fn validate(set: &ChangeSet) -> Result<()> {
     }
 
     for op in &set.operations {
-        if op.key.trim().is_empty() {
-            return Err(AiHubError::InvalidChangeSet(
-                "every operation needs a key".to_owned(),
-            ));
-        }
-        if op.operation.resource_type.trim().is_empty() {
-            return Err(AiHubError::InvalidChangeSet(format!(
-                "operation `{}` names no resource type",
-                op.key
-            )));
-        }
-        if op.operation.resource_type != "page" {
-            return Err(AiHubError::InvalidChangeSet(format!(
-                "operation `{}` targets `{}`; this build previews pages only",
-                op.key, op.operation.resource_type
-            )));
-        }
-        if op.operation.kind != OpKind::Create && op.operation.resource_id.trim().is_empty() {
-            return Err(AiHubError::InvalidChangeSet(format!(
-                "operation `{}` is an {} with no target id",
-                op.key,
-                op.operation.kind.label()
-            )));
-        }
-        if op.operation.kind == OpKind::Create && !op.operation.resource_id.is_empty() {
-            return Err(AiHubError::InvalidChangeSet(format!(
-                "operation `{}` is a create that names a target id (`{}`); a create has none",
-                op.key, op.operation.resource_id
-            )));
-        }
+        validate_operation(op)?;
+    }
+    Ok(())
+}
+
+/// The per-operation rules, on their own so a caller that builds operations **without** a
+/// `ChangeSet` can run them.
+///
+/// # Why this was extracted
+///
+/// Slice 3g adds a second producer of operations: a chat reply that proposes them, parsed
+/// straight off the model's answer. That producer has no `ChangeSet` to hand — it has a list,
+/// and the list is validated *before* the row exists, because a proposal nobody will ever
+/// confirm should not occupy a row. So the rules could either be copied there (two
+/// implementations, and the copy is the one that drifts) or run from here.
+///
+/// The copy is the dangerous version. `resource_type == "page"` is the rule that decides
+/// whether the applier has a reader at all, and a parser that accepted `"themes"` would file
+/// a set whose operations no preview can ever resolve — accepted at the boundary, refused at
+/// the confirm, with the reviewer holding a set the platform could not have read. One
+/// implementation means the parser cannot accept anything the store would refuse.
+///
+/// # Errors
+///
+/// `Err(InvalidChangeSet)` naming the operation and the rule it broke.
+pub fn validate_operation(op: &ChangeOp) -> Result<()> {
+    if op.key.trim().is_empty() {
+        return Err(AiHubError::InvalidChangeSet(
+            "every operation needs a key".to_owned(),
+        ));
+    }
+    if op.operation.resource_type.trim().is_empty() {
+        return Err(AiHubError::InvalidChangeSet(format!(
+            "operation `{}` names no resource type",
+            op.key
+        )));
+    }
+    if op.operation.resource_type != "page" {
+        return Err(AiHubError::InvalidChangeSet(format!(
+            "operation `{}` targets `{}`; this build previews pages only",
+            op.key, op.operation.resource_type
+        )));
+    }
+    if op.operation.kind != OpKind::Create && op.operation.resource_id.trim().is_empty() {
+        return Err(AiHubError::InvalidChangeSet(format!(
+            "operation `{}` is an {} with no target id",
+            op.key,
+            op.operation.kind.label()
+        )));
+    }
+    if op.operation.kind == OpKind::Create && !op.operation.resource_id.is_empty() {
+        return Err(AiHubError::InvalidChangeSet(format!(
+            "operation `{}` is a create that names a target id (`{}`); a create has none",
+            op.key, op.operation.resource_id
+        )));
     }
     Ok(())
 }

@@ -33,6 +33,7 @@ pub mod health_store;
 pub mod identity;
 pub mod loop_engine;
 pub mod model;
+pub mod proposal;
 pub mod protocol;
 pub mod provider_model;
 pub mod registry;
