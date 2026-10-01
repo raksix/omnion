@@ -1124,9 +1124,34 @@ async fn a_correction_is_guarded_carries_its_reason_and_audits_itself() {
         "the clock cannot run backwards: {}",
         backwards.body
     );
+    // The product publishes the FIELD as structured data, not only in the sentence: `details.field`
+    // is `check_out` while the prose is "the check-out must be after the check-in". Asserting the
+    // sentence would break the moment somebody improves the wording, and would keep passing if a
+    // different field were named -- so this walks the structured half, which is what a client
+    // can branch on without parsing English.
+    assert_eq!(
+        error_code(&backwards.body),
+        "invalid_hr_record",
+        "the refusal names its case: {}",
+        backwards.body
+    );
+    assert_eq!(
+        backwards.body["error"]["details"]["entity"].as_str(),
+        Some("attendance"),
+        "the refusal says which record is wrong: {}",
+        backwards.body
+    );
+    assert_eq!(
+        backwards.body["error"]["details"]["field"].as_str(),
+        Some("check_out"),
+        "the refusal names the field, structurally: {}",
+        backwards.body
+    );
+    // …and the sentence still says it in words, because the correction drawer renders the message
+    // and a bare field name is not something a person reads. Both halves, each for its own reader.
     assert!(
-        error_message(&backwards.body).contains("check_out"),
-        "the refusal names the field: {}",
+        error_message(&backwards.body).contains("check-out"),
+        "the sentence names the field too: {}",
         backwards.body
     );
 
