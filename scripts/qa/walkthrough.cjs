@@ -846,6 +846,11 @@ async function ensureSignedIn(page, report) {
   const pass = page.locator('input[type="password"], input[name="password"], #password').first();
   await pass.fill(CREDS.password).catch(() => {});
   await shot(page, "10-login-filled");
+  // The mark is taken BEFORE the click, not after it — a mark taken afterwards sees an EMPTY slice
+  // of the log and the predicate is false on every single attempt, so the retry branch is dead
+  // code that reads exactly like the fix it is supposed to be. My first version put the line here
+  // and the gate caught it: the mark sat 142 characters after the click it was meant to precede.
+  const mark = netFailures.length;
   const clicked = await primaryClick(page);
   // Wait for the sign-in to LAND, not for a fixed span.
   //
@@ -859,10 +864,22 @@ async function ensureSignedIn(page, report) {
   // So: poll for EITHER leaving /login OR the app shell rendering. The shell is the positive
   // signal and matters more than the URL — a panel that renders its shell while the router has
   // not yet rewritten the address is signed in, and a pass that reads only the URL calls that a
-  // failure. The error state (`role="alert"` beside the form) is checked too, so a genuine
-  // refusal returns promptly instead of burning the whole budget on a wait that cannot succeed.
+  // failure. The error state (`role="alert"`) is checked too, so a genuine refusal returns
+  // promptly instead of burning the whole budget on a wait that cannot succeed.
+  //
+  // **A `429` is NOT a refusal, and this loop used to treat it as one.** The limiter budgets
+  // `sign_in` at ten per five minutes, and a pass that signs in more than once — the desktop
+  // phase, the re-login before the mobile phase, and the mobile context itself — can spend the
+  // whole budget on its own bookkeeping. On 2026-10-01 that produced a pass which signed in, was
+  // refused with `429` when it tried again, and then reported **22 of 44 screens** as "the
+  // session was lost — the browser was on the sign-in form". Every one of those screens was
+  // measured as a login form, which is the exact shape tick 59 was fixed for: the diagnosis was
+  // right about the symptom and completely wrong about the cause. A `429` names itself in the
+  // network log; the screen it produced names a lost session. So a rate-limited attempt is now
+  // retried after a pause, and only a non-429 refusal breaks the loop.
   let signedIn = false;
   let refusal = "";
+  let rateLimited = false;
   for (let attempt = 0; attempt < 40; attempt += 1) {
     const state = await page
       .evaluate(() => ({
@@ -871,21 +888,57 @@ async function ensureSignedIn(page, report) {
         alert: (document.querySelector('[role="alert"]')?.textContent || "").trim().slice(0, 200),
       }))
       .catch(() => ({ offLogin: false, shell: false, alert: "" }));
-    if (state.alert) {
-      refusal = state.alert;
-      break;
-    }
+    // Scoped to the sign-in endpoint, so an unrelated `429` from another screen cannot make a
+    // perfectly good login look rate limited — and the opposite mistake (ignoring the endpoint)
+    // is the one that produced 22 screens measured as a login form.
+    rateLimited = refusedSince(mark, "/auth/login");
     if (state.shell || state.offLogin) {
       signedIn = true;
       break;
     }
+    if (rateLimited && !state.alert) {
+      // Wait out the limiter rather than reporting a failure the platform did not produce. The
+      // pause is the limiter's own window divided by a small factor so a handful of retries fits
+      // inside it; giving up here would leave the pass measuring sign-in forms for the rest of the
+      // run, which is what makes this the most expensive place to be wrong.
+      log(`sign-in: rate limited (429) — waiting ${SIGN_IN_BACKOFF_MS}ms before retrying`);
+      await page.waitForTimeout(SIGN_IN_BACKOFF_MS);
+      await clickSignIn(page);
+      continue;
+    }
+    if (state.alert) {
+      refusal = state.alert;
+      break;
+    }
     await page.waitForTimeout(500);
   }
-  report.steps.push({ action: "login", clicked, url: page.url(), signedIn, refusal });
+  report.steps.push({ action: "login", clicked, url: page.url(), signedIn, refusal, rateLimited });
   if (!signedIn) {
-    log(`sign-in: the form was submitted but no session appeared${refusal ? ` — the panel said: ${refusal}` : ""}`);
+    log(`sign-in: the form was submitted but no session appeared${refusal ? ` — the panel said: ${refusal}` : ""}${rateLimited ? " (last attempt was rate limited)" : ""}`);
   }
   return signedIn;
+}
+
+/// How long to wait after a rate-limited sign-in before trying again.
+const SIGN_IN_BACKOFF_MS = Number(process.env.QA_SIGN_IN_BACKOFF_MS || 15000);
+
+/// Whether the panel was refused `429` since the pass marked `mark`.
+///
+/// Read from `netFailures` — the array `attach` fills from `page.on("response")` for every status
+/// `>= 400` — rather than from the DOM, because a `429` never reaches the panel as an alert: the
+/// form re-renders empty and the only trace is the network entry. Inventing a `page.__qaNet` here
+/// is what this helper did first, and it is worth recording because the failure mode is silent in
+/// the worst way: the array is always empty, so the predicate is always `false`, so the retry
+/// branch never runs, and the code reads exactly like the fix it replaced.
+function refusedSince(mark, urlFragment) {
+  return netFailures
+    .slice(mark)
+    .some((failure) => failure.status === 429 && String(failure.url || "").includes(urlFragment));
+}
+
+/// Press the sign-in button again after a backoff.
+async function clickSignIn(page) {
+  await primaryClick(page).catch(() => {});
 }
 
 // ---------------------------------------------------------------- interaction
@@ -11611,6 +11664,18 @@ async function runReliabilityBreakersDepth(page) {
   md.push("");
   for (const p of report.pages) {
     const d = p.diagnostics;
+    // The SAME guard the two roll-up loops above apply, for the same reason and at the same cost.
+    // This loop is the LAST thing a pass does, so a missing `diagnostics` here is the throw that
+    // takes the whole finding report with it — which is exactly what happened on 2026-10-01: the
+    // pass walked 150 screenshots of the wave-5b screens and then died on
+    // `Cannot read properties of undefined (reading 'horizontalOverflow')` at this very line,
+    // writing a 94-byte summary that said `fatal` and nothing else. 150 measured screens, and the
+    // artifact recorded none of them: the report is not a by-product of the walk, it IS the
+    // output, and the last untested line of it can discard everything before it.
+    if (!d) {
+      md.push(`- **${p.name}** — NOT MEASURED${p.failed ? ` (${p.failed})` : ""}`);
+      continue;
+    }
     md.push(`- **${p.name}** — overflow: ${d.horizontalOverflow ? "YES" : "no"} · offscreen: ${d.offscreen.length} · broken images: ${d.brokenImages.length} · low contrast: ${d.lowContrast.length} · unlabeled inputs: ${d.unlabeledInputs.length} · duplicate ids: ${d.duplicateIds.length} · h1: ${d.h1Count}`);
   }
   md.push("");
