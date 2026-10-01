@@ -9168,3 +9168,13 @@ accept/reject/edit/regenerate toolbar, the blocking summary, keyboard and mobile
 client, and the two new routes in `scripts/qa/walkthrough.cjs`. Until a screen exists in the
 inventory, no REQ-045 box that says "the tree", "the tree is usable" or "the footer counters"
 can be ticked — which is most of them, and is the honest state of slice 3.
+
+**One environment note, recorded because the last measurement is not the one in the table.** After
+both suites were green (routes 10/10, store 18/18), the **shared** PostgreSQL at `:5433` entered
+recovery: ten writers, each holding a `max_connections: 4` pool against a server-wide 100, and a
+re-run of the route walks answered `PoolTimedOut` on every test before a single assertion ran. The
+container is `Up 20 hours (unhealthy)`. Nothing in this tick's diff causes that — the tables and
+queries are the same ones that ran green minutes earlier — but it is the honest reason the
+route suite's most recent run is red for a reason that has nothing to do with the code, and the
+numbers in the table above are the green runs, not this one. **A suite that cannot reach its
+database has measured nothing**; treat `PoolTimedOut` as infrastructure, not as a verdict.
