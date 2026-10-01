@@ -16,6 +16,10 @@
 > restarted. **No screen of this REQ is claimed as verified in a browser until it has been.**
 > The three outbound walks last tick flagged as needing a re-run are still blocked on the same
 > outage. ·
+> slice 2 the **re-map** — `guard_remap.rs`, built inside `checkpoint()` where the original
+> text and the detector's spans are both in hand, `substitute` for the requester and `redact`
+> for everyone else, plus the `mask_text`/`placeholder()` deterministic-token drift this found
+> and closed (`ad445d11`) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
