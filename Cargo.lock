@@ -1462,6 +1462,7 @@ dependencies = [
  "p256",
  "percent-encoding",
  "rand 0.8.8",
+ "redis",
  "reqwest",
  "rsa",
  "serde",
