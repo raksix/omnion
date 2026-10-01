@@ -10753,3 +10753,72 @@ constant-time comparison; the live path is a digest equality, so the function is
 thing the lookup should use (with a constant-time digest compare) or a comment that promises a
 property no code path has. Either way it is the next candidate in the same sweep, and it is the
 same shape: *a comment about a credential, and nothing behind it.*
+
+## Tick 52 — REQ-117 slice 21: the public capture endpoint's only lookup was a sequential scan
+
+**What.** `find_source_by_key` has been documented as *"one indexed equality"* since the keyed
+intake surface shipped. No index covered `endpoint_key_hash`. Read back from the catalog rather
+than inferred — `pg_indexes` on a fully migrated database lists five indexes on
+`crm_intake_sources` (primary key, `(organization_id, name)`, the partial `form_key` unique index,
+its duplicate, and the SLA-policy index) and this is not one of them, while the column has been
+written by `create_source` and `rotate_key` since `0055` and read by nothing else.
+
+Fourth time in four ticks that reading a comment against the code produced the real defect (a field
+comment, a method comment, a doc comment, and now a performance claim). What makes this one worse
+than a stale sentence is the surface: `POST /api/v1/crm/intake/{source_key}` is the platform's one
+deliberately unauthenticated business endpoint — no session, no permission guard, the key *is* the
+authentication — and the REQ's own Risks section calls it "the attack surface". The predicate
+carries no `organization_id` (a key names its own tenant), so the scan spans **every tenant**; a
+wrong key costs exactly what a right one does, so the whole cost is reachable with no credential at
+all; and it grows with the platform's success rather than the attacker's effort.
+`rate_limit_per_hour` cannot help — the request never reaches a source row.
+
+**Proof.**
+
+- `bash scripts/qa/run-crm-key-lookup-index.sh` — **6 passed, 0 failed**.
+- **The measurement, before and after**, on the gate's own 20k-row fixture scaled up to 100k:
+
+  | | plan | rows removed | buffers | time |
+  |---|---|---|---|---|
+  | before | `Seq Scan on crm_intake_sources` | 100000 | 2593 | 13.645 ms |
+  | after | `Index Scan using crm_intake_sources_key_lookup_idx` | 0 | 4 | 0.038 ms |
+
+  The buffer count is the load-bearing number rather than the 360x: it is what a spray of concurrent
+  anonymous requests multiplies, since each one holds those shared buffers while it scans.
+- **Negative control:** the same statement against the same fixture with the index dropped inside a
+  rolled-back transaction returns `Seq Scan`, and a further assertion confirms the rollback happened
+  — a gate that leaves its own defect behind makes the next run meaningless.
+- `cargo test -p omnion-module-crm-intake --lib` **172 passed** (was 171). `cargo build -p
+  omnion-api` green. Admin `tsc --noEmit` exit 0. Clippy 0. `run-crm-key-lifecycle.sh` **7/7**
+  unchanged — it drives `create_source` and the public lookup, so it is the regression net here.
+
+**My own defect, and it is the tick's lesson.** The new unit test pins the comment to the
+migration, and its first version located the statement with
+`lines().find(|l| l.contains("create index"))` — which returned a **comment** line, because the
+migration's header quotes that exact phrase in prose. The `unique` assertion therefore passed
+against a statement saying `create unique index`, and it **shipped green in the same commit that
+claims to pin the promise.** A test that cannot fail is decoration; the three assertions are now
+proven to fail independently (`unique` added, partial predicate dropped, `concurrently` dropped),
+each panicking with its own message, then green again on restore.
+
+**The index shape, and why not the obvious one.** Partial on `endpoint_key_hash is not null`,
+because a form-bound source stores no digest and the nulls are the majority of a healthy table.
+**Not** partial on `active`, because a deactivated source's digest must still be *found and
+refused* — excluding inactive rows would turn "paused source" into "unknown key" for the index's
+own sake, and the surface deliberately collapses those into one `401`. **Not unique**, because
+`crm_key_lifecycle.rs` deliberately stores one real digest on two rows (the state a restored dump or
+an import tool leaves behind) and the lookup refuses it with its `kind` predicate; a unique index
+would make that state unrepresentable and leave the predicate untested. `concurrently`, because a
+plain build holds a lock that blocks writes on the one endpoint with no permission guard — a
+performance fix that becomes a short outage.
+
+**Not done, deliberately.** No browser pass — no screen changed, and the QA slot is held by a live
+w3 pass. REQ-117 stays open: the REQ-064 form-editor card is slice 3's one missing screen and
+REQ-064's forms module is on no branch.
+
+**Commits.** `ccf36b44` the migration, the corrected comment, the gate and the test.
+
+**Next.** `keys::verify_key` is still exported with no production caller while its comment claims
+"comparison is constant-time" — the live path is a digest equality in SQL. Either the lookup should
+consult it, or the promise describes a property no path has. Same shape again: *a comment about a
+credential, and nothing behind it.*
