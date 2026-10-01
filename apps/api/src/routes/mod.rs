@@ -88,6 +88,8 @@ pub mod content_read;
 pub mod featured_media;
 pub mod forms;
 pub mod health;
+pub mod health_incidents;
+pub mod health_panel;
 pub mod iam;
 pub mod iam_approvals;
 pub mod iam_policy;
@@ -112,6 +114,7 @@ pub mod members;
 pub mod newsletter;
 pub mod notifications;
 pub mod notifications_admin;
+pub mod notifications_test;
 pub mod onboarding;
 pub mod patterns;
 pub mod public;
@@ -1025,6 +1028,13 @@ pub fn router(state: AppState) -> Router {
         .route_layer(guards::require(&state, "notifications.manage"));
     let notifications_channels =
         get(notifications_admin::channels).layer(guards::require(&state, "notifications.manage"));
+    // The settings screen's per-channel `Test delivery`. Declared next to the other
+    // `notifications.manage` surface and, like `preferences` above, before the `{id}` routes:
+    // `POST /notifications/preferences/test` is two static segments, and axum ranks static
+    // ahead of parameter, so the order only matters as a promise that the literal keeps
+    // winning. Guarded by the same key as the preferences it tests.
+    let notifications_test = post(notifications_test::test_delivery)
+        .layer(guards::require(&state, "notifications.manage"));
     let notifications_outbox = Router::new()
         .route(
             "/notifications/outbox",
@@ -1444,6 +1454,111 @@ pub fn router(state: AppState) -> Router {
         // deployment that grants both lets an account that can only look also dismiss what it
         // saw. The static segments come first so axum ranks them ahead of
         // `/security/findings/{id}`.
+        // System health (REQ-014, slice 1). Two keys, and the split is the one the request
+        // draws: seeing that a dependency is unhappy is `health.read`, and everything that
+        // *writes* is `health.manage`.
+        //
+        // `POST /health/checks/run` rides `health.manage` rather than `health.read` even
+        // though it "only runs probes", because it is a mutation: it records a sample per
+        // metric. An account that could trigger a run on demand could fill the retention
+        // window with rows of its own choosing, one press at a time, and the trends would
+        // become a fiction nobody could audit. Reading a status screen and *causing* the
+        // platform to record something are different powers.
+        //
+        // `/healthz` and `/readyz` are NOT here and must not be: they stay unversioned and
+        // unguarded so an orchestrator's probe never depends on a session or a permission
+        // (see `crate::routes::health` and `crate::routes::readyz`).
+        .route(
+            "/health/overview",
+            get(health_panel::overview).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/checks/run",
+            post(health_panel::run_checks).layer(guards::require(&state, "health.manage")),
+        )
+        .route(
+            "/health/services/{key}",
+            get(health_panel::service).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/samples",
+            get(health_panel::samples).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/host",
+            get(health_panel::host_metrics).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/summary",
+            get(health_panel::summary).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/metrics",
+            get(health_panel::metrics).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/metrics.csv",
+            get(health_panel::metrics_csv).layer(guards::require(&state, "health.read")),
+        )
+        // Pruning is destructive and irreversible, so it is a POST behind the managing key
+        // and not a side effect of a settings save.
+        .route(
+            "/health/maintenance/prune",
+            post(health_panel::prune).layer(guards::require(&state, "health.manage")),
+        )
+        // -------------------------------------------------------------------------------------
+        // Incidents and threshold policy (REQ-014 slice 3).
+        //
+        // Every write here is `health.manage` and every read is `health.read`, which is why
+        // the two live on separately-built method routers that get `.merge()`d: axum applies
+        // `.layer()` to the routers it is chained onto, so a single `route_layer` over a path
+        // that serves both a GET and a PATCH would demand the *managing* key from the reader
+        // who only opens an incident to read it. `guards::require` resolves its name from the
+        // permission catalogue, so both keys must exist there (`crates/permissions`).
+        // -------------------------------------------------------------------------------------
+        .route(
+            "/health/incidents",
+            get(health_incidents::incidents).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/incidents/{id}",
+            get(health_incidents::incident)
+                .layer(guards::require(&state, "health.read"))
+                .merge(
+                    patch(health_incidents::patch_incident)
+                        .layer(guards::require(&state, "health.manage")),
+                ),
+        )
+        // Settings split the same way: `GET` shows the policy, `PUT` changes it. A single
+        // route cannot, because the reader is exactly the person who should see *which*
+        // thresholds are configured without being able to rewrite them.
+        .route(
+            "/health/settings",
+            get(health_incidents::get_settings)
+                .layer(guards::require(&state, "health.read"))
+                .merge(
+                    put(health_incidents::put_settings)
+                        .layer(guards::require(&state, "health.manage")),
+                ),
+        )
+        .route(
+            "/health/maintenance-windows",
+            get(health_incidents::list_windows)
+                .layer(guards::require(&state, "health.read"))
+                // Creating a window is a write even though it only *suppresses* alerts: an
+                // operator who can silence a whole service has to be the operator who can
+                // change its thresholds, or the screen is a mute button for anyone with a
+                // login.
+                .merge(
+                    post(health_incidents::create_window)
+                        .layer(guards::require(&state, "health.manage")),
+                ),
+        )
+        .route(
+            "/health/maintenance-windows/{id}",
+            delete(health_incidents::delete_window)
+                .layer(guards::require(&state, "health.manage")),
+        )
         .route(
             "/security/overview",
             get(security::overview).layer(guards::require(&state, "security.read")),
@@ -1644,6 +1759,7 @@ pub fn router(state: AppState) -> Router {
         // as a `PUT` on an id called "preferences" — which is a `400` a reader would report
         // as "the settings screen is broken".
         .route("/notifications/preferences", notifications_preferences)
+        .route("/notifications/preferences/test", notifications_test)
         // Slice 3's four sub-routers, merged rather than spelled out route by route. Each is a
         // `Router` with its own `route_layer`, so the guard travels with the group and a future
         // fifth endpoint joins the right one by being added inside its block.

@@ -21,7 +21,20 @@ import type {
   SecurityFindingStatus,
   SecurityImportReport,
   SecurityOverview,
-
+  HealthOverview,
+  HealthServiceDetail,
+  HealthSamplePoint,
+  HealthSummary,
+  HealthPruneResult,
+  HealthMetricRow,
+  HealthMetricsReport,
+  HealthRangeKey,
+  HealthIncident,
+  HealthIncidentPage,
+  HealthIncidentAction,
+  HealthMaintenanceWindow,
+  HealthSettings,
+  HealthThreshold,
   HeaderPolicyDocument,
   HeaderPolicySave,
   HeaderPolicySaved,
@@ -4616,6 +4629,33 @@ export function removeNotificationDevice(id: string): Promise<void> {
   return request<void>(`/api/v1/notifications/push-subscriptions/${id}`, { method: "DELETE" });
 }
 
+/**
+ * Send one test notification through one channel, now, and report what happened.
+ *
+ * **The answer carries the transport's own outcome, not a boolean the client invented.**
+ * `delivered` plus `detail` are separate because the settings screen renders them
+ * differently — the boolean decides the colour of the line, `detail` is the sentence under
+ * it. A failure is a `200`, not an error status: "your SMTP host refused the message" is a
+ * result the reader asked for, and a `502` would tell them their settings screen is broken.
+ */
+export function sendTestNotificationDelivery(input: {
+  channel: string;
+  title?: string;
+  body?: string;
+}): Promise<{
+  channel: string;
+  delivered: boolean;
+  detail: string;
+  response_status: number | null;
+  notification_id: string;
+  delivery_status: string;
+}> {
+  return request("/api/v1/notifications/preferences/test", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 /** What each channel can do on this installation, and the sentence explaining it. */
 export function fetchNotificationChannels(): Promise<NotificationChannelReadiness[]> {
   return request<NotificationChannelReadiness[]>("/api/v1/notifications/channels");
@@ -6932,4 +6972,277 @@ export function saveBlob(blob: Blob, filename: string): void {
   anchor.click();
   anchor.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+}
+
+// ---------------------------------------------------------------------------------------------
+// System health (REQ-014).
+//
+// The overview is fetched with `cache: "no-store"` and the POST carries the CSRF header
+// `request()` already adds, because both of those are the difference between this screen
+// showing the platform and showing a screenshot of it. A cached overview is a status
+// screen that answers "how were things when this tab was last opened", which is the one
+// question a health screen must never answer.
+// ---------------------------------------------------------------------------------------------
+
+/** Every service's state, the host's metrics and the banner, read live. */
+export function fetchHealthOverview(): Promise<HealthOverview> {
+  return request<HealthOverview>("/api/v1/health/overview", { cache: "no-store" });
+}
+
+/**
+ * Run every probe now and record the samples.
+ *
+ * The answer is a full overview rather than a run id, so the panel replaces what it has
+ * with what the server now believes. A client that merged the new states into the old rows
+ * would keep the last stored `healthy` for a service that has just gone down.
+ */
+export function runHealthChecks(): Promise<HealthOverview> {
+  return request<HealthOverview>("/api/v1/health/checks/run", {
+    method: "POST",
+    cache: "no-store",
+  });
+}
+
+/** One service, with the checks it ran and the metrics it has published. */
+export function fetchHealthService(key: string): Promise<HealthServiceDetail> {
+  return request<HealthServiceDetail>(`/api/v1/health/services/${encodeURIComponent(key)}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * One metric's series, oldest first.
+ *
+ * The window is a **named range** (`1h` / `24h` / `7d`), the same vocabulary
+ * `/health/metrics` uses, and the server refuses anything else with a message naming
+ * what is offered. It used to take `hours` and clamp it, which is the silent-clamp
+ * shape: a caller asking for a month got a week with a `200`, drew the wrong chart,
+ * and had no way to tell from the response. The parameter's *name* is the reason this
+ * was worth changing rather than leaving compatible — `hours=24` and `range=24h` are
+ * the same window with two spellings, and the second one travels into the CSV
+ * filename, so there must be exactly one.
+ */
+export function fetchHealthSamples(
+  service: string,
+  metric: string,
+  range: HealthRangeKey = "24h",
+): Promise<HealthSamplePoint[]> {
+  const query = new URLSearchParams({ service, metric, range });
+  return request<HealthSamplePoint[]>(`/api/v1/health/samples?${query.toString()}`, {
+    cache: "no-store",
+  });
+}
+
+/** The one-line summary the security overview and the operator dashboard embed. */
+export function fetchHealthSummary(): Promise<HealthSummary> {
+  return request<HealthSummary>("/api/v1/health/summary", { cache: "no-store" });
+}
+
+/** The host's raw kernel readings, including the notes for anything unreadable. */
+export function fetchHealthHost(): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>("/api/v1/health/host", { cache: "no-store" });
+}
+
+/** Drop raw samples past the retention window. Destructive, so it is a POST. */
+export function pruneHealthSamples(): Promise<HealthPruneResult> {
+  return request<HealthPruneResult>("/api/v1/health/maintenance/prune", { method: "POST" });
+}
+
+/**
+ * `GET /api/v1/health/metrics` — the aggregated table for a named range.
+ *
+ * The range is a **name** (`1h`, `24h`, `7d`) rather than a number of hours, and the server
+ * refuses anything else. The client cannot quietly ask for a window the panel has no label
+ * for, which is what stops a table headed `7d` from holding a day.
+ */
+export function fetchHealthMetrics(
+  range: HealthRangeKey = "24h",
+): Promise<HealthMetricsReport> {
+  return request<HealthMetricsReport>(
+    `/api/v1/health/metrics?range=${encodeURIComponent(range)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * `GET /api/v1/health/metrics.csv` — exactly the rows the table is showing.
+ *
+ * The **server** renders the file from the same query the table used, and repeats the window in
+ * `X-Health-Range`. The client never builds CSV from the rows it holds: a client-built export is
+ * a client-chosen file, and "the export matches the range shown" is precisely the property that
+ * a client-built export cannot promise.
+ */
+export async function downloadHealthMetricsCsv(
+  range: HealthRangeKey = "24h",
+): Promise<{ rows: number; blob: Blob; filename: string; range: string }> {
+  const url = `/api/v1/health/metrics.csv?range=${encodeURIComponent(range)}`;
+  let response: Response;
+  try {
+    response = await fetch(url, { credentials: "same-origin", headers: { accept: "text/csv" } });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    let code = "export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(text) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON error body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  const served = response.headers.get("x-health-range") ?? range;
+  const blob = await response.blob();
+
+  // The row count is read from the file itself rather than trusted from a header, because the
+  // header the API sends is the same code path that made the mistake.
+  const text = await blob.text();
+  const rows = Math.max(0, text.split("\n").filter((line) => line.trim() !== "").length - 1);
+
+  return { rows, blob, filename: match?.[1] ?? `omnion-health-${served}.csv`, range: served };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Incidents and threshold policy (REQ-014, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `GET /api/v1/health/incidents` — a page of the timeline.
+ *
+ * The filters go out as query parameters and the server **refuses** a malformed instant rather
+ * than ignoring it: a `from=` that silently widens to "no lower bound" is the kind of filter
+ * that makes an incident screen agree with itself while showing the wrong week.
+ */
+export function fetchHealthIncidents(
+  filter: {
+    service?: string | null;
+    state?: string | null;
+    from?: string | null;
+    to?: string | null;
+    limit?: number;
+    offset?: number;
+  } = {},
+): Promise<HealthIncidentPage> {
+  const query = new URLSearchParams();
+  if (filter.service) query.set("service", filter.service);
+  if (filter.state) query.set("state", filter.state);
+  if (filter.from) query.set("from", filter.from);
+  if (filter.to) query.set("to", filter.to);
+  if (filter.limit !== undefined) query.set("limit", String(filter.limit));
+  if (filter.offset !== undefined) query.set("offset", String(filter.offset));
+  const suffix = query.toString();
+  return request<HealthIncidentPage>(
+    `/api/v1/health/incidents${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/** `GET /api/v1/health/incidents/{id}` — one incident with its own detail. */
+export function fetchHealthIncident(id: string): Promise<HealthIncident> {
+  return request<HealthIncident>(`/api/v1/health/incidents/${encodeURIComponent(id)}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * `PATCH /api/v1/health/incidents/{id}` — acknowledge with a note, or resolve by hand.
+ *
+ * One endpoint for both, because they are one decision: an operator looking at an incident
+ * either claims it or closes it.
+ */
+export function patchHealthIncident(
+  id: string,
+  action: HealthIncidentAction,
+  note?: string,
+): Promise<HealthIncident> {
+  return request<HealthIncident>(`/api/v1/health/incidents/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ action, note: note ?? "" }),
+  });
+}
+
+/** `GET /api/v1/health/settings` — the policy, its bounds and its suggestions. */
+export function fetchHealthSettings(): Promise<HealthSettings> {
+  return request<HealthSettings>("/api/v1/health/settings", { cache: "no-store" });
+}
+
+/**
+ * `PUT /api/v1/health/settings` — save intervals, pairs and toggles.
+ *
+ * `thresholds` is omitted entirely when the caller did not change a pair, so a save of one
+ * interval cannot silently reset every threshold to whatever the form's placeholders say. That
+ * is why the argument is `null`-able rather than an empty array: an empty array is a request to
+ * erase the policy.
+ */
+export function saveHealthSettings(update: {
+  check_interval_seconds?: number;
+  worker_stale_seconds?: number;
+  thresholds?: HealthThreshold[] | null;
+  notifications?: Record<string, boolean>;
+}): Promise<HealthSettings> {
+  const body: Record<string, unknown> = {};
+  if (update.check_interval_seconds !== undefined) {
+    body.check_interval_seconds = update.check_interval_seconds;
+  }
+  if (update.worker_stale_seconds !== undefined) {
+    body.worker_stale_seconds = update.worker_stale_seconds;
+  }
+  if (update.thresholds !== undefined && update.thresholds !== null) {
+    body.thresholds = update.thresholds.map((row) => ({
+      metric: row.metric,
+      warn: row.warn,
+      crit: row.crit,
+      direction: row.direction,
+    }));
+  }
+  if (update.notifications !== undefined) body.notifications = update.notifications;
+  return request<HealthSettings>("/api/v1/health/settings", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `GET /api/v1/health/maintenance-windows` — the windows, newest first. */
+export function fetchHealthMaintenanceWindows(): Promise<HealthMaintenanceWindow[]> {
+  return request<HealthMaintenanceWindow[]>("/api/v1/health/maintenance-windows", {
+    cache: "no-store",
+  });
+}
+
+/**
+ * `POST /api/v1/health/maintenance-windows` — create one.
+ *
+ * An empty `services` array is the deploy case and covers every service; that is a real choice
+ * the form makes explicitly rather than a default the API invents.
+ */
+export function createHealthMaintenanceWindow(input: {
+  starts_at: string;
+  ends_at: string;
+  services?: string[];
+  note?: string;
+}): Promise<HealthMaintenanceWindow> {
+  return request<HealthMaintenanceWindow>("/api/v1/health/maintenance-windows", {
+    method: "POST",
+    body: JSON.stringify({
+      starts_at: input.starts_at,
+      ends_at: input.ends_at,
+      services: input.services ?? [],
+      note: input.note ?? "",
+    }),
+  });
+}
+
+/** `DELETE /api/v1/health/maintenance-windows/{id}` — withdraw a window. */
+export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
+  return request<void>(`/api/v1/health/maintenance-windows/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 }

@@ -11,11 +11,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod base64url;
 pub mod config;
 pub mod db;
 pub mod error;
 pub mod redis_client;
 pub mod telemetry;
+pub mod vapid;
 
 pub use config::{Config, WorkflowConfig};
 pub use db::{Db, MigrationStatus};

@@ -3227,3 +3227,225 @@ export type OpenApiDocument = {
     schemas: Record<string, { description?: string; required?: string[]; properties?: Record<string, unknown> }>;
   };
 };
+
+// -------------------------------------------------------------------------------------------
+// System health (REQ-014).
+//
+// The four states are a closed set on the server and here, and the reason the client
+// repeats the list instead of typing `state: string` is the same one the server closes it
+// for: a colour map keyed by a string is a map that renders `undefined` in a class
+// attribute the first time a probe learns a fifth word. The badge, the label and the icon
+// all come out of one record, so a state can never have a colour and no label.
+// -------------------------------------------------------------------------------------------
+
+/** The four words a service state can be. `unknown` is NOT "fine". */
+export type HealthState = "healthy" | "degraded" | "down" | "unknown";
+
+/** One check inside a service row. */
+export type HealthCheck = {
+  check: string;
+  state: string;
+  message: string;
+  latency_ms: number;
+};
+
+/** One service row. Always present for every registered service, probed or not. */
+export type HealthService = {
+  service: string;
+  state: HealthState;
+  description: string;
+  latency_ms: number | null;
+  checked_at: string | null;
+  message: string;
+  detail: Record<string, unknown>;
+  checks: HealthCheck[];
+  href: string;
+};
+
+/** One host metric card. `threshold: null` means no opinion is configured. */
+export type HealthHostMetric = {
+  metric: string;
+  value: number;
+  unit: string;
+  state: string;
+  threshold: number | null;
+};
+
+/** The overview's verdict, as a word and as a sentence. */
+export type HealthBanner = {
+  state: HealthState;
+  headline: string;
+  worst_service: string | null;
+};
+
+/** `GET /api/v1/health/overview`. */
+export type HealthOverview = {
+  services: HealthService[];
+  host: HealthHostMetric[];
+  banner: HealthBanner;
+  counts: Record<HealthState, number>;
+  last_checked_at: string | null;
+  registry: string[];
+  sample_count: number;
+};
+
+/** One metric of one service, with the newest value it published and its 24 h trend. */
+export type HealthServiceMetric = {
+  metric: string;
+  value: number;
+  unit: string;
+  sampled_at: string;
+  /**
+   * The metric's values over the last 24 h, oldest first.
+   *
+   * Empty when the window holds no samples — and empty is a real answer here, because
+   * a platform whose history was pruned or never recorded is genuinely unknown, not zero.
+   * The screen draws a dot for one point and a line for two or more, so this array is the
+   * only thing separating a real trend from an empty box.
+   */
+  series: number[];
+};
+
+/** `GET /api/v1/health/services/{key}`. */
+export type HealthServiceDetail = HealthService & { metrics: HealthServiceMetric[] };
+
+/** `GET /api/v1/health/summary` — the one line other centres embed. */
+export type HealthSummary = {
+  state: HealthState;
+  headline: string;
+  worst_service: string | null;
+  /** `true` only when every registered service is healthy. Never true while any is unprobed. */
+  operational: boolean;
+  counts: Record<HealthState, number>;
+};
+
+/** One point of a metric's series, oldest first. */
+export type HealthSamplePoint = {
+  value: number;
+  unit: string;
+  state: string;
+  sampled_at: string;
+};
+
+/** What the retention prune deleted. */
+export type HealthPruneResult = { deleted: number; retention_days: number };
+
+/**
+ * The three windows the metric table offers.
+ *
+ * A name rather than an hour count, so the label on screen, the label in the CSV filename and
+ * the window the server queried are the same string. Anything else is refused server-side.
+ */
+export type HealthRangeKey = "1h" | "24h" | "7d";
+
+/** One row of `GET /api/v1/health/metrics`. */
+export type HealthMetricRow = {
+  service: string;
+  metric: string;
+  unit: string;
+  samples: number;
+  /** `null` on a window with no samples — never `0`, which is a value. */
+  current: number | null;
+  min: number | null;
+  avg: number | null;
+  max: number | null;
+  state: string;
+  last_sample_at: string | null;
+  /** The window's values, oldest first. Empty when there are no samples. */
+  series: number[];
+};
+
+/** `GET /api/v1/health/metrics` — the aggregated table for one range. */
+export type HealthMetricsReport = {
+  range: string;
+  ranges: string[];
+  metrics: HealthMetricRow[];
+  total_samples: number;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Incidents and threshold policy (REQ-014, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** One row of `GET /api/v1/health/incidents`. */
+export type HealthIncident = {
+  id: string;
+  service: string;
+  from_state: string;
+  to_state: string;
+  summary: string;
+  detail: Record<string, unknown>;
+  started_at: string;
+  /** `null` while the incident is open. */
+  resolved_at: string | null;
+  /** Seconds between open and resolve, or `null` while it is still open. */
+  duration_seconds: number | null;
+  /** True when a maintenance window covered the moment it opened. */
+  suppressed: boolean;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  note: string | null;
+};
+
+/** `GET /api/v1/health/incidents` — a page plus the count behind the filter. */
+export type HealthIncidentPage = {
+  incidents: HealthIncident[];
+  total: number;
+  /**
+   * Every service the platform probes.
+   *
+   * Sent with the list rather than fetched separately so the filter dropdown cannot offer a
+   * value the server would answer `unknown_service` for — the vocabulary and the filter
+   * options are the same read.
+   */
+  services: string[];
+};
+
+/** One threshold row on the settings form. */
+export type HealthThreshold = {
+  metric: string;
+  warn: number;
+  crit: number;
+  direction: "above" | "below";
+  unit: string;
+  /**
+   * False when the numbers are the **suggestion** rather than something an operator saved.
+   *
+   * The form marks these, because a placeholder that looks like a saved value is a limit
+   * nobody chose being read as a limit they chose.
+   */
+  configured: boolean;
+};
+
+/** One maintenance window. */
+export type HealthMaintenanceWindow = {
+  id: string;
+  starts_at: string;
+  ends_at: string;
+  services: string[];
+  note: string;
+  created_by: string | null;
+  created_at: string;
+  /** True when `now` is inside the window — the only flag a row can have. */
+  active: boolean;
+};
+
+/** `GET`/`PUT /api/v1/health/settings`. */
+export type HealthSettings = {
+  check_interval_seconds: number;
+  worker_stale_seconds: number;
+  thresholds: HealthThreshold[];
+  notifications: Record<string, boolean>;
+  updated_by: string | null;
+  updated_at: string;
+  /** The inclusive bounds the form enforces, so the UI and the API agree. */
+  bounds: {
+    check_interval_seconds: [number, number];
+    worker_stale_seconds: [number, number];
+  };
+  /** How many breaches the ledger holds, resolved ones included. */
+  breaches: number;
+};
+
+/** What `PATCH /health/incidents/{id}` accepts. */
+export type HealthIncidentAction = "acknowledge" | "resolve";
