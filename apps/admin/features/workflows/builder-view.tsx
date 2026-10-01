@@ -706,31 +706,59 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     [],
   );
 
+  /**
+   * A press of undo, and of redo: the cursor moves and the caller restores the target.
+   *
+   * Both replace the graph WHOLESALE, which is the one operation that can leave the selection
+   * naming a card the canvas does not have, so both prune. Before this, they restored nodes
+   * and edges and nothing else: add two cards, select the first, press ⌘Z twice, and the
+   * inspector holds a node id that renders nothing while Duplicate and Copy stay ENABLED
+   * (`disabled={!selected}` reads the surviving string), the status bar counts "1 selected"
+   * over an empty canvas, and `Del` resolves to a card the graph does not have and removes
+   * nothing. The keyboard alone reaches it — no second tab and no conflict.
+   *
+   * It is the same hole the loader closed one tick earlier, from the other direction: `load()`
+   * adopts a *newer* graph and prunes, undo adopts an *older* one and did not. One rule, two
+   * callers, one of them left behind.
+   *
+   * The alive set is read off `restored`, NOT off `nodes`. `nodes` in the closure is the graph
+   * being replaced — the one that still holds both cards — so pruning against it would keep
+   * exactly the nodes the undo is removing, and the prune would be a no-op on the only case it
+   * exists for.
+   *
+   * Pruned, not cleared, for the same reason the loader prunes: undoing a `remove` should
+   * leave the node selected again, because the author pressed Del on the wrong card and wants
+   * it back with the inspector on it. Clearing there is the one press in the builder that
+   * half-works.
+   */
+  const applyHistoryStep = useCallback(
+    (next: History, target: HistorySnapshot) => {
+      const restored = target as { nodes: GraphNode[]; edges: GraphEdge[] };
+      historyRef.current = next;
+      setNodes(restored.nodes);
+      setEdges(restored.edges);
+      setSelection((current) => pruneSelection(current, restored.nodes.map((node) => node.id)));
+      setHistoryTick((n) => n + 1);
+      queueSave();
+    },
+    [queueSave],
+  );
+
   const doUndo = useCallback(() => {
     const target = undoTarget(historyRef.current);
     if (!target) {
       return;
     }
-    historyRef.current = undo(historyRef.current);
-    const restored = target as { nodes: GraphNode[]; edges: GraphEdge[] };
-    setNodes(restored.nodes);
-    setEdges(restored.edges);
-    setHistoryTick((n) => n + 1);
-    queueSave();
-  }, [queueSave]);
+    applyHistoryStep(undo(historyRef.current), target);
+  }, [applyHistoryStep]);
 
   const doRedo = useCallback(() => {
     const target = redoTarget(historyRef.current);
     if (!target) {
       return;
     }
-    historyRef.current = redo(historyRef.current);
-    const restored = target as { nodes: GraphNode[]; edges: GraphEdge[] };
-    setNodes(restored.nodes);
-    setEdges(restored.edges);
-    setHistoryTick((n) => n + 1);
-    queueSave();
-  }, [queueSave]);
+    applyHistoryStep(redo(historyRef.current), target);
+  }, [applyHistoryStep]);
 
   const { canUndo, canRedo } = capabilities(historyRef.current);
 
