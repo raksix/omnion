@@ -9855,3 +9855,92 @@ is the lever that actually works.
 
 **Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps
 out of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+
+---
+
+## Tick 74 (wave3) — the keyboard row asked the server for a field the server does not send
+
+**Merge first, and the BUILD-LOG conflict is the append-only journal meeting itself.** `origin/main`
+had moved 8 commits (REQ-010's media filters); the only conflict was this file, and both sides are
+diverging append-only tails off a common base — **a splice, not a choice.** The merge was verified
+with the multiset check rather than by eye: `(ours-only + theirs-only) - merged` over `^## ` headings
+must be empty, and it was — 35 ours-only + 2 theirs-only + 100 base = 137 present, **zero lost**.
+`##` counts would also have read 137, and a line count would have read 137 too; the only assertion
+that distinguishes "kept both tails" from "silently dropped one block" is the per-parent set
+difference, because a duplicated block satisfies every total.
+
+**The finding: a QA gate that could never go green, reporting `false` the whole time.**
+
+```js
+const waited = (graphAfterParam?.graph?.nodes ?? []).find((node) => node.node_type === "wait");
+paramReadBack = waited?.params?.seconds ?? null;
+```
+
+`Node` carries `#[serde(rename = "type")]` on `node_type`, under `deny_unknown_fields`. The wire
+has `type`; `node_type` is not sent and could not be. So the predicate was `undefined === "wait"` —
+false on every run, for the life of the row — `paramReadBack` structurally `null`, and `paramWrote`
+reporting `false` while the keyboard path worked perfectly. **This is the finding, not the field
+name: a gate that cannot go green and a gate that cannot go red look identical in a report.** Every
+tick that cited "`paramWrote: false`, so `I` cannot edit a parameter" was citing a constant, and the
+only honest reading of that number was "this row never had a subject". No other row in this REQ's
+history has failed in this direction; all the others read the wrong *surface*, which at least
+produces a number that could have been right.
+
+**Resolving by TYPE is the half a rename would have hidden.** The earlier draft's fallback — and
+the reason a "just look up any wait node" fix would have been worse than nothing — is that the
+run-from-here block puts a `wait` node in this same graph (the `spine` fixture at the builder's
+run-from-here leg builds `trigger → wait → end`). So the type lookup **resolves**: it returns a
+different node's `seconds`, and reports it as the keyboard's write. The subject now comes from the
+element the keystrokes land in — `NodeInspector` renders `id={param-${node.id}-${field.key}}` — and
+`paramWrote` requires a resolved subject, with `paramSubjectKnown` beside it so a fallback read is
+legible rather than silent.
+
+**Two of my own drafts were wrong, and each was wrong in a way the file already documents.**
+
+1. **The fallback reached for `data-inspector-node-id`, an attribute no element writes.** The same
+   defect with a longer name. And `data-inspector` is a **prefix** of `data-inspector-field`, so
+   the obvious selector matches the fields and never the panel — the trap `table-mode-row.test.ts`
+   pins with its own assertion, one file over.
+2. **The first test window stopped one token early.** Anchored on the row's opening line it ended
+   on `step:`, the first key of the note call, so it excluded every field the note *reports*: three
+   of five tests went red asserting `paramSubjectKnown` and a `paramWrote` gate that sit inside the
+   note. Re-anchoring on the next banner fixes that and creates the mirror — it runs on into the
+   following row, where another note's `paramWrote` satisfies the assertion. **A window spanning the
+   wrong construct is a window satisfied by the wrong occurrence**, which is tick 62's sentence, and
+   this is its seventh appearance in this REQ. The window is now banner → the note's own closing brace.
+
+**Comments are stripped before every code assertion, because the sentence describing this defect
+lives in this row's own comment.** That is not a precaution: the first run went red on a row that was
+already correct, for mentioning `node_type` in prose. A guard that trips on the sentence describing
+the defect cannot police the defect.
+
+**Proof.** 346 admin tests (341 → 346, +5) · `pnpm typecheck` 2/2 · `node --check` clean ·
+`cargo test -p omnion-workflows --lib` **157 unchanged** — the defect was in the instrument, and the
+product was never wrong. **Five mutations red, one assertion each.** M6 renames the serde attribute
+in `graph.rs`, so the Rust half of the guard is load-bearing rather than decoration, and both mutated
+files are restored **byte-exact, asserted on every run rather than only on the red ones** (the
+restore is the thing another writer's work would be lost through). The mutation list has **no M5 and
+says so in its own header**: an earlier draft of that doc described a mutation that was never
+written, which is this REQ's failure mode wearing a proofreader's clothes — a doc claiming a check
+nobody runs reads as a check that was run, and I wrote it that way thirty seconds before committing.
+
+**Browser pass: RAN, and it has not reached the builder.** `--only=workflow-builder`, my stack
+(`QA_STACK=w3`, 18082/3102/3202, `omnion_qa_w3`), slot reclaimed from a dead holder (pid 2044970,
+`kill -0` confirms gone). It reset the database, seeded the tenant through the wizard — the first pass
+on this stack with an organization to measure against — and is walking the route list; the builder
+depth pass is the **last** leg, after every route and the mobile pass. Mid-run the disk hit **100%**
+and the walk began recording `ENOSPC` on screenshots. Not my artifact: `qa-artifacts` held two
+directories, I removed the older one (62 MB) and left the running pass's directory alone; another
+writer's build then released ~1.8 GB. **A screenshot failing is not a screenshot being wrong**, and
+the pass records it and continues — but every visual claim from this run is weakened, which is the
+honest way to carry it.
+
+**NOT TICKED, and the box says why in its own words.** The instrument is fixed and **no browser
+reading has been taken on it**. The criterion is no closer to green than it was when the tick
+opened; what changed is that when the reading arrives it *can* be green.
+
+**Next:** read `keyboard-pass` off `summary.json` — `paramSubjectKnown`, `paramReadBack`,
+`paramWrote`, beside `edgeCommitted` and `focusIsCanvas` — then the unticked `narrow-lock`,
+`shortcut-help` and `tab-walk` rows from the same pass. REQ-045 stays blocked: `entities` /
+`entity_fields` still exist in no worktree, so the apply pipeline's first step has no table to write.
