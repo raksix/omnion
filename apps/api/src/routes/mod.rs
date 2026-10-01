@@ -70,13 +70,14 @@
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
 pub mod ai;
-pub mod ai_agents;
 pub mod ai_agent_workspace;
+pub mod ai_agents;
 pub mod ai_approvals;
 pub mod ai_change_sets;
 pub mod ai_decisions;
 pub mod ai_guard;
 pub mod ai_identities;
+pub mod ai_local;
 pub mod ai_routing;
 pub mod ai_skills;
 pub mod ai_tools;
@@ -84,7 +85,6 @@ pub mod analytics;
 pub mod auth;
 pub mod automation;
 pub mod backups;
-pub mod restore_jobs;
 pub mod commands;
 pub mod content;
 pub mod health;
@@ -115,6 +115,7 @@ pub mod notifications_test;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
+pub mod restore_jobs;
 pub mod scim;
 pub mod search;
 pub mod security;
@@ -799,9 +800,7 @@ pub fn router(state: AppState) -> Router {
         post(ai::probe_provider).layer(guards::require(&state, "ai.providers.manage"));
     let ai_failover = get(ai::failover_chain)
         .layer(guards::require(&state, "ai.providers.read"))
-        .merge(
-            put(ai::set_failover_order).layer(guards::require(&state, "ai.providers.manage")),
-        );
+        .merge(put(ai::set_failover_order).layer(guards::require(&state, "ai.providers.manage")));
 
     let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
     // The instruction a chat sends to be able to propose changes (REQ-101 slice 3g). `read`,
@@ -825,21 +824,16 @@ pub fn router(state: AppState) -> Router {
         .merge(put(ai_guard::put_policy).layer(guards::require(&state, "ai.guard.manage")));
     let ai_guard_rules = get(ai_guard::list_rules)
         .layer(guards::require(&state, "ai.guard.read"))
-        .merge(
-            post(ai_guard::create_rule).layer(guards::require(&state, "ai.guard.manage")),
-        );
+        .merge(post(ai_guard::create_rule).layer(guards::require(&state, "ai.guard.manage")));
     let ai_guard_test = post(ai_guard::run_test).layer(guards::require(&state, "ai.guard.manage"));
-    let ai_guard_events = get(ai_guard::list_events).layer(guards::require(&state, "ai.guard.read"));
+    let ai_guard_events =
+        get(ai_guard::list_events).layer(guards::require(&state, "ai.guard.read"));
     let ai_guard_fixtures = get(ai_guard::list_fixtures)
         .layer(guards::require(&state, "ai.guard.read"))
-        .merge(
-            post(ai_guard::create_fixture).layer(guards::require(&state, "ai.guard.manage")),
-        );
+        .merge(post(ai_guard::create_fixture).layer(guards::require(&state, "ai.guard.manage")));
     let ai_guard_exemptions = get(ai_guard::list_exemptions)
         .layer(guards::require(&state, "ai.guard.read"))
-        .merge(
-            post(ai_guard::create_exemption).layer(guards::require(&state, "ai.guard.manage")),
-        );
+        .merge(post(ai_guard::create_exemption).layer(guards::require(&state, "ai.guard.manage")));
 
     // Task routing and feature overrides (REQ-098 slice 2). Reading a route map is the same
     // knowledge as the provider list — which models exist and what they can do — so it is
@@ -854,9 +848,7 @@ pub fn router(state: AppState) -> Router {
         .merge(put(ai_routing::put_routing).layer(guards::require(&state, "ai.settings.manage")));
     let ai_routing_overrides = get(ai_routing::get_overrides)
         .layer(guards::require(&state, "ai.providers.read"))
-        .merge(
-            put(ai_routing::put_override).layer(guards::require(&state, "ai.settings.manage")),
-        );
+        .merge(put(ai_routing::put_override).layer(guards::require(&state, "ai.settings.manage")));
     let ai_routing_preview =
         post(ai_routing::preview_routing).layer(guards::require(&state, "ai.providers.read"));
 
@@ -864,20 +856,48 @@ pub fn router(state: AppState) -> Router {
     // the log is the accounting trail of what the platform asked of its providers, so a reader
     // of "which models are connected" has no business reading an organization's per-request
     // history. One key, shared with the cost manager (REQ-104), rather than two spellings.
-    let ai_decisions = get(ai_decisions::list_decisions)
-        .layer(guards::require(&state, "ai.usage.read"));
-    let ai_decision = get(ai_decisions::get_decision)
-        .layer(guards::require(&state, "ai.usage.read"));
-    let ai_decisions_csv = get(ai_decisions::export_decisions)
-        .layer(guards::require(&state, "ai.usage.read"));
+    // Local endpoints and their models (REQ-106 slice 1). The read/write split is the same
+    // shape as the guard's, and for the same reason: "which endpoints are local and what do they
+    // serve" is the same knowledge as the provider list, while `ai.local.manage` is the power to
+    // point the platform's AI at a host on an operator's own network — a change that alters where
+    // a tenant's prompts physically go. The read key is `ai.local.read` rather than the provider
+    // one so the AI screens can expose the locality badges without also exposing provider
+    // management.
+    let ai_local_endpoints = get(ai_local::list_endpoints)
+        .layer(guards::require(&state, "ai.local.read"))
+        .merge(post(ai_local::create_endpoint).layer(guards::require(&state, "ai.local.manage")));
+    let ai_local_models = get(ai_local::list_models)
+        .layer(guards::require(&state, "ai.local.read"))
+        .merge(
+            axum::routing::delete(ai_local::remove_model)
+                .layer(guards::require(&state, "ai.local.manage")),
+        );
+    // Pull/cancel/retry are separate POSTs rather than a PATCH on the model row: each is a
+    // *decision* about a download, and one labelled button per decision is what keeps a
+    // double-click from starting a pull the operator did not ask for.
+    let ai_local_pull =
+        post(ai_local::pull_model).layer(guards::require(&state, "ai.local.manage"));
+    let ai_local_cancel =
+        post(ai_local::cancel_pull).layer(guards::require(&state, "ai.local.manage"));
+    let ai_local_retry =
+        post(ai_local::retry_pull).layer(guards::require(&state, "ai.local.manage"));
+    let ai_local_scan =
+        post(ai_local::scan_endpoint).layer(guards::require(&state, "ai.local.manage"));
+
+    let ai_decisions =
+        get(ai_decisions::list_decisions).layer(guards::require(&state, "ai.usage.read"));
+    let ai_decision =
+        get(ai_decisions::get_decision).layer(guards::require(&state, "ai.usage.read"));
+    let ai_decisions_csv =
+        get(ai_decisions::export_decisions).layer(guards::require(&state, "ai.usage.read"));
     // "What cannot resolve" is a routing question, not a usage one: it answers from the log but
     // belongs to the routing screen's warning banner, which a provider reader must be able to
     // see — otherwise the only people who can tell that a task is broken are the ones who
     // already cannot fix it.
-    let ai_unresolved = get(ai_decisions::get_unresolved)
-        .layer(guards::require(&state, "ai.providers.read"));
-    let ai_last_resolved = get(ai_decisions::last_resolved)
-        .layer(guards::require(&state, "ai.providers.read"));
+    let ai_unresolved =
+        get(ai_decisions::get_unresolved).layer(guards::require(&state, "ai.providers.read"));
+    let ai_last_resolved =
+        get(ai_decisions::last_resolved).layer(guards::require(&state, "ai.providers.read"));
 
     // The agent runtime (REQ-099 slice 1). Three powers, because the three are genuinely
     // different: *seeing* an agent is knowing how the installation's AI is configured, *changing*
@@ -895,16 +915,16 @@ pub fn router(state: AppState) -> Router {
             patch(ai_agents::patch_agent_route).layer(guards::require(&state, "ai.agents.manage")),
         )
         .merge(
-            delete(ai_agents::delete_agent_route).layer(guards::require(&state, "ai.agents.manage")),
+            delete(ai_agents::delete_agent_route)
+                .layer(guards::require(&state, "ai.agents.manage")),
         );
-    let ai_agent_runs =
-        post(ai_agents::start_run).layer(guards::require(&state, "ai.agents.run"));
+    let ai_agent_runs = post(ai_agents::start_run).layer(guards::require(&state, "ai.agents.run"));
     // The telemetry reads (REQ-099 slice 4). Both are `ai.agents.read` rather than a new key:
     // they read the runs and steps an `ai.agents.read` caller can already list, so a separate
     // permission would be a key an operator has to remember for a sum of columns they can add
     // up themselves.
-    let ai_agent_telemetry = get(ai_agents::agent_telemetry_route)
-        .layer(guards::require(&state, "ai.agents.read"));
+    let ai_agent_telemetry =
+        get(ai_agents::agent_telemetry_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_tool_usage =
         get(ai_agents::tool_usage_route).layer(guards::require(&state, "ai.agents.read"));
     // The skills registry (REQ-099, slice 3). Read and write are separate keys for the same
@@ -912,7 +932,9 @@ pub fn router(state: AppState) -> Router {
     // attached agent sends, which is a different act from reading a list of them.
     let ai_skills = get(ai_skills::list_skills_route)
         .layer(guards::require(&state, "ai.skills.read"))
-        .merge(post(ai_skills::create_skill_route).layer(guards::require(&state, "ai.skills.manage")));
+        .merge(
+            post(ai_skills::create_skill_route).layer(guards::require(&state, "ai.skills.manage")),
+        );
     // `POST /ai/skills/{key}/validate`, **not** a second POST on `/ai/skills`. The handler has
     // always been written for the keyed path — the spec's own table says so — and the router was
     // the only place that disagreed. axum does not accept two `POST` routes on one path: it
@@ -921,8 +943,8 @@ pub fn router(state: AppState) -> Router {
     // other 1600 lines are fine. This is slice 3's own defect, found by the first pass that
     // ever got far enough to boot the binary: the skill walks had run against a *test* binary
     // built with the routes module, and the unit suite never builds a router at all.
-    let ai_skill_validate = post(ai_skills::validate_skill_route)
-        .layer(guards::require(&state, "ai.skills.manage"));
+    let ai_skill_validate =
+        post(ai_skills::validate_skill_route).layer(guards::require(&state, "ai.skills.manage"));
     let ai_skill = get(ai_skills::get_skill_route)
         .layer(guards::require(&state, "ai.skills.read"))
         .merge(
@@ -942,22 +964,19 @@ pub fn router(state: AppState) -> Router {
     let ai_agent_skills = get(ai_skills::list_agent_skills_route)
         .layer(guards::require(&state, "ai.skills.read"))
         .merge(
-            post(ai_skills::attach_skill_route)
-                .layer(guards::require(&state, "ai.skills.manage")),
+            post(ai_skills::attach_skill_route).layer(guards::require(&state, "ai.skills.manage")),
         )
         .merge(
             axum::routing::put(ai_skills::set_agent_skills_route)
                 .layer(guards::require(&state, "ai.skills.manage")),
         );
-    let ai_agent_skill =
-        axum::routing::delete(ai_skills::detach_skill_route)
-            .layer(guards::require(&state, "ai.skills.manage"));
+    let ai_agent_skill = axum::routing::delete(ai_skills::detach_skill_route)
+        .layer(guards::require(&state, "ai.skills.manage"));
     // The tool registry (REQ-100 slice 1). Read and write are separate keys because they are
     // separate acts: *seeing* the registry is knowing which actions the installation's AI can
     // take, and *changing* it is changing what a model will be allowed to do. Collapsing them
     // would give every reader of a schema the power to un-gate `deployment.deploy`.
-    let ai_tools =
-        get(ai_tools::list_tools_route).layer(guards::require(&state, "ai.tools.read"));
+    let ai_tools = get(ai_tools::list_tools_route).layer(guards::require(&state, "ai.tools.read"));
     // `/ai/tools/classes` is a STATIC table, not a parameterised path, and axum panics at router
     // construction when two routes on one prefix disagree about arity — the failure surfaces as
     // "the API did not answer" with `Overlapping method route` naming a line in a 1700-line
@@ -1046,32 +1065,32 @@ pub fn router(state: AppState) -> Router {
     // request from now on. A viewer holding only the first key gets `403` from the layer on the
     // other two, naming the missing key — which is why the keys are in the catalogue and not
     // invented at the call site.
-    let ai_approvals = get(ai_approvals::list_approvals)
-        .layer(guards::require(&state, "ai.approvals.read"));
-    let ai_approval = get(ai_approvals::get_approval)
-        .layer(guards::require(&state, "ai.approvals.read"));
-    let ai_approval_approve = post(ai_approvals::approve)
-        .layer(guards::require(&state, "ai.approvals.act"));
-    let ai_approval_reject = post(ai_approvals::reject)
-        .layer(guards::require(&state, "ai.approvals.act"));
+    let ai_approvals =
+        get(ai_approvals::list_approvals).layer(guards::require(&state, "ai.approvals.read"));
+    let ai_approval =
+        get(ai_approvals::get_approval).layer(guards::require(&state, "ai.approvals.read"));
+    let ai_approval_approve =
+        post(ai_approvals::approve).layer(guards::require(&state, "ai.approvals.act"));
+    let ai_approval_reject =
+        post(ai_approvals::reject).layer(guards::require(&state, "ai.approvals.act"));
     // The apply is a *write* and carries the same key as the decision: releasing a change and
     // performing it are one authority, and a caller who may approve but not apply would leave
     // approved rows nobody can carry out.
-    let ai_approval_apply = post(ai_approvals::apply)
-        .layer(guards::require(&state, "ai.approvals.act"));
+    let ai_approval_apply =
+        post(ai_approvals::apply).layer(guards::require(&state, "ai.approvals.act"));
     let ai_approval_sweep =
         post(ai_approvals::sweep).layer(guards::require(&state, "ai.approvals.act"));
     // Re-preview carries the *read* key, not `act`. It decides nothing, resumes nothing and
     // writes nothing but a newer description of a proposal nobody has decided yet — so gating it
     // on the decision authority would leave the stale banner's own remedy unavailable to the
     // readers who can see it. The handler documents the argument at length.
-    let ai_approval_repreview = post(ai_approvals::re_preview)
-        .layer(guards::require(&state, "ai.approvals.read"));
+    let ai_approval_repreview =
+        post(ai_approvals::re_preview).layer(guards::require(&state, "ai.approvals.read"));
     // The policy screen reads under the *read* key on purpose: an installation has to be able to
     // show "these six classes are all gated" to somebody who cannot change it, or the screen is
     // only visible to the people who already trust it.
-    let ai_approval_policies = get(ai_approvals::list_policies)
-        .layer(guards::require(&state, "ai.approvals.read"));
+    let ai_approval_policies =
+        get(ai_approvals::list_policies).layer(guards::require(&state, "ai.approvals.read"));
     let ai_approval_policy = put(ai_approvals::put_policy)
         .layer(guards::require(&state, "ai.policies.manage"))
         .merge(
@@ -1084,37 +1103,37 @@ pub fn router(state: AppState) -> Router {
     // writes it is the person who will read it; only confirming and discarding are `act`,
     // because only those two can cause something to happen. Gating the whole lifecycle on
     // `act` would leave a reader with no way to *ask* for something.
-    let ai_change_sets = get(ai_change_sets::list)
-        .layer(guards::require(&state, "ai.approvals.read"));
-    let ai_change_set_create = post(ai_change_sets::create)
-        .layer(guards::require(&state, "ai.approvals.read"));
+    let ai_change_sets =
+        get(ai_change_sets::list).layer(guards::require(&state, "ai.approvals.read"));
+    let ai_change_set_create =
+        post(ai_change_sets::create).layer(guards::require(&state, "ai.approvals.read"));
     let ai_change_set_update = axum::routing::patch(ai_change_sets::update)
         .layer(guards::require(&state, "ai.approvals.read"));
     // The editor's re-plan. `read`, not `act`, exactly like the single-approval re-preview it
     // mirrors: recomputing a diff writes nothing, and a reader must be able to see what they
     // are about to decide on without being able to make it happen. The permission that matters
     // is the one on the confirm, and that one is `act`.
-    let ai_change_set_preview = post(ai_change_sets::preview)
-        .layer(guards::require(&state, "ai.approvals.read"));
-    let ai_change_set_confirm = post(ai_change_sets::confirm)
-        .layer(guards::require(&state, "ai.approvals.act"));
-    let ai_change_set_discard = post(ai_change_sets::discard)
-        .layer(guards::require(&state, "ai.approvals.act"));
+    let ai_change_set_preview =
+        post(ai_change_sets::preview).layer(guards::require(&state, "ai.approvals.read"));
+    let ai_change_set_confirm =
+        post(ai_change_sets::confirm).layer(guards::require(&state, "ai.approvals.act"));
+    let ai_change_set_discard =
+        post(ai_change_sets::discard).layer(guards::require(&state, "ai.approvals.act"));
     // The apply is the only route here that writes content, so it is the second `act` one and
     // carries the same guard the confirm does: a viewer may *ask* for a set and *see* it, and
     // a person with the permission is the only one who can make it happen.
-    let ai_change_set_apply = post(ai_change_sets::apply)
-        .layer(guards::require(&state, "ai.approvals.act"));
+    let ai_change_set_apply =
+        post(ai_change_sets::apply).layer(guards::require(&state, "ai.approvals.act"));
 
     let ai_runs = get(ai_agents::list_runs_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run = get(ai_agents::get_run_route).layer(guards::require(&state, "ai.agents.read"));
-    let ai_run_steps = get(ai_agents::get_run_steps).layer(guards::require(&state, "ai.agents.read"));
+    let ai_run_steps =
+        get(ai_agents::get_run_steps).layer(guards::require(&state, "ai.agents.read"));
     let ai_run_events = get(ai_agents::run_events).layer(guards::require(&state, "ai.agents.read"));
-    let ai_run_agent = get(ai_agents::run_agent_link).layer(guards::require(&state, "ai.agents.read"));
-    let ai_run_cancel =
-        post(ai_agents::cancel_run).layer(guards::require(&state, "ai.agents.run"));
-    let ai_run_resume =
-        post(ai_agents::resume_run).layer(guards::require(&state, "ai.agents.run"));
+    let ai_run_agent =
+        get(ai_agents::run_agent_link).layer(guards::require(&state, "ai.agents.read"));
+    let ai_run_cancel = post(ai_agents::cancel_run).layer(guards::require(&state, "ai.agents.run"));
+    let ai_run_resume = post(ai_agents::resume_run).layer(guards::require(&state, "ai.agents.run"));
 
     // The per-agent workspace (REQ-099 slice 2). Reading a workspace is reading the agent;
     // adding or removing a file is managing it, and it is `ai.agents.manage` rather than
@@ -1520,8 +1539,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/health/maintenance-windows/{id}",
-            delete(health_incidents::delete_window)
-                .layer(guards::require(&state, "health.manage")),
+            delete(health_incidents::delete_window).layer(guards::require(&state, "health.manage")),
         )
         .route(
             "/security/overview",
@@ -1641,7 +1659,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(
                     patch(security::patch_status).layer(guards::require(&state, "security.manage")),
                 ),
-    );
+        );
     let analytics_reports = Router::new()
         .route("/analytics/overview", get(analytics::overview))
         .route("/analytics/pages", get(analytics::pages))
@@ -2016,7 +2034,10 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)
-        .route("/ai/chat/proposal-instruction", ai_chat_proposal_instruction)
+        .route(
+            "/ai/chat/proposal-instruction",
+            ai_chat_proposal_instruction,
+        )
         .route("/ai/routing", ai_routing)
         .route("/ai/routing/overrides", ai_routing_overrides)
         .route("/ai/routing/preview", ai_routing_preview)
@@ -2056,6 +2077,12 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(ai_guard::delete_exemption)
                 .layer(guards::require(&state, "ai.guard.manage")),
         )
+        .route("/ai/local/endpoints", ai_local_endpoints)
+        .route("/ai/local/models", ai_local_models)
+        .route("/ai/local/models/pull", ai_local_pull)
+        .route("/ai/local/models/cancel", ai_local_cancel)
+        .route("/ai/local/models/retry", ai_local_retry)
+        .route("/ai/local/scan", ai_local_scan)
         .route("/ai/logs/decisions.csv", ai_decisions_csv)
         .route("/ai/logs/decisions/{id}", ai_decision)
         .route("/ai/routing/unresolved", ai_unresolved)
@@ -2126,7 +2153,10 @@ pub fn router(state: AppState) -> Router {
         // rather than a sub-path of the approvals inbox: a set is a *draft* while an approval
         // is a *request*, and the two have different lifecycles, different permissions and
         // different screens.
-        .route("/ai/change-sets", ai_change_sets.merge(ai_change_set_create))
+        .route(
+            "/ai/change-sets",
+            ai_change_sets.merge(ai_change_set_create),
+        )
         .route("/ai/change-sets/{id}", ai_change_set_update)
         .route("/ai/change-sets/{id}/preview", ai_change_set_preview)
         .route("/ai/change-sets/{id}/confirm", ai_change_set_confirm)
