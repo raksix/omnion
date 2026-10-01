@@ -425,3 +425,192 @@ export function cancelMyLeaveRequest(id: string): Promise<LeaveRequest> {
     body: "{}",
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Attendance (REQ-055 slice 2d)
+// ---------------------------------------------------------------------------------------------
+
+/** The exception types the summary counts. */
+export type AttendanceException = "missing_checkout" | "overtime" | "under_hours";
+
+/**
+ * One day of one employee, as the month grid, the roster and the correction drawer read it.
+ *
+ * `minutes_worked` is `null` while the day is open. It is **never** recomputed here: the module
+ * derives it in SQL on every read, and a second derivation in TypeScript is a second answer to a
+ * number a payroll run reads.
+ */
+export type AttendanceDay = {
+  id: string;
+  organization_id: string;
+  employee_id: string;
+  /** `YYYY-MM-DD`, in the organization's time zone. */
+  work_date: string;
+  /** RFC 3339, or `null` while the day is open. */
+  check_in: string | null;
+  check_out: string | null;
+  minutes_worked: number | null;
+  /** `manual`, `api` or `import`. A correction never rewrites it. */
+  source: string;
+  note: string;
+  corrected_by: string | null;
+  corrected: boolean;
+  /**
+   * The server's flag, or `null` for a plain day.
+   *
+   * It is a **reading against the server's clock** — `missing_checkout` applies only to a day in
+   * the past — so it is never recomputed here. The grid, the summary and the CSV are three
+   * readers of one answer, and a fourth reader in the browser disagrees with all three by
+   * however far the two clocks are apart.
+   */
+  exception: AttendanceException | null;
+};
+
+/** One employee's month, as the summary and the grid footer read it. */
+export type AttendanceSummary = {
+  employee_id: string;
+  /** `YYYY-MM`. */
+  month: string;
+  days_present: number;
+  minutes_worked: number;
+  overtime_days: number;
+  under_hours_days: number;
+  missing_checkout_days: number;
+  /** Days still open — a working day, not a mistake. */
+  open_days: number;
+};
+
+/** The month grid: the days and their totals, shipped together so the two cannot disagree. */
+export type AttendanceMonth = {
+  month: string;
+  employee_id: string;
+  days: AttendanceDay[];
+  summary: AttendanceSummary;
+};
+
+/** One line of the daily roster. */
+export type RosterEntry = {
+  employee_id: string;
+  employee_name: string;
+  work_date: string;
+  check_in: string | null;
+  check_out: string | null;
+  minutes_worked: number | null;
+  on_leave: boolean;
+  exception: AttendanceException | null;
+};
+
+/** One organization's day: who is in, who is out, who is away. */
+export type Roster = {
+  work_date: string;
+  /** The server's own answer to "is this today" — a client clock is not a second source. */
+  today: boolean;
+  days: RosterEntry[];
+};
+
+/** What a punch asks for. Omitted `work_date` means *today, on the server*. */
+export type ClockPunch = {
+  employee_id?: string;
+  work_date?: string;
+  /** An explicit instant, for a correction drawer or an import. A person pressing the button
+   *  does not send this, and the server's clock is the honest default. */
+  at?: string;
+  organization_id?: string;
+};
+
+/** A correction: which day, the two punches and the reason the schema requires. */
+export type AttendanceCorrection = {
+  employee_id: string;
+  work_date: string;
+  /** Omit to keep the stored punch — which leaves the day open, and is the usual reason. */
+  check_in?: string | null;
+  check_out?: string | null;
+  reason: string;
+  organization_id?: string;
+};
+
+/** `GET /hr/me/attendance` — the caller's own month. No `hr.*` key required. */
+export function fetchMyAttendance(month?: string): Promise<AttendanceMonth> {
+  return hrRequest<AttendanceMonth>(`/api/v1/hr/me/attendance${query({ month })}`);
+}
+
+/** `GET /hr/attendance` — one employee's month. Needs `hr.attendance.read` for anybody else. */
+export function fetchAttendance(
+  params: { employee_id?: string; month?: string } = {},
+): Promise<AttendanceMonth> {
+  return hrRequest<AttendanceMonth>(`/api/v1/hr/attendance${query(params)}`);
+}
+
+/** `GET /hr/attendance/roster` — one organization's day. Needs `hr.attendance.read`. */
+export function fetchRoster(workDate?: string): Promise<Roster> {
+  return hrRequest<Roster>(`/api/v1/hr/attendance/roster${query({ work_date: workDate })}`);
+}
+
+/** `POST /hr/me/attendance/check-in` — open the caller's own day. */
+export function checkInSelf(body: ClockPunch = {}): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/me/attendance/check-in", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/me/attendance/check-out` — close the caller's own day. */
+export function checkOutSelf(body: ClockPunch = {}): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/me/attendance/check-out", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/attendance/check-in` — punch somebody else's day. Needs `hr.attendance.record`. */
+export function checkInFor(body: ClockPunch): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/attendance/check-in", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/attendance/check-out` — close somebody else's day. Needs `hr.attendance.record`. */
+export function checkOutFor(body: ClockPunch): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/attendance/check-out", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/attendance/corrections` — change a day, with a reason. Needs `hr.attendance.manage`. */
+export function correctAttendance(body: AttendanceCorrection): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/attendance/corrections", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** The hours a minute count reads as, e.g. `510` → `"8h 30m"`.
+ *
+ *  Presentational only. The number a payroll import reads is the CSV, not this string, and the
+ *  grid's cell shows the same two numbers this derives so a person can check it by eye.
+ */
+export function formatMinutes(minutes: number | null): string {
+  if (minutes === null) {
+    return "—";
+  }
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours === 0) {
+    return `${rest}m`;
+  }
+  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+}
+
+/** The clock time of a punch, in the browser's own zone — `09:02`, or `—` for an open day. */
+export function formatPunch(instant: string | null): string {
+  if (!instant) {
+    return "—";
+  }
+  const parsed = new Date(instant);
+  if (Number.isNaN(parsed.getTime())) {
+    return "—";
+  }
+  return `${String(parsed.getHours()).padStart(2, "0")}:${String(parsed.getMinutes()).padStart(2, "0")}`;
+}

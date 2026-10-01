@@ -25,7 +25,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { CalendarDays, FileText, Palmtree, Plus, User } from "lucide-react";
+import { CalendarDays, Clock, FileText, Palmtree, Plus, User } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
 import { ErrorState, toScreenError, type ScreenErrorValue } from "@/components/error-state";
@@ -66,6 +66,19 @@ function MyWorkspaceNav() {
       >
         <Palmtree className="h-4 w-4" aria-hidden />
         My leave
+      </Link>
+      {/*
+        The clock is here, not only in the module shelf, because this is the surface that needs
+        no `hr.*` key: an employee is exactly who holds no `hr.attendance.*` permission, so the
+        entry a person without keys can actually open has to live in the keyless shelf.
+      */}
+      <Link
+        href="/hr/me/attendance"
+        data-qa-hr-me-link="attendance"
+        className="inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-sm text-muted-foreground hover:text-foreground"
+      >
+        <Clock className="h-4 w-4" aria-hidden />
+        My attendance
       </Link>
       <Link
         href="/hr/me/documents"

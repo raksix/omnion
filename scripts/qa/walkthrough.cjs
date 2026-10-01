@@ -2227,6 +2227,97 @@ async function runHrMe(page, report) {
   return { ok: true, steps: steps.length };
 }
 
+/**
+ * The clock (REQ-055, slice 2d).
+ *
+ * The one thing a bare inventory visit cannot prove about attendance is that the punch
+ * **works and then refuses to punch twice** -- the second click is a 409 carrying the punch it
+ * found, and a screen that hides the refusal passes a click-through pass while being unusable.
+ * So this presses the clock once, asserts the day appeared, and presses again to prove the
+ * refusal is shown rather than swallowed.
+ */
+async function runHrAttendance(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "hr", action: "hr-attendance", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/hr/me/attendance`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const loaded = (await page.locator("[data-qa-hr-attendance]").count()) > 0;
+  note({ step: "load", loaded });
+  if (!loaded) {
+    return { ok: false, reason: "My attendance did not render", steps };
+  }
+  await shot(page, "page-hr-me-attendance");
+
+  // The clock card and the summary strip are the screen's two halves; a grid with no totals
+  // beside it is the layout that makes somebody add the two numbers up in their head.
+  const hasCard = (await page.locator("[data-qa-hr-attendance-card]").count()) > 0;
+  const hasSummary = (await page.locator("[data-qa-hr-attendance-summary]").count()) > 0;
+  note({ step: "panels", card: hasCard, summary: hasSummary });
+  if (!hasCard || !hasSummary) {
+    return { ok: false, reason: "the clock card or the summary strip is missing", steps };
+  }
+
+  // The month control must move the month on screen, the same rule the year switch answers to.
+  const monthNow = (await page.locator("[data-qa-hr-attendance-month]").first().textContent()) || "";
+  await page.locator("[data-qa-hr-attendance-prev]").click().catch(() => {});
+  await page.waitForTimeout(1600);
+  const monthPrev = (await page.locator("[data-qa-hr-attendance-month]").first().textContent()) || "";
+  note({ step: "month-switch", from: monthNow.trim(), to: monthPrev.trim() });
+  if (monthNow.trim() === monthPrev.trim()) {
+    return { ok: false, reason: "the month control did not change the month on screen", steps };
+  }
+  await page.locator("[data-qa-hr-attendance-next]").click().catch(() => {});
+  await page.waitForTimeout(1600);
+
+  // Press the clock. A disabled button is a legitimate reason to stop, but it must be disabled
+  // because the day is already punched -- the pass cannot tell the two apart by looking, so it
+  // presses and reads whatever the card says afterwards.
+  const checkIn = page.locator("[data-qa-hr-attendance-check-in]").first();
+  const wasEnabled = await checkIn.isEnabled().catch(() => false);
+  if (wasEnabled) {
+    await checkIn.click().catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+  const todayLine =
+    (await page.locator("[data-qa-hr-attendance-today]").first().textContent()) || "";
+  note({ step: "punch", pressed: wasEnabled, today: todayLine.trim() });
+  await shot(page, "page-hr-me-attendance-punched");
+
+  // The refusal path: a second check-in is a 409, and the screen must show the sentence rather
+  // than swallow it into a silently unchanged card.
+  const stillEnabled = await checkIn.isEnabled().catch(() => false);
+  if (wasEnabled && stillEnabled) {
+    await checkIn.click().catch(() => {});
+    await page.waitForTimeout(1800);
+    const refusal = (await page.locator("[data-qa-hr-attendance-refusal]").first().textContent()) || "";
+    note({ step: "second-punch", shown: refusal.trim().length > 0, text: refusal.trim() });
+    if (refusal.trim().length === 0) {
+      return {
+        ok: false,
+        reason: "a second check-in was accepted without a visible refusal",
+        steps,
+      };
+    }
+  }
+
+  // The roster is the other half of the slice: a month grid with no organizational day would
+  // leave the acceptance criterion about the roster unmeasured.
+  await page.goto(`${URL_ADMIN}/hr/attendance`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const rosterLoaded = (await page.locator("[data-qa-hr-attendance-roster]").count()) > 0;
+  note({ step: "roster", loaded: rosterLoaded });
+  await shot(page, "page-hr-attendance-roster");
+  if (!rosterLoaded) {
+    return { ok: false, reason: "the attendance roster did not render", steps };
+  }
+
+  return { ok: true, steps: steps.length };
+}
+
 /** The next Monday at or after `ms`, as midnight UTC. */
 function nextMonday(ms) {
   const date = new Date(ms);
@@ -10057,6 +10148,11 @@ async function main() {
     { path: "/hr/me/leave", name: "hr-me-leave" },
     { path: "/hr/me/leave/new", name: "hr-me-leave-new" },
     { path: "/hr/me/documents", name: "hr-me-documents" },
+    // Attendance (REQ-055 slice 2d). Both routes are in the ordinary inventory list rather than
+    // only inside a bespoke pass, so a screen that exists but is never walked is a screen whose
+    // regressions nobody notices.
+    { path: "/hr/me/attendance", name: "hr-me-attendance" },
+    { path: "/hr/attendance", name: "hr-attendance-roster" },
     { path: "/hr/leave/types", name: "hr-leave-types" },
     // The security centre's five screens (REQ-012, slices 1–3). `runSecurityDepth` drives the
     // overview, the findings store and the header policy, but it never opened the last two —
@@ -10292,6 +10388,14 @@ async function main() {
   if (!onlyGroup("hr")) {
     report.hrMe = await runDepthPass("hr-me", () => runHrMe(page, report));
     log(`hr me: ${JSON.stringify(report.hrMe)}`);
+
+  // The clock (REQ-055, slice 2d). Driven rather than merely visited: the pass presses the punch
+  // and then presses it again, because "a second check-in is refused" is the criterion and a
+  // click-through pass that visits the page never finds out.
+  if (!onlyGroup("hr")) {
+    report.hrAttendance = await runDepthPass("hr-attendance", () => runHrAttendance(page, report));
+    log(`hr attendance: ${JSON.stringify(report.hrAttendance)}`);
+  }
   }
 
   if (!onlyGroup("crm")) {

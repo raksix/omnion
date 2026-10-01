@@ -15,7 +15,7 @@
  */
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { ListChecks, Palmtree, type LucideIcon } from "lucide-react";
+import { Clock, ListChecks, Palmtree, type LucideIcon } from "lucide-react";
 
 const LINKS: { href: string; label: string; icon: LucideIcon }[] = [
   // Leave is the only surface slice 2b builds, and it is the one people open: a request list with
@@ -26,6 +26,10 @@ const LINKS: { href: string; label: string; icon: LucideIcon }[] = [
   // The type catalogue sits next to the requests it governs rather than under a Settings drawer:
   // deciding whether annual leave needs approval is part of working the leave screen.
   { href: "/hr/leave/types", label: "Leave types", icon: ListChecks },
+  // Attendance (slice 2d). The roster is the operator's morning screen, so it sits in the module
+  // shelf rather than behind My workspace -- the employee's own clock is the self-service route,
+  // and this one answers for everybody at once behind `hr.attendance.read`.
+  { href: "/hr/attendance", label: "Attendance", icon: Clock },
 ];
 
 export function HrModuleNav() {
@@ -37,28 +41,27 @@ export function HrModuleNav() {
       className="flex flex-wrap items-center gap-1 border-b border-border pb-2"
     >
       {LINKS.map((link) => {
-        // The **longest** matching href wins. `/hr/leave/types` is under `/hr/leave`, so a plain
+        // The **longest** matching href wins, and the match is a segment boundary. A plain
         // `startsWith` lights the requests tab while the catalogue is open — the tab a person is
-        // not looking at is the tab that says where they are. Sorting by length descending and
-        // taking the first match is what makes the two nested routes honest.
-        const here =
-          pathname === link.href ||
-          (pathname?.startsWith(`${link.href}/`) ?? false) ||
-          (pathname?.startsWith(`${link.href}/new`) ?? false) ||
-          (link.href === "/hr/leave" &&
-            pathname?.startsWith("/hr/leave") === true &&
-            ![...LINKS].some(
-              (other) => other.href !== link.href && (pathname?.startsWith(other.href) ?? false),
-            ));
+        // not looking at is the tab that says where they are — and it also lights `/hr/leave`
+        // for a route that has nothing to do with leave. Sorting descending and taking the first
+        // match that is either the pathname itself or a **segment** prefix is what makes nested
+        // routes honest.
+        const here = [...LINKS]
+          .sort((a, b) => b.href.length - a.href.length)
+          .find((candidate) => {
+            const path = pathname ?? "";
+            return path === candidate.href || path.startsWith(`${candidate.href}/`);
+          });
         const Icon = link.icon;
         return (
           <Link
             key={link.href}
             href={link.href}
             data-qa-hr-module-link={link.href.split("/").pop()}
-            aria-current={here ? "page" : undefined}
+            aria-current={here?.href === link.href ? "page" : undefined}
             className={`inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-sm ${
-              here
+              here?.href === link.href
                 ? "bg-muted font-medium text-foreground"
                 : "text-muted-foreground hover:text-foreground"
             }`}

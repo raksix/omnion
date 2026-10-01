@@ -489,23 +489,38 @@ pub async fn punch(
             }
         }
         ClockKind::Out => {
-            // The `where check_in is not null` is the checkout-without-checkin refusal expressed
-            // as one statement, and it distinguishes the two failures the request names: a day
-            // with NO row at all fails on the insert (no check-in was ever punched), while a day
-            // with a check-in but no checkout falls through the clause and is closed here.
+            // A check-out is an **update**, never an insert. The upsert that used to be here
+            // could not express the rule: `on conflict (employee_id, work_date) do update` only
+            // fires when the row ALREADY exists, so on a day nobody punched the statement fell
+            // through to a plain insert and created a row carrying nothing but a check-out. The
+            // schema did not stop it either — `hr_attendance_has_a_punch_check` reads
+            // `check_in is not null or check_out is not null`, which a check-out-only row
+            // satisfies — so the walk found a clock that reports a finished day nobody ever
+            // started, with `minutes_worked` null and no way to tell it from a lost badge.
+            //
+            // An UPDATE states the fact in one statement: there is no path here that creates a
+            // row, so "no day to close" is a `None` and the match below can name it.
+            //
+            // The placeholders and the binds must agree POSITIONALLY, and a mismatch here is
+            // silent in a way a check-in's typo never is: `sqlx` binds five values, the
+            // statement only names `$1..$5` with no `$4`, and the row it looks for is keyed on
+            // organization/employee/date. Binding a fresh id to `$1` therefore makes the
+            // predicate `organization_id = <a uuid nobody owns>`, which matches zero rows on
+            // every call — the check-out returns `CheckoutWithoutCheckin` for a day that was
+            // clocked in perfectly well, and the walk cannot tell that from the real refusal it
+            // is trying to prove. The row is now named by its real key and `source` is stored
+            // on the way through, so a punched day records how it was closed.
             let updated: Option<Uuid> = sqlx::query_scalar(
-                "insert into hr_attendance \
-                     (id, organization_id, employee_id, work_date, check_out, source) \
-                 values ($1, $2, $3, $4, $5, $6) \
-                 on conflict (employee_id, work_date) do update \
-                     set check_out = excluded.check_out, \
-                         minutes_worked = (extract(epoch from (excluded.check_out - hr_attendance.check_in)) / 60)::int, \
+                "update hr_attendance \
+                     set check_out = $4, \
+                         minutes_worked = (extract(epoch from ($4 - check_in)) / 60)::int, \
+                         source = $5, \
                          updated_at = now() \
-                 where hr_attendance.check_in is not null \
-                   and hr_attendance.check_out is null \
+                 where organization_id = $1 and employee_id = $2 and work_date = $3 \
+                   and check_in is not null \
+                   and check_out is null \
                  returning id",
             )
-            .bind(Uuid::new_v4())
             .bind(organization_id)
             .bind(employee_id)
             .bind(work_date)
@@ -557,34 +572,63 @@ pub async fn correct(
             message: "a correction must supply a check-in, a check-out, or both".to_string(),
         });
     }
-    // The order check is here rather than left to the constraint so the refusal names the field,
-    // and it is ALSO in the migration: the service is where the message lives, the constraint is
-    // where the fact lives.
-    if let (Some(start), Some(end)) = (check_in, check_out)
-        && end <= start
-    {
-        return Err(HrError::Invalid {
-            entity: "attendance",
-            field: "check_out",
-            message: "the check-out must be after the check-in".to_string(),
-        });
+    // A correction may close a day the person forgot to close, so a check-out on its OWN is the
+    // shape the drawer actually sends and the stored check-in is the one it is measured against.
+    // The order check below therefore has to consult the **stored** check-in when the request
+    // supplies none, or "backwards" is decided against nothing and every lone check-out passes.
+    // This is the one place the two arguments disagree: `check_in` is what the day becomes,
+    // `effective_start` is what "the clock cannot run backwards" is a statement about.
+    if let Some(end) = check_out {
+        let stored_start: Option<OffsetDateTime> = sqlx::query_scalar(
+            "select check_in from hr_attendance \
+             where organization_id = $1 and employee_id = $2 and work_date = $3",
+        )
+        .bind(organization_id)
+        .bind(employee_id)
+        .bind(work_date)
+        .fetch_one(pool)
+        .await?;
+        let effective_start = check_in.or(stored_start);
+        if let Some(start) = effective_start
+            && end <= start
+        {
+            return Err(HrError::Invalid {
+                entity: "attendance",
+                field: "check_out",
+                message: "the check-out must be after the check-in".to_string(),
+            });
+        }
     }
     let minutes = match (check_in, check_out) {
         (Some(start), Some(end)) => minutes_between(start, end),
+        // The lone-check-out case has to re-read the day it just wrote to learn its minutes: the
+        // pair is split across the request and the row, and `minutes_worked` is what the grid
+        // shows, so leaving it null would make the day uncountable and the month wrong.
+        // `and_then`, not `map`: `minutes_between` already answers `Option<i32>` for a negative
+        // span, and a `map` over it would build `Option<Option<i32>>` and stop compiling.
+        (_, Some(end)) => day_of(pool, organization_id, employee_id, work_date)
+            .await?
+            .and_then(|day| day.check_in)
+            .and_then(|start| minutes_between(start, end)),
         _ => None,
     };
+    // The placeholders and the binds are positional and there is no spare: this statement named
+    // `$5` for the check-in while binding nine values, so `$4` — a date with no column to write —
+    // shifted the check-in into the minutes slot and the reason into `corrected_by`. It stored
+    // `minutes_worked: null` and left `corrected_by` holding the operator's sentence, which is
+    // the kind of row nobody can audit afterwards. The five columns the update writes are `$4..$8`
+    // and the binds below follow them in that order.
     let updated: Option<Uuid> = sqlx::query_scalar(
         "update hr_attendance \
-             set check_in = $5, check_out = $6, minutes_worked = $7, note = $8, \
-                 corrected_by = $9, updated_at = now() \
+             set check_in = coalesce($4, check_in), check_out = $5, \
+                 minutes_worked = $6, note = $7, corrected_by = $8, updated_at = now() \
          where organization_id = $1 and employee_id = $2 and work_date = $3 \
-           and ($5 is not null or $6 is not null) \
+           and ($4 is not null or $5 is not null) \
          returning id",
     )
     .bind(organization_id)
     .bind(employee_id)
     .bind(work_date)
-    .bind(OffsetDateTime::now_utc().date())
     .bind(check_in)
     .bind(check_out)
     .bind(minutes)

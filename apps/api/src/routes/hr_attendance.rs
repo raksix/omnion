@@ -129,9 +129,36 @@ pub async fn get_attendance(
     Ok(Json(json!({
         "month": omnion_module_hr::dates::to_wire(&summary.month),
         "employee_id": employee_id,
-        "days": days,
+        "days": days_with_flags(days),
         "summary": summary,
     })))
+}
+
+/// Add each day's exception to the row that already carries its punches.
+///
+/// The flag is a **reading against the server's clock** — `missing_checkout` only applies to a
+/// day in the past — so it cannot live in `AttendanceDay` as a field: a stored value would be
+/// wrong the morning after it was written, and nothing would ever recompute it. Publishing it
+/// here is what keeps the grid, the summary and the CSV giving the same answer; a client that
+/// recomputed it would be a fourth reader, disagreeing with the others by however far its own
+/// clock is from the server's.
+fn days_with_flags(days: Vec<AttendanceDay>) -> Value {
+    let today = OffsetDateTime::now_utc().date();
+    Value::Array(
+        days.into_iter()
+            .map(|day| {
+                let mut row = serde_json::to_value(&day).unwrap_or(Value::Null);
+                if let Some(object) = row.as_object_mut() {
+                    object.insert(
+                        "exception".to_owned(),
+                        day.exception(today)
+                            .map_or(Value::Null, |e| Value::String(e.as_str().to_owned())),
+                    );
+                }
+                row
+            })
+            .collect(),
+    )
 }
 
 /// `GET /api/v1/hr/attendance/summary` — one employee's month, as the reports screen reads it.
@@ -168,10 +195,79 @@ pub async fn get_roster(
     let organization_id = organization_of(&state, &current, params.organization_id).await?;
     let work_date = day_of(params.work_date.as_deref())?;
     let days = attendance::roster(state.db().pool(), organization_id, work_date).await?;
+
+    // One query for the names and one for the absences, rather than a lookup per row: a roster of
+    // forty people answered with forty round trips is a screen that takes four seconds, and the
+    // roster is the screen an operator opens when they arrive in the morning.
+    let mut names: std::collections::HashMap<Uuid, String> = std::collections::HashMap::new();
+    for row in sqlx::query_as::<_, (Uuid, String)>(
+        // `first_name`/`last_name`, not a `full_name` column: `hr_employees` has never had one
+        // (0196 split the name into two columns so a script can name somebody from any culture),
+        // and naming a column that does not exist makes this whole route answer 500 for every
+        // caller — the roster is the screen an operator opens on arrival, so the bug is visible
+        // within a minute of deploying. The concatenation is the module's own `to_wire` order:
+        // given name first, exactly as the employee list renders it.
+        "select id, \
+         coalesce(nullif(btrim(first_name || ' ' || last_name), ''), work_email, 'Employee') \
+         from hr_employees where organization_id = $1",
+    )
+    .bind(organization_id)
+    // `HrError::Database` rather than a bare `?`: `ApiError` has no `From<sqlx::Error>`, and
+    // routing the failure through the module's own error is what gives it the 500 the rest of
+    // this module's storage failures already answer with.
+    .fetch_all(state.db().pool())
+    .await
+    .map_err(HrError::Database)?
+    {
+        names.insert(row.0, row.1);
+    }
+    // Approved leave only. A pending request is a question, not an absence, and a roster that
+    // showed somebody as away on the strength of a request nobody approved is a roster that
+    // argues with the leave screen.
+    let mut away: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    for employee in sqlx::query_scalar::<_, Uuid>(
+        "select distinct employee_id from hr_leave_requests \
+         where organization_id = $1 and leave_status = 'approved' \
+           and starts_on <= $2 and ends_on >= $2",
+    )
+    .bind(organization_id)
+    .bind(work_date)
+    .fetch_all(state.db().pool())
+    .await
+    .map_err(HrError::Database)?
+    {
+        away.insert(employee);
+    }
+
+    let today = OffsetDateTime::now_utc().date();
+    let rows: Vec<Value> = days
+        .iter()
+        .map(|day| {
+            json!({
+                "employee_id": day.employee_id,
+                // A day row whose employee has since been hard-deleted cannot happen — the
+                // reference is RESTRICT — so the name is always there; the fallback is for the
+                // employee whose row predates the full_name column being non-null.
+                "employee_name": names
+                    .get(&day.employee_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Employee".to_owned()),
+                "work_date": omnion_module_hr::dates::to_wire(&day.work_date),
+                "check_in": day.check_in,
+                "check_out": day.check_out,
+                "minutes_worked": day.minutes_worked,
+                "on_leave": away.contains(&day.employee_id),
+                "exception": day
+                    .exception(today)
+                    .map(|e| e.as_str()),
+            })
+        })
+        .collect();
+
     Ok(Json(json!({
         "work_date": omnion_module_hr::dates::to_wire(&work_date),
-        "today": work_date == OffsetDateTime::now_utc().date(),
-        "days": days,
+        "today": work_date == today,
+        "days": rows,
     })))
 }
 
