@@ -85,8 +85,8 @@ pub mod content;
 pub mod restore_jobs;
 // Deployment tooling (REQ-128, slice 4). The release cache, the artifact list, the bundle
 // generator and the upgrade plan.
+pub mod backfills;
 pub mod deployment;
-pub mod migrations;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -109,6 +109,7 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
+pub mod migrations;
 pub mod notifications;
 pub mod notifications_admin;
 pub mod notifications_test;
@@ -1321,6 +1322,55 @@ pub fn router(state: AppState) -> Router {
             "/deployment/migrations/{version}/verify-down",
             post(migrations::rehearse_reversal)
                 .layer(guards::require(&state, "deployment.migrations.verify")),
+        )
+        // Backfill jobs (REQ-129, slice 3). `read` is `migrations.read` — a backfill is a
+        // migration that has not finished, and an operator reading the ledger needs to see the
+        // jobs that release registered. `backfills.manage` is a SEPARATE key from
+        // `migrations.apply`, and the reason is the whole point of the split: applying a migration
+        // changes the schema for rows written from now on, while a backfill REWRITES EVERY
+        // EXISTING ROW of a table. An operator trusted to break the schema has proved nothing
+        // about the data in it.
+        //
+        // `/deployment/backfills/{id}` is registered AFTER `/deployment/backfills` and before the
+        // `{id}/…` action routes only for the usual axum reason — a literal segment and a capture
+        // segment cannot be siblings without the capture eating the literal.
+        .route(
+            "/deployment/backfills",
+            get(backfills::list_backfills)
+                .layer(guards::require(&state, "deployment.migrations.read")),
+        )
+        .route(
+            "/deployment/backfills/{id}",
+            get(backfills::read_backfill)
+                .layer(guards::require(&state, "deployment.migrations.read")),
+        )
+        .route(
+            "/deployment/backfills/{id}/run",
+            post(backfills::run_batch)
+                .layer(guards::require(&state, "deployment.backfills.manage")),
+        )
+        .route(
+            "/deployment/backfills/{id}/pause",
+            post(backfills::pause_backfill)
+                .layer(guards::require(&state, "deployment.backfills.manage")),
+        )
+        .route(
+            "/deployment/backfills/{id}/resume",
+            post(backfills::resume_backfill)
+                .layer(guards::require(&state, "deployment.backfills.manage")),
+        )
+        // Seed datasets. The READ is `migrations.read` — the datasets and this installation's
+        // load history are release metadata — and the LOAD is `seeds.load`, its own key, because
+        // it is the only write on this surface that puts fixture rows into an operator's database.
+        // The environment refusal is separate from the key and both apply: the key says who, and
+        // the environment says where — the same split `migrations.apply` has.
+        .route(
+            "/deployment/seeds",
+            get(backfills::list_seeds).layer(guards::require(&state, "deployment.migrations.read")),
+        )
+        .route(
+            "/deployment/seeds/{name}/load",
+            post(backfills::load_seed).layer(guards::require(&state, "deployment.seeds.load")),
         )
         .route(
             "/security/overview",
