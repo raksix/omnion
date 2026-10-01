@@ -303,6 +303,107 @@ async fn a_completed_claim_answers_the_lead_its_winner_wrote() {
     drop_org(&pool, org).await;
 }
 
+/// The row-level consequence of the id rule, for the ids that needed it.
+///
+/// **Every other test in this file uses an id of two or three words, and that is why the
+/// submission-id defect survived a gate written for it.** `run-crm-submission-id.sh` proves the
+/// API's `idempotency_key` and the module's `claims::normalize` return the *same answer*, which
+/// is the sentence that was broken — and both answers agreed on every short key, because there
+/// is nothing to disagree about. The disagreement only exists past the cap, and this file's
+/// fixtures never went there.
+///
+/// So the shape that was broken is stated here as a row: **a key longer than the cap, delivered
+/// twice, leaves one claim and one lead.** Not "the functions agree" (the gate has that) and not
+/// "the claim table has a primary key" (the gate asserts that too) — the acceptance box says
+/// *one submission, one lead, no duplicates*, and this is the one delivery identity for which
+/// that sentence was false: the API refused the id, `claims::take` was never reached, **no claim
+/// row existed at all**, and every retry wrote another lead. Nothing about the second lead is an
+/// error, which is why the duplicate was invisible.
+#[tokio::test]
+async fn a_key_longer_than_the_cap_still_leaves_one_claim_and_one_lead() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "claims-longkey").await;
+    let source_id = source(&pool, org).await;
+
+    // A real id, not `x.repeat(400)`: the API's header is what carries this, and a value with
+    // no readable prefix is a shape no caller produces. It also has to be *longer* than the cap
+    // and *distinct in its first 128 characters* from anything else, or the test would pass on
+    // a build that caps by refusing to claim at all.
+    let long = format!(
+        "form-{}-{}",
+        Uuid::new_v4().simple(),
+        "tail-".repeat(40)
+    );
+    assert!(
+        long.chars().count() > claims::MAX_SUBMISSION_ID,
+        "the fixture must actually be over the cap, or this test measures nothing"
+    );
+
+    let first = store::capture(&pool, &submission(org, source_id, Some(&long)))
+        .await
+        .expect("the first delivery");
+    let second = store::capture(&pool, &submission(org, source_id, Some(&long)))
+        .await
+        .expect("the redelivery finds the claim the first one wrote");
+
+    assert_eq!(
+        second.lead.id, first.lead.id,
+        "the redelivery must answer with the lead the first delivery wrote"
+    );
+    assert_eq!(
+        lead_count(&pool, org).await,
+        1,
+        "one submission, one lead — for an id that had to be capped, which is the case that \
+         wrote no claim at all before the two halves of the rule were made to agree"
+    );
+
+    // **The claim row is the half no pure function can assert**, and it is the row whose absence
+    // is what made every retry a new lead. Read it back rather than trusting the lead count: a
+    // build that captured once and then deduplicated by *address* rather than by claim would
+    // satisfy the count above and leave this empty.
+    let claims: i64 = sqlx::query_scalar(
+        "select count(*) from crm_lead_submissions where source_id = $1",
+    )
+    .bind(source_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the claim count");
+    assert_eq!(claims, 1, "the capped id wrote its claim");
+
+    // And the stored key is the **normalized** one, which is what every read path binds. This
+    // is the assertion that names the third spelling: a column holding the raw 200-character
+    // value would still be one row, and every later read of it — `lead_of_claim`,
+    // `find_lead_by_submission` — would find nothing while looking for the same submission.
+    let stored: String = sqlx::query_scalar(
+        "select submission_id from crm_lead_submissions where source_id = $1",
+    )
+    .bind(source_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the stored claim key");
+    assert_eq!(
+        stored,
+        claims::normalize(&long).expect("a usable identity"),
+        "the claim table holds the normalized key, so the four read paths can bind the same \
+         string the writer stored"
+    );
+    assert!(
+        stored.chars().count() <= claims::MAX_SUBMISSION_ID,
+        "the stored key is the capped one, not the caller's spelling — migration 0150's \
+         char_length check would refuse the raw value anyway"
+    );
+    assert_eq!(
+        claims::lead_of(&pool, source_id, &long)
+            .await
+            .expect("the claim read"),
+        Some(first.lead.id),
+        "a reader given the caller's RAW spelling still finds the lead: normalization is the \
+         reader's job too, which is exactly what the four call sites were getting wrong"
+    );
+
+    drop_org(&pool, org).await;
+}
+
 /// A submission with no key still captures — the claim is an opt-in for callers that have an
 /// identity, not a new requirement on the browser form post that has none.
 #[tokio::test]
