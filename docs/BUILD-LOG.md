@@ -7574,3 +7574,30 @@ have **zero call sites anywhere**, so a revoked endpoint is not yet pruned. Next
   migration and not a code change), the chat entry point, and a walk against a real database
   proving operation 1's write is rolled back. The unit test proves the executor **stopped**;
   it does not prove a transaction undid a row, and the acceptance box says so.
+
+## 2026-10-01 · wave7 tick 42 · REQ-101 slice 3b — the apply, the `failed` status, and the rollback a real database can prove
+
+- **What.** `POST /ai/change-sets/{id}/apply`; the `failed` status and `updated_by` in migration
+  `0201`; `ai.changeset.failed` and `ai.changeset.applied` in the event catalogue;
+  `content::pages::update_page_in` and four `_on` readers in the AI hub, so a write and the
+  preview it is derived from can share one transaction; and `apps/api/tests/ai_change_sets.rs`,
+  four walks against a real database.
+- **Proof.** `cargo build -p omnion-api` clean; `cargo test --lib` over ai-hub **507** (+1),
+  api **256**, content **15**, events **52**; `--test ai_change_sets` **4 passed**;
+  `pnpm typecheck` clean.
+- **The walk failed first, and it was the code.** The rollback walk drove a real set whose
+  second operation named a page that was not there, and the refusal came back as "`page`
+  0fa7bb0f… does not exist, so there is nothing to preview against" — a uuid, out of a set
+  whose operations all carry keys. The route annotated its **write** and not its **preview**, so
+  the acceptance criterion's "the failing operation named" was untrue for the one failure a
+  real database can produce. The annotation moved into the store's loop.
+- **A duplicated applier, and the cost of finding out.** The walk could not import the route's
+  applier (a route is a module of the binary), so the first version **copied** it. The copy
+  drifted inside the same commit — in the error message, which is the part nobody diffs. The
+  fix was not a better copy: the loop moved to the store as `AsyncOperationExecutor` +
+  `apply_all_with`, and the per-operation write is the content crate's own. The file says what
+  it does not cover.
+- **What is still open, deliberately.** The stale banner's browser half (slice 2c, waiting on a
+  QA slot), the chat reply entry point that files a set, and the park-one-operation-as-an-
+  approval bridge. `updated_by` and the diff re-render / preview hash box stay open: the editor
+  re-plans on the client today and the request wants a hash the reviewer can compare.
