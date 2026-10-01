@@ -11682,6 +11682,103 @@ async function runWorkflowBuilderDepth(page, report) {
   }
   note({ step: "reload-rebase", ...rebaseNote });
 
+  // Undo replaces the graph WHOLESALE, and a wholesale replacement has to prune the selection.
+  // It did not: `doUndo` restored nodes and edges and nothing else, so the selection went on
+  // naming a card the canvas no longer had. The keyboard alone reaches it — no second tab, no
+  // conflict — and the shape is ordinary: the palette's click-add selects the card it just
+  // added, so a second add leaves the selection on B, and one ⌘Z then removes B.
+  //
+  // **What the defect looked like on screen, which is why it is read from the words.** The
+  // inspector looks its node up with `nodes.find(...) ?? null` and so went blank and looked
+  // fine; the toolbar's Duplicate and Copy read `disabled={!selected}`, and `selected` is a
+  // string that survived, so both stayed ENABLED for a node that did not exist. The status bar
+  // counts `selectionSize(selection)` and announced "1 selected" over a canvas that had one
+  // card left and it was not that one. Every one of those is a *claim* the screen makes about
+  // a card it is not drawing, so the row reads the buttons and the words, not a CSS class.
+  //
+  // The conjunction matters and the preconditions are reported as their own fields: a
+  // `selectedCount === 0` after an undo is also the answer for a page where nothing was
+  // selected, and for an undo that never happened. A row that fails its preconditions has
+  // measured nothing, which is how the tick-48 `reload-rebase` row spent three ticks
+  // reporting a number that could not move.
+  const undoSelAdd = async (kind) => {
+    await page.locator("[data-builder-palette]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.locator(`[data-palette-node='${kind}']`).first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  };
+  const selectedCardId = () =>
+    page
+      .evaluate(() =>
+        document
+          .querySelector("[data-node-id][data-node-selected='true']")
+          ?.getAttribute("data-node-id") ?? null,
+      )
+      .catch(() => null);
+  const toolbarDisabled = (testId) =>
+    page
+      .locator(`[data-testid='${testId}']`)
+      .first()
+      .getAttribute("disabled")
+      .then((value) => value !== null)
+      .catch(() => null);
+
+  let undoSelNote = { attempted: false };
+  await undoSelAdd("wait");
+  await undoSelAdd("transform");
+  const undoSelVictim = await selectedCardId();
+  const cardsBefore = await page
+    .evaluate(() => document.querySelectorAll("[data-builder-canvas] [data-node-id]").length)
+    .catch(() => null);
+  if (!undoSelVictim) {
+    undoSelNote = { attempted: true, reason: "the palette add selected nothing to lose" };
+  } else {
+    const preRead = {
+      duplicateEnabled: (await toolbarDisabled("builder-duplicate")) === false,
+      copyEnabled: (await toolbarDisabled("builder-copy")) === false,
+    };
+    // The gesture under test. `Control+z` is the same key the `drag-undo` row uses, but the
+    // reading is on the selection rather than the position, and this one undoes an ADD rather
+    // than a drag.
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(1200);
+    const postRead = await page
+      .evaluate((victim) => {
+        const selectionTextEl = document.querySelector("[data-builder-selection]");
+        return {
+          selectedCount: document.querySelectorAll(
+            "[data-node-id][data-node-selected='true']",
+          ).length,
+          victimStillDrawn: Boolean(
+            document.querySelector(`[data-node-id="${CSS.escape(victim ?? "")}"]`),
+          ),
+          cards: document.querySelectorAll("[data-builder-canvas] [data-node-id]").length,
+          selectionText: selectionTextEl ? (selectionTextEl.textContent ?? "").trim() : null,
+          inspectorOpen: Boolean(document.querySelector("[data-node-inspector]")),
+        };
+      }, undoSelVictim)
+      .catch(() => ({ readFailed: true }));
+    undoSelNote = {
+      attempted: true,
+      // The preconditions. Without the first two, "nothing selected" is also the answer for a
+      // page that was never selected and for an undo that never ran.
+      cardsBefore,
+      cardWasSelected: undoSelVictim !== null,
+      toolbarOfferedTheSelection: preRead.duplicateEnabled && preRead.copyEnabled,
+      // The undo actually removed the card the selection named. If this is false the rest of
+      // the row is about a graph that still holds the node.
+      cardRemovedByUndo: postRead.victimStillDrawn === false,
+      // THE ASSERTION. A selection naming a card the canvas does not have must not be drawn,
+      // must not be counted, and must not leave a live control pointed at nothing.
+      selectionPruned: postRead.selectedCount === 0,
+      selectedCountAfter: postRead.selectedCount,
+      selectionTextAfter: postRead.selectionText,
+      duplicateDisabled: await toolbarDisabled("builder-duplicate"),
+      copyDisabled: await toolbarDisabled("builder-copy"),
+      cardsAfter: postRead.cards,
+    };
+  }
+  note({ step: "undo-selection", ...undoSelNote });
+
   // The connection gesture: press an output port, press a target node, and the server's edge
   // count rises. The refusal is the half that matters — a port the source does not export has
   // to *say so*, and a gesture that refuses silently is indistinguishable from a dead button,
