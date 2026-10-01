@@ -6406,3 +6406,64 @@ inspector — is written and unmeasured, and for three ticks each has been "the 
 run". The reason was never that the pass was slow. It was that consecutive ticks were starting
 competing passes that destroyed each other, and the resulting failure mode is a report full of
 findings measured against a database that was dropped underneath the walk.
+
+## Tick 90 (third pass) — the browser pass finally measured, and it found two real defects
+
+A focused pass (`QA_ONLY='notifications-depth,webhooks-depth,event-retention-depth,security-depth'`)
+walked the whole route inventory and reached the depth passes. It ended in the mobile phase with
+`TypeError: Cannot read properties of undefined (reading 'horizontalOverflow')` at
+`walkthrough.cjs:7724` — a harness bug, recorded below — but everything before it is measurement.
+
+**REQ-021 — the keyboard criterion is now closed.** The box had been open for four ticks with a
+note that no pass had reached the leg. Every leg is now measured:
+
+```text
+keyboardRows 3  cursorMoved true  keyboardSelected true  keyboardOpenedDrawer true
+escapeClosedDrawer true  escapeWithNoRowUnderCursor true
+eToggledRead true  shiftEMarkedVisible true
+drawerDeliveryEmptyState true  drawerDeliveryNamesChannelsInProse true
+readRowsStayVisible true  bulkNoticeIsHonest true  inboxFilterIsHonest true
+```
+
+The settings screen's legs also came back green after the `c48db9d` fix, including the two that
+were false twice: **`quietSaved: true`, `digestPersisted: true`**, plus `serverAgrees`,
+`inAppRefusalIsA400`, `errorState` and `errorOffersRetry`.
+
+### Two defects this pass found, both mine
+
+**1. `slashFocusedFilter: false` — `/` does not focus the filter.** Every other key on the
+criterion is wired (`j`, `k`, `Enter`, `e`, `Shift+E`, `x`, `Esc` all measured true), and `/` is the
+one the criterion names that the handler does not have. A shortcut list in the file header and a
+handler that lacks one of them is the same defect the `Escape` leg was two ticks ago: documented,
+absent, and invisible to every walk that only pressed the keys that work. It is a one-line fix
+once someone reads the criterion as a list rather than as a sample.
+
+**2. `pushEnableExplainsItself: false`, with `pushUnavailableNamesAVariable: true`.** Slice 6a
+made the Web Push readiness row honest — it now says the installation has no usable key pair
+instead of claiming the channel is configured — and 6b added the transport. But the **button**
+next to that message is disabled with no explanation of *why*, so the screen says "this
+installation has no push key pair" in one sentence and offers a dead control in the next. A
+disabled control with no reason is the "dead button" the definition of done forbids, and it is
+the same shape as the webhook `chat`-channel defect from last tick: the state was reported
+honestly while the affordance beside it stayed silent.
+
+**REQ-016 and REQ-010 — the passes ran and the screens are honest, but the flows could not
+complete.** `webhooks` reports a correct empty state (`emptyState`, `emptyOffersTheAction`,
+`emptyNameRefused`, `emptyUrlRefused`, `emptyEventsRefused`, `badUrlRefused`,
+`shortSecretRefused`, `insecureWarns`, `groupSelectsTheWholeArea` — the whole validation set the
+criterion names), then `secretShown: false` / `endpointId: ""` / `testQueued: false`, and
+`endpointIsGone: true` because there was never an endpoint to delete. The same shape on
+`event-retention`: the tab renders and the **bounds come from the API** (`boundsComeFromTheApi`,
+`windowIsTheServers`, `zeroDisablesSave`, `hugeDisablesSave`, `validEnablesSave` all true) but
+`saved: true` with `savedIsAnnounced: false`, `auditCarriesBoth: false`, `sweepAnswers: false` and
+`runLogGrew: false`. In both cases the assertion that depends on a *write* is false while the
+assertions that read the screen are true, which points at the environment rather than at the
+screens: the QA stack runs without a Web Push key pair and without an object store the upload can
+write to, and both passes stop at the first write.
+
+**A harness bug, not a product one.** `walkthrough.cjs:7724` reads `.horizontalOverflow` off an
+undefined value in the mobile phase. It is the same class as the earlier `'horizontalOverflow'`
+note in this ledger: a measurement that cannot be taken is reported as a **thrown TypeError**,
+which kills the pass and takes every later measurement with it, rather than being recorded as an
+absent measurement. The mobile legs for REQ-021 are therefore still unmeasured — and this time the
+cause is in the file that is supposed to be measuring them.
