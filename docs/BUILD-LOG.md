@@ -11615,3 +11615,63 @@ dangling image (581 MB), my own orphaned `qa-slot.sh` waiter reparented to PID 1
 **Next.** Slice 1's remaining half: `/developer/keys` and `/developer/logs` routes and screens,
 the catalogue entries for `developer.keys.*`, and the middleware that turns `omn_<prefix>.<secret>`
 into a scoped session — then the pass.
+
+## Tick 103 · REQ-033 slice 1, the remaining half (branch `wave5`)
+
+**What.** Slice 1's second half: `apps/api/src/routes/developer.rs` (list / detail+usage / create
+/ rotate / revoke / request-log page / request-log row), the permission catalogue entries, the two
+admin screens, and `apps/api/src/developer_auth.rs` — the guard that turns `omn_<prefix>.<secret>`
+into an authorized request. Three commits: `9e597100`, `d210444b`, `3d5d299d`.
+
+**The design decision, stated because it looks wrong until it is explained.** A key is authorized
+against **its own scope list**, not against a role, and it is **never a `CurrentSession`**. Both
+look inconsistent with the `omsa_*` service-account path sitting next to them, and the module
+argues it: a service account is a person's automation whose power is a role change — visible,
+attributable, reviewed — whereas an API key is a credential pasted into somebody's `.env` by
+whoever holds that file, and nobody necessarily knows it exists. Its scope list is the only place
+its power is written down anywhere, so it has to be enforced at the edge. And because a key has no
+user, `actor_user_id()` is `None` rather than a fabricated id: manufacturing a synthetic session
+is how a platform ends up with audit rows naming a person who never made the request. Both are
+asserted in tests, and the "never a person" one is a one-liner that is worth more than its length.
+
+**One refusal, two layers.** `authn::decide` returns the *precise* reason (revoked / expired /
+address not allowed) because a log line has to tell an operator whether to rotate or ask for an
+extension; `KeyRefusal::into_error` collapses address-not-allowed into the generic answer because
+a caller must not learn which keys exist. The tests caught this being written against the wrong
+layer first — asserting that `decide` returns `Invalid` when it correctly returns the precise
+reason. The lesson is the shape of the fix: **a fix to either layer alone regresses the other**,
+so both halves are asserted together.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-api --lib` | **375 passed**, 0 failed (339 before this tick, +36) |
+| `cargo test -p omnion-developer --features store` | **39 passed**, 0 failed |
+| `cargo check -p omnion-api` | exit 0, no errors |
+| `pnpm typecheck` | **2/2** successful |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+
+**Four defects caught while writing it, all real, all fixed in the commit that found them.**
+
+1. `u64::from(Ipv4Addr)` does not exist — it needs `u64::from(u32::from(..))`. Separately, the
+   `/0` case needs the mask computed in a width that can hold the shift, or `u32::MAX << 32`
+   overflows and every legitimate `0.0.0.0/0` allowlist is silently wrong. An allowlist that is
+   "any IPv4" is the single most common one.
+2. `::/0` matched a v4 address. A dual-stack allowlist written as `::/0` plus a v4 block would
+   have become a universal bypass, and it would have looked like a *feature*.
+3. `ApiError: From<sqlx::Error>` does not exist in this API, and the developer store's error is
+   not `sqlx::Error` either — it wraps it. Three call sites assumed otherwise; one of them would
+   have answered `500` where the right answer is `400`.
+4. `KeyPrincipal::allows` originally built a whole throwaway `ApiKey` to reach
+   `AuthenticatedKey::allows`. The comparison belongs to a scope list, so it moved to
+   `omnion_developer::scope_allows` and both callers use it — one spelling of "does this scope
+   list grant X" instead of two, which is where a prefix match eventually creeps in.
+
+**Not ticked.** No acceptance box. Every box in this slice is about what a *request* does, and
+the browser pass over this build has not run.
+
+**Next.** The pass over `/developer/keys` and `/developer/logs` — the key form, the one-time
+secret dialog (which refuses to close until the secret is acknowledged), rotation's
+"the old secret stops working immediately" confirmation, the log's filters and its no-bodies
+explanation. Then, once slice 1's box can be ticked, slice 2: the API Explorer.
