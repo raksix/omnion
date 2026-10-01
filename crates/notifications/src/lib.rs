@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audience;
 pub mod delivery;
 pub mod error;
 pub mod model;
@@ -27,6 +28,7 @@ pub mod router;
 pub mod store;
 pub mod vocabulary;
 
+pub use audience::{may_address, refused_recipients};
 pub use delivery::{
     DeliveryConfig, DeliveryJob, EnqueueReport, InAppTransport, NO_TRANSPORT_YET,
     READER_SWITCHED_IT_OFF, RunReport as DeliveryRunReport, Transport, TransportOutcome, claim_due,
@@ -56,9 +58,9 @@ pub use router::{
     list_rules, render, resolve_recipients, route, rules_for_event,
 };
 pub use store::{
-    BulkRecord, archive, delete, find, list, mark_all_read, record, record_many,
-    record_many_with_deliveries, record_with_deliveries, set_read, set_read_many, summary,
-    validate_categories, validate_channel, within_emit_budget,
+    BulkRecord, archive, delete, find, list, mark_all_read, recipient_organizations, record,
+    record_many, record_many_with_deliveries, record_with_deliveries, set_read, set_read_many,
+    summary, validate_categories, validate_channel, within_emit_budget,
 };
 pub use vocabulary::{
     CATEGORIES, CHANNELS, EMIT_BUDGET_PER_MINUTE, MAX_BULK_IDS, MAX_PAGE, PRIORITIES, is_category,
