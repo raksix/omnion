@@ -7746,11 +7746,21 @@ async function runNotificationSettingsDepth(page, report) {
       steps.pushEnableLiveWithKey = !(await enable.first().isDisabled().catch(() => true));
     }
 
-    // Pressing it in a headless pass cannot succeed — there is no user gesture and no service
-    // worker — and the block must say *that* rather than silently doing nothing or throwing
-    // an unhandled rejection into the console. Chromium without a service worker rejects
-    // `navigator.serviceWorker.ready`, which is the exact leg that catches a missing catch.
-    if (steps.pushEnableOffered) {
+    // Pressing a LIVE button in a headless pass cannot succeed — there is no user gesture and
+    // no service worker — and the block must say *that* rather than silently doing nothing or
+    // throwing an unhandled rejection into the console. Chromium without a service worker
+    // rejects `navigator.serviceWorker.ready`, which is the exact leg that catches a missing
+    // catch.
+    //
+    // A *disabled* button is a different case and the earlier version measured it wrongly:
+    // it clicked unconditionally and read "no error appeared" as a defect, while on an
+    // installation with no key pair the button is `disabled` by design — Playwright refuses
+    // the click, so the leg was measuring the browser, not the screen. The two are separated
+    // now and BOTH still have to say something: a live button must produce a sentence when
+    // its browser refuses, and a disabled one must carry the reason *with the control*
+    // rather than leaving it in a paragraph further up the block.
+    const enableDisabled = await enable.first().isDisabled().catch(() => true);
+    if (steps.pushEnableOffered && !enableDisabled) {
       await enable.first().click().catch(() => {});
       await page.waitForTimeout(1800);
       const said = await page.locator("[data-push-error]").count();
@@ -7762,6 +7772,17 @@ async function runNotificationSettingsDepth(page, report) {
           .catch(() => "");
         steps.pushErrorIsASentence = text.trim().length > 20;
       }
+    } else if (steps.pushEnableOffered) {
+      steps.pushEnableExplainsItself =
+        (await page.locator("[data-push-enable-reason]").count()) > 0;
+      steps.pushDisabledReasonNamesAVariable = /OMNION_PUSH_[A-Z_]+/.test(
+        await page
+          .locator("[data-push-enable-reason]")
+          .innerText()
+          .catch(() => ""),
+      );
+      steps.pushDisabledReasonIsDescribed =
+        (await page.locator("[data-push-enable][aria-describedby=push-enable-reason]").count()) > 0;
     }
 
     // A remove button that exists on a row must delete that row, and the row must disappear
@@ -11086,11 +11107,29 @@ async function main() {
   // So an unmeasurable page is recorded as a finding of its own. It is deliberately NOT a pass:
   // the screen was in the route list, so the rule that decides whether a page ships cannot treat
   // "we failed to look at it" as "we looked and found nothing".
-  const unmeasured = [];
   for (const p of report.pages) {
+    // A page whose walk threw is pushed as `{ ...route, failed }` with no `diagnostics` at
+    // all, so every field read off `d` below is a read off `undefined`. That is not a
+    // cosmetic gap: this loop runs *before* the rest of the roll-up, and an uncaught
+    // TypeError here takes every later finding with it — one crashed page silently converts a
+    // pass that measured 90 screens into a pass that reported nothing, and a pass with no
+    // verdict reads as "no findings". The measurement is therefore recorded as **absent**
+    // (a finding that says so) instead of being assumed clean, and the loop continues so a
+    // single bad page cannot cost every later page its report.
     const d = p.diagnostics;
     if (!d) {
-      unmeasured.push(p.name);
+      // Main's shape wins here, and the reason is which artifact the reader opens: a `high`
+      // finding is in the per-screen report and in `bySeverity`, while the alternative — a
+      // `voidReasons` entry — only marks the WHOLE run as unmeasured. Both refuse to call an
+      // unmeasured screen clean; one says which screen, per page, in the same list as a
+      // horizontal overflow. Main also fixed the same bug in the mobile leg below.
+      pushFindings(
+        "high",
+        "unmeasured-page",
+        `${p.name}: the page walk failed before it produced diagnostics${
+          p.failed ? ` (${p.failed})` : ""
+        } — this screen was not measured`,
+      );
       continue;
     }
     if (d.horizontalOverflow) pushFindings("high", "overflow", `${p.name}: page scrolls horizontally (${d.scrollWidth}px > ${d.viewport.w}px)`);
@@ -11103,15 +11142,15 @@ async function main() {
     if (d.h1Count === 0) pushFindings("low", "no-h1", `${p.name}: no h1 heading`);
   }
   for (const m of report.mobile) {
-    // Same contract as the desktop roll-up above: a phone screen we could not measure is a
-    // finding, not a pass. The 390×844 leg is the only evidence the mobile acceptance boxes can
-    // ever be ticked from, so letting it throw here would leave them untickable with no report.
-    if (!m.diagnostics) {
-      unmeasured.push(`mobile:${m.name}`);
+    // Main's version, for the same reason as the desktop leg above: a `high` finding naming the
+    // screen, in the same report a reviewer already reads for overflow.
+    const d = m.diagnostics;
+    if (!d) {
+      pushFindings("high", "unmeasured-mobile", `mobile ${m.name}: no diagnostics were produced — this screen was not measured at 390px`);
       continue;
     }
-    if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
-    if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
+    if (d.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
+    if (d.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${d.offscreen.length} element(s) outside the viewport`);
   }
   // A step that came back `false` and is only written into the JSON report is a defect nobody is
   // told about: the pass reports success, the report records a failure, and the two are read by
@@ -11136,13 +11175,6 @@ async function main() {
   // number in a log is not a verdict. `medium` rather than `high` because the page may well be
   // fine and the tab may have navigated — but the acceptance box it was to prove stays UNticked,
   // because nothing about that page was actually read.
-  if (unmeasured.length) {
-    pushFindings(
-      "medium",
-      "unmeasured-page",
-      `${unmeasured.length} screen(s) were visited but produced no diagnostics: ${unmeasured.join(", ")}`,
-    );
-  }
   const refusedOnPurpose = [];
   // Is the stack still up? A pass that walks twenty screens against an API which stopped
   // answering turns every screen's read into a 503, and each of those becomes a `high`
