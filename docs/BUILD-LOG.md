@@ -8565,3 +8565,63 @@ the only thing read.
 masking criterion that is not yet proved), then `/ai/guard` and `/ai/guard/rules` with the
 walkthrough registration, then slice 2 (masking + re-mapping). The queued w7 pass remains the only
 thing that can close REQ-099 and REQ-100.
+
+## 2026-10-01 · wave7 · REQ-105 slice 1, the outbound half: the stub-provider walk
+
+**WHAT.** `apps/api/tests/ai_guard_outbound.rs` (96232f63). REQ-105's first criterion asks for
+masking to be "proven with a stub provider that records the exact body it received", and slice 1
+had closed on a detector the test itself constructed — which proves `checkpoint`, not the route.
+This suite registers a stub provider, makes real `POST /ai/chat` calls through the router, and
+reads back the exact bytes it was sent. Five walks: a masked turn leaves as `[EMAIL_1]` and the
+address never leaves (both halves asserted); one value keeps one placeholder across two turns; a
+blocked turn answers `403 ai_guard_blocked` naming the label and the recorded call count does not
+move; a clean payload leaves the body untouched and files no event row; the tester answers a
+verdict, carries no outbound text for a blocked verdict, never puts a value in a match and dials
+nothing.
+
+**PROOF.** `cargo test -p omnion-ai-hub --lib` → 575 passed, 0 failed. `pnpm typecheck` → 2/2
+clean. `cargo build --test ai_guard_outbound -p omnion-api` → compiles with zero warnings in the
+new file. The five walks themselves: **5 passed** on the run that finished before the box ran out
+of disk; two of the five were then re-run green individually after their harness faults were fixed
+(`a_masked_turn_leaves_as_a_placeholder_and_the_address_never_leaves`,
+`the_same_value_keeps_one_placeholder_across_two_turns`). The last three have NOT been re-run
+green since the member/owner correction — see BLOCKER.
+
+**PROVEN TO FAIL, which is the part that mattered.** With `checkpoint_messages` in
+`routes/ai.rs:1798` replaced by a pass-through on purpose: the blocked walk fails on the 403 and
+the masking walk fails with the raw address in the recorded body
+(`body was: {"messages":[{"content":"Write to ada.lovelace@omnion.test ...`). The neuter was
+reverted and the route is byte identical to its committed state (`git diff --stat` empty).
+
+**TWO FALSE GREENS FOUND AND FIXED.** Both were found *by* the proven-to-fail run, and neither was
+visible while the walks were passing:
+1. The suite leaked a throwaway database per walk and read an unreachable PostgreSQL as "skip,
+   carry on" — so with the checkpoint bypassed, four of five walks printed `ok` for the wrong
+   reason. Every walk now calls `dispose`, and an unreachable database **panics** rather than
+   skipping (borrowed from `ai_guard.rs`, which records the same lesson).
+2. The walks read the policy and the events list as the bootstrap **owner**, who is platform-level
+   with a null `organization_id`. That is indistinguishable from a guard that does nothing: the
+   policy read-back showed `all_permissive: true` and the events list showed zero rows while the
+   product was working perfectly. Both are read as the member now, and the platform view is
+   asserted separately so the two maps' independence is proven rather than assumed.
+Also corrected: `RatePolicy` lives in `omnion_security`, not in `omnion_api::rate_limit_middleware`
+(a private-import error); the `sign_in` ceiling is 10 per 300s per **IP**, so five walks that each
+sign in trip over each other and over the other suites on the box — raised for this suite only,
+every other scope left as shipped; a blocked `Finding` carries `text: String::new()`, so
+`masked_text` is empty and asserting it contained a placeholder would have been asserting a shape
+the code deliberately does not produce.
+
+**BLOCKER (not mine).** `/mnt/apopic` hit **100%** mid-tick (`write_file` failed with "No space
+left on device", four zero-byte `.hermes-tmp.*` files appeared). Reclaimed from **my own**
+worktree only — `apps/admin/.next/cache` 1.1G and `apps/web/.next/cache` — taking it to 92%.
+`omnion-postgres` (the shared QA database, `0.0.0.0:5433`) had already entered crash recovery on
+the full filesystem and is still `postgres: startup` in **D state** 20+ minutes later, so the last
+three walks cannot be re-run to green. Shared infrastructure and not mine to restart, so it is
+reported rather than touched. `apps/api/src/routes/ai.rs` is unmodified; `git status` is clean.
+
+**NEXT.** Re-run the three un-re-verified walks once PostgreSQL is out of recovery (all five were
+green together once, and the two that changed since were re-run green individually). Then
+`/ai/guard` + `/ai/guard/rules` + `/ai/guard/events` + `/ai/guard/tester` with the walkthrough
+routes registered, then slice 2 (masking + response re-mapping). The w7 QA pass is still queued
+behind a live w5 holder (pid 1822938, `cwd=/mnt/apopic/omnion-w5`) and is the only thing that can
+close REQ-099 and REQ-100.

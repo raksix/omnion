@@ -3,8 +3,10 @@
 > **Status:** in-progress (slice 1 detector/policy/budget: `602531b0`; the migration, the store
 > and the API: `94fde861`, `26f09f3a`; the **outbound checkpoint every provider call passes
 > through** — `d96d7f37`, which is the half that makes this a control rather than a screen: a
-> blocked payload is refused with `403 ai_guard_blocked` before any provider is dialled, and the
-> verdict is proved with a detector built in the test and no database in the picture) ·
+> blocked payload is refused with `403 ai_guard_blocked` before any provider is dialled; the
+> **stub-provider walk that proves it on the wire** — `96232f63`, which replaces the detector-in-
+> the-test proof with a real provider at the other end of `POST /ai/chat`, so a masked turn is
+> observed leaving as `[EMAIL_1]` and a blocked turn is observed never being dialled) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
@@ -140,14 +142,14 @@ refuses to start in the guard (the API answers a configuration error) rather tha
 
 ### Acceptance criteria
 
-- [ ] A prompt containing an email address is masked to `[EMAIL_1]` before the provider call (proven with a stub provider that records the exact body it received) and the same value keeps the same placeholder across two calls in one request.
+- [x] A prompt containing an email address is masked to `[EMAIL_1]` before the provider call (proven with a stub provider that records the exact body it received) and the same value keeps the same placeholder across two calls in one request. — **proved in `apps/api/tests/ai_guard_outbound.rs`**: a stub provider records every body the router sends; the walk asserts `[EMAIL_1]` arrives *and* the original address does not, and that two mentions in two messages produce one placeholder and no `[EMAIL_2]`. The "no provider call" half of this criterion is the third walk, where the recorded call count does not move across the refused request.
 - [ ] The answer is re-mapped on completion: a stub provider that echoes `[EMAIL_1]` produces the original address in the stored message for the requester.
 - [ ] While streaming, deltas show the placeholder and the completed message shows the original — asserted by capturing the SSE frames and then reading the stored message.
 - [ ] A second reader (shared conversation, admin) sees the placeholder, not the original (asserted with two readers on the same message).
 - [x] An exemption for one label and one feature allows that label through for that feature only; another feature with the same label stays masked.
 - [ ] An expired exemption stops applying on the next request and emits `ai.guard.exemption.expired`.
 - [x] Saving an invalid regex is refused with a field error and stores nothing; the validate endpoint returns the same message.
-- [ ] The tester returns matches with labels and spans, the masked text and the verdict, and performs no provider call (stub provider records zero calls).
+- [x] The tester returns matches with labels and spans, the masked text and the verdict, and performs no provider call (stub provider records zero calls). — **proved in `apps/api/tests/ai_guard_outbound.rs`**: the walk runs a payload carrying an e-mail *and* a Luhn-valid card through `POST /ai/guard/test`, reads the `blocked` verdict, the `card` label, the eight running rules and the matches, and asserts the stub recorded **zero** calls. It also asserts two things the criterion does not name and the screen depends on: a blocked verdict carries **no** outbound text (so no caller can mistake a half-masked body for something that was sent), and no match carries the value — only its salted hash.
 - [x] The payload never appears in `ai_guard_events`, in the audit log or in the API response of the events endpoints — asserted by a test that greps the stored row text for the original value.
 - [ ] A caller without `ai.guard.manage` sees Rule actions and the tester disabled with the missing permission named; the API answers 403.
 - [ ] `/ai/guard/about` states the residual risk, and no other guard screen claims detection is complete.
