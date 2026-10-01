@@ -1,40 +1,49 @@
 # REQ-033 — Internal Developer Platform
 
-> **Status:** in-progress (`a1840487`; tick 107 — **slice 3a: OAuth client material, the
-> redirect-URI rule, PKCE and the `0229` migration.** The store functions, the routes and the
-> screen are still open, so no acceptance box is ticked.) Slice 2 remains code-complete and
-> waiting only on a browser pass. Two commits this tick: `82d52d55` the main merge,
-> `a1840487` slice 3a.
+> **Status:** in-progress (`a1840487`, `416a58bf`, `dd00be30`; tick 108 — slices 3a and 3b are shipped: the client material and the redirect/PKCE rules, the store, the authorization check, six panel routes behind two new permission keys, and migration `0231`. A real open-redirect defect in 3a's own loopback rule was found by 3b's validator and fixed (`816b89d5`), and the migration number had to be renumbered because w8 had taken `0229`. Gates: `omnion-developer --features store --lib` **104** (was 73), `omnion-api --lib` **397** (was 391), `omnion-permissions --lib` **64**, the OpenAPI drift gate **5/5** with all four new routes documented, and migration `0231` proved against live PostgreSQL by **8 named refusals across 7 constraints** plus 3 positive controls. **Open: the sessionless half** — the authorization request, consent screen and token endpoint — and then the panel screen, which is why the browser pass is not owed on this tick.)
+> are shipped.** The client material and the redirect/PKCE rules, the store, the authorization
+> check, six panel routes behind two new permission keys, and migration `0231`. The sessionless
+> half and the panel screen are still open, so the browser pass is not owed on this tick.) Slice 2
+> remains code-complete and waiting only on a browser pass.
 >
-> **The merge was a real defect, not a text conflict.** `public_media` runs main's conditional
-> machinery and my cache layer, and *both* wrote `ETag` on the same response. The two
-> derivations are not the same string — main's is `W/"<checksum>"`, mine is `"<checksum>"` — so
-> a client revalidating against the tag it was handed was compared against the other one and
-> never matched. It surfaces as a media file that re-downloads on every request, which reads
-> as "caching does not work" rather than as two layers disagreeing about a header. The fix is
-> `Validator::Preserved`: the conditional answer is decided in the handler (next to the `Range`
-> logic that shares its instant) and the cache layer writes only what it owns —
-> `Cache-Control`, `Vary`, `surrogate-key`.
+> **Two things this tick found that the code did not know about itself.**
 >
-> **A `#[cfg]` that was applied to half a match.** Slice 3a's first compile failed on
-> `DeveloperError::code()` naming the `Database` variant without the `store` feature guard
-> that variant itself carries. That is **pre-existing** — `error.rs` is untouched by this
-> slice — and it meant `cargo test -p omnion-developer` could not build, while the crate's own
-> `Cargo.toml` documents that exact command as the one that "needs no database at all". The
-> feature split had been written and the enum had been gated, and the *match* had not. Gated
-> rather than given a `_` arm, so a new variant still has to be given a code.
+> **(1) A real open-redirect defect in slice 3a's own code** (`816b89d5`). 3a fixed IPv6 loopback
+> by taking a bracketed authority whole, so that `split(':')` would not reduce `[::1]` to `[` —
+> and taking it whole *as a literal* accepts `http://[::1].attacker.example/cb`, an attacker's
+> hostname that merely begins with the loopback literal. It is the `starts_with("localhost")` bug
+> one level down, and it was found by 3b's redirect-list validator rather than by 3a's own unit
+> tests: those covered the accepted spellings and the `starts_with` near-misses, and not a
+> bracket-prefixed hostname. The closing bracket is now honoured only when nothing but an
+> optional decimal `:port` follows it, and the regression test lives in the module that holds
+> the predicate as well as in the caller — a test in the caller is fixed by changing the caller
+> and leaves the hole in the shared rule.
 >
-> **The IPv6 bug my own test caught on the first run.** `loopback_host` stripped the port by
-> splitting on the first colon, which reduces the IPv6 literal `[::1]` to `[` — so IPv6 loopback
-> was silently refused, and the only symptom was that a developer binding to `::1` could not
-> register a redirect URI. A bracketed authority is now taken whole before any colon is read
-> as a port separator.
+> **(2) The migration number was already taken.** `0229` is
+> `0229_crm_lead_sla_index_terminal_status.sql` in w8. The migration namespace is shared across
+> every worktree, so when both push, sqlx reads two files numbered 229 and answers
+> `VersionMismatch(29)` for the *whole* database — one writer's numbering choice kills every
+> other writer's suite. Renumbered to **`0231`**, the union high-water across all ten worktrees
+> plus one.
 >
-> **Gates:** `cargo test -p omnion-developer --lib` **73** (was 54, +19),
-> `cargo test -p omnion-api --lib` **391** (was 388, +3 for the preserved validator),
-> `pnpm typecheck` **2/2**. The `0229` migration is proven against a live PostgreSQL: four
-> constraints refuse their bad input and a fifth insert proves they are not simply refusing
-> everything. · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + SDKs · **Source:** owner
+> **A third thing, found by the response-shape tests:** `MintedAppResponse` declared
+> `previous_secret_expires_at` while the flattened `OAuthApp` already carries a field of that
+> name. Two fields, one JSON key, and the flatter writes first — so on a *creation* the response
+> said `null` while also claiming to have no such field, and a client reading the outer value
+> could never learn a rotation's deadline. The duplicate is gone and a `debug_assert` states that
+> the minted app and its row must agree about the deadline.
+>
+> **Gates:** `cargo test -p omnion-developer --features store --lib` **104** (was 73, +31),
+> `cargo test -p omnion-api --lib` **397** (was 391), `cargo test -p omnion-permissions --lib`
+> **64**, the OpenAPI drift gate **5/5** with all four new routes documented, and migration
+> `0231` proven against live PostgreSQL by **8 named refusals across 7 constraints** —
+> `oauth_apps_deletion_is_whole` in *both* directions, plus `oauth_apps_overlap_is_whole`,
+> `oauth_apps_grant_types_are_known`, `oauth_apps_redirect_uris_known`,
+> `oauth_codes_challenge_is_whole`, `oauth_codes_expiry_is_future` and
+> `oauth_apps_org_name_key` — with **3 positive controls**, including the one that matters: a
+> *withdrawn* app frees its name, so the partial unique index is doing its job. · **Captured:**
+> 2026-09-25 · **Layer:** `apps/admin` + SDKs · **Source:** owner brief — platform periphery &
+> headline features (2026-09-25)
 > brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -199,8 +208,8 @@ Audit: key create/rotate/revoke, OAuth app create/edit/delete and secret rotatio
 - [ ] The API Explorer lists operations from the served OpenAPI document, and a CI check fails when the document drifts from the running router.
 - [ ] Explorer sends run as the signed-in caller; a call the caller could not make from the UI returns the same `403`.
 - [ ] The Explorer shows status, duration and body, and copies the request as curl, TypeScript and Python with a placeholder instead of a real secret.
-- [ ] OAuth apps reject non-`https` redirect URIs except `http://localhost`, and an authorization-code plus PKCE flow completes end to end.
-- [ ] Client secret rotation keeps the previous secret valid until its overlap expiry, then rejects it.
+- [ ] OAuth apps reject non-`https` redirect URIs except `http://localhost`, and an authorization-code plus PKCE flow completes end to end. *(the **rejection** half is proved and is where the danger was; the flow's second half is not built yet. `app_rules::validate_redirect_uris` refuses a non-`https` scheme unless the host is exactly `localhost`, `127.0.0.1` or `[::1]`, and the list is checked in full before any of it is stored. The refusal carries the row's **position** and never the URL — `a_non_https_redirect_is_refused_by_position_and_never_echoed_back` asserts both `Display` and `Debug` are free of the submitted string, because `Display` reaches a log and `Debug` reaches a panic message. The loopback exception is narrow enough to survive a look-alike: `localhost.attacker.example`, `127.0.0.1.attacker.example` and `[::1].attacker.example` are all refused — the last of those by the tick-108 fix, found by this validator rather than by 3a's own tests. Every form that *is* accepted is asserted too, so the rule is not merely a refusal.)*
+- [ ] Client secret rotation keeps the previous secret valid until its overlap expiry, then rejects it. *(proved in code and in the database. `rotate_secret` moves the old hash into the overlap slot **by the same expression** that writes the new one — `previous_secret_hash = client_secret_hash` inside the `update` — so there is no window in which the old secret is in neither slot, and migration `0231`'s `oauth_apps_overlap_is_whole` refuses a partial write at the database level. `which_secret_matched` filters the overlap **by the clock before comparing** and returns *which* slot matched: `a_previous_secret_is_honoured_only_inside_its_overlap_and_the_slot_is_reported` asserts the second-before boundary works, the instant of expiry does not, and a window that expired years ago authenticates nobody. The slot name is what lets the audit row distinguish a deployment that has not redeployed from one that has, which is the only reason the overlap exists. The panel half is not built yet.)*
 - [ ] The Events catalog lists only event types the caller may subscribe to, and every sample validates against its own schema.
 - [ ] Request logs filter by key, status class, path prefix and date range, and history stays readable after a key is revoked.
 - [ ] A log entry contains no bodies and no secret-looking values (asserted against the redaction list in tests).
@@ -234,7 +243,10 @@ Visual check: the one-time secret dialog is unmistakable (warning icon, explicit
 2. **API Explorer.** OpenAPI emission, operation browser, schema-driven request form, send-as-caller, snippet drawer, CI drift check.
    **Code-complete** (`be241bd2`, `de029671`, `54853888`): the document, the runtime, the routes, the screen and the depth pass all ship; the drift check is a test that runs in `cargo test --workspace`, which is what CI runs. **Open on the browser pass alone.**
 3. **OAuth apps + events catalog.** App registration and editing, secret rotation with overlap, authorization-code plus PKCE, catalog from the event registry, webhook deep link.
-   **Slice 3a in progress** (`a1840487`; tick 107): the client material, the redirect-URI rule, PKCE and the `0229` migration ship. **Open: the store functions, the routes, the screen.** The event catalogue half of this slice is largely already built by REQ-016 — `/api/v1/events/catalogue` reads the same compiled registry `omnion_events::catalogue` — so what remains there is the developer framing, not a second source of truth.
+   **Slices 3a and 3b shipped** (`a1840487`, `416a58bf`, `dd00be30`; tick 108). 3a: the client material, the redirect-URI rule, PKCE and the migration — **renumbered `0229` → `0231`**, because w8 holds `0229_crm_lead_sla_index_terminal_status.sql` and the migration namespace is shared across every worktree (two files numbered 229 make sqlx answer `VersionMismatch(29)` for the whole database). 3b: the store (`crates/developer/src/store_oauth.rs`), the authorization check (`authorize()` in `model_oauth.rs`), the six panel routes, both permission keys, and the seven documented operations.
+   **A real open-redirect defect in 3a's own code was found by 3b's tests** (`816b89d5`): `http://[::1].attacker.example/cb` was accepted as loopback, because the fix that stopped `split(':')` reducing `[::1]` to `[` took a bracketed authority whole *as a literal*. The closing bracket is now honoured only when nothing but an optional decimal `:port` follows it.
+   **Open: the sessionless half.** The authorization request, the consent screen and the token endpoint live in their own file, because they take no session, carry a client secret in a body, and resolve their tenant from the *app row* rather than from `organization_of` — merging them with the panel's handlers would mean one endpoint picking a tenant by whichever value arrived first. Then the panel screen and its walkthrough route.
+   The event catalogue half of this slice is largely already built by REQ-016 — `/api/v1/events/catalogue` reads the same compiled registry `omnion_events::catalogue` — so what remains there is the developer framing, not a second source of truth.
    Done: a local test client completes the flow and every catalog sample validates against its schema.
 4. **SDKs + CLI + polish.** Scaffold generator, manifest validator, CLI device-code, overview cards, permission-hidden controls, mobile layout.
    Done: scaffolds install or load, `omnion login` issues a scoped token, and the read-only role sees no management controls.
