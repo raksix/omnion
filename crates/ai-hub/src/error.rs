@@ -144,6 +144,22 @@ pub enum AiHubError {
     /// the ones that name a page somebody is about to delete.
     #[error("no approval `{0}` in this organization")]
     ApprovalNotFound(Uuid),
+    /// A change set breaks one of its own rules (REQ-101 slice 3).
+    ///
+    /// Its own code, not `InvalidApproval`, because the refusal belongs on a different screen:
+    /// an approval's problem is a field of the **review** form, while a change set's problem is
+    /// an operation in an **editable list** — "operation 3 is a create that names a target id".
+    /// A client that mapped this onto `invalid_approval` would print the sentence above the
+    /// title field, which is the one control the reviewer is not looking at when a row of the
+    /// list is refused. Every message names the operation it is about.
+    #[error("invalid change set: {0}")]
+    InvalidChangeSet(String),
+    /// No change set carries that id in this organization.
+    ///
+    /// `NotFound` for the same tenancy reason as [`Self::ApprovalNotFound`]: a set id that
+    /// exists in another tenant must not be distinguishable from one that does not exist.
+    #[error("no change set `{0}` in this organization")]
+    ChangeSetNotFound(Uuid),
     /// No identity carries that id in this organization.
     ///
     /// `NotFound` rather than a 403, and that is a tenancy property rather than a preference:
@@ -236,6 +252,12 @@ impl AiHubError {
             Self::InvalidIdentity(_) => "invalid_identity",
             Self::InvalidApproval(_) => "invalid_approval",
             Self::ApprovalNotFound(_) => "approval_not_found",
+            // The change-set codes (REQ-101 slice 3). Distinct from the approval pair on
+            // purpose: the refusal belongs on a row of the editor's list, not on a field of
+            // the review form, and a client that collapsed them would print the sentence
+            // above the title.
+            Self::InvalidChangeSet(_) => "invalid_change_set",
+            Self::ChangeSetNotFound(_) => "change_set_not_found",
             Self::IdentityNotFound(_) => "identity_not_found",
             Self::IdentityConflict(_) => "identity_conflict",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",

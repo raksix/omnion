@@ -19,6 +19,7 @@ pub mod agent_sdk;
 pub mod approvals;
 pub mod catalog;
 pub mod catalogue;
+pub mod change_sets;
 pub mod ops_binding;
 pub mod client;
 pub mod connection_test;
