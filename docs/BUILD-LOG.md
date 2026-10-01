@@ -10232,3 +10232,49 @@ gates are green, but a pass that never ran measures nothing. Ticking it now woul
 **Next.** One `--only=forms` pass at the first tick that finds the slot free **and** the volume
 with room — the harness is proven, only the run is owed. Then `--only=block-editor` and
 `--only=members` for criteria 17 and 18, then REQ-019's content-api criterion.
+
+## 2026-10-01 · tick 52 — the guard that measured tmpfs fullness backwards, and the pass I stopped rather than let it run without a slot
+
+**What.** A defect in this writer's own `disk-guard.sh`, found by reading its own output rather
+than by any gate: `shm_free_pct()` returned `df --output=pcent` — **percent USED** — while every
+caller named it, printed it and compared it as percent FREE. Fixed in `128f3469`, pinned by
+`scripts/qa/test-disk-guard-shm.sh` (`d7f1d9fb`), wired into every pass (`51a9979d`).
+
+**Proof.**
+- On this box, `df` said `/dev/shm` **Use 98%**; the function answered **98** and every call site
+  read that as "98% free". It now answers **2**. The relief branch (`free < 15`) fires on a full
+  tmpfs and stays quiet on an empty one — with the old code both were exactly backwards, which is
+  why the branch was unreachable in the only situation it exists for.
+- The test mounts a scratch tmpfs and fills it, so the assertions are about **direction**: an
+  empty filesystem reads mostly free, a filled one does not, the reading *moves* with `df`, and
+  the branch fires on full / stays quiet on empty. **Verified to fail first**: with the old
+  one-liner restored, **5 of 6 assertions fail**; with the fix, 6/6 pass. It skips rather than
+  stubbing `df` when a tmpfs cannot be mounted — a stand-in would test the stub, not the box.
+- Re-running the corrected guard reclaimed this worktree's own incremental cache (431M) and
+  **dropped nothing it should not**: `w4-target` (9.4G), `w5-target` (6.7G) and `w6-target`
+  (4.6G) each have a live process whose cwd is that worktree, so `reclaimable()` refused all three.
+  That refusal is the rule working, not the fix failing.
+- Fast gates on the merged tree: `omnion-content` **314/0**, `pnpm typecheck` **exit 0** (14 pkgs).
+
+**The pass was started, waited honestly, and then stopped.** `--only=block-editor` queued behind
+w3's live pass (holder 2624054, `clicks.jsonl` still growing: 1299 → 2308 across 30 minutes) and
+after 2400s of queueing printed `no place after 2400s, proceeding without one`. That expiry is the
+dangerous part: it proceeds **without a place**, onto a box already running w3's and w8's Chromium
+walkthroughs — at 55 chrome processes and **0 GB available RAM** of 32. So the group was killed
+(`kill -TERM -4008976`) rather than allowed to start a third browser into a box at the RAM cliff
+that took the shared Postgres down on 29 September.
+
+Verified the kill left nothing: no `run.sh`/walkthrough orphan for 18081/3101/3201, `pm2 list |
+grep w2` **0**, my `/dev/shm/w2-artifacts` removed, and the sibling's place untouched and still
+live. A pass that dies holding a place holds the whole queue — this one never took one.
+
+**No acceptance criterion is ticked by this tick and none should be.** Criterion 17 (REQ-063) and
+criterion 18 (REQ-064) are browser measurements, and this tick ran no browser. Both depth passes
+exist and are reachable (`--only=block-editor`, `--only=members`), and the members pass demands
+four explicit 390px keys plus its drawer pair — but a written pass that has not run measures
+nothing, and ticking on intent is the "assertion that cannot fail" defect this loop keeps finding
+in its own harness.
+
+**Next.** `--only=block-editor` at the first tick that finds the slot free **and** RAM above the
+cliff — not merely the volume with room, since on this box RAM is the binding constraint first.
+Then `--only=members` for criterion 18, then REQ-019's content-api criterion.
