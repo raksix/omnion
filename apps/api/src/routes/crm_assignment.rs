@@ -237,7 +237,7 @@ pub async fn create_rule(
         json!({ "name": rule.name, "position": rule.position, "target_kind": rule.target_kind }),
     )
     .await;
-    emit(pool, organization_id, "crm.intake.rule.updated", rule.id, json!({ "changed_keys": ["created"] })).await;
+    emit(pool, organization_id, rule.id, json!({ "changed_keys": ["created"] })).await;
     Ok((axum::http::StatusCode::CREATED, Json(rule.into())))
 }
 
@@ -279,7 +279,7 @@ pub async fn update_rule(
         json!({ "name": updated.name, "active": updated.active, "target_kind": updated.target_kind }),
     )
     .await;
-    emit(pool, organization_id, "crm.intake.rule.updated", id, json!({ "changed_keys": ["updated"] })).await;
+    emit(pool, organization_id, id, json!({ "changed_keys": ["updated"] })).await;
     Ok(Json(updated.into()))
 }
 
@@ -520,14 +520,32 @@ pub async fn delete_policy(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Emit a bus event. Best effort by design: an event that cannot be recorded is logged and
-/// the request still succeeds, because a lead's assignment is not rolled back by a bus that
-/// is briefly unavailable — and the reverse (refusing the assignment because the bus is
-/// down) would lose the assignment itself.
+/// Emit the assignment-rule bus event. Best effort by design: an event that cannot be recorded
+/// is logged and the request still succeeds, because a lead's assignment is not rolled back by
+/// a bus that is briefly unavailable — and the reverse (refusing the assignment because the bus
+/// is down) would lose the assignment itself.
+///
+/// **There is no `name` parameter, and that is the fix.** This helper used to take one
+/// (`emit(pool, organization_id, name, target_id, payload)`) and both call sites passed the same
+/// value, `crm.intake.rule.updated` — so the parameter could only ever carry that one name, and
+/// it cost the name its place in the drift gate. `every_live_name_has_an_emitter` walks the
+/// workspace for a quoted string at a `NewEvent::new(…)` constructor; a name that arrives
+/// through a binding is invisible to it, so the row read as `Live` with no emitter behind it
+/// while the worker emitted it correctly on every rule write. The picker therefore never
+/// offered the name: **undeliverable by construction**, and indistinguishable from a
+/// misconfigured endpoint to whoever wired one up.
+///
+/// Widening the scanner was rejected on purpose. A scanner that resolves a parameter would
+/// resolve a `format!` too, and a gate that accepts a wire contract assembled at runtime cannot
+/// name a contract that drifted — it would have replaced a blind spot with a licence. The cost
+/// of the honest repair is one duplicated literal at two call sites, and both call sites are
+/// *the same event*: a create and an update are the same fact ("the rules changed"), which is
+/// why the payload carries `changed_keys` and why the catalogue row describes both. If a
+/// future change needs two genuinely different names here, the helper grows a second
+/// constructor rather than a parameter, so the gate keeps seeing them.
 async fn emit(
     pool: &sqlx::PgPool,
     organization_id: Uuid,
-    name: &'static str,
     target_id: Uuid,
     payload: Value,
 ) {
@@ -543,11 +561,16 @@ async fn emit(
     }
     if let Err(error) = bus::emit(
         pool,
-        NewEvent::new(name).organization(organization_id).payload(body),
+        NewEvent::new("crm.intake.rule.updated")
+            .organization(organization_id)
+            .payload(body),
     )
     .await
     {
-        tracing::warn!(error = %error, name, "the assignment event could not be recorded");
+        tracing::warn!(
+            error = %error,
+            "the assignment event could not be recorded"
+        );
     }
 }
 

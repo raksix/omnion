@@ -2980,11 +2980,35 @@ mod tests {
              a unique index would make that state unrepresentable — leaving the kind predicate \
              untested. Found: {statement}"
         );
+        // `concurrently` was asserted here until tick 60, and the assertion was the defect.
+        //
+        // This test is the one place the index's own shape is pinned, and it pinned
+        // `create index concurrently` — which sqlx cannot run, because `migrate!` wraps every
+        // migration in one transaction. **Every fresh installation of the platform died at
+        // `migrate()`** with `CREATE INDEX CONCURRENTLY cannot run inside a transaction block`.
+        // The two arguments for it were both wrong: a plain build does not "block the public
+        // capture endpoint", because a migration runs at *install*, before the platform serves
+        // a single request, so the write path it would protect does not exist yet; and the file's
+        // own note had already named the exact error and then argued it away.
+        //
+        // So the assertion is not merely relaxed, it is **inverted**: a concurrent build is now
+        // the thing this test refuses, and the reason is installability rather than locking.
+        // The gate that owns this property is `crates/core/tests/migration_transaction_directive.rs`
+        // (walks every migration, checks the directive is the file's first bytes) plus
+        // `scripts/qa/run-migration-installs.sh`, which boots the real binary against an empty
+        // database — the only instrument that can reproduce the failure at all, since `psql <
+        // file` has no transaction wrapper. **A test that pins the shape is not allowed to pin a
+        // shape that cannot be installed**, and this one spent its whole life doing exactly that
+        // while its own crate stayed green.
         assert!(
-            statement.contains("concurrently"),
-            "the build must be CONCURRENTLY: this indexes the table the public capture endpoint \
-             writes on every submission, and a plain build holds a lock that blocks those \
-             writes, turning a performance fix into an outage. Found: {statement}"
+            !statement.to_lowercase().contains("concurrently"),
+            "the build must NOT be concurrent: sqlx wraps every migration in one transaction \
+             (`sqlx::migrate!`), so `create index concurrently` cannot run and every fresh \
+             installation dies at migrate() with 25001. A migration runs at install, before \
+             the platform serves traffic, so the write lock it would avoid protects nothing. \
+             If a future migration genuinely needs one, declare `-- no-transaction` as the \
+             file's FIRST BYTES — below a comment header it is inert, which is the shape this \
+             very migration shipped in. Found: {statement}"
         );
     }
 }

@@ -546,6 +546,30 @@ catalogue! {
     "crm.lead.sla_reminder", "crm", Live,
     "A lead's first-response deadline is close enough that its owner was reminded.",
     [("lead_id", Uuid, req), ("due_at", Timestamp, req), ("owner_user_id", Uuid, opt)];
+    // The eighth CRM name, and the reason this row reads the way it does. `crm.intake.rule.updated`
+    // is emitted on every assignment-rule create and update by a **local** helper —
+    // `emit(pool, organization_id, name, target_id, payload)` in `crm_assignment.rs`, which takes
+    // the name as a parameter and hands it to `bus::emit` — so it never reaches the drift gate in
+    // `apps/api/tests/events.rs` that walks the workspace for `NewEvent::new("…")`. The gate's
+    // own header calls this shape out: *"listing the wrapper here is the difference between a gate
+    // that measures the workspace and one that measures a subset of it"*, and it did it for
+    // `Announcement::new(`. This name is the second instance, and unlike the first it was
+    // **undeliverable by construction**: the picker never offered it, so a receiver could not
+    // subscribe, while the bus recorded the fact on every rule write.
+    //
+    // The name is deliberately `crm.intake.rule.updated` and not a `crm.assignment.*` name.
+    // `crm.intake.source.updated` already exists and means "a source, its mapping or its key
+    // changed" — a rule is what *decides* an intake lead's owner, and the wrapper deliberately
+    // reports both `created` and `updated` through one `changed_keys` payload, so renaming it
+    // would be a wire change for an event some receiver may already subscribe to. The
+    // `crm.assignment.*` names beside it are **audit actions**, not bus events: they are written
+    // to `audit_log` by `audit(…)` and never reach the bus at all, so listing them here would
+    // put a subscription in the picker that could never receive anything. That distinction is
+    // the whole reason this row was not written a week ago when the same gap was found — the
+    // file contains sixteen `crm.*` literals and exactly one of them is an unemitted bus event.
+    "crm.intake.rule.updated", "crm", Live,
+    "An assignment rule was created or changed, so a lead's owner may now be decided differently.",
+    [("rule_id", Uuid, req), ("changed_keys", String, opt)];
 
     // ---- System health --------------------------------------------------------------------------
     // The five names REQ-014's Events section names, and the reason this area exists at all is
