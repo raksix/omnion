@@ -768,6 +768,18 @@ export type MediaFilters = {
   min_bytes?: number;
   max_bytes?: number;
   uploaded_by?: string;
+  /**
+   * Upload window, as `YYYY-MM-DD` — a day, not a timestamp.
+   *
+   * A date input can only offer a day, and "uploaded on 3 October" is the question an operator is
+   * asking. `mediaQuery` turns it into the two instants the store takes: `created_after` is the
+   * start of that day **in the operator's own timezone** (so a file uploaded at 23:00 on the 3rd
+   * is inside the window, and a file uploaded at 01:00 on the 4th is not), and `created_before`
+   * is the start of the *next* day — which is what makes the last day inclusive.
+   */
+  created_after?: string;
+  /** The last day of the window, inclusive; expanded to the start of the following day. */
+  created_before?: string;
   tag?: string;
   metadata?: string;
   scan_status?: string;
@@ -775,6 +787,13 @@ export type MediaFilters = {
   sort?: string;
   limit?: number;
   offset?: number;
+};
+
+/** One account the uploader filter offers, from `GET /api/v1/media/uploaders`. */
+export type MediaUploader = {
+  id: string;
+  label: string;
+  files: number;
 };
 
 /** One trashed file. */

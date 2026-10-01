@@ -798,6 +798,13 @@ impl From<MediaError> for ApiError {
                 Self::bad_request("invalid_folder_name", message)
                     .with_details(serde_json::json!({ "field": "name" }))
             }
+            // A browser filter that contradicts itself is a `400` with its own code and the
+            // offending field, so the toolbar can put the sentence under the box that produced
+            // it instead of showing "no files match" for a filter nobody typed.
+            MediaError::InvalidFilter { field, reason } => {
+                Self::bad_request("invalid_filter", format!("`{field}`: {reason}"))
+                    .with_details(serde_json::json!({ "field": field }))
+            }
             MediaError::FolderCycle { path } => Self::new(
                 StatusCode::CONFLICT,
                 "folder_cycle",

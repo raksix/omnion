@@ -125,6 +125,7 @@ import type {
   MediaFilePage,
   MediaFilters,
   MediaFolder,
+  MediaUploader,
   MediaFolderTree,
   MediaMergeResult,
   MediaPreset,
@@ -733,9 +734,82 @@ function mediaQuery(siteId: string, filters: MediaFilters = {}): string {
     if (value === undefined || value === null || value === "" || value === false) {
       continue;
     }
+    if (key === "created_after" || key === "created_before") {
+      // The store's window is two instants, the toolbar's is two days, and the expansion happens
+      // here and NOT in the API for one reason: `new Date("2026-10-03")` on a server is midnight
+      // **UTC**, so a server-side expansion shifts the window by the server's offset from the
+      // operator's. A file uploaded at 23:00 on the 3rd in Istanbul is outside a UTC-midnight
+      // window, and the panel would report "nothing matches" about a file the operator can see.
+      // The browser knows the operator's own day, so the browser draws the line.
+      //
+      // `created_before` is the start of the day AFTER the one picked, because the store's
+      // clause is `created_at <` — sending the start of the picked day would exclude every file
+      // uploaded after midnight on the day the operator chose, and the window's last day would
+      // be silently empty.
+      const instant =
+        key === "created_after"
+          ? startOfLocalDay(value as string)
+          : startOfLocalDay(nextLocalDay(value as string));
+      if (instant) {
+        params.set(key, instant);
+      }
+      continue;
+    }
     params.set(key, value === true ? "true" : String(value));
   }
   return params.toString();
+}
+
+/**
+ * Split a `YYYY-MM-DD` string into numbers, or `null` when it is not a plain calendar day.
+ *
+ * The check exists so a malformed value cannot reach the query string as `Invalid Date` and come
+ * back from the store as a `400` nobody can act on. A date input hands over nothing else, so
+ * this is a guard against a hand-edited URL, not against the control.
+ */
+function calendarDay(day: string): [number, number, number] | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!match) {
+    return null;
+  }
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/**
+ * The first instant of a `YYYY-MM-DD` day **in this browser's timezone**, as RFC 3339.
+ *
+ * Built from the parts rather than from `new Date("2026-10-03")`, because that form is specified
+ * as UTC: an operator picking "3 October" means their own 3 October, and a UTC reading of the
+ * same string is a different day for most of the planet.
+ *
+ * `null` for a value that is not a plain calendar day.
+ */
+function startOfLocalDay(day: string): string | null {
+  const parts = calendarDay(day);
+  if (!parts) {
+    return null;
+  }
+  const [year, month, date] = parts;
+  const moment = new Date(year, month - 1, date, 0, 0, 0, 0);
+  return Number.isNaN(moment.getTime()) ? null : moment.toISOString();
+}
+
+/**
+ * The `YYYY-MM-DD` day after the one given, in this browser's timezone.
+ *
+ * Round-tripped through the offset rather than built by hand from the parts: adding a day to
+ * `31 December` has to be `1 January`, and `new Date(year, month - 1, 32)` does that while
+ * hand-rolled arithmetic on the month does not.
+ */
+function nextLocalDay(day: string): string {
+  const parts = calendarDay(day);
+  if (!parts) {
+    return day;
+  }
+  const [year, month, date] = parts;
+  const moment = new Date(year, month - 1, date + 1, 0, 0, 0, 0);
+  const shifted = new Date(moment.getTime() - moment.getTimezoneOffset() * 60_000);
+  return shifted.toISOString().slice(0, 10);
 }
 
 /** The folder tree of a site, with the file count of every folder. */
@@ -779,6 +853,20 @@ export function fetchMediaFiles(
   filters: MediaFilters = {},
 ): Promise<MediaFilePage> {
   return request<MediaFilePage>(`/api/v1/media/files?${mediaQuery(siteId, filters)}`);
+}
+
+/**
+ * The accounts the uploader filter offers, most prolific first.
+ *
+ * Its own route rather than a field on the listing: a dropdown of candidates is a different
+ * question from the rows that question selects, and a list response carrying both would make
+ * every page of the library pay for a filter nobody touched. `media.read` is enough — it reads
+ * the `created_by` of rows the caller may already list.
+ */
+export function fetchMediaUploaders(siteId: string): Promise<MediaUploader[]> {
+  return request<{ site_id: string; uploaders: MediaUploader[] }>(
+    `/api/v1/media/uploaders?site_id=${encodeURIComponent(siteId)}`,
+  ).then((body) => body.uploaders);
 }
 
 /** Rename, move or edit the metadata of one file. */

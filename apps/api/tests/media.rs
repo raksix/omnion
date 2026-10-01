@@ -3816,3 +3816,320 @@ async fn the_pair_filter_and_editor_hold_the_line_a_tenant_does_not_cross() {
 
     fixture.cleanup().await;
 }
+
+#[tokio::test]
+async fn the_size_uploader_and_date_filters_narrow_a_live_listing() {
+    // The five filters this tick moved onto the toolbar. Until now they existed only in the
+    // store's `Filter` enum and the route's query struct, with a walk that asserted the SQL
+    // string and nothing that ever ran them against rows: `min_bytes` was proved to *build a
+    // clause* and never to *select anything*. This is that proof.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let upload = format!("/api/v1/media?site_id={site}");
+    let browser = format!("/api/v1/media/files?site_id={site}");
+    let other_site = fixture.site_b;
+    let other_library = format!("/api/v1/media?site_id={other_site}");
+
+    // Two different sizes, and one of them in the other organization so the filter cannot pass by
+    // matching everything in the database.
+    let small = b"x".repeat(64);
+    let large = b"y".repeat(4096);
+    for (name, bytes) in [("filters-small.txt", &small), ("filters-large.bin", &large)] {
+        let response = call(
+            &fixture.state,
+            upload_request(
+                &upload,
+                Some(&editor),
+                name,
+                "application/octet-stream",
+                bytes,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "{name}: {}",
+            response.body
+        );
+    }
+    let neighbour = call(
+        &fixture.state,
+        upload_request(
+            &other_library,
+            Some(&editor),
+            "filters-neighbour.bin",
+            "application/octet-stream",
+            &large,
+        ),
+    )
+    .await;
+    // The editor holds no key in the second organization, so this is refused. That is the point:
+    // the neighbour cannot appear, and the walk does not depend on it appearing.
+    assert!(
+        neighbour.status.is_client_error(),
+        "a file of another site must not be reachable: {}",
+        neighbour.body
+    );
+
+    // The size range selects the large one and not the small one, and the total agrees with the
+    // rows — the count and the page come from one filter list, so a disagreement is impossible.
+    let ranged = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "{browser}&min_bytes={}&max_bytes={}",
+                large.len(),
+                large.len() + 1
+            ),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(ranged.status, StatusCode::OK, "body: {}", ranged.body);
+    let names: Vec<&str> = ranged.body["files"]
+        .as_array()
+        .expect("files is an array")
+        .iter()
+        .filter_map(|file| file["filename"].as_str())
+        .collect();
+    assert_eq!(
+        ranged.body["total"].as_i64(),
+        Some(1),
+        "one file is 4096 bytes: {}",
+        ranged.body
+    );
+    assert_eq!(names, vec!["filters-large.bin"], "{names:?}");
+
+    // The other half of the range excludes it. A filter that ignored its bound would answer the
+    // same thing here, so the pair is the assertion — one direction is not a filter.
+    let narrow = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&max_bytes={}", small.len()),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(narrow.status, StatusCode::OK, "body: {}", narrow.body);
+    assert_eq!(narrow.body["total"].as_i64(), Some(1), "{}", narrow.body);
+    assert_eq!(narrow.body["files"][0]["filename"], "filters-small.txt");
+
+    // The uploader filter: only the editor uploaded here, so it selects both, and a member who
+    // never uploaded is not offered by the list at all.
+    let mine = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&uploaded_by={}", Uuid::nil()),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        mine.status,
+        StatusCode::OK,
+        "a stranger's id is a filter, not an error: {}",
+        mine.body
+    );
+    assert_eq!(mine.body["total"].as_i64(), Some(0), "{}", mine.body);
+
+    let uploaders = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/uploaders?site_id={site}"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(uploaders.status, StatusCode::OK, "body: {}", uploaders.body);
+    let listed = uploaders.body["uploaders"]
+        .as_array()
+        .expect("uploaders is an array");
+    assert_eq!(
+        listed.len(),
+        1,
+        "one account uploaded into this library: {listed:?}"
+    );
+    assert_eq!(
+        listed[0]["files"].as_i64(),
+        Some(2),
+        "both files: {listed:?}"
+    );
+    let label = listed[0]["label"].as_str().expect("a label");
+    assert!(
+        !label.trim().is_empty(),
+        "an empty dropdown label is worse than an address: {label:?}"
+    );
+    // The account that uploaded is the only candidate, and filtering by it returns both files —
+    // the list and the filter agree, which is the pair that makes a dropdown trustworthy.
+    let by_uploader = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "{browser}&uploaded_by={}",
+                listed[0]["id"].as_str().expect("an id")
+            ),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        by_uploader.status,
+        StatusCode::OK,
+        "body: {}",
+        by_uploader.body
+    );
+    assert_eq!(
+        by_uploader.body["total"].as_i64(),
+        Some(2),
+        "{}",
+        by_uploader.body
+    );
+
+    // A member holding no media key gets no uploader list — the route reads with `media.read`,
+    // so the control can only be fed by somebody who may use the filter.
+    let member = fixture.member_token().await;
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/uploaders?site_id={site}"),
+            Some(&member),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "an account without media.read must not read the uploader list: {}",
+        refused.body
+    );
+
+    // A library nobody has uploaded into offers nobody. The panel shows that as its own sentence
+    // rather than as a dropdown with one blank option that silently filters everything out.
+    let platform = fixture.platform_token().await;
+    let empty = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/uploaders?site_id={other_site}"),
+            Some(&platform),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::OK, "body: {}", empty.body);
+    assert_eq!(
+        empty.body["uploaders"].as_array().map(Vec::len),
+        Some(0),
+        "an empty library has no uploaders: {}",
+        empty.body
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_range_typed_the_wrong_way_round_is_refused_by_name() {
+    // PostgreSQL's own answer to `min_bytes` above `max_bytes` is zero rows, and the panel renders
+    // zero rows as "no files match these filters" — a sentence about the library, printed for a
+    // form that is simply self-contradictory. The refusal has to name the box instead.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let browser = format!("/api/v1/media/files?site_id={site}");
+
+    for (query, field) in [
+        ("min_bytes=4096&max_bytes=1024", "min_bytes"),
+        (
+            "created_after=2030-01-02T00:00:00Z&created_before=2030-01-01T00:00:00Z",
+            "created_after",
+        ),
+    ] {
+        let response = call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("{browser}&{query}"),
+                Some(&editor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{query} must be refused: {}",
+            response.body
+        );
+        assert_eq!(
+            response.body["error"]["code"], "invalid_filter",
+            "{}",
+            response.body
+        );
+        assert_eq!(
+            response.body["error"]["details"]["field"], field,
+            "the message must name the field, so it can land under that input: {}",
+            response.body
+        );
+        assert!(
+            response.body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "the refusal carries a sentence: {}",
+            response.body
+        );
+    }
+
+    // A one-sided range and a negative size are not contradictions. Rejecting them would refuse a
+    // form a person can obviously mean: "at most 1 MB" and "from 0 bytes" are both valid.
+    for query in ["min_bytes=1", "max_bytes=1024", "min_bytes=-5&max_bytes=3"] {
+        let response = call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("{browser}&{query}"),
+                Some(&editor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{query} is a valid range, not a contradiction: {}",
+            response.body
+        );
+    }
+
+    // A malformed date is refused by the store, not turned into a `500`.
+    let bad = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&created_after=not-a-date"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{}", bad.body);
+
+    fixture.cleanup().await;
+}
