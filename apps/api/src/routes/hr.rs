@@ -410,7 +410,15 @@ async fn employee_of_caller(
 }
 
 /// The caller's visibility level, read from the same department-scoped bindings the CRM uses.
-async fn scope_of(state: &AppState, current: &CurrentSession, organization_id: Uuid) -> Scope {
+///
+/// `pub(crate)` because the attendance routes ask this question too ("may this caller read
+/// another employee's month?") and a second implementation of the rule in that file would be a
+/// second answer to "who may read whom" — the drift the leave slice already paid for once.
+pub(crate) async fn scope_of(
+    state: &AppState,
+    current: &CurrentSession,
+    organization_id: Uuid,
+) -> Scope {
     let Some(tenant) = current.user.organization_id else {
         return Scope::all(organization_id, current.user.id);
     };
@@ -1048,6 +1056,30 @@ impl From<HrError> for ApiError {
                     "database is unavailable",
                 )
             }
+            // Attendance (slice 2d). The three clock refusals are all `409`, never `400`: the
+            // payload is well formed and the DAY says no. A client that retries a 400 forever —
+            // which is what an optimistic client does with a bad request — would retry a second
+            // check-in forever too, and the refusal carries the punch it found precisely so the
+            // UI can show "you are in since 09:02" instead of an error with no information in it.
+            // `at` arrives already rendered (the module's own `Display` cannot format an
+            // `Option`), so the sentence is the variant's and the body carries the machine-
+            // readable value the clock screen shows next to it.
+            HrError::AlreadyCheckedIn { at, .. } => Self::new(
+                StatusCode::CONFLICT,
+                "hr_attendance_already_checked_in",
+                format!("this day is already clocked in{at}"),
+            )
+            .with_details(json!({ "check_in_at": at })),
+            HrError::CheckoutWithoutCheckin { .. } => Self::new(
+                StatusCode::CONFLICT,
+                "hr_attendance_checkout_without_checkin",
+                "this day has no check-in to close",
+            ),
+            HrError::AlreadyCheckedOut { .. } => Self::new(
+                StatusCode::CONFLICT,
+                "hr_attendance_already_checked_out",
+                "this day is already clocked out",
+            ),
             HrError::Database(err) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", err.to_string())
             }

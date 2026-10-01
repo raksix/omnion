@@ -100,6 +100,7 @@ pub mod crm_deals;
 pub mod crm_leads;
 pub mod crm_views;
 pub mod hr;
+pub mod hr_attendance;
 pub mod hr_leave;
 pub mod hr_me;
 pub mod health;
@@ -1447,6 +1448,48 @@ pub fn router(state: AppState) -> Router {
         .route("/hr/org-chart", get(hr::org_chart))
         .route_layer(guards::require(&state, "hr.employees.read"));
 
+    // Attendance (slice 2d). Three routers, three keys, and the split is the point:
+    //
+    // * Reading somebody else's month, the roster and the summary is `hr.attendance.read`. The
+    //   caller's OWN month is not in this router at all — it is on `/hr/me/attendance` with no
+    //   key, because the person who needs their own hours is the one person without the key.
+    // * **Punching for somebody else** is `hr.attendance.record`, and it is a layer on the clock
+    //   routes rather than a check inside them: a service account and a person pressing the
+    //   button send the same request, and the guard is the only place that can tell them apart
+    //   before the handler has resolved a subject. The handler still resolves the caller's own
+    //   employee when the body names nobody, so the *same* route serves both — there is no
+    //   separate "admin punch" endpoint that could drift from it.
+    // * **Correcting a recorded day** is `hr.attendance.manage`, the one write in this module that
+    //   changes what a payroll run will pay.
+    let hr_attendance_read = Router::new()
+        .route("/hr/attendance", get(hr_attendance::get_attendance))
+        .route("/hr/attendance/roster", get(hr_attendance::get_roster))
+        .route("/hr/attendance/summary", get(hr_attendance::get_summary))
+        .route("/hr/attendance/export", get(hr_attendance::export_csv))
+        .route_layer(guards::require(&state, "hr.attendance.read"));
+
+    let hr_attendance_record = Router::new()
+        .route(
+            "/hr/attendance/check-in",
+            post(hr_attendance::check_in),
+        )
+        .route(
+            "/hr/attendance/check-out",
+            post(hr_attendance::check_out),
+        )
+        // The clock needs a session AND the recording key, because it is a write that moves a
+        // number somebody is measured on. The self-service twin above is the same handler
+        // without the key, which is the whole difference between an employee and a service
+        // account.
+        .route_layer(guards::require(&state, "hr.attendance.record"));
+
+    let hr_attendance_manage = Router::new()
+        .route(
+            "/hr/attendance/corrections",
+            post(hr_attendance::correct_day),
+        )
+        .route_layer(guards::require(&state, "hr.attendance.manage"));
+
     let hr_employees_create = Router::new()
         .route("/hr/employees", post(hr::create_employee))
         .route_layer(guards::require(&state, "hr.employees.create"));
@@ -1553,7 +1596,22 @@ pub fn router(state: AppState) -> Router {
             post(hr_me::cancel_my_leave_request),
         )
         .route("/hr/me/leave/preview", get(hr_me::my_leave_preview))
-        .route("/hr/me/documents", get(hr_me::my_documents));
+        .route("/hr/me/documents", get(hr_me::my_documents))
+        // Attendance (slice 2d). The caller's OWN clock lives here, with no `hr.*` key, for the
+        // reason the rest of this router carries none: the person pressing the button is an
+        // employee, and an employee is exactly who holds no `hr.attendance.*` permission. The
+        // month grid and the CSV sit beside it so `/hr/me/attendance` is one screen, not a tab
+        // that fetches its own totals and can disagree with them.
+        .route("/hr/me/attendance", get(hr_attendance::get_attendance))
+        .route("/hr/me/attendance/export", get(hr_attendance::export_csv))
+        .route(
+            "/hr/me/attendance/check-in",
+            post(hr_attendance::check_in),
+        )
+        .route(
+            "/hr/me/attendance/check-out",
+            post(hr_attendance::check_out),
+        );
 
     // Activities and the merged timeline. Reading the feed and reading one record's history are
     // the same exposure, so they share `crm.activities.read` — a separate "timeline" key would
@@ -1633,6 +1691,9 @@ pub fn router(state: AppState) -> Router {
         .merge(hr_leave_approve)
         .merge(hr_leave_manage)
         .merge(hr_me)
+        .merge(hr_attendance_read)
+        .merge(hr_attendance_record)
+        .merge(hr_attendance_manage)
         .merge(crm_create)
         .merge(crm_update)
         .merge(crm_archive)
