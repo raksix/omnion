@@ -1393,7 +1393,17 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/deployment/exports/classifications",
             get(exports::read_classifications)
-                .layer(guards::require(&state, "deployment.migrations.read")),
+                .layer(guards::require(&state, "deployment.migrations.read"))
+                // Writing the map is a SEPARATE power from reading it, and it is the stronger one:
+                // a reader can see what is classified, only a reviewer can change it. Classifying a
+                // column `safe` is how a credential gets exported raw, so this carries
+                // `deployment.migrations.apply` — the key that owns DDL — rather than the read
+                // key sitting directly above it. Sharing one key would let anyone who can see the
+                // map also un-see a column from it.
+                .merge(
+                    axum::routing::put(exports::classify_column)
+                        .layer(guards::require(&state, "deployment.migrations.apply")),
+                ),
         )
         .route(
             "/deployment/exports",

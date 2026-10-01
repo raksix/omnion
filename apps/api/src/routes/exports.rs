@@ -279,6 +279,136 @@ pub async fn read_classifications(
     })))
 }
 
+/// Body of `PUT /deployment/exports/classifications`.
+#[derive(Debug, Deserialize)]
+pub struct ClassifyColumn {
+    pub table_name: String,
+    pub column_name: String,
+    pub class: String,
+    pub default_action: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+/// `PUT /deployment/exports/classifications` — classify or re-classify one column.
+///
+/// **This route is the reason the fail-closed builder is usable at all.** The builder refuses an
+/// export whose selected columns are not in `column_classifications`, the map ships empty, and
+/// the first version of this module had NO route that writes to it: `read_classifications` was
+/// the only way to reach the table. So every export in a fresh installation was permanently
+/// refused with a list of columns and no way to classify any of them — a feature that could only
+/// ever answer "no". The unit tests over `plan_export` never saw it, because they build the map
+/// directly and so never notice that nothing produces one.
+///
+/// It is an upsert because a classification is REVIEWED, not created once: re-reviewing a column
+/// is the same act as classifying it, and the `reviewed_by`/`reviewed_at` pair is what makes the
+/// map an audit surface rather than a config file.
+pub async fn classify_column(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Json(request): Json<ClassifyColumn>,
+) -> Result<impl IntoResponse, ApiError> {
+    let pool = state.db().pool();
+
+    // The class and the action are validated HERE, with the request's own vocabulary, so the
+    // refusal names what was sent. The database has CHECK constraints for both and would answer
+    // a generic constraint violation naming a column nobody typed.
+    if !CLASSES.contains(&request.class.as_str()) {
+        return Err(ApiError::bad_request(
+            "classification_class_invalid",
+            format!(
+                "`{}` is not a class. The classes are {}.",
+                request.class,
+                CLASSES.join(", ")
+            ),
+        ));
+    }
+    if !ACTIONS.contains(&request.default_action.as_str()) {
+        return Err(ApiError::bad_request(
+            "classification_action_invalid",
+            format!(
+                "`{}` is not an action. The actions are {}.",
+                request.default_action,
+                ACTIONS.join(", ")
+            ),
+        ));
+    }
+
+    // A `secret` classified `keep` is the one combination that must be unrepresentable, and the
+    // migration states it as a CHECK. Refusing it here with a sentence is what turns a
+    // constraint violation into an instruction, and the check stays as the floor under this.
+    if request.class == "secret" && request.default_action == "keep" {
+        return Err(ApiError::bad_request(
+            "classification_secret_never_kept",
+            "a credential cannot be classified `keep`: the export would carry it raw. Choose \
+             `remove` (omit the column) or `hash`.",
+        ));
+    }
+
+    // A note is not decoration here. The migration says a row with an empty reason in a table
+    // somebody reviews quarterly is a row nobody reviewed, so the empty case is refused rather
+    // than defaulted — with the ONE exception of a first pass over a column with nothing to
+    // add, which is spelled out rather than left as a loophole.
+    if request.notes.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "classification_notes_required",
+            "a classification needs a reason: it is what the next reviewer reads to decide \
+             whether this still holds. Say what the column holds, or that you checked it.",
+        ));
+    }
+
+    let row = sqlx::query(
+        "insert into column_classifications \
+           (table_name, column_name, class, default_action, notes, reviewed_by) \
+         values ($1, $2, $3, $4, $5, $6) \
+         on conflict (table_name, column_name) do update \
+            set class = excluded.class, \
+                default_action = excluded.default_action, \
+                notes = excluded.notes, \
+                reviewed_by = excluded.reviewed_by, \
+                reviewed_at = now() \
+         returning table_name, column_name, class, default_action, notes, reviewed_by, reviewed_at",
+    )
+    .bind(request.table_name.trim())
+    .bind(request.column_name.trim())
+    .bind(&request.class)
+    .bind(&request.default_action)
+    .bind(request.notes.trim())
+    .bind(session.user.display_name.clone())
+    .fetch_one(pool)
+    .await
+    .map_err(|error| ApiError::from_core(error.into()))?;
+
+    // The audit entry is the point of `reviewed_by`: the panel shows who classified a column, and
+    // a question that reaches a support engineer months later is answered by the trail, not by
+    // the row's current contents.
+    omnion_audit::record(
+        pool,
+        NewAuditEntry::by_user(session.user.id, "deployment.exports.column_classified")
+            .organization(session.user.organization_id)
+            .target(
+                "column_classification",
+                format!("{}.{}", row.get::<String, _>("table_name"), row.get::<String, _>("column_name")),
+            )
+            .metadata(json!({
+                "class": row.get::<String, _>("class"),
+                "default_action": row.get::<String, _>("default_action"),
+                "notes": row.get::<String, _>("notes"),
+            })),
+    )
+    .await;
+
+    Ok(Json(json!({
+        "table": row.get::<String, _>("table_name"),
+        "column": row.get::<String, _>("column_name"),
+        "class": row.get::<String, _>("class"),
+        "default_action": row.get::<String, _>("default_action"),
+        "notes": row.get::<String, _>("notes"),
+        "reviewed_by": row.get::<String, _>("reviewed_by"),
+        "reviewed_at": row.get::<String, _>("reviewed_at"),
+    })))
+}
+
 /// `POST /deployment/exports` — plan the export, and record it.
 ///
 /// The route does NOT produce the file: producing it is the runner's job (REQ-129's CLI), because
