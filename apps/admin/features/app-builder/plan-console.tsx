@@ -30,7 +30,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { AlertTriangle, Loader2, RefreshCw, Search, Sparkles, Trash2, WandSparkles, X } from "lucide-react";
+import { AlertTriangle, Download, Loader2, RefreshCw, Search, Sparkles, Trash2, WandSparkles, X } from "lucide-react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
@@ -40,6 +40,7 @@ import { StatusBadge } from "@/components/status-badge";
 import {
   ApiError,
   deleteAppBuilderPlan,
+  downloadAppBuilderPlanExport,
   fetchAppBuilderPlans,
   fetchAppBuilderVocabulary,
   streamGenerateAppBuilderPlan,
@@ -129,7 +130,16 @@ export function PlanConsole() {
   const [stage, setStage] = useState<string | null>(null);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [failedPlanId, setFailedPlanId] = useState<string | null>(null);
-  const [busyPlanId, setBusyPlanId] = useState<string | null>(null);
+  // **Which** button on a row is working, not merely which row. One `busyPlanId` for both
+  // actions spins the delete button while an export is in flight — two controls reporting
+  // "working" for one request is the same shape as a lock that cannot tell a working page
+  // from an unsaved one, and it teaches the reviewer to ignore both.
+  const [busy, setBusy] = useState<{ planId: string; action: "delete" | "export" } | null>(null);
+  // The last export's outcome, read out of the file rather than announced by the button.
+  // "Downloaded" is a claim about a click; "22 artifacts · omnion.app-builder.plan/1" is a
+  // claim about the bytes the operator now holds, and only the second can be wrong in a way
+  // worth telling them about.
+  const [exportNote, setExportNote] = useState<string | null>(null);
 
   const promptRef = useRef<HTMLTextAreaElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -247,7 +257,7 @@ export function PlanConsole() {
 
   const discard = useCallback(
     async (plan: AppBuilderPlan) => {
-      setBusyPlanId(plan.id);
+      setBusy({ planId: plan.id, action: "delete" });
       setGenerateError(null);
       try {
         await deleteAppBuilderPlan(plan.id);
@@ -257,10 +267,48 @@ export function PlanConsole() {
           cause instanceof ApiError ? cause.message : "That plan could not be deleted.",
         );
       } finally {
-        setBusyPlanId(null);
+        setBusy(null);
       }
     },
     [loadPlans],
+  );
+
+  // Take the plan away as a file. The button is **always** enabled, unlike delete: an export
+  // is a read, and the statuses that block a delete (applied) are exactly the ones an
+  // operator most wants a copy of. The note reports what came back out of the file, so a
+  // download that arrived empty says so here instead of in a support ticket.
+  const exportPlan = useCallback(async (plan: AppBuilderPlan) => {
+    setBusy({ planId: plan.id, action: "export" });
+    setExportNote(null);
+    try {
+      const { blob, filename, artifacts, schema } = await downloadAppBuilderPlanExport(plan.id);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setExportNote(
+        artifacts === 0
+          ? `${filename} · the file carries no artifacts — this plan was never answered`
+          : `${filename} · ${artifacts} ${artifacts === 1 ? "artifact" : "artifacts"}${schema ? ` · ${schema}` : ""}`,
+      );
+    } catch (cause: unknown) {
+      setExportNote(
+        cause instanceof ApiError ? cause.message : "The export could not be downloaded.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  /** `true` when this row's action is the one in flight — never the row's other button. */
+  const isBusy = useCallback(
+    (planId: string, action: "delete" | "export") =>
+      busy?.planId === planId && busy.action === action,
+    [busy],
   );
 
   // Keyboard: `n` focuses the composer, `Cmd/Ctrl+Enter` generates, `Esc` cancels a
@@ -339,29 +387,46 @@ export function PlanConsole() {
           </td>
           <td className="px-4 py-3.5 text-[12.5px] text-muted">{formatTimestamp(plan.created_at)}</td>
           <td className="px-4 py-3.5 text-right">
-            <button
-              type="button"
-              onClick={() => void discard(plan)}
-              disabled={busyPlanId === plan.id || plan.status === "applied"}
-              title={
-                plan.status === "applied"
-                  ? "An applied plan cannot be deleted — its artifacts are what the live app was built from"
-                  : "Delete this plan"
-              }
-              aria-label={`Delete ${plan.title || plan.id.slice(0, 8)}`}
-              data-delete-plan={plan.id}
-              className="rounded-lg border border-line bg-surface p-1.5 text-muted transition hover:text-accent-strong disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {busyPlanId === plan.id ? (
-                <Loader2 className="size-3.5 animate-spin" aria-hidden />
-              ) : (
-                <Trash2 className="size-3.5" aria-hidden />
-              )}
-            </button>
+            <div className="flex items-center justify-end gap-1.5">
+              <button
+                type="button"
+                onClick={() => void exportPlan(plan)}
+                disabled={isBusy(plan.id, "export")}
+                title="Download this plan as a JSON file"
+                aria-label={`Export ${plan.title || plan.id.slice(0, 8)} as JSON`}
+                data-export-plan={plan.id}
+                className="rounded-lg border border-line bg-surface p-1.5 text-muted transition hover:text-accent-strong disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {isBusy(plan.id, "export") ? (
+                  <Loader2 className="size-3.5 animate-spin" aria-hidden />
+                ) : (
+                  <Download className="size-3.5" aria-hidden />
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={() => void discard(plan)}
+                disabled={isBusy(plan.id, "delete") || plan.status === "applied"}
+                title={
+                  plan.status === "applied"
+                    ? "An applied plan cannot be deleted — its artifacts are what the live app was built from"
+                    : "Delete this plan"
+                }
+                aria-label={`Delete ${plan.title || plan.id.slice(0, 8)}`}
+                data-delete-plan={plan.id}
+                className="rounded-lg border border-line bg-surface p-1.5 text-muted transition hover:text-accent-strong disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {isBusy(plan.id, "delete") ? (
+                  <Loader2 className="size-3.5 animate-spin" aria-hidden />
+                ) : (
+                  <Trash2 className="size-3.5" aria-hidden />
+                )}
+              </button>
+            </div>
           </td>
         </tr>
       )),
-    [plans, busyPlanId, discard],
+    [plans, busy, discard, exportPlan, isBusy],
   );
 
   return (
@@ -584,6 +649,27 @@ export function PlanConsole() {
               className="rounded underline underline-offset-2 hover:text-ink"
             >
               Clear filters
+            </button>
+          </div>
+        ) : null}
+
+        {/* The export's result. `role="status"` rather than a toast: the operator's next
+            action is on this page, not somewhere else, and a toast that vanishes is a claim
+            nobody can re-read if the download landed somewhere unexpected. */}
+        {exportNote ? (
+          <div
+            role="status"
+            data-export-note
+            className="flex items-center justify-between gap-3 border-b border-line bg-quiet-soft/40 px-4 py-2 text-[11.5px] text-muted"
+          >
+            <span className="truncate">{exportNote}</span>
+            <button
+              type="button"
+              onClick={() => setExportNote(null)}
+              aria-label="Dismiss the export note"
+              className="shrink-0 rounded p-0.5 hover:text-ink"
+            >
+              <X className="size-3" aria-hidden />
             </button>
           </div>
         ) : null}

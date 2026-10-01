@@ -7164,6 +7164,69 @@ export function deleteAppBuilderPlan(planId: string): Promise<void> {
   });
 }
 
+/**
+ * The plan as a downloadable JSON document (REQ-045 slice 4).
+ *
+ * A raw `fetch` rather than `request<T>` for two reasons, both of which the health export
+ * above already had to solve: the response is an **attachment**, so going through the JSON
+ * helper would parse the file into an object and throw away the one thing the caller wants
+ * (the bytes), and a `request` that cannot parse the body reports a parse failure as an
+ * API error with a status of `200`.
+ *
+ * The artifact count is read back **out of the file**, not taken from a header, because the
+ * header would be written by the same code path that made the mistake — the assertion in the
+ * console's note ("22 artifacts") is only worth anything if it was counted from the
+ * download the operator got.
+ */
+export async function downloadAppBuilderPlanExport(
+  planId: string,
+): Promise<{ blob: Blob; filename: string; artifacts: number; schema: string }> {
+  const url = `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/export`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    let code = "export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(await response.text()) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON error body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  const blob = await response.blob();
+
+  let artifacts = 0;
+  let schema = "";
+  try {
+    const parsed = JSON.parse(await blob.text()) as {
+      schema?: string;
+      artifacts?: unknown[];
+    };
+    artifacts = Array.isArray(parsed.artifacts) ? parsed.artifacts.length : 0;
+    schema = parsed.schema ?? "";
+  } catch {
+    // An unparseable download is reported by the caller's note as an artifact count of
+    // zero, which is the honest reading: the file did not carry a plan this panel can name.
+  }
+
+  return { blob, filename: match?.[1] ?? `omnion-app-plan-${planId.slice(0, 8)}.json`, artifacts, schema };
+}
+
 /** One frame of a generation, as the two handlers report it. */
 export type AppBuilderStreamHandlers = {
   /** What the platform is doing right now (`plan`). */
