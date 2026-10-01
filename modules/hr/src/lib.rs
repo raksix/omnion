@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attendance;
 pub mod dates;
 pub mod departments;
 pub mod employees;

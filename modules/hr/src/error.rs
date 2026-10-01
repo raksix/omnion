@@ -130,6 +130,42 @@ pub enum HrError {
     /// PostgreSQL refused or could not answer.
     #[error("hr storage error: {0}")]
     Database(#[from] sqlx::Error),
+    // --- attendance (slice 2d) ---------------------------------------------------------------
+    //
+    // The three clock refusals are their own variants rather than formatted `Invalid` values,
+    // for the reason the two cycle refusals above are: a client has to be able to say "you are
+    // already clocked in" and a test has to ask "is this the second-check-in case?" by kind. A
+    // substring test on a message breaks the day somebody improves the wording.
+
+    /// A check-in was punched on a day that already has one.
+    ///
+    /// Carries the punch it found, because the person standing at the clock needs the time they
+    /// came in — "already clocked in" alone sends them to a log to find out when.
+    ///
+    /// **`at` is a rendered `String`, never an `Option`.** `thiserror` formats through `Display`,
+    /// which `Option` does not implement, so a variant holding the raw option cannot be rendered
+    /// at all — the error is then unprintable rather than wrong, which no type check reports. The
+    /// "the row cannot say" case is an empty string, and the API layer publishes the
+    /// machine-readable value in the body.
+    #[error("this day is already clocked in{at}")]
+    AlreadyCheckedIn {
+        /// The day, as `YYYY-MM-DD`.
+        work_date: String,
+        /// `", at 2026-10-05T09:02:00Z"`, or empty when the row cannot say.
+        at: String,
+    },
+    /// A check-out was punched for a day with no check-in.
+    #[error("this day has no check-in to close")]
+    CheckoutWithoutCheckin {
+        /// The day, as `YYYY-MM-DD`.
+        work_date: String,
+    },
+    /// A check-out was punched on a day that is already closed.
+    #[error("this day is already clocked out")]
+    AlreadyCheckedOut {
+        /// The day, as `YYYY-MM-DD`.
+        work_date: String,
+    },
 }
 
 impl HrError {

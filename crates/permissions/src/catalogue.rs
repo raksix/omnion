@@ -786,6 +786,31 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "hr",
         description: "Create and edit leave types: entitlement, approval and negative-balance policy",
     },
+    // Attendance (REQ-055 slice 2d). Three keys, and the split that matters is the third one:
+    //
+    // * **`hr.attendance.record` is a power, not a form.** It is what a service account holds so a
+    //   device or an import can punch somebody else's day, and it is deliberately separate from
+    //   `.manage` — a person who can correct their own forgotten punch must not thereby gain the
+    //   power to rewrite somebody else's, which is the one edit in this module that changes what
+    //   an organization's payroll thinks it owes.
+    // * **Reading is split from recording.** An employee reads their own month with no key at all
+    //   (the self-service surface), so `hr.attendance.read` is about reading *other* people's
+    //   months and the roster.
+    PermissionDef {
+        key: "hr.attendance.read",
+        category: "hr",
+        description: "Read any employee's attendance month, the daily roster and the summary",
+    },
+    PermissionDef {
+        key: "hr.attendance.record",
+        category: "hr",
+        description: "Punch the clock for another employee, as a service account or an import does",
+    },
+    PermissionDef {
+        key: "hr.attendance.manage",
+        category: "hr",
+        description: "Correct a recorded day, with a reason, for any employee",
+    },
     // Sales (docs/requests/REQ-052). The selling side splits the way the relationship layer
     // does — read, create, edit, archive — and adds the two powers that are genuinely different
     // acts rather than a stricter version of editing:
