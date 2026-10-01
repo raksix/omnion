@@ -529,13 +529,30 @@ async fn record_binding_health(pool: &PgPool, source: &IntakeSource, submission:
 /// read looks equivalent and is not: the payload is the submitter's own data, and a form
 /// cannot be trusted to carry an id the platform minted.
 async fn lead_of_claim(pool: &PgPool, submission: &Submission) -> Option<Uuid> {
+    // **The key is normalized before it is bound, and that is the point of this line.**
+    //
+    // `claims::take` writes `normalize(id)` into `crm_lead_submissions.submission_id`, so the
+    // column holds a *trimmed, capped* value. This read used to bind
+    // `submission.submission_id` raw, which agrees with the column for every id that needed
+    // no normalizing and disagrees for every id that did — and "disagrees" here is the whole
+    // mechanism going quiet: the line exists to attach a mapping-health note to the lead a
+    // previous delivery of this submission produced, and a trailing space or an over-long id
+    // meant it silently found nothing.
+    //
+    // That is this branch's standing defect class for the second time in one slice (the
+    // write side was `idempotency_key`): **one rule, two implementations, and the read path
+    // is the one that is wrong in a way nothing can observe** — it returns `None`, which is
+    // the same answer as "this is the first submission", and the first submission is the
+    // overwhelmingly common case. `claims::normalize` is the single place that decides, and
+    // the option it returns is also the honest answer for a blank id: no claim, no lead.
+    let key = crate::claims::normalize(submission.submission_id.as_deref()?)?;
     let id: Option<Uuid> = sqlx::query_scalar(
         "select lead_id from crm_lead_submissions \
          where source_id = $1 and submission_id = $2 and lead_id is not null \
          order by claimed_at desc limit 1",
     )
     .bind(submission.source_id)
-    .bind(submission.submission_id.clone()?)
+    .bind(key)
     .fetch_optional(pool)
     .await
     .ok()
@@ -1608,7 +1625,20 @@ async fn insert_lead(
             "dedupe_key": lead.dedupe_key,
             "spam_score": lead.spam_score,
             "ip": submission.ip,
-            "submission_id": submission.submission_id,
+            // **The normalized key, not the caller's spelling of it.** This line is the
+            // writer half of `find_lead_by_submission`, which is the only way a losing
+            // delivery finds the winner's lead when a claim is open. The two must store and
+            // compare the same string, and `claims::normalize` is what the claim table holds
+            // — so a raw value here and a normalized read there is a comparison that fails
+            // for exactly the ids that needed normalizing and succeeds for the ones that did
+            // not, which is the shape of a defect no fixture with a tidy uuid can reach.
+            // `None` is the honest value for a submission that carried no id: the column is
+            // a claim key, and "no key" is a fact rather than an empty string that would
+            // match every other keyless submission on the source.
+            "submission_id": submission
+                .submission_id
+                .as_deref()
+                .and_then(crate::claims::normalize),
         }),
     )
     .await?;
@@ -1770,6 +1800,18 @@ async fn find_lead_by_submission(
     // lead column is a second thing to keep in sync, and the trail is already the record of
     // what happened to this lead. The lookup is a lateral over the first line, which is the
     // only one that can carry it.
+    //
+    // **The key is normalized on both sides of this comparison, and the writer normalizes it
+    // too** (`insert_lead` writes `submission_id` through `claims::normalize`).
+    // That matters because the fallback this function backs is the one taken when a claim is
+    // open: a delivery that lost the race has to find the winner's lead, and it can only do
+    // that by the id the winner actually *stored*. A trailing space or an over-long key made
+    // the two spellings differ and the fallback answer "no such submission" — for a
+    // submission that is very much being written, which the caller then reports as an error
+    // and the caller is right to: it was told the claim is held by somebody else.
+    let key = crate::claims::normalize(submission_id).ok_or_else(|| {
+        CrmIntakeError::invalid("a submission id must be a non-empty value")
+    })?;
     let query = format!(
         "select {LEAD_COLUMNS} from crm_leads l where l.source_id = $1 and exists ( \
             select 1 from crm_lead_events e where e.lead_id = l.id \
@@ -1777,7 +1819,7 @@ async fn find_lead_by_submission(
     );
     Ok(sqlx::query_as::<_, Lead>(&query)
         .bind(source_id)
-        .bind(submission_id)
+        .bind(key)
         .fetch_optional(pool)
         .await?)
 }

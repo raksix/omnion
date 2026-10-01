@@ -1010,16 +1010,22 @@ fn spawn_autoresponder(
 ///
 /// Without it a retry is a second lead; with it a retry finds the row the first attempt
 /// wrote. A caller that sends no header gets the "every attempt is its own lead" behaviour,
-/// which is the honest default for a form post a browser may resend. The value is capped
-/// and trimmed, because it is stored in a text column and an unbounded header would let a
-/// caller write an arbitrary string into a lead's identity.
+/// which is the honest default for a form post a browser may resend.
+///
+/// **The value's meaning belongs to the module, not to this function.** The cap is a
+/// key-width bound and the answer is *cap, never refuse* — a caller that sent an id sent a
+/// real submission, and dropping the claim because the id was long does not lose the
+/// submission, it loses the **only thing standing between a retry and a second lead**. This
+/// function used to answer `None` for anything over 128 while `claims::normalize` answered
+/// "the first 128 characters", so a long-keyed submission was captured with no claim at all
+/// and every retry wrote another lead. Both halves wrote the number `128` and disagreed about
+/// what to *do* with it, which is why a test asserting either against the constant is not
+/// enough: `the_api_and_the_module_agree_on_every_submission_id` compares the two answers
+/// against each other, and `claims::MAX_SUBMISSION_ID` is exported so that comparison has
+/// something to compare.
 fn idempotency_key(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get("x-idempotency-key")?.to_str().ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > 128 {
-        return None;
-    }
-    Some(trimmed.to_string())
+    omnion_module_crm_intake::claims::normalize(raw)
 }
 
 /// `crm.lead.received` — a submission is stored, accepted or not.
@@ -2648,17 +2654,108 @@ mod tests {
         );
         assert_eq!(idempotency_key(&headers), None);
 
+        // **This assertion used to read `None`, and it was asserting the defect.** The cap is
+        // a key-width bound, not a policy about the caller's request: `claims::normalize`
+        // answers the same question by *capping* and says why in its own test — "capping, not
+        // refusing: the caller supplied an id, the submission is real, and a 200-character id
+        // is not a reason to lose the lead." Refusing here does not lose the lead; it loses
+        // the **claim**, so every retry of one long-keyed submission writes another lead,
+        // which is the outcome the whole claim mechanism exists to prevent. Two
+        // implementations of one rule, and this one silently won because it runs first.
+        //
+        // The rule now lives in the module and both sides call it; the assertion that pins
+        // them together is `an_over_long_key_is_capped_rather_than_refused`, below, which
+        // compares this function's answer against the module's *directly* rather than
+        // against a second literal — a test that restates the constant is how two
+        // implementations of one rule stay two.
         headers.insert(
             "x-idempotency-key",
             "x".repeat(129).parse().expect("header must build"),
         );
-        assert_eq!(idempotency_key(&headers), None);
+        assert_eq!(
+            idempotency_key(&headers).map(|key| key.chars().count()),
+            Some(omnion_module_crm_intake::MAX_SUBMISSION_ID)
+        );
 
         headers.insert(
             "x-idempotency-key",
             "x".repeat(128).parse().expect("header must build"),
         );
         assert_eq!(idempotency_key(&headers).map(|key| key.len()), Some(128));
+    }
+
+    /// The two halves of one rule, compared against **each other**.
+    ///
+    /// A test that asserts both sides against the literal `128` is green while the two sides
+    /// disagree about what to *do* with a value over it — which is exactly the defect this
+    /// slice removed. Reading the module's answer and requiring this one to be identical is
+    /// the only assertion that can notice a change to either half, and it is the reason
+    /// `MAX_SUBMISSION_ID` is exported at all.
+    ///
+    /// **The candidates are restricted to values an HTTP header can actually carry**, and the
+    /// restriction is a finding rather than a convenience. The first draft of this test also
+    /// fed it `"\t\n"` and a run of `ş`, and it failed with `InvalidHeaderValue` — against the
+    /// *fixed* code, which is the worst way for a test to be wrong: a fixture defect that
+    /// reports itself as a product defect, and a negative control built on it would have
+    /// "passed" for entirely the wrong reason. `HeaderValue::from_str` accepts visible ASCII
+    /// and space only, and `idempotency_key` reads through `to_str().ok()?`, so a non-ASCII
+    /// header never becomes a `&str` at all. That is a **correct refusal** and it is not the
+    /// rule this test compares: the rule is what a decodable id means, not whether a byte
+    /// sequence is decodable. The multi-byte cap (`the_cap_counts_characters_and_not_bytes`)
+    /// is still covered, in `claims.rs`, where a `&str` exists to be capped — a form-bound
+    /// source reaches the same field from a form's own event rather than from a header.
+    #[test]
+    fn the_api_and_the_module_agree_on_every_submission_id() {
+        let candidates = [
+            "abc-123",
+            "  abc-123  ", // a header carries whitespace; the two spellings are one submission
+            "x",
+            &"x".repeat(127),
+            &"x".repeat(128),
+            &"x".repeat(129), // the boundary: the API used to refuse here, the module caps
+            &"x".repeat(400),
+        ];
+        for raw in candidates {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-idempotency-key",
+                raw.parse().expect("a visible-ASCII header value must build"),
+            );
+            let ours = idempotency_key(&headers);
+            let theirs = omnion_module_crm_intake::claims::normalize(raw);
+            assert_eq!(
+                ours, theirs,
+                "the two implementations disagree about {raw:?}: the API says {ours:?}, \
+                 the module says {theirs:?}"
+            );
+        }
+    }
+
+    /// The three answers that are *not* about length, asserted on both halves.
+    ///
+    /// "No header", "a blank header" and "a header that is only whitespace" all mean the
+    /// same thing — the caller sent no usable identity, so the submission has no claim and
+    /// every attempt is its own lead. They are separated out because a loop over the
+    /// comparison test cannot build a `HeaderValue` for two of them, and a case the
+    /// comparison cannot reach is a case nobody compares.
+    #[test]
+    fn an_absent_or_blank_header_is_no_identity_on_both_halves() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(idempotency_key(&headers), None);
+        assert_eq!(omnion_module_crm_intake::claims::normalize(""), None);
+
+        for blank in [" ", "   ", "\t"] {
+            headers.insert(
+                "x-idempotency-key",
+                blank.parse().expect("a blank header value must build"),
+            );
+            assert_eq!(idempotency_key(&headers), None, "for {blank:?}");
+            assert_eq!(
+                omnion_module_crm_intake::claims::normalize(blank),
+                None,
+                "for {blank:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------------------------
