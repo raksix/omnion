@@ -101,8 +101,44 @@ async fn tick(state: &AppState) -> Result<(), String> {
 }
 
 /// Send one reservation and record the outcome on its own claim line.
+///
+/// **The claim comes before the mailer, and that ordering is the whole fix.** This function
+/// used to call the mailer first and `mark_sent` second, which is the exact order its own
+/// header forbids: *"a claim is taken **before** the send, and a completion is recorded
+/// **after** it, or two workers both mail."* `mark_sent` is the completion, so the send path's
+/// only arbiter was consulted after the irreversible act, and the `Ok(false)` branch below —
+/// commented "another worker had already completed this reservation … sending again would be
+/// the duplicate this whole design exists to prevent" — stopped a call that had already sent.
+///
+/// Two app instances on one database both receive the same due row, because
+/// [`autoresponder_store::due_reservations`] is a plain read. Both then reached this function,
+/// and before the fix both mailed. The trail showed one send while the visitor received two.
 async fn send_one(pool: &PgPool, settings: &MailSettings, reservation: DueReservation) {
     let DueReservation { lead, message, .. } = reservation;
+
+    // The right to send, taken before the socket. A worker that loses this does not send and
+    // does not release — the reservation belongs to the winner, and `release_claim` deleting a
+    // row another worker is mid-send on is how a lead loses its answer entirely.
+    match autoresponder_store::claim_delivery(pool, lead.id, &message.to, OffsetDateTime::now_utc())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!(
+                lead_id = %lead.id,
+                "another worker holds the send claim for this autoresponder"
+            );
+            return;
+        }
+        Err(error) => {
+            // Without a claim there is no safe send: sending first and recording afterwards is
+            // the defect, so an unreadable claim means this tick skips the lead rather than
+            // risking the duplicate. The reservation stays due and the next tick retries.
+            tracing::warn!(lead_id = %lead.id, %error, "the autoresponder's send claim could not be read");
+            return;
+        }
+    }
+
     let email = Email::new(message.to.clone(), message.subject.clone(), message.body.clone());
 
     match omnion_automation::mail::send(settings, &email).await {
