@@ -1,4 +1,104 @@
-## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
+## 2026-10-01 — the two halves of a submission id agreed on every key any fixture used, and the first-touch lookup was still reading the phone column the wrong way round
+
+test(crm-intake): the capped submission id as a row. fix(crm-intake): merge_attribution's stored-side phone normalization.
+
+**This tick closed the half of last tick's gate that was written but never run (`QA_CLAIMS_DB`
+unset), and the very next question — what does the *row* say for an id that had to be capped —
+turned out to have no test anywhere.**
+
+### What the acceptance box says, and what each gate actually measured
+
+The box says **one submission, one lead, no duplicates**. Two gates sat next to it and neither
+measured that sentence:
+
+- `run-crm-submission-id.sh` proves the API's `idempotency_key` and the module's
+  `claims::normalize` return the **same answer** — which was the sentence that was broken.
+- `run-crm-claims.sh` proves the claim table has a **primary key** on `(source_id,
+  submission_id)`.
+
+Both are true and neither is the box. The row is. And every fixture in the claims gate uses a
+two-word id, so for every identity any test had ever written the two halves agreed by
+construction — the disagreement only exists **past the cap**.
+
+`a_key_longer_than_the_cap_still_leaves_one_claim_and_one_lead` therefore states the box as a
+row: an over-long key delivered twice leaves **one claim, one lead, the same lead**, the stored
+key is the **normalized** one, and `claims::lead_of` finds that lead from the caller's **raw**
+spelling. The last two are the four read paths that used to bind the value raw, and they are the
+half a lead count cannot see.
+
+**RED ran before a line of product code was touched**, and the negative control is the reason to
+believe it: with `claims::normalize` reduced to its pre-fix shape (refuse over the cap rather
+than cap it), the gate is **7/8** — exactly this test goes red on the first delivery and the
+seven short-keyed tests stay green. **That is the mechanism, stated plainly: every fixture in the
+file used an id short enough that the bug could not show.** A gate whose fixtures all take the
+same branch measures one branch, however many of them there are.
+
+### The second defect was one function away from last tick's, and the first fix made it findable
+
+`fetch_candidates` was given `dedupe::PHONE_DIGITS_SQL` on tick 67 because it normalized the
+**stored** phone in SQL (`regexp_replace`, which strips the `+`) while the key came from
+`normalize_phone` (which keeps it) — the phone arm could never match. `merge_attribution` reads
+**the same column**, was not part of that fix, and hand-wrote its own normalization:
+
+```text
+dedupe_key(mapped)                                       -> "+905****2233"   (keeps the +)
+and (lower(email) = $3 or lower(coalesce(phone, '')) = $3)
+where the phone column holds                            -> "+90 555 111 22 33" (mapped, VERBATIM)
+```
+
+`insert_lead` binds `mapped.get("phone")` verbatim, so the column holds whatever the operator's
+mapping produced. The two sides agree **only** when the source happens to map the field through
+`e164_lite`; without it the comparison is false for ever, so a phone-identified visitor lost their
+first touch on every submission after the first — the second visit **overwrote the campaign that
+brought them in**, which is precisely what acceptance 6 forbids.
+
+The gate hid it, and the reason is the useful half: its one phone fixture
+(`a_visitor_identified_by_phone_keeps_their_first_touch`) maps through `e164_lite`, so the stored
+column is pre-normalized and the comparison is trivially true. **A fixture that applies the
+transform hides the disagreement rather than fixing it** — and the transform is *optional* on the
+operator's form, so a source without it is the ordinary case.
+
+The stored side is now `dedupe::PHONE_DIGITS_SQL`, the same named expression. The e-mail arm keeps
+`lower()`: e-mails have case and no punctuation to strip, a phone number has neither — which is
+why `PHONE_DIGITS_SQL`'s own unit guard asserts the expression contains no `lower(`.
+
+**RED before the fix** (`left: "autumn-sale"`, `right: "spring-sale"` — the second visit stored
+over the first), then **5/5**, then **PROVEN TO FAIL at 4/5** with the pre-fix spelling restored:
+only the new test goes red.
+
+### Two things worth keeping from the mechanics
+
+**A revert script that removes the control can remove the line it replaced.** The control replaced
+`let stored_phone = PHONE_DIGITS_SQL…`, and deleting the control's own text took the real line
+with it — `E0425: cannot find value 'stored_phone' in this scope`, in a function that had compiled
+minutes earlier. **A negative control that overwrites production code needs its revert to restore
+the original string, not just delete its own.** The compile caught it immediately and the gate was
+re-run green before anything was committed, but a control that is only ever *added* is a much
+safer shape.
+
+**A `python` edit whose `assert count == 1` fails leaves the tree untouched** — which is why the
+second control run reported a clean 5/5 while no control had been applied. The assertion is not
+ceremony; it is the difference between "the negative control failed as designed" and "the negative
+control never ran and the green is meaningless". Read the patch step's own exit code, not the
+cargo exit code at the end of the chain.
+
+### Proof
+
+- `run-crm-submission-id.sh` with the DB half (`QA_CLAIMS_DB=omnion_qa_w8_subid`): cross-boundary
+  **9/9**, DB half **7/7 before this tick's test, 8/8 after**; **PROVEN TO FAIL at 7/8**.
+- `run-crm-attribution.sh` **5/5**, **PROVEN TO FAIL at 4/5**.
+- Regressions: module lib **186/186**, `run-crm-dedupe.sh` **12/12**, `run-crm-claims.sh` **8/8**.
+- Commits `77de49b2` (test) and `041e7ac8` (fix), both pushed to `wave8`.
+
+**Not claimed.** No browser pass: no screen changed (both defects are below the API), and the QA
+slot is held by a live **w5** pass — holder pid 1269373, alive, `cwd=/mnt/apopic/omnion-w5`,
+checked with `kill -0` and `/proc/<pid>/cwd` rather than read off the placeholder's name.
+
+**Next.** The audit that found the second defect is the standing method rather than a one-off:
+`PHONE_DIGITS_SQL` now has **two** call sites, so the remaining question is whether any *third*
+query over `crm_leads.phone` or `.email` still hand-writes its own normalization — `grep` the
+`.bind(`s and the `=`-comparisons rather than the functions, which is what found the other three
+sites of last tick's class.## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
 
 test(events): revive the whole suite. feat(events): catalogue four names the drift gate
 found already on the bus.
