@@ -943,6 +943,10 @@ async fn a_denied_network_cannot_reach_the_api() {
 
     let inside = address("203.0.113.7");
     let outside = address("198.51.100.7");
+    // A third address no rule covers, for the calls made *after* the self-blocking rule
+    // exists. It stands for the operator who noticed they had locked themselves out and walked
+    // to the CLI — see the note on the removal below.
+    let elsewhere = address("192.0.2.7");
 
     // The premise, asserted rather than assumed: before the rule exists, the request is served.
     // A walk that only checked the "after" would pass just as well if the route were refusing
@@ -1060,6 +1064,83 @@ async fn a_denied_network_cannot_reach_the_api() {
         tested.text
     );
 
+    // The self-lockout warning. This half of the criterion is a *different* claim from the
+    // refusal above — that a rule which blocks the caller is stored and warned about rather than
+    // refused — and it needs its own rule, because the rule written above deliberately does NOT
+    // cover this session's address (that is what let the walk keep driving requests at all).
+    let self_blocking = harness
+        .call(from_address(
+            post(
+                "/api/v1/security/ip-rules",
+                json!({
+                    "kind": "deny",
+                    // 198.51.100.0/24 is the address the walk is calling from.
+                    "cidr": "198.51.100.0/24",
+                    "note": "the walk's own address, deliberately",
+                }),
+                Some(&operator),
+            ),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        self_blocking.status,
+        StatusCode::CREATED,
+        "a rule that blocks the caller must still be saved: {}",
+        self_blocking.text
+    );
+    assert_eq!(
+        self_blocking.body["blocks_you"], true,
+        "the response must say the rule covers this session: {}",
+        self_blocking.text
+    );
+    assert!(
+        self_blocking.body["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("198.51.100.0/24")),
+        "the warning must name the network that is about to refuse this session: {}",
+        self_blocking.text
+    );
+
+    // And the warning was honest: the very next request from that address is refused.
+    let caught = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        caught.status,
+        StatusCode::FORBIDDEN,
+        "the warning promised this; the layer must keep the promise: {}",
+        caught.text
+    );
+
+    // Remove it, so the rest of the walk is not run from a locked-out session.
+    let self_rule_id = self_blocking.body["rule"]["id"]
+        .as_str()
+        .expect("the created rule must carry an id")
+        .to_owned();
+    let removed_self = harness
+        .call(from_address(
+            request(
+                Method::DELETE,
+                &format!("/api/v1/security/ip-rules/{self_rule_id}"),
+                Some(&operator),
+                None,
+            ),
+            // Driven from a third address, and the reason is worth recording. The rule this
+            // walk just created covers `outside`, so a request from there would be refused
+            // before the layer reached the route — which is the feature working correctly, and
+            // not what the assertion is about. It is also the real operator experience: once a
+            // deny covers your own address, you cannot remove it from the panel, and the only
+            // way back is another network or the CLI. The REQ's risk note asks for exactly that
+            // escape to keep working, and this is the walk that keeps it honest.
+            elsewhere,
+        ))
+        .await;
+    assert_eq!(removed_self.status, StatusCode::NO_CONTENT, "{}", removed_self.text);
+
     // Removing the rule restores the address on the *next* request, not at the next boot.
     let rule_id = created.body["rule"]["id"]
         .as_str()
@@ -1068,7 +1149,7 @@ async fn a_denied_network_cannot_reach_the_api() {
     let deleted = harness
         .call(from_address(
             request(Method::DELETE, &format!("/api/v1/security/ip-rules/{rule_id}"), Some(&operator), None),
-            outside,
+            elsewhere,
         ))
         .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{}", deleted.text);
