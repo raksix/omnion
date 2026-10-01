@@ -174,6 +174,45 @@ impl Harness {
             }
         };
 
+        // Drop anything a PREVIOUS run left behind, before taking a new name.
+        //
+        // **This is the half of the cleanup that actually holds, and finding that out took
+        // four attempts.** A `Drop` guard does not: a panic inside `#[tokio::test]` unwinds
+        // the runtime TASK, not the future the macro awaits, so a guard in that future never
+        // runs — measured, not assumed, and each of the other three shapes failed for its own
+        // measurable reason (`catch_unwind` needs the `futures` crate this workspace does not
+        // carry; `tokio::spawn`ing the body needs a `Send` result and `Box<dyn Error>` is not
+        // one; a detached `handle.spawn` for the drop is not polled before the process exits).
+        //
+        // The next run is the only process guaranteed to exist on the failing path, so the
+        // sweep belongs here. Twelve databases accumulated over six failing runs while the
+        // guard was "fixed"; this clears them whatever the previous run did.
+        // `r#"..."#` because a `LIKE` pattern needs backslashes to escape its own wildcard
+        // characters, and escaping those once for Rust and once for SQL inside a normal
+        // string literal is how a query silently matches nothing. The first version of this
+        // line was exactly that: correct in psql, empty from the suite.
+        let stale: Vec<String> = sqlx::query_scalar(
+            r#"
+            select datname
+              from pg_database
+             where datname like 'omnion\_themes\_%'
+               and datname <> current_database()
+               and not exists (
+                   select 1 from pg_stat_activity a where a.datname = pg_database.datname
+               )
+            "#,
+        )
+        .fetch_all(maintenance.pool())
+        .await
+        .unwrap_or_default();
+        for database in stale {
+            // A failure here is not the walk's failure: another writer may be using it, and
+            // a sweep that refused to start would be worse than a sweep that skips one.
+            let _ = sqlx::query(&format!("drop database if exists \"{database}\" with (force)"))
+                .execute(maintenance.pool())
+                .await;
+        }
+
         let database = format!("omnion_themes_{}", &Uuid::new_v4().simple().to_string()[..12]);
         if let Err(error) = sqlx::query(&format!("create database \"{database}\""))
             .execute(maintenance.pool())
@@ -209,7 +248,11 @@ impl Harness {
         })
     }
 
-    /// Drop the throwaway database. Called even when a walk panics, by the `walk!` macro.
+    /// Drop the throwaway database. Called by the `walk!` macro when the walk RETURNS.
+    ///
+    /// Not on a panic — see [`Harness::fresh`] for the measurement behind that and for the
+    /// sweep that covers it. `dispose` consuming `self` is deliberate: it cannot be called
+    /// twice, so there is no path where a walk drops its database and then drops it again.
     async fn dispose(self) {
         self.db.pool().close().await;
         let database = self.database;
