@@ -2015,6 +2015,14 @@ pub fn router(state: AppState) -> Router {
             get(ai_guard::read_event).layer(guards::require(&state, "ai.guard.read")),
         )
         .route("/ai/guard/fixtures", ai_guard_fixtures)
+        // `read`, not `manage`: the about page is the residual-risk statement, and an operator
+        // has to be able to read what the guard misses *especially* when they are not allowed to
+        // change it. Gating the disclosure behind the permission to configure the control would
+        // hide the risk from exactly the people who most need to argue about it.
+        .route(
+            "/ai/guard/about",
+            get(ai_guard::about).layer(guards::require(&state, "ai.guard.read")),
+        )
         .route("/ai/guard/exemptions", ai_guard_exemptions)
         .route(
             "/ai/guard/exemptions/{id}",
