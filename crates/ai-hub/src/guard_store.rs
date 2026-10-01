@@ -1146,7 +1146,13 @@ pub struct NewEvent {
 /// to log a failure here (the chat route warns and continues), because refusing a user's chat
 /// because the audit row did not fit would be a worse outcome than the gap it closes.
 pub async fn record_event(pool: &PgPool, new: NewEvent) -> Result<i64> {
-    let blocked = new.action == "blocked";
+    // **`Action::Block.as_wire()` is `"block"`, not `"blocked"`.** Comparing against `"blocked"`
+    // here made `blocked` permanently `false` on every row, which meant the `?blocked=true` filter
+    // on the events screen could never match anything — the refusal was on record and invisible,
+    // which is the one outcome an audit trail must not have. The strictest action decides, exactly
+    // as the detector's own verdict does, so a `flag` rule inside a blocked request is still
+    // recorded as a block.
+    let blocked = Action::from_wire(&new.action) == Some(Action::Block);
     let row: (i64,) = sqlx::query_as(
         "insert into ai_guard_events (organization_id, site_id, user_id, request_id, run_id, \
            provider_id, feature, action, rule_keys, label_counts, match_count, blocked, \
