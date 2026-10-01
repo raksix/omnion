@@ -17,11 +17,23 @@
 pub mod cluster;
 pub mod error;
 pub mod job;
-pub mod jobs;
+pub mod log_cursor;
 pub mod maintenance;
 pub mod manifest;
 pub mod preflight;
 pub mod version;
+
+/// The job write side, behind the `store` feature.
+///
+/// Ungated until tick 100, and that is a real defect rather than a style note: `jobs.rs` is 692
+/// lines of `sqlx` and `crate::store`, both of which only exist when the feature is on, so
+/// `cargo test -p omnion-deployment` — the exact command the crate's own documentation and this
+/// loop's gate both name — failed to *compile* with 34 errors. Only the feature-enabled form was
+/// ever green, because `apps/api` is what turns the feature on, so the API built and the crate's
+/// own default test command did not. The two database-free cursor helpers moved to
+/// [`log_cursor`] so the log-stream edge cases keep their tests on the build with no database.
+#[cfg(feature = "store")]
+pub mod jobs;
 
 pub use cluster::{
     MAX_WORKLOAD_NAME, Metric, Point, Process, RestartEdit, RestartRefusal, Runtime,
@@ -60,6 +72,15 @@ pub mod cluster_store;
 
 #[cfg(feature = "store")]
 pub use cluster_store::{Recorded, SampleRow};
+
+/// The maintenance window's storage, behind the same `store` feature.
+///
+/// Four queries and a `Window` type's worth of decisions, separated so the twenty decision tests
+/// in [`maintenance`] run on a build with no database — the same split as [`log_cursor`] and
+/// [`jobs`], and for the same reason: the crate's default test command could not compile while
+/// the two halves shared a module.
+#[cfg(feature = "store")]
+pub mod maintenance_store;
 
 #[cfg(feature = "store")]
 // `UpdateCheck`, not `CheckState`: `preflight::CheckState` is the pass/warn/fail/unknown of a

@@ -25,6 +25,11 @@ use uuid::Uuid;
 use crate::error::StoreError;
 use crate::job::{Job, JobKind, JobStatus, Step, StepStatus, plan_steps};
 
+// The log cursor moved to [`crate::log_cursor`] so its edge-case tests run without a database.
+// Re-exported here because a caller that already imports this module for the job write side
+// should not have to learn a second path for the log it is reading.
+pub use crate::log_cursor::{cursor_for, log_since};
+
 /// The environment a job targets, as the routes receive it.
 ///
 /// `Clone` but **not** `Copy`: it owns the environment name, and a `Copy` derive on a struct with
@@ -590,30 +595,6 @@ pub async fn elapsed_ms(pool: &PgPool, id: Uuid) -> Result<Option<i64>, StoreErr
     Ok(value.map(i64::from))
 }
 
-/// A cursor for the log stream: the byte offset the client has already seen.
-///
-/// The fallback for a browser whose `EventSource` is blocked by a proxy is a poll against
-/// `?cursor=`, and the cursor is what makes that poll cheap — without it every poll re-sends the
-/// whole log, and a two-minute deploy's log becomes the reason the pane stops updating.
-pub fn cursor_for(log: &str) -> usize {
-    log.len()
-}
-
-/// The part of the log after `cursor`, and the cursor that follows it.
-///
-/// Clamped to the end rather than to the string's boundary: a cursor from a *different* job's
-/// log is longer than this one, and reading past the end would return nothing for ever instead
-/// of the whole log.
-pub fn log_since(log: &str, cursor: usize) -> (&str, usize) {
-    if cursor >= log.len() {
-        return ("", log.len());
-    }
-    if !log.is_char_boundary(cursor) {
-        return (log, log.len());
-    }
-    (&log[cursor..], log.len())
-}
-
 /// When a job row was started, for the history screen's sort when a filter is active.
 pub async fn started_at(pool: &PgPool, id: Uuid) -> Result<Option<OffsetDateTime>, StoreError> {
     Ok(
@@ -646,47 +627,5 @@ mod tests {
                 .to_string()
                 .contains("already holds")
         );
-    }
-
-    #[test]
-    fn a_cursor_reads_forward_and_clamps_backwards() {
-        let log = "first\nsecond\n";
-        let (chunk, next) = log_since(log, 0);
-        assert_eq!(chunk, "first\nsecond\n");
-        assert_eq!(next, log.len());
-
-        let (chunk, next) = log_since(log, 6);
-        assert_eq!(chunk, "second\n");
-        assert_eq!(next, log.len());
-
-        // A cursor from a longer log must return the whole log, not nothing, for ever.
-        let (chunk, next) = log_since(log, 9_999);
-        assert_eq!(chunk, "");
-        assert_eq!(next, log.len());
-        let (chunk, _) = log_since(log, 99);
-        assert_eq!(chunk, "");
-    }
-
-    #[test]
-    fn a_cursor_mid_character_returns_the_whole_log() {
-        // `é` is two bytes, so offset 1 splits a character and `&log[1..]` would panic. The
-        // offset that actually splits one is inside the multi-byte char, not after it.
-        let log = "é\n";
-        assert!(
-            !log.is_char_boundary(1),
-            "the test needs a mid-character offset to be meaningful"
-        );
-        let (chunk, next) = log_since(log, 1);
-        assert_eq!(
-            chunk, log,
-            "a split cursor returns the whole log, not a panic"
-        );
-        assert_eq!(next, log.len());
-    }
-
-    #[test]
-    fn the_cursor_is_a_byte_length() {
-        assert_eq!(cursor_for("abc"), 3);
-        assert_eq!(cursor_for(""), 0);
     }
 }
