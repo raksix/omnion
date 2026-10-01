@@ -699,6 +699,9 @@ impl Default for AiHubConfig {
             agent_runner_enabled: true,
             runner_concurrency: DEFAULT_AI_RUNNER_CONCURRENCY,
             log_runner_enabled: true,
+        }
+    }
+}
 
 /// The installation's Web Push identity (`OMNION_PUSH_*`, REQ-021 slice 6).
 ///
