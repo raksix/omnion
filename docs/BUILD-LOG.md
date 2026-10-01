@@ -12945,3 +12945,36 @@ finish is not a pass that reports zero findings.
 API compiles, so the measurement is possible. Then the CRM inbox depth pass, which the last three
 ticks have deferred.
 
+
+### Tick 62 addendum — the pass that measures the simulator was itself broken, twice
+
+**What.** The private-stack pass ran three times. The first died instantly on Postgres in crash
+recovery; the second and third reached the depth phase and both reported `crm-assignment` as
+`steps: 0` with `TimeoutError: locator.fill: Timeout 30000ms exceeded`.
+
+**That is a harness fault, not a product one, and it took two runs to see why.** The pass throws out
+of the whole function at the first **unguarded** locator action. Every other action in that function
+carries `.catch(() => {})` so a missing element records an *absent step*; four actions in the block
+this branch already owned did not — three pre-existing, six added this tick. **The second run failed
+on a different fill**, which is the tell: guarding changed *which* control the pass reached first,
+not whether it ran. A guarded control that is genuinely absent must read as a red step; an abort
+hides that no measurement was taken at all.
+
+**Counted the class rather than the instance:** 19 unguarded actions across seven depth passes —
+storefront 1, projects 1, backups 1, media-file-manager 5, webhooks 1, security 8, retention 2. The
+six that are not this worktree's are recorded, not fixed.
+
+**What the pass did prove, before and around the failure.**
+
+- `crm-intake` ran its full set: **130+ assertions green** — `editKeptEvidence`,
+  `respondIsIdempotent`, `pickerIsNotUuids`, `transformChips: 7`, `unsatisfiedNamed` +
+  `saveDisabled`, `keyRevealShown` + `keyValueLength: 32`, `rotateRevealsKey` +
+  `oldKeyAfterRotate: 401`, `retentionSweepHiddenBeforeCount`, `blockedStepsNameTheirModule`,
+  `convertOutcomeHonest`, `captureStatus: 202` → `accepted` → idempotent retry, and
+  `spamStatus: 202` → `rejected`.
+- `projects` ran **45 steps**; all six CRM routes walked at **40 interactive elements** each.
+- **`crm-assignment` remains unmeasured** and REQ-117's simulator box stays `[~]`.
+
+**Also worth recording: the box was not merely busy.** Postgres spent **56 minutes** in crash
+recovery on an fsync (root disk 96%), and every gate refuses to start until it accepts connections —
+so "the database is recovering" and "the box is loaded" read identically from the harness.
