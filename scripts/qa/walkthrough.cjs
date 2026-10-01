@@ -1721,6 +1721,85 @@ async function runMediaFileManager(page, report) {
   await page.click('button[aria-label="Filters"]');
   await page.waitForTimeout(600);
 
+  // The size, uploader, date and tag filters (REQ-010, tick 101). They existed in the store and
+  // on the API for the whole life of the request with no control on the toolbar, so nothing in
+  // the tree could ever click them. This step is what makes them an *interaction* rather than
+  // markup: each is filled, the listing must react, and the contradictory range must produce a
+  // message under its own field rather than an empty listing.
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(300);
+  const filterIds = [
+    "media-min-size",
+    "media-max-size",
+    "media-uploader",
+    "media-created-after",
+    "media-created-before",
+    "media-tag",
+  ];
+  const present = [];
+  for (const id of filterIds) {
+    if ((await page.locator(`#${id}`).count()) > 0) {
+      present.push(id);
+    }
+  }
+  note({ step: "media-filter-controls", present, expected: filterIds.length });
+  await shot(page, "media-filter-bar");
+
+  // A min/max pair that contradicts itself must be refused *by name*. A zero-row listing would
+  // be the product looking healthy, so the assertion is on the alert text, not on the row count.
+  await page.fill("#media-min-size", "999999999");
+  await page.fill("#media-max-size", "1");
+  await page.waitForTimeout(1200);
+  const rangeAlert = await page
+    .locator("#media-min-size-error")
+    .innerText()
+    .catch(() => null);
+  const stillRendered = (await page.locator("#media-min-size").count()) > 0;
+  note({ step: "media-range-refusal", rangeAlert, stillRendered });
+  await shot(page, "media-range-refusal");
+
+  // Clear filters has to clear *all* of them, including the five this step added. A Clear that
+  // left the size boxes populated would make every later assertion in this pass read a filtered
+  // listing and blame the screen for it.
+  if ((await page.locator("#media-clear-filters").count()) > 0) {
+    await page.click("#media-clear-filters");
+  } else {
+    await page.fill("#media-min-size", "");
+    await page.fill("#media-max-size", "");
+  }
+  await page.waitForTimeout(900);
+  const cleared = {
+    min: await page.inputValue("#media-min-size").catch(() => null),
+    max: await page.inputValue("#media-max-size").catch(() => null),
+  };
+  note({ step: "media-filters-cleared", cleared });
+
+  // A real uploader selection must narrow, and the dropdown must be fed by the route that shares
+  // the listing's permission key rather than by the IAM one a media operator does not hold.
+  const uploaderOptions = await page
+    .locator("#media-uploader option")
+    .allTextContents()
+    .catch(() => []);
+  let uploaderNarrowed = null;
+  if (uploaderOptions.length > 1) {
+    const value = await page
+      .locator("#media-uploader option")
+      .nth(1)
+      .getAttribute("value")
+      .catch(() => null);
+    if (value) {
+      await page.selectOption("#media-uploader", value);
+      await page.waitForTimeout(1100);
+      const rows = await page.locator("tbody tr").count();
+      uploaderNarrowed = { value, rows };
+      await page.selectOption("#media-uploader", "");
+    }
+  }
+  note({ step: "media-uploader-filter", options: uploaderOptions.length, uploaderNarrowed });
+  await page.waitForTimeout(400);
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(500);
+
   // A delete is a trash, not a purge.
   const firstRow = page.locator("tbody tr").first();
   if ((await firstRow.count()) > 0) {
