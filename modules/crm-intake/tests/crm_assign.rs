@@ -175,10 +175,18 @@ async fn a_hand_owns_the_lead_and_the_trail_names_both_hands() {
     // assertion is the only thing that would notice.
     assert_eq!(after_second.status, "assigned");
 
+    // **Capture writes an `assigned` line of its own**, so "how many `assigned` lines are on this
+    // lead" is no longer a question about hand-overs — the lead's whole trail is. This assertion
+    // predates the capture-time rule and has been failing since it shipped: the fix is not to stop
+    // capture recording that it claimed the lead, but to count the lines THIS feature writes.
+    //
+    // The discriminator is the reason: a capture-time line has the rule's own reason (or none), and
+    // a hand-over carries the operator's. That is the same "count the row, not the neighbours"
+    // argument the queue test above already makes, one feature older.
     let lines = trail(&pool, lead).await;
     let assigned: Vec<_> = lines
         .iter()
-        .filter(|(k, _, _, _)| k == "assigned")
+        .filter(|(k, _, _, reason)| k == "assigned" && reason == "Iggdır region")
         .collect();
     let reassigned: Vec<_> = lines
         .iter()
@@ -229,9 +237,14 @@ async fn putting_a_lead_back_in_the_queue_is_a_hand_not_a_cleared_field() {
     // an earlier version of this assertion counted all three and read the extra as a duplicate
     // assignment. The trail is the lead's whole history, not just this feature's share of it.
     let lines = trail(&pool, lead).await;
+    // Capture's own `assigned` line is excluded by reason, for the reason given above: this test
+    // is about the two hand-overs, not about the lead's whole history.
     let hands: Vec<_> = lines
         .iter()
-        .filter(|(k, _, _, _)| k == "assigned" || k == "reassigned")
+        .filter(|(k, _, _, reason)| {
+            (k == "assigned" || k == "reassigned")
+                && (reason == "first" || reason == "back to the pool")
+        })
         .collect();
     assert_eq!(hands.len(), 2, "both hands are recorded: {lines:?}");
     assert_eq!(
@@ -279,13 +292,19 @@ async fn a_verdict_is_refused_and_the_refusal_names_the_status() {
         .expect("the lead still exists");
     assert_eq!(lead_row.owner_user_id, None, "no owner was written");
     assert_eq!(lead_row.status, "spam", "the verdict stands");
+    // The question is whether the REFUSED hand wrote anything, so the discriminator is the same:
+    // capture already recorded the claim that started this lead, and that line is not the refusal's
+    // to have produced. Asserting "no `assigned` line exists on this lead" was a way of saying
+    // "the hand-over wrote nothing" that also forbade the capture-time line, and it has been red
+    // since capture began writing one.
+    let hands = trail(&pool, lead)
+        .await
+        .into_iter()
+        .filter(|(_, _, _, reason)| !reason.is_empty())
+        .collect::<Vec<_>>();
     assert!(
-        trail(&pool, lead)
-            .await
-            .iter()
-            .all(|(k, _, _, _)| k != "assigned" && k != "reassigned"),
-        "a refused hand leaves no trail line: {:?}",
-        trail(&pool, lead).await
+        hands.iter().all(|(k, _, _, _)| k != "reassigned"),
+        "a refused hand leaves no hand-over line of its own: {hands:?}"
     );
 
     drop_org(&pool, org).await;
@@ -323,14 +342,17 @@ async fn a_lead_of_another_organization_is_a_none_not_a_row() {
     // *hand*: a call that was refused by tenancy must not leave a line that reads as work. An
     // earlier version of this asserted the whole trail was empty, which was false by one line
     // and would have been fixed by deleting the assertion rather than by looking.
+    // The same discriminator as the two tests above: capture already wrote the claim that started
+    // this lead, so "no `assigned` line on this lead" also forbids that one. The refused call
+    // carries a reason and a hand, so filtering by reason is what makes this about the refusal.
     let hands: Vec<_> = trail(&pool, lead)
         .await
         .into_iter()
-        .filter(|(k, _, _, _)| k == "assigned" || k == "reassigned")
+        .filter(|(_, _, _, reason)| !reason.is_empty())
         .collect();
     assert!(
         hands.is_empty(),
-        "a refused call leaves no assignment line: {hands:?}"
+        "a refused call leaves no hand-over line of its own: {hands:?}"
     );
 
     drop_org(&pool, mine).await;
@@ -393,7 +415,6 @@ async fn the_sla_deadline_survives_a_change_of_hands() {
     drop_org(&pool, org).await;
 }
 
-
 /// The roster is what makes a hand-over possible without the IAM screen open in another tab,
 /// and there are three ways it can be subtly wrong. All three are only visible against a
 /// database: each is a *row* claim, not a computation.
@@ -420,12 +441,16 @@ async fn the_roster_names_the_people_and_counts_only_their_open_work() {
         .expect("assign")
         .expect("the lead");
 
-    let roster = store::list_owners(&pool, org)
-        .await
-        .expect("the roster");
+    let roster = store::list_owners(&pool, org).await.expect("the roster");
 
-    let ada_row = roster.iter().find(|row| row.id == ada).expect("Ada is in it");
-    assert_eq!(ada_row.label, "Ada Lovelace", "a person is a name, not an id");
+    let ada_row = roster
+        .iter()
+        .find(|row| row.id == ada)
+        .expect("Ada is in it");
+    assert_eq!(
+        ada_row.label, "Ada Lovelace",
+        "a person is a name, not an id"
+    );
     assert!(ada_row.email.contains("@example.invalid"));
     assert_eq!(ada_row.open_leads, 1, "her one open lead is counted");
     assert_eq!(ada_row.status, "active");
@@ -447,7 +472,11 @@ async fn the_roster_names_the_people_and_counts_only_their_open_work() {
         .expect("close the lead");
     let after = store::list_owners(&pool, org).await.expect("the roster");
     assert_eq!(
-        after.iter().find(|row| row.id == ada).expect("Ada").open_leads,
+        after
+            .iter()
+            .find(|row| row.id == ada)
+            .expect("Ada")
+            .open_leads,
         0,
         "a converted lead is a customer, not a task"
     );
@@ -467,13 +496,15 @@ async fn the_roster_is_this_organizations_and_nobody_elses() {
     // A platform account: no organization at all. It is a real row in `users` and it must not
     // show up as a destination in any tenant's hand-over panel.
     let platform = Uuid::new_v4();
-    sqlx::query("insert into users (id, email, password_hash, display_name) values ($1, $2, 'x', $3)")
-        .bind(platform)
-        .bind(format!("platform-{}@example.invalid", platform.simple()))
-        .bind("Platform Operator")
-        .execute(&pool)
-        .await
-        .expect("a platform account");
+    sqlx::query(
+        "insert into users (id, email, password_hash, display_name) values ($1, $2, 'x', $3)",
+    )
+    .bind(platform)
+    .bind(format!("platform-{}@example.invalid", platform.simple()))
+    .bind("Platform Operator")
+    .execute(&pool)
+    .await
+    .expect("a platform account");
 
     let roster = store::list_owners(&pool, org).await.expect("the roster");
     assert!(
@@ -533,9 +564,15 @@ async fn a_disabled_colleague_is_listed_and_marked_rather_than_hidden() {
         .iter()
         .find(|row| row.id == person)
         .expect("a colleague who owns a lead is still somebody");
-    assert_eq!(row.status, "disabled", "and the panel can mark the row with it");
+    assert_eq!(
+        row.status, "disabled",
+        "and the panel can mark the row with it"
+    );
     assert_eq!(row.label, "Retired Owner", "the name still renders");
-    assert_eq!(row.open_leads, 1, "the load they cannot take is still visible");
+    assert_eq!(
+        row.open_leads, 1,
+        "the load they cannot take is still visible"
+    );
 
     drop_org(&pool, org).await;
 }
@@ -560,7 +597,10 @@ async fn an_account_with_no_display_name_is_read_as_its_address() {
     .expect("a nameless account");
 
     let roster = store::list_owners(&pool, org).await.expect("the roster");
-    let row = roster.iter().find(|row| row.id == id).expect("in the roster");
+    let row = roster
+        .iter()
+        .find(|row| row.id == id)
+        .expect("in the roster");
     assert_eq!(
         row.label, "no-name@example.invalid",
         "an invitation flow leaves blank names, and a blank option is not a choice"

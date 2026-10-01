@@ -52,13 +52,15 @@ async fn drop_org(pool: &PgPool, org: Uuid) {
 
 async fn one_user(pool: &PgPool, org: Uuid, label: &str) -> Uuid {
     let id = Uuid::new_v4();
-    sqlx::query("insert into users (id, email, password_hash, display_name) values ($1, $2, 'x', $3)")
-        .bind(id)
-        .bind(format!("{label}-{}@example.invalid", id.simple()))
-        .bind(label)
-        .execute(pool)
-        .await
-        .expect("a user");
+    sqlx::query(
+        "insert into users (id, email, password_hash, display_name) values ($1, $2, 'x', $3)",
+    )
+    .bind(id)
+    .bind(format!("{label}-{}@example.invalid", id.simple()))
+    .bind(label)
+    .execute(pool)
+    .await
+    .expect("a user");
     let _ = sqlx::query("update users set organization_id = $2 where id = $1")
         .bind(id)
         .bind(org)
@@ -171,7 +173,11 @@ async fn a_batch_where_one_row_is_a_verdict_moves_the_rest_and_names_the_one() {
             .await
             .expect("read")
             .expect("the lead");
-        assert_eq!(moved.owner_user_id, Some(person), "the real hand-over landed");
+        assert_eq!(
+            moved.owner_user_id,
+            Some(person),
+            "the real hand-over landed"
+        );
     }
 
     drop_org(&pool, org).await;
@@ -256,7 +262,10 @@ async fn a_batch_that_names_nothing_or_too_much_is_refused_before_anything_is_wr
         .await
         .expect("read")
         .expect("the lead");
-    assert_eq!(untouched.owner_user_id, None, "a refused batch wrote nothing");
+    assert_eq!(
+        untouched.owner_user_id, None,
+        "a refused batch wrote nothing"
+    );
 
     drop_org(&pool, org).await;
 }
@@ -276,9 +285,10 @@ async fn a_batch_back_to_the_queue_is_a_hand_over_and_writes_one_trail_line_per_
             .expect("the lead");
     }
 
-    let report = store::bulk_assign_owner(&pool, org, &[first, second], None, "queue is empty", None)
-        .await
-        .expect("the batch");
+    let report =
+        store::bulk_assign_owner(&pool, org, &[first, second], None, "queue is empty", None)
+            .await
+            .expect("the batch");
     assert_eq!(
         report.applied(),
         2,
@@ -295,12 +305,27 @@ async fn a_batch_back_to_the_queue_is_a_hand_over_and_writes_one_trail_line_per_
             None,
             "the queue really is empty for this one"
         );
+        // Capture writes an `assigned` line of its own when it claims the lead for a rule, so
+        // counting every `assigned`/`reassigned` line sees three where the batch wrote two. The
+        // batch's own lines are the ones carrying the reason it passed, which is the same
+        // discriminator the hand-over tests use — count the rows this feature writes, not the
+        // lead's whole history.
         let lines = store::list_events(&pool, org, lead).await.expect("events");
         let hands = lines
             .iter()
-            .filter(|line| line.kind == "assigned" || line.kind == "reassigned")
+            .filter(|line| {
+                (line.kind == "assigned" || line.kind == "reassigned")
+                    && line
+                        .detail
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|reason| !reason.is_empty())
+            })
             .count();
-        assert_eq!(hands, 2, "each lead keeps both of its hands — the trail is the only history");
+        assert_eq!(
+            hands, 2,
+            "each lead keeps both of its hands — the trail is the only history"
+        );
     }
 
     drop_org(&pool, org).await;
