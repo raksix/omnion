@@ -115,6 +115,7 @@ import type {
   NotificationPage,
   NotificationPreferences,
   NotificationPreferencesSaved,
+  NotificationPushKey,
   NotificationPushOutcome,
   NotificationRouteReport,
   NotificationRouteRule,
@@ -4296,6 +4297,17 @@ export function registerNotificationDevice(input: {
 /** Remove one device. `404` for somebody else's, so existence does not leak. */
 export function removeNotificationDevice(id: string): Promise<void> {
   return request<void>(`/api/v1/notifications/push-subscriptions/${id}`, { method: "DELETE" });
+}
+
+/**
+ * The installation's VAPID public key, which is what `applicationServerKey` needs.
+ *
+ * `available: false` is an answer, not an error: the settings screen renders the push block
+ * either way, and a rejected request would put a toast on a panel that is working correctly
+ * and simply has nothing configured yet.
+ */
+export function fetchNotificationPushKey(): Promise<NotificationPushKey> {
+  return request<NotificationPushKey>("/api/v1/notifications/push-key");
 }
 
 /**

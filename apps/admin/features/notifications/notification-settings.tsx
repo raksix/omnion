@@ -40,6 +40,8 @@ import {
   sendTestNotificationDelivery,
   type ApiError,
 } from "@/lib/api";
+import { NotificationDevices } from "./notification-devices";
+
 import {
   DIGEST_CADENCES,
   DIGEST_WEEKDAYS,
@@ -564,6 +566,20 @@ export function NotificationSettings() {
           </div>
         ) : null}
       </section>
+
+      {/* --------------------------------------------------------- browser push */}
+      {/*
+        **Slice 6b.** The device block sits between the matrix and the test-delivery rows
+        because that is the order a reader needs them in: "Web Push is on in the matrix" is a
+        claim about the matrix, and "this browser is registered" is the fact that makes it
+        true. Putting the devices below the test rows would ask somebody to test a channel
+        whose destination they had not yet been told about.
+
+        Rendered for every reader with `notifications.manage` rather than gated on readiness,
+        for the same reason the test rows are: an installation that has lost its push key still
+        has registered devices, and those are exactly the rows somebody needs to delete.
+      */}
+      <NotificationDevices />
 
       {/* ------------------------------------------------------------- test delivery */}
       {/*

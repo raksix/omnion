@@ -788,6 +788,35 @@ impl PushConfig {
             .is_some_and(|v| !v.trim().is_empty())
     }
 
+    /// A copy with the private key set, base64url without padding.
+    ///
+    /// **The one writer, and it exists because the fields are private on purpose.** A private
+    /// key is a credential, and a struct whose fields can be built from anywhere is a struct
+    /// that gets one assembled in a test, a fixture and a config file without anybody deciding
+    /// that. But "generated at deploy time" means something has to hand the platform a key it
+    /// did not read from the environment: `vapid::VapidKeys::generate` mints one, and this is
+    /// how it is handed over.
+    ///
+    /// No validation happens here, deliberately. A malformed key is still *present*, and
+    /// [`Self::has_private_key`] is exactly the distinction the settings screen renders against
+    /// [`Self::private_key_bytes`]. Keeping "what was configured" and "what would a push
+    /// service accept" as two separate questions is what lets that screen name which of the two
+    /// problems it has.
+    #[must_use]
+    pub fn with_private_key(mut self, private_key: impl Into<String>) -> Self {
+        self.private_key = Some(private_key.into());
+        self
+    }
+
+    /// A copy with the contact address set.
+    ///
+    /// Same reasoning as [`Self::with_private_key`]; validated on read in [`Self::contact`].
+    #[must_use]
+    pub fn with_contact(mut self, contact: impl Into<String>) -> Self {
+        self.contact = Some(contact.into());
+        self
+    }
+
     /// The base64url public key, derived from the private half.
     ///
     /// Derived rather than configured, because a pair supplied as two strings can disagree and

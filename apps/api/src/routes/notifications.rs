@@ -729,7 +729,7 @@ pub async fn emit(
             draft = draft.with_dedupe_key(key.clone());
         }
 
-        if omnion_notifications::store::record(
+        if omnion_notifications::store::record_with_deliveries(
             state.db().pool(),
             session.user.organization_id,
             Some(session.user.id),
@@ -737,6 +737,7 @@ pub async fn emit(
         )
         .await
         .map_err(map_store)?
+        .is_some()
         {
             created += 1;
         } else {
