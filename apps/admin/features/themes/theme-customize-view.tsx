@@ -14,8 +14,15 @@
  * 2. **Contrast is measured by the SERVER, on every edit, and shown before publish.** The
  *    browser can compute a ratio too and be subtly different (colour-space rounding, the AA
  *    threshold for large text); a badge that disagrees with the 422 on publish is worse than no
- *    badge. So the panel shows `view.contrast` and sends `acknowledgeContrast: true` only after
- *    the operator has actually seen the findings.
+ *    badge. So the panel ASKS — `POST …/theme-settings/contrast-check` on the draft it is
+ *    editing, debounced — and sends `acknowledgeContrast: true` only after the operator has
+ *    actually seen the findings.
+ *
+ *    This rule used to claim "on every edit" while reading `view.contrast`, the measurement of
+ *    the last SAVE. The claim was the right one and the code was the wrong one, which is worse:
+ *    the screen printed a palette's all-clear beside a preview of a *different* palette, and
+ *    the publish refusal told the operator to read that all-clear. The rule is now true as
+ *    written, and `scripts/qa/probe-contrast-live.cjs` is what holds it true.
  * 3. **Discard restores the draft from the last server response, not from a local snapshot.**
  *    A local snapshot is a second copy of the truth that drifts the moment a restore from the
  *    history screen lands in another tab.
@@ -37,6 +44,7 @@ import { AlertTriangle, Check, Eye, Loader2, RotateCcw, Save, Undo2 } from "luci
 import { EmptyState } from "@/components/empty-state";
 import {
   ApiError,
+  checkThemeSettingsContrast,
   fetchThemeSettings,
   publishThemeSettings,
   saveThemeSettings,
@@ -144,6 +152,22 @@ export function ThemeCustomizeView() {
   const [brandingMessages, setBrandingMessages] = useState<Record<string, string[]>>({});
   const [openSection, setOpenSection] = useState<SectionName>("tokens");
   const [contrastSeen, setContrastSeen] = useState(false);
+  /**
+   * The findings for the palette **as it is being edited**, measured by the server.
+   *
+   * `view.contrast` is the measurement of the last SERVER response, and the screen prints one
+   * beside a live preview of `form` — two different palettes. An operator who edits the accent
+   * into a failing pair was told "every pair meets WCAG AA" while the preview beside them showed
+   * the failing colours, and the publish refusal instructs them to read exactly that panel.
+   *
+   * `null` is a distinct third state and not an empty list: an empty list means "measured, and
+   * nothing fails", which is the all-clear the screen is allowed to print. `null` means "not
+   * measured yet", and the all-clear must NOT be printed for it — a badge that says every pair
+   * passes before anything has been measured is the defect this state exists to prevent.
+   */
+  const [liveContrast, setLiveContrast] = useState<ThemeContrastFinding[] | null>(null);
+  const [contrastPending, setContrastPending] = useState(false);
+  const [contrastFailed, setContrastFailed] = useState(false);
   // The form as the last SERVER response left it, kept beside the live form so "is this dirty"
   // is a comparison of two React values rather than a read of a mutable ref during render.
   // A ref read in a render is a lie the first time a component re-renders without the writer
@@ -174,6 +198,58 @@ export function ThemeCustomizeView() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /**
+   * Measure the palette being EDITED, debounced, on every token change.
+   *
+   * **Why a request per edit and not a browser calculation.** A ratio computed in the browser
+   * disagrees with the server's in colour-space rounding and in the large-text threshold, and
+   * the badge that matters is the one that precedes the 422. If the two ever disagree, the
+   * operator is told their palette is fine by the panel and refused by the product — which is
+   * worse than having no badge, because they have learned to trust it.
+   *
+   * **Why debounced, and why the pending state is shown rather than hidden.** The measurement is
+   * a network call on a colour picker, so an undebounced effect fires one per drag frame. The
+   * panel therefore prints `Checking contrast…` while one is in flight, and refuses to print
+   * the all-clear during that window: the honest state of an unmeasured draft is "not measured",
+   * and a badge that says "every pair meets AA" while a measurement is in flight is the same lie
+   * the fix exists to remove.
+   *
+   * The abort matters for the same reason the debounce does: two in-flight measurements can
+   * land out of order, and the older one would overwrite the newer palette's findings.
+   */
+  useEffect(() => {
+    if (!selectedSite || !form) return;
+    const controller = new AbortController();
+    setContrastPending(true);
+    setContrastFailed(false);
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const measured = await checkThemeSettingsContrast(
+            selectedSite.id,
+            form.themeKey,
+            form.tokens as Record<string, unknown>,
+          );
+          if (controller.signal.aborted) return;
+          setLiveContrast(measured.findings);
+        } catch {
+          if (controller.signal.aborted) return;
+          // A failed measurement is NOT an empty one. Reporting "every pair meets AA" because
+          // the check could not run is how a panel ends up guaranteeing something it never
+          // verified, so the state is kept distinct and the panel says so.
+          setLiveContrast(null);
+          setContrastFailed(true);
+        } finally {
+          if (!controller.signal.aborted) setContrastPending(false);
+        }
+      })();
+    }, 300);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [selectedSite, form]);
 
   const setField = useCallback(
     <K extends keyof ThemeSettingsInput>(key: K, value: ThemeSettingsInput[K]) => {
@@ -287,7 +363,13 @@ export function ThemeCustomizeView() {
     try {
       // The acknowledgement is sent ONLY when there is something to acknowledge and the
       // operator has seen it. Sending it unconditionally would make the server's guard a no-op.
-      const acknowledge = view.contrast.length === 0 || contrastSeen;
+      //
+      // `liveContrast`, not `view.contrast`: the guard this acknowledges is the one the server
+      // will run against the DRAFT being published, and a browser that decided from the last
+      // read's findings would be substituting its own judgement for the product's. An
+      // unmeasured palette sends `false` — the server then refuses with its real findings,
+      // which is the answer, rather than this client asserting one it never computed.
+      const acknowledge = (liveContrast?.length ?? 1) === 0 || contrastSeen;
       const next = await publishThemeSettings(selectedSite.id, acknowledge);
       setView(next);
       accept(initialSettings(next));
@@ -320,7 +402,7 @@ export function ThemeCustomizeView() {
     } finally {
       setBusy(null);
     }
-  }, [contrastSeen, load, selectedSite, view]);
+  }, [contrastSeen, liveContrast, load, selectedSite, view]);
 
   // ------------------------------------------------------------------ states
   if (siteStatus === "error") {
@@ -358,7 +440,16 @@ export function ThemeCustomizeView() {
     return <div className="h-64 animate-pulse rounded-lg bg-line" />;
   }
 
-  const findings = view.contrast;
+  /**
+   * The palette's findings as the panel renders them.
+   *
+   * The LIVE measurement, and `null` until one lands — never `view.contrast`, which describes
+   * the last save rather than the palette on screen. Falling back to the server's stored
+   * findings while a fresh measurement is pending would restore exactly the lie this replaced:
+   * an operator mid-edit reading an all-clear about a palette they have already changed.
+   */
+  const findings = liveContrast;
+  const measured = findings !== null;
   const themeDefaults = (view.defaultTokens ?? {}) as Record<string, unknown>;
   const hasDraft = view.draft !== null;
   // A comparison of the two React values. Comparing against `initialSettings(view)` instead
@@ -464,7 +555,35 @@ export function ThemeCustomizeView() {
         </p>
       ) : null}
 
-      {findings.length > 0 ? (
+      {/*
+        * Three states, and the middle one is the point of the fix.
+        *
+        * `pending` and `failed` both print something OTHER than an all-clear. The all-clear is a
+        * measurement claim — "every pair in this draft meets AA" — and it may only be printed for
+        * a palette that has just been measured. An unmeasured draft printing it is the defect
+        * this whole path replaced, so a failed check says it could not check rather than
+        * quietly falling through to the green line: silence reads as a pass.
+        */}
+      {!measured ? (
+        <p
+          className="flex items-center gap-2 rounded-md border border-line bg-panel px-3 py-2 text-sm text-muted"
+          data-theme-contrast-pending={contrastFailed ? "failed" : "checking"}
+          role="status"
+        >
+          {contrastFailed ? (
+            <>
+              <AlertTriangle className="h-4 w-4 text-warn" aria-hidden />
+              Contrast could not be measured for this draft. Nothing has been checked — the panel
+              will not report a palette as passing a check that did not run.
+            </>
+          ) : (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin text-muted" aria-hidden />
+              Checking this draft&apos;s contrast…
+            </>
+          )}
+        </p>
+      ) : findings.length > 0 ? (
         <section
           className="rounded-md border border-warn/40 bg-warn/10 px-3 py-3"
           data-theme-contrast
