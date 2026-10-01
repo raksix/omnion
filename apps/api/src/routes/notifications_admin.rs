@@ -26,8 +26,8 @@ use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use omnion_notifications::push::{
-    MAX_OUTBOX_PAGE, OUTBOX_RETENTION_DAYS, OutboxCounts, OutboxQuery, OutboxRow, PushSubscription,
-    RegisterOutcome, RegisterReport, RetryOutcome,
+    MAX_OUTBOX_PAGE, OUTBOX_RETENTION_DAYS, OutboxCounts, OutboxQuery, OutboxRow, OutboxScope,
+    PushSubscription, RegisterOutcome, RegisterReport, RetryOutcome,
 };
 use omnion_notifications::router::{RecipientRule, RouteReport, RouteRule, RoutedEvent};
 use serde::{Deserialize, Serialize};
@@ -277,24 +277,55 @@ pub async fn list_outbox(
     session: CurrentSession,
     RawQuery(query): RawQuery,
 ) -> Result<Json<OutboxBody>, ApiError> {
+    // An account nobody ever attached to a tenant is refused rather than handed a scope: the
+    // old signature took `Option<Uuid>` and its `None` branch meant "everything stamped to no
+    // tenant", which is a *different* question from the one an orgless session is asking.
+    let scope = outbox_scope(&session)?;
     let parsed = parse_outbox_query(query.as_deref());
-    let rows = omnion_notifications::push::list_outbox(
-        state.db().pool(),
-        session.user.organization_id,
-        &parsed,
-    )
-    .await
-    .map_err(map_push)?;
-    let counts =
-        omnion_notifications::push::outbox_counts(state.db().pool(), session.user.organization_id)
-            .await
-            .map_err(map_push)?;
+    let rows = omnion_notifications::push::list_outbox(state.db().pool(), scope, &parsed)
+        .await
+        .map_err(map_push)?;
+    let counts = omnion_notifications::push::outbox_counts(state.db().pool(), scope)
+        .await
+        .map_err(map_push)?;
 
     Ok(Json(OutboxBody {
         rows: rows.iter().map(OutboxRowBody::from).collect(),
         counts: OutboxCountsBody::from(counts),
         retention_days: OUTBOX_RETENTION_DAYS,
     }))
+}
+
+/// What one session may read out of the delivery log.
+///
+/// **The one caller that knows what an orgless session means.** `OutboxScope::for_session`
+/// returns `None` rather than guessing between "the platform's traffic" and "no tenant at
+/// all", because a guess here is what let the list and the counts drift apart in the first
+/// place. The two cases are genuinely different:
+///
+/// * a session with an organization gets [`OutboxScope::Organization`] and cannot name
+///   anybody else's;
+/// * a session with **no** organization is an account nobody ever attached to a tenant, and
+///   is handed [`OutboxScope::Platform`] — the rows stamped to no tenant.
+///
+/// **So an orgless session is never refused, and this function has no error arm on purpose.**
+/// The old signature took the caller's organization as a *parameter*, and its `None` branch
+/// read "every row stamped to no tenant" — which is what the platform arm still means, so the
+/// one thing this changed is that no caller can spell "a tenant's rows" without naming that
+/// tenant. An earlier draft of this comment claimed the orgless case was refused and the
+/// function returned `Ok(Platform)`; a doc that says "refused" above a function that answers
+/// is the same defect as a counts query that disagrees with its list, one layer up.
+///
+/// The `Result` stays because the signature is the seam: the decision is now one named
+/// function instead of an `if` at each of the two call sites, and a future caller that must
+/// refuse has somewhere obvious to put it.
+pub(crate) fn outbox_scope(session: &CurrentSession) -> Result<OutboxScope, ApiError> {
+    Ok(
+        match omnion_notifications::push::OutboxScope::for_session(session.user.organization_id) {
+            Some(scope) => scope,
+            None => OutboxScope::Platform,
+        },
+    )
 }
 
 /// The outbox answer: the rows, the counts for the chips, and how far back the log reaches.
@@ -446,10 +477,15 @@ fn percent_decode(value: &str) -> String {
 /// somebody, and a `pending` row is already queued. Both would be a second copy of a message.
 pub async fn retry_outbox(
     State(state): State<AppState>,
-    _session: CurrentSession,
+    session: CurrentSession,
     Path(id): Path<Uuid>,
 ) -> Result<Json<RetryResult>, ApiError> {
-    let outcome = omnion_notifications::push::retry_delivery(state.db().pool(), id)
+    // The same scope the list uses, so the button is addressable exactly when the row is
+    // visible. A row outside it answers `not-retryable`, not `404` — this endpoint's existing
+    // contract already answers anything that is not a retryable row with a state rather than
+    // an existence, and inventing a second one for tenancy would leak which ids are real.
+    let scope = outbox_scope(&session)?;
+    let outcome = omnion_notifications::push::retry_delivery(state.db().pool(), scope, id)
         .await
         .map_err(map_push)?;
     Ok(Json(RetryResult { outcome }))

@@ -431,7 +431,7 @@ async fn a_platform_event_stamps_the_tenant_whose_user_it_reached() {
     // a correct column nobody queries is still a defect the operator experiences.
     let listed = omnion_notifications::push::list_outbox(
         &pool,
-        Some(tenant_a),
+        omnion_notifications::push::OutboxScope::Organization(tenant_a),
         &omnion_notifications::push::OutboxQuery {
             limit: omnion_notifications::push::MAX_OUTBOX_PAGE,
             ..Default::default()

@@ -49,9 +49,10 @@ pub use preferences::{
 };
 pub use push::{
     ChannelReadiness, MAX_OUTBOX_PAGE, OUTBOX_RETENTION_DAYS, OutboxCounts, OutboxQuery, OutboxRow,
-    PrunedSubscription, PushSubscription, RegisterOutcome, RegisterReport, RetryOutcome,
-    SUBSCRIPTION_STALE_DAYS, channel_readiness, list_outbox, list_subscriptions, outbox_counts,
-    prune_deliveries, prune_endpoints, prune_stale, register, remove, retry_delivery,
+    OutboxScope, PrunedSubscription, PushSubscription, RegisterOutcome, RegisterReport,
+    RetryOutcome, SUBSCRIPTION_STALE_DAYS, channel_readiness, list_outbox, list_subscriptions,
+    outbox_counts, prune_deliveries, prune_endpoints, prune_stale, register, remove,
+    retry_delivery,
 };
 pub use router::{
     RecipientRule, RouteReport, RouteRule, RoutedEvent, create_rule, dedupe_key, delete_rule,

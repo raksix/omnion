@@ -824,7 +824,7 @@ async fn the_outbox_reads_back_what_the_queue_wrote() {
 
     let rows = push::list_outbox(
         &pool,
-        None,
+        push::OutboxScope::Platform,
         &push::OutboxQuery {
             statuses: Vec::new(),
             channel: None,
@@ -841,7 +841,7 @@ async fn the_outbox_reads_back_what_the_queue_wrote() {
          skipped `chat` row"
     );
 
-    let counts = push::outbox_counts(&pool, None)
+    let counts = push::outbox_counts(&pool, push::OutboxScope::Platform)
         .await
         .expect("the counts must read");
     assert_eq!(counts.sent, 1, "the in-app row went out");
@@ -866,7 +866,7 @@ async fn the_outbox_reads_back_what_the_queue_wrote() {
         .find(|r| r.status == "failed")
         .expect("a failed row must be present")
         .id;
-    let outcome = push::retry_delivery(&pool, failed_id)
+    let outcome = push::retry_delivery(&pool, push::OutboxScope::Platform, failed_id)
         .await
         .expect("the retry must run");
     assert_eq!(outcome, push::RetryOutcome::Requeued);
