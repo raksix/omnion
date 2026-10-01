@@ -53,8 +53,24 @@ pub struct MachinePrincipal {
 pub enum GuardKind {
     /// A signed-in session (the cookie).
     Session,
-    /// A session or a service-account key presented as `Authorization: Bearer`.
+    /// A session or a service-account key presented as `Authorization: ***
     SessionOrMachine,
+    /// A session whose permission may arrive on a **department-scoped** binding.
+    ///
+    /// This kind exists because the default context is organization-wide, and a department
+    /// binding is not a subset of it that the evaluator can find on its own:
+    /// `Scope::Department::applies_to` compares `resource_id` against `context.department`,
+    /// which nothing in the plain request path populates. A role granted `hr.employees.read`
+    /// with a department scope of `team` therefore counted **zero of one** bindings and was
+    /// refused with `403` — from the route guard, before the HR handler that would have honoured
+    /// the level ever ran. The refusal was correct under the rule it was applying and useless as
+    /// a product: the only way to hold an HR visibility level at all was an organization grant,
+    /// which is exactly the level the level exists to stop somebody being given.
+    ///
+    /// The guard tries the organization context first and then each department the caller's
+    /// bindings actually name, so an organization-scoped role keeps working unchanged and a
+    /// department-scoped one opens the route as well.
+    SessionDepartmentScoped,
 }
 
 /// Layer rejecting requests whose caller does not carry `permission`.
@@ -136,6 +152,64 @@ pub fn require_or_machine(state: &AppState, permission: &'static str) -> Require
 #[must_use]
 pub fn require_any(state: &AppState, permissions: &'static [&'static str]) -> RequirePermission {
     RequirePermission::new_any(state.clone(), permissions)
+}
+
+/// Guard a route whose permission may be held on a **department-scoped** binding.
+///
+/// The HR directory is the reason this exists, and the shape of the gap is worth naming because
+/// it is invisible from the route table: `require()` authorizes against an organization-wide
+/// context, so a role whose grant is scoped to a department is consulted with
+/// `context.department = None`, matched by nothing, and refused. The HR module reads the very
+/// same bindings afterwards to decide *how much* of the directory the caller sees, so the level
+/// was fully implemented and unreachable — a request that should have answered "your team" was
+/// stopped one layer earlier with a permission error naming a key the caller demonstrably holds.
+///
+/// The department names are read from the caller's own bindings rather than taken as an argument:
+/// the guard is wired at startup and a route layer cannot know who will call it, and a hard-coded
+/// department would silently refuse everybody else. The organization context is still tried
+/// first, so every organization-scoped role behaves exactly as it did before.
+#[must_use]
+pub fn require_department_scoped(
+    state: &AppState,
+    permission: &'static str,
+) -> RequirePermission {
+    RequirePermission {
+        state: state.clone(),
+        permission,
+        kind: GuardKind::SessionDepartmentScoped,
+        alternatives: &[],
+    }
+}
+
+/// The department names a caller's allow-bindings actually name, for one permission.
+///
+/// Read from `role_bindings` joined to `role_permissions` rather than from any list the caller
+/// supplies, so a level can only be one the tenant granted. `own`/`team`/`all` are the HR
+/// visibility levels stored in the same column as a real department name, and both are returned
+/// here: the guard only asks "does this binding open the route", and the HR handler is what
+/// decides what an opened route may show.
+async fn granted_departments(
+    state: &AppState,
+    user_id: Uuid,
+    organization_id: Uuid,
+    permission: &str,
+) -> Vec<String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "select distinct rb.resource_id \
+         from role_bindings rb \
+         join role_permissions rp on rp.role_id = rb.role_id \
+         where rb.user_id = $1 and rb.organization_id = $2 \
+           and rb.scope_type = 'department' and rb.resource_id is not null \
+           and rb.revoked_at is null and (rb.expires_at is null or rb.expires_at > now()) \
+           and rp.effect = 'allow' and rp.permission_key = $3",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .bind(permission)
+    .fetch_all(state.db().pool())
+    .await
+    .unwrap_or_default();
+    rows.into_iter().map(|(name,)| name).collect()
 }
 
 impl<S> Layer<S> for RequirePermission {
@@ -313,6 +387,33 @@ pub async fn check_kind(
         let session = CurrentSession::resolve(state, headers).await?;
         let scope = scope_of(&session.user);
         let context = ResourceContext::from_scope(scope.clone());
+        // A department-scoped guard is the organization context **plus** one context per
+        // department the caller actually holds the permission on. The first decision that allows
+        // the request wins, and the denial that is finally reported is the organization one, so
+        // the explanation an operator reads is still the one about the whole tenant.
+        if kind == GuardKind::SessionDepartmentScoped {
+            if let Some(organization_id) = session.user.organization_id {
+                let departments = granted_departments(
+                    state,
+                    session.user.id,
+                    organization_id,
+                    permission,
+                )
+                .await;
+                for department in departments {
+                    let scoped = ResourceContext {
+                        organization_id: Some(organization_id),
+                        department: Some(department),
+                        ..ResourceContext::default()
+                    };
+                    if let Decision::Allowed(_) =
+                        authorize_subject(state.db().pool(), Subject::User(session.user.id), &scoped, permission).await?
+                    {
+                        return Ok(Caller::Session(Box::new(session)));
+                    }
+                }
+            }
+        }
         return match authorize(state.db().pool(), session.user.id, scope, permission).await? {
             Decision::Allowed(_) => Ok(Caller::Session(Box::new(session))),
             Decision::Denied { reason, source } => {

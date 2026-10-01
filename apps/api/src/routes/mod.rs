@@ -1501,7 +1501,17 @@ pub fn router(state: AppState) -> Router {
         // The chart is the directory drawn as a tree, so it reads with the directory rather than
         // with the department tree below: a role that may see the org chart must see it whole.
         .route("/hr/org-chart", get(hr::org_chart))
-        .route_layer(guards::require(&state, "hr.employees.read"));
+        //   The **department-scoped** guard, not `require()`. An HR visibility level (`own`,
+        //   `team`, `all`) is granted as a department-scoped binding — it is the only place a
+        //   level can live — and `require()` authorizes against an organization-wide context,
+        //   which matches no department binding at all. A manager holding `team` was refused
+        //   with a permission error naming a key they demonstrably hold, one layer before the
+        //   handler that implements the level ever ran. The narrowing itself is unchanged and is
+        //   still read from the same rows by `hr::scope_of`; this only lets such a caller reach it.
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "hr.employees.read",
+        ));
 
     // Attendance (slice 2d). Three routers, three keys, and the split is the point:
     //
