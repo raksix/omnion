@@ -24,6 +24,8 @@
 //! The harness is the throwaway-database pattern the other AI suites use, and it **panics**
 //! rather than skipping when PostgreSQL is unreachable — a skipped walk proves nothing.
 
+use omnion_ai_hub::client::{ChatMessage, ChatRequest, ProviderTarget};
+use omnion_ai_hub::error::AiHubError;
 use omnion_ai_hub::local_store::{self, ModelFilter, NewLocalEndpoint, PullOutcome, ServedModel};
 use omnion_core::Db;
 use omnion_core::config::{Config, DatabaseConfig};
@@ -527,6 +529,145 @@ async fn the_endpoint_list_carries_remote_rows_too_so_the_screen_can_answer_the_
         endpoints[1].host_kind, None,
         "a remote provider has no host kind to explain"
     );
+
+    fixture.dispose().await;
+}
+
+// -------------------------------------------------------------------------------------------
+// A registered endpoint actually serves a chat
+// -------------------------------------------------------------------------------------------
+
+/// A loopback stub that answers N requests with `status` and `body`.
+///
+/// It reads the request before answering so the kernel accepts it, and answers the same thing
+/// every time so the walk does not depend on how many sockets it wins. The `Host` header is
+/// never inspected: this stands in for Ollama, and a stub that checked headers would be testing
+/// itself.
+async fn stub_answering(status_line: &'static str, body: &'static str, times: usize) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let port = listener.local_addr().expect("a bound address").port();
+    tokio::spawn(async move {
+        for _ in 0..times {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+    format!("http://127.0.0.1:{port}/v1")
+}
+
+#[tokio::test]
+async fn a_registered_endpoint_serves_a_chat_and_a_bad_key_surfaces_the_server_own_error() {
+    // The slice's "done when" in one walk: **a local endpoint serves a chat, and a bad key
+    // surfaces the server's error.** Every other walk in this file is about rows; this one is
+    // about the endpoint being real, because "local" is only worth anything if a call through it
+    // comes back.
+    let fixture = local!();
+
+    let answer = r#"{"id":"chatcmpl-1","object":"chat.completion","model":"llama3.1:8b",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"Answered on this machine."},
+        "finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":6,"total_tokens":15}}"#;
+    let base = stub_answering("200 OK", answer, 1).await;
+
+    let id = local_store::create_endpoint(&fixture.pool, fixture.endpoint("ollama", &base))
+        .await
+        .expect("a loopback endpoint registers");
+    let stored = local_store::get_endpoint(&fixture.pool, id)
+        .await
+        .expect("the stored row reads back");
+
+    // The target is built from the **stored** row, not from the URL the test already has in
+    // hand. That is the claim: what the screen registered is what a later call will address, so
+    // a save path that mangled the base URL could not pass this by re-typing the right one.
+    let target = ProviderTarget {
+        id: stored.id,
+        name: stored.name.clone(),
+        protocol: stored.protocol.clone(),
+        base_url: stored.base_url.clone(),
+        api_key: None,
+        timeout_ms: 10_000,
+    };
+
+    let outcome = omnion_ai_hub::client::chat(
+        &target,
+        &ChatRequest::new(
+            "llama3.1:8b",
+            vec![ChatMessage::user("Are you running locally?")],
+        ),
+    )
+    .await
+    .expect("the local endpoint answers a chat");
+
+    assert_eq!(
+        outcome.content, "Answered on this machine.",
+        "the answer is the server's, read through the platform's own client"
+    );
+    assert_eq!(outcome.tool_calls.len(), 0, "a plain chat asks for no tools");
+    // The stub reports usage; a parser that dropped it would still "answer", so the counts are
+    // part of the round trip rather than a bonus.
+    assert_eq!(
+        outcome.usage.as_ref().and_then(|usage| usage.total_tokens),
+        Some(15),
+        "the provider's own token counts survive the round trip"
+    );
+
+    // The failure half: the server's words reach the caller. A local server refusing a bad key
+    // says *why* ("invalid api key"), and a platform that replaced that with "request failed"
+    // would leave an operator checking the wrong end of the socket.
+    let refused_base = stub_answering(
+        "401 Unauthorized",
+        r#"{"error":{"message":"invalid api key","type":"auth_error"}}"#,
+        1,
+    )
+    .await;
+    let refused_id =
+        local_store::create_endpoint(&fixture.pool, fixture.endpoint("keyed", &refused_base))
+            .await
+            .expect("a second loopback endpoint registers");
+    let refused = local_store::get_endpoint(&fixture.pool, refused_id)
+        .await
+        .expect("the refused row reads back");
+
+    let error = omnion_ai_hub::client::chat(
+        &ProviderTarget {
+            id: refused.id,
+            name: refused.name.clone(),
+            protocol: refused.protocol.clone(),
+            base_url: refused.base_url.clone(),
+            api_key: Some("wrong-key".to_owned()),
+            timeout_ms: 10_000,
+        },
+        &ChatRequest::new(
+            "llama3.1:8b",
+            vec![ChatMessage::user("hello")],
+        ),
+    )
+    .await
+    .expect_err("a local server refusing a key is an error, not an empty answer");
+
+    match error {
+        AiHubError::Upstream { status, message } => {
+            assert_eq!(status, 401, "the server's own status reaches the caller");
+            assert!(
+                message.contains("invalid api key"),
+                "the server's own words survive: {message}"
+            );
+        }
+        other => panic!("an upstream refusal must stay an upstream refusal, got {other:?}"),
+    }
 
     fixture.dispose().await;
 }
