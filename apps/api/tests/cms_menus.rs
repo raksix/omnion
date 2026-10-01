@@ -32,6 +32,10 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+use support::walk_auth;
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -55,7 +59,7 @@ const CURATOR_EXTRA: [&str; 3] = [
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
     status: StatusCode,
-    set_cookie: Option<String>,
+    set_cookies: Vec<String>,
     body: Value,
 }
 
@@ -65,11 +69,14 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .await
         .expect("router must answer");
     let status = response.status();
-    let set_cookie = response
+    // **Every** `Set-Cookie`, not the first: sign-in sets the session and the CSRF token
+    // beside it, and `headers().get()` returns one value. See `support::walk_auth`.
+    let set_cookies: Vec<String> = response
         .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_owned))
+        .collect();
     let bytes = response
         .into_body()
         .collect()
@@ -83,7 +90,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     };
     TestResponse {
         status,
-        set_cookie,
+        set_cookies,
         body,
     }
 }
@@ -91,7 +98,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(token) => walk_auth::apply_credential(token, builder),
         None => builder,
     };
     match body {
@@ -167,17 +174,8 @@ async fn login(state: &AppState, email: &str) -> String {
         response.status,
         response.body
     );
-    response
-        .set_cookie
-        .as_deref()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("the cookie has a value")
-        .split_once('=')
-        .expect("the cookie is name=value")
-        .1
-        .to_owned()
+    // Both cookies, packed: the session and the CSRF token travel together.
+    walk_auth::Session::from_set_cookies(&response.set_cookies).pack()
 }
 
 async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], label: &str) {
