@@ -6862,3 +6862,70 @@ against the new spine is **written but not measured**, and the criterion stays u
 `run-from-here` off the rows; then `two-tab-keep-mine`, which regressed to
 `resolved: false` last tick while `two-tab-conflict` stayed healthy; then `listener`
 (`controlFound: false` beside a successful retarget) and `tab-walk.reachedAnEdge`.
+
+## Tick 45 (w3) — the pass never reached the builder because a cleanup step could end the walk
+
+Two ticks of notes on this REQ were about the **box**: the QA slot was held by a live sibling, the
+shared Chrome ran out, and pass `20261001-012121` died with `Target page, context or browser has
+been closed` before it reached a single builder step. The reading was memory pressure and shared
+browsers. The reading was the harness.
+
+**The site was `walkthrough.cjs:8307`, and it is the sign-out block.** It was the last unguarded
+statement in `main` — `page.locator(...).count()` with nothing around it — and it sits between the
+route loop and the automation and builder passes. So the statement that ended the walk was a
+*cleanup* step, and it ended it three passes before the screen this REQ needs measured. The summary
+it left said `pages: 55`, `mobile: 0`, and had **no `workflowBuilder` key at all** — which reads as
+"the builder is fine, the box was tired", and is the reading three ticks then acted on.
+
+**Its comment said "Sign-out is exercised last so it cannot break the walk", and eight passes follow
+it.** The comment described an intention the ordering had long since stopped implementing, and that
+gap — code saying one thing, the note beside it saying another — is the shape that has cost the
+most time on this branch.
+
+**The second defect is why reviving a tab could never have helped.** `reviveMainPage` existed and
+was wired, and on that pass it ran and failed seventy-six times with the same line:
+`browserContext.newPage: Target page, context or browser has been closed`. **A dead TAB and a dead
+PROCESS raise the same string** — `context.newPage` answers it for either — so the recovery could
+not distinguish the one case it fixes from the one it cannot, and the case it cannot is the case
+that happens on a loaded box. `browserIsGone` now records which of the two it is: a known-dead
+browser is not asked again, and the passes after it report `skippedForDeadBrowser`, which is a
+shortfall rather than a defect on a screen that was never reached. The roll-up names the whole thing
+once as `browser-died`, because **seventy-six findings is what a reader sees and one machine event
+is what happened** — the other reading sends the next reader to re-verify seventy screens that were
+fine, while the screens that actually needed measuring are silently absent.
+
+**And the guard that was supposed to catch this proved the other half of the same mistake.**
+`selfcheckRecovery` closed a TAB and asserted the recovery worked. That is the case that recovers,
+so it was green while the thing that does not recover went unexercised — *the thing exercised was
+not the thing that happens*. It now closes the browser outright and asserts the two claims the fix
+rests on. 6/6, and **both new checks are proven to bite**: removing the guard turns exactly the two
+red, with the third and fourth untouched.
+
+The first draft of the second check asserted `attempts === 1` and came back `false`, and the test was
+wrong rather than the code: the preceding leg had already left `browserIsGone` set, so the two passes
+short-circuited and never reached `installMainPage` at all. That is the correct behaviour and it
+tests nothing — so the leg resets the flag and three passes must produce **exactly one** attempt.
+Asserting `attempts === 0` would have passed against a browser that died for a reason nobody had
+recorded, which is the same false-green shape one level up.
+
+**The Rust guard asserts an ORDER, not a string.** Text would be theatre: the comment naming the
+sign-out could stay while the block lost its `try`. What actually costs the measurements is that the
+builder pass runs *after* the crash site, so the source order is the claim. Both halves were proven
+to bite independently — removing the `try` fails on the distance to the nearest one, moving the
+builder call above the sign-out fails on the ordering.
+
+**Proof.** `cargo test -p omnion-workflows --lib` → **156 passed** (155 before). `pnpm typecheck`
+clean. `RECOVERY_SELFCHECK` → **6/6**. Merge of `origin/main` resolved `docs/BUILD-LOG.md` with
+`scripts/qa/merge-build-log.py` at an exact multiset (`base=6068 ours=6671 theirs=6261 →
+merged=6864`); the first attempt passed bare commit hashes, so `git show` returned the *commit*
+instead of the blob and the script reported non-append-only edits — a probe reading the wrong file,
+not a conflict it could not merge.
+
+**Next:** the pass is queued behind a live `omnion-w6` holder (45 Chrome processes on the box), which
+is the queue behaving correctly — starting a second pass is what produced the crash under study. When
+it runs, read `run-from-here-spine` (`usable true`, `step_count 3`, `valid true`),
+`orphan-run-from-here` (`refused`, `namesTrigger` — never yet true), `run-from-here` (`skipped > 0`,
+`reasonNamesNode`, `firstRunnableNo === firstSkippedNo + 1`, `pillsPainted > 0`), then
+`two-tab-keep-mine`, `listener`, `tab-walk.reachedAnEdge` and `edge-delete`. If `browser-died` appears
+in the roll-up, that is now one named box event rather than the seventy-six it used to be — and the
+passes it names were never measured, which is a different sentence from "the screens are clean".
