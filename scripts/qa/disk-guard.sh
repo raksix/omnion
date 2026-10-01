@@ -32,7 +32,22 @@ SHM_MIN_FREE_PCT="${OMNION_SHM_MIN_FREE_PCT:-15}"
 
 dir_mb() { du -sm "$1" 2>/dev/null | cut -f1; }
 free_gb() { df -BG --output=avail "$ROOT" 2>/dev/null | tail -1 | tr -dc '0-9'; }
-shm_free_pct() { df --output=pcent "$SHM" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+# Percent FREE, not percent used.
+#
+# `df --output=pcent` is Use% — how full the filesystem is — and this function has always been
+# named, printed ("$SHM free NN%") and compared (`-lt SHM_MIN_FREE_PCT`) as though it were the
+# opposite. So the tmpfs relief in 3c could never run: it fires when free space drops BELOW 15%,
+# and Use% only drops below 15 when the filesystem is 85% EMPTY. On a box where /dev/shm is a
+# real RAM-backed tmpfs shared by every writer's build target, the one step that reclaims
+# orphans there was silently skipped at exactly the moment it was needed — and it printed
+# "/dev/shm free 98%" while `df` said 98% full. A guard that reports the inverse of the thing it
+# is guarding is worse than no guard: it reads as a measurement.
+shm_free_pct() {
+  local used
+  used="$(df --output=pcent "$SHM" 2>/dev/null | tail -1 | tr -dc '0-9')"
+  [ -n "${used:-}" ] || { echo 0; return; }
+  echo $(( 100 - used ))
+}
 
 say() { printf '%s\n' "$*"; }
 
