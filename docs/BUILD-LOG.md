@@ -6624,5 +6624,33 @@ worker's own copy of `walkthrough.cjs`, and it is the same class as REQ-127's ti
 (the harness skipping its own first run). Fixing it is the first thing next tick — it is the
 reason three ticks in a row have had no usable pass.
 
-Next: fix the seed/wizard disagreement so a pass can actually sign in, then the runner + lock +
-`omnion migrate` subcommands.
+### The sign-in fix landed in this tick — `72ce88ba`
+
+Root cause found and fixed rather than reported. `ensureSignedIn` submitted the login form and
+then `waitForTimeout(1200)` before reading `page.url()`. On a cold `next dev` **that click is what
+makes Turbopack compile the authenticated route**, so 1.2 s is routinely answered while the panel
+is still compiling and the address is still `/login`. The pass returned `signedIn: false` and died
+on a login that had been accepted.
+
+This is the same defect class as `runWizard`'s fixed 900 ms sleep, one function over, and it was
+fixed there in REQ-127's tick 43 — so the fix is a poll for the app **shell**, not for the URL:
+a panel rendering `nav[aria-label="Sections"]` is signed in even when the router has not rewritten
+the address yet. The loop also reads `[role="alert"]`, so a genuine refusal returns promptly
+instead of burning the budget on a wait that cannot succeed, and its text lands in `report.steps`.
+
+Proven load-bearing, not merely green — the three new checks in `wizard-gate.test.cjs`:
+
+```
+git stash push -- scripts/qa/walkthrough.cjs   → 3 checks FAIL 3/3
+node scripts/qa/wizard-gate.test.cjs           → 9/9 pass
+```
+
+The gate test needed its own fix to be able to make that claim: `body` is the slice **between**
+`runWizard` and `ensureSignedIn`, so the sign-in function was never in it and three checks passed
+vacuously against a string they could not match. They now cut from the comment-stripped whole
+source — which is also why the check for `nav[aria-label="Sections"]` cannot be satisfied by a
+comment mentioning it.
+
+Next: the rest of slice 1 — advisory lock, the `apply` / `plan` / `verify-down` runner, the
+`omnion migrate` subcommands, `/deployment/migrations` list + detail, the CI gate — and then a pass
+that can finally sign in, which unblocks the REQ-126/127/128 close gates.
