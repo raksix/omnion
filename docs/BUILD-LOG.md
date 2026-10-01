@@ -7143,3 +7143,76 @@ box) and that queue is behaving correctly — a second concurrent pass is what c
 `two-tab-keep-mine`, `listener`, `tab-walk.reachedAnEdge` and `edge-delete`. **`chrome-error://`
 in any page's `url` is now a guard-relevant reading, not a tired box** — it is the signature of
 the disk guard having found a live server after this fix lands on every worktree.
+
+## 2026-10-01 · tick 47 · `fac40efe` — the drag was never in the history
+
+**What.** REQ-004 criterion 6 says undo restores "add, **move**, connect, delete". Add, connect
+and delete all route through `commit`, which hands the history the graph from before the change.
+Move did not — and the half that was missing was not half a gesture, it was every drag a mouse
+author ever made. `commitMove` was three lines: `queueSave()` and a comment. The position was
+written to the canvas by `moveNode`; the history was never told, so the Undo button stayed grey
+and `⌘Z` was a no-op.
+
+**Why three ticks of notes did not find it.** The arrow-key nudge **is** routed through
+`commit("nudge", …)`. So the history module — which has been able to undo a move since the day it
+was written — passed its own twelve tests throughout, and the walkthrough's `undo` step presses
+Ctrl+Z and measures exactly the nudge path. Everything the repository could see was green and
+everything a mouse could do was broken. One released key undoes; one released mouse did not, and
+nothing in the product distinguished them.
+
+**The fix, and the two things that are not optional in it.** The `before` snapshot has to be
+taken on the way **down**: `pointerdown` opens a gesture that emits one `pointermove` per frame
+and closes at some later `pointerup`, so by the release every frame has already written the new
+position and the only snapshot describing the old one is one nobody took. Rebuilding it
+(`position - delta`) is wrong the moment a drag crosses a `clampCoord` boundary or a `snap()`
+grid line, and it is wrong *silently*, which is the only kind of wrong nobody reports. So
+`beginDrag` is called where the pre-drag graph still exists and `pointerup` spends that token.
+
+The second half is the one the obvious fix gets wrong. `endDrag` calls `sealGroup` **before**
+recording, and `sealGroup` was written for exactly this caller — its own comment names "a drag
+that ended" — and nothing had ever called it, because there was no drag in the history to seal.
+The instant a drag *is* recorded the coalesce window starts biting: drag a card, let go, drag the
+same card again 300 ms later, and `record` finds two same-key edits inside `COALESCE_MS`, merges
+them, keeps the first `before` and takes the second `after` — and the position between the two
+drags becomes reachable from neither key. That is a history with a hole in it, introduced by the
+fix for "a drag is not undoable". The first draft of this tick did not seal, and the test named
+for that case is the one that caught it.
+
+`moveNode` also writes `graphRef` now, not just state. A ref written in a render body is one
+render behind the last pointer frame, so the `after` a drag records could be the position the card
+*started* at: an undo that does nothing, on a button that enabled itself.
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **228 passed,
+0 failed** (217 before, +11). `npx tsc --noEmit` clean. `cargo test -p omnion-workflows --lib` →
+157 passed, unchanged (no Rust was touched — this was a caller defect, not a history defect).
+`node --check scripts/qa/walkthrough.cjs` clean.
+
+**The guard that matters, and the one that nearly wasn't.** Every unit test in the new file
+passes against a `commitMove` that records nothing — that is the bug, unchanged. So the
+load-bearing test reads `builder-view.tsx` and fails unless the gesture is opened at `pointerdown`
+and spent at `pointerup`. **All three halves proven to bite independently:** reverting the
+recording, replacing `beginDrag(...)` with a null origin, and removing the seal each turn exactly
+one assertion red and nothing else.
+
+**Two assertion drafts were wrong in the same direction, and the way they were wrong is the
+lesson.** The ordering guard read "`beginDrag` appears before `endDrag` in the file" — a claim
+about how React source is *ordered*, and React source is not ordered by events: `commitMove` (the
+release) is written several hundred lines above the `pointerdown` that opens the gesture, so the
+real file reads end-then-begin and the guard went red on correct code. Worse, the first draft used
+`indexOf` on the raw source, whose first match for both names is the **import line** — so it went
+green against a file nobody had edited. A guard that passes on an unedited file is not a guard.
+The claim worth keeping is the claim itself: the origin is the whole pre-drag graph, taken at the
+gesture's start, and spent by the release.
+
+**The 50-step half is still unmeasured, and the row stays unticked.** The criterion claims depth;
+the module's bound is `HISTORY_LIMIT = 100`, which satisfies it by arithmetic and by no
+measurement. Nothing in the walkthrough drives fifty presses, and the new `drag-undo` row measures
+one. A claim answered by a constant is not a claim measured.
+
+**Next.** The `drag-undo` row is written and syntax-clean but **has not been measured**: the QA
+slot is held by a live `omnion-w5` pass (35 Chrome processes) and the loop's own rule is that a
+second concurrent pass is what produced pass `20261001-021909`. When the slot frees, read
+`drag-undo` for `moved: true` **and** `undoEnabledAfterDrag: true` and `returned: true` — the
+middle one is the row's whole point, because a drag that recorded nothing leaves the button
+disabled and still reports `returned: true` if the card never moved. Then drive the depth claim
+(50 presses) or state plainly that the bound is unproven. Criterion 6 is not close.
