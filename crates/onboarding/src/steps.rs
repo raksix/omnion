@@ -136,6 +136,18 @@ pub async fn create_organization(
 
     state::set_organization(pool, organization.id).await?;
 
+    // The owner's ACCOUNT must point at the new organization too, not only the onboarding
+    // progress record. `scope::resolve_organization` reads `users.organization_id` on every
+    // org-scoped route, and an account with `None` is answered `400 organization_required` — so
+    // writing only `onboarding_state` produced a first run that reported itself complete and
+    // then refused every org-scoped read on the installation it had just created. `onboarding_state`
+    // is progress; `users.organization_id` is tenancy, and only the second one is load bearing.
+    users::set_organization(pool, actor, Some(organization.id))
+        .await?
+        .ok_or_else(|| OnboardingError::Incomplete {
+            missing: String::from("owner"),
+        })?;
+
     record(
         pool,
         NewAuditEntry::by_user(actor, "onboarding.organization_created")

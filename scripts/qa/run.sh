@@ -209,6 +209,27 @@ curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not health
 qa_scalar() {
   docker exec "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB" -t -A -c "$1" 2>/dev/null || echo ""
 }
+# The guard below is correct — and it had no way to be satisfied. The only thing that created the
+# organization was the browser's first-run wizard, and the wizard is the exact thing this branch's
+# own `wizard-gate.test.cjs` exists because it does not always reach its submit on a cold dev
+# server. So the pass reset the database, required a tenant, and could not make one: every pass
+# aborted at the guard before measuring a single screen. A precondition with no way to be met is a
+# harness that can only fail.
+#
+# The seed runs BEFORE the guard, over the API and through the same endpoints the wizard calls —
+# never by inserting rows. A SQL-inserted organization would satisfy the count while leaving
+# `onboarding_state`, the membership row and the site row unwritten, and each of those is what an
+# org-scoped read joins against: the pass would measure screens answering 403 and report it as the
+# product's answer, which is the precise failure the guard was added to catch.
+if [ "$(qa_scalar 'select count(*) from organizations')" = "0" ]; then
+  step "seeding the QA tenant (the wizard creates it in a browser; this does it over the API)"
+  node scripts/qa/ensure-organization.mjs || {
+    echo "[qa] FATAL: the QA tenant could not be seeded, so the walk below would measure 403s."
+    echo "[qa] Check the API log for the reason; the seeder prints the status and body it got."
+    exit 1
+  }
+fi
+
 QA_ORGS="$(qa_scalar 'select count(*) from organizations')"
 QA_USERS="$(qa_scalar 'select count(*) from users')"
 if [ "$QA_ORGS" = "0" ] || [ -z "$QA_ORGS" ]; then

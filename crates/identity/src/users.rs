@@ -172,6 +172,35 @@ pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<
         .map_err(IdentityError::from)
 }
 
+/// Set an account's **primary organization** and answer the updated row.
+///
+/// ## Why this exists, and why onboarding needs it
+///
+/// `User.organization_id` is the primary organization, and `scope::resolve_organization` reads it
+/// on every org-scoped route: an account with `None` and no requested organization is answered
+/// `400 organization_required`. The first-run flow wrote the new organization to **`onboarding_state`
+/// only** — `onboarding::state::set_organization` updates the singleton row and nothing else — so
+/// the owner's account kept `organization_id = NULL` for the entire life of the installation.
+///
+/// That is invisible in the first-run UI, which reads `onboarding_state`, and fatal everywhere
+/// else: the wizard finished "successfully", and then `GET /api/v1/sites`, `GET /api/v1/deployment/
+/// artifacts` and every other org-scoped read answered 400. `onboarding_state` is a progress
+/// record; `users.organization_id` is tenancy. Writing only the first is a setup that reports
+/// itself complete and hands the operator an installation they cannot use.
+///
+/// `None` means no such account, matching `set_status`.
+pub async fn set_organization(pool: &PgPool, id: Uuid, organization_id: Option<Uuid>) -> Result<Option<User>> {
+    let sql = format!(
+        "update users set organization_id = $2 where id = $1 returning {USER_COLUMNS}"
+    );
+    sqlx::query_as::<_, User>(&sql)
+        .bind(id)
+        .bind(organization_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(IdentityError::from)
+}
+
 /// Look an account up by email address.
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>> {
     let email = normalize_email(email)?;
