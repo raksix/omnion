@@ -34,11 +34,11 @@ use crate::model::{
 /// Columns read back from `app_builder_plans`.
 const PLAN_COLUMNS: &str = "id, organization_id, site_id, prompt, title, status, plan_version, \
      model_label, tokens_in, tokens_out, cost_cents, error, created_by, applied_at, created_at, \
-     updated_at, supersedes_id";
+     updated_at, supersedes_id, decision_reason";
 
 /// Columns read back from `app_builder_artifacts`.
 const ARTIFACT_COLUMNS: &str = "id, plan_id, kind, key, parent_key, ordinal, status, spec, \
-     rationale, validation, supersedes_id, created_at, updated_at";
+     rationale, validation, supersedes_id, created_at, updated_at, rejected_reason";
 
 // ---------------------------------------------------------------------------------------------
 // Writes
@@ -48,10 +48,7 @@ const ARTIFACT_COLUMNS: &str = "id, plan_id, kind, key, parent_key, ordinal, sta
 ///
 /// The row is written **before** the provider is called, so a generation that dies
 /// mid-flight leaves a `failed` plan naming its reason instead of leaving nothing at all.
-pub async fn insert_plan(
-    pool: &PgPool,
-    new: NewPlan,
-) -> Result<AppBuilderPlan> {
+pub async fn insert_plan(pool: &PgPool, new: NewPlan) -> Result<AppBuilderPlan> {
     let prompt = read_prompt(&new.prompt)?;
     let title = read_title(new.title.as_deref())?;
     require_known_status(NEW_PLAN_STATUS)?;
@@ -134,11 +131,7 @@ pub async fn apply_answer(
 ///
 /// Leaves the row's prompt and title in place: a failed plan is still the operator's request,
 /// and the console's error state shows the plan so they can retry it rather than retype it.
-pub async fn apply_failure(
-    pool: &PgPool,
-    id: Uuid,
-    error: &str,
-) -> Result<Option<AppBuilderPlan>> {
+pub async fn apply_failure(pool: &PgPool, id: Uuid, error: &str) -> Result<Option<AppBuilderPlan>> {
     let reason = read_error(error)?;
     let plan = sqlx::query_as::<_, AppBuilderPlan>(&format!(
         "update app_builder_plans
@@ -166,13 +159,17 @@ pub async fn insert_artifact(
     findings: &[crate::validate::Finding],
 ) -> Result<AppBuilderArtifact> {
     require_known_kind(&artifact.kind)?;
-    validate_artifact_key(&artifact.key)?;
+    validate_artifact_key(&artifact.kind, &artifact.key)?;
     let spec = require_object(&artifact.spec)?;
     let rationale = read_rationale(&artifact.rationale)?;
     let validation = serde_json::to_value(findings).map_err(|err| {
         AppBuilderError::invalid("app_builder_artifact_findings", err.to_string())
     })?;
-    let status = if findings.is_empty() { "pending" } else { "invalid" };
+    let status = if findings.is_empty() {
+        "pending"
+    } else {
+        "invalid"
+    };
 
     let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, AppBuilderArtifact>(&format!(
@@ -213,7 +210,11 @@ pub async fn update_artifact_spec(
     })?;
     // An edit that still has findings is `invalid`, not `edited`: "edited" reads as *fixed* on
     // the review screen, and a body the validator refuses is not fixed.
-    let status = if findings.is_empty() { "edited" } else { "invalid" };
+    let status = if findings.is_empty() {
+        "edited"
+    } else {
+        "invalid"
+    };
 
     let row = sqlx::query_as::<_, AppBuilderArtifact>(&format!(
         "update app_builder_artifacts
@@ -229,6 +230,69 @@ pub async fn update_artifact_spec(
     .fetch_optional(pool)
     .await?;
     Ok(row)
+}
+
+/// Move an artifact to `rejected` with the reviewer's reason.
+///
+/// The reason is **required** here and nowhere else, which is the asymmetry that keeps the
+/// column honest: a rejection is a decision somebody made, and "reject this" with nothing
+/// beside it leaves a rejected artifact and a regenerated one indistinguishable in the apply
+/// log. The machine retirement in [`supersede_artifact`] lands on `rejected` too and has
+/// nothing to say, which is why it does not come through here.
+pub async fn reject_artifact(
+    pool: &PgPool,
+    artifact_id: Uuid,
+    reason: &str,
+) -> Result<Option<AppBuilderArtifact>> {
+    let reason = read_decision(reason, "app_builder_artifact_rejection")?;
+    let row = sqlx::query_as::<_, AppBuilderArtifact>(&format!(
+        "update app_builder_artifacts
+            set status = 'rejected', rejected_reason = $2, updated_at = now()
+          where id = $1 and status <> 'accepted'
+        returning {ARTIFACT_COLUMNS}"
+    ))
+    .bind(artifact_id)
+    .bind(&reason)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Accept an artifact a validator already cleared.
+///
+/// A named function rather than a string argument because "which status may a status write
+/// claim" is a rule with three answers — `accepted` is allowed, `rejected` must carry a
+/// reason, `edited` is the edit path's alone — and a handler that passes `"accepted"` as a
+/// string has to know all three.
+pub async fn accept_artifact(
+    pool: &PgPool,
+    artifact_id: Uuid,
+) -> Result<Option<AppBuilderArtifact>> {
+    set_artifact_status(pool, artifact_id, "accepted").await
+}
+
+/// Reject the whole plan with the reviewer's reason.
+///
+/// Terminal by design: the store's `where` admits only plans that are still open, so a plan
+/// somebody already applied or rejected cannot be re-rejected into a different story — the
+/// second attempt finds no row and the handler answers `409` naming the status it is in.
+pub async fn reject_plan(
+    pool: &PgPool,
+    plan_id: Uuid,
+    reason: &str,
+) -> Result<Option<AppBuilderPlan>> {
+    let reason = read_decision(reason, "app_builder_plan_rejection")?;
+    let plan = sqlx::query_as::<_, AppBuilderPlan>(&format!(
+        "update app_builder_plans
+            set status = 'rejected', decision_reason = $2, updated_at = now()
+          where id = $1 and status in ('generating', 'draft', 'approved')
+        returning {PLAN_COLUMNS}"
+    ))
+    .bind(plan_id)
+    .bind(&reason)
+    .fetch_optional(pool)
+    .await?;
+    Ok(plan)
 }
 
 /// Move an artifact to `accepted`, `rejected` or `invalid`.
@@ -257,7 +321,7 @@ pub async fn set_artifact_status(
         return Err(AppBuilderError::invalid(
             "app_builder_artifact_not_decidable",
             "`edited` is written by the edit path, which re-validates the body; a status write \
-             cannot claim a correction it did not check"
+             cannot claim a correction it did not check",
         ));
     }
 
@@ -325,13 +389,17 @@ pub async fn supersede_artifact(
     findings: &[crate::validate::Finding],
 ) -> Result<Option<AppBuilderArtifact>> {
     require_known_kind(&replacement.kind)?;
-    validate_artifact_key(&replacement.key)?;
+    validate_artifact_key(&replacement.kind, &replacement.key)?;
     let spec = require_object(&replacement.spec)?;
     let rationale = read_rationale(&replacement.rationale)?;
     let validation = serde_json::to_value(findings).map_err(|err| {
         AppBuilderError::invalid("app_builder_artifact_findings", err.to_string())
     })?;
-    let status = if findings.is_empty() { "pending" } else { "invalid" };
+    let status = if findings.is_empty() {
+        "pending"
+    } else {
+        "invalid"
+    };
 
     let mut tx = pool.begin().await?;
     // `for update` takes the row's lock, so a second regeneration of the same artifact
@@ -361,6 +429,31 @@ pub async fn supersede_artifact(
         ));
     }
 
+    // **Retire the predecessor FIRST, then insert the replacement.** The order is load-bearing and
+    // the natural one is wrong: `app_builder_artifacts_unique_key (plan_id, kind, key)` means
+    // the live row and its replacement cannot both exist, so inserting before retiring the
+    // predecessor — which is what the comment above this function used to describe as "writes
+    // the new row first and retires the old one" — raises `duplicate key value violates unique
+    // constraint` and the whole regeneration dies as a `500`. The two statements are in ONE
+    // transaction and the `for update` above holds the predecessor's lock, so retiring first
+    // leaves no window: a concurrent regeneration blocks on the lock, and by the time it
+    // reads the row this one's replacement is already in.
+    //
+    // The retirement writes the machine reason, so a reviewer reading the tree can tell this
+    // from their own refusal: "superseded by a regenerated version", not a person deciding.
+    // `0226` only requires that a reason is never set on a row that is *not* rejected, so
+    // writing one here is allowed.
+    sqlx::query(
+        "update app_builder_artifacts
+            set status = 'rejected',
+                rejected_reason = 'superseded by a regenerated version',
+                updated_at = now()
+          where id = $1",
+    )
+    .bind(previous_id)
+    .execute(&mut *tx)
+    .await?;
+
     let row = sqlx::query_as::<_, AppBuilderArtifact>(&format!(
         "insert into app_builder_artifacts
              (plan_id, kind, key, parent_key, ordinal, status, spec, rationale, validation,
@@ -376,14 +469,6 @@ pub async fn supersede_artifact(
     .bind(&validation)
     .fetch_one(&mut *tx)
     .await?;
-
-    // The predecessor becomes `rejected` rather than being deleted: the request asks for the
-    // previous version to be kept so a rejected attempt stays comparable, and a row that
-    // still carries `accepted` would count towards apply's totals.
-    sqlx::query("update app_builder_artifacts set status = 'rejected', updated_at = now() where id = $1")
-        .bind(previous_id)
-        .execute(&mut *tx)
-        .await?;
 
     tx.commit().await?;
     Ok(Some(row))
@@ -411,7 +496,10 @@ pub async fn supersede_plan(
 
     let mut tx = pool.begin().await?;
     sqlx::query(
-        "update app_builder_plans set status = 'rejected', updated_at = now()
+        "update app_builder_plans
+            set status = 'rejected',
+                decision_reason = 'superseded by a newer attempt',
+                updated_at = now()
           where id = $1 and status in ('generating', 'draft')",
     )
     .bind(previous_id)
@@ -518,7 +606,7 @@ pub async fn list_plans(
     let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
         "select p.id, p.organization_id, p.site_id, p.prompt, p.title, p.status, p.plan_version, \
                 p.model_label, p.tokens_in, p.tokens_out, p.cost_cents, p.error, p.created_by, \
-                p.applied_at, p.created_at, p.updated_at, p.supersedes_id, \
+                p.applied_at, p.created_at, p.updated_at, p.supersedes_id, p.decision_reason, \
                 count(a.id)::bigint                                        as artifact_count, \
                 count(a.id) filter (where a.status in ('accepted', 'edited'))::bigint as accepted_count, \
                 count(a.id) filter (where a.status = 'rejected')::bigint   as rejected_count, \
@@ -556,10 +644,7 @@ pub async fn list_plans(
     builder.push(" offset ");
     builder.push_bind(filter.offset.max(0));
 
-    let rows = builder
-        .build_query_as::<PlanRow>()
-        .fetch_all(pool)
-        .await?;
+    let rows = builder.build_query_as::<PlanRow>().fetch_all(pool).await?;
 
     let plans = rows.iter().map(|row| row.plan.clone()).collect();
     let counts = rows
@@ -575,7 +660,11 @@ pub async fn list_plans(
 
     let total = count_matching(pool, organization_id, filter).await?;
 
-    Ok(PlanPage { plans, counts, total })
+    Ok(PlanPage {
+        plans,
+        counts,
+        total,
+    })
 }
 
 async fn count_matching(
@@ -659,12 +748,11 @@ pub async fn blockers(pool: &PgPool, plan_id: Uuid) -> Result<Vec<BlockedArtifac
     // A required kind the plan never produced blocks apply too, and it is named here rather
     // than only counted: "the plan proposes no report" is actionable in a way that "the plan
     // is incomplete" is not.
-    let present: Vec<String> = sqlx::query_scalar(
-        "select distinct kind from app_builder_artifacts where plan_id = $1",
-    )
-    .bind(plan_id)
-    .fetch_all(pool)
-    .await?;
+    let present: Vec<String> =
+        sqlx::query_scalar("select distinct kind from app_builder_artifacts where plan_id = $1")
+            .bind(plan_id)
+            .fetch_all(pool)
+            .await?;
     for kind in crate::model::REQUIRED_KINDS {
         if !present.iter().any(|present_kind| present_kind == kind) {
             blockers.push(BlockedArtifact {
@@ -685,12 +773,11 @@ pub async fn blockers(pool: &PgPool, plan_id: Uuid) -> Result<Vec<BlockedArtifac
 /// "why not?" is a list it renders, and deriving the first from the second would mean the
 /// screen re-derives a rule the store already applied.
 pub async fn required_kinds_present(pool: &PgPool, plan_id: Uuid) -> Result<bool> {
-    let present: Vec<String> = sqlx::query_scalar(
-        "select distinct kind from app_builder_artifacts where plan_id = $1",
-    )
-    .bind(plan_id)
-    .fetch_all(pool)
-    .await?;
+    let present: Vec<String> =
+        sqlx::query_scalar("select distinct kind from app_builder_artifacts where plan_id = $1")
+            .bind(plan_id)
+            .fetch_all(pool)
+            .await?;
     Ok(crate::model::REQUIRED_KINDS
         .iter()
         .all(|kind| present.iter().any(|present_kind| present_kind == kind)))
@@ -810,6 +897,23 @@ fn read_rationale(raw: &str) -> Result<String> {
     Ok(rationale.to_owned())
 }
 
+fn read_decision(raw: &str, code: &'static str) -> Result<String> {
+    let reason = raw.trim();
+    if reason.is_empty() {
+        return Err(AppBuilderError::invalid(
+            code,
+            "say why — a rejection with no reason cannot be told apart from a version that \
+             was simply overtaken later",
+        ));
+    }
+    Ok(chars_bounded(reason, MAX_DECISION_LEN))
+}
+
+/// Longest a reviewer's reason may be. The column has no check of its own: the two machine
+/// retirements write `null`, so there is no value to compare a length against in SQL, and the
+/// bound belongs where the reason is written rather than in a constraint nothing else uses.
+const MAX_DECISION_LEN: usize = 2000;
+
 fn read_error(raw: &str) -> Result<String> {
     let reason = raw.trim();
     if reason.is_empty() {
@@ -821,7 +925,17 @@ fn read_error(raw: &str) -> Result<String> {
     Ok(chars_bounded(reason, 2000))
 }
 
-fn validate_artifact_key(key: &str) -> Result<()> {
+fn validate_artifact_key(kind: &str, key: &str) -> Result<()> {
+    // A permission artifact's key is a `domain.action` permission key and the dot is part of
+    // that vocabulary, so the **kind** decides who owns the check — and for a permission it is
+    // the validator, not this boundary. Checking it here as well made a permission artifact
+    // impossible to write at all: `permission` is a required kind, so every plan was blocked by
+    // a missing kind that no artifact row could ever fill, and no amount of reviewing could
+    // reach an applicable plan. Two owners for one key is how that happened — the store's rule
+    // and the validator's rule both claimed the key and only one of them knew about the dot.
+    if kind == "permission" {
+        return Ok(());
+    }
     let findings = crate::validate::validate_key(key, "key");
     if let Some(first) = findings.first() {
         return Err(AppBuilderError::invalid(
@@ -940,6 +1054,25 @@ impl<'a> PlanStore<'a> {
         set_artifact_status(self.pool, artifact_id, status).await
     }
 
+    /// Accept an artifact.
+    pub async fn accept(&self, artifact_id: Uuid) -> Result<Option<AppBuilderArtifact>> {
+        accept_artifact(self.pool, artifact_id).await
+    }
+
+    /// Reject an artifact, with the reason a reviewer has to give.
+    pub async fn reject(
+        &self,
+        artifact_id: Uuid,
+        reason: &str,
+    ) -> Result<Option<AppBuilderArtifact>> {
+        reject_artifact(self.pool, artifact_id, reason).await
+    }
+
+    /// Reject the whole plan, with its reason.
+    pub async fn reject_plan(&self, plan_id: Uuid, reason: &str) -> Result<Option<AppBuilderPlan>> {
+        reject_plan(self.pool, plan_id, reason).await
+    }
+
     /// Write a regenerated artifact beside the one it replaces.
     pub async fn regenerate(
         &self,
@@ -1054,7 +1187,10 @@ mod tests {
 
     #[test]
     fn a_prompt_is_trimmed_before_it_is_stored() {
-        assert_eq!(read_prompt("  build an app  ").expect("valid"), "build an app");
+        assert_eq!(
+            read_prompt("  build an app  ").expect("valid"),
+            "build an app"
+        );
     }
 
     #[test]
@@ -1062,13 +1198,18 @@ mod tests {
         assert_eq!(read_title(None).expect("no title"), "");
         assert_eq!(read_title(Some(" Leave app ")).expect("valid"), "Leave app");
         let long = "t".repeat(crate::model::MAX_TITLE_LEN + 1);
-        assert_eq!(read_title(Some(&long)).expect_err("too long").code(), "invalid_plan_title");
+        assert_eq!(
+            read_title(Some(&long)).expect_err("too long").code(),
+            "invalid_plan_title"
+        );
     }
 
     #[test]
     fn a_failure_needs_a_reason() {
         assert_eq!(
-            read_error("   ").expect_err("an empty reason explains nothing").code(),
+            read_error("   ")
+                .expect_err("an empty reason explains nothing")
+                .code(),
             "invalid_plan_error"
         );
         assert_eq!(read_error(" no route ").expect("valid"), "no route");
@@ -1077,7 +1218,10 @@ mod tests {
     #[test]
     fn a_rationale_is_bounded() {
         let long = "r".repeat(crate::validate::MAX_RATIONALE_LEN + 1);
-        assert_eq!(read_rationale(&long).expect_err("too long").code(), "invalid_artifact_rationale");
+        assert_eq!(
+            read_rationale(&long).expect_err("too long").code(),
+            "invalid_artifact_rationale"
+        );
     }
 
     #[test]
@@ -1109,7 +1253,9 @@ mod tests {
     #[test]
     fn a_spec_that_is_not_an_object_is_refused_before_the_insert() {
         assert_eq!(
-            require_object(&json!("text")).expect_err("a scalar has no fields").code(),
+            require_object(&json!("text"))
+                .expect_err("a scalar has no fields")
+                .code(),
             "invalid_artifact_spec"
         );
         assert!(require_object(&json!({ "key": "x" })).is_ok());
@@ -1118,10 +1264,33 @@ mod tests {
     #[test]
     fn an_artifact_key_is_held_to_the_naming_rules_here_too() {
         assert_eq!(
-            validate_artifact_key("users").expect_err("reserved").code(),
+            validate_artifact_key("entity", "users")
+                .expect_err("reserved")
+                .code(),
             "invalid_artifact_key"
         );
-        assert!(validate_artifact_key("leave_request").is_ok());
+        assert!(validate_artifact_key("entity", "leave_request").is_ok());
+    }
+
+    #[test]
+    fn a_permission_artifact_key_is_the_validators_to_judge_not_this_boundarys() {
+        // The regression this file exists for: with the store checking the key itself, a
+        // permission artifact could **never** be written, because `permission` is a required
+        // kind — so `blockers` reported it missing on every plan, and no review could ever
+        // reach an applicable plan. The two rules both claimed the key and only the validator
+        // knew the dot is vocabulary.
+        assert!(
+            validate_artifact_key("permission", "leave.approve").is_ok(),
+            "a `domain.action` permission key is not a storage key"
+        );
+        // Every OTHER kind is still held to the storage rule, or the exemption would be a
+        // blanket hole.
+        assert_eq!(
+            validate_artifact_key("entity", "Leave.Request")
+                .expect_err("mixed case is not a storage key")
+                .code(),
+            "invalid_artifact_key"
+        );
     }
 
     #[test]
@@ -1154,6 +1323,10 @@ mod tests {
         // starts including the artifact body is visible.
         let metadata = json!({ "kind": "entity", "key": "leave_request" });
         assert_eq!(metadata.as_object().expect("an object").len(), 2);
-        assert!(!metadata.to_string().contains("leave requests are what the app is for"));
+        assert!(
+            !metadata
+                .to_string()
+                .contains("leave requests are what the app is for")
+        );
     }
 }

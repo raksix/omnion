@@ -27,15 +27,16 @@ pub mod validate;
 pub use error::{AppBuilderError, BlockedArtifact, Result, describe_blocker};
 pub use model::{
     ARTIFACT_STATUSES, AppBuilderApplication, AppBuilderApplicationStep, AppBuilderArtifact,
-    AppBuilderPlan, EditedArtifact, KINDS, MAX_PROMPT_LEN, MIN_PROMPT_LEN, NewArtifact, NewPlan,
-    NEW_PLAN_STATUS, OPEN_STATUSES, PlanCounts, PlanFilter, PlanPage, PlanUsage, REQUIRED_KINDS,
-    STATUSES, artifact_is_resolved, artifact_status_is_known, kind_is_known, plan_status_is_known,
+    AppBuilderPlan, EditedArtifact, KINDS, MAX_PROMPT_LEN, MIN_PROMPT_LEN, NEW_PLAN_STATUS,
+    NewArtifact, NewPlan, OPEN_STATUSES, PlanCounts, PlanFilter, PlanPage, PlanUsage,
+    REQUIRED_KINDS, STATUSES, artifact_is_resolved, artifact_status_is_known, kind_is_known,
+    plan_status_is_known,
 };
 pub use store::{
-    PlanStore, apply_answer, apply_failure, artifact_counts, blockers, delete_plan, find_artifact,
-    find_plan, find_plan_in, insert_artifact, insert_plan, list_artifacts, list_plans,
-    required_kinds_present, set_artifact_status, supersede_artifact, supersede_plan,
-    update_artifact_spec,
+    PlanStore, accept_artifact, apply_answer, apply_failure, artifact_counts, blockers,
+    delete_plan, find_artifact, find_plan, find_plan_in, insert_artifact, insert_plan,
+    list_artifacts, list_plans, reject_artifact, reject_plan, required_kinds_present,
+    set_artifact_status, supersede_artifact, supersede_plan, update_artifact_spec,
 };
 pub use validate::{
     FIELD_TYPES, Finding, MAX_KEY_LEN, MAX_RATIONALE_LEN, MIN_KEY_LEN, PlanValidation,

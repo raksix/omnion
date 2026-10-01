@@ -71,13 +71,7 @@ pub const KINDS: &[&str] = &[
 ];
 
 /// Every status an artifact may hold.
-pub const ARTIFACT_STATUSES: &[&str] = &[
-    "pending",
-    "accepted",
-    "rejected",
-    "edited",
-    "invalid",
-];
+pub const ARTIFACT_STATUSES: &[&str] = &["pending", "accepted", "rejected", "edited", "invalid"];
 
 /// Kinds apply cannot leave unresolved. A plan missing any of these is not a plan the apply
 /// button may offer: "the app is created" includes the permission set that keeps it from
@@ -153,6 +147,13 @@ pub struct AppBuilderPlan {
     pub updated_at: OffsetDateTime,
     /// The attempt this one replaces, `null` for a first attempt.
     pub supersedes_id: Option<Uuid>,
+    /// Why the whole plan was rejected, `null` unless `status` is `rejected`.
+    ///
+    /// Set by a reviewer's rejection and by the two machine retirements that also land on
+    /// `rejected` — a plan a fresh attempt superseded, and a generation that failed. It is
+    /// never cleared, because "rejected" is terminal and a reason that disappears is a
+    /// decision that cannot be learned from.
+    pub decision_reason: Option<String>,
 }
 
 /// A stored artifact.
@@ -184,6 +185,13 @@ pub struct AppBuilderArtifact {
     pub created_at: OffsetDateTime,
     /// Last write.
     pub updated_at: OffsetDateTime,
+    /// Why the reviewer refused this artifact, `null` unless `status` is `rejected`.
+    ///
+    /// **Not every `rejected` row has one**, and that is deliberate: `supersede_artifact`
+    /// retires the row a regeneration replaced with `rejected` and no reason, because nothing
+    /// was decided — the version was simply overtaken. A reviewer must give a reason; a
+    /// machine does not have to invent one.
+    pub rejected_reason: Option<String>,
 }
 
 /// One apply run.
@@ -327,7 +335,11 @@ pub struct PlanPage {
 }
 
 /// What the list screen shows beside a plan.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `Serialize` because the counts ride the **same body** as the plan they decorate, in the
+/// list and in every decision answer: a client that has to fetch a second endpoint to draw
+/// the footer bar is a screen that shows a number the reviewer cannot act on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PlanCounts {
     /// Artifacts of every kind.
     pub artifacts: i64,

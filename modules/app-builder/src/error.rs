@@ -67,11 +67,23 @@ pub struct BlockedArtifact {
 pub fn describe_blocker(artifact: &BlockedArtifact) -> String {
     match (&artifact.reason, artifact.status.as_str()) {
         (Some(reason), "invalid") => {
-            format!("the {} artifact `{}` is invalid — {reason}", artifact.kind, artifact.key)
+            format!(
+                "the {} artifact `{}` is invalid — {reason}",
+                artifact.kind, artifact.key
+            )
         }
-        (_, "rejected") => format!("the {} artifact `{}` was rejected", artifact.kind, artifact.key),
-        (Some(reason), _) => format!("the {} artifact `{}` — {reason}", artifact.kind, artifact.key),
-        (_, status) => format!("the {} artifact `{}` is {status}", artifact.kind, artifact.key),
+        (_, "rejected") => format!(
+            "the {} artifact `{}` was rejected",
+            artifact.kind, artifact.key
+        ),
+        (Some(reason), _) => format!(
+            "the {} artifact `{}` — {reason}",
+            artifact.kind, artifact.key
+        ),
+        (_, status) => format!(
+            "the {} artifact `{}` is {status}",
+            artifact.kind, artifact.key
+        ),
     }
 }
 
@@ -208,12 +220,18 @@ mod tests {
     #[test]
     fn only_the_provider_failure_is_worth_a_repair_round_trip() {
         assert!(AppBuilderError::Ai("no route".into()).is_provider_failure());
-        assert!(!AppBuilderError::invalid("invalid_plan_prompt", "too short").is_provider_failure());
+        assert!(
+            !AppBuilderError::invalid("invalid_plan_prompt", "too short").is_provider_failure()
+        );
         assert!(!AppBuilderError::blocked(Vec::new()).is_provider_failure());
     }
 
     #[test]
     fn a_non_blocked_failure_offers_no_artifacts() {
-        assert!(AppBuilderError::Ai("no route".into()).blocked_by().is_none());
+        assert!(
+            AppBuilderError::Ai("no route".into())
+                .blocked_by()
+                .is_none()
+        );
     }
 }

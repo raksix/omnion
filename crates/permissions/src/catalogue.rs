@@ -152,6 +152,39 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "workflows",
         description: "Decide the approvals a rule is waiting for",
     },
+    // The AI app builder (docs/requests/REQ-045). Four keys rather than two, and the split is
+    // the request's own: *"...and the app is actually created"* is a second act with a
+    // different blast radius from the sentence that proposed it.
+    //
+    // `read` and `generate` are the ordinary powers — reading plans and spending a generation
+    // are the same day's work. `review` is what a person does to an artifact: accepting,
+    // rejecting, editing, discarding. `apply` is the only key that can write a live table, and
+    // it is deliberately the *fourth* rather than a variant of `review`: a reviewer who
+    // tidies up proposals must not thereby be able to materialise them, because the apply
+    // runner also creates roles and permissions, so a single key would let a reviewer grant
+    // the power they just handed themselves. Four keys also mean the request's own acceptance
+    // line ("Keys … exist in the catalogue") is checkable — a key nothing is refused for is a
+    // key nobody holds.
+    PermissionDef {
+        key: "appbuilder.read",
+        category: "ai",
+        description: "Read AI app builder plans and their artifacts",
+    },
+    PermissionDef {
+        key: "appbuilder.generate",
+        category: "ai",
+        description: "Generate and regenerate app builder plans",
+    },
+    PermissionDef {
+        key: "appbuilder.review",
+        category: "ai",
+        description: "Accept, reject and edit generated app builder artifacts",
+    },
+    PermissionDef {
+        key: "appbuilder.apply",
+        category: "ai",
+        description: "Apply a reviewed app builder plan to the live platform",
+    },
     // Users.
     PermissionDef {
         key: "users.read",
@@ -768,6 +801,43 @@ mod tests {
                 "{key} belongs to the ai category"
             );
         }
+    }
+
+    #[test]
+    fn the_app_builder_family_is_catalogued_and_apply_is_its_own_power() {
+        // REQ-045 asks for four keys by name, and the acceptance line is checkable only if
+        // all four are here — so this walks the list rather than spot-checking one.
+        for key in [
+            "appbuilder.read",
+            "appbuilder.generate",
+            "appbuilder.review",
+            "appbuilder.apply",
+        ] {
+            let entry = get(key).unwrap_or_else(|| panic!("{key} is in the catalogue"));
+            assert_eq!(
+                entry.category, "ai",
+                "{key} groups with the other AI powers"
+            );
+            assert!(!entry.description.is_empty(), "{key} explains itself");
+        }
+
+        // `apply` writes live tables, creates roles and permissions, and is therefore the
+        // only key a *different* person should hold. Reviewing is not applying: a person who
+        // only tidies up proposals must not be able to materialise them, because the runner
+        // binds the permission keys the plan proposed — so one key would let a reviewer grant
+        // themselves exactly the power they were handed.
+        assert_ne!(
+            get("appbuilder.apply").map(|entry| entry.key),
+            get("appbuilder.review").map(|entry| entry.key),
+            "applying a plan is not reviewing it"
+        );
+        // Nor is it generation: spending a generation writes draft rows only, which are inert
+        // by construction, so the two must not be the same key.
+        assert_ne!(
+            get("appbuilder.apply").map(|entry| entry.key),
+            get("appbuilder.generate").map(|entry| entry.key),
+            "applying a plan is not generating it"
+        );
     }
 
     #[test]

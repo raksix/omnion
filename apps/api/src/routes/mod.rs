@@ -68,11 +68,23 @@
 //! public by nature — a rendered site's tracking script posts to it — and protected by a body
 //! cap, a per-site rate limit and a collector that decides before it writes. The worker that
 //! keeps the rollups fresh is `crate::analytics_runner`.
+//!
+//! The app-builder surface (`/app-builder`, docs/requests/REQ-045) turns one sentence into
+//! typed artifacts and is the platform's headline "build me an app" path. Its four permission
+//! keys are a split that mirrors the request's own two acts: `appbuilder.read` sees plans,
+//! `appbuilder.generate` spends a generation, `appbuilder.review` is a person accepting,
+//! rejecting or editing an artifact, and `appbuilder.apply` is the only key that may write a
+//! live table — and it is deliberately not a variant of `review`, because the apply runner
+//! also creates roles and permissions, so one key would let a reviewer grant themselves the
+//! power the plan proposed. **Apply is not registered yet**: the runner is slice 3, and a
+//! button that answers "coming soon" is what the plan's Definition of Done forbids. See
+//! `crate::routes::app_builder`.
 
 pub mod ai;
 pub mod ai_workflow_decisions;
 pub mod ai_workflows;
 pub mod analytics;
+pub mod app_builder;
 pub mod auth;
 pub mod automation;
 pub mod automation_approvals;
@@ -878,6 +890,59 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "workflows.manage"));
     let ai_workflow_test_run = post(ai_workflow_decisions::test_run)
         .layer(guards::require(&state, "workflows.run"));
+
+    // The AI app builder's console and review workspace (docs/requests/REQ-045). Four keys,
+    // borrowed one per act rather than one per screen, and the split that matters is
+    // `review` against `apply`:
+    //
+    // * `appbuilder.read` for the list, the detail and the vocabulary — reading a proposal is
+    //   what an auditor does with one.
+    // * `appbuilder.generate` for `generate` and `regenerate`: both spend a generation, so
+    //   both sit behind the same power.
+    // * `appbuilder.review` for the three decisions a person makes to an artifact and for the
+    //   two whole-plan ones. Accepting, rejecting, editing, discarding and rejecting the plan
+    //   are all "the reviewer is tidying up proposals" — none of them writes a live table.
+    // * `appbuilder.apply` is **declared and unused**, because the apply runner is slice 3 and
+    //   a route that answered "coming soon" is what the Definition of Done forbids. It is
+    //   catalogued now so the key is a key a role can be given, and the REQ's own acceptance
+    //   line ("the four keys exist in the catalogue") is true today rather than on the day the
+    //   runner lands.
+    let app_builder_plans =
+        get(app_builder::list_plans).layer(guards::require(&state, "appbuilder.read"));
+
+    let app_builder_examples =
+        get(app_builder::examples).layer(guards::require(&state, "appbuilder.read"));
+
+    let app_builder_generate =
+        post(app_builder::generate).layer(guards::require(&state, "appbuilder.generate"));
+
+    let app_builder_plan = get(app_builder::get_plan)
+        .layer(guards::require(&state, "appbuilder.read"))
+        .merge(delete(app_builder::delete_plan).layer(guards::require(&state, "appbuilder.review")));
+
+    // The whole plan's own decisions, on their own paths rather than merged onto
+    // `/plans/{id}`. A `POST /plans/{id}` that silently meant "reject this plan" is a verb a
+    // REST client cannot discover, and a review screen that guesses the wrong one destroys a
+    // plan — so the path says what it does.
+    let app_builder_plan_reject =
+        post(app_builder::reject_plan).layer(guards::require(&state, "appbuilder.review"));
+
+    // The artifact tree's three decisions. The literal segments are registered **before**
+    // nothing parameterised here, but the ordering still matters for `/artifacts/{id}` versus
+    // `/artifacts/{id}/accept`: axum matches the longer literal path for its own methods, and
+    // a `POST` to `/artifacts/{id}/accept` must not be read as an edit of a plan whose id is
+    // the word "accept".
+    let app_builder_artifact = patch(app_builder::edit_artifact)
+        .layer(guards::require(&state, "appbuilder.review"));
+
+    let app_builder_artifact_accept =
+        post(app_builder::accept_artifact).layer(guards::require(&state, "appbuilder.review"));
+
+    let app_builder_artifact_reject =
+        post(app_builder::reject_artifact).layer(guards::require(&state, "appbuilder.review"));
+
+    let app_builder_artifact_regenerate = post(app_builder::regenerate_artifact)
+        .layer(guards::require(&state, "appbuilder.generate"));
 
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
     // history is `webhooks.read`, connecting, changing, testing and removing them is
@@ -1863,6 +1928,31 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/workflows/drafts/{id}/approve", ai_workflow_approve)
         .route("/ai/workflows/drafts/{id}/reject", ai_workflow_reject)
         .route("/ai/workflows/drafts/{id}/test-run", ai_workflow_test_run)
+        // The AI app builder (docs/requests/REQ-045). The literal `examples` segment is
+        // declared **before** `/plans/{id}` for the same reason `/events/catalogue` is: it is
+        // a sibling, and a parameterised route registered first would read `examples` as a plan
+        // id and answer "no such plan" for a request that is perfectly valid.
+        .route("/app-builder/plans", app_builder_plans)
+        .route("/app-builder/examples", app_builder_examples)
+        .route("/app-builder/generate", app_builder_generate)
+        .route("/app-builder/plans/{id}", app_builder_plan)
+        .route("/app-builder/plans/{id}/reject", app_builder_plan_reject)
+        .route(
+            "/app-builder/plans/{id}/artifacts/{artifact_id}",
+            app_builder_artifact,
+        )
+        .route(
+            "/app-builder/plans/{id}/artifacts/{artifact_id}/accept",
+            app_builder_artifact_accept,
+        )
+        .route(
+            "/app-builder/plans/{id}/artifacts/{artifact_id}/reject",
+            app_builder_artifact_reject,
+        )
+        .route(
+            "/app-builder/plans/{id}/artifacts/{artifact_id}/regenerate",
+            app_builder_artifact_regenerate,
+        )
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)

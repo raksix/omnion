@@ -276,16 +276,32 @@ async fn an_artifacts_status_is_derived_from_the_validators_answer_not_the_gener
         .expect("the artifact must be written");
     assert_eq!(good.status, "pending", "nothing has been reviewed yet");
 
-    // The generator is handed findings, not a status it chose. A reserved key produces a
-    // finding, and the row lands `invalid` — the generator cannot approve its own work.
-    let reserved = entity("users", 1);
-    let findings = validate_artifact(&reserved);
-    assert!(!findings.is_empty(), "the fixture must actually be invalid");
+    // The generator is handed findings, not a status it chose, and the row lands `invalid` —
+    // the generator cannot approve its own work.
+    //
+    // **A missing rationale, not a reserved key.** A reserved key is *refused at the store
+    // boundary* (`a_reserved_key_is_refused_by_name_before_it_can_be_written` asserts that it
+    // leaves no row at all), so using one here would ask for a row that by design does not
+    // exist. The two tests are about different rules and an earlier version of this one
+    // contradicted the other; a finding the store still *accepts* — the artifact is storable,
+    // it is just not approvable — is what makes the claim "the status comes from the
+    // validator" cleanly separable from "the key is refused".
+    // A **distinct** key: `leave_request` is already written above, and `0227`'s live-version
+    // index refuses a second live row for one `(plan, kind, key)` — which is exactly the
+    // property that index exists for. Reusing the key would have made this walk fail for a
+    // reason that looks like a store defect and is really a fixture collision.
+    let mut invalid = entity("leave_approval_note", 1);
+    invalid.rationale = String::new();
+    let findings = validate_artifact(&invalid);
+    assert!(
+        findings.iter().any(|finding| finding.path == "rationale"),
+        "the fixture must fail a rule the store does not refuse outright: {findings:?}"
+    );
     let bad = harness
         .store()
-        .artifact(plan.id, &reserved, &findings)
+        .artifact(plan.id, &invalid, &findings)
         .await
-        .expect("the artifact must be written even when invalid");
+        .expect("an artifact with findings is stored — that is the whole point of recording them");
     assert_eq!(bad.status, "invalid");
     assert!(
         bad.validation
@@ -363,8 +379,12 @@ async fn the_migrations_checks_hold_on_a_populated_table() {
     .execute(harness.db.pool())
     .await
     .expect_err("the unique index must refuse a second live row for one key");
+    // The index is named, because a violation the database cannot name is a message the
+    // reader has to guess at. `0227` replaced the absolute table constraint with a partial
+    // one over the LIVE versions, so the name changed with it — and the assertion follows the
+    // migration rather than the name it happened to have on the day it was written.
     assert!(
-        duplicate.to_string().contains("app_builder_artifacts_unique_key"),
+        duplicate.to_string().contains("app_builder_artifacts_live_key"),
         "the database must name its own constraint: {duplicate}"
     );
 
@@ -441,13 +461,23 @@ async fn accepting_an_artifact_is_possible_and_editing_is_not_a_status_write() {
     assert_eq!(accepted.status, "accepted");
 
     // Accepting an artifact the validator refused is refused BY NAME and by the finding.
-    let reserved = entity("users", 1);
-    let findings = validate_artifact(&reserved);
+    //
+    // The invalid artifact is made invalid by a **missing rationale**, not by a reserved key —
+    // a reserved key never reaches a row (the store refuses it, see
+    // `a_reserved_key_is_refused_by_name_before_it_can_be_written`), and this walk needs a row
+    // that exists and cannot be accepted.
+    let mut broken = entity("leave_approval", 1);
+    broken.rationale = String::new();
+    let findings = validate_artifact(&broken);
+    assert!(
+        !findings.is_empty(),
+        "the fixture must actually be invalid: {findings:?}"
+    );
     let invalid = harness
         .store()
-        .artifact(plan.id, &reserved, &findings)
+        .artifact(plan.id, &broken, &findings)
         .await
-        .expect("an invalid artifact is still stored");
+        .expect("an artifact with findings is stored — recording them is the point");
     assert_eq!(invalid.status, "invalid");
 
     let error = harness
@@ -456,8 +486,12 @@ async fn accepting_an_artifact_is_possible_and_editing_is_not_a_status_write() {
         .await
         .expect_err("an invalid artifact cannot be accepted");
     assert_eq!(error.code(), "app_builder_artifact_invalid");
+    // The refusal names **the finding the validator actually recorded** — which is the whole
+    // point of recording findings beside the artifact rather than repairing it. Asserting the
+    // specific finding text rather than "the message mentions the key" is what proves the
+    // store read `validation` instead of inventing a sentence of its own.
     assert!(
-        error.to_string().contains("reserved platform key"),
+        error.to_string().contains("carries no rationale"),
         "the refusal must name the finding in the way: {error}"
     );
     assert!(
@@ -636,7 +670,27 @@ async fn blockers_name_what_stands_between_a_plan_and_apply() {
         .blockers(plan.id)
         .await
         .expect("the blockers must read back");
-    assert_eq!(blocked.len(), 2, "both artifacts are unresolved");
+    // **Seven** blockers, not two: the plan's two unresolved artifacts AND the five required
+    // kinds it never proposed. The list is "everything between this plan and its apply", so a
+    // count of only the stored rows would hide the half a reviewer cannot fix by accepting
+    // something — and the number that matters is the second one, checked immediately below.
+    // An earlier version of this asserted `2` here and `5` for the missing kinds, which cannot
+    // both be true of one list.
+    let unresolved: Vec<&str> = blocked
+        .iter()
+        .filter(|b| b.status != "missing")
+        .map(|b| b.kind.as_str())
+        .collect();
+    assert_eq!(
+        unresolved.len(),
+        2,
+        "the two stored artifacts are the unresolved ones: {blocked:?}"
+    );
+    assert_eq!(
+        blocked.len(),
+        7,
+        "two unresolved artifacts plus the five missing kinds: {blocked:?}"
+    );
 
     // Every required kind the plan never proposed is named too — five of them here, and none
     // of them expressible as an artifact row.
@@ -672,6 +726,11 @@ async fn a_plan_with_every_required_kind_present_is_applicable() {
 
     for (kind, key) in [
         ("entity", "leave_request"),
+        // `field` is in REQUIRED_KINDS and this list used to omit it, so `applicable` was
+        // false for a plan that looked complete — the walk asserted what it meant to prove
+        // ("every required kind is present") and was itself the reason one was missing.
+        // A field belongs to an entity, so it carries a `parent_key` the other kinds do not.
+        ("field", "start_date"),
         ("ui", "leave_request_list"),
         ("permission", "leave.read"),
         ("workflow", "leave_approval"),
@@ -679,6 +738,15 @@ async fn a_plan_with_every_required_kind_present_is_applicable() {
         ("report", "leave_summary"),
     ] {
         let mut artifact = match kind {
+            "field" => NewArtifact {
+                kind: kind.into(),
+                key: key.into(),
+                parent_key: Some("leave_request".into()),
+                ordinal: 0,
+                spec: json!({ "key": key, "label": "Start date", "type": "date" }),
+                rationale: "A request has a start.".into(),
+                validation: json!([]),
+            },
             "permission" => NewArtifact {
                 kind: kind.into(),
                 key: key.into(),

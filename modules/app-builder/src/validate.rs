@@ -211,7 +211,12 @@ pub fn validate_artifact(artifact: &NewArtifact) -> Vec<Finding> {
 pub fn validate_plan(artifacts: &[NewArtifact]) -> PlanValidation {
     let findings = artifacts
         .iter()
-        .map(|artifact| (artifact_id(&artifact.kind, &artifact.key), validate_artifact(artifact)))
+        .map(|artifact| {
+            (
+                artifact_id(&artifact.kind, &artifact.key),
+                validate_artifact(artifact),
+            )
+        })
         .collect();
 
     let present_kinds: Vec<&str> = artifacts.iter().map(|a| a.kind.as_str()).collect();
@@ -295,9 +300,16 @@ pub fn validate_key(key: &str, path: &str) -> Vec<Finding> {
 fn validate_entity(artifact: &NewArtifact) -> Vec<Finding> {
     let mut findings = Vec::new();
 
-    let label = artifact.spec.get("label").and_then(Value::as_str).unwrap_or_default();
+    let label = artifact
+        .spec
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if label.trim().is_empty() {
-        findings.push(Finding::new("spec.label", "the entity has no label to show"));
+        findings.push(Finding::new(
+            "spec.label",
+            "the entity has no label to show",
+        ));
     }
 
     if let Some(plural) = artifact.spec.get("plural_label").and_then(Value::as_str) {
@@ -506,7 +518,10 @@ mod tests {
     fn a_reserved_key_is_invalid_and_is_named_rather_than_renamed() {
         let findings = validate_artifact(&entity("users"));
         assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(findings[0].message.contains("reserved platform key"), "{findings:?}");
+        assert!(
+            findings[0].message.contains("reserved platform key"),
+            "{findings:?}"
+        );
         assert!(findings[0].message.contains("users"), "{findings:?}");
     }
 
@@ -516,7 +531,10 @@ mod tests {
         // choosing which of two true sentences to fix first; the shape is upstream.
         let findings = validate_artifact(&entity("Users"));
         assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(findings[0].message.contains("lowercase ASCII"), "{findings:?}");
+        assert!(
+            findings[0].message.contains("lowercase ASCII"),
+            "{findings:?}"
+        );
     }
 
     #[test]
@@ -549,7 +567,10 @@ mod tests {
         let key = "k".repeat(MAX_KEY_LEN + 1);
         let findings = validate_key(&key, "key");
         assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(findings[0].message.contains(&MAX_KEY_LEN.to_string()), "{findings:?}");
+        assert!(
+            findings[0].message.contains(&MAX_KEY_LEN.to_string()),
+            "{findings:?}"
+        );
     }
 
     #[test]
@@ -558,7 +579,10 @@ mod tests {
         artifact.rationale = "  ".into();
         let findings = validate_artifact(&artifact);
         assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(findings[0].message.contains("nothing to review"), "{findings:?}");
+        assert!(
+            findings[0].message.contains("nothing to review"),
+            "{findings:?}"
+        );
     }
 
     #[test]
@@ -635,7 +659,6 @@ mod tests {
             findings.iter().any(|f| f.message.contains("domain.action")),
             "{findings:?}"
         );
-
     }
 
     #[test]
@@ -685,7 +708,12 @@ mod tests {
         assert!(!validation.is_clean());
         // Six kinds are missing, and `role` is deliberately not one of them: a generated app
         // with no role is a lesser risk than one with a role nobody approved.
-        assert_eq!(validation.required_missing.len(), 6, "{:?}", validation.required_missing);
+        assert_eq!(
+            validation.required_missing.len(),
+            6,
+            "{:?}",
+            validation.required_missing
+        );
         assert!(validation.required_missing.contains(&"report".to_owned()));
         assert!(!validation.required_missing.contains(&"role".to_owned()));
         assert!(validation.findings_for(&artifacts[0]).is_empty());
@@ -698,7 +726,12 @@ mod tests {
         let findings = validate_artifact(&artifact);
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].path, "spec.key");
-        assert!(findings[0].message.contains("the plan's key is the one apply uses"), "{findings:?}");
+        assert!(
+            findings[0]
+                .message
+                .contains("the plan's key is the one apply uses"),
+            "{findings:?}"
+        );
     }
 
     #[test]
@@ -728,8 +761,14 @@ mod tests {
         let findings = validate_artifact(&artifact);
         // Two mistakes — a capital in each half — and no third finding restating the key.
         assert_eq!(findings.len(), 2, "{findings:?}");
-        assert!(findings.iter().any(|f| f.message.contains("`Leave`")), "{findings:?}");
-        assert!(findings.iter().any(|f| f.message.contains("`Read`")), "{findings:?}");
+        assert!(
+            findings.iter().any(|f| f.message.contains("`Leave`")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.message.contains("`Read`")),
+            "{findings:?}"
+        );
     }
 
     #[test]
@@ -745,7 +784,10 @@ mod tests {
         };
         let findings = validate_artifact(&artifact);
         assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(findings[0].message.contains("reserved platform key"), "{findings:?}");
+        assert!(
+            findings[0].message.contains("reserved platform key"),
+            "{findings:?}"
+        );
     }
 
     #[test]
