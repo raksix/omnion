@@ -238,8 +238,34 @@ wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did 
 # has just built two screens and needs them proven before the tick ends. It is a filter on the
 # walk, never on the harness around it: the stack, the reset, the vision review and the report
 # all run exactly as they do for a full pass.
+#
+# **`--only` is ALSO accepted on the command line, because a filter that can only be spelled one
+# way is a filter that gets missed.** Tick 74 ran `bash scripts/qa/run.sh --only=workflow-builder`
+# and got a full pass over all 55 routes instead -- the walkthrough received no `--only` at all and
+# walked the entire panel, which is why that pass had reached `iam-devices` after 36 minutes and
+# had not come near the builder. The script read `${QA_ONLY:-}` and never `$1`, so the argument
+# was not an error, not a warning and not in the log: **the one thing the flag exists to do was
+# the one thing it did not do, silently.** A narrow pass that silently runs wide costs more than
+# no pass at all, because the tick reports "no builder rows" and reads it as a product defect.
 QA_ONLY_ARGS=()
-[ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
+QA_ONLY_FILTER="${QA_ONLY:-}"
+# A manual cursor rather than `shift` inside a `for arg in "$@"`: the loop iterates over a
+# snapshot of the argument list, so shifting inside it does not move what the loop sees and the
+# value after a bare `--only` would be read as an unknown option.
+_prev=""
+for arg in "$@"; do
+  case "$arg" in
+    --only=*) QA_ONLY_FILTER="${arg#--only=}" ;;
+    --only)   QA_ONLY_FILTER="" ;; # the value arrives as the next argument, seen on the next turn
+    *)
+      # `--only VALUE` is the one spelling that cannot be handled inside the loop, so it is
+      # repaired here: a bare `--only` is only ever followed by its own value.
+      if [ "$_prev" = "--only" ]; then QA_ONLY_FILTER="$arg"; fi
+      ;;
+  esac
+  _prev="$arg"
+done
+[ -n "$QA_ONLY_FILTER" ] && QA_ONLY_ARGS=(--only="$QA_ONLY_FILTER")
 
 # The tenant has to exist before the walkthrough runs, and this step is what puts it there.
 #
@@ -256,7 +282,11 @@ step "ensure the QA organization exists"
 node scripts/qa/ensure-organization.mjs --url "http://127.0.0.1:$API_PORT" --admin "http://127.0.0.1:$ADMIN_PORT" \
   || echo "[qa] the organization could not be created; the rule screens will report an empty tenant"
 
-step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
+# The banner reads `QA_ONLY_FILTER`, not `QA_ONLY`. With the flag arriving on the command line
+# the env var is empty, so the old line announced a full pass over every route while a narrow
+# one ran -- a report that misstates its own scope is worse than no report, because it is the
+# line a reader trusts to know what was covered.
+step "browser walkthrough${QA_ONLY_FILTER:+ (focused: $QA_ONLY_FILTER)}"
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
 
 step "vision review"
