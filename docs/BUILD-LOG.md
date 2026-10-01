@@ -9576,3 +9576,65 @@ of the placeholder file). The export's *screen* states still owe a pass.
 
 **Next:** the bulk delete — a checkbox column, a selection that survives a filter change, and a
 confirmation naming how many drafts are about to go.
+
+## Tick 73 — REQ-045 slice 4: the bulk delete, and the box that stood unticked for four ticks
+
+**What.** `delete_plans` in the store (`modules/app-builder/src/store.rs`), `POST
+/app-builder/plans/bulk-delete` (`apps/api/src/routes/app_builder.rs`, guarded by
+`appbuilder.review`), the console's checkbox column + bulk bar + confirmation
+(`apps/admin/features/app-builder/plan-console.tsx`), and a walkthrough section that drives it and
+reads the answers **out of the database**.
+
+**Four decisions, each of which had a cheaper alternative that would have been wrong.**
+
+1. **`200` with `requested` / `deleted` / `failures`, never `204` and never `409`.** A status code
+   can only say whether *anything* went, and "two of five deleted, one was applied" is the truth of
+   the call the console's confirmation already asked about. A response carrying only a count renders
+   a partial bulk as a complete one.
+2. **The delete is driven by the scoped read, never by the request.** The rows inside
+   `organization_id` are read first, the applied ones dropped, and only what is left is handed to
+   `delete … where id = any(...)`. Passing the caller's array straight through would be shorter and
+   would be a **cross-tenant write**: the ids are the caller's and nothing inside a `delete` looks
+   at an organization.
+3. **Two refusal sentences, deliberately different.** An applied plan is named and told why it
+   stays; a plan that is absent and a plan of another tenant get the **same** sentence — a refusal
+   that differed between the two would confirm the existence of every id a caller guessed.
+4. **An applied plan's checkbox stays enabled.** Disabling it is cheaper and worse: a control that
+   silently does nothing on the one row a reviewer most needs to know about is a control they
+   learn to mistrust on every row. The tick holds; the server's sentence says why the plan stayed.
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-module-app-builder --lib --quiet` | **68 passed** (was 65) |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **317 passed** |
+| walk | `cargo test -p omnion-api --test app_builder_routes -- --test-threads=1` | **18 passed** (was 16) |
+| types | `apps/admin` `tsc --noEmit` | **0 errors** |
+| build | `cargo build -p omnion-api` | clean |
+
+**Two of my own red rows were the walk's fault, in the two different ways this REQ keeps doing it.**
+The first compared a SQL-`order by id` list against an expectation written in creation order — a
+test of uuid byte order dressed up as a test of what survived; both sides are sorted now. The
+second got `403` where it wanted `200` because the stranger tenant held no `appbuilder.read` key,
+so the permission guard answered before tenancy could run — and **a stranger with no key cannot
+tell you whether somebody else's bulk deleted its plan**, which is the whole claim. Granted in its
+own tenant.
+
+**`rustfmt` on a shared file is a diff you did not ask for.** Formatting `routes/mod.rs` reflowed
+eight *other* route files it happens to be adjacent to in the tree. I proved they were pure
+reformatting (token streams identical modulo whitespace and trailing commas) rather than assuming
+it, then reverted all eight and re-applied my two additions onto pristine `HEAD` — `mod.rs` went
+from 45 changed lines to **+9, mine only**. A feature commit that carries a reformat of a sibling
+wave's file is a diff nobody can review, and the byte-equivalence check is what let me revert
+without risking anybody's work.
+
+**Browser pass: queued, not run.** `omnion-w4` holds the shared QA slot (pid 1857610,
+`cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd` — never by the age
+of the placeholder file), and `/mnt/apopic` is at **99%** with 821 MB free. The acceptance box is
+ticked on the wire proof and the record says the pass is owed; the screen states of the new bulk
+bar are unmeasured.
+
+**Next:** REQ-045's remaining work is blocked on a table this wave does not own — the apply
+pipeline's first step writes the generated entity and REQ-026's `entities` / `entity_fields` exist
+in no worktree (wave 2 owns them). Per-application rollback and failure retry sit behind that same
+table. **So the honest next move is to move to the next REQ in wave-3 order** rather than spend
+ticks against a blocker, and to come back to REQ-045 the moment `entities` lands.

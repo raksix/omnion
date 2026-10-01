@@ -1,6 +1,26 @@
 # REQ-045 — AI App Builder *(headline)*
 
-> **Status:** in-progress (slice 4 · **THE PLAN EXPORT, AND THE COST COLUMN ANSWERED** ·
+> **Status:** in-progress (slice 4 · **THE BULK DELETE, AND THE BOX IT CLOSES** ·
+> `POST /app-builder/plans/bulk-delete` (`8299d2f1`, `16fbf8d0`) plus the console's checkbox
+> column, selection and confirmation (`088bb666`). The criterion "plan list, filters, **bulk
+> delete of drafts** and JSON export work; applied plans are undeletable" had stood unticked for
+> four ticks with the reason printed on the box: the console carried **no checkbox, no selection
+> state and no bulk action**, so the clause described a control that was never drawn rather than
+> one that behaved badly. It is drawn now, and the box is ticked.
+> **The four claims are measured differently on purpose:** the list, the filters and "applied plans
+> are undeletable" were already proven on the wire; the export was proven by reading the downloaded
+> bytes; and the bulk is proven by the **arithmetic** of the answer plus the **rows read back out
+> of the database**, because a bulk is the only one of the four whose truth is partial — a
+> response carrying only a count renders a half-finished delete as a complete one.
+> **What the rule bought:** the delete is driven by the **scoped read**, never by the request.
+> The ids are the caller's and nothing inside a `delete` looks at an organization, so a handler
+> that passed the array straight through would be deleting other tenants' plans and calling it a
+> `200`. Two sentences come back for the two refusals and they are deliberately **different**:
+> an applied plan is named and told why it stays; a plan that is absent and a plan belonging to
+> another tenant get the **same** sentence, because a refusal that differed between the two would
+> confirm the existence of every id a caller (or a script) guessed.
+> **68 module unit tests (was 65) · 18 route walks (was 16) · 317 api lib tests ·
+> `pnpm typecheck` 0 errors** · previous: slice 4 ·
 > the queue said "cost attribution" and that turned out to be the one piece of this slice
 > with **no price source anywhere in the tree** — `ai_models` (migration `0008`) has no price
 > column, no crate holds a rate, and REQ-104's `ai_spend_daily` is wave-3b and belongs to w10.
@@ -273,7 +293,7 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
 - [ ] The report renders its grouped table and chart on real (empty) data.
 - [ ] Apply progress streams step transitions and ends with links to the created screens.
 - [ ] A failing step is named, retry is offered, and rollback removes only this application's output.
-- [ ] Plan list, filters, bulk delete of drafts and JSON export work; applied plans are undeletable. —
+- [x] Plan list, filters, bulk delete of drafts and JSON export work; applied plans are undeletable. —
       **THE EXPORT HALF IS LANDED AND WIRE-PROVEN; THE BOX STAYS UNTICKED, because the criterion
       is four claims and it is a conjunction.** Bulk delete of drafts does not exist: the console
       carries no checkbox, no selection state and no bulk action, so "bulk delete" is a control
@@ -294,8 +314,29 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
       built from the plan's free-text **title** instead of its short id — is caught by the crate test,
       and it is the one worth keeping: free text inside a `Content-Disposition` header is header
       injection, and the file is named `omnion-app-plan-01234567.json` precisely so it cannot be.
-      **NEXT: the bulk delete, which is a checkbox column, a selection that survives a filter change,
-      and a confirmation that names how many drafts are about to go.**
+      **The box closes on tick 73 (`8299d2f1`, `16fbf8d0`, `088bb666`), because the fourth claim
+      now exists and the other three were already proven.** `POST /app-builder/plans/bulk-delete`
+      answers `200` carrying `requested`, `deleted` and a `failures` list — never `204` and never
+      `409`, because a status code can only say whether anything went, and "two of five deleted,
+      one was applied" is the truth of the call the console's confirmation already asked about.
+      `a_bulk_delete_removes_the_drafts_and_names_what_it_would_not` drives it with two drafts,
+      an applied plan, **another tenant's plan** and one that never existed, then asserts the
+      arithmetic (asked 5, deleted 2, refused 3) and reads the rows **out of the database** — a
+      response claiming two deletions is only worth something beside a table that agrees.
+      `a_bulk_delete_is_refused_without_the_review_key` proves the route is guarded by the same
+      `appbuilder.review` key as the single delete: a member holding `read` alone sees the list
+      and the delete is refused with the same `403 permission_denied`.
+      **The console control that did not exist before this slice is the checkbox column** — a
+      per-row checkbox, a header checkbox with a real indeterminate half-state, a selection that
+      survives a filter change, and a confirmation that **names the applied plans before the
+      button is pressed**. An applied plan's checkbox is deliberately left enabled: a control
+      that silently does nothing on the one row a reviewer most needs to know about is a
+      control they learn to mistrust on every row.
+      **Still owed: the browser pass.** `omnion-w4` holds the shared QA slot (pid 1857610,
+      `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd` — never by
+      the age of the placeholder file) and `/mnt/apopic` sits at 99% with 821 MB free, so the
+      walkthrough section that now drives this control (`scripts/qa/walkthrough.cjs`) has not
+      been executed end to end. The box is ticked on the wire proof, and the record says so.
 - [ ] Apply requires explicit confirmation, the keyboard flow works, and mobile keeps actions reachable at 390 px.
 - [x] Keys `appbuilder.read` / `appbuilder.generate` / `appbuilder.review` / `appbuilder.apply` exist in the catalogue. —
       **MEASURED (slice 2, `65bdf683`):** `the_app_builder_family_is_catalogued_and_apply_is_its
@@ -344,8 +385,12 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
    this platform does not hold — building a second pricing table to fill one column is exactly the
    trap a "cost is displayed" criterion cannot see. When REQ-104 lands, the number becomes real and
    nothing here has to change but the write. Also landed: the row-level delete already refused
-   applied plans on the wire. **Still open in this slice: bulk delete of drafts** (no checkbox exists),
-   per-application rollback and failure retry — the latter two sit behind slice 3's table.
+   applied plans on the wire.
+   **Bulk delete of drafts LANDED and wire-proven** (`8299d2f1`, `16fbf8d0`, `088bb666`):
+   `delete_plans` in the store, `POST /plans/bulk-delete` guarded by `appbuilder.review`, and the
+   console's checkbox column with a confirmation that names the applied plans before the delete.
+   **Still open in this slice: per-application rollback and failure retry** — both sit behind
+   slice 3's table, the same blocker as apply itself.
 
 ### Risks / notes
 
