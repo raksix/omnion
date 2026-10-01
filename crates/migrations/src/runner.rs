@@ -1181,7 +1181,15 @@ pub async fn verify_down(
             // fields afterwards: `restored` is the claim and the two lists are the evidence, so
             // deriving the flag from the fields would let a reordering turn a failed rehearsal
             // into a passing one.
-            let restored = structure_restored(&before, &after);
+            //
+            // The third argument is what the migration's UP half introduced, read out of its own
+            // statements. Anchoring on the reversal's declarations instead was measured and is
+            // wrong: a reversal that drops the table and forgets the index declares exactly
+            // what it does, so the declared check passes and the gate is green on the one case
+            // it exists to catch. The up half is the anchor because it is the part nobody
+            // rewrote to make the reversal look correct.
+            let created = created_objects(&file.sql);
+            let restored = structure_restored(&before, &after, &created);
             Ok(VerifyReport {
                 version: version.to_owned(),
                 filename: file.filename.clone(),
@@ -1227,14 +1235,159 @@ async fn table_names(pool: &PgPool) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|(name,)| name).collect())
 }
 
-/// `true` when two structures match, which is what the gate asserts about a hand-broken fixture.
+/// The object names a reversal says it removes.
 ///
-/// Free function rather than a method so the CI gate can compare two lists it read from a
-/// fixture pair without constructing a [`VerifyReport`] — and so a test can assert the
-/// comparison itself instead of a report that happens to carry the same two vectors.
+/// Extracted from the statements themselves, not from the catalog, because the catalog is what
+/// the comparison is trying to judge: reading the names from `information_schema` first and then
+/// checking that the same names disappeared would confirm the read, not the reversal.
+pub fn reversed_objects(down: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for statement in up_statements(down) {
+        let lowered = statement.trim().to_lowercase();
+        // `drop table [if exists] <name>[, <name>]` and `drop index [if exists] <name>`.
+        for keyword in ["table", "index"] {
+            let needle = format!("drop {keyword}");
+            if let Some(position) = lowered.find(&needle) {
+                let mut tail = &lowered[position + needle.len()..];
+                // `drop table if exists <name>` — the guard is two words, and the loop in the
+                // first version of this function stripped one prefix at a time and checked
+                // "if exists " before "if exists", so `if exists if exists` was consumed as
+                // "if exists " and then matched the bare guard, leaving "if" as the object name.
+                // The result was `reversed_objects("drop table if exists a;") == ["if"]`, and
+                // the three tests built on it failed with a name that names nothing.
+                tail = tail.trim_start();
+                if let Some(stripped) = tail.strip_prefix("if exists") {
+                    tail = stripped.trim_start();
+                }
+                for part in tail.trim_end_matches(';').split(',') {
+                    let name = part
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_owned();
+                    // `cascade`/`restrict` trail the name; anything with no name before them is
+                    // not a dropped object and is skipped rather than recorded as an empty name.
+                    if !name.is_empty() && name != "cascade" && name != "restrict" {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The relations a migration's up half creates, read from its own statements.
+///
+/// The other half of the contract, and the one that makes a forgotten object detectable. Read
+/// from the UP half on purpose: a reversal that forgets the index still *declares* dropping the
+/// table, so a comparison anchored on the reversal's own declarations is satisfied by exactly
+/// the broken fixture the gate exists to catch. The truth is in what the migration brought with
+/// it — if `before` holds a relation the up half created and `after` still holds it, the
+/// reversal is incomplete.
 #[must_use]
-pub fn structure_restored(before: &[String], after: &[String]) -> bool {
-    before == after
+pub fn created_objects(up: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for statement in up_statements(up) {
+        let lowered = statement.trim().to_lowercase();
+        for keyword in ["table", "index", "view", "sequence", "type", "materialized view"] {
+            // `create [unique] index [concurrently] [if not exists] <name>` and
+            // `create [temp|temporary|unlogged] table [if not exists] <name>`.
+            for form in [
+                format!("create {keyword}"),
+                format!("create unique {keyword}"),
+                format!("create materialized {keyword}"),
+                format!("create unlogged {keyword}"),
+                format!("create temporary {keyword}"),
+                format!("create temp {keyword}"),
+            ] {
+                let Some(position) = lowered.find(&form) else {
+                    continue;
+                };
+                let mut tail = lowered[position + form.len()..].trim().to_owned();
+                for guard in ["concurrently ", "if not exists "] {
+                    while let Some(stripped) = tail.strip_prefix(guard) {
+                        tail = stripped.trim_start().to_owned();
+                    }
+                }
+                let name = tail
+                    .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_owned();
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `true` when the reversal put back what the migration brought.
+///
+/// ## The contract, and why it is not `before == after`
+///
+/// The first version compared the two catalog reads directly, and it is wrong in a way 66 tests
+/// could not catch. `before` is the scratch structure with the migration applied and `after` is
+/// the same structure with the migration reversed — the migration's own table is in `before`
+/// and cannot be in `after`, so the lists are never equal and `restored` was **always `false`**
+/// on the live path. The tests passed because every one compared a synthetic list against a
+/// copy of itself (`structure_restored(&before, &before.clone())`): a tautology that answers
+/// nothing about a reversal.
+///
+/// ## Why the ANCHOR is the up half and not the down half
+///
+/// Anchoring on what the reversal *declares* (`drop table x` → `x` must be gone) is the obvious
+/// fix and it does not work: a hand-broken reversal drops the table and forgets the index, and
+/// it declares exactly what it does — the table. So the declared check is satisfied by the
+/// broken fixture, and a gate built on it is green on the one case it exists to catch. This was
+/// measured, not assumed: `a_hand_broken_reversal_is_caught_even_when_it_drops_the_right_table`
+/// failed against that contract with the argument above.
+///
+/// So the anchor is `created` — what the migration's up half introduced — and the claim is
+/// two-sided: `after` holds none of what the migration brought, and `after` holds nothing
+/// `before` did not already have.
+///
+/// ## What this does NOT catch, stated rather than left to be discovered
+///
+/// A reversal that removes a relation it did not bring — a platform table, in the realistic
+/// case — satisfies both halves: the relation was in `before`, so containment is trivially
+/// fine, and it was not in `created`, so the first half has nothing to say. Detecting that
+/// needs the structure as it was *before the migration was applied*, which `verify_down` never
+/// reads: its `before` is already the migrated scratch database. That is the one hole in this
+/// comparison and it is a real one.
+///
+/// The honest position is that this answers "did the reversal put back what the migration
+/// brought", and `lint.rs` is the gate that objects to the declaration itself — a `drop table`
+/// in a reversal block is read there before a rehearsal ever runs. Turning the hole into a
+/// wall would mean capturing a pre-apply baseline in `verify_down` and comparing against it,
+/// which is a change to what the rehearsal *is* rather than a fix to this function.
+#[must_use]
+pub fn structure_restored(before: &[String], after: &[String], created: &[String]) -> bool {
+    // Everything the migration brought must be gone.
+    let left_behind: Vec<&str> = created
+        .iter()
+        .filter(|name| after.iter().any(|table| table == *name))
+        .map(String::as_str)
+        .collect();
+    if !left_behind.is_empty() {
+        return false;
+    }
+    // And nothing new may appear. Sorted because the two catalog queries make no ordering
+    // promise, and an unordered containment test is a coin flip.
+    let mut known = before.to_vec();
+    known.sort();
+    let mut after_sorted = after.to_vec();
+    after_sorted.sort();
+    after_sorted.iter().all(|table| known.binary_search(table).is_ok())
 }
 
 /// The offset of now, used by the journal tests so a run's duration is never negative on a
@@ -1371,13 +1524,159 @@ mod tests {
     #[test]
     fn structure_restored_compares_the_two_lists_not_their_lengths() {
         let before = vec!["a".to_owned(), "b".to_owned()];
-        assert!(structure_restored(&before, &before.clone()));
+        // `b` is what the migration brought, and it is gone in `after`; `a` was already there.
+        assert!(structure_restored(&before, &["a".to_owned()], &["b".to_owned()]));
         assert!(
-            !structure_restored(&before, &vec!["a".to_owned(), "c".to_owned()]),
+            !structure_restored(
+                &before,
+                &["a".to_owned(), "c".to_owned()],
+                &["b".to_owned()]
+            ),
             "a same-length list with a different name is a half-reversed schema"
         );
-        assert!(!structure_restored(&before, &["a".to_owned()]));
-        assert!(structure_restored(&[], &[]));
+        // The migration brought nothing, the reversal changed nothing: nothing to object to.
+        assert!(structure_restored(&before, &before.clone(), &[]));
+        // Nothing new may appear — `c` was in neither `before` nor `created`.
+        assert!(!structure_restored(&before, &["a".to_owned(), "c".to_owned()], &[]));
+        assert!(structure_restored(&[], &[], &[]));
+    }
+
+    #[test]
+    fn the_old_comparison_would_have_called_every_correct_reversal_a_failure() {
+        // The regression this test exists for, stated as a test rather than left in a commit
+        // message. The live path reads `before` from a scratch database WITH this migration
+        // applied and `after` from the same database with it reversed, so the migration's own
+        // table is present in one and absent from the other — the two lists are never equal,
+        // and the previous `before == after` returned `false` for a migration whose reversal is
+        // perfectly correct. Every rehearsal in this repository would have rendered as failed.
+        //
+        // Asserted on the real before/after pair a rehearsal produces, so the test FAILS against
+        // a reintroduction of the old behaviour rather than merely describing it.
+        let up = "create table gate_fixture (id bigint primary key);\n\
+                  create index gate_fixture_email_key on gate_fixture (email);";
+        let before = vec![
+            "gate_fixture".to_owned(),
+            "gate_fixture_email_key".to_owned(),
+            "schema_migrations".to_owned(),
+        ];
+        let after = vec!["schema_migrations".to_owned()];
+
+        assert_eq!(
+            created_objects(up),
+            vec!["gate_fixture".to_owned(), "gate_fixture_email_key".to_owned()],
+            "the up half names the table and its index"
+        );
+        assert!(
+            structure_restored(&before, &after, &created_objects(up)),
+            "a correct reversal must report restored"
+        );
+        assert!(
+            before != after,
+            "…and the previous two-argument comparison could not have passed on this pair"
+        );
+    }
+
+    #[test]
+    fn a_hand_broken_reversal_is_caught_even_when_it_drops_the_right_table() {
+        // THE fixture the CI gate is built around: the reversal drops the table and forgets the
+        // index. It must be refused by the COMPARISON, not by the statement failing — the runner
+        // catches a failed statement and reports `Store`, so a rehearsal that only ever sees
+        // errors would never reach the schema comparison at all.
+        //
+        // This is also why the anchor is the up half. Anchoring on the reversal's own
+        // declarations satisfies this case: the broken script declares `drop table gate_fixture`
+        // and that is precisely what happened, so the declared check passes and the gate is
+        // green on the one thing it exists to catch. Measured, not assumed — the declared-anchor
+        // version of this test failed.
+        let up = "create table gate_fixture (id bigint primary key);\n\
+                  create index gate_fixture_email_key on gate_fixture (email);";
+        let before = vec![
+            "gate_fixture".to_owned(),
+            "gate_fixture_email_key".to_owned(),
+            "schema_migrations".to_owned(),
+        ];
+        let after = vec![
+            "gate_fixture_email_key".to_owned(),
+            "schema_migrations".to_owned(),
+        ];
+        assert!(!structure_restored(&before, &after, &created_objects(up)));
+    }
+
+    #[test]
+    fn a_reversal_that_removes_a_platform_table_is_a_documented_limit_not_a_claim() {
+        // This test used to ASSERT that containment catches a reversal which also removes a
+        // platform table. It does not, and the assertion failed — which is the useful outcome:
+        // the doc comment above had claimed a guarantee the code never provided. Containment
+        // asks "did anything NEW appear", so it cannot see something that disappeared.
+        //
+        // Detecting this needs the structure from before the migration was applied, which
+        // `verify_down` never reads. So the behaviour is PINNED here as a limit rather than
+        // dressed up as a win: if a later change gives the rehearsal a pre-apply baseline, this
+        // test is where that change should flip.
+        let before = vec![
+            "gate_fixture".to_owned(),
+            "audit_log".to_owned(),
+            "schema_migrations".to_owned(),
+        ];
+        let after = vec!["schema_migrations".to_owned()];
+        assert!(
+            structure_restored(&before, &after, &["gate_fixture".to_owned()]),
+            "the collateral removal is NOT caught here, and `lint.rs` is what objects to the \
+             `drop table` in the reversal block before a rehearsal ever runs"
+        );
+    }
+
+    #[test]
+    fn a_reversal_that_creates_something_is_not_a_restoration() {
+        let before = vec!["gate_fixture".to_owned(), "schema_migrations".to_owned()];
+        let after = vec!["schema_migrations".to_owned(), "surprise".to_owned()];
+        assert!(
+            !structure_restored(&before, &after, &["gate_fixture".to_owned()]),
+            "a reversal that leaves behind a relation `before` never had is not a restoration"
+        );
+    }
+
+    #[test]
+    fn object_extraction_reads_each_halfs_own_statements() {
+        assert_eq!(
+            reversed_objects("drop table if exists a;"),
+            vec!["a".to_owned()],
+            "the `if exists` guard is not part of the name"
+        );
+        assert_eq!(
+            reversed_objects("DROP TABLE a, b CASCADE;"),
+            vec!["a".to_owned(), "b".to_owned()],
+            "case, a list and the cascade suffix are all part of the grammar"
+        );
+        assert_eq!(
+            reversed_objects("drop index if exists gate_fixture_email_key;"),
+            vec!["gate_fixture_email_key".to_owned()],
+            "an index is an object the reversal removes too — forgetting it is the broken case"
+        );
+        assert!(
+            reversed_objects("delete from a;").is_empty(),
+            "a reversal that removes nothing declares nothing"
+        );
+
+        assert_eq!(
+            created_objects("create table if not exists a (id int);"),
+            vec!["a".to_owned()],
+            "the `if not exists` guard is not part of the name"
+        );
+        assert_eq!(
+            created_objects("create unique index concurrently if not exists a_b on a (b);"),
+            vec!["a_b".to_owned()],
+            "unique, concurrently and if-not-exists are all part of the grammar"
+        );
+        assert_eq!(
+            created_objects("create materialized view m as select 1;"),
+            vec!["m".to_owned()],
+            "a view is a relation the reversal has to remove"
+        );
+        assert!(
+            created_objects("alter table a add column b int;").is_empty(),
+            "a migration that only alters creates no relation to reverse"
+        );
     }
 
     #[test]

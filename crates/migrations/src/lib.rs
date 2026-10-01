@@ -56,4 +56,7 @@ pub use ledger::{Drift, LedgerRow, NewLedgerRow, checksum, detect_drift};
 pub use lint::{PATTERNS, Pattern, Violation, gate_fails, lint};
 pub use lock::{LockView, lock_id, lock_id_text};
 pub use policy::Policy;
-pub use runner::{ApplyReport, Direction, Plan, RunActor, VerifyReport, verify_down};
+pub use runner::{
+    created_objects, reversed_objects, ApplyReport, Direction, Plan, RunActor, VerifyReport,
+    structure_restored, verify_down,
+};
