@@ -66,7 +66,34 @@ export interface Rebase {
  * silently focusing a node the author did not choose reads as the reload having picked
  * something for them, which is the one behaviour that would make a reload feel like a
  * different tab taking the wheel.
+ *
+ * ## The edges, and why this function is the only place that can judge them
+ *
+ * `aliveEdges` is **optional** because two of the three callers cannot answer the question.
+ * `removeNodes` prunes against a node id list and has no edge list in hand, and a prune that
+ * answered "no" for an unknown would discard a selection nobody had reason to doubt. So the
+ * optionality is the "do not guess" rule, kept in one place instead of restated per caller.
+ *
+ * It is *this* caller that must pass it, and the reason is the whole point of the Reload
+ * button: the graph being adopted is the **other editor's**. Their removed connections are the
+ * ordinary case, not an edge case, and a selection left naming one is not an inert leftover —
+ * an edge outranks every node selection in both `deleteTarget` and `whatEscapeClears`, so `Del`
+ * resolves to a connection that is not in the graph and the status bar announces "1 connection
+ * selected (Del removes it)" over a canvas that draws no such line.
+ *
+ * This argument was added one tick after the node half of the same rule, and the comment it
+ * replaced was not wrong so much as **incomplete in a direction that only this caller cares
+ * about**: "a reload cannot invent an edge" is true, and it is an argument about not creating
+ * a false positive — it says nothing about the false negative this function was leaving
+ * behind, which is keeping an edge id the adopted graph does not have.
  */
-export function rebaseAfterReload(current: CanvasSelection, alive: readonly string[]): Rebase {
-  return { history: emptyHistory(), selection: pruneSelection(current, alive) };
+export function rebaseAfterReload(
+  current: CanvasSelection,
+  alive: readonly string[],
+  aliveEdges?: readonly string[],
+): Rebase {
+  return {
+    history: emptyHistory(),
+    selection: pruneSelection(current, alive, aliveEdges),
+  };
 }

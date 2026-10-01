@@ -409,7 +409,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       setEdges(graph.graph.edges);
       versionRef.current = graph.graph_version;
       setSave({ kind: "clean" });
-      // This is the Reload exit of the two-tab conflict, and it ADOPTED another editor's graph
+      // The Reload exit of the two-tab conflict, and it ADOPTED another editor's graph
       // while keeping everything the old one implied. Undo was the dangerous half: its entries
       // described the graph the author just chose to discard, and `doUndo` ends in `queueSave`,
       // so one press of ⌘Z wrote that discarded graph back over the other tab — quoting the
@@ -417,9 +417,17 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       // conflict. The concurrency guard was undone by the undo button. The selection is pruned
       // for the same reason, one screen down: an inspector holding a node this graph does not
       // contain is a panel that can be aimed at nothing.
+      //
+      // The EDGE ids go in as well, and the reason is the same one argument by argument: a
+      // connection is the other selectable thing, it OUTRANKS every node selection in
+      // `deleteTarget` and `whatEscapeClears`, and the graph adopted here is the *other
+      // editor's* — so their removed connections are the ordinary case. A selection left
+      // naming one resolves `Del` to a line this graph does not have and the status bar
+      // announces "1 connection selected (Del removes it)" over a canvas drawing no such edge.
       const rebased = rebaseAfterReload(
         selectionRef.current,
         graph.graph.nodes.map((n) => n.id),
+        graph.graph.edges.map((e) => e.id),
       );
       historyRef.current = rebased.history;
       setSelection(rebased.selection);
