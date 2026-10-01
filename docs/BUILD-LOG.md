@@ -6491,3 +6491,56 @@ it collide — which is what that limit exists for. The device-block legs from t
 keyboard/mobile legs are therefore still **written, not measured**. Next tick runs the pass first.
 
 Next: the remaining REQ-021 legs, then REQ-016.
+
+---
+
+## Tick 45 — wave 5b platform extras · REQ-126 close gate
+
+Merged `origin/main` (7 commits; `docs/BUILD-LOG.md` conflict resolved with
+`scripts/qa/merge-build-log.py` — `base=5976 ours=6326 theirs=6143 merged=6493`, missing lines 0/0/0,
+lost headings 0).
+
+**Three things were "not measurable" on this request. All three were defects in the measurement,
+and two of them were in this writer's own files.** Four consecutive ticks attributed the missing
+browser pass to a saturated box. The box was never the cause.
+
+**1. The permissions suite was never broken — it was pointed at another writer's database.**
+Recorded for two ticks as "aborts mid-run (exit 101, no panic message)" and deliberately logged
+rather than claimed. `OMNION_DATABASE_URL` was unset in the shell, so `Config::from_env()` fell
+back to `DEFAULT_DATABASE_URL` — whose database is named `omnion`, the MAIN WRITER's. Its
+`_sqlx_migrations` carries `19 = "cms blocks"` (wave 2) against this tree's `0019_secret_hierarchy`,
+so `migrate()` refused with a checksum mismatch. The tell was a number nobody read: **all four
+walks failed in 0.26 s**, which is too fast for four multi-second walks. `4/4 failed` never
+distinguishes "four assertions failed" from "four setup calls failed". `walk_state.rs` already
+carried a paragraph naming this exact trap; the recorded reading never opened the file.
+
+```text
+cargo test -p omnion-api --test observability_permissions    4 passed  0 failed  (13.86s)
+  (same tree, OMNION_DATABASE_URL=omnion_w6_dev — no code change)
+cargo test -p omnion-telemetry                              179 passed  0 failed
+tsc -p apps/admin/tsconfig.json --noEmit                    exit 0
+node --check scripts/qa/walkthrough.cjs                      SYNTAX OK
+node -e 'require("./scripts/qa/walkthrough.cjs")'            MODULE LOADS OK
+```
+
+**2. `walkthrough.cjs` could not be loaded at all** (`55c420bd`). `module.exports` names
+`DEPLOYMENT_SCREENS`; `module.exports` is evaluated at LOAD time, while the `const` declaring it
+sat 570 lines lower in its temporal dead zone. Every invocation threw `ReferenceError` at line
+8161 before walking a route. A harness that dies at load and a pass that finds a screen missing
+both produce **no artifact**, which is how a broken file reads as a slow machine for four ticks.
+Proven load-bearing, not merely fixed: deleting one entry from the desktop route list makes the
+guard throw `deployment screens missing from the route list: /deployment/upgrade`.
+
+**3. A depth pass was handed a promise, so its guard guarded nothing** (`c1c7fcd6`).
+`runDepthPass(name, pass)` is a try/catch around `await pass()`. The traces site passed
+`runObservabilityOverviewDepth(page),` — parentheses included — so the overview began before the
+wrapper was entered, and the traces pass was a third argument the function ignores and never ran.
+A rejection escaped as an uncaught exception and killed the pass after **380 screenshots with no
+summary.json**. Every other call site passes a thunk; this was the only eager one.
+
+**Not done this tick:** the close gate stays **UNTICKED**. The pass ran 380 screenshots deep and
+died on the defect in (3); the re-run is queued behind a live w3 holder at load 20 rather than
+contending. REQ-126 is code-complete; what remains is one pass that finishes.
+
+Next: read the re-run's summary, tick the box only if it visited all seven screens, then REQ-128's
+close gate and REQ-129.
