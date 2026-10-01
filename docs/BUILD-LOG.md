@@ -7995,3 +7995,69 @@ that measures a machine already at load 12.
 
 **Next:** that pass over `/deployment/backfills`, `/deployment/migrations`, `/deployment/seeds`;
 then `docs/deployment/upgrade.md`, which now has executed steps to quote.
+
+## Tick 57 — wave 6 (REQ-129 slice 4, panel leg)
+
+**The acceptance line said "visible in the panel" and the panel did not exist.** Watermark,
+expiry, single-use download and revoke were all real — schema constraints, one atomic claim
+statement, a `410` that re-reads the row to name which of four reasons applies — and none of it
+was visible anywhere a human could look. The acceptance note itself admitted the gap in the same
+sentence that required it. So this tick built `/deployment/exports` and, more usefully, built the
+gate that measures whether the screen keeps its one honest claim.
+
+**The claim: an operator learns WHY a download is refused BEFORE pressing it.** The API refuses
+with a bare `410` and four different messages, and those four are four different follow-ups —
+revoked (ask for a new one), expired (ask for a new one, later), already downloaded (you spent
+it), not ready (wait, or press Produce). A panel knowing only "download failed" turns the
+single-use guarantee into a support ticket. The Rust suite cannot see this at all: the routes,
+the schema and the claim statement are all correct with an empty screen.
+
+`scripts/qa/exports-states.test.cjs` reads the view's source with comments stripped first — this
+log and the test file both explain the bug in prose, and a comment naming a code would satisfy a
+regex looking for that code's branch, so a fix could be described and never written.
+
+**Two defects in the gate itself, both found by running it rather than reading it.**
+
+1. **The first version could not fail.** It matched the bare literal `code: "downloaded"`.
+   Rewriting the guard to `if (false)` left the unreachable branch's body in place and the gate
+   stayed GREEN. Each check now requires the guard AND the code in the same branch, and rejects a
+   constant condition — an assertion that passes on a branch no input can reach measures the file,
+   not the panel.
+2. **The rewrite went red on the UNMODIFIED file.** `[^)]*` for the condition stopped at the `)`
+   inside `new Date(entry.expires_at).getTime()`, so it matched no branch at all and reported all
+   three refusals missing on correct code. The condition is now scanned with a paren depth
+   counter. A gate red on correct code is worse than no gate: it teaches its reader to ignore it.
+
+Five mutations now go red — link ungated, constant guard on the single-use branch, clock read per
+row, revoked branch deleted, badge words stripped to colour alone. Clean: 14/14.
+
+**The panel puts the classification map above the exports.** The unclassified count decides whether
+the feature works at all: the builder fails closed, so while that list is non-empty nothing can be
+exported, and last tick found nothing could even classify a column. Each entry is classifiable in
+place and carries its reviewer, which is what makes the map an audit surface rather than a config
+file. Where a download cannot work the control is REPLACED by its explanation, following the seeds
+screen — a link that is present and refuses when pressed is the dead button the request forbids.
+Expiry is compared against ONE clock read per render: a `Date.now()` inside the row loop lets two
+exports expiring in the same second render as one ready and one expired.
+
+**Also fixed, and it is the kind of thing a green suite never reports: this request's own status
+line had lost its `> **Status:**` marker.** A mechanical edit wrote the prose on line 3 with no
+marker — the exact string every reader, including this loop's own wave-order picker, greps for. The
+prose was there and readable; the STATUS was not. Restored in the same tick that needed it.
+
+**The QA pass: queued three ticks, and this one did not queue a third.** Two consecutive queued
+runs wrote `void: true, reason: "queued-and-never-ran"` — the slot holder has been alive in
+`/mnt/apopic/omnion-w8` throughout. Queueing again would have recorded the same failure in a third
+summary, so this tick spent itself on slot-free work and the pass remains the one unticked line.
+Box: `/mnt/apopic` 97% (1.8 G free), `/opt` 98% (2.8 G free) with this writer's 14 G `target` on
+it — still the recorded invariant-11 violation.
+
+| Gate | Result |
+| --- | --- |
+| `pnpm typecheck` (apps/admin) | clean |
+| `node --check scripts/qa/walkthrough.cjs` | parses |
+| `node scripts/qa/exports-states.test.cjs` | **14 passed** |
+| five mutations of that gate | **5/5 red** |
+
+**Next:** the browser pass over the seven deployment screens including `/deployment/exports`;
+then `docs/deployment/upgrade.md`, which now has executed steps to quote.
