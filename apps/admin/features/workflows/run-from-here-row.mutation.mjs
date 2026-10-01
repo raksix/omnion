@@ -91,6 +91,46 @@ const MUTATIONS = [
     find: "the painted set and the run's set are the SAME set",
     replace: "every node the run touched is painted, and nothing else is",
   },
+  // ---- TICK 61: the run is read before it settles -----------------------------------------
+  // These four sit BEFORE the row window opens, which is why `rowWindow` above could not have
+  // found them. The harness learned this the same way the test did: a window that starts one
+  // block too late is a check that reports on a construct it never read, and the mutation
+  // harness is where that is cheapest to discover. `mutateIn` widens the window rather than
+  // loosening the assertion.
+  {
+    name: "M10 the run is read once after a fixed delay again (THE tick-61 defect)",
+    in: "run",
+    find: "const settled = await settleRun(page, readRun);",
+    replace: "await page.waitForTimeout(2500);\n      const settled = { run: await readRun(), settled: true };",
+  },
+  {
+    name: "M11 the settle poll accepts ONE unchanged reading instead of two",
+    // My first attempt at this mutation APPENDED a second early-return beside the real check
+    // and left the real check in place, so the row still required two readings and the suite
+    // stayed green — a strawman, and this harness now has a second one to report on. The
+    // regression has to REMOVE the two-reading requirement, not sit next to it.
+    global: true,
+    find: "if (current.state === previous) return { ...current, settled: true };",
+    replace: "if (previous !== null) return { ...current, settled: true };",
+  },
+  {
+    name: "M12 the note drops the field saying whether the run ever settled",
+    // This one is in the NOTE, which is neither the run window nor the row window — the harness
+    // refused it on the first run, correctly. Two named windows now exist and neither covers
+    // the note, which is the third window in this directory for the third block of this row.
+    // Rather than widen either (a wider window is a window that can land on the wrong
+    // occurrence of a common line), the note gets its own, and the refusal above is left in
+    // place: it is a load-bearing check, not an obstacle to route around.
+    in: "note",
+    find: "      runSettled,\n",
+    replace: "",
+  },
+  {
+    name: "M13 a run that never settles is reported as settled",
+    global: true,
+    find: "return { ...(await read()), settled: false };",
+    replace: "return { ...(await read()), settled: true };",
+  },
 ];
 
 const runSuite = () => {
@@ -119,6 +159,43 @@ const mutate = (find, replace) => {
   return original.slice(0, start) + window.replace(find, replace) + original.slice(end);
 };
 
+/**
+ * The RUN window: from the click to the reduction, which is where the tick-61 settle-wait lives.
+ *
+ * The row window opens at `const painted = …`, one block AFTER the run is read, so a mutation
+ * about the run cannot be expressed in it at all. Widening `rowWindow` instead would weaken
+ * the nine mutations above — a window that spans twice as much is a window that can land on the
+ * wrong occurrence of a common line. A second, named window keeps both guarantees.
+ */
+const runWindow = (source) => {
+  const start = source.indexOf('page.locator("[data-run-from-here-button]")');
+  const end = source.indexOf("const runnable = ", start);
+  assert.notEqual(start, -1, "the run-from-here click must exist");
+  assert.notEqual(end, -1, "the run must be reduced");
+  return { start, end };
+};
+
+const mutateIn = (which, find, replace) => {
+  const { start, end } = rowWindows[which](original);
+  const window = original.slice(start, end);
+  assert.ok(
+    window.includes(find),
+    `the mutation target is not inside the ${which} window, so this harness would measure another block: ${find.slice(0, 60)}`,
+  );
+  return original.slice(0, start) + window.replace(find, replace) + original.slice(end);
+};
+
+/** The NOTE: the block the row reports itself in, which neither of the other two reaches. */
+const noteWindow = (source) => {
+  const start = source.indexOf('step: "run-from-here",');
+  const end = source.indexOf('await shot(page, "page-workflow-builder-run-from-here")', start);
+  assert.notEqual(start, -1, "the run-from-here note must exist");
+  assert.notEqual(end, -1, "the row must take a screenshot");
+  return { start, end };
+};
+
+const rowWindows = { row: rowWindow, run: runWindow, note: noteWindow };
+
 let failures = 0;
 try {
   const baseline = runSuite();
@@ -126,7 +203,27 @@ try {
   console.log("baseline: green");
 
   for (const mutation of MUTATIONS) {
-    writeFileSync(WALKTHROUGH, mutate(mutation.find, mutation.replace));
+    // `global: true` targets the `settleRun` helper, which lives above every row window — the
+    // helper is shared, so scoping it to a row would be wrong rather than merely narrow.
+    const mutated = mutation.global
+      ? (() => {
+          const helperStart = original.indexOf("async function settleRun(");
+          const helperEnd = original.indexOf("async function interact(");
+          assert.notEqual(helperStart, -1, "the settle helper must exist");
+          assert.ok(helperEnd > helperStart, "the settle helper window must not end before it begins");
+          const helper = original.slice(helperStart, helperEnd);
+          assert.ok(
+            helper.includes(mutation.find),
+            `the mutation target is not inside the settleRun helper: ${mutation.find.slice(0, 60)}`,
+          );
+          return (
+            original.slice(0, helperStart) +
+            helper.replace(mutation.find, mutation.replace) +
+            original.slice(helperEnd)
+          );
+        })()
+      : mutateIn(mutation.in ?? "row", mutation.find, mutation.replace);
+    writeFileSync(WALKTHROUGH, mutated);
     const result = runSuite();
     writeFileSync(WALKTHROUGH, original);
     if (result.green) {

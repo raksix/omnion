@@ -80,6 +80,26 @@ const COMPARE = (() => {
   return ROW.slice(start, end);
 })();
 
+/**
+ * The row from the CLICK, so the window can see how the run is read.
+ *
+ * `ROW` starts at `const painted = …` — the canvas read — which is *after* the run read that
+ * everything downstream depends on. A guard about the run read therefore needs a window that
+ * reaches back past it, and this is the third time in this directory that a too-narrow window
+ * has been the whole defect: `ROW` was narrowed to the note once, `PANEL_READ` in
+ * `step-trace-row.test.ts` was widened to include its own evidence, and here the natural
+ * window starts one block too late. The failure is always the same and always silent — the
+ * test reports on a construct it never read.
+ */
+const RUN = (() => {
+  const start = WALKTHROUGH.indexOf('page.locator("[data-run-from-here-button]")');
+  assert.notEqual(start, -1, "the row must click the run control");
+  const end = WALKTHROUGH.indexOf("const runnable = ", start);
+  assert.notEqual(end, -1, "the row must reduce the run it read");
+  assert.ok(end > start, "the window must not end before it begins");
+  return WALKTHROUGH.slice(start, end);
+})();
+
 test("the painted set is compared against the run's set in BOTH directions", () => {
   // The defect, stated as the two expressions that close it. A check for the *name*
   // `paintedButNotInRun` passes against a row that computes it and never reports it, and
@@ -152,6 +172,63 @@ test("the pill count is READ off the canvas, not asserted as a number", () => {
   assert.ok(
     /const painted = await page\.evaluate[\s\S]*?data-node-status/.test(ROW),
     "and the canvas read is the one that looks for the pill the product writes",
+  );
+});
+
+test("the run is read AFTER IT SETTLES, and the note says whether it ever did", () => {
+  // TICK 61'S FINDING, and it is the same defect the sleep was introduced to prevent.
+  //
+  // The row clicked `data-run-from-here-button`, waited a fixed 2500ms, and read the run ONCE.
+  // The pass took that reading while the engine had accepted the request and claimed nothing:
+  //
+  //     startedFrom: "wait-3"                the run WAS created and WAS started
+  //     skipped: 0                           the skipped prefix not yet written
+  //     statuses: ["pending"]                nothing claimed
+  //     pillsPainted: 0                      so the canvas had nothing to paint
+  //     inRunButNotPainted: [wait-3, act-3, end-3]
+  //
+  // Every one of those reads "the product is missing this", and the criterion is about four of
+  // them. None was true. The 2500ms was a guess about how long a run takes, and this pass
+  // shared its box with three sibling passes — a duration-based wait is wrong exactly there
+  // and right everywhere else, which is the worst place for a guess to live.
+  //
+  // The stop condition is the run STOPPED MOVING, and it has to be read off the run rather
+  // than the canvas: the canvas is what the criterion is about, so waiting on it would make
+  // the wait depend on the thing under test. `settleRun` polls the execution's own status and
+  // its step statuses, which is the engine's copy and not the panel's.
+  assert.ok(
+    /const settled = await settleRun\(page, readRun\)/.test(RUN),
+    "the run must be polled until it stops moving; a single read after a fixed delay reports a run in flight as if it had finished",
+  );
+  // …and the note has to CARRY the answer, or a run that never settled is indistinguishable
+  // from one that settled instantly. Same one-switch rule as `rowIsMeasurable` and
+  // `canvasWasStable`: the gates below it are meaningless without it, and a conjunction
+  // nobody can hold under time pressure is how a vacuous gate gets closed.
+  assert.ok(
+    /runSettled,/.test(ROW),
+    "a note that cannot say 'the run never settled' reports a mid-flight read as a verdict",
+  );
+  // The old form has to be gone, named exactly. A fixed delay in this block IS the defect.
+  assert.ok(
+    !/await page\.waitForTimeout\(\s*\d+\s*\);/.test(RUN),
+    "a fixed delay is wrong in the same direction every time and only on a loaded box",
+  );
+  // `settleRun` itself has to require TWO identical readings. One is not enough: two polls
+  // landing inside the same engine tick see the same bytes twice and call it settled, which
+  // reproduces the original defect at a smaller scale.
+  const helperStart = WALKTHROUGH.indexOf("async function settleRun(");
+  const helperEnd = WALKTHROUGH.indexOf("async function interact(");
+  assert.ok(helperStart !== -1 && helperEnd > helperStart, "the settle helper must exist");
+  const helper = WALKTHROUGH.slice(helperStart, helperEnd);
+  assert.ok(
+    /if \(current\.state === previous\) return \{ \.\.\.current, settled: true \}/.test(helper),
+    "a poll that accepts ONE unchanged reading calls a run settled inside a single engine tick",
+  );
+  // And it must be able to say it never settled. A helper whose only answer is 'settled'
+  // forces every caller to report a hung run as a finished one.
+  assert.ok(
+    /settled: false/.test(helper),
+    "a hung run reported as settled is the same defect one level up from the sleep it replaced",
   );
 });
 

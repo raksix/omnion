@@ -876,6 +876,55 @@ async function settleCanvasCards(page, minimum = 250, attempts = 20) {
   return previous;
 }
 
+/**
+ * Wait for a run to stop MOVING, and report whether it ever did.
+ *
+ * `settleCanvasCards` above waits for the CANVAS to stop changing; this is the run-side twin,
+ * and tick 61's pass is what it exists for. The run-from-here row clicked the button, slept
+ * 2500ms and read the run ONCE. The read came back with the run genuinely started and every
+ * step still `pending`:
+ *
+ *     startedFrom: "wait-3"        the engine accepted the request
+ *     skipped: 0                   the skipped prefix had not been written
+ *     statuses: ["pending"]        nothing had been claimed yet
+ *     pillsPainted: 0              so the canvas had nothing to paint
+ *     inRunButNotPainted: [wait-3, act-3, end-3]
+ *
+ * Five readings, every one of them "the product is missing this", and all five downstream of
+ * one fixed sleep standing in for a condition. A wait that measures the wrong thing is worse
+ * than no wait, because it yields numbers rather than an absence — `startedFrom` was non-null,
+ * so the row looked alive while reporting a run mid-flight.
+ *
+ * The stop condition is *the run stopped moving*, never *N milliseconds passed*: a run that
+ * settles in 40ms should not wait 2500ms, and a run on a loaded box that takes 9s must not be
+ * read at 2500ms. This pass was competing with three sibling passes for one box when it took
+ * this reading, and a duration-based wait is exactly what fails there and only there.
+ *
+ * The polling happens INSIDE `page.evaluate`, not in Node: every read of an authenticated
+ * endpoint in this file goes through the browser so it carries the session cookie, and a
+ * `fetch` from Node would be a 401 that reads exactly like a run that does not exist. The
+ * helper takes an `id` getter because the caller usually has the run in hand rather than the id.
+ */
+async function settleRun(page, readRun, { attempts = 40, interval = 500 } = {}) {
+  const read = async () => {
+    const run = await readRun();
+    const steps = (run?.steps ?? []).map((s) => `${s.step_no}:${s.status}`).join(",");
+    return { run, state: `${run?.status ?? "?"}|${steps}` };
+  };
+  let previous = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const current = await read();
+    // Two identical readings in a row. One is not enough: two polls landing inside the same
+    // engine tick see the same bytes twice and call it settled.
+    if (current.state === previous) return { ...current, settled: true };
+    previous = current.state;
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  // A pending step that never moves is a HUNG run, and returning that as "settled" is the
+  // same class of error one level up — so the caller can say "never settled" out loud.
+  return { ...(await read()), settled: false };
+}
+
 async function interact(page, pageName, report) {
   const inventory = () =>
     page.evaluate((max) => {
@@ -12552,35 +12601,51 @@ note({
     }).catch(() => null);
 
     let after = null;
+    let runSettled = null;
     if (canStart === "true") {
       await page.locator("[data-run-from-here-button]").first().click({ timeout: 8000 }).catch(() => {});
-      await page.waitForTimeout(2500);
       // Read the run back from the API, not from the canvas: the canvas paints what the
       // server sent, and the criterion is about what the engine is holding.
-      after = await page.evaluate(async (workflowId) => {
-        const res = await fetch(`/api/v1/workflows/${workflowId}/executions?limit=1`, {
-          credentials: "same-origin",
-        });
-        if (!res.ok) return null;
-        const body = await res.json();
-        const latest = body.executions?.[0];
-        if (!latest) return null;
-        const detail = await fetch(`/api/v1/workflow-executions/${latest.id}`, {
-          credentials: "same-origin",
-        });
-        if (!detail.ok) return null;
-        const run = await detail.json();
-        return {
-          executionId: run.id ?? latest.id ?? null,
-          startedFrom: run.started_from_node ?? null,
-          steps: (run.steps ?? []).map((step) => ({
-            step_no: step.step_no,
-            status: step.status,
-            skip_reason: step.skip_reason ?? null,
-            node_id: step.node_id ?? null,
-          })),
-        };
-      }, workflowId).catch(() => null);
+      //
+      // AND WAIT FOR IT TO SETTLE. The read was a single `page.evaluate` after
+      // `waitForTimeout(2500)`, and tick 61's pass took that reading mid-flight: the run had
+      // genuinely started (`startedFrom: "wait-3"`) and not one step had been claimed. Every
+      // assertion below it then reported a product that does not draw pills, write a skipped
+      // prefix or open a panel — none of which was true, and none of which would have been
+      // true of a run that had been allowed to finish. The 2500 was a guess, and this pass
+      // shared its box with three sibling passes.
+      const readRun = () =>
+        page.evaluate(async (workflowId) => {
+          const res = await fetch(`/api/v1/workflows/${workflowId}/executions?limit=1`, {
+            credentials: "same-origin",
+          });
+          if (!res.ok) return null;
+          const body = await res.json();
+          const latest = body.executions?.[0];
+          if (!latest) return null;
+          const detail = await fetch(`/api/v1/workflow-executions/${latest.id}`, {
+            credentials: "same-origin",
+          });
+          if (!detail.ok) return null;
+          const run = await detail.json();
+          return {
+            executionId: run.id ?? latest.id ?? null,
+            status: run.status ?? null,
+            startedFrom: run.started_from_node ?? null,
+            steps: (run.steps ?? []).map((step) => ({
+              step_no: step.step_no,
+              status: step.status,
+              skip_reason: step.skip_reason ?? null,
+              node_id: step.node_id ?? null,
+            })),
+          };
+        }, workflowId).catch(() => null);
+      // Poll until the run stops MOVING, and say out loud whether it ever did. A run whose
+      // steps never leave `pending` is a hung run, and a note that cannot tell a hung run from
+      // a settled one is the same defect one level up from the sleep it replaced.
+      const settled = await settleRun(page, readRun);
+      after = settled.run;
+      runSettled = settled.settled;
     }
 
     // Criterion 2 reads the CANVAS, not the API: the pill is the thing being claimed, and
@@ -12646,6 +12711,18 @@ note({
       // one too, which is the point of recording it separately.
       canvasWasStable: cardOrder.length === cardCount,
       canStart,
+      // **TICK 61'S FINDING, AND IT BELONGS ABOVE EVERY GATE IN THIS NOTE.** The run used to
+      // be read once after a fixed 2500ms sleep, and this pass took that reading while the
+      // engine had accepted the request and claimed nothing: `skipped: 0`,
+      // `statuses: ["pending"]`, `pillsPainted: 0`, and every node in the run reported as
+      // unpainted. Five readings, each of them "the product is missing this", and all five
+      // downstream of one sleep. `runSettled: false` says the run never stopped moving, and
+      // the gates below it are then readings of a run in flight rather than of a rule.
+      //
+      // It is a single field rather than a precondition woven into each gate for the same
+      // reason `rowIsMeasurable` is: a conjunction nobody can hold in their head under time
+      // pressure is how a vacuous gate gets closed. Read this one first.
+      runSettled,
       // Which node each card answered for, so a `canStart: "false"` can be told apart from
       // "the control never rendered for the node the criterion is about".
       scan,
