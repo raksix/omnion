@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 mod support;
 use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+use support::walk_auth;
 
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
@@ -179,6 +180,28 @@ async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
         redis,
         test_storage(),
     );
+    // The limiter is the one thing a per-walk database does not fix: its counters live in one
+    // Redis shared with every other writer's worktree, and a sign-in carries no session, so its
+    // budget is keyed on the peer address -- `ip:127.0.0.1` for every walk in every suite on this
+    // box. The shipped `sign_in` policy allows ten per five minutes and this file signs in two
+    // accounts per walk across twelve walks, so the eleventh is refused and every walk after it
+    // dies inside `login` on a rate limit it was never testing.
+    walk_auth::give_the_process_its_own_sign_in_budget(|| {
+        let policies: Vec<omnion_security::RatePolicy> = omnion_security::RatePolicy::defaults()
+            .into_iter()
+            .map(|mut policy| {
+                if policy.scope == "sign_in" {
+                    policy.limit = 10_000;
+                    policy.burst = 0;
+                }
+                policy
+            })
+            .collect();
+        omnion_api::rate_limit_middleware::install(
+            omnion_api::rate_limit_middleware::RateLimiter::new(&state, policies),
+        );
+    });
+
     Some((state, db, isolated))
 }
 
