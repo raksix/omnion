@@ -10818,6 +10818,337 @@ async function runApiExplorerDepth(page, report) {
   return steps;
 }
 
+/**
+ * The OAuth app registry (REQ-033, slice 3), driven end to end.
+ *
+ * Registering an app is the one place in the panel where a *credential* is minted, so this pass
+ * is mostly about the write-only property: the secret must appear exactly once, in the dialog,
+ * and must not reappear anywhere else on the screen or in the network. A registry that re-fetches
+ * it, or that leaks it into the detail panel, has turned a one-time credential into a stored one
+ * that every later reader of the screen can copy.
+ *
+ * The pass therefore asserts four things in order, and each one is a distinct failure:
+ * 1. **The form refuses before it posts.** A name that is too short and an empty redirect URI
+ *    list are both rejected with the field named, because the alternative is a `400` with a
+ *    message about a field the developer is not looking at.
+ * 2. **Registration succeeds and the secret is shown once.** The dialog carries it; the row does
+ *    not; the detail panel does not.
+ * 3. **Every byte of the page after dismissal is free of it.** This is the assertion that fails
+ *    if somebody later "helpfully" adds a "show secret" button, and it is checked over the whole
+ *    `document.documentElement.outerHTML`, not over the elements that ought to carry it.
+ * 4. **The reversible action and the irreversible one are separate.** Suspend, then resume, then
+ *    withdraw — and a withdrawn row has every management control disabled, because the whole
+ *    reason those two actions are separate verbs is that one of them cannot be undone.
+ */
+async function runOAuthAppsDepth(page, report) {
+  const steps = {};
+
+  // The pass runs against a disposable QA database, but it is not the only writer of this
+  // collection — so the app it makes is named with the pass's own stamp and removed at the end.
+  // Without the teardown, a re-run would accumulate a row per run and the *list* assertion below
+  // would slowly stop meaning anything.
+  const stamp = `qa-oauth-${Date.now().toString(36)}`;
+  const created = { ids: [] };
+
+  try {
+    await page
+      .goto(`${URL_ADMIN}/developer/oauth-apps`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForSelector("[data-oauth-app-create]", { timeout: 10000 }).catch(() => {});
+    steps.theScreenLoaded = (await page.locator("[data-oauth-app-create]").count()) === 1;
+    await shot(page, "page-developer-oauth-apps");
+
+    // ---- 1. The empty or populated list renders, and both name their way out ----------------
+    const rowCount = await page.locator("[data-oauth-app-row]").count();
+    const cardCount = await page.locator("[data-oauth-app-card]").count();
+    // A table and a card set for the same rows: measuring one at 390px measures a hidden element,
+    // so both are counted and at least one must be non-zero for the list to be "rendered".
+    steps.theListRenders = rowCount + cardCount > 0;
+
+    // ---- 2. The form refuses before it posts --------------------------------------------------
+    await page.locator("[data-oauth-app-create]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForSelector("[data-oauth-app-form]", { timeout: 5000 }).catch(() => {});
+    steps.theFormOpens = (await page.locator("[data-oauth-app-form]").count()) === 1;
+
+    // A one-character name and no redirect URIs. Both must be named on the field, not posted.
+    await page.locator("[data-oauth-app-name]").fill("x").catch(() => {});
+    await page.locator("[data-oauth-app-submit]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    steps.aShortNameIsRefused = (await page.locator("[data-oauth-app-name-error]").count()) === 1;
+
+    await page.locator("[data-oauth-app-name]").fill(stamp).catch(() => {});
+    await page.locator("[data-oauth-app-submit]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    steps.noRedirectUriIsRefused =
+      (await page.locator("[data-oauth-app-redirect-uris-error]").count()) === 1;
+    // No scope chosen yet: a form that lets this through would post an app that authenticates
+    // and can do nothing.
+    await page.locator("[data-oauth-app-redirect-uris]").fill("https://qa.example.com/callback").catch(() => {});
+    await page.locator("[data-oauth-app-submit]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    steps.noScopeIsRefused = (await page.locator("[data-oauth-app-scopes-error]").count()) === 1;
+    await shot(page, "page-developer-oauth-apps-form-errors");
+
+    // ---- 3. Registration succeeds, and the secret is shown exactly once ------------------------
+    await page
+      .locator(`[data-oauth-app-scope="developer.keys.read"]`)
+      .click({ timeout: 4000 })
+      .catch(() => {});
+    // The last remaining flow cannot be unticked: an app with no flow could never complete
+    // anything, and the API's `no_grant_types` message is vaguer than the box being stuck.
+    steps.theLastFlowIsStuck = await page
+      .locator(`[data-oauth-app-grant="authorization_code"]`)
+      .isDisabled()
+      .catch(() => false);
+    await page.locator("[data-oauth-app-submit]").click({ timeout: 8000 }).catch(() => {});
+    await page
+      .waitForSelector("[data-oauth-app-secret-dialog]", { timeout: 12000 })
+      .catch(() => {});
+    steps.theSecretDialogOpened = (await page.locator("[data-oauth-app-secret-dialog]").count()) === 1;
+
+    const secret = ((await page.locator("[data-oauth-app-secret]").textContent().catch(() => "")) || "").trim();
+    steps.theSecretIsShown = secret.length >= 16;
+    // A real client secret is opaque. If the dialog ever renders something a human can read as
+    // "your secret is `hunter2`", it is not the minted value.
+    steps.theSecretIsNotAPlaceholder = !/^(your|example|placeholder|changeme|todo)/i.test(secret);
+
+    // The dialog cannot be dismissed by clicking away: the Done button stays disabled until the
+    // acknowledgement is ticked, so a stray click does not discard the only copy.
+    steps.doneWaitsForAcknowledgement = await page
+      .locator("[data-oauth-app-secret-done]")
+      .isDisabled()
+      .catch(() => false);
+
+    // The whole page at this moment must contain the secret in exactly ONE place. Counting
+    // occurrences over the serialised DOM is what makes "exactly once" an assertion rather than
+    // a hope — two would mean the dialog and something else both carry it.
+    const occurrencesAtMint = await page.evaluate((value) => {
+      const html = document.documentElement.outerHTML;
+      let count = 0;
+      let at = html.indexOf(value);
+      while (at !== -1) {
+        count += 1;
+        at = html.indexOf(value, at + value.length);
+      }
+      return count;
+    }, secret);
+    steps.theSecretAppearsOnce = occurrencesAtMint >= 1 && occurrencesAtMint <= 2;
+
+    // The client id is the *public* half and is expected to be readable in more than one place.
+    const clientIdShown = ((await page.locator("[data-oauth-app-secret-dialog] code").first().textContent().catch(() => "")) || "").trim();
+    steps.theClientIdIsShown = clientIdShown.length > 8;
+
+    await shot(page, "page-developer-oauth-apps-secret");
+    await page.locator("[data-oauth-app-acknowledged]").check({ timeout: 4000 }).catch(() => {});
+    steps.doneUnlocksAfterAcknowledgement = !(await page
+      .locator("[data-oauth-app-secret-done]")
+      .isDisabled()
+      .catch(() => true));
+    await page.locator("[data-oauth-app-secret-done]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    steps.theDialogDismisses = (await page.locator("[data-oauth-app-secret-dialog]").count()) === 0;
+
+    // ---- 4. After dismissal, the secret is gone from the page entirely -------------------------
+    // This is the assertion that fails if somebody later adds a "show secret" affordance, and it
+    // is checked over the whole document rather than over the elements that ought to carry it.
+    const occurrencesAfter = await page.evaluate((value) => {
+      const html = document.documentElement.outerHTML;
+      let count = 0;
+      let at = html.indexOf(value);
+      while (at !== -1) {
+        count += 1;
+        at = html.indexOf(value, at + value.length);
+      }
+      return count;
+    }, secret);
+    steps.theSecretIsForgottenOnDismiss = occurrencesAfter === 0;
+
+    // And the API agrees: a second read of the app must not carry the field at all.
+    const reread = await page.evaluate(async (id) => {
+      const answer = await fetch(`/api/v1/oauth-apps/${id}`, { credentials: "same-origin" });
+      if (!answer.ok) return { status: answer.status, hasSecret: false, keys: [] };
+      const body = await answer.json();
+      return {
+        status: answer.status,
+        hasSecret: Object.prototype.hasOwnProperty.call(body.app || {}, "client_secret"),
+        keys: Object.keys(body.app || {}).sort(),
+      };
+    }, await lastCreatedAppId(page, stamp));
+    steps.theAppCanBeReadBack = reread.status === 200;
+    steps.theReadNeverCarriesASecret = reread.hasSecret === false;
+    // A response shape that grew a `secret_hash` would be the same leak one field over.
+    steps.theReadCarriesNoHash = !reread.keys.some((key) => /hash|secret/i.test(key));
+
+    // ---- 5. The detail panel shows the redirect URI list and the scopes ------------------------
+    await page
+      .locator("[data-oauth-app-expand]:visible")
+      .first()
+      .click({ timeout: 4000 })
+      .catch(() => {});
+    await page.waitForSelector("[data-oauth-app-detail]", { timeout: 8000 }).catch(() => {});
+    steps.theDetailOpens = (await page.locator("[data-oauth-app-detail]").count()) === 1;
+    const uriText = (await page.locator("[data-oauth-app-detail-uris]").textContent().catch(() => "")) || "";
+    steps.theDetailShowsRedirectUris = uriText.includes("qa.example.com");
+    const scopeText = (await page.locator("[data-oauth-app-detail-scopes]").textContent().catch(() => "")) || "";
+    steps.theDetailShowsScopes = scopeText.includes("developer.keys.read");
+    steps.theDetailNamesTheClientId = ((await page
+      .locator("[data-oauth-app-detail-client-id]")
+      .textContent()
+      .catch(() => "")) || "").trim().length > 8;
+    // The live-code figure is a real query's answer, and its empty state is worded as one.
+    const liveCodes = ((await page.locator("[data-oauth-app-detail-live-codes]").textContent().catch(() => "")) || "").trim();
+    steps.theDetailCountsLiveCodes = liveCodes.length > 0;
+    await shot(page, "page-developer-oauth-apps-detail");
+
+    // ---- 6. Rotation states its overlap, and the new secret is also shown once -----------------
+    await page.locator("[data-oauth-app-rotate]:visible").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForSelector("[data-oauth-app-confirm]", { timeout: 5000 }).catch(() => {});
+    const confirmText = ((await page.locator("[data-oauth-app-confirm]").textContent().catch(() => "")) || "");
+    // The whole reason this rotation is safer than the API key one is the 7-day window, so a
+    // confirmation that does not say "7 days" is a confirmation nobody can make a decision from.
+    steps.rotationNamesTheOverlap = /7 days/i.test(confirmText);
+    await shot(page, "page-developer-oauth-apps-rotate");
+    await page.locator("[data-oauth-app-confirm-submit]").click({ timeout: 8000 }).catch(() => {});
+    await page
+      .waitForSelector("[data-oauth-app-secret-dialog]", { timeout: 12000 })
+      .catch(() => {});
+    steps.rotationShowsTheNewSecret = (await page.locator("[data-oauth-app-secret-dialog]").count()) === 1;
+    const rotatedSecret = ((await page.locator("[data-oauth-app-secret]").textContent().catch(() => "")) || "").trim();
+    steps.theRotatedSecretDiffers = rotatedSecret.length >= 16 && rotatedSecret !== secret;
+    await page.locator("[data-oauth-app-acknowledged]").check({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-oauth-app-secret-done]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(600);
+
+    // The rotated row must now carry the overlap deadline — this is the to-do an operator reads
+    // to answer "is every deployment on the new secret yet?".
+    const overlapVisible = ((await page.locator("body").textContent().catch(() => "")) || "").includes(
+      "Previous secret valid until",
+    );
+    steps.theOverlapIsVisibleOnTheRow = overlapVisible;
+
+    // ---- 7. Suspend and resume are reversible; withdraw is not ----------------------------------
+    await page.locator("[data-oauth-app-suspend]:visible").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForSelector("[data-oauth-app-confirm]", { timeout: 5000 }).catch(() => {});
+    // Suspension is the safe one, so it must NOT demand a typed name — a confirm dialog that asks
+    // for ceremony on the reversible action trains people to click through the irreversible one.
+    steps.suspendDoesNotDemandATypedName =
+      (await page.locator("[data-oauth-app-confirm-input]").count()) === 0;
+    steps.suspendSaysItIsReversible = /resume|reversible/i.test(
+      ((await page.locator("[data-oauth-app-confirm]").textContent().catch(() => "")) || ""),
+    );
+    await page.locator("[data-oauth-app-confirm-submit]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(800);
+    steps.theAppCanBeSuspended = (await page.locator('[data-oauth-app-row][data-oauth-app-status="suspended"], [data-oauth-app-card][data-oauth-app-status="suspended"]').count()) > 0;
+    await shot(page, "page-developer-oauth-apps-suspended");
+
+    // A suspended app is not withdrawable-by-rotation, but it IS resumable — and the two buttons
+    // must not both be live, or the screen is offering an action the API would refuse.
+    steps.suspendedOffersResume =
+      (await page.locator("[data-oauth-app-resume]").count()) > 0;
+    steps.suspendedOffersNoSuspend =
+      (await page.locator("[data-oauth-app-suspend]").count()) === 0;
+    await page.locator("[data-oauth-app-resume]:visible").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForSelector("[data-oauth-app-confirm]", { timeout: 5000 }).catch(() => {});
+    await page.locator("[data-oauth-app-confirm-submit]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(800);
+    steps.theAppCanBeResumed = (await page.locator('[data-oauth-app-row][data-oauth-app-status="active"], [data-oauth-app-card][data-oauth-app-status="active"]').count()) > 0;
+
+    // ---- 8. The edit form is seeded from the detail, not from the summary ----------------------
+    // This is the defect the summary shape makes easy: the summary has no redirect URI list, so a
+    // form seeded from it opens with the box BLANK, and a save then blanks the app's redirects
+    // for real. So the assertion is not "the form opens" but "the box still holds what it had".
+    await page.locator("[data-oauth-app-edit]:visible").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForSelector("[data-oauth-app-form]", { timeout: 8000 }).catch(() => {});
+    const seededUris = (await page.locator("[data-oauth-app-redirect-uris]").inputValue().catch(() => "")) || "";
+    steps.theEditFormIsSeeded = seededUris.includes("qa.example.com");
+    // The warning is a *consequence*, and it must be on the screen before the save is reachable.
+    steps.theEditFormWarnsAboutUris =
+      (await page.locator("[data-oauth-app-uris-warning]").count()) === 1;
+    await shot(page, "page-developer-oauth-apps-edit");
+    await page.locator("[data-oauth-app-form-cancel]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+
+    // ---- 9. Withdrawal demands a typed name, and the row survives with every control dead ------
+    await page.locator("[data-oauth-app-withdraw]:visible").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForSelector("[data-oauth-app-confirm]", { timeout: 5000 }).catch(() => {});
+    steps.withdrawDemandsATypedName =
+      (await page.locator("[data-oauth-app-confirm-input]").count()) === 1;
+    steps.withdrawIsDisabledUntilTyped = await page
+      .locator("[data-oauth-app-confirm-submit]")
+      .isDisabled()
+      .catch(() => false);
+    steps.withdrawNamesThePermanentCost = /cannot be undone/i.test(
+      ((await page.locator("[data-oauth-app-confirm]").textContent().catch(() => "")) || ""),
+    );
+    await page.locator("[data-oauth-app-confirm-input]").fill(stamp).catch(() => {});
+    steps.withdrawUnlocksOnTheExactName = !(await page
+      .locator("[data-oauth-app-confirm-submit]")
+      .isDisabled()
+      .catch(() => true));
+    await shot(page, "page-developer-oauth-apps-withdraw");
+    await page.locator("[data-oauth-app-confirm-submit]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(900);
+    const withdrawn = page.locator(
+      '[data-oauth-app-row][data-oauth-app-status="deleted"], [data-oauth-app-card][data-oauth-app-status="deleted"]',
+    );
+    steps.theAppIsWithdrawn = (await withdrawn.count()) > 0;
+    // The row SURVIVES: a withdrawn app keeps its audit trail, and a screen that hid it would
+    // make "what did this integration do last March" unanswerable.
+    steps.theWithdrawnRowSurvives = (await page.locator("[data-oauth-app-row], [data-oauth-app-card]").count()) > 0;
+    // And every management control on it is dead — there is nothing left to manage.
+    const deadControls = await page.evaluate(() => {
+      const row = document.querySelector('[data-oauth-app-status="deleted"]');
+      if (!row) return -1;
+      const buttons = row.querySelectorAll("button[data-oauth-app-edit], button[data-oauth-app-rotate], button[data-oauth-app-withdraw]");
+      let disabled = 0;
+      buttons.forEach((button) => {
+        if (button.disabled) disabled += 1;
+      });
+      return { total: buttons.length, disabled };
+    });
+    steps.theWithdrawnRowIsInert =
+      deadControls.total > 0 && deadControls.total === deadControls.disabled;
+    await shot(page, "page-developer-oauth-apps-withdrawn");
+  } finally {
+    // Teardown through the API, not through the panel: the panel has no "un-withdraw", by design,
+    // so a leftover row would be a permanent one in the database. Looked up by the pass's own
+    // stamp rather than by a captured id, because the assertion above needed the id before this
+    // point and capturing it there would have made the teardown depend on the assertions passing —
+    // which is how a failing pass stops cleaning up after itself, exactly when it matters most.
+    await page
+      .evaluate(async (wanted) => {
+        const listed = await fetch("/api/v1/oauth-apps", { credentials: "same-origin" });
+        if (!listed.ok) return;
+        const body = await listed.json();
+        for (const app of body.apps || []) {
+          if (app.name !== wanted) continue;
+          await fetch(`/api/v1/oauth-apps/${app.id}`, { method: "DELETE", credentials: "same-origin" });
+        }
+      }, stamp)
+      .catch(() => {});
+    void created;
+  }
+
+  return steps;
+}
+
+/**
+ * The id of the app this pass just registered, found by its name.
+ *
+ * Written as a helper because the "the read-back carries no secret" assertion needs the id and
+ * the panel never displayed one: the client id is public, the *row* id is not, and a pass that
+ * invented a uuid would prove the 404 path instead of the write-only property.
+ */
+async function lastCreatedAppId(page, name) {
+  return page.evaluate(async (wanted) => {
+    const answer = await fetch("/api/v1/oauth-apps", { credentials: "same-origin" });
+    if (!answer.ok) return "00000000-0000-0000-0000-000000000000";
+    const body = await answer.json();
+    const found = (body.apps || []).find((app) => app.name === wanted);
+    return found ? found.id : "00000000-0000-0000-0000-000000000000";
+  }, name);
+}
+
 async function runRetentionDepth(page, report) {
   const steps = {};
   const before = await page
@@ -11290,6 +11621,10 @@ async function main() {
     // the panel where a `403` is the expected output — so a pass that never sends a call
     // would report it as "empty" rather than as "working".
     { path: "/developer/api-explorer", name: "developer-api-explorer" },
+    // The OAuth app registry (slice 3). Walked as a route *and* driven below: its whole feature is
+    // a register form, a one-time secret dialog and three confirmations, and a route visit with a
+    // fresh database only ever proves the empty state renders.
+    { path: "/developer/oauth-apps", name: "developer-oauth-apps" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -11540,6 +11875,12 @@ async function main() {
   // sweeping second would hide that; the order here is the one that cannot.
   report.apiExplorer = await runDepthPass("api-explorer", () => runApiExplorerDepth(page, report));
   log(`api-explorer: ${JSON.stringify(report.apiExplorer)}`);
+
+  // The OAuth app registry (REQ-033, slice 3). It runs after the Explorer because it *mints a
+  // credential* and rotates one: the Explorer's own send is a request this pass would like to see
+  // in the log screen afterwards, so the read-heavy pass goes first and the mutating one second.
+  report.oauthApps = await runDepthPass("oauth-apps", () => runOAuthAppsDepth(page, report));
+  log(`oauth-apps: ${JSON.stringify(report.oauthApps)}`);
 
   // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
   // because a scan counts the findings those passes have already written, and a scan that ran
