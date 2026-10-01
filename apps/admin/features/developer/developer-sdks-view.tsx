@@ -39,6 +39,7 @@
  * Every hook is `data-dev-sdk-*`; the walkthrough pass drives them by name.
  */
 
+import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
@@ -116,8 +117,58 @@ function bytesLabel(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function isTab(value: string | null): value is Tab {
+  return value === "plugin" || value === "theme" || value === "workflow" || value === "cli";
+}
+
+/**
+ * Which tab the URL asks for, and the fallback when it asks for nothing.
+ *
+ * Extracted as a named pure function because it is the load-bearing line of the whole deep link
+ * and it is the line a *generic* check cannot see: `search.get("tab")` also appears in the
+ * resynchronising effect below, so "does the view read ?tab=" passes even when the initial state
+ * ignores the URL and paints the plugin generator first — the probe's first mutation run caught
+ * exactly that, a gate reporting green on the dead-button shape it exists to catch. A function
+ * with its own name is something a check can point at.
+ */
+export function initialTab(value: string | null): Tab {
+  return isTab(value) ? value : "plugin";
+}
+
 export function DeveloperSdksView() {
-  const [tab, setTab] = useState<Tab>("plugin");
+  const router = useRouter();
+  const search = useSearchParams();
+
+  // The CLI tab is not only a tab: `DeviceStart.verification_uri` is `/developer/sdks?tab=cli`,
+  // and the terminal prints that URI for the person to open. A tab strip held only in React
+  // state ignores it, so the one link the platform hands out in clear text landed on the plugin
+  // generator — a working page, which is exactly why no route walk or compile-time gate noticed.
+  // The same reasoning as the catalogue's `?event=` deep link, one level over: a URL the platform
+  // prints must select what it names.
+  //
+  // Read in the *initialiser*, not only in the effect: a person who opens the terminal's own URL
+  // must land on the CLI tab, not watch the plugin generator for one frame and then correct
+  // itself.
+  const [tab, setTab] = useState<Tab>(() => initialTab(search.get("tab")));
+
+  // A back/forward step or a hand-edited URL must move the strip, and it must not rewrite the
+  // address bar while the person is typing into it — hence the value check rather than an
+  // unconditional replace. `replace` rather than `push`: a tab is not a navigation anybody wants
+  // in their history, and eleven tabs would then need eleven Back presses to leave the screen.
+  useEffect(() => {
+    const wanted = search.get("tab");
+    if (isTab(wanted) && wanted !== tab) setTab(wanted);
+  }, [search, tab]);
+
+  const select = useCallback(
+    (next: Tab) => {
+      setTab(next);
+      const params = new URLSearchParams(search.toString());
+      params.set("tab", next);
+      router.replace(`/developer/sdks?${params.toString()}`, { scroll: false });
+    },
+    [router, search],
+  );
 
   return (
     <div className="space-y-4">
@@ -129,7 +180,7 @@ export function DeveloperSdksView() {
             role="tab"
             aria-selected={tab === entry.id}
             data-dev-sdk-tab={entry.id}
-            onClick={() => setTab(entry.id)}
+            onClick={() => select(entry.id)}
             className={
               tab === entry.id
                 ? "rounded border border-accent bg-accent-soft px-3 py-1.5 text-[13px] text-ink"
