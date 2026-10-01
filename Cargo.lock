@@ -1447,6 +1447,7 @@ dependencies = [
  "omnion-deployment",
  "omnion-events",
  "omnion-graphql",
+ "omnion-graphql-resolvers",
  "omnion-health",
  "omnion-identity",
  "omnion-media",
@@ -1611,6 +1612,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "omnion-graphql-resolvers"
+version = "0.1.0"
+dependencies = [
+ "omnion-content",
+ "omnion-graphql",
+ "omnion-identity",
+ "omnion-media",
+ "omnion-permissions",
+ "serde_json",
+ "sqlx",
+ "uuid",
 ]
 
 [[package]]

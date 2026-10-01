@@ -92,6 +92,7 @@ pub mod deployment;
 // `seed_datasets`, and an export is neither — it is the only artifact on this surface that leaves
 // the platform, and burying it at the end of a file about jobs would make that invisible.
 pub mod exports;
+pub mod graphql;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -2228,6 +2229,25 @@ pub fn router(state: AppState) -> Router {
         .route("/sites/{id}/domains", domains)
         .route("/sites/{id}/domains/{domain_id}", domain)
         .route("/sites/{id}/domains/{domain_id}/primary", domain_primary)
+        // The GraphQL surface (REQ-130, slice 1).
+        //
+        // **The guard is `content.pages.read`, and that is deliberate.** The endpoint reads the
+        // same surface it exposes, so a caller who may read content may run queries — and the key
+        // is REAL. The first draft guarded it on `developer.graphql.execute`, which this
+        // repository does not ship, and an uncatalogued key resolves to no permission: the route
+        // answers `403` for every caller, the instance owner included, while looking perfectly
+        // healthy. That is the fourth time this defect has cost this repository a tick.
+        //
+        // `require_or_machine`, because a service account integrating with the platform has no
+        // session and the request says so ("session or API key, sandbox keys included"). The two
+        // verbs share one path; the GET leg answers `PERSISTED_QUERY_NOT_FOUND` until slice 2
+        // registers documents.
+        .route(
+            "/graphql",
+            post(graphql::execute_graphql)
+                .get(graphql::execute_persisted)
+                .layer(guards::require_or_machine(&state, "content.pages.read")),
+        )
         .route("/pages", pages)
         .route("/pages/{id}", page)
         .route("/pages/{id}/publish", page_publish)

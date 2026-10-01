@@ -42,6 +42,10 @@ omnion-content = { path = "../../crates/content" }
 # surface names is a key the platform actually ships", can only live here, in a crate that links
 # `omnion-permissions`. See `tests/graphql_parity.rs`.
 omnion-graphql = { path = "../../crates/graphql" }
+# The resolver layer (REQ-130 slice 1): the seam where the pure decision layer meets the store.
+# A separate crate so its tests can assert the rule that matters — every resolver calls a service
+# function REST also calls, and holds no SQL of its own — without a running server.
+omnion-graphql-resolvers = { path = "../../crates/graphql-resolvers" }
 # Deployment tooling (REQ-128): the release cache, the artifacts, the bundles and the upgrade
 # plan. Its own crate because the decision layer — which steps, in what order, and what is known
 # about whether the database can be rolled back — is a property of the release contract and not of
