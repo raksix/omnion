@@ -438,13 +438,28 @@ export function CdnRulesView() {
 
   return (
     <div className="flex flex-col gap-4">
+      {/* The banner carries the way forward, not just the reason it is here: REQ-011 asks for
+          "an error banner with a retry that re-runs the failing request", and the four other
+          screens that provoke the same state (notifications, its preferences, events, webhooks)
+          all render one. This one did not, so a transient failure left the operator a dead end —
+          the table below it is empty, and empty reads as "this site has no rules", which is the
+          one state that makes people stop trusting the screen. `reload` is the same token the
+          Refresh control already bumps, so the retry re-runs exactly the request that failed. */}
       {error ? (
-        <p
+        <div
+          data-cdn-rules-error
           role="alert"
-          className="rounded-xl border border-accent/30 bg-accent-soft px-4 py-3 text-[12.5px] text-accent-strong"
+          className="flex items-start gap-2 rounded-xl border border-accent/30 bg-accent-soft px-4 py-3 text-[12.5px] text-accent-strong"
         >
-          {error}
-        </p>
+          <span className="flex-1">{error}</span>
+          <button
+            type="button"
+            onClick={reload}
+            className="shrink-0 font-medium underline decoration-dotted underline-offset-2"
+          >
+            Retry
+          </button>
+        </div>
       ) : null}
       {notice ? (
         <p

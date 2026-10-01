@@ -313,16 +313,37 @@ const consoleLog = [];
  */
 const expectedRefusals = [];
 
-/** Register one deliberate refusal (a URL fragment for a request, a status shape for a console line). */
-function expectRefusal(match, reason) {
+/**
+ * Register one deliberate refusal (a URL fragment for a request, a status shape for a console line).
+ *
+ * `statuses` is what makes this safe to use for a **stimulus** as well as a refusal. A refusal is
+ * a status the server chose on its own (401/403 from a gate), so excusing those is a statement
+ * about the product. A stimulus is a status **the pass itself routed into the browser** — the
+ * `page.route(...).fulfill({ status: 500 })` that proves an error banner renders. Excusing a 500
+ * by default would mean a genuine server-side 500 during that window went unreported, so the
+ * statuses are explicit and a stimulus registers only the ones it actually injected.
+ */
+function expectRefusal(match, reason, statuses = [401, 403]) {
   expectedRefusals.push({
     match,
     reason,
+    statuses,
     consoleFrom: consoleLog.length,
     netFrom: netFailures.length,
     claimedConsole: false,
     claimedNet: false,
   });
+}
+
+/**
+ * Register a **stimulus**: a failure the pass manufactured in the browser to prove a screen's
+ * error state renders. Same accounting as `expectRefusal`, but the status is named, because a
+ * 500 is a status the platform should never produce on its own — one arriving from the network
+ * instead of from the route is a defect, and the two must not be able to borrow each other's
+ * excuses.
+ */
+function expectStimulus(match, reason, statuses = [500]) {
+  expectRefusal(match, reason, statuses);
 }
 
 const netFailures = [];
@@ -5575,6 +5596,11 @@ async function runNotificationsDepth(page, report) {
   // the summary cannot affect — the bell degrades on its own and the list stays healthy, so
   // the assertion could only ever have passed by accident. The element under test belongs to
   // the call that has to fail.
+  //
+  // Registered as a **stimulus**: this 500 is manufactured here, in the browser, and the pass
+  // below proves the error state renders *because of it*. Unregistered, the pass reported the
+  // failure it had just caused as a defect against the screen it was measuring.
+  expectStimulus("notifications?", "the notification list is forced to fail so its error state can be proved");
   await page.route("**/api/v1/notifications?*", (route) =>
     route.fulfill({
       status: 500,
@@ -5738,6 +5764,10 @@ async function runNotificationSettingsDepth(page, report) {
 
   // The error state, provoked the way the list's is: a routed 500 must show a retry, not a
   // blank screen with the Save button still on it.
+  expectStimulus(
+    "notifications/preferences",
+    "the preferences read is forced to fail so its error state can be proved",
+  );
   await page.route("**/api/v1/notifications/preferences", (route) =>
     route.fulfill({
       status: 500,
@@ -6626,7 +6656,9 @@ async function runCdnRulesDepth(page, report) {
 
   // 5. The states. The error banner, provoked the honest way — a route that answers 500 —
   //    because a table that shows an empty list after a failure is a table an operator
-  //    reads as "this site has no rules".
+  //    reads as "this site has no rules". Registered as a stimulus: the 500 is manufactured in
+  //    the browser, so filing it as a finding was the pass reporting a defect it had caused.
+  expectStimulus("cdn/rules?", "the cache-rule list is forced to fail so its error state can be proved");
   await page.route("**/api/v1/cdn/rules?*", (route) =>
     route.fulfill({
       status: 500,
@@ -6637,6 +6669,23 @@ async function runCdnRulesDepth(page, report) {
   await page.locator("button[aria-label='Reload cache rules']").click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(1000);
   steps.errorState = (await page.locator("[role=alert]").count()) > 0;
+  // A banner with no way forward is a dead end: the table below it is empty, and empty reads as
+  // "this site has no rules", which is the one state that makes people stop trusting a screen.
+  // REQ-011 asks for "an error banner with a retry that re-runs the failing request" — and a
+  // retry is only real if the request behind it runs again, so the button is pressed with the
+  // route still failing and the request is watched going out. Counting the button would have
+  // accepted a label.
+  steps.errorOffersRetry = (await page.locator("[data-cdn-rules-error] button").count()) > 0;
+  const retried = page
+    .waitForResponse((r) => r.url().includes("/api/v1/cdn/rules") && r.request().method() === "GET", {
+      timeout: 6000,
+    })
+    .then(() => true)
+    .catch(() => false);
+  if (steps.errorOffersRetry) {
+    await page.locator("[data-cdn-rules-error] button").first().click({ timeout: 5000 }).catch(() => {});
+  }
+  steps.retryReRunsTheRequest = await retried;
   await page.unroute("**/api/v1/cdn/rules?*").catch(() => {});
   await shot(page, "page-cdn-rules-error");
 
@@ -6861,6 +6910,7 @@ async function runEventsDepth(page, report) {
   // 5. The error state, provoked the honest way: a route that answers 500. A feed that cannot
   //    say "the API could not be reached" is a feed that renders an empty table and calls it
   //    "nothing recorded yet", which is the most expensive kind of wrong.
+  expectStimulus("api/v1/events?", "the event feed is forced to fail so its error state can be proved");
   await page.route("**/api/v1/events?*", (route) =>
     route.fulfill({
       status: 500,
@@ -7786,6 +7836,10 @@ async function runWebhooksDepth(page, report) {
     steps.filterSurvivesReload = page.url().includes("status=delivered");
 
     // A routed failure must render the error banner, not a silent empty table.
+    expectStimulus(
+      "/deliveries",
+      "the delivery history is forced to fail so its error banner can be proved",
+    );
     await page.route("**/api/v1/webhooks/*/deliveries*", (route) => route.fulfill({
       status: 500,
       contentType: "application/json",
@@ -10186,7 +10240,63 @@ async function main() {
     }));
     report.web = { status: res && res.status(), title: await wp.title().catch(() => ""), links: root.links, text: root.text, base: webBase };
 
-    // The page the panel published in this pass must come back rendered on the site's own host.
+    // The page the renderer check below reads has to **exist**, and nothing guaranteed it:
+    // `SAMPLE_SLUG` is only produced by a form filler inside a depth pass this scope may have
+    // filtered out, so a `--only=cdn` run reached the renderer with nothing published and filed
+    // the 404 as a defect in the renderer. Gating the check on "did some other pass happen to
+    // run" was the tempting fix and it is the wrong one — a check that quietly skips is
+    // indistinguishable in the report from a check that passed, which is the same camouflage a
+    // "write-only" assertion gives you.
+    //
+    // So the renderer establishes its own precondition: publish the page through the real route
+    // on the signed-in admin page, immediately before reading it back on the public host. It is
+    // idempotent — an existing `qa-sample` row is adopted rather than duplicated — and it uses
+    // the same `publish` route the panel does, so the state the renderer reads is a state
+    // something actually produced. If the publication itself fails, that is reported as its own
+    // finding instead of surfacing later as a 404 that names the wrong component.
+    //
+    // `qaSql`, not `qaScalar`: the throwing helper would be caught by this block's `catch` and
+    // filed as `web-unreachable` — "the public renderer could not be reached" — for a fixture
+    // miss. Read the id non-throwing and let the finding name what is actually missing.
+    const rendererSite = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+    const seeded = rendererSite
+      ? await page
+          .evaluate(async (site) => {
+            const headers = { "content-type": "application/json" };
+            const existing = await fetch(`/api/v1/pages?site_id=${site}`, {
+              headers,
+              credentials: "same-origin",
+            })
+              .then((r) => (r.ok ? r.json() : null))
+              .catch(() => null);
+            const rows = Array.isArray(existing) ? existing : (existing?.pages ?? []);
+            const id =
+              rows.find((r) => r.slug === "qa-sample")?.id ??
+              (
+                await fetch(`/api/v1/pages?site_id=${site}`, {
+                  method: "POST",
+                  credentials: "same-origin",
+                  headers,
+                  body: JSON.stringify({ title: "QA Sample Page", slug: "qa-sample" }),
+                })
+                  .then((r) => (r.ok ? r.json() : null))
+                  .catch(() => null)
+              )?.id ??
+              null;
+            if (!id) return { id: null, published: null };
+            const res = await fetch(`/api/v1/pages/${id}/publish`, {
+              method: "POST",
+              credentials: "same-origin",
+              headers,
+              body: "{}",
+            }).catch(() => null);
+            return { id, published: res ? res.status : null };
+          }, rendererSite)
+          .catch((cause) => ({ id: null, published: null, error: String(cause) }))
+      : { id: null, published: null, error: "no QA site row to publish into" };
+    report.web.seededForRenderer = seeded;
+
+    // The page the panel published above must come back rendered on the site's own host.
     const publishedRes = await wp
       .goto(`${webBase}/${SAMPLE_SLUG}`, { waitUntil: "domcontentloaded", timeout: 30000 })
       .catch(() => null);
@@ -10308,9 +10418,18 @@ async function main() {
     if (f.type === "warning") continue;
     // A console line names the status, not the URL: the allowance for one is the window it was
     // registered in, so only a line that arrived after the pass announced the act can be excused.
-    const deliberate = /status of 40[13]/.test(f.text)
-      ? expectedRefusals.find((entry) => !entry.claimedConsole && index >= entry.consoleFrom)
-      : null;
+    // The status is read from the line's own text, which is the only place it appears — a console
+    // message does not carry the response the browser saw. Matching on a hardcoded 40[13] here
+    // meant a routed 500 (the stimulus that proves an error banner renders) could never be
+    // excused however it was registered, so every stimulus the pass fired was reported as a
+    // console error against the screen it was measuring.
+    const statusInLine = f.text.match(/status of (\d{3})/);
+    const lineStatus = statusInLine ? Number(statusInLine[1]) : null;
+    const deliberate = lineStatus === null
+      ? null
+      : expectedRefusals.find(
+          (entry) => !entry.claimedConsole && index >= entry.consoleFrom && entry.statuses.includes(lineStatus),
+        );
     if (deliberate) {
       deliberate.claimedConsole = true;
       refusedOnPurpose.push({ kind: "console", detail: `${f.phase} ${f.text.slice(0, 120)}`, reason: deliberate.reason });
@@ -10325,7 +10444,7 @@ async function main() {
         !entry.claimedNet &&
         index >= entry.netFrom &&
         String(n.url || "").includes(entry.match) &&
-        [401, 403].includes(n.status),
+        entry.statuses.includes(Number(n.status)),
     );
     if (deliberate) {
       deliberate.claimedNet = true;
@@ -10345,6 +10464,17 @@ async function main() {
   if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
   if (report.web && !report.web.error) {
     const published = report.web.published;
+    // A check whose subject does not exist measures nothing, and a 404 that arrives because the
+    // pass never produced its fixture says nothing about the renderer. Say which of the two it
+    // was, rather than letting one line stand for both — the 404 below is only evidence about
+    // the renderer if the page it read was really published.
+    if (!report.web.seededForRenderer?.id) {
+      pushFindings(
+        "high",
+        "web-page",
+        `the pass could not publish the sample page the renderer check reads (${report.web.seededForRenderer?.error || "unknown reason"}), so the check below measures nothing`,
+      );
+    }
     if (!published || published.status !== 200) {
       pushFindings("high", "web-page", `the published page /${SAMPLE_SLUG} did not render (status ${published ? published.status : "missing"})`);
     } else if (!published.heading) {
