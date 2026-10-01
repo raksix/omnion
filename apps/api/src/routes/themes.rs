@@ -60,6 +60,7 @@ pub struct ActivateBody {
 
 /// The write response: the gallery after the write, plus what changed.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivationBody {
     /// The gallery, exactly as `GET /themes?site=<id>` would answer now.
     pub gallery: GalleryView,
@@ -69,6 +70,13 @@ pub struct ActivationBody {
     pub previous_theme_key: Option<String>,
     /// Whether this was a restore rather than a forward switch.
     pub restored: bool,
+    /// The settings revision a rollback republished, when it republished one.
+    ///
+    /// Null for every forward activation and for a rollback whose displaced state had
+    /// published nothing. The panel's toast names it, so "the previous theme is back" and
+    /// "the previous theme and its settings are back" are two different messages — the
+    /// criterion is the second one and the operator is the only one who can confirm it.
+    pub restored_settings_revision_no: Option<i32>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -153,6 +161,7 @@ pub async fn activate_theme(
         "themes.theme.activated",
         &change.theme_key,
         change.previous_theme_key.as_deref(),
+        change.restored_settings_revision_no,
     )
     .await;
 
@@ -161,6 +170,9 @@ pub async fn activate_theme(
         theme_key: change.theme_key,
         previous_theme_key: change.previous_theme_key,
         restored: change.restored,
+        // Carried from the store rather than recomputed here: a forward switch restores
+        // nothing, and the store is the only place that knows which case this was.
+        restored_settings_revision_no: change.restored_settings_revision_no,
     }))
 }
 
@@ -194,9 +206,14 @@ pub async fn rollback_theme(
     )
     .await;
 
-    // The rollback event carries the settings revision in the REQ's payload sketch, and slice 1
-    // has no revisions — so it carries the theme key it came FROM instead, which is the fact
-    // an operator restoring a site needs and the one the event name promises.
+    // The rollback event carries the settings revision in the REQ's payload sketch. Slice 2
+    // added revisions and slice 4 (this tick) made the rollback republish one, so the number
+    // is a real field now — and it is null on the case that has nothing to republish, which is
+    // a fact a subscriber can branch on rather than a missing key.
+    //
+    // The displaced KEY is still carried: it is what an operator restoring a site needs, and
+    // the two are different facts (a rollback can restore a key whose settings were never
+    // published).
     emit_theme_event(
         &state,
         site.organization_id,
@@ -204,6 +221,7 @@ pub async fn rollback_theme(
         "themes.theme.rolled_back",
         &change.theme_key,
         change.previous_theme_key.as_deref(),
+        change.restored_settings_revision_no,
     )
     .await;
 
@@ -212,6 +230,10 @@ pub async fn rollback_theme(
         theme_key: change.theme_key,
         previous_theme_key: change.previous_theme_key,
         restored: true,
+        // The number the store actually republished. Hard-coding `restored: true` and
+        // omitting the revision here is exactly the half that was missing: the endpoint said
+        // "restored" and changed nothing a visitor could see.
+        restored_settings_revision_no: change.restored_settings_revision_no,
     }))
 }
 
@@ -244,6 +266,7 @@ async fn emit_theme_event(
     name: &'static str,
     theme_key: &str,
     previous: Option<&str>,
+    restored_settings_revision_no: Option<i32>,
 ) {
     if let Err(error) = omnion_events::bus::emit(
         state.db().pool(),
@@ -254,6 +277,11 @@ async fn emit_theme_event(
                 "site_id": site_id,
                 "theme_key": theme_key,
                 "previous_theme_key": previous,
+                // Always present, null when there is nothing to republish. A key that is
+                // sometimes missing cannot be branched on by a subscriber, and a rollback
+                // that changed nothing a visitor sees is exactly the case somebody has to
+                // be able to detect downstream.
+                "restored_settings_revision_no": restored_settings_revision_no,
             })),
     )
     .await
