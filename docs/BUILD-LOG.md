@@ -10058,3 +10058,52 @@ walkthrough. A third browser pass into that is the documented 29-September failu
 passes OOM-killing each other), and killing a sibling's pass to make room for mine trades one
 loop's evidence for another's. The boxes that name a screen stay unticked until a tick finds the
 box idle, which is the same condition `run.sh`'s own `flock` was added to protect.
+
+## Tick 50 (wave2-cms) — twenty false keys, one literal, and a slot that never came
+
+**Merge first.** `origin/main` had moved 16 commits. The only conflict was the append-only
+BUILD-LOG, spliced with `scripts/qa/merge-build-log.py` and then verified **per parent**:
+`entries(ours) - entries(merged) == 0` and `entries(theirs) - entries(merged) == 0`, 0 missing,
+0 extra, 0 conflict markers, merged 10060 lines = exactly `ours + theirs - base`. Merged as
+`567cfc89`.
+
+**My first verification of that merge was wrong twice, and both failures were instructive.**
+Reading the three index stages through a shell pipeline *truncates* them, so the parents looked
+like fragments of themselves and the check was meaningless. Then the sum-multiset shape —
+`required = Counter(ours) + Counter(theirs)` — demands that shared history appear **twice**, and
+reported 91 perfectly-present entries as missing. Containment is the right shape for a merge that
+must not lose anything. A line count alone would have passed with a duplicated block.
+
+**The `forms` section's 20 red keys were one wrong literal in the instrument.** The pass asserted
+that clicking the palette leaves a field named `plan`. `addField` names a new field after its
+label, so it lands on `new_field` — and **no label the product ships has ever produced `plan`**.
+Proved by mutation rather than by reading: relabelling the palette to "Untitled question" and
+re-running `suggestKey` gives `untitled_question`, still not `plan`, so the old assertion was
+*impossible*, not flaky. Every step after it addressed `[data-form-field="plan"]` or
+`[data-form-preview-input="plan"]`, so one assumption cascaded into twenty red keys that each
+looked like an independent product defect.
+
+**A second, independent mismatch was hiding underneath it.** `forms.rs::validate_answer` compares
+an answer against the option LABEL exactly (`label == &text`), so the only legal value is the text
+the owner typed — `Gold`. The pass sent the slug `gold`, which is a **refusal**, and every
+submission check inherited that too. `bronze` stays deliberately unoffered, because refusing an
+unoffered value is the point of that check. The pass now reads the key off the canvas and the
+option value off the preview's own `<option>`s, and reports what it found (`paletteNamedTheField`,
+`choiceOptionValue`) — so a future rename surfaces as a changed value instead of twenty reds
+(`74fadb12`).
+
+**Gates.** `cargo test -p omnion-content` **314 passed / 0 failed**. `pnpm typecheck` **exit 0**
+across 14 packages. `node --check` on the pass: clean.
+
+**No browser pass, and that is a real gap, not a dodge.** The QA slot was held by a live sibling
+for the whole tick: holder pid 1646901 with `/proc/1646901/cwd -> /mnt/apopic/omnion-w4`, and by
+the end the holder had turned over to 2269810 — the queue moved without reaching me. The volume
+was at its worst (**97% / 2.1G**) mid-tick. Per the invariants, a queued pass that expires into a
+full volume is the same wasted hour as never starting one, so this writer reclaimed its own build
+cache (`debug/incremental`, 1.5G) while **keeping `debug/omnion-api`**, which the stack runs, and
+closed the tick on committed, gate-verified work. **Criterion 8 stays `~`**: the fix is to the
+instrument, and until a pass runs it, `previewAcceptedAFilledForm` has no measurement behind it.
+
+**Next.** One `--only=forms` pass on the fixed harness — it is the cheapest measurement in the
+queue and it unblocks criterion 8 — then `--only=block-editor` and `--only=members` for criteria
+17 and 18, then REQ-019's content-api criterion.
