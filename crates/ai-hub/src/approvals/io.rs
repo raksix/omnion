@@ -622,6 +622,75 @@ async fn decide<R: RevisionReader + ?Sized>(
                 }),
             )
             .await?;
+            // **The decision is half the answer; the run's fate is the other half.**
+            //
+            // This branch used to return straight after the audit, which left a parked run
+            // parked forever: the reviewer saw `approved`, the run row still said
+            // `awaiting_approval`, and nothing picked it up again. `expire_one` already did
+            // this requeue for the clock-driven path — a decision is the person-driven version
+            // of exactly the same event, so the two paths must not differ in whether the run
+            // is handed back.
+            //
+            // The two arms are not the same operation, and neither is expressible as the other's
+            // negation:
+            //
+            // * **Approve** puts the run back on the queue. It is requeued, not resumed by
+            //   hand: the runner picks it up and continues from the parked step, which is what
+            //   makes "approve then approve again" impossible (the row is no longer `pending`).
+            // * **Reject** ends the run. The agent asked for a tool, a person said no, and
+            //   requeueing would send it straight back to the same question — a run that
+            //   re-asks every time it is refused is a run that burns tokens forever. It is
+            //   finished with `cancelled` and a reason, because a person pressing stop is not
+            //   the agent failing, and the step that asked is closed so `resume_point` does not
+            //   read its tool as "may already have fired" for the rest of the run's life.
+            //
+            // `run_id` is nullable: a request raised outside a run (a reviewer's own preview,
+            // a scheduled action) has no run to move, and that is not an error.
+            //
+            // **A change-set gate is not a tool call, and this is not its run's turn.** A set
+            // files one row per gated operation, all of them carrying the same
+            // `created_by_run` (REQ-101 slice 3d), and the set is applied by the *release* when
+            // the **last** gate is answered — `release_gate` is what reports
+            // `change_set_gates_outstanding`. Requeueing on the first of two gates would put
+            // the run back on the queue while the set it proposed is still blocked and cannot
+            // be applied, so the runner would pick up a run whose whole point was to ask
+            // somebody. Symmetrically, finishing it `cancelled` on the first rejection would
+            // end a run over one operation of a set a reviewer may re-propose. So a set-bound
+            // row moves nothing here; the release path owns it, and it is the only path that
+            // knows whether the set cleared.
+            if let Some(run_id) = approval.run_id.filter(|_| approval.change_set_id.is_none()) {
+                match decision {
+                    Decision::Approve { .. } => {
+                        crate::run_store::requeue_run(pool, run_id).await?;
+                    }
+                    Decision::Reject { reason } => {
+                        // The step is closed **before** the run so the trace never claims a
+                        // tool fired when the run is already finished, and the parked step is
+                        // `running` on purpose — that running row is exactly what made
+                        // `resume_point` call its tool ambiguous, and a rejected step is not
+                        // ambiguous, it is settled. `Skipped` is the wire status that means
+                        // "deliberately not run", and it is what this is.
+                        sqlx::query(
+                            "update ai_run_steps set status = 'skipped', finished_at = $2, \
+                             result = coalesce(result, '{}'::jsonb) || $3::jsonb \
+                             where run_id = $1 and status = 'running'",
+                        )
+                        .bind(run_id)
+                        .bind(now)
+                        .bind(json!({ "rejected_reason": reason }))
+                        .execute(pool)
+                        .await?;
+                        crate::run_store::finish_run(
+                            pool,
+                            run_id,
+                            crate::agent::StepStatus::Skipped,
+                            crate::agent::StopReason::Cancelled,
+                            Some("the reviewer rejected the tool this run asked for"),
+                        )
+                        .await?;
+                    }
+                }
+            }
             Ok(DecisionOutcome::Decided(Box::new(approval)))
         }
         // Somebody else won the race between the read and the write. Read the row back so the
