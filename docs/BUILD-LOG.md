@@ -7826,3 +7826,52 @@ it collide — which is what that limit exists for. The device-block legs from t
 keyboard/mobile legs are therefore still **written, not measured**. Next tick runs the pass first.
 
 Next: the remaining REQ-021 legs, then REQ-016.
+
+## 2026-10-01 · omnion-wave7 · REQ-101 slice 3d — the release, and the delete that never deleted
+
+**What.** Finished the pipeline 3c left one-directional. Applying a **set-bound** approval is
+now a release: every gated operation needs an approving decision, a rejected gate *ends* the
+set, and the writes go through the same `apply_confirmed` transaction a set applied through
+`/apply` uses. Migration `0203_ai_approvals_operation_key.sql` adds the `operation_key` the
+release joins on — `resource_id` and `preview_hash` are both wrong there, and the header says
+why. Five walks, both directions: approving every parked row renames a real page and deletes
+two real pages; approving one of two gates leaves the set blocked *and* names the outstanding
+gate.
+
+**Two real defects the walks caught, neither of which the compiler could see.**
+
+1. `approved_operation_keys` listed `status in ('approved','rejected')` while its own doc
+   comment said "approved and **not** decided … counting a rejected one as released is how a
+   refused delete turns into a delete". The route survived it because it refuses on the
+   rejection first, but the primitive contradicted its contract and the walk that reads the
+   pair directly said no. Now two functions, two questions, `approved` only.
+2. **A `delete` operation was never deleted.** `change.is_empty()` asks "does this change name
+   any field to write" — right for an update, wrong for a delete, whose plan carries *no* diffs
+   because the diff IS the target going away. Every delete fell through to `update_page_in` with
+   all fields `None`, wrote nothing, committed, and reported `applied`. The all-or-nothing
+   guarantee, ticked in 3b, was an all-or-nothing apply of nothing for every set containing a
+   delete — and `content_delete` is the class REQ-101 exists to gate. Both appliers now have a
+   real delete branch, on the caller's connection: `delete_page_in` exists because `delete_page`
+   opens its own transaction and would have committed the delete *outside* the transaction that
+   rolls the set back.
+
+**Proof.**
+
+```
+cargo test -p omnion-api --test ai_change_sets   → 12 passed; 0 failed
+cargo test -p omnion-api --test ai_approvals     → 29 passed; 0 failed
+cargo test -p omnion-ai-hub --lib                → 507 passed; 0 failed
+cargo test -p omnion-content                     →  15 passed; 0 failed
+pnpm typecheck                                   → 2 successful, 2 total
+```
+
+Two of the walks failed first, on purpose-shaped fixtures: one minted its gate by writing
+`status: "published"` into an update's args, which classifies as `content_publish` and parks
+correctly and then fails the apply — the gate and the write disagreed, and only `content_delete`
+is a gated class this build can carry through a write. The other exposed defect 2 above.
+
+**Next.** The QA pass is still open from 2c (it is the only thing that can close the stale-banner
+and viewer-permission boxes). Then the chat entry point that *files* a change set from a reply —
+the remaining half of the "lands in the same inbox" box, and the entry point rather than the
+pipeline, so it is small. Then the server-side preview hash for the "editing updates the preview
+hash" box: the editor re-plans on the client today, so a reviewer has nothing to compare against.
