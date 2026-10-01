@@ -11587,6 +11587,213 @@ note({
   // skipped. The rows are read back through the API by step_no, because a run that quietly
   // executed the prefix the author asked to skip is exactly what this has to rule out.
   {
+    // ---- THE SPINE. BUILD IT BEFORE THE SCAN, OR THE SCAN HAS NOTHING TO SKIP ----------
+    // Two ticks were lost to this and the shape of the loss is worth recording. Every
+    // step above adds a node by *clicking the palette*, and the palette's gesture drops a
+    // card on the canvas **unconnected** — there is no gesture in this harness that
+    // inserts a node between two wired ones. So the graph accumulated nodes beside the
+    // spine (trigger → end, one edge) and `wait-3` was an ORPHAN.
+    //
+    // An orphan is refused by `plan_from_node` with `unknown_node`, correctly: the
+    // engine's walk has never reached it. So the criterion about skipping a prefix was
+    // being measured on a graph where **no prefix exists**, and every row underneath
+    // reported a missing feature rather than a missing fixture. The wrong answer was not
+    // plausible-looking — it was a null, which is the one shape that reads as "broken"
+    // — so the fix was never to suspect the harness.
+    //
+    // The spine is therefore written through the real graph route, in the node types and
+    // port names the registry has, and the walk is *verified before* the scan rather
+    // than assumed: `projection.nodes === 4` is the check, and it is the same number the
+    // engine will walk. A harness that built a prefix and did not check it built one the
+    // server may not share.
+    //
+    // It carries the CSRF header for the reason the `switch-not-executable` leg above
+    // does: without it the save is refused with `csrf_unavailable` before the handler
+    // runs, which is a *green* pass over a screen that works perfectly in the hand above.
+    const spine = await page.evaluate(async (id) => {
+      const csrf = document.cookie
+        .split(";")
+        .map((pair) => pair.split("="))
+        .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+        ?.trim();
+      const current = await fetch(`/api/v1/workflows/${id}/graph`, {
+        credentials: "same-origin",
+      });
+      if (!current.ok) return { ok: false, reason: `read ${current.status}` };
+      const body = await current.json();
+
+      const trigger = (body.graph?.nodes ?? []).find((node) =>
+        String(node.type).startsWith("trigger."),
+      );
+      if (!trigger) return { ok: false, reason: "no trigger node to build a spine from" };
+      // The trigger keeps its own event name; the listener leg further down points it at
+      // `page.published`, and re-typing it here would undo that for a leg that runs later.
+      const wait = (nid) => ({
+        id: nid,
+        type: "wait",
+        label: `Wait ${nid}`,
+        // `seconds` is REQUIRED and the projection reads it through the engine's own
+        // reader, so a wait without it saves as a rule that cannot run — which is
+        // indistinguishable, from the outside, from a run-from-here defect.
+        params: { seconds: 5 },
+        position: { x: 320, y: 40 },
+      });
+      const act = (nid) => ({
+        id: nid,
+        type: "action",
+        label: `Act ${nid}`,
+        params: { action: "echo", parameters: JSON.stringify({ value: nid }) },
+        position: { x: 600, y: 40 },
+      });
+      const finish = (nid) => ({
+        id: nid,
+        type: "end",
+        label: `End ${nid}`,
+        params: {},
+        position: { x: 880, y: 40 },
+      });
+      const edge = (from, to, port) => ({
+        id: `e-${from}-${port}-${to}`,
+        source: from,
+        source_port: port,
+        target: to,
+      });
+      // `trigger → wait → act → end`. Ports are the registry's: `out` off the trigger,
+      // `out` off a wait, `success` off a task, and nothing off an end.
+      const graph = {
+        nodes: [trigger, wait("wait-3"), act("act-3"), finish("end-3")],
+        edges: [
+          edge(trigger.id, "wait-3", "out"),
+          edge("wait-3", "act-3", "out"),
+          edge("act-3", "end-3", "success"),
+        ],
+      };
+      const saved = await fetch(`/api/v1/workflows/${id}/graph`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          ...(csrf ? { "x-omnion-csrf": csrf } : {}),
+        },
+        body: JSON.stringify({ graph, graph_version: body.graph_version }),
+      });
+      if (!saved.ok) {
+        return { ok: false, reason: `save ${saved.status}` };
+      }
+      const after = await (
+        await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+      ).json();
+      const p = after.projection ?? {};
+      return {
+        ok: true,
+        nodes: after.node_count ?? null,
+        edges: after.edge_count ?? null,
+        valid: p.valid ?? null,
+        // `step_count`, not a node count: the projection counts STEPS, so a trigger and
+        // any note are invisible to it. The spine is trigger + wait + act + end = **3**
+        // steps, and asking for 4 would be a probe asserting a number the shape does not
+        // have — the mistake `first_followed_port` and `trigger.cron` already made twice.
+        walkSteps: p.step_count ?? null,
+        errorCount: after.error_count ?? null,
+        reason: p.reason ?? null,
+      };
+    }, workflowId).catch(() => null);
+    note({
+      step: "run-from-here-spine",
+      ...(spine ?? { ok: false, reason: "the spine could not be written" }),
+      // The fixture has to be *the engine's* graph, not merely a set of cards on a canvas.
+      // `valid: false` means the walk stops early and the scan below is measuring a graph
+      // with a shorter path than it thinks — which is the failure this whole block exists.
+      usable: Boolean(spine?.ok && spine?.valid === true && (spine?.walkSteps ?? 0) === 3),
+    });
+    // The canvas has to show the graph that was just written.
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-builder-palette] [data-palette-node]", { timeout: 20000 })
+      .catch(() => {});
+    await page.waitForTimeout(1500);
+
+    // ---- AN UNCONNECTED NODE MUST NOT OFFER A LIVE BUTTON -------------------------------
+    // The defect this tick found, measured on the surface under test. Before the fix the
+    // inspector's answer for an un-wired card was `data-can-start="true"` — a button that
+    // is enabled and is refused by the server on every single press. The canvas is what has
+    // to show the refusal, because a client-side rule that is merely *believed* to be
+    // right is the same fiction the crate test is for.
+    {
+      const orphanCard = await page.evaluate(async () => {
+        const canvas = document.querySelector("[data-builder-canvas]");
+        if (!canvas) return { added: false };
+        const item = document.querySelector("[data-palette-node='transform']");
+        if (!item) return { added: false, reason: "no transform card in the palette" };
+        const rect = canvas.getBoundingClientRect();
+        const transfer = new DataTransfer();
+        item.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: transfer }));
+        canvas.dispatchEvent(
+          new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+        );
+        canvas.dispatchEvent(
+          new DragEvent("drop", {
+            bubbles: true,
+            cancelable: true,
+            dataTransfer: transfer,
+            clientX: rect.left + 520,
+            clientY: rect.top + 300,
+          }),
+        );
+        return { added: true };
+      });
+      await page.waitForTimeout(900);
+      // The newest card is the dropped one: the palette appends, so `.last()` is it.
+      const orphanId = await page
+        .locator("[data-node-type='transform']")
+        .last()
+        .getAttribute("data-node-id")
+        .catch(() => null);
+      let orphanCanStart = null;
+      let orphanReason = null;
+      if (orphanId) {
+        await page.locator(`[data-node-id="${orphanId}"]`).first().click({ timeout: 8000 })
+          .catch(() => {});
+        await page.waitForTimeout(500);
+        orphanCanStart = await page
+          .locator("[data-run-from-here]")
+          .first()
+          .getAttribute("data-can-start")
+          .catch(() => null);
+        orphanReason = (
+          await page.locator("[data-run-from-here-reason]").first().innerText().catch(() => "")
+        )
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+      note({
+        step: "orphan-run-from-here",
+        ...orphanCard,
+        nodeId: orphanId,
+        canStart: orphanCanStart,
+        // The refusal has to NAME the reason. A disabled control with no sentence is a
+        // dead button wearing a disabled attribute — and this leg would otherwise prove
+        // only that `startability` returns false, which is the unit test's job.
+        reason: orphanReason ? orphanReason.slice(0, 160) : null,
+        refused: orphanCanStart === "false",
+        namesTrigger: /trigger/i.test(orphanReason ?? ""),
+      });
+      // Take the card back off the canvas: it is an orphan by construction, and the scan
+      // below walks the graph — leaving one here would put a fifth node on it for every
+      // later row in this pass.
+      if (orphanId) {
+        await page.locator(`[data-node-id="${orphanId}"]`).first().click({ timeout: 5000 })
+          .catch(() => {});
+        await page.waitForTimeout(300);
+        await page.locator("[data-inspector-delete]").first().click({ timeout: 5000 })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+        await page.waitForSelector("[data-builder-palette] [data-palette-node]", { timeout: 20000 })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+      }
+    }
+
     // Start from the *second* action of a live graph, so there is a prefix to skip.
     // "Second in draw order" is the wrong question to ask a canvas. A rule is born from
     // `Graph::starter` as `[trigger, end]`, so the second card is always the END node — and

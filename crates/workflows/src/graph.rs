@@ -996,7 +996,7 @@ pub fn validate_with_plugins(
     // same drawing twice for one cause.
     let mut walked: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
     for edge in &graph.edges {
-        if follows(edge.source_port.as_str()) {
+        if followed_port(edge.source_port.as_str()) {
             walked
                 .entry(edge.source.as_str())
                 .or_default()
@@ -1564,7 +1564,7 @@ pub fn project_walk_with_plugins(
         let next = graph
             .edges
             .iter()
-            .find(|edge| edge.source == node.id && follows(edge.source_port.as_str()));
+            .find(|edge| edge.source == node.id && followed_port(edge.source_port.as_str()));
         let Some(next) = next else { break };
         current = next.target.clone();
     }
@@ -1579,8 +1579,36 @@ pub fn project_walk_with_plugins(
 }
 
 /// Which output port the linear walk follows.
-fn follows(port: &str) -> bool {
-    matches!(port, "out" | "true" | "success" | "case_1" | "default")
+///
+/// **It is `!terminal`, and the identity is asserted over the whole registry in
+/// `run_from.rs` rather than trusted.** The list this replaced (`"out" | "true" |
+/// "success" | "case_1" | "default"`) was a *second* hand-maintained copy of a fact the
+/// port table already carries: `Port::terminal` is declared next to every port, and the
+/// panels already render it. Two lists over the same fact is the drift this branch has
+/// now hit three times — the node type registry, the trigger prefix, and this.
+///
+/// It is public because the *client* has to answer the same question (which nodes can
+/// start a run) and it cannot compile Rust. Copying the five strings into TypeScript
+/// would make it four; deriving it from `terminal`, which the palette already ships to
+/// the browser, means the browser reads the registry's own answer rather than a guess
+/// about it. The test that keeps the two honest lives with the feature that depends on it.
+#[must_use]
+pub fn followed_port(port: &str) -> bool {
+    // Ports that leave the run cannot be walked *onto* — there is nothing after them.
+    !find_port(port).map_or(false, |spec| spec.terminal)
+}
+
+/// The terminal flag of a port of a core node type, or `false` for an unknown one.
+///
+/// An unknown port is answered *not* terminal on purpose: the registry refuses an edge on
+/// a port a node does not export at save time, so this is only ever asked about a port
+/// that exists, and answering "unknown ports end the run" would silently truncate a
+/// walk on a graph that has not been validated yet.
+fn find_port(port: &str) -> Option<&'static Port> {
+    NODE_TYPES
+        .iter()
+        .flat_map(|node_type| node_type.outputs.iter())
+        .find(|spec| spec.key == port)
 }
 
 /// How many different nodes a node's followed edges point at.
@@ -2049,7 +2077,7 @@ mod tests {
     fn a_node_with_two_followed_ports_is_refused_rather_than_guessed() {
         // The sibling of `a_loop_that_closes_on_a_branch_is_still_a_loop`, one level down.
         // `find_cycle` was fixed to follow every edge; the projection still resolves the
-        // *next* node with `find(|edge| … follows(port))`, so a node carrying two edges on
+        // *next* node with `find(|edge| … followed_port(port))`, so a node carrying two edges on
         // ports the linear walk follows (`case_1` and `default` on a switch, or two `out`
         // edges) resolves to whichever one sits earlier in the saved array.
         //
@@ -2270,7 +2298,7 @@ mod tests {
             .outputs
             .iter()
             .map(|port| port.key)
-            .find(|key| follows(key))
+            .find(|key| followed_port(key))
             .unwrap_or_else(|| panic!("{key:?} exports no walked port"))
             .to_owned()
     }
@@ -2696,6 +2724,68 @@ mod tests {
             "a bare `trigger` node type does not exist — which is why the probe's comparison \
              excluded nothing, and why the run-from-here scan chose the trigger every time. \
              The trigger types that do exist are {trigger_keys:?}"
+        );
+    }
+
+    /// The browser answers "which nodes can start a run" too, and it must reach the same
+    /// answer by the same rule rather than by a fourth copy of the facts.
+    ///
+    /// Two copies now exist outside Rust, and both were written as literals:
+    ///
+    /// * `scripts/qa/walkthrough.cjs` decides `isTriggerType` from `card.type`, and
+    /// * `apps/admin/features/workflows/reachability.ts` decided which port the walk
+    ///   follows, from a name that does not exist — `portWalksThrough` was given
+    ///   `follows` by hand until this tick, which is the third instance on this branch
+    ///   after the type registry and the port names.
+    ///
+    /// A guard that only checks one of them is a guard that reports "clean" while the
+    /// other drifts, and the drift is silent by construction: both files compile, both
+    /// run, and the disagreement shows up as a **refusal the author cannot explain** —
+    /// a live button the server will not honour, or a walk the client thinks is shorter
+    /// than the engine's. Neither shape crashes.
+    ///
+    /// So both are asserted here, and the assertions are about the *shape* of the code:
+    /// no port-name list to re-derive the walk, and no bare `trigger` literal. The one
+    /// thing that is deliberately NOT asserted is that the client walks correctly — a text
+    /// guard cannot execute TypeScript, and pretending otherwise is how the reachability
+    /// test above came to exist without its port rule being checked at all.
+    #[test]
+    fn the_javascript_side_of_the_walk_reads_the_registry_rather_than_restating_it() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above crates/workflows");
+        let walkthrough =
+            std::fs::read_to_string(repo_root.join("scripts/qa/walkthrough.cjs"))
+                .unwrap_or_else(|e| panic!("the walkthrough is the thing being guarded: {e}"));
+        let client = std::fs::read_to_string(
+            repo_root.join("apps/admin/features/workflows/reachability.ts"),
+        )
+        .unwrap_or_else(|e| panic!("the client's walk is the thing being guarded: {e}"));
+
+        // The client must not name the port the walk follows. It reads `terminal` off the
+        // palette instead, and `the_walk_follows_every_port_that_is_not_terminal_and_no_
+        // terminal_one` is what makes that reading equal to this side.
+        for port in ["out", "true", "success", "case_1", "default"] {
+            assert!(
+                !client.contains(&format!("\"{port}\"")),
+                "`reachability.ts` names the port {port:?} in a comparison, which is a copy \
+                 of the walk rule in a file nothing compiles. Read `port.terminal` instead."
+            );
+        }
+        assert!(
+            client.contains("terminal"),
+            "the client has to read the flag the palette already ships, or the refusal it \
+             added is a guess about which connections the engine follows"
+        );
+
+        // And the same shape on the walkthrough's side of the trigger question, which is
+        // the third time this exact check has been needed.
+        assert!(
+            !walkthrough.contains(r#"card.type !== "trigger""#)
+                && !walkthrough.contains(r#"card.type != "trigger""#),
+            "the run-from-here scan is comparing a node type against a bare `trigger` literal \
+             again; the registry's trigger types are `trigger.*`"
         );
     }
 }

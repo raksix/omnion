@@ -83,6 +83,11 @@ import { decideConnection } from "./connect-edge";
 import { readVersionFrom, resolveConflict } from "./conflict";
 import { arbitrateSave } from "./save-arbitration";
 import { startability, startMessage } from "@/features/workflows/run-from-here";
+import {
+  isLastOnPath,
+  reachedByTrigger,
+  type WalkWorld,
+} from "@/features/workflows/reachability";
 import { retryAnswer, retryMessage } from "@/features/workflows/retry-node";
 import {
   indexStepsByNode,
@@ -2565,6 +2570,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               nodeType={nodeTypes.get(selectedNode.type) ?? null}
               nodes={nodes}
               edges={edges}
+              nodeTypes={nodeTypes}
               onChange={(patch) => updateNode(selectedNode.id, patch)}
               onDelete={() => removeNode(selectedNode.id)}
               onRemoveConnection={(edgeId) => removeEdge(edgeId)}
@@ -2892,29 +2898,47 @@ function ToolbarButton({
  * most likely to try. A disabled button with no reason teaches nothing; a live button
  * that always fails is worse.
  *
- * "Is this the last node on the path" is answered from the edges rather than from the
- * node type alone, because a node with no outgoing edge is the end of the run whatever it
- * is called. The walk follows the first outgoing edge, and a graph the server refused to
- * save is not the case this has to survive: an unsaved graph is a graph whose *nodes* the
- * author is still editing.
+ * **The two questions are answered from the graph, and neither one from the node type
+ * alone.** "Is this the last node on the path" is about the connections, because a node
+ * with no outgoing connection is the end of the run whatever it is called. "Does the
+ * trigger reach this node" is about the walk, because a node the engine cannot see
+ * cannot start anything — and that is the half this used to get wrong: a card with no
+ * connection *leaving* it looks like the end of the path, so an **unconnected** node was
+ * offered a live button and refused it on every press. Every node in this builder is
+ * dropped un-wired and connected second, so that was the editing state itself.
+ *
+ * Both answers come from `reachability.ts` rather than from inline edge scans, so the
+ * rules are unit-testable and the port rule is *read* from the palette rather than typed
+ * out here. A graph the server refused to save is not the case this has to survive: an
+ * unsaved graph is a graph whose *nodes* the author is still editing, and the press still
+ * goes to the server, which is the authority.
  */
 function RunFromHereControl({
   node,
   nodeType,
   edges,
+  nodes,
+  nodeTypes,
   onRun,
   running,
 }: {
   node: GraphNode;
   nodeType: GraphNodeType;
   edges: GraphEdge[];
+  nodes: GraphNode[];
+  nodeTypes: Map<string, GraphNodeType>;
   onRun: () => void;
   running: boolean;
 }) {
-  const hasOutgoing = edges.some((edge) => edge.source === node.id);
+  const world: WalkWorld = { nodes, edges, types: nodeTypes };
   const answer = startability(
-    { id: node.id, type: node.type, inert: nodeType.inert === true },
-    !hasOutgoing,
+    {
+      id: node.id,
+      type: node.type,
+      inert: nodeType.inert === true,
+      reachedByTrigger: reachedByTrigger(world, node.id),
+    },
+    isLastOnPath(world, node.id),
   );
 
   return (
@@ -3076,6 +3100,7 @@ function NodeInspector({
   nodeType,
   nodes,
   edges,
+  nodeTypes,
   onChange,
   onDelete,
   onRemoveConnection,
@@ -3090,6 +3115,7 @@ function NodeInspector({
   node: GraphNode;
   nodeType: GraphNodeType | null;
   nodes: GraphNode[];
+  nodeTypes: Map<string, GraphNodeType>;
   edges: GraphEdge[];
   onChange: (patch: Partial<GraphNode>) => void;
   onDelete: () => void;
@@ -3133,6 +3159,8 @@ function NodeInspector({
         node={node}
         nodeType={nodeType}
         edges={edges}
+        nodes={nodes}
+        nodeTypes={nodeTypes}
         onRun={() => onRunFromHere(node.id)}
         running={running}
       />

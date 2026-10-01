@@ -423,4 +423,94 @@ mod tests {
             "which is why it can only ever be a leaf — nothing can leave it"
         );
     }
+
+    /// A node the author can place on the canvas in the ordinary way — by dragging one card
+    /// out of the palette — that gets a **live** button and is refused every single time.
+    ///
+    /// This is not an exotic drawing. An unconnected node is what a canvas looks like
+    /// *while it is being edited*: every node in this builder is dropped on un-wired first
+    /// and connected second, and the inspector is live the whole time. The graph saves
+    /// (a rule is built by being incomplete), so the node stays on the screen, selectable,
+    /// with its own *Run from here*.
+    ///
+    /// The two sides then disagree about the same question:
+    ///
+    /// * `RunFromHereControl` asks "does this node have any outgoing edge leaving it". An
+    ///   unconnected node has **none**, so `isLastOnPath` is `true` — and `startability`
+    ///   refuses only an *inert* node in that position. An `action` is not inert, so the
+    ///   answer is `canStart: true` and the button is **enabled**.
+    /// * The server walks from the trigger. An island is not on that walk, so
+    ///   `plan_from_node` refuses it with `unknown_node` — and it refuses it through
+    ///   `project_walk`, which raises `graph_invalid` on the orphan finding before it
+    ///     ever looks at the node.
+    ///
+    /// A live button that always fails is the shape this feature's own module doc names as
+    /// its worst outcome, and every gate in the repo is green over it: this crate's tests
+    /// pass (the *refusal* is correct), `typecheck` passes, and no test of the client ever
+    /// asked whether the two answers could disagree. The only test that would have caught
+    /// it is one that asserts the sentence on both sides of the wire — which is the
+    /// harness row this tick adds.
+    #[test]
+    fn an_unconnected_node_cannot_be_started_from_because_the_walk_never_reaches_it() {
+        let mut graph = spine();
+        // Dropped on the canvas, not yet wired to anything — the state every node passes
+        // through, and a state the graph store happily persists.
+        graph.nodes.push(action("island"));
+        assert!(
+            !graph.edges.iter().any(|edge| edge.source == "island"),
+            "the node is unconnected by construction — that is the whole point"
+        );
+
+        // The canvas's own question, answered by the rule in `run-from-here.ts`: no
+        // outgoing edge, so the node is last on its own (empty) path.
+        let has_outgoing = graph.edges.iter().any(|edge| edge.source == "island");
+        assert!(
+            !has_outgoing,
+            "this is what makes the inspector offer the button at all"
+        );
+
+        let error = plan_from_node(&graph, "island")
+            .expect_err("the walk never reaches an unconnected node, so it cannot start a run")
+            .to_string();
+        assert!(
+            error.contains("island"),
+            "the refusal has to name the node, or the author cannot tell which card failed: \
+             {error}"
+        );
+    }
+
+    /// The port the engine's walk follows is *every non-terminal port*, and the client now
+    /// derives it from `terminal` instead of carrying a second list of port names.
+    ///
+    /// This test is what makes that derivation legitimate rather than a second guess. A
+    /// hand-written copy of `follows()` in TypeScript would be the exact defect this
+    /// branch has now hit three times — the type registry, the port names and the trigger
+    /// prefix, each copied into a file nothing compiles — and it would fail the same way:
+    /// a port added to the registry later would be followed by the engine and refused by
+    /// the client, or the reverse, and the button would be live where the run is refused.
+    ///
+    /// So the identity is asserted over the whole registry rather than in prose: **no
+    /// terminal port is followed, and every non-terminal one is.** If a future node type
+    /// breaks it — a terminal port that leaves the run to another node, or a non-terminal
+    /// one that ends it — this goes red, and the client's `terminal` check stops being a
+    /// guess and becomes a fact it is allowed to rely on.
+    #[test]
+    fn the_walk_follows_every_port_that_is_not_terminal_and_no_terminal_one() {
+        let mut ports = 0;
+        for node_type in crate::graph::NODE_TYPES {
+            for port in node_type.outputs {
+                ports += 1;
+                assert_eq!(
+                    crate::graph::followed_port(port.key),
+                    !port.terminal,
+                    "{}.{} is {}terminal, so the walk must {} follow it",
+                    node_type.key,
+                    port.key,
+                    if port.terminal { "" } else { "non-" },
+                    if port.terminal { "not " } else { "" },
+                );
+            }
+        }
+        assert!(ports >= 8, "the registry is the whole input; {ports} ports is too few");
+    }
 }
