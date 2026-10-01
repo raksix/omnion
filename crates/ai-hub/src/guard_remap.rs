@@ -54,6 +54,12 @@ pub struct RemapEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemapMap {
     entries: Vec<RemapEntry>,
+    /// Tokens dropped by [`Self::merge`] because the same placeholder named two values.
+    ///
+    /// Carried on the map rather than recomputed by the caller: the caller cannot tell a token
+    /// that was withheld from one that was never seen, and the difference is exactly what a
+    /// requester needs reported.
+    withheld: Vec<String>,
 }
 
 impl RemapMap {
@@ -101,7 +107,10 @@ impl RemapMap {
                 label: m.label.clone(),
             });
         }
-        Self { entries }
+        Self {
+            entries,
+            withheld: Vec::new(),
+        }
     }
 
     /// Whether anything was masked in this request.
@@ -120,6 +129,72 @@ impl RemapMap {
     #[must_use]
     pub fn entries(&self) -> &[RemapEntry] {
         &self.entries
+    }
+
+    /// Merge the maps of one request's messages into a single answer map.
+    ///
+    /// This exists because each message is inspected on its own, and each inspection numbers its
+    /// own first e-mail `[EMAIL_1]`. Two turns naming two **different** addresses therefore both
+    /// emit `[EMAIL_1]` and the provider cannot tell them apart — so an answer that echoes the
+    /// token does not say which address it meant. Merging them naively would hand the reader one
+    /// of the two, and which one is a coin toss: a wrong guess writes somebody else's address
+    /// into an answer about a different person.
+    ///
+    /// So a contested token is **dropped rather than guessed**. It stays visible as the
+    /// placeholder, which is the same rule [`Self::substitute`] already applies to a token the
+    /// provider mangled — an unreadable token must never become a guess — applied one level up,
+    /// where the ambiguity comes from our own numbering instead of the model's spelling.
+    ///
+    /// A token whose value is **identical** everywhere it appears is not contested: that is the
+    /// same person named twice, and it merges into one entry.
+    #[must_use]
+    pub fn merge(maps: &[Option<RemapMap>]) -> Self {
+        // `BTreeMap` for the membership/agreement bookkeeping and a `Vec` for order: the
+        // entries are ordered by first appearance, which is the order `labels` and any listing
+        // already promise, and a sorted map would quietly change it.
+        let mut resolved: BTreeMap<String, Option<RemapEntry>> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut contested: Vec<String> = Vec::new();
+
+        for map in maps.iter().flatten() {
+            for entry in &map.entries {
+                match resolved.get(&entry.placeholder) {
+                    // Same token, same value: the same person named again. Nothing to merge.
+                    Some(Some(existing)) if existing.original == entry.original => {}
+                    // Same token, a different value: the token no longer identifies anything.
+                    Some(Some(_)) => {
+                        if !contested.contains(&entry.placeholder) {
+                            contested.push(entry.placeholder.clone());
+                        }
+                    }
+                    _ => {
+                        resolved.insert(entry.placeholder.clone(), Some(entry.clone()));
+                        order.push(entry.placeholder.clone());
+                    }
+                }
+            }
+        }
+
+        let entries = order
+            .into_iter()
+            .filter(|placeholder| !contested.contains(placeholder))
+            .filter_map(|placeholder| resolved.remove(&placeholder).flatten())
+            .collect();
+        Self {
+            entries,
+            withheld: contested,
+        }
+    }
+
+    /// The tokens this map **declined** to put back, because two different values claimed the
+    /// same placeholder.
+    ///
+    /// Named rather than folded into a log line: a requester looking at `[EMAIL_1]` needs to be
+    /// told it was withheld rather than left to assume the feature is broken, and an audit row
+    /// has to record that the token was seen and refused rather than merely absent.
+    #[must_use]
+    pub fn withheld(&self) -> &[String] {
+        &self.withheld
     }
 
     /// The placeholders this map knows, for a UI listing what was withheld.
@@ -193,7 +268,7 @@ impl RemapMap {
 mod tests {
     use super::*;
     use crate::guard_checkpoint::placeholder;
-    use crate::guard_data::{hash_value, mask_text, MaskStyle, Match_};
+    use crate::guard_data::{MaskStyle, Match_, hash_value, mask_text};
 
     const SALT: &str = "test-salt";
 
@@ -301,6 +376,105 @@ mod tests {
         assert_eq!(masked, "[EMAIL_1] and [EMAIL_1]");
         assert_eq!(map.len(), 2, "both spans map to the same token");
         assert_eq!(map.placeholders(), vec!["[EMAIL_1]", "[EMAIL_1]"]);
+    }
+
+    #[test]
+    fn a_token_naming_two_values_in_two_turns_is_withheld_rather_than_guessed() {
+        // Each turn is inspected separately, so each numbers its own first e-mail `[EMAIL_1]`.
+        let first = "mail ada@example.test";
+        let second = "mail grace@example.test";
+        let maps = vec![
+            Some(RemapMap::from_matches(
+                first,
+                &mask_text(
+                    first,
+                    &vec![match_at(first, "ada@example.test", "email")],
+                    MaskStyle::Numbered,
+                ),
+                &vec![match_at(first, "ada@example.test", "email")],
+                &token_map(
+                    &[match_at(first, "ada@example.test", "email")],
+                    MaskStyle::Numbered,
+                ),
+            )),
+            Some(RemapMap::from_matches(
+                second,
+                &mask_text(
+                    second,
+                    &vec![match_at(second, "grace@example.test", "email")],
+                    MaskStyle::Numbered,
+                ),
+                &vec![match_at(second, "grace@example.test", "email")],
+                &token_map(
+                    &[match_at(second, "grace@example.test", "email")],
+                    MaskStyle::Numbered,
+                ),
+            )),
+        ];
+        let merged = RemapMap::merge(&maps);
+
+        // The dangerous case is a silent wrong answer: a coin toss between two real addresses.
+        // Whichever one this picks, the reader is told about somebody else's address.
+        assert!(
+            merged.is_empty(),
+            "a contested token must put nothing back, got {:?}",
+            merged.entries()
+        );
+        assert_eq!(
+            merged.withheld(),
+            ["[EMAIL_1]".to_owned()],
+            "the withheld token must be reported, not silently dropped"
+        );
+        assert_eq!(
+            merged.substitute("I mailed [EMAIL_1]"),
+            "I mailed [EMAIL_1]",
+            "the token must stay visible rather than become a guess"
+        );
+        assert!(
+            !merged.substitute("[EMAIL_1]").contains("example.test"),
+            "NO address may be substituted for a contested token"
+        );
+    }
+
+    #[test]
+    fn the_same_value_in_two_turns_merges_into_one_entry_and_round_trips() {
+        let text = "mail ada@example.test";
+        let matches = vec![match_at(text, "ada@example.test", "email")];
+        let tokens = token_map(&matches, MaskStyle::Numbered);
+        let masked = mask_text(text, &matches, MaskStyle::Numbered);
+        let map = RemapMap::from_matches(text, &masked, &matches, &tokens);
+        let merged = RemapMap::merge(&[Some(map.clone()), Some(map)]);
+
+        assert_eq!(merged.len(), 1, "one person named twice is one entry");
+        assert!(merged.withheld().is_empty(), "nothing was contested here");
+        // The round trip is the promise: masked text -> original answer.
+        assert_eq!(merged.substitute(&masked), text);
+    }
+
+    #[test]
+    fn merging_unmasked_turns_alongside_masked_ones_keeps_the_masked_values() {
+        let text = "mail ada@example.test";
+        let matches = vec![match_at(text, "ada@example.test", "email")];
+        let tokens = token_map(&matches, MaskStyle::Numbered);
+        let masked = mask_text(text, &matches, MaskStyle::Numbered);
+        let map = RemapMap::from_matches(text, &masked, &matches, &tokens);
+        // `None` is what a clean turn reports — a batch is mostly clean turns in practice, and
+        // pairing them positionally is the case an off-by-one would corrupt.
+        let merged = RemapMap::merge(&[None, Some(map)]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged.substitute("sent to [EMAIL_1]"),
+            "sent to ada@example.test"
+        );
+    }
+
+    #[test]
+    fn a_merge_of_nothing_is_empty_and_harmless() {
+        let merged = RemapMap::merge(&[]);
+        assert!(merged.is_empty());
+        assert!(merged.withheld().is_empty());
+        assert_eq!(merged.substitute("[EMAIL_1]"), "[EMAIL_1]");
     }
 
     #[test]

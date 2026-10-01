@@ -27,10 +27,10 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::AiHubError;
 use crate::error::Result;
 use crate::guard_data::{Action, GuardVerdict, MaskStyle, Policy};
 use crate::guard_store::{self, LoadedGuard, NewEvent};
-use crate::AiHubError;
 
 /// Who is making the call and what it is for. Everything the rules can be scoped by.
 #[derive(Debug, Clone, Default)]
@@ -164,6 +164,20 @@ impl CheckpointReport {
             .zip(texts.iter())
             .map(|(report, text)| report.substitute(text))
             .collect()
+    }
+
+    /// The one answer map for a whole request, merged across every message it contained.
+    ///
+    /// The batch helpers above pair reports with texts **positionally**, which is the right
+    /// pairing for per-message decisions and the wrong one for an answer: the answer is a single
+    /// text produced after every message was masked, and each message numbered its own
+    /// `[EMAIL_1]`. Merging is therefore not a convenience but the only correct way to read one
+    /// token across a conversation — see [`crate::guard_remap::RemapMap::merge`].
+    #[must_use]
+    pub fn merged_map(reports: &[Self]) -> crate::guard_remap::RemapMap {
+        let maps: Vec<Option<crate::guard_remap::RemapMap>> =
+            reports.iter().map(|report| report.remap.clone()).collect();
+        crate::guard_remap::RemapMap::merge(&maps)
     }
 
     /// The redaction of a whole batch of texts.
@@ -559,7 +573,13 @@ mod tests {
     }
 
     fn match_at(start: usize, end: usize, key: &str) -> Match_ {
-        Match_::new(start, end, "email".to_owned(), key.to_owned(), "deadbeef".to_owned())
+        Match_::new(
+            start,
+            end,
+            "email".to_owned(),
+            key.to_owned(),
+            "deadbeef".to_owned(),
+        )
     }
 
     #[test]
@@ -576,7 +596,11 @@ mod tests {
             &guard.policy,
             "salt",
         );
-        assert!(finding.verdict.is_blocked(), "the verdict was {:?}", finding.verdict);
+        assert!(
+            finding.verdict.is_blocked(),
+            "the verdict was {:?}",
+            finding.verdict
+        );
     }
 
     #[test]
@@ -586,9 +610,14 @@ mod tests {
             blocking_policy(),
         );
         let text = "hello there, nothing to guard";
-        let finding = guard.detector.inspect(text, None, None, &guard.policy, "salt");
+        let finding = guard
+            .detector
+            .inspect(text, None, None, &guard.policy, "salt");
         assert_eq!(finding.verdict, GuardVerdict::Clear);
-        assert_eq!(finding.text, text, "a clean payload must arrive byte-identical");
+        assert_eq!(
+            finding.text, text,
+            "a clean payload must arrive byte-identical"
+        );
     }
 
     #[test]
@@ -623,13 +652,10 @@ mod tests {
             blocking_policy(),
         );
         let report = CheckpointReport {
-            verdict: guard.detector.inspect(
-                "ada@lovelace.com",
-                None,
-                None,
-                &guard.policy,
-                "salt",
-            ).verdict,
+            verdict: guard
+                .detector
+                .inspect("ada@lovelace.com", None, None, &guard.policy, "salt")
+                .verdict,
             outbound: String::new(),
             label_counts: BTreeMap::new(),
             match_count: 0,
@@ -654,7 +680,10 @@ mod tests {
             blocking_policy(),
         );
         let report = CheckpointReport {
-            verdict: guard.detector.inspect("nothing here", None, None, &guard.policy, "salt").verdict,
+            verdict: guard
+                .detector
+                .inspect("nothing here", None, None, &guard.policy, "salt")
+                .verdict,
             outbound: "nothing here".to_owned(),
             label_counts: BTreeMap::new(),
             match_count: 0,
@@ -690,8 +719,14 @@ mod tests {
             audit_error: Some("connection refused".to_owned()),
             remap: None,
         };
-        assert!(report.may_send(), "a missing audit row must not refuse a call");
-        assert_eq!(audit_failures(&[report]), vec!["connection refused".to_owned()]);
+        assert!(
+            report.may_send(),
+            "a missing audit row must not refuse a call"
+        );
+        assert_eq!(
+            audit_failures(&[report]),
+            vec!["connection refused".to_owned()]
+        );
     }
 
     #[test]
