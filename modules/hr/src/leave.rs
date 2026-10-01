@@ -486,6 +486,13 @@ impl LeaveScope {
     /// applied to the row query and to the count: two builders would let the count drift away
     /// from the rows, and the header's "24 requests" would then be a number the list cannot show.
     ///
+    /// The id is rendered as a **quoted, cast uuid literal** rather than interpolated bare. A
+    /// UUID is hyphenated, so `e.id = 6ba96e44-1111-…` is not a string to Postgres — it is
+    /// subtraction, and the database refuses it with "trailing junk after numeric literal". The
+    /// bug is invisible until a caller with a real id reaches the query, which is exactly what
+    /// the self-service surface does: it is the first thing in the module that narrows to a
+    /// *specific* employee rather than reading the whole organization.
+    ///
     /// # Errors
     ///
     /// **Refuses** a narrowed caller with no employee row, rather than returning no predicate.
@@ -499,7 +506,9 @@ impl LeaveScope {
             crate::model::Visibility::All => Ok(None),
             crate::model::Visibility::Own | crate::model::Visibility::Team => match self.employee_id
             {
-                Some(id) => Ok(Some(format!("e.id = {id}"))),
+                // `Uuid`'s `Display` is the canonical hyphenated form and nothing else, so the
+                // quoted literal cannot carry user input into the statement.
+                Some(id) => Ok(Some(format!("e.id = '{id}'::uuid"))),
                 None => Err(HrError::NotFound("employee")),
             },
         }
@@ -1138,9 +1147,12 @@ mod tests {
 
         let own = LeaveScope::all(Uuid::from_u128(1))
             .with(crate::model::Visibility::Own, Some(mine));
+        // Quoted and cast, because a bare hyphenated uuid is subtraction to the parser. The
+        // assertion is on the *exact* string so a change back to interpolation is a red test
+        // rather than a 500 that only a browser discovers.
         assert_eq!(
             own.employee_predicate().unwrap(),
-            Some(format!("e.id = {mine}"))
+            Some(format!("e.id = '{mine}'::uuid"))
         );
 
         // A platform account with no employee row is REFUSED, not widened. Returning "no
