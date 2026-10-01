@@ -2039,11 +2039,13 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
             .as_object()
             .expect("properties is an object")
             .len();
+        let listed = entry["payload_fields"]
+            .as_array()
+            .expect("payload_fields is an array")
+            .len();
         assert_eq!(
-            declared,
-            fields_of(entry).len(),
-            "{name}: the schema declares {declared} properties and the field list has {}",
-            fields_of(entry).len()
+            declared, listed,
+            "{name}: the schema declares {declared} properties and the field list has {listed}"
         );
 
         // And the acceptance criterion itself: the sample validates against its own schema.

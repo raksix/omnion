@@ -38,7 +38,7 @@
 //! it. What it does not enforce is stated there too, so a reader never has to guess whether a
 //! passing sample is a strong or a weak claim.
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use crate::catalogue::{EventDefinition, Field, FieldKind};
 
