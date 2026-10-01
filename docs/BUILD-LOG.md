@@ -7544,3 +7544,33 @@ cargo test -p omnion-core --lib   62 passed; 0 failed
 against, the `/notifications/settings` device block (three device API functions in
 `api.ts` still have **zero UI callers**), and `prune_endpoints`/`prune_stale` — which still
 have **zero call sites anywhere**, so a revoked endpoint is not yet pruned. Next tick.
+
+## 2026-10-01 · wave7 tick 41 · REQ-101 slice 3a — the change set, and the transaction that makes it all-or-nothing
+
+- **What.** `crates/ai-hub/src/change_sets.rs` (the store, the transition table, the
+  validator, the executor seam) and `apps/api/src/routes/ai_change_sets.rs` (list, create,
+  edit, confirm, discard) on the `ai_change_sets` table that migration `0189` created and
+  left unbuilt. Plus the two error variants the request's own refusals need.
+- **Proof.** `cargo build -p omnion-api` clean; `cargo test -p omnion-ai-hub --lib` → 506
+  passed (491 before, +15); `cargo test -p omnion-api --lib` → 256 passed; `pnpm typecheck`
+  2/2 successful.
+- **The merge nearly cost the tick.** `origin/main` had moved four commits and touched
+  `crates/core/src/config.rs`, so the merge conflicted there as well as in BUILD-LOG. The
+  resolution spliced both sides and produced a file that **compiled no further than the
+  `impl Default for AiHubConfig` header**: main's `PushConfig` block landed between the last
+  field and the closing braces. `cargo build -p omnion-core` caught it; `cargo build
+  -p omnion-ai-hub` did not, because it never needed to rebuild core. The lesson is about
+  which gate is authoritative *for the crate that changed*: a green `cargo build -p
+  omnion-ai-hub` says nothing at all about a merge that broke `omnion-core`.
+- **The sqlx trap, twice.** `#[sqlx(type_name = "jsonb")]` on a `Vec<ChangeOp>` field does not
+  configure the column — it makes the `FromRow` derive **panic** with `expected `,``. A bare
+  `Vec<T>` is a Postgres *array*, and a `jsonb` column is a document. So `ChangeSet` is not a
+  `FromRow` at all: `ChangeSetRow` holds the raw `Value` and `into_domain` refuses a document
+  of the wrong shape **by naming the column**. `unwrap_or_default()` would have been the easy
+  version and would have turned a corrupted row into a set with no operations, which
+  `validate` would then refuse with the far less useful "needs at least one operation".
+- **What is still open, deliberately.** The `failed` status, the `ai.changeset.failed` event,
+  the `updated_by` column (migration `0189` shipped without one, so recording the editor is a
+  migration and not a code change), the chat entry point, and a walk against a real database
+  proving operation 1's write is rolled back. The unit test proves the executor **stopped**;
+  it does not prove a transaction undid a row, and the acceptance box says so.
