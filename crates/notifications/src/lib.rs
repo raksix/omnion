@@ -24,8 +24,10 @@ pub mod model;
 pub mod preference_store;
 pub mod preferences;
 pub mod push;
+pub mod retention;
 pub mod router;
 pub mod store;
+pub mod testing;
 pub mod vocabulary;
 
 pub use audience::{addressable_recipients, may_address, refused_recipients};
@@ -51,8 +53,13 @@ pub use push::{
     ChannelReadiness, MAX_OUTBOX_PAGE, OUTBOX_RETENTION_DAYS, OutboxCounts, OutboxQuery, OutboxRow,
     OutboxScope, PrunedSubscription, PushSubscription, RegisterOutcome, RegisterReport,
     RetryOutcome, SUBSCRIPTION_STALE_DAYS, channel_readiness, list_outbox, list_subscriptions,
-    outbox_counts, prune_deliveries, prune_endpoints, prune_stale, register, remove,
-    retry_delivery,
+    outbox_counts, prune_endpoints, register, remove, retry_delivery,
+};
+pub use retention::{
+    DEFAULT_DEVICE_STALE_DAYS, MAX_ORGANIZATIONS as MAX_RETENTION_ORGANIZATIONS,
+    MAX_ROWS_PER_SWEEP, PassReport as RetentionPassReport, RetentionPolicy, SweepReport,
+    run_pass as run_retention_pass, sweep_deliveries, work_list as retention_work_list,
+    write_run as write_retention_run,
 };
 pub use router::{
     RecipientRule, RouteReport, RouteRule, RoutedEvent, create_rule, dedupe_key, delete_rule,

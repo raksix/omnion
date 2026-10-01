@@ -220,19 +220,13 @@ pub async fn list_subscriptions(pool: &PgPool, user_id: Uuid) -> Result<Vec<Push
 /// cutoff is a fact about time. The 30 days is generous on purpose: a phone that has been off
 /// for a month is a phone whose browser has very likely rotated the service worker, and the
 /// row would only ever collect `410`s.
+///
+/// **The constant survives its function.** The sweep that uses this lives in [`crate::retention`]
+/// and reads this number rather than carrying its own, because "how long is a dead device kept"
+/// has to have one answer between the outbox screen and the sweeper. What was removed is the
+/// `pub async fn prune_stale` that had **zero call sites for its whole life**: a statement
+/// nobody could reach, which is why the devices this names grew for ever on every installation.
 pub const SUBSCRIPTION_STALE_DAYS: i32 = 30;
-
-/// How many devices a pruning pass removed.
-pub async fn prune_stale(pool: &PgPool) -> Result<u64> {
-    let result: PgQueryResult = sqlx::query(
-        "delete from push_subscriptions \
-         where last_seen_at < now() - make_interval(days => $1::int)",
-    )
-    .bind(SUBSCRIPTION_STALE_DAYS)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
 
 /// Delete the devices a push service has said are gone, and report which ones.
 ///
@@ -274,6 +268,13 @@ impl PrunedSubscription {
 /// short enough that an installation does not accumulate a delivery log forever. The sweep is
 /// [`prune_deliveries`]'s job; the constant is here so the admin screen can say how far back
 /// it answers.
+///
+/// **It is the fallback, not the rule.** Each organization keeps its own window in
+/// `organizations.notification_retention_days`, and this is what an installation with no row
+/// gets — the same relationship `organizations.event_retention_days` has to the event bus. The
+/// sweep that reads both is [`crate::retention::sweep_deliveries`], which the runner calls on
+/// every tick; the number used to be published here with nothing behind it, because the only
+/// function that read it (`prune_deliveries`) had no caller.
 pub const OUTBOX_RETENTION_DAYS: i32 = 60;
 
 /// The largest page of outbox rows one read returns.
@@ -562,9 +563,17 @@ pub async fn retry_delivery(
     scope: OutboxScope,
     id: Uuid,
 ) -> Result<RetryOutcome> {
+    // **`settled_at = null` is load-bearing, and the pre-fix statement had no such column.**
+    // A retry un-settles the row: it was `failed` (so `mark_failed` stamped `settled_at`) and it
+    // is now queued again. Leaving the stamp would make retention judge a row nobody has
+    // finished with by an instant from a delivery that already ended — the sweep's pending
+    // guard would rescue it today, so a test that only asserts "a pending row is kept" would
+    // pass with this omission in place, and the row would be swept the moment the guard is
+    // rewritten. The other four columns cleared here are the row's own error record; this one
+    // is the clock the sweep reads.
     let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
         "update notification_deliveries d set status = 'pending', attempts = 0, \
-             next_attempt_at = now(), error = null, response_status = null \
+             next_attempt_at = now(), error = null, response_status = null, settled_at = null \
          from notifications n where d.notification_id = n.id and d.id = ",
     );
     builder.push_bind(id);
@@ -600,19 +609,6 @@ pub async fn retry_delivery(
     } else {
         RetryOutcome::NotRetryable
     })
-}
-
-/// Delete delivery rows older than [`OUTBOX_RETENTION_DAYS`], and report how many went.
-pub async fn prune_deliveries(pool: &PgPool) -> Result<u64> {
-    let result: PgQueryResult = sqlx::query(
-        "delete from notification_deliveries \
-         where status in ('sent', 'skipped') \
-           and created_at < now() - make_interval(days => $1::int)",
-    )
-    .bind(OUTBOX_RETENTION_DAYS)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
 }
 
 /// Refuse an endpoint the push service could never accept.
