@@ -132,6 +132,7 @@ pub mod secrets_credentials;
 pub mod secrets_leases;
 pub mod security;
 pub mod security_headers;
+pub mod security_ip;
 pub mod security_limiter;
 pub mod sso;
 pub mod tenancy;
@@ -1561,6 +1562,32 @@ pub fn router(state: AppState) -> Router {
             "/security/locked-accounts/{user_id}/unlock",
             post(security_limiter::unlock).layer(guards::require(&state, "security.manage")),
         )
+        // IP access lists (REQ-012 slice 4). Reading them is `security.read` — the same read the
+        // overview's IP-allow-list check already makes, and the same read an operator needs to
+        // understand a refusal. Changing them is `security.ip.manage`, its OWN key rather than
+        // `security.manage`, because an allow/deny list is the one screen in the centre that can
+        // lock every administrator out of the platform at once. Splitting it means holding the
+        // "manage findings and settings" power does not silently confer the power to deny the
+        // CEO's office — a grant nobody would think twice about.
+        .route(
+            "/security/ip-rules",
+            get(security_ip::get)
+                .layer(guards::require(&state, "security.read"))
+                .merge(
+                    post(security_ip::post).layer(guards::require(&state, "security.ip.manage")),
+                ),
+        )
+        .route(
+            "/security/ip-rules/test",
+            // The tester changes nothing, so it is `security.read` — the same reasoning as the
+            // rate-limit tester: an operator diagnosing a refusal must not need the power to
+            // change the policy in order to be told what the policy says.
+            post(security_ip::test).layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/ip-rules/{id}",
+            delete(security_ip::delete).layer(guards::require(&state, "security.ip.manage")),
+        )
         .route(
             "/security/findings/{id}",
             get(security::get)
@@ -2323,6 +2350,10 @@ pub fn router(state: AppState) -> Router {
     // matches" is the documented state of a fresh instance, and the gateway limiter above is
     // still enforcing its own document throughout.
     let platform_layer = crate::reliability_middleware::ensure_installed(&state);
+    // The IP access list is installed the same way and for the same reason (REQ-012 slice 4):
+    // read once, swapped in place by a save, so a rule added on the panel refuses the *next*
+    // request rather than the one after the next restart.
+    let ip_access_layer = crate::security_ip::ensure_installed(&state);
 
     Router::new()
         .route("/healthz", get(health::healthz))
@@ -2359,19 +2390,28 @@ pub fn router(state: AppState) -> Router {
         // The request log stays outside the limiter (see the bottom of this chain) so a request
         // BURNED the budget is still a line an operator can find — a rate-limited request with no
         // log line is the one rejection the log cannot answer questions about.
-        .layer(crate::rate_limit_middleware::rate_limit(
-            limiter_layer.clone(),
-        ))
         // The platform budgets sit INSIDE the gateway limiter, so a caller over both budgets is
         // refused by the outer one and the operator's first stop is the document they configured
         // first. The reverse order would mean the newer, less-tuned layer always wins, and a
         // platform whose 429s are decided by whichever row was written last is not debuggable.
         //
-        // The request log stays OUTSIDE both, for the same reason it is outside the gateway
-        // limiter: a request that BURNED a budget must still be a line an operator can find.
+        // The IP access list runs ahead of the limiter and ahead of every guard, for the same
+        // reason the limiter does: an address rule exists to stop a caller who has no account,
+        // so anything behind `guards::require` would never see one. Ahead of the limiter because
+        // a denied address should cost nothing — not even a Redis round trip.
+        //
+        // Read the chain OUTERMOST to INNERMOST, i.e. bottom-up, because `.layer()` wraps what is
+        // already built: the LAST call in the block is the OUTERMOST layer. The order below is
+        // therefore `platform_limit` → `rate_limit` → `ip_access`, meaning a refused address
+        // costs nothing, a caller over the gateway budget is told by the document written first,
+        // and a request that BURNED a budget is still a line the request log can find.
         .layer(crate::reliability_middleware::platform_limit(
             platform_layer.clone(),
         ))
+        .layer(crate::rate_limit_middleware::rate_limit(
+            limiter_layer.clone(),
+        ))
+        .layer(crate::security_ip::ip_access(ip_access_layer))
         // CSRF sits OUTSIDE the permission guards on purpose: a guard answers 401 for a request
         // with no session and 403 for one whose account lacks the key. The CSRF layer's answer is
         // about the *request*, and it has to be reached only by a request that actually

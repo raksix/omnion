@@ -6319,6 +6319,79 @@ async function runSecurityDepth(page, report) {
     }
   }
 
+  // -- the IP access lists (REQ-012, slice 4) ------------------------------------------------
+  //
+  // `/security/ip-access` was linked from the posture overview's IP-allow-list row since the
+  // check registry was written, so this step is not optional bookkeeping: it is what proves the
+  // link is no longer dead. The walk exercises the parts a static inventory cannot judge — that
+  // a rule is really added, that a malformed one is refused with a message on the field, and
+  // that the tester agrees with the platform about an address the walk itself owns.
+  await page.goto(`${URL_ADMIN}/security/ip-access`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-ip-access-counts]", { timeout: 15000 }).catch(() => {});
+  const ipAccessReady = (await page.locator("[data-ip-access-counts]").count()) > 0;
+  note({ step: "ip-access-loaded", rendered: ipAccessReady });
+  if (!ipAccessReady) {
+    note({ step: "ip-access-missing", reason: "/security/ip-access did not render its summary line" });
+    await shot(page, "security-ip-access-missing");
+  } else {
+    // The empty state has to be a statement rather than a blank table: "no rules" and "a broken
+    // screen" look identical otherwise, and this is the state a fresh installation is in.
+    const emptyState = (await page.locator("[data-ip-access-empty]").count()) > 0;
+    note({ step: "ip-access-empty-state", present: emptyState });
+
+    // A malformed network must be refused with a message, not saved. The form is filled with a
+    // prefix past the family's maximum: the shape an operator's typo actually takes.
+    const cidrField = page.locator("[data-ip-access-cidr]").first();
+    const noteField = page.locator("[data-ip-access-note]").first();
+    if ((await cidrField.count()) > 0 && (await noteField.count()) > 0) {
+      await cidrField.fill("203.0.113.0/33");
+      await noteField.fill("walkthrough invalid network");
+      await page.locator("[data-ip-access-submit]").first().click().catch(() => {});
+      await page.waitForTimeout(900);
+      const fieldError = (await page.locator("[data-ip-access-error]").count()) > 0;
+      note({ step: "ip-access-malformed-refused", refused: fieldError });
+      if (!fieldError) {
+        note({
+          step: "ip-access-malformed-accepted",
+          reason: "203.0.113.0/33 was accepted by the form",
+        });
+      }
+      await shot(page, "security-ip-access-invalid");
+
+      // Now a real rule, added through the panel's own form. The note is required, so it is
+      // filled too — a walk that omitted it would be measuring the wrong refusal.
+      await cidrField.fill("203.0.113.0/24");
+      await noteField.fill("walkthrough deny list");
+      await page.locator("[data-ip-access-submit]").first().click().catch(() => {});
+      await page.waitForTimeout(1200);
+      const created = (await page.locator("[data-ip-rule-list]").count()) > 0;
+      note({ step: "ip-access-rule-created", listed: created });
+      await shot(page, "security-ip-access");
+
+      // The tester must agree with the platform about the address the walk itself comes from.
+      // A rule that covers this session is expected to produce the self-lockout warning; either
+      // that warning or a plain "blocked" verdict is correct, and both are recorded rather than
+      // asserted here, because the browser's address is not something this step controls.
+      const probeField = page.locator("[data-ip-access-probe-input]").first();
+      if ((await probeField.count()) > 0) {
+        await probeField.fill("203.0.113.7");
+        await page.locator("[data-ip-access-probe]").first().click().catch(() => {});
+        await page.waitForTimeout(900);
+        const verdict = (await page.locator("[data-ip-access-probe-result]").count()) > 0;
+        const blocked = await page
+          .locator("[data-ip-access-probe-result]")
+          .first()
+          .getAttribute("data-blocked")
+          .catch(() => null);
+        note({ step: "ip-access-tester", rendered: verdict, blocked });
+        if (!verdict) {
+          note({ step: "ip-access-tester-missing", reason: "the tester rendered no verdict" });
+        }
+        await shot(page, "security-ip-access-tester");
+      }
+    }
+  }
+
   return { ok: true, steps };
 }
 
@@ -9979,6 +10052,7 @@ async function main() {
     // things on it that can be wrong while the list looks perfect, and neither is visible until
     // it is opened -- which is exactly what this pass does.
     { path: "/settings/reliability/intake", name: "reliability-intake" },
+    { path: "/security/ip-access", name: "security-ip-access" },
     // The system health centre (REQ-014, slice 1). Walked here and driven by
     // `runHealthDepth` below, which reads the eight service rows, opens a row's
     // checks and presses "Run all checks". "No untested screen" means no
@@ -10650,11 +10724,11 @@ async function runReliabilityBreakersDepth(page) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
-  // as a known name instead of reporting it as unmatched. The three deployment screens (REQ-128
+// as a known name instead of reporting it as unmatched. The three deployment screens (REQ-128
   // slice 4) are in this list rather than only measured inside their depth passes: a layout that
   // has never been opened in a 390px context has not been tested on a phone, and the upgrade
   // helper is read at 2am on a phone more often than anybody planned.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }, { path: "/deployment/backfills", name: "deployment-backfills" }, { path: "/deployment/seeds", name: "deployment-seeds" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }, { path: "/deployment/backfills", name: "deployment-backfills" }, { path: "/deployment/seeds", name: "deployment-seeds" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
