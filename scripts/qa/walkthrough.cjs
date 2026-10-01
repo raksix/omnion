@@ -11414,6 +11414,269 @@ async function runDevEventsDepth(page, report) {
   return { ok: true, claims: Object.keys(steps).length, ...steps };
 }
 
+
+/**
+ * The SDK and CLI surface (REQ-033, slice 4), driven.
+ *
+ * A route visit is worth almost nothing here: every claim on this screen is a claim about what
+ * happens *after* a button is pressed. A fresh database renders four empty starters, a validator
+ * with nothing in it and a CLI panel with no code — all of which pass a route walk. So this pass
+ * previews a starter, generates one, downloads the archive the list offers, validates a broken
+ * manifest with line numbers, and walks the device-code flow from "request" to "approved".
+ *
+ * **Every claim is a verdict, not an observation.** `runDepthPass` catches a *thrown* error and
+ * `run.sh` reads only `summary.json`, so a pass that appends booleans to a `steps` object and
+ * returns it produces numbers nobody reads — the tick-98 class of gate, and several older passes
+ * in this file have exactly that shape. Each claim is `check(name, value)` and the pass throws
+ * naming the ones that did not hold.
+ *
+ * Two claims here are the ones that fail on a *plausible* implementation:
+ *   - `theDownloadServesAZip`: a `<a href>` that returns 200 with HTML in it downloads a file the
+ *     developer cannot unpack. The assertion reads the response, not the DOM.
+ *   - `theDeepLinkSelectsTheCliTab`: `verification_uri` is `/developer/sdks?tab=cli`, handed to
+ *     the terminal in clear text. A tab strip held only in React state ignores it, lands on a
+ *     working page, and is invisible to every other gate on this file — the same dead-button
+ *     shape as the catalogue's `?event=` link two ticks earlier.
+ */
+async function runDevSdksDepth(page, report) {
+  const steps = {};
+  const failures = [];
+  const check = (claim, ok) => {
+    steps[claim] = Boolean(ok);
+    if (!ok) failures.push(claim);
+  };
+
+  const name = `qa-scaffold-${Date.now().toString(36)}`;
+
+  await page
+    .goto(`${URL_ADMIN}/developer/sdks`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector("[data-dev-sdk-form]", { timeout: 15000 }).catch(() => {});
+
+  // ---- The empty state, which is the first paint a developer sees -------------------------
+  check("theEmptyHistoryNamesItself", (await page.locator("[data-dev-sdk-history-empty]").count()) === 1);
+
+  // ---- Validation before any request --------------------------------------------------------
+  // A short name must be refused *on screen*. The buttons stay disabled, so the claim is about
+  // the button rather than about an error banner — there is nothing to send.
+  await page.locator("[data-dev-sdk-name]").fill("ab");
+  await page.waitForTimeout(300);
+  check(
+    "anUnacceptableNameIsRefusedOnScreen",
+    (await page.locator("[data-dev-sdk-name-error]").count()) === 1 &&
+      (await page.locator("[data-dev-sdk-generate]").isDisabled().catch(() => false)),
+  );
+
+  // A name the *server* also refuses, typed past the client rule's own length check, must reach
+  // the server and come back as a message rather than as a silent no-op. `..` is the case that
+  // matters: it is what a person types when they mean "the same folder, one level up".
+  await page.locator("[data-dev-sdk-name]").fill("has spaces/slash");
+  await page.waitForTimeout(300);
+  check(
+    "anUnsafeNameIsRefusedBeforeTheRequest",
+    (await page.locator("[data-dev-sdk-name-error]").count()) === 1,
+  );
+
+  // ---- Preview writes nothing ---------------------------------------------------------------
+  const beforeRows = await page.locator("[data-dev-sdk-row]").count();
+  await page.locator("[data-dev-sdk-name]").fill(name);
+  await page.waitForTimeout(200);
+  await page.locator("[data-dev-sdk-preview]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-dev-sdk-preview-panel]", { timeout: 15000 }).catch(() => {});
+  check("thePreviewRenders", (await page.locator("[data-dev-sdk-preview-panel]").count()) === 1);
+
+  const previewFiles = await page
+    .locator("[data-dev-sdk-file]")
+    .evaluateAll((nodes) => nodes.map((n) => n.getAttribute("data-dev-sdk-file")))
+    .catch(() => []);
+  check(
+    "thePreviewShowsARealTree",
+    previewFiles.length > 0 && previewFiles.includes("omnion.manifest.json"),
+    );
+  check(
+    "thePreviewHidesTheDotfilesItAdmitsToHiding",
+    !previewFiles.includes(".env.example") && !previewFiles.includes(".gitignore"),
+  );
+
+  // Opening a file must show THAT file's body. Counting `<pre>` elements would pass on a screen
+  // that opened the wrong one, so the assertion is on the content.
+  if (previewFiles.length > 0) {
+    const first = previewFiles[0];
+    await page.locator(`[data-dev-sdk-file="${first}"]`).click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    const body = await page
+      .locator(`[data-dev-sdk-file-body="${first}"]`)
+      .textContent()
+      .catch(() => "");
+    check("theFileOpensItsOwnBody", body.length > 0);
+  }
+  await shot(page, "page-developer-sdks-preview");
+
+  // The claim above the one everybody forgets: Preview is a *preview*.
+  check(
+    "previewRecordedNothing",
+    (await page.locator("[data-dev-sdk-row]").count()) === beforeRows,
+  );
+
+  // ---- Generate records a row, and the row is downloadable -----------------------------------
+  await page.locator("[data-dev-sdk-generate]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-dev-sdk-notice]", { timeout: 20000 }).catch(() => {});
+  check("generateReportsWhatItDid", (await page.locator("[data-dev-sdk-notice]").count()) === 1);
+  const rows = page.locator("[data-dev-sdk-row]");
+  check("generateRecordedTheRow", (await rows.count()) > beforeRows);
+
+  const href = await page
+    .locator("[data-dev-sdk-download]")
+    .first()
+    .getAttribute("href")
+    .catch(() => null);
+  check("theRowOffersADownload", Boolean(href));
+
+  if (href) {
+    // Fetched rather than clicked, because the claim is about the *response*: a link that
+    // downloads an HTML error page is a dead button with a download icon on it.
+    const archive = await page.evaluate(async (url) => {
+      const answer = await fetch(url, { credentials: "same-origin" });
+      const body = await answer.arrayBuffer();
+      const head = new Uint8Array(body.slice(0, 4));
+      return {
+        status: answer.status,
+        contentType: answer.headers.get("content-type") || "",
+        disposition: answer.headers.get("content-disposition") || "",
+        // PK\x03\x04 — a local file header. Any HTML, JSON or empty body fails this.
+        signature: Array.from(head),
+        length: body.byteLength,
+      };
+    }, href);
+
+    check("theDownloadServesAZip", archive.status === 200 && archive.signature[0] === 0x50 && archive.signature[1] === 0x4b);
+    check(
+      "theDownloadNamesTheFile",
+      archive.disposition.includes("attachment") && archive.disposition.includes(".zip"),
+    );
+    check(
+      "theDownloadIsTypedAsAZip",
+      archive.contentType.includes("zip"),
+      );
+    // A zero-byte zip is still a valid signature, so the size has to be asserted too: the
+    // template is eight files and the smallest one a developer could receive is kilobytes.
+    check("theDownloadHasContent", archive.length > 2000, );
+  }
+  await shot(page, "page-developer-sdks-generated");
+
+  // ---- The validator reports a line ----------------------------------------------------------
+  await page.locator("[data-dev-sdk-manifest-input]").fill("{ not json at all");
+  await page.locator("[data-dev-sdk-manifest-run]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-dev-sdk-manifest-report]", { timeout: 15000 }).catch(() => {});
+  const verdict = await page
+    .locator("[data-dev-sdk-manifest-verdict]")
+    .getAttribute("data-dev-sdk-manifest-verdict")
+    .catch(() => null);
+  check("anInvalidManifestIsRefused", verdict === "invalid");
+  const issueText = await page
+    .locator("[data-dev-sdk-manifest-issue]")
+    .first()
+    .textContent()
+    .catch(() => "");
+  check("theValidatorExplainsItself", issueText.trim().length > 0);
+  await shot(page, "page-developer-sdks-manifest");
+
+  // The inverse: a manifest the platform will actually load must be reported as loadable. A
+  // validator that refuses everything passes the claim above.
+  await page
+    .locator("[data-dev-sdk-manifest-input]")
+    .fill(JSON.stringify({ kind: "plugin", version: "1.0.0", name, entry: "dist/index.js" }));
+  await page.locator("[data-dev-sdk-manifest-run]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const goodVerdict = await page
+    .locator("[data-dev-sdk-manifest-verdict]")
+    .getAttribute("data-dev-sdk-manifest-verdict")
+    .catch(() => null);
+  check("aLoadableManifestIsAccepted", goodVerdict === "valid");
+
+  // ---- The CLI tab: the deep link the terminal prints ------------------------------------------
+  await page.goto(`${URL_ADMIN}/developer/sdks?tab=cli`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-dev-sdk-cli]", { timeout: 15000 }).catch(() => {});
+  // The tab strip must SHOW the selection, not merely render the right panel: a screen whose
+  // aria-selected is wrong tells a person they are somewhere they are not.
+  const selected = await page
+    .locator('[data-dev-sdk-tab][aria-selected="true"]')
+    .getAttribute("data-dev-sdk-tab")
+    .catch(() => null);
+  check("theDeepLinkSelectsTheCliTab", selected === "cli" && (await page.locator("[data-dev-sdk-cli]").count()) === 1);
+
+  await page.locator("[data-dev-sdk-cli-start]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-dev-sdk-cli-code]", { timeout: 15000 }).catch(() => {});
+  const shownCode = (await page.locator("[data-dev-sdk-cli-code]").textContent().catch(() => "")) || "";
+  const codeMatch = shownCode.match(/[A-Z0-9]{4}-[A-Z0-9]{4}/);
+  check("aLoginCodeIsShown", Boolean(codeMatch));
+
+  const verification = shownCode.includes("tab=cli") ? true : await page
+    .locator("[data-dev-sdk-cli-code]")
+    .textContent()
+    .then((t) => Boolean(t && t.includes("tab=cli")))
+    .catch(() => false);
+  check("theCodePointsAtThisScreen", verification);
+
+  if (codeMatch) {
+    const userCode = codeMatch[0];
+    await page.locator("[data-dev-sdk-cli-code-input]").fill(userCode);
+    await page.locator("[data-dev-sdk-cli-find]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-dev-sdk-cli-pending]", { timeout: 15000 }).catch(() => {});
+    check("theLookupShowsWhoIsAsking", (await page.locator("[data-dev-sdk-cli-pending]").count()) === 1);
+
+    // The plain-language scopes, not the raw permission keys. This is the phishing defence's
+    // whole surface: a bare code with a confirm button next to it is what makes device-code
+    // approval dangerous, and the sentences are the difference.
+    const sentences = await page
+      .locator("[data-dev-sdk-cli-pending] li")
+      .allTextContents()
+      .catch(() => []);
+    check(
+      "theScopesAreSpokenNotSpelled",
+      sentences.length > 0 && sentences.every((s) => !s.includes("developer.")),
+    );
+
+    await page.locator("[data-dev-sdk-cli-approve]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-dev-sdk-cli-approved]", { timeout: 15000 }).catch(() => {});
+    check("approvalIsConfirmed", (await page.locator("[data-dev-sdk-cli-approved]").count()) === 1);
+    await shot(page, "page-developer-sdks-cli-approved");
+
+    // The single-use claim: approving the same code twice must not mint a second token. The
+    // screen says "already approved" rather than offering the button again.
+    await page.locator("[data-dev-sdk-cli-code-input]").fill(userCode);
+    await page.locator("[data-dev-sdk-cli-find]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    check(
+      "anApprovedCodeCannotBeApprovedAgain",
+      (await page.locator("[data-dev-sdk-cli-approve]").count()) === 0,
+    );
+  }
+  await shot(page, "page-developer-sdks-cli");
+
+  // ---- The other three tabs are real -----------------------------------------------------------
+  for (const kind of ["theme", "workflow"]) {
+    await page.locator(`[data-dev-sdk-tab="${kind}"]`).click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    const selectedAfter = await page
+      .locator('[data-dev-sdk-tab][aria-selected="true"]')
+      .getAttribute("data-dev-sdk-tab")
+      .catch(() => null);
+    // The tab switch must also move the URL, or a reload silently throws the person back to the
+    // plugin generator and the terminal's own instruction ("open ?tab=cli") becomes a stale tip.
+    check(`the${kind}TabSelects`, selectedAfter === kind && page.url().includes(`tab=${kind}`));
+  }
+  await shot(page, "page-developer-sdks-theme");
+
+  if (failures.length > 0) {
+    throw new Error(
+      `${failures.length} dev-sdks claim(s) did not hold: ${failures.join(", ")}`,
+    );
+  }
+
+  return { ok: true, claims: Object.keys(steps).length, ...steps };
+}
+
 /**
  * The id of the app this pass just registered, found by its name.
  *
@@ -11913,6 +12176,14 @@ async function main() {
     // walked at /events by REQ-016 — this route checks that the developer framing is reachable
     // from its own nav entry, which is the one thing a second copy of the table could get wrong.
     { path: "/developer/events", name: "developer-events" },
+    // The SDK and CLI tooling (slice 4). Four tools on one tab strip, and every one of them is a
+    // claim about what happens *after* a button: a generator, a download, a validator and a
+    // device-code approval. A route visit on a fresh database renders four empty panels and
+    // passes, so the route is registered for first-paint and coverage, and the depth pass below
+    // is what actually drives it. The `?tab=cli` form is walked as its own entry because that is
+    // the URI the terminal prints — a deep link that lands on a working page is invisible here.
+    { path: "/developer/sdks", name: "developer-sdks" },
+    { path: "/developer/sdks?tab=cli", name: "developer-sdks-cli" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -12176,6 +12447,15 @@ async function main() {
   // is the one driving that form into a ticked state rather than walking past it.
   report.devEvents = await runDepthPass("dev-events", () => runDevEventsDepth(page, report));
   log(`dev-events: ${JSON.stringify(report.devEvents)}`);
+
+  // The SDK and CLI surface (REQ-033, slice 4). It runs after the OAuth and event passes because
+  // it *writes*: it records a scaffold row, stores an archive and approves a device code, and the
+  // request-log pass that follows would otherwise report a smaller window than the run produced.
+  // Its own claim about the deep link is why it cannot simply be a route: `/developer/sdks?tab=cli`
+  // is what a terminal prints, and the pass is the only thing that can tell whether the tab strip
+  // honours it.
+  report.devSdks = await runDepthPass("dev-sdks", () => runDevSdksDepth(page, report));
+  log(`dev-sdks: ${JSON.stringify(report.devSdks)}`);
 
   // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
   // because a scan counts the findings those passes have already written, and a scan that ran
