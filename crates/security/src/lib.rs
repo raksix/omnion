@@ -26,6 +26,9 @@ pub mod csrf;
 pub mod csv;
 pub mod enforce;
 pub mod error;
+pub mod events;
+pub mod events_csv;
+pub mod events_store;
 pub mod header_store;
 pub mod headers;
 pub mod ip_rules;
@@ -43,6 +46,16 @@ pub use csrf::{CSRF_COOKIE, CSRF_HEADER, derive_token as derive_csrf_token, toke
 pub use csv::{COLUMNS as EXPORT_COLUMNS, MAX_EXPORT_ROWS, render as render_findings_csv};
 pub use enforce::{EnforcedLockout, resolve as resolve_lockout};
 pub use error::{Result, SecurityError};
+pub use events::{
+    describe_outcome, event_id, is_refusal, is_sensitive_key, page_size as event_page_size,
+    search_term as event_search_term, summarise_metadata as summarise_event_metadata,
+};
+pub use events::{
+    EVENT_COLUMNS as SECURITY_EVENT_COLUMNS, EventCategory, EventPage, EventQuery, EventSource,
+    MAX_EXPORT_ROWS as MAX_EVENT_EXPORT_ROWS, SecurityEvent,
+};
+pub use events_csv::render as render_events_csv;
+pub use events_store::{export_rows as export_security_events, list as list_security_events};
 pub use header_store::{
     HeaderChange, StoredHeaders, header_history, history_count, load_headers, save_headers,
 };
