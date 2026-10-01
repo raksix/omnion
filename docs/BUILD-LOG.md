@@ -1,3 +1,64 @@
+## 2026-10-02 — tick 71: the generate route was the only one that answered with its own absence
+
+feat(app-builder): a prompt becomes a plan, and the artifacts are stored
+
+**Why this slice and not the apply runner the plan names next.** The queue said apply, so apply
+was the plan — until the entity step was traced to its target. The apply runner's first step
+writes the generated entity, and REQ-026's `entities` / `entity_fields` / `entity_records`
+tables exist in **no worktree at all** (checked all ten: `omnion`, `-w2`, `-w4`…`-w10`). Wave 2
+owns the dynamic data model, so writing those migrations here would collide with another
+writer's namespace over a table I do not own. So apply could not be built honestly today, and
+building it against a table I invented would have been the exact defect the loop exists to
+prevent.
+
+What *was* mine, and unreachable, was sitting in a registered route. `POST /generate` answered
+with `app_builder_generator_pending` — "the typed artifact generator is not wired yet" — after
+spending **zero** provider calls. That is the "coming soon" button wearing a status code: a
+reviewer pressed Generate, saw an error, and learned nothing about their application. Slice 1
+wrote the store, slice 2 wrote nine review routes, and nothing had ever asked a model for
+anything.
+
+**What landed.** `modules/app-builder/src/generate.rs` — the schema prompt as a **literal** (a
+caller who could append to it could describe a different application format and have it stored
+as if the platform had asked for it), and `normalize()`, which reads an untrusted answer into
+validated artifacts. `POST /generate` now spends **one** call and streams `artifact` / `note` /
+`done` frames while each row lands.
+
+| Gate | Command | Result |
+|---|---|---|
+| module | `cargo test -p omnion-module-app-builder --lib --quiet` | **56 passed**, 0 failed (was 41) |
+| api | `cargo build -p omnion-api --quiet` | clean, 0 errors |
+| walk | `cargo test -p omnion-api --test app_builder_routes` | **14/14** (was 10; the one that asserted the fake is gone) |
+
+**The walk found a real defect in the repair logic, and it was the interesting one.** The key
+repair normalized the artifact's own `key` but left `parent_key` exactly as the model wrote it,
+so an entity spelled `Leave Request` became `leave_request` while its field still pointed at
+`Leave Request` — a field belonging to an artifact that was not in the plan, invisible in the
+tree and unattached for apply. Fixed, with a unit test that also asserts a **correctly** spelled
+parent is left byte-identical (a repair that fired on every artifact would be indistinguishable
+from one that fired on none).
+
+**Repairs are stated, and the states are not equally forgiving.** `Leave Request` →
+`leave_request` and `Int` → `integer` are spelled out in the artifact's `rationale`, because
+silence is what makes a plan untrustworthy. But `photo` is **never** downgraded to `text`: that
+would build a plan storing something other than what was asked, and the validator names the
+unknown type instead so the reviewer decides. A missing rationale is likewise never invented —
+that would erase the difference between a model that explained itself and one that did not.
+
+**One call, asserted by the provider's own counter.** A walk pins `calls() == 1`, so a future
+repair loop fails there rather than quietly doubling the cost of a merely mis-spelled plan. And
+a plan missing required kinds **keeps its artifacts and names the gap** — the alternative
+(discarding a partial answer) throws away work for being incomplete, and the alternative
+(settling at `draft` with no notice) is the one state a reviewer could mistake for finished.
+
+**Not ticked:** the REQ-045 screen boxes still wait on the browser pass, and the QA slot is
+held live by `omnion-w4` (holder pid 1782910, `cwd=/mnt/apopic/omnion-w4`, verified with
+`kill -0` **and** `/proc/<pid>/cwd`).
+
+**Next:** REQ-026's entity tables land in wave 2 — the apply runner is unblocked the moment they
+do, and its first step is already specified against them. Meanwhile the screens' boxes are owed
+a pass.
+
 ## 2026-10-02 — tick 69b: tracing a pass you cannot run yet finds three things no gate would have
 
 fix(app-builder): three defects the pass found while tracing it, none of them in the pass's favour
