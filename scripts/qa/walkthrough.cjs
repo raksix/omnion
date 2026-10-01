@@ -83,6 +83,16 @@ const matchedOnly = new Set();
 /** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
 const MOBILE_NAMES = new Set();
 /**
+ * The deployment screens the pass must cover. Declared HERE, above both
+ * `assertDeploymentScreensWalked` and `module.exports`, because `module.exports` is evaluated at
+ * LOAD time while a `const` further down the file is still in its temporal dead zone — the
+ * exported reference threw `ReferenceError: Cannot access 'DEPLOYMENT_SCREENS' before
+ * initialization` and took the ENTIRE walkthrough file down with it, so no pass ran at all and the
+ * harness reported nothing. A missing screen and a broken harness must not look the same.
+ */
+const DEPLOYMENT_SCREENS = ["/deployment/artifacts", "/deployment/install", "/deployment/upgrade"];
+
+/**
  * Refuse to start a pass whose deployment screens are not all in the route list.
  *
  * `run.sh` reads a non-zero exit as "the pass did not run", which is the honest outcome for a
@@ -8733,8 +8743,6 @@ function walkVersion(label) {
  * route list — and it runs at startup, where a drift is a loud line in the log rather than a
  * silently untested screen three weeks later.
  */
-const DEPLOYMENT_SCREENS = ["/deployment/artifacts", "/deployment/install", "/deployment/upgrade"];
-
 async function runDeploymentArtifactsDepth(page, report) {
   const steps = [];
   const note = (step) => {
