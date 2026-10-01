@@ -13,10 +13,18 @@
 // for a tenant nobody created, and the report presented 1,477 high findings as a verdict
 // about the product.
 //
-// Two invariants, one file:
-//   1. the wizard entry point POLLS for the redirect instead of sleeping a fixed span, and
+// Four invariants, one file:
+//   1. the wizard entry point POLLS for the redirect instead of sleeping a fixed span,
 //   2. a step is only submitted when the form actually carries values, so an unfilled
-//      click can never be mistaken for a refused step.
+//      click can never be mistaken for a refused step,
+//   3. a wizard that did not run is reported with a REASON, and
+//   4. the sign-in after the wizard POLLS for the app shell, for the same reason as (1).
+//
+// Invariants 3 and 4 came from a run that had already succeeded at everything else:
+// `/tmp/w6-pass-t45b.log` seeded owner, organization and site over the API, and then died at
+// `FATAL: could not sign in` because the panel was still compiling the route the sign-in click
+// triggered. Three consecutive ticks recorded that pass as "queued and never ran" by reading
+// `summary.json`'s reason string instead of the rest of the file.
 const fs = require("fs");
 const path = require("path");
 
@@ -82,6 +90,49 @@ check(
   "the skip is recorded in the report's step log",
   /report\.steps\.push\(\{[^}]*wizard-skipped/.test(body),
   "nothing in the report records that the first run was skipped",
+);
+
+// ---- 4. the sign-in is WAITED FOR, not waited on with a fixed sleep -----------------------------
+// The same defect class as invariant 1, one function over. `ensureSignedIn` submitted the login
+// form and then `waitForTimeout(1200)` before reading `page.url()`. On a cold `next dev` that
+// click is what makes Turbopack compile the authenticated route, so 1.2 s is routinely answered
+// while the panel is still compiling and the address is still `/login`.
+//
+// The pass then returned `signedIn: false` and died at `FATAL: could not sign in after wizard` on
+// a login that had been accepted. `/tmp/w6-pass-t45b.log` is exactly that run: the seeder had
+// created owner, organization and site successfully three lines earlier, and the only thing the
+// pass could not do was notice that it was already signed in.
+//
+// The invariant is a POLL, and it must poll for the app SHELL rather than for the URL — a panel
+// that renders `nav[aria-label="Sections"]` is signed in even if the router has not rewritten the
+// address yet, and reading only the URL calls that a failure.
+// `body` is the slice BETWEEN runWizard and ensureSignedIn, so the sign-in function is not in it —
+// it has to be cut out of the whole source, and from the COMMENT-STRIPPED text, or a prose
+// mention of `nav[aria-label="Sections"]` in a comment would satisfy the check it is meant to
+// falsify. The function's real end is the first line that is exactly `}` at column 0; a lazy
+// `\n}` would stop at the first closing brace inside it.
+const stripped = stripComments(src);
+const signin = stripped.match(/async function ensureSignedIn[\s\S]*?\n\}\n/);
+check(
+  "the sign-in function is present to check",
+  signin !== null,
+  "ensureSignedIn could not be located in walkthrough.cjs",
+);
+const signinBody = signin ? signin[0] : "";
+check(
+  "the sign-in does not decide from a fixed sleep",
+  !/primaryClick\(page\)[\s\S]{0,120}?await page\.waitForTimeout\(\s*1200\s*\)/.test(signinBody),
+  "a fixed sleep still guards the post-login check — poll until the shell renders instead",
+);
+check(
+  "the sign-in polls for the app shell, not only for the address changing",
+  /nav\[aria-label="Sections"\]/.test(signinBody) && /(for\s*\(\s*let\s+\w+\s*=\s*0)/.test(signinBody),
+  "the post-login wait does not poll for the shell — a compiling route looks identical to a refusal",
+);
+check(
+  "a refused sign-in is reported with what the panel said",
+  /(refusal|role="alert")/.test(signinBody),
+  "a refused sign-in returns false with no reason, so it is indistinguishable from a slow compile",
 );
 
 if (failures.length > 0) {

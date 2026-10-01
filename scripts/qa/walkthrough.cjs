@@ -740,9 +740,45 @@ async function ensureSignedIn(page, report) {
   await pass.fill(CREDS.password).catch(() => {});
   await shot(page, "10-login-filled");
   const clicked = await primaryClick(page);
-  await page.waitForTimeout(1200);
-  report.steps.push({ action: "login", clicked, url: page.url() });
-  return !/\/login/.test(page.url());
+  // Wait for the sign-in to LAND, not for a fixed span.
+  //
+  // `waitForTimeout(1200)` was the same class of bug `runWizard` had: on a cold `next dev` the
+  // click on "Sign in" is what triggers Turbopack to compile the authenticated route, so 1.2 s
+  // can easily be answered while the panel is still compiling and the URL is still `/login`.
+  // The pass then returned `signedIn: false` and died at `FATAL: could not sign in after wizard`
+  // on a login that had in fact been accepted — which is what `/tmp/w6-pass-t45b.log` records,
+  // after a seeder that had already created the tenant successfully.
+  //
+  // So: poll for EITHER leaving /login OR the app shell rendering. The shell is the positive
+  // signal and matters more than the URL — a panel that renders its shell while the router has
+  // not yet rewritten the address is signed in, and a pass that reads only the URL calls that a
+  // failure. The error state (`role="alert"` beside the form) is checked too, so a genuine
+  // refusal returns promptly instead of burning the whole budget on a wait that cannot succeed.
+  let signedIn = false;
+  let refusal = "";
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const state = await page
+      .evaluate(() => ({
+        offLogin: !/\/login/.test(location.pathname),
+        shell: !!document.querySelector('nav[aria-label="Sections"]'),
+        alert: (document.querySelector('[role="alert"]')?.textContent || "").trim().slice(0, 200),
+      }))
+      .catch(() => ({ offLogin: false, shell: false, alert: "" }));
+    if (state.alert) {
+      refusal = state.alert;
+      break;
+    }
+    if (state.shell || state.offLogin) {
+      signedIn = true;
+      break;
+    }
+    await page.waitForTimeout(500);
+  }
+  report.steps.push({ action: "login", clicked, url: page.url(), signedIn, refusal });
+  if (!signedIn) {
+    log(`sign-in: the form was submitted but no session appeared${refusal ? ` — the panel said: ${refusal}` : ""}`);
+  }
+  return signedIn;
 }
 
 // ---------------------------------------------------------------- interaction
