@@ -15,13 +15,18 @@
  */
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Clock, ListChecks, Palmtree, type LucideIcon } from "lucide-react";
+import { Clock, ListChecks, Network, Palmtree, Users, type LucideIcon } from "lucide-react";
 
 const LINKS: { href: string; label: string; icon: LucideIcon }[] = [
-  // Leave is the only surface slice 2b builds, and it is the one people open: a request list with
-  // the absence calendar above it. Employees, attendance and settings belong to the slices that
-  // ship them — a link to a route that renders nothing is a dead button, and a dead button in a
-  // module's own nav is the first thing that makes the module look unfinished.
+  // Employees is the module's front door (slice 1). It is first because everything else in HR is a
+  // row that points at a person: leave, attendance and onboarding all ask "which employee?" before
+  // they ask anything else, so this is the tab the rest of the module hangs off.
+  { href: "/hr/employees", label: "Employees", icon: Users },
+  // The department tree and the org chart share a screen, because they answer one question
+  // between them — "who is in this part of the organization, and who leads it".
+  { href: "/hr/departments", label: "Departments", icon: Network },
+  // Leave is the surface people open most, and the request list with the absence calendar above it
+  // is where a request is actually made and decided.
   { href: "/hr/leave", label: "Leave", icon: Palmtree },
   // The type catalogue sits next to the requests it governs rather than under a Settings drawer:
   // deciding whether annual leave needs approval is part of working the leave screen.
