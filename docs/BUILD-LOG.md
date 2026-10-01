@@ -1,3 +1,65 @@
+## 2026-10-01 — tick 62 fixed the three sites its own report named, and left five
+
+fix(qa): settle-driven writes in the five builder rows a fixed sleep was racing ·
+test(qa): guard the write-gesture PATTERN, not the sites a report named
+
+**The box was not free, so this tick did not run a pass — it audited instead, and the audit
+found that the previous tick's fix was five rows short.**
+
+Tick 62 found `waitForTimeout(1200)` racing `AUTOSAVE_MS` and fixed three sites. Its own note
+calls the remaining ones "the same gesture", which is what made the gap invisible: each fix had
+been written from the row that reported the defect, so it covered the sites the report named.
+**Fixing the sites a report names leaves every unnamed site holding the defect.** A row-by-row
+sweep of `runWorkflowBuilderDepth` found five more.
+
+Three are the same race and were *shorter* than the debounce, which is worse:
+
+| row | was | why it was wrong |
+|---|---|---|
+| `undo-selection` | 1200 | exactly `AUTOSAVE_MS`; decided by which side of a timer |
+| `undo` | 900 | read the canvas BEFORE the autosave it asserted |
+| `drag-undo` | 900 | `doUndo` → `queueSave`; read an optimistically-repainted canvas |
+
+Two are the **mirror image**, and that is the part worth keeping. `narrow-lock` asserts the
+narrow-screen lock **refused** `Del` and `Control+z`, reading the graph after 600ms/800ms — both
+shorter than the debounce. A working lock and an unsaved graph are byte-identical readings: every
+number unchanged, banner present, verdict "read-only". `settleGraph` cannot help here; it waits
+for a version to MOVE, so on a correctly-locked page it returns `settled: false` — the right
+answer to the wrong question. Hence `awaitGraphUnchanged`, which waits out a full window and
+reports `unchanged`, so "nothing happened" means the write was given its chance and did not come.
+
+**The guard I wrote was wrong twice before it was right, both times caught only by dumping the
+window it actually read instead of trusting its verdict.** First draft searched for
+`indexOf("note({ step:")`, but most notes here are written across lines as `note({
+  step:` — so
+it skipped them, `edge-delete` got a 100KB window, and it condemned a `waitForTimeout(400)` two
+hundred lines away while CLEARING the two rows tick 62 had fixed correctly. Confidently wrong in
+both directions, which is worse than no guard. Second draft flagged any sleep anywhere in a window,
+so it condemned the `c`/`Enter` link probe for the `Delete` before it — the "widen until the
+assertion agrees" failure in its purest form. The sleep is now judged by POSITION: only one before
+that gesture's own helper can be standing in for it.
+
+Two things this tick got right that the previous ones did not:
+
+* **Every sibling harness was run, not the two touched** (tick 62's own `next_hint` asked for it).
+  All seven green.
+* **The guard ships with a mutation that turns it red**, because a guard that cannot fail is the
+  failure this REQ keeps re-learning in new shapes. Three mutations revert one site each; all three
+  are caught and the file is restored with an md5 check so an interrupted run cannot leave a defect.
+
+**Box state:** no pass — 27 Chrome, load 11.5, w5 mid-pass, `/mnt/apopic` at 94–100% during the
+tick (a patch failed on ENOSPC and was retried after clearing a stray temp file, +2.1G). Slot was
+free but the box was not. Next tick takes the pass when the box is genuinely idle.
+
+PROOF: `node --check` clean · **7/7 sibling harnesses** · `undo-selection-row` **8/8** (was 6/6) ·
+**3/3 mutations caught, file restored byte-exact** · `pnpm typecheck` **2/2** (admin + web) ·
+`cargo test -p omnion-workflows --lib` **157 passed** (no Rust touched).
+
+NEXT: the pass, on an idle box. It now closes `undo-selection` for `writeSettled:true` beside
+`cardRemovedByUndo`, `undo`/`drag-undo` for their new `writeSettled` + `nodesOnServer`, and
+`narrow-lock` for `keysUnchangedDuringWindow`. Then run-from-here and step-trace per tick 61's
+conjunction. Plugin row stays BLOCKED on REQ-121.
+
 ## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
 
 test(events): revive the whole suite. feat(events): catalogue four names the drift gate
