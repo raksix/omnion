@@ -8657,3 +8657,59 @@ layer its proofs will rest on.
 **Next.** The migration — numbered above the **union** high-water across all ten worktrees (0229),
 not my own branch's 0221 — then the resolver layer over the same service functions the REST
 handlers call, then the endpoint.
+
+## Tick 64 — REQ-130 slice 1 correction: the decision layer's vocabulary was fiction (wave6)
+
+**What.** The slice-1 schema catalogue named five permission keys the platform does not ship
+(`content.read`, `tenancy.read`, `media.download`, `billing.read`, `content.revisions.read`) and
+declared an `Article` type over `articles`/`createArticle` root fields. The platform spells them
+`content.pages.read`, `organizations.read`, `media.read`, and its content model is `Page`.
+
+**Why it survived 75 green tests.** A permission here was a bare `&str`, so nothing inside the crate
+could disagree with it. The failure mode is a *refusal*, not a crash: an uncatalogued key resolves to
+no permission, so `authorize(pool, user, scope, "content.read")` answers `403` — for every caller,
+**including the instance owner**, with a body that reads like an authentication problem. That is the
+defect REQ-128 and REQ-133 each lost ticks to. On a GraphQL surface it is worse than a dead route:
+the endpoint would be up, healthy and signed in while refusing every query.
+
+**Proof.**
+- `cargo test -p omnion-graphql --quiet` → **75 passed, 0 failed, 0 warnings**.
+- `cargo test -p omnion-api --test graphql_parity --quiet` → **8 passed, 0 failed**.
+- `cargo build -p omnion-graphql` → 0 warnings. `pnpm typecheck` → 2/2.
+- **Proven load-bearing, twice.** A `Known::InventedBillingRead` variant naming `"billing.read"` was
+  added and the suite stayed GREEN — because the crate cannot read the platform's catalogue. So the
+  gate moved to `apps/api/tests/graphql_parity.rs`, which links both sides. **It stayed green again**,
+  because it iterated a hand-written `ALL` list the variant was not in, and the local test only
+  checked that list for duplicates. After generating the list from the enum with a macro, the same
+  mutation is red in both places (local: "`billing.read` is not a key the platform ships"; gate:
+  "the GraphQL surface names `billing.read`, which is NOT a permission the platform ships").
+
+**What that mutation found, and it is the tick's real result.** A gate that shares its subject with
+the thing it audits measures nothing — the same family as tick 63's page-size loop and REQ-129's
+exported-snapshot gate. The fix is structural, not an assertion: the vocabulary is now generated, so
+a variant cannot exist outside the list the gate iterates, and `VARIANT_COUNT` pins the two against
+each other. Three ticks in a row have now found an assertion that could not fail. **An assertion
+whose subject is the implementation's own constant is not a guard.**
+
+**A parity gate has to run in both directions.** The first version compared schema ROOT fields only,
+so it reported `author` — a legitimate relation on `Page`, priced because a relation is a second
+query per parent — as fabricated. It was the test that was wrong. Narrowing a check to make it pass
+is how a gate gets deleted by the next reader instead of fixed.
+
+**Also fixed:** the cost catalogue priced `articles`/`createArticle` for a type that never existed,
+and had no entry for the `sites` and `publishPage` the restatement added — a field with no price is
+worse than a price with no field, because `price` fails closed. `pageBySlug` was already priced
+under the name `articleBySlug`; it is now declared, and it is the public renderer's own service
+function (`omnion_content::pages::find_page_by_slug`), so it is not a second implementation.
+
+**Rest and GraphQL are deliberately NOT identical in three places** — `Page.revisions`
+(`content.pages.restore`), `Page.author` (`users.read`), `MediaFile.scanStatus`. Each is annotated at
+its declaration, listed in `KNOWN_DIVERGENCES` with its reason, and asserted still to be true.
+Narrower costs a legitimate caller one query and shows in the explorer; wider would hand out data over
+a transport the operator did not intend to expose it on.
+
+**Not ticked.** Every acceptance box. Still no endpoint, no migration, no screen.
+
+**Next.** `0232_graphql_sdk.sql` — numbered above the **union** high-water of 0231 across all ten
+worktrees, not my own branch's 0221 — then the resolver layer over the SAME service functions the
+REST handlers call, then the endpoint.
