@@ -20,6 +20,7 @@ import {
   FileBarChart,
   FileText,
   ListChecks,
+  ListTodo,
   Network,
   Palmtree,
   Users,
@@ -48,6 +49,9 @@ const LINKS: { href: string; label: string; icon: LucideIcon }[] = [
   // screens rather than under My workspace: it answers "whose expires next", which is a question
   // about the organization and not about the person asking it.
   { href: "/hr/documents", label: "Documents", icon: FileText },
+  // Onboarding (slice 4b) sits with the operator's screens for the same reason documents does:
+  // "who is behind on their first weeks" is a question about the organization.
+  { href: "/hr/onboarding", label: "Onboarding", icon: ListTodo },
   // Reports last, because it is the screen you arrive at when you already know what you want.
   { href: "/hr/reports", label: "Reports", icon: FileBarChart },
 ];

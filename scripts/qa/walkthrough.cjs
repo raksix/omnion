@@ -2052,6 +2052,116 @@ async function runHrDocumentsAndReports(page, report) {
   return { ok: true, steps };
 }
 
+/**
+ * The onboarding board (REQ-055, slice 4b).
+ *
+ * Driven, and the two assertions it makes are the ones a screenshot cannot:
+ *
+ * 1. **A card's bar carries a number.** The pass reads the `done / total` text beside the bar and
+ *    requires it to be two integers — a bar that renders as a coloured div is unreadable in print
+ *    and to a colour-blind operator, and the acceptance criterion says the ticked items are styled
+ *    distinctly "not colour alone".
+ * 2. **Opening the checklist shows items, not a blank panel.** A checklist whose due dates arrive
+ *    as `[2026,61]` renders `undefined` on screen while every test stays green, because nothing in
+ *    the Rust side reads its own JSON back. The pass therefore reads the rendered due text and
+ *    requires it to look like a `YYYY-MM-DD` day rather than a year and an ordinal.
+ */
+async function runHrOnboarding(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "hr", action: "hr-onboarding", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/hr/onboarding`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  const rendered = (await page.locator("[data-qa-hr-onboarding]").count()) > 0;
+  note({ step: "board", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the onboarding board did not render", steps };
+  }
+  await shot(page, "page-hr-onboarding");
+
+  // Either cards or the empty state, and one of the two. Neither is a board still loading.
+  const cards = await page.locator("[data-qa-hr-onboarding-card]").count();
+  const empty = await page.locator("text=Nobody is onboarding yet").count();
+  note({ step: "board-state", cards, empty });
+  if (cards === 0 && empty === 0) {
+    return {
+      ok: false,
+      reason: "the onboarding board rendered neither a card nor an empty state",
+      steps,
+    };
+  }
+
+  // The shelf offers it, for the same reason as every other HR screen.
+  const shelf = await page.locator('[data-qa-hr-module-link="onboarding"]').count();
+  note({ step: "module-nav", offered: shelf > 0 });
+  if (shelf === 0) {
+    return { ok: false, reason: "the HR module nav does not offer the onboarding board", steps };
+  }
+
+  if (cards === 0) {
+    return { ok: true, steps };
+  }
+
+  // **The bar carries its number.** Two integers, in that order.
+  const progress = await page.locator("[data-qa-hr-onboarding-progress]").first().textContent();
+  const barNumbers = (progress ?? "").match(/(\d+)\s*\/\s*(\d+)/);
+  note({ step: "progress-text", text: progress, parsed: barNumbers ? barNumbers.slice(1, 3) : null });
+  if (!barNumbers) {
+    return {
+      ok: false,
+      reason: `a progress bar rendered "${progress}" instead of two numbers — the bar is carrying colour alone`,
+      steps,
+    };
+  }
+
+  // Open the first checklist and require it to have content.
+  await page.locator("[data-qa-hr-onboarding-open]").first().click().catch(() => {});
+  await page.waitForTimeout(1200);
+  const dialog = await page.locator("[role=dialog]").count();
+  const items = await page.locator("[data-qa-hr-onboarding-item]").count();
+  note({ step: "checklist", dialog, items });
+  if (dialog === 0) {
+    return { ok: false, reason: "the checklist did not open", steps };
+  }
+  if (items === 0) {
+    return {
+      ok: false,
+      reason: "the checklist opened with no items — an empty checklist is a real state, but the board's own apply path should have produced steps",
+      steps,
+    };
+  }
+  await shot(page, "page-hr-onboarding-checklist");
+
+  // **The due date is a day, not an ordinal array.** `time`'s own `serde` writes `[2026,61]`,
+  // which a browser renders as `undefined`, and nothing in cargo test can see it.
+  const itemText = await page.locator("[data-qa-hr-onboarding-item]").first().textContent();
+  const hasDay = /\d{4}-\d{2}-\d{2}/.test(itemText ?? "");
+  const hasUndefined = (itemText ?? "").includes("undefined");
+  note({ step: "due-date", hasDay, hasUndefined });
+  if (hasUndefined || !hasDay) {
+    return {
+      ok: false,
+      reason: `a checklist row did not render a YYYY-MM-DD due date (text: "${itemText}")`,
+      steps,
+    };
+  }
+
+  // Escape closes it — the drawer is keyboard-dismissable.
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(700);
+  const stillOpen = await page.locator("[role=dialog]").count();
+  note({ step: "escape-closes", stillOpen });
+  if (stillOpen > 0) {
+    return { ok: false, reason: "Escape did not close the checklist", steps };
+  }
+
+  return { ok: true, steps };
+}
+
 async function runHrLeave(page, report) {
   const steps = [];
   const note = (step) => {
@@ -10564,6 +10674,11 @@ async function main() {
     // here — which is exactly how slice 1's gap survived two ticks with every gate green.
     { path: "/hr/documents", name: "hr-documents" },
     { path: "/hr/reports", name: "hr-reports" },
+    // Onboarding (REQ-055, slice 4b) is the third of the three screens this slice owed, and it is
+    // in the list for the same reason as the other two: it shipped with a module, a migration,
+    // seven routes and nine walks before it had a route here, which is the whole reason this
+    // slice's QA story needed writing at all.
+    { path: "/hr/onboarding", name: "hr-onboarding" },
     // The security centre's five screens (REQ-012, slices 1–3). `runSecurityDepth` drives the
     // overview, the findings store and the header policy, but it never opened the last two —
     // and the same is true of the route list, so two screens that ship with rules, a policy
@@ -10807,6 +10922,14 @@ async function main() {
     report.hrDocumentsReports = await runDepthPass("hr-documents-reports", () =>
       runHrDocumentsAndReports(page, report));
     log(`hr documents+reports: ${JSON.stringify(report.hrDocumentsReports)}`);
+
+  // The onboarding board (REQ-055, slice 4b), driven for two things a screenshot cannot show: a bar
+  // that carries its number beside it, and a due date rendered as a YYYY-MM-DD day rather than the
+  // ordinal array `time`'s serde impl writes.
+  if (!onlyGroup("hr")) {
+    report.hrOnboarding = await runDepthPass("hr-onboarding", () => runHrOnboarding(page, report));
+    log(`hr onboarding: ${JSON.stringify(report.hrOnboarding)}`);
+  }
   }
   }
 

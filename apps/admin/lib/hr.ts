@@ -1121,3 +1121,163 @@ export function fetchReportCsv(
 export function reportFilename(report: string, period: Period): string {
   return `hr-${report}-${period.from}-to-${period.to}.csv`;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Onboarding (REQ-055, slice 4b)
+// ---------------------------------------------------------------------------------------------
+
+/** One step of a template, as the template editor writes it. */
+export type TemplateItem = {
+  title: string;
+  /** Free text, not an enum: the roles are the organization's, not the platform's. */
+  owner_role: string | null;
+  /** Days after the start date. `null` means "no deadline" — a real answer, and different from 0. */
+  due_offset_days: number | null;
+  requires_file: boolean;
+};
+
+/** A checklist template, as the picker lists it. */
+export type OnboardingTemplate = {
+  id: string;
+  organization_id: string;
+  name: string;
+  items: TemplateItem[];
+  active: boolean;
+  /** How many employees are working through it right now. */
+  in_progress: number;
+};
+
+/** One materialised step on somebody's checklist. */
+export type ChecklistItem = {
+  id: string;
+  employee_id: string;
+  template_id: string | null;
+  /** Zero-based and contiguous per employee — the order it is worked in. */
+  position: number;
+  title: string;
+  owner_role: string | null;
+  /** Wire form `YYYY-MM-DD`, or `null` for a step with no deadline. */
+  due_on: string | null;
+  /** Kept beside the derived date, so "why is this due on the 9th?" needs no reconstruction. */
+  due_offset_days: number | null;
+  requires_file: boolean;
+  /** RFC-3339, or `null` while the step is open. */
+  done_at: string | null;
+  done_by: string | null;
+  note: string;
+};
+
+/** Somebody's whole checklist, with the numbers the progress bar reads. */
+export type Checklist = {
+  employee_id: string;
+  employee_name: string;
+  department_name: string | null;
+  template_id: string | null;
+  template_name: string | null;
+  items: ChecklistItem[];
+  /** Ticked. */
+  done: number;
+  /** How many there are — the bar's denominator, and **not** the template's length. */
+  total: number;
+};
+
+/** The board's own totals, computed server-side over the whole board. */
+export type OnboardingTotals = {
+  people: number;
+  in_progress: number;
+  finished: number;
+  items_total: number;
+  items_done: number;
+};
+
+/** The board: everybody's checklist, with the totals above a filtered list. */
+export type OnboardingBoard = { items: Checklist[]; totals: OnboardingTotals };
+
+/** `GET /hr/onboarding` — the board. Needs `hr.onboarding.read`. */
+export function fetchOnboardingBoard(): Promise<OnboardingBoard> {
+  return hrRequest<OnboardingBoard>("/api/v1/hr/onboarding");
+}
+
+/** `GET /hr/onboarding/templates` — the picker. */
+export function fetchOnboardingTemplates(): Promise<{ items: OnboardingTemplate[]; total: number }> {
+  return hrRequest<{ items: OnboardingTemplate[]; total: number }>("/api/v1/hr/onboarding/templates");
+}
+
+/** `GET /hr/onboarding/employees/{id}` — one person's checklist. */
+export function fetchChecklist(employeeId: string): Promise<Checklist> {
+  return hrRequest<Checklist>(`/api/v1/hr/onboarding/employees/${employeeId}`);
+}
+
+/** A new template. `organization_id` is the server's business for a tenant session. */
+export type NewOnboardingTemplate = {
+  name: string;
+  items: TemplateItem[];
+};
+
+/** `POST /hr/onboarding/templates` — create one. Needs `hr.onboarding.manage`. */
+export function createOnboardingTemplate(
+  body: NewOnboardingTemplate,
+): Promise<OnboardingTemplate> {
+  return hrRequest<OnboardingTemplate>("/api/v1/hr/onboarding/templates", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `PATCH /hr/onboarding/templates/{id}` — rename it, restep it, or retire it. */
+export function updateOnboardingTemplate(
+  id: string,
+  patch: Partial<NewOnboardingTemplate> & { active?: boolean },
+): Promise<OnboardingTemplate> {
+  return hrRequest<OnboardingTemplate>(`/api/v1/hr/onboarding/templates/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/**
+ * `POST /hr/employees/{id}/onboarding` — materialise a template onto somebody's checklist.
+ *
+ * Refused with a **409 carrying the item count** when the employee already has one: applying twice
+ * would silently duplicate every step, and an onboarding checklist with "sign the contract" twice
+ * is a checklist nobody can finish honestly.
+ */
+export function applyOnboardingTemplate(
+  employeeId: string,
+  templateId: string,
+): Promise<Checklist> {
+  return hrRequest<Checklist>(`/api/v1/hr/employees/${employeeId}/onboarding`, {
+    method: "POST",
+    body: JSON.stringify({ template_id: templateId }),
+  });
+}
+
+/**
+ * `PATCH /hr/onboarding/items/{id}` — tick or untick one step.
+ *
+ * The answer carries `completed`, which flips only on the **transition** to all-ticked: ticking an
+ * already-ticked item and unticking the last one are both writes and neither is somebody finishing
+ * their onboarding.
+ */
+export function tickChecklistItem(
+  id: string,
+  body: { done: boolean; note?: string },
+): Promise<{ checklist: Checklist; completed: boolean }> {
+  return hrRequest<{ checklist: Checklist; completed: boolean }>(
+    `/api/v1/hr/onboarding/items/${id}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
+}
+
+/**
+ * The bar, as a fraction.
+ *
+ * **Never computed here.** The module answers `progress()` and the server sends `done`/`total`; a
+ * browser that divides its own copy is a second definition of "how far along is this person", and
+ * the two disagree the moment an item is added to a template after the checklist was applied.
+ * An empty checklist is 0.0 — a person nobody gave anything to do has done nothing, which is not
+ * the same as being finished.
+ */
+export function checklistProgress(checklist: Pick<Checklist, "done" | "total">): number {
+  return checklist.total === 0 ? 0 : checklist.done / checklist.total;
+}
