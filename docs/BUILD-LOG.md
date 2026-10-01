@@ -10258,3 +10258,71 @@ it collide — which is what that limit exists for. The device-block legs from t
 keyboard/mobile legs are therefore still **written, not measured**. Next tick runs the pass first.
 
 Next: the remaining REQ-021 legs, then REQ-016.
+
+## Tick 55 · REQ-055 slice 2c — the self-service surface (`/hr/me/*`)
+
+**What.** Eight routes in the one router in `mod.rs` with **no `route_layer`**, plus four screens
+(`/hr/me`, `/hr/me/leave`, `/hr/me/leave/new`, `/hr/me/documents`), a `My workspace` sidebar entry,
+`runHrMe` in the walkthrough and the four routes in the ordinary inventory list. The module's
+`me.rs` holds the reads behind it, so the HTTP layer, the walks and the later calendar module share
+one owner of "what does my own record look like".
+
+**The design point, because it is the whole slice.** Every other `/hr/*` route answers behind an
+`hr.*` key, which is exactly what makes them unusable for the one person they exist for. What
+replaces the permission check is a *different* check: `CurrentSession` (401 anonymous),
+`organization_of` (cannot name a foreign tenant), and the subject resolved from `user_id` on every
+request. There is **no `employee_id` parameter anywhere in `hr_me`** — that absence is the security
+property, since one query param turns "my leave" into "any leave" for anyone who can edit a URL, and
+a walk asserts it by naming a colleague and getting the caller's own record back. An account with no
+employee row answers **404 naming the employee**, not 403: a real platform state, not a permission
+problem, and 403 would send the person to an administrator for an honest "you are not in the
+directory yet".
+
+**A production bug in the slice that shipped before this one.** `LeaveScope::employee_predicate`
+built its narrowing clause by interpolating the id: `e.id = 6ba96e44-1111-…`. A UUID is hyphenated,
+so to Postgres that is subtraction, and every query narrowing to a real employee died with
+*"trailing junk after numeric literal"* — the request list **and** the absence calendar, both of
+which reuse the predicate for their count. **Slice 2a could not see it**: it only ever built `all`
+scopes, and `all` returns no predicate at all, so the branch never ran. Worse, the unit test
+asserted `Some(format!("e.id = {mine}"))` — built from the same `Display`, so it compared the
+interpolation against itself and passed. **A test that pins the bug instead of the behaviour.** The
+self-service surface is the first caller that narrows to a *specific* employee, and it turned a 500
+on the very first request. Fixed to a quoted cast literal, and the assertion now pins that exact
+string so a regression is red rather than a production 500. Both existing leave walks re-run green,
+which is the part that says the fix did not change `all`.
+
+**Two of the five new walks were wrong on arrival, and they said so by failing.** The fixture built
+its employee rows by calling `POST /hr/employees` **as the unprivileged account** — adding
+somebody to the directory is an HR action answered behind `hr.employees.create`, so it 403s, and the
+walk died in its own setup on a refusal that says nothing about self-service. The second read the
+row back through the *colleague* to prove a refused cancellation had not half-applied — but the
+colleague is refused at the HR route for a reason unrelated to the row's state, so it was asserting
+the 403 a second time. Both now go through the HR account, and the read-back is the assertion it
+claims to be. A third: `id_of(&me.body)` panicked because `MyProfile` publishes `employee_id`, not
+`id` — reading a null out of a perfectly good response.
+
+**A gate that was green without running.** `npx tsc` printed *"This is not the tsc command you are
+looking for"* and the pipeline's `$?` was `tail`'s, so the typecheck reported **exit 0 having
+checked nothing**. The worktree has no `node_modules/.bin`; the real compiler is
+`apps/admin/node_modules/typescript/bin/tsc` (5.9.3). It is genuinely clean, but only after running
+the binary and reading the file.
+
+**Proof.**
+
+```text
+cargo test -p omnion-module-hr --lib        72 passed  (69 + 3 for the me module)
+tsc -p apps/admin/tsconfig.json --noEmit    exit 0, empty output (the real binary, not npx)
+cargo test -p omnion-api --test hr_me       5 passed  (live PostgreSQL, omnion_qa_w4)
+cargo test -p omnion-api --test hr_leave    9 passed  (no regression from the predicate fix)
+cargo test -p omnion-api --test hr          9 passed  (same)
+```
+
+**Not done this tick — the browser pass.** The QA slot is held by a **live** w3 pass (holder pid
+2018881, `cwd` `/mnt/apopic/omnion-w3`, verified with `kill -0` *and* `/proc/<pid>/cwd` rather than
+the file's age), so this one queues behind it rather than colliding. `/mnt/apopic` is at 97% and
+`/dev/shm` at 98%, which on its own would rule out a pass that needs a cargo build and a browser.
+Artifacts are pre-staged on tmpfs (`qa-artifacts -> /dev/shm/w4-artifacts`; `.gitignore` matches it
+without the trailing slash, so it stays untracked). **No browser acceptance box is ticked**, and the
+four new screens are written and wired but unmeasured.
+
+Next tick: run the pass first, tick the browser boxes, then slice 2d (attendance check-in/out).

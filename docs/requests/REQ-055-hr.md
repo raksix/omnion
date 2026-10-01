@@ -1,6 +1,21 @@
 # REQ-055 — HR
 
-> **Status:** in-progress (slice 2b — the leave SCREENS: `/hr/leave` (the request list over the absence
+> **Status:** in-progress (slice 2c — the SELF-SERVICE surface: eight `/hr/me/*` routes in the one
+> router with no `route_layer` at all, because an employee holding no `hr.*` key is exactly the
+> person those routes exist for, plus four screens (`/hr/me`, `/hr/me/leave`, `/hr/me/leave/new`,
+> `/hr/me/documents`), a `My workspace` sidebar entry kept **outside** the admin `People` shelf —
+> everything under People answers behind an `hr.*` key, so hiding self-service in there would make
+> it look like it 403s — and `runHrMe` in the walkthrough with the four routes in the ordinary
+> inventory list. Five DB walks, **5/5 GREEN against live PostgreSQL**, and the fixture is itself
+> the assertion: the plain account holds `sites.read` and no `hr.*` key at all, so adding one would
+> delete the test rather than break it. **The slice found a production bug in slice 2a's own code**
+> (commit `cd5120a0`): `LeaveScope::employee_predicate` interpolated the employee id straight into
+> SQL, and a hyphenated uuid is subtraction to Postgres — every query narrowing to a real employee
+> died with "trailing junk after numeric literal". Slice 2a never hit it because it only ever built
+> `all` scopes, which emit no predicate at all, and the unit test asserted the interpolated string
+> back onto itself: a test pinning the bug rather than the behaviour. **Still unticked: every
+> browser box** — the QA slot is held by a **live** w3 pass, so the pass has not run. Previous:
+> slice 2b — the leave SCREENS: `/hr/leave` (the request list over the absence
 > calendar), `/hr/leave/new` (the form, whose day counter calls `GET /hr/leave/requests/preview`
 > rather than recomputing it), `/hr/leave/{id}` (balance card, timeline, decision panel) and
 > `/hr/leave/types` (the catalogue editor), the module shelf and a `People` sidebar entry — plus
@@ -187,7 +202,7 @@ Webhook relevance: `hr.leave.approved` is consumed by the calendar module (absen
 ### Acceptance criteria
 
 - [x] The HR migration applies on a populated database; `cargo test -p omnion-module-hr` is green and seeds leave types, a root department and a template. *(Numbered **0196**, not the spec's `0015` — the migration namespace is shared by ten writers and the high-water across every worktree was 0193; the spec's own note says to renumber if a sibling module lands first. Applied with psql, all **63** migrations in order against a live PostgreSQL, because cargo never opens the file: the crate compiles and its 48 unit tests pass against a migration that could not be installed, so the proof has to be `psql`, not a green test run. A tenant created **after** the migration is seeded by the TRIGGER — 1 department, 3 leave types at 14/0/0 days, 1 template with 3 items — which is the assertion that distinguishes the trigger from the backfill.)*
-- [x] Every `/api/v1/hr/*` route is permission-guarded; self-service routes work for an employee without any `hr.*` permission but answer only for their own data. *(Slice 1 ships 11 routes across six routers, each behind one key; a reader who may look at the directory is refused `403` on the create, and every route answers `401` without a session. **`/hr/me/*` is slice 3** and the `own`-level self-service read it needs is the only part still open here.)*
+- [x] Every `/api/v1/hr/*` route is permission-guarded; self-service routes work for an employee without any `hr.*` permission but answer only for their own data. *(Slice 1 ships 11 routes across six routers, each behind one key; a reader who may look at the directory is refused `403` on the create, and every route answers `401` without a session. **Slice 2c closes the `own`-level half that was the only part still open**: eight `/hr/me/*` routes in the one router with no `route_layer` at all, proved by five DB walks against live PostgreSQL. The fixture is the assertion — the plain account holds `sites.read` and **no `hr.*` key**, and adding one would delete the test rather than break it. "Own data" is proved negatively too: another employee's request answers **404 on read and on cancel**, and a refusal that half-applied would be worse than no refusal, so the row is read back and still `pending`. Naming a colleague in `?employee_id=` returns the *caller's own* record — there is deliberately no such parameter, and that absence is the security property.)*
 - [ ] Visibility works: `own` sees self only, `team` sees direct reports, `all` sees the organization; a cross-organization employee id answers 404.
 - [ ] Employee create/update/terminate, department changes, leave decisions, attendance corrections and document uploads write audit entries.
 - [x] A manager or parent cycle is refused with an explicit message (self-manager, descendant manager, department moved under its own child). *(Both are their own error variants rather than a formatted `Invalid`, so a test can match on the *kind* — "is this the self-manager case?" is a question about a variant, and a substring test on a message breaks when somebody improves the wording. Both answer **409**, not 400: the request is well-formed and the conflict is with the current shape of the org chart. The cycle message names the chain it found (`Grace Hopper`), because "set someone who is below you" sends the operator back to the tree to guess. The walk asserts the refused write **left the chain untouched** — a refusal that half-applied would be worse than no refusal.)*
