@@ -475,6 +475,33 @@ The walkthrough must visit `/cdn`, `/cdn/purges`, `/cdn/purge`, `/cdn/rules`, `/
    telling the operator their credential is invalid would send them to paste the key they have
    already pasted.
 
+   **(tick 91: the counters half was never proved, and the walk that claimed it could not have
+   failed.)** The slice's "Done" sentence has two legs — a signed payload to a test endpoint,
+   and "the overview counters reflect it". The first ships. The second was covered by
+   `the_overview_reports_the_queue_the_counters_and_the_last_twenty`, which queues two purges,
+   drains **neither**, and asserts `failure_rate == 0.0` — a value that is *structurally* zero
+   when nothing has been attempted. A card wired to a constant passes that walk, which is the
+   whole failure: the assertion and the defect it was meant to catch are indistinguishable.
+
+   `the_overview_counters_follow_a_real_drain_rather_than_the_queue` (`2c0ff769`) drives the
+   window through two real drains and reads the counters back off the API. **The order is the
+   whole trick and it is not a style choice:** `cdn_settings` is scoped to the *site*, not to a
+   purge, so a row written before the first drain sends the success case at the dead endpoint
+   as well — the walk I wrote first failed exactly that way, measuring two failures. The first
+   drain runs against the default `origin`; only then does the `generic_http` row exist, with
+   `max_attempts = 1` so the refusal is a **failure** on the first pass rather than a retry. A
+   two-attempt budget would leave the item `pending`, the counters would read 1 succeeded / 0
+   failed, and that looks like a working card without being one.
+
+   The pre-drain zeros are asserted for the same reason: without them, an `succeeded_24h` of 1
+   is also consistent with a counter that ignores the drain and counts the queue twice.
+
+   `on conflict (site_id)` cannot be used against `cdn_settings` at all, and the error is worth
+   keeping: uniqueness there comes from a **partial unique index** (`where site_id is not null`),
+   not a constraint, so the column list matches nothing and PostgreSQL answers `42P10`. The row
+   is deleted and reinserted — which also makes the walk's premise explicit rather than
+   depending on what the fixture happened to leave behind.
+
 ### Risks / notes
 
 - Credential handling is the sharp edge: values are write-only, stored encrypted, never returned by the API and never written to audit payloads or event payloads. The repo must stay free of any provider key.

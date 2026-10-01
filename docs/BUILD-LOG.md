@@ -10193,3 +10193,62 @@ inspector — is written and unmeasured, and for three ticks each has been "the 
 run". The reason was never that the pass was slow. It was that consecutive ticks were starting
 competing passes that destroyed each other, and the resulting failure mode is a report full of
 findings measured against a database that was dropped underneath the walk.
+
+## 2026-10-01 · Wave 5 · tick 91 — the overview counters were never driven by a real drain
+
+**What.** Not a new screen: the second leg of REQ-011 slice 4, which says "a test endpoint
+receives a correctly signed purge payload **and the overview counters reflect it**". The
+payload ships. The counters had a walk and it could not have failed.
+
+`the_overview_reports_the_queue_the_counters_and_the_last_twenty` queues two purges, drains
+**neither**, and asserts `failure_rate == 0.0` — a value that is *structurally* zero when
+nothing has been attempted. A card wired to a constant passes that walk, and that is the whole
+failure: the assertion and the defect it was written to catch are indistinguishable. The same
+shape as the credential field two ticks ago (`a7169471`, where every walk asserted
+`has_credential == false` and a build that stored nothing satisfied it).
+
+`the_overview_counters_follow_a_real_drain_rather_than_the_queue` (`2c0ff769`) drives the
+window through two real drains and reads the counters back off the API. The ORDER is the trick
+and it is not style: `cdn_settings` is scoped to the **site**, not to a purge, so a row written
+before the first drain sends the success case at the dead endpoint too. My first version failed
+exactly that way — `failed` came back 0 where 1 was expected, because `origin` accepts every
+target by design. First drain therefore runs against the default `origin`; only then does the
+`generic_http` row exist, with `max_attempts = 1` so the refusal is a **failure** on the first
+pass rather than a retry. A two-attempt budget leaves the item `pending` and the card reads
+1 succeeded / 0 failed, which looks working and is not.
+
+Two smaller things the walk had to be taught. `on conflict (site_id)` is unusable against this
+table: uniqueness is a **partial unique index** (`where site_id is not null`), not a
+constraint, so the column list matches nothing and PostgreSQL answers `42P10` — the row is
+deleted and reinserted instead. And the pre-drain zeros are asserted, because without them an
+`succeeded_24h` of 1 is also consistent with a counter that ignores the drain and counts the
+queue twice.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-cdn --quiet` | **116 passed, 0 failed** |
+| `pnpm typecheck` | **2/2** |
+| `the_overview_counters_follow_a_real_drain_rather_than_the_queue` | **1/1** |
+| `cargo test -p omnion-api --test cdn_purge` | **21/22** — the one failure a shared `PoolTimedOut` |
+| the same test alone, `--test-threads=1` | **ok**, 17.76 s |
+| Postgres during the failure | 47/100 connections, **0 ungranted locks** — contention, not deadlock |
+| browser pass | queued behind w6's, which is writing (artifact mtime 04:39:34) |
+
+**Next.** The browser pass still has not executed, so REQ-011's last box stays open and this
+tick closes nothing on that gate. Two ticks have now named the queue and both were honest; this
+time the wait is measured rather than reported — w6's newest artifact is being written every
+minute, so the pass is queued behind real work and not behind the wedge tick 89 found. Do not
+reap it. REQ-017's `/environments` boxes are the next slice in the queue, and tick 85's note
+that the panel "has no `/environments/new` route" is **stale**: `apps/admin/app/environments/[id]/page.tsx`
+exists and the wizard is deep-linked as `?wizard=1`, which is the right shape and was measured
+at a phone width by tick 74.
+
+**Merge.** `origin/main` was 6 commits ahead; `scripts/qa/run.sh` auto-merged and
+`docs/BUILD-LOG.md` conflicted as it always does. Resolved with the repo's own
+`scripts/qa/merge-build-log.py` — `OK: all 0 entry check passed`, 0 markers left. Also worth
+recording: `/mnt/apopic/omnion-w5/target` had been **deleted out from under the build** by
+another writer's cleanup, and `cargo` reported it as
+`could not write output ... No such file or directory` — the os error 2 signature, not a disk
+full (os error 28). `CARGO_TARGET_DIR=/dev/shm/w5-target` is the standing answer on this box.
