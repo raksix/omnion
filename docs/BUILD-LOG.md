@@ -8016,3 +8016,73 @@ of a two-step node. Then `undo-selection-edge` for `edgeRemovedByUndo` beside
 `edgeSelectionPruned`, then the table-mode row, written and unmeasured. The plugin row stays
 BLOCKED on REQ-121. REQ-004 is far from close: the QA pass has not run in six ticks and every
 criterion needing one is open.
+
+## Tick 58 — 2026-10-01 · REQ-004 · the table-mode row claimed the canvas and read the server
+
+Seventh tick blocked on the QA slot, and the first one where the block cost nothing: the
+holder is a LIVE w6 pass (pid 2887474, `/proc/2887474/cwd` = `/mnt/apopic/omnion-w6`,
+200 artifacts written in the ten minutes before this tick opened, still writing at 3-minute
+intervals), so the pass was queued against committed code and the tick was spent on the
+one thing the hint left: the table-mode row, written and unmeasured.
+
+**The row measured Postgres while its field said canvas.** The criterion's third clause is
+"stays consistent with **the canvas** after a save in either mode", and the row asserting it
+was this:
+
+```js
+const builderSeesTableEdit = await page.evaluate(async (id) => {
+  const current = await (await fetch(`/api/v1/workflows/${id}/graph`, …)).json();
+  return Object.values(current.graph.nodes ?? {}).some((n) =>
+    Object.values(n.params ?? {}).includes("qa.table.edited"));
+}, workflowId);
+```
+
+A `goto` to the builder sits one line above it and the field is named `builderSeesTableEdit`,
+so the note reads as a claim about a screen while being a claim about a database row. A canvas
+that mounted no node, an inspector that never received the graph, and a builder that failed
+to render all report `true` identically. This is the tick-57 defect one block up — there
+`step.output` was read off the wire where the criterion named the panel — and the fix is the
+same one: read the surface the sentence is about. The read is now **card → panel → field**,
+waiting on `[data-node-id]` and `[data-inspector]` rather than `waitForTimeout(1500)`, since a
+fixed delay is green against a page that has not drawn and is wrong only on a slow machine.
+
+**It was also the only row in the builder pass with no instrument test.** `step-trace-row`,
+`run-from-here-row`, `undo-selection-edge-row` and `reload-rebase-row` each have one, and each
+was written because its row measured the wrong surface; `table-mode.test.ts` covers the
+table's *rules*, and every one of them can be correct while the row that reports them renders
+nothing.
+
+**Two of eight mutations survived the first draft, and both were the defect class the new
+file documents in its own header.** I wrote the paragraph about names appearing in two places
+and then made the mistake inside it: `data-inspector` is a **prefix** of
+`data-inspector-field`, so M3 (`const panel = document`) left a `/data-inspector/` assertion
+green, and M2 (counting any non-empty field) satisfied an assertion made about the literal
+`qa.table.edited`, which sits in the window anyway as the `evaluate` argument. Both now assert
+the construct — the node-scoped selector with `${nodeId}` interpolated, and `f.value === value`.
+That is the fourteenth reading in this REQ that was green against a defect entirely unchanged.
+
+**Three of the test's own failures were the window, not the product**, and they are worth the
+same attention as the mutation results: an invented function name (`runTableMode` for
+`runWorkflowTableDepth`) produced `actual: -1, expected: -1`, a message that reads like a
+missing row; a window ending at the *first token* of a note excluded the two closing notes and
+reported them missing; and renaming the fix's own variable broke an anchor that had been
+pinned to the old name. The file now says so at each site: a window in a harness test is a
+contract with the row, and the fix that satisfies the contract may rename the row's variables.
+
+**Proof.** `node --test --experimental-strip-types apps/admin/features/workflows/*.test.ts` →
+**326 passed** (317 before, +9) · `pnpm typecheck` → 2/2 successful · `node --check` clean
+(14,372 → 14,410 lines) · `cargo test -p omnion-workflows --lib` → **157 unchanged** (a
+QA-instrument change; the target had been swept, so a cold build) · **eight mutations red**,
+each naming the assertion it turned.
+
+**Next.** The pass, and it is now the only thing standing between this REQ and its close.
+Read `table-save-survives` for `builderSeesTableEdit: true` **alongside `inspected > 0`** — the
+first alone is satisfied by a read that inspects nothing, which is the exact shape this tick
+removed. Then `step-trace` for `stepsWithoutBothSides: []` AND `stepsInRunButNotShown: []` AND
+`stepsWithParams === stepsWithOutput === stepsTotal > 0` (a conjunction), then
+`run-from-here` for `inRunButNotPainted: []` beside `pillsPainted > 0`, then
+`undo-selection-edge` for `edgeRemovedByUndo` beside `edgeSelectionPruned`. Before the pass,
+check the summary for `chrome-error://` in a page url and confirm the admin error log is quiet.
+The plugin row stays BLOCKED on REQ-121. `target` is a symlink to `/dev/shm/w3-target` and
+the dir was missing again after the disk guard swept it — `mkdir -p /dev/shm/w3-target` first,
+or cargo fails with `Not a directory (os error 20)`, which reads like a broken symlink.
