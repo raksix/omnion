@@ -28,17 +28,20 @@
 #![forbid(unsafe_code)]
 
 pub mod authn;
+pub mod cli;
 pub mod error;
 pub mod model;
 pub mod model_oauth;
 pub mod oauth;
 pub mod oauth_flow;
 pub mod openapi;
+pub mod scaffold;
 pub mod secret;
 #[cfg(feature = "store")]
 pub mod store;
 #[cfg(feature = "store")]
 pub mod store_oauth;
+pub mod templates;
 
 pub use authn::{
     AuthenticatedKey, KeyRefusal, address_allowed, cidr_contains, decide, scope_allows,

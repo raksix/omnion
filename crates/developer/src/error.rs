@@ -8,7 +8,11 @@
 use thiserror::Error;
 
 /// What can go wrong in the developer platform.
-#[derive(Debug, Error)]
+///
+/// `PartialEq` is derived because the CLI poll rule's tests compare outcomes by value: "a poll
+/// too soon returns `SlowDown { seconds: 10 }`" is the assertion, and an assertion that could
+/// only check "it returned *an* error" would pass for every wrong number in the rule.
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum DeveloperError {
     /// A submitted name was outside the accepted length.
     #[error("name must be between {min} and {max} characters")]
@@ -224,6 +228,72 @@ pub enum DeveloperError {
     #[error("this grant cannot be used with that code")]
     GrantMismatch,
 
+    // --- SDK scaffolds and the CLI (REQ-033, slice 4) ------------------------------------
+    //
+    // Same rule as the OAuth block: these carry a *code* and a sentence, never the value that
+    // broke the rule. A scaffold name becomes a bucket key and a package name; echoing it back
+    // from an error that reaches a log index tells a reader nothing they did not submit.
+    /// A template kind other than `plugin`, `theme` or `workflow`.
+    #[error("{0:?} is not a template kind this platform scaffolds")]
+    UnknownScaffoldKind(String),
+
+    /// A target other than `live` or `sandbox`.
+    #[error("{0:?} is not a target this platform scaffolds for")]
+    UnknownScaffoldTarget(String),
+
+    /// A scaffold request that broke a rule.
+    ///
+    /// Carries the *code* alongside the message, which is the shape the panel needs: the code
+    /// decides which field the message goes under, and a variant per field would mean the
+    /// table grows a row every time a template gains a rule.
+    #[error("{message}")]
+    ScaffoldRefused {
+        /// Stable machine code, e.g. `invalid_scaffold_name`.
+        code: String,
+        /// The sentence to show the reader.
+        message: String,
+    },
+
+    /// The requested generation does not exist in this organization.
+    #[error("no such scaffold")]
+    ScaffoldNotFound,
+
+    // --- CLI device-code flow (REQ-033, slice 4) -----------------------------------------
+    //
+    // The risk note on this flow is phishing: a code is short-lived, bound to the approving
+    // user, and cannot be approved without key-management permission. The error variants are
+    // part of that, because a flow that says "this code is for user X" to the session that
+    // presented it is a flow that can be walked into with a support call.
+    /// A device code that is unknown, already approved, or past its expiry.
+    ///
+    /// One answer for all three, exactly as `InvalidCode` does for an authorization code: a
+    /// caller that can tell them apart learns which codes exist, and a code is short-lived
+    /// enough that guessing is the whole attack.
+    #[error("invalid device code")]
+    InvalidDeviceCode,
+
+    /// A device code whose polling interval has not elapsed yet.
+    ///
+    /// The one answer that is *not* an error: RFC 8628 makes slow-down a normal part of the
+    /// flow, and the client is told to wait rather than refused.
+    #[error("slow down: wait {seconds} seconds before polling again")]
+    DeviceCodeSlowDown {
+        /// How long the client must wait.
+        seconds: u64,
+    },
+
+    /// The code has not been approved yet, which is also a normal part of the flow.
+    #[error("the code has not been approved yet")]
+    DeviceCodePending,
+
+    /// A session without key-management permission tried to approve a code.
+    ///
+    /// Its own variant rather than the generic refusal, because the panel needs to say *why*
+    /// — a person following the CLI's instructions has no way to know the account they are
+    /// logged into cannot approve.
+    #[error("approving a CLI login needs developer.keys.manage")]
+    DeviceCodeApprovalRefused,
+
     /// The database said no, and the message is one we wrote.
     #[cfg(feature = "store")]
     #[error("database error: {0}")]
@@ -288,6 +358,19 @@ impl DeveloperError {
                 | Self::RedirectUriMismatch
                 | Self::InvalidCode
                 | Self::GrantMismatch
+                // Slice 4. `DeviceCodePending` and `DeviceCodeSlowDown` are the two that look
+                // like faults and are not: RFC 8628 makes both a normal part of the flow, so a
+                // `400` is what a client needs to see (it means "keep polling", not "the
+                // platform is broken") and a `500` would invite a retry storm against a code
+                // that is working exactly as intended.
+                | Self::UnknownScaffoldKind(_)
+                | Self::UnknownScaffoldTarget(_)
+                | Self::ScaffoldRefused { .. }
+                | Self::ScaffoldNotFound
+                | Self::InvalidDeviceCode
+                | Self::DeviceCodeSlowDown { .. }
+                | Self::DeviceCodePending
+                | Self::DeviceCodeApprovalRefused
         )
     }
 
@@ -339,6 +422,18 @@ impl DeveloperError {
             Self::RedirectUriMismatch => "redirect_uri_mismatch",
             Self::InvalidCode => "invalid_authorization_code",
             Self::GrantMismatch => "grant_mismatch",
+            Self::UnknownScaffoldKind(_) => "unknown_scaffold_kind",
+            Self::UnknownScaffoldTarget(_) => "unknown_scaffold_target",
+            Self::ScaffoldRefused { .. } => "scaffold_refused",
+            Self::ScaffoldNotFound => "scaffold_not_found",
+            // Two flat codes for three "keep polling" shapes. `DeviceCodePending` and
+            // `DeviceCodeSlowDown` are distinct *because the client must behave differently* —
+            // one is "wait", the other is "you polled too fast, wait longer" — but neither is a
+            // failure and neither may be branched on to learn which codes exist.
+            Self::InvalidDeviceCode => "invalid_device_code",
+            Self::DeviceCodePending => "device_code_pending",
+            Self::DeviceCodeSlowDown { .. } => "device_code_slow_down",
+            Self::DeviceCodeApprovalRefused => "device_code_approval_refused",
             // Gated for the same reason the variant is: without the `store` feature this arm
             // does not exist, and a match that names it is a compile error. The alternative —
             // a `_ =>` arm — would swallow a new client-error variant added later without its
