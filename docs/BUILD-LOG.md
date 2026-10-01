@@ -7573,3 +7573,60 @@ desktop and the mobile pass, and which will be visited the first time the box is
 
 **Next.** The browser pass owed for slices 1–4, then slice 4's remaining two thirds: the
 security-event view over the audit trail and the secret-inventory projection.
+
+---
+
+## Tick 53 — eight commits of main merged, and the merge found a comment that lied about the code
+
+**What.** `origin/main` had moved eight commits, so the merge came first (invariant 1) and it
+conflicted in four files. All four resolved by UNION rather than by picking a side — `lib.rs` gained
+`security_ip` alongside my reliability modules, `routes/mod.rs` gained the IP-access layer beside
+my platform budgets, and the walkthrough's two route lists gained `/security/ip-access` next to my
+deployment screens. `6100d5c9`.
+
+**The merge found a real defect, and it was in MY code, not in the collision.** My HEAD put
+`platform_limit` in the `.layer()` chain and its comment claimed "the platform budgets sit INSIDE
+the gateway limiter". Axum's `.layer()` wraps what is already built, so **the LAST call in the block
+is the OUTERMOST layer** — my ordering made the platform budgets the OUTERMOST of the three, the
+exact inverse of what the comment described and of the reasoning in it (an operator should be told
+by the document written first). Nothing failed: the chain compiles, the limiter is present, and no
+walk asserts an order. **A comment stating an invariant is a test nobody runs.** The order is now
+`platform_limit` → `rate_limit` → `ip_access` (outermost first), and the comment says how to read it.
+
+**The other three-way trap: `git add` reports `UU=0` while the markers are still in the file.**
+Staging a file I had just hand-edited satisfies git's conflict bookkeeping, so `git status | grep
+'^UU'` printed zero and the merge commit was one command away from committing a `<<<<<<<` into the
+harness. `node --check` caught it, not git. *Resolution completeness has to be checked in the FILE,
+not in git's index* — `grep -rn '^<<<<<<<'` across the tree.
+
+**Proof of the gate after the merge.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo check -p omnion-api` | ok (33 pre-existing warnings) |
+| `cargo test -p omnion-migrations --quiet` | 86 passed |
+| `cargo test -p omnion-events --quiet` | 49 passed |
+| `pnpm typecheck` (apps/admin, `tsc --noEmit`) | exit 0 |
+| `node --check scripts/qa/walkthrough.cjs` | parse ok |
+| `cargo test -p omnion-api --test backfills` | **7 passed, 44.95 s** — on a fresh database |
+
+**The 7/7 needed a fresh database, and the reason is worth the two ticks it cost.** A bare
+`cargo test` has no `OMNION_DATABASE_URL`, so the walk connected to the SHARED `omnion` database and
+died on `migration 19 was previously applied but has been modified` — which is not an edited
+migration but another writer's `0019` under the same number (`scripts/qa/run.sh` sets the variable
+for the QA pass; a bare `cargo test` does not). With it pointed at my own `omnion_w6_dev`, all seven
+passed except one that HUNG: 0% CPU, two threads, `futex_do_wait` in main, every PostgreSQL backend
+idle, zero ungranted locks. **A wedged process and a slow one look identical from the outside, and
+"it is still running" is not a diagnosis.** The one test in isolation on a fresh database finished in
+15.9 s; the full file on a fresh database finished all seven in 44.95 s. So the hang was contention
+on a database several writers were sharing, not the seed loader — and the fix was the environment
+(`OMNION_DATABASE_URL` at a fresh DB), not a line of product code. **Recreating the exact condition
+is the only way to tell those two apart**, and the isolated re-run answered it in 16 seconds.
+
+**Browser pass NOT started, recorded not skipped.** The slot holder (`2624054`) is ALIVE in
+`/mnt/apopic/omnion-w3`; load 18.9 on 6 cores, 30/32 GB used, 55 Chrome processes and four live
+passes. The box got worse during this tick, not better. The box that names a screen stays unticked.
+
+**Next.** REQ-129 slice 3's browser pass — the only thing left in it — then slice 4: the column
+classification map, the anonymised export builder and job, the single-use/expiring download, and the
+upgrade guide finalised with the rollback split.
