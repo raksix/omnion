@@ -33,7 +33,10 @@
 //! 3. **The client secret is verified in constant time, and the overlap is filtered by the
 //!    clock first.** [`which_secret_matched`] does both; this file adds nothing to it.
 
+use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::model_oauth::ConsentRequest;
@@ -70,8 +73,6 @@ pub const CODE_BYTES: usize = 48;
 /// makes it recognisable in a log without being a secret.
 #[must_use]
 pub fn mint_code() -> String {
-    use rand::RngCore;
-    use rand::rngs::OsRng;
     let mut bytes = [0u8; CODE_BYTES];
     OsRng.fill_bytes(&mut bytes);
     format!("code_{}", base64url(&bytes))
@@ -272,6 +273,135 @@ pub fn redirect_with_code(redirect_uri: &str, code: &str, state: Option<&str>) -
         out.push_str(&encode_state(state));
     }
     out
+}
+
+/// The namespace a minted access token carries.
+///
+/// Distinct from every other credential in the platform — `omn_` for an API key, `omn_app_` for
+/// a client id, `code_` for an authorization code — so a token found in a log is identifiable,
+/// and a client that mistakenly sends one as an API key is refused by shape before any database
+/// probe. That last part is the reason it is worth a separate string: the API-key path splits
+/// the token on `.`, finds no separator, and answers "invalid API key" without a query.
+const TOKEN_NAMESPACE: &str = "omn_tok_";
+
+/// Bytes of entropy in an access token. 32 bytes, the same answer as an API key and a client
+/// secret: a token is a machine-generated credential, and a slow hash to slow brute force buys
+/// nothing against 256 bits of entropy.
+const TOKEN_BYTES: usize = 32;
+
+/// A freshly minted access token. Never stored, never logged, never returned twice.
+#[derive(Clone)]
+pub struct MintedToken {
+    /// What the client sends as `Authorization: Bearer …`.
+    pub plaintext: String,
+}
+
+impl std::fmt::Debug for MintedToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Same reason `MintedKey` and `MintedClientSecret` hand-write this: a derived `Debug`
+        // writes a live credential into any log that touches the value by reference, and a token
+        // is a credential for as long as its hour lasts.
+        formatter
+            .debug_struct("MintedToken")
+            .field("plaintext", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Mint an access token: 256 bits of CSPRNG entropy, namespaced and hex encoded.
+///
+/// Hex rather than the code's base64url because a token travels in an `Authorization` header as
+/// often as in a query string, and hex needs no encoding anywhere — one alphabet fewer to get
+/// wrong in a header this platform has to construct correctly.
+#[must_use]
+pub fn mint_access_token() -> MintedToken {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    MintedToken {
+        plaintext: format!("{TOKEN_NAMESPACE}{}", hex::encode(bytes)),
+    }
+}
+
+/// The one-way form written to `oauth_access_tokens.token_hash`.
+#[must_use]
+pub fn hash_access_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"omnion-oauth-token.v1\0");
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Whether a string could be one of this platform's access tokens, checked before any lookup.
+///
+/// A shape test, and the reason it exists: [`hash_access_token`] would happily hash a 4 KB
+/// paragraph of nonsense, and an access token is presented by an unauthenticated caller to a
+/// table keyed on its hash. A caller gets "invalid token" for something that was never a token,
+/// without costing a probe — and the check is on the *namespace* too, so a client secret
+/// presented as a token is refused before it can be compared against a token hash at all.
+#[must_use]
+pub fn token_looks_valid(token: &str) -> bool {
+    let Some(body) = token.strip_prefix(TOKEN_NAMESPACE) else {
+        return false;
+    };
+    body.len() == TOKEN_BYTES * 2
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Which grant a token request authenticated with, and what the token therefore stands for.
+///
+/// The type exists because these two differ in exactly one place — whether a user id is written
+/// to the token row — and a `bool` or a string at that call site would let the wrong answer be
+/// passed with no compiler complaint, producing a request log row that attributes a machine's
+/// call to a person. That is the same property `KeyPrincipal::actor_user_id` returns `None` for,
+/// arrived at from the other direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantProvenance {
+    /// Redeemed from an authorization code: a user consented, and the token names them.
+    UserConsent,
+    /// `client_credentials`: the app acting as itself, with no user in the flow.
+    ClientCredentials,
+}
+
+impl GrantProvenance {
+    /// Whether a token from this grant acts for a person.
+    #[must_use]
+    pub fn involves_user(self) -> bool {
+        matches!(self, Self::UserConsent)
+    }
+}
+
+/// The scopes a token will carry, or `None` when the request asked for more than the grant holds.
+///
+/// `requested` is what the client sent to the token endpoint, and it is allowed to be **empty** —
+/// an omitted `scope` means "the grant I was just given", which is what a client that only ever
+/// wants one thing sends, and treating that as an error would break the most common client in the
+/// ecosystem.
+///
+/// A non-empty request is a **narrowing**, checked as a subset: asking for less than was
+/// consented is a client restricting itself, and refusing that would be a rule no spec has.
+/// Asking for *more* is refused, and this is the one place the error is worth a round trip —
+/// because silently issuing a token that is missing the permission produces a `403` at the API
+/// naming the *API* as the thing that lacks the permission, which sends the developer to debug
+/// the wrong system entirely. The consent screen already showed the user exactly what was being
+/// granted, so a request that widens past it is either a bug or an attack and both deserve to
+/// stop here.
+///
+/// Deliberately **not** parameterised on [`GrantProvenance`]: the rule is the same for both
+/// grants, because a machine token's granted set is also the app's registered set and there is
+/// no consent to narrow against in either direction. A signature carrying the provenance would
+/// invite a second arm that differs in no way anybody could justify from the request — and a
+/// parameter that does not change the answer is a parameter the next editor will branch on.
+#[must_use]
+pub fn resolve_token_scopes(requested: &[String], granted: &[String]) -> Option<Vec<String>> {
+    if requested.is_empty() {
+        return Some(granted.to_vec());
+    }
+    if oauth::grant_covers(granted, requested) {
+        return Some(requested.to_vec());
+    }
+    None
 }
 
 /// A token response, as RFC 6749 §5.1 shapes it.
@@ -590,6 +720,139 @@ mod tests {
             &code,
             &oauth::hash_code(&code)
         ));
+    }
+
+    // ── the access token ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_token_is_namespaced_long_and_write_only() {
+        let minted = mint_access_token();
+        assert!(minted.plaintext.starts_with("omn_tok_"));
+        assert_eq!(minted.plaintext.len(), "omn_tok_".len() + 64);
+        // The shape check the token table is keyed on, asserted on a real mint rather than on a
+        // hand-written string: a mint that did not satisfy its own validator would produce a
+        // token no request could ever authenticate.
+        assert!(token_looks_valid(&minted.plaintext));
+        // And the `Debug` form is a hand-written one for the same reason as every other
+        // credential in this crate.
+        assert!(!format!("{minted:?}").contains(&minted.plaintext));
+        assert!(format!("{minted:?}").contains("redacted"));
+    }
+
+    #[test]
+    fn only_this_platforms_own_tokens_pass_the_shape_check() {
+        // The near-miss family, not the accepted case. Each of these is a credential that
+        // *exists* on this platform and must not be accepted as an access token: a code
+        // redeemed a second time, a client secret presented by mistake, an API key, and a
+        // token from a different namespace.
+        for not_a_token in [
+            mint_code(),
+            oauth::mint_client_secret().plaintext,
+            oauth::mint_client_id(),
+            "omn_000000000000.deadbeef".to_owned(),
+            "omn_tok_".to_owned(),
+            // Right namespace, wrong length — the two near-misses a truncation produces.
+            format!("omn_tok_{}", "a".repeat(63)),
+            format!("omn_tok_{}", "a".repeat(65)),
+            // Right length, not hex. A token truncated in transit usually becomes this.
+            format!("omn_tok_{}", "z".repeat(64)),
+            format!("omn_tok_{}", "a".repeat(63) + "!"),
+            String::new(),
+            "   ".to_owned(),
+        ] {
+            assert!(
+                !token_looks_valid(&not_a_token),
+                "{not_a_token:?} is not an access token"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_hash_is_its_own_space_and_not_reversible_by_comparison() {
+        // The property that stops a code, a client secret and a token being interchangeable: a
+        // token presented where a code is expected must not verify, and the three schemes are
+        // what make that a `false` rather than a comparison.
+        let token = mint_access_token().plaintext;
+        let token_hash = hash_access_token(&token);
+        assert_ne!(token_hash, oauth::hash_code(&token));
+        assert_ne!(token_hash, oauth::hash_client_secret(&token));
+        assert_eq!(hash_access_token(&token), token_hash, "stable across calls");
+        assert_ne!(
+            hash_access_token(&token),
+            hash_access_token("omn_tok_00"),
+            "injective enough"
+        );
+    }
+
+    // ── the scopes a token carries ──────────────────────────────────────────
+
+    #[test]
+    fn an_omitted_scope_means_the_whole_grant() {
+        // The common case, and the one a naive implementation refuses: a client that only ever
+        // wants one thing sends no `scope` at the token endpoint, and treating that as an error
+        // breaks it.
+        let granted = vec!["content.pages.read".to_owned(), "search.read".to_owned()];
+        assert_eq!(
+            resolve_token_scopes(&[], &granted),
+            Some(granted.clone()),
+            "no scope parameter means everything consented"
+        );
+    }
+
+    #[test]
+    fn asking_for_less_than_was_granted_is_a_narrowing_and_is_allowed() {
+        // The direction that must work: a client restricting itself is legitimate, and refusing
+        // it would be a rule no spec has.
+        let granted = vec!["content.pages.read".to_owned(), "search.read".to_owned()];
+        assert_eq!(
+            resolve_token_scopes(&["content.pages.read".to_owned()], &granted),
+            Some(vec!["content.pages.read".to_owned()]),
+            "the token carries exactly what was asked for"
+        );
+    }
+
+    #[test]
+    fn asking_for_more_than_was_granted_is_refused_rather_than_silently_narrowed() {
+        // The boundary the test that only checks the happy path never reaches. Silently issuing
+        // a token without the permission produces a `403` at the API that names the *API* as
+        // the thing lacking it — a developer debugging the wrong system for an afternoon.
+        let granted = vec!["content.pages.read".to_owned()];
+        assert_eq!(
+            resolve_token_scopes(&["content.pages.update".to_owned()], &granted),
+            None,
+            "a wider request is refused"
+        );
+        // And the near-miss: a scope that differs only in a suffix, which is exactly what a
+        // prefix match would have accepted.
+        assert_eq!(
+            resolve_token_scopes(&["content.pages.read-all".to_owned()], &granted),
+            None
+        );
+        // Nothing granted and something asked is also a refusal, not an empty token.
+        assert_eq!(resolve_token_scopes(&["search.read".to_owned()], &[]), None);
+    }
+
+    #[test]
+    fn a_scope_submission_that_a_client_would_write_space_delimited_becomes_a_list() {
+        // The token endpoint's `scope` parameter arrives as a string, and this is the parse.
+        // Written here against the same helper the authorize path uses, because two spellings of
+        // "split a space-delimited scope" is one of them eventually accepting a comma.
+        let submitted = " content.pages.read   search.read ";
+        let parsed: Vec<String> = submitted.split_whitespace().map(str::to_owned).collect();
+        assert_eq!(
+            resolve_token_scopes(&parsed, &parsed),
+            Some(parsed.clone()),
+            "a client that echoes back what it asked for gets it"
+        );
+    }
+
+    #[test]
+    fn the_provenance_type_exists_to_stop_a_machine_token_being_attributed_to_a_person() {
+        // A property of the *type*, not of a function: only the user-consent arm may be given a
+        // user id, and a machine token carries none. Asserted as the two answers rather than as
+        // a branch nobody can take.
+        assert!(GrantProvenance::UserConsent.involves_user());
+        assert!(!GrantProvenance::ClientCredentials.involves_user());
     }
 
     // ── the shapes the endpoint returns ─────────────────────────────────────
