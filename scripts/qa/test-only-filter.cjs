@@ -72,6 +72,45 @@ const uuidOrNull = new Function(`return (${extract("uuidOrNull")})`)();
  * statement executable, and a statement that executes with zero rows is the honest answer for an
  * id that names nothing.
  */
+/**
+ * Create the scratch table both probes count against, and report whether it worked.
+ *
+ * The probes' only question is "is this rendered statement EXECUTABLE" — a question about
+ * quoting — so they must not also answer "does this schema happen to exist yet". Against the
+ * shared container they did, because a pass had already migrated the QA database; against a
+ * FRESH database (exactly the state this test runs in, because run.sh calls it *before*
+ * reset-db.sh) every statement failed with `relation "cms_members" does not exist`, and 13
+ * checks reported a finding about the probe inside a test whose entire purpose is to be a
+ * trustworthy instrument.
+ *
+ * So the probe now owns its table and its columns. It creates what the statements name and
+ * drops it afterwards, which makes the section self-contained: it measures `uuidOrNull` on a
+ * database that has never had a migration run against it, which is the only state in which
+ * its answer means anything.
+ */
+function ensureProbeSchema() {
+  // The seeded row is what makes the section end on a COUNT rather than on executability: a
+  // guard that emits `null` for everything still runs every statement, and only a row that
+  // EXISTS separates "this value is not a uuid" from "this guard never matches anything".
+  const sql = [
+    "drop table if exists qa_uuid_probe;",
+    "create table qa_uuid_probe (id uuid primary key, member_id uuid);",
+    "insert into qa_uuid_probe (id, member_id) values",
+    "('0f0f0f0f-1111-2222-3333-444455556666'::uuid, '0f0f0f0f-1111-2222-3333-444455556666'::uuid);",
+  ].join(" ");
+  try {
+    execFileSync(
+      "docker",
+      ["exec", process.env.QA_PG_CONTAINER || "omnion-postgres", "psql", "-U", "omnion",
+       "-d", process.env.QA_DB || "omnion_qa_w2", "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", sql],
+      { encoding: "utf8", timeout: 30000 },
+    );
+    return "";
+  } catch (e) {
+    return String(e.stderr || e.message).split("\n")[0];
+  }
+}
+
 function probeUuidStatements() {
   const UUID = "0f0f0f0f-1111-2222-3333-444455556666";
   const cases = [
@@ -86,7 +125,7 @@ function probeUuidStatements() {
   let threw = 0;
   for (const [value, label] of cases) {
     const emitted = uuidOrNull(value);
-    const stmt = `select count(*) from cms_members where id = ${emitted}`;
+    const stmt = `select count(*) from qa_uuid_probe where id = ${emitted}`;
     let outcome;
     try {
       execFileSync(
@@ -110,11 +149,56 @@ function probeUuidStatements() {
     // and came back green. The guard's job is to PASS A REAL UUID THROUGH, so the valid case
     // asserts the value itself, not merely that the statement ran.
     if (UUID === value) {
-      check("a VALID uuid is passed through, not replaced", emitted.includes(UUID), `emitted ${emitted}`);
+      // `String(...)`, not `.includes` on the raw value: a guard that returns the literal
+      // `null` (correct SQL, matches nothing, runs perfectly) made this line throw
+      // "Cannot read properties of null", which killed the probe before it reported anything.
+      // A guard against a broken guard must itself survive the broken guard — a throw here
+      // reads as "the probe found nothing" to every layer above it, which is exactly the
+      // green-by-crashing failure this file exists to catch.
+      const text = String(emitted);
+      check("a VALID uuid is passed through, not replaced", text.includes(UUID), `emitted ${text}`);
     }
   }
   check("every statement executed", threw === 0, `${threw} of ${ran} threw`);
+
+  // A guard that returns the literal `null` for EVERY value makes all six statements execute
+  // perfectly and every check above pass — while it silently stopped matching any row at all,
+  // so `where id = null` reports zero rows for a row that exists. That variant was tried
+  // against this table and came back GREEN, which is why the section must end on a count
+  // rather than on executability alone.
+  //
+  // The count is what distinguishes "the guard produced null because the value is not a uuid"
+  // from "the guard produced null because it never matches anything". The scratch table holds
+  // exactly the two uuids this section uses, so a correct guard sees the valid one and a
+  // degenerate one sees neither.
+  const seen = probeCount("qa_uuid_probe", "id", UUID);
+  check(
+    "the guard FINDS a row that exists (not just a statement that runs)",
+    seen === "1",
+    `count(*) for the seeded uuid returned ${seen}`,
+  );
+  const seenBad = probeCount("qa_uuid_probe", "id", "not-a-uuid");
+  check(
+    "a non-uuid matches nothing",
+    seenBad === "0",
+    `count(*) for a non-uuid returned ${seenBad}`,
+  );
   probeRenderedCallSites();
+}
+
+/** `count(*)` for one value, or a diagnostic string. Used to tell a real filter from none. */
+function probeCount(table, column, value) {
+  try {
+    return execFileSync(
+      "docker",
+      ["exec", process.env.QA_PG_CONTAINER || "omnion-postgres", "psql", "-U", "omnion",
+       "-d", process.env.QA_DB || "omnion_qa_w2", "-t", "-A", "-c",
+       `select count(*) from ${table} where ${column} = ${uuidOrNull(value)};`],
+      { encoding: "utf8", timeout: 30000 },
+    ).trim();
+  } catch (e) {
+    return `THREW: ${String(e.stderr || e.message).split("\n")[0]}`;
+  }
 }
 
 /**
@@ -148,7 +232,11 @@ function probeRenderedCallSites() {
     `${doubleQuoted.length} quoted call site(s): ${doubleQuoted.map((s) => s.line).join(", ")}`,
   );
   for (const site of callSites) {
-    const stmt = `select count(*) ${site.line}${uuidOrNull("")}`;
+    // The TABLE is retargeted at the scratch table, and only the table: the rendered fragment
+    // is the point of this probe, so its COLUMN (the part that made it fail as "column
+    // member_id does not exist") has to survive untouched into the statement.
+    const target = site.line.replace(/\b(cms_member_sessions|cms_members)\b/, "qa_uuid_probe");
+    const stmt = `select count(*) ${target}${uuidOrNull("")}`;
     let outcome;
     try {
       execFileSync(
@@ -343,7 +431,26 @@ if (!PG_UP) {
     "       This says NOTHING about uuidOrNull; it says the statements could not be run. Re-run this test once Postgres is up.",
   );
 } else {
-  probeUuidStatements();
+  // A scratch table, not the CMS tables: this section runs BEFORE reset-db.sh, so on a fresh
+  // database the real tables do not exist and every statement would fail for a reason that has
+  // nothing to do with quoting. Created and dropped here, so the section owns its schema.
+  const schemaError = ensureProbeSchema();
+  if (schemaError) {
+    failures += 1;
+    console.log(`  FAIL the probe could not create its scratch table → ${schemaError}`);
+  } else {
+    probeUuidStatements();
+    try {
+      execFileSync(
+        "docker",
+        ["exec", process.env.QA_PG_CONTAINER || "omnion-postgres", "psql", "-U", "omnion",
+         "-d", process.env.QA_DB || "omnion_qa_w2", "-q", "-c", "drop table if exists qa_uuid_probe;"],
+        { encoding: "utf8", timeout: 30000 },
+      );
+    } catch {
+      // A scratch table left behind is not a test failure — it is dropped on the next run.
+    }
+  }
 }
 
 const verdict = failures === 0 ? "PASS" : `FAIL (${failures})`;
