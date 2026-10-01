@@ -8988,12 +8988,20 @@ async function runDeploymentMigrationsDepth(page, report) {
   const missing = await page.locator('[role="alert"]').count();
   note({ check: "unknown-version-explains-itself", alerts: missing, ok: missing >= 1 });
 
-  report.push({
-    page: "deployment-migrations",
-    action: "depth",
+  // A summary line, recorded the way every other step in this pass records: through `note`, which
+  // is what puts it in `steps` AND in the click stream. `report.push` is not a call that exists —
+  // `report` is the run's object (`{ startedAt, admin, steps, pages, ... }`), not an array, so
+  // `.push` is undefined and the line threw. It threw on the LAST statement of the pass, which
+  // is the worst possible place: every check above had already run and every screenshot had
+  // already been taken, and the throw unwound the whole process, so the run produced no summary
+  // at all. A defect in the reporter cannot cost the measurements; it can only cost the report.
+  note({
+    check: "summary",
     checks: steps.filter((step) => step.ok !== false).length,
     total: steps.length,
   });
+
+  return { ok: true, steps: steps.length };
 }
 
 async function runDeploymentArtifactsDepth(page, report) {
@@ -10030,10 +10038,19 @@ async function main() {
   // version that EXISTS — see the note above the route list.
   if (wants("deployment-artifacts")) {
     matchedOnly.add("deployment-artifacts");
-    report.deploymentArtifacts = await runDepthPass("deployment-artifacts", () =>
-      runDeploymentArtifactsDepth(page, report),
-      runDeploymentMigrationsDepth(page, report),
-    );
+    report.deploymentArtifacts = await runDepthPass("deployment-artifacts", async () => {
+      // Both passes are inside ONE thunk, and that placement is load-bearing. `runDepthPass`
+      // takes (name, pass) and calls `pass()` inside its own try/catch — so anything handed to it
+      // as a THUNK is caught, and anything evaluated as a value is not. The migrations pass used
+      // to be passed as a third argument, which JavaScript evaluates eagerly at the call site,
+      // outside the guard: its `TypeError` unwound the entire process, took the next three depth
+      // passes with it, and left a run with 400+ screenshots and no summary.json at all. The
+      // signature was never wrong — a third argument is simply ignored, and the work it was
+      // supposed to do happened anyway, unprotected.
+      const artifacts = await runDeploymentArtifactsDepth(page, report);
+      const migrations = await runDeploymentMigrationsDepth(page, report);
+      return { ...artifacts, migrations };
+    });
   }
   if (wants("deployment-install")) {
     matchedOnly.add("deployment-install");
