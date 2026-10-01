@@ -922,6 +922,23 @@ pub async fn list_events(
             "from must be earlier than to",
         ));
     }
+    // **The action filter is validated against the same list the writer uses.** Left unvalidated
+    // it was an argument that silently answered "no events" for a name nothing can produce, which
+    // is indistinguishable from "this tenant has had no incidents" — the worst possible answer
+    // from an audit screen. `0210` allowed `flagged` and `remapped` and no code path emits either,
+    // so a filter saved from the old screen returned an empty table with a `200`.
+    if let Some(action) = query.action.as_deref() {
+        if !guard_store::event_actions().contains(&action) {
+            return Err(ApiError::bad_request(
+                "invalid_guard_filter",
+                format!(
+                    "`{action}` is not an event action; an event records what happened to the \
+                     request, and the vocabulary is {}",
+                    guard_store::event_actions().join(", ")
+                ),
+            ));
+        }
+    }
 
     let page = guard_store::list_events(
         state.db().pool(),

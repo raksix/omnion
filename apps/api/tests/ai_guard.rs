@@ -350,6 +350,198 @@ async fn an_invalid_regex_is_a_field_error_and_stores_nothing() {
     store.dispose().await;
 }
 
+/// Every verdict a request can reach must produce a **stored row**, and no other name may.
+///
+/// This is the walk that was missing while the audit trail was broken for three slices. Every
+/// other walk in this file filed an event by hand with a literal it chose, so all of them were
+/// green against a writer whose own output the database rejected — the tests exercised the
+/// store's *capacity* to hold a row, and the one code path that decides which string the column
+/// gets was never asserted. A green suite therefore said nothing about the trail working.
+///
+/// So this one starts from the **verdict**, the way the checkpoint does, and asserts the row
+/// survives to storage: the names the detector produces are the names the table accepts. The
+/// second half then files an action name and requires it to be refused *before* the insert, so
+/// the near-miss vocabulary cannot come back through a new caller.
+#[tokio::test]
+async fn every_verdict_the_guard_reaches_becomes_a_row_and_no_other_name_does() {
+    let store = guard!();
+
+    // A policy that raises all three labels to distinct actions, the way the policy screen does.
+    // **This is the step the first draft of this walk skipped**, and the assertion below caught
+    // it: with no policy row a card number reaches `allowed`, because the default for an absent
+    // label is `Action::Allow` and the seeded `card.builtin` rule's own `block` is only the
+    // action the rule was created with, not what the policy does with it. A walk that asserted
+    // "a card is blocked" without configuring that would have been asserting the author's
+    // assumption rather than the detector's behaviour — the failure mode this file's other walks
+    // were written to avoid.
+    guard_store::save_policy(
+        &store.pool,
+        store.organization_id,
+        None,
+        PolicyChanges {
+            label_defaults: Some(
+                [
+                    ("card".to_owned(), Action::Block),
+                    ("email".to_owned(), Action::Mask),
+                    ("secret_like".to_owned(), Action::Flag),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            mask_style: Some(MaskStyle::Numbered),
+            allow_user_override: Some(false),
+        },
+    )
+    .await
+    .expect("the policy must save");
+
+    let loaded = guard_store::load_guard(&store.pool, store.organization_id)
+        .await
+        .expect("the guard must load");
+
+    // One payload per **reachable** verdict, each exercising a different policy action rather than
+    // four spellings of one: a card (`Block`), an e-mail (`Mask`), a vendor token (`Allow`).
+    //
+    // The third is the one this walk's first draft got wrong, and the assertion below is what
+    // caught it. `Action::Flag` looks like it should produce a `flagged` verdict, and it does not:
+    // the verdict enum has **no** `flagged` variant — flagging means "send it, and record that a
+    // human should know", which is `Allowed` with a rule key attached. So the fileable set is
+    // three names, and two of the five names `0210` allowed (`flagged`, `remapped`) were never
+    // producible by any code path in the build. `allowed` here is filed by a `Flag` policy to
+    // prove that half: a payload a human is asked to look at and an untouched payload produce
+    // **the same row shape**, and the only difference is the rule key beside it.
+    //
+    // `clear` is absent on purpose: the checkpoint returns before filing anything for a payload
+    // with nothing to guard, because one row per ordinary message would drown the events an
+    // operator opens the screen to read — `a_clean_payload…` in the outbound suite pins that.
+    let payloads = [
+        ("blocked", "my card is 4111111111111111"),
+        ("masked", "write to ada@lovelace.com about it"),
+        ("allowed", "my token is sk-abcdefghijklmnopqrstuvwx"),
+    ];
+
+    let mut expected: Vec<&str> = Vec::new();
+    for (name, payload) in payloads {
+        let finding = loaded.detector.inspect(payload, None, Some("chat"), &loaded.policy, "salt");
+        let verdict_name = finding.verdict.as_wire();
+        assert!(
+            verdict_name == name,
+            "this walk's vocabulary table must describe the detector, not the author: \
+             `{payload}` reached `{verdict_name}`, the walk expected `{name}`"
+        );
+
+        let id = guard_store::record_event(
+            &store.pool,
+            NewEvent {
+                organization_id: store.organization_id,
+                site_id: None,
+                user_id: None,
+                request_id: Uuid::new_v4(),
+                run_id: None,
+                provider_id: None,
+                feature: Some("chat".to_owned()),
+                action: verdict_name.to_owned(),
+                rule_keys: finding.matches.iter().map(|m| m.rule_key.clone()).collect(),
+                label_counts: finding.label_counts.clone(),
+                match_count: finding.matches.len() as i32,
+                value_hashes: finding.matches.iter().map(|m| m.value_hash.clone()).collect(),
+                error_code: finding
+                    .verdict
+                    .is_blocked()
+                    .then(|| "ai_guard_blocked".to_owned()),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "the verdict `{verdict_name}` must be storable: {error}. The table's check and \
+                 this writer must speak the SAME vocabulary — if the error names \
+                 `action_known`, the checkpoint is writing the per-rule action name \
+                 (allow/flag/mask/block) where the verdict name belongs."
+            )
+        });
+        assert!(id > 0, "a stored event must have an id: {id}");
+        expected.push(name);
+    }
+
+    // Every row the verdicts produced is really there, read the way the events screen reads.
+    let page = guard_store::list_events(
+        &store.pool,
+        &EventFilter {
+            organization_id: store.organization_id,
+            limit: 50,
+            ..EventFilter::default()
+        },
+    )
+    .await
+    .expect("the events must list");
+    assert_eq!(
+        page.total,
+        expected.len() as i64,
+        "every reached verdict must be on the record: {expected:?} stored {page:?}"
+    );
+    // The `blocked` flag has to agree with the word, or the screen's "blocked only" switch is a
+    // filter that answers a question nobody asked. Derived from the string, so this is the check
+    // that the derivation itself was not re-introduced as a second vocabulary.
+    for row in &page.rows {
+        assert_eq!(
+            row.blocked,
+            row.action == "blocked",
+            "the flag and the word are the same fact: {:?}",
+            row.action
+        );
+    }
+
+    // The names that are **not** event names. A refusal here is the point: it is what
+    // turns "the table rejected it" into "the store says so, and says why", instead of a
+    // constraint violation that names neither vocabulary.
+    //
+    // Two groups, and the second group is why this walk exists. `clear` is a real verdict the
+    // detector produces and the checkpoint deliberately does not record, so a row must not be
+    // able to claim it. The four per-rule action names are the near-misses that broke every
+    // insert: `block` reads as the obvious past tense of `blocked` and is the exact string that
+    // did it. `flagged` and `remapped` are the two names `0210` accepted that **no code path in
+    // the build could ever produce** — included here because a name the database accepts but the
+    // platform cannot emit is an invitation for the next writer to invent it.
+    for action in [
+        "clear",
+        "allow",
+        "flag",
+        "mask",
+        "block",
+        "flagged",
+        "remapped",
+    ] {
+        let error = guard_store::record_event(
+            &store.pool,
+            NewEvent {
+                organization_id: store.organization_id,
+                site_id: None,
+                user_id: None,
+                request_id: Uuid::new_v4(),
+                run_id: None,
+                provider_id: None,
+                feature: Some("chat".to_owned()),
+                action: action.to_owned(),
+                rule_keys: Vec::new(),
+                label_counts: std::collections::BTreeMap::new(),
+                match_count: 1,
+                value_hashes: Vec::new(),
+                error_code: None,
+            },
+        )
+        .await;
+        let error = error.expect_err(&format!("`{action}` is not an event action and must not store"));
+        let message = error.to_string();
+        assert!(
+            message.contains("verdict") && message.contains("allowed"),
+            "the refusal must name the vocabulary it wanted: {message}"
+        );
+    }
+
+    store.dispose().await;
+}
+
 #[tokio::test]
 async fn the_event_row_cannot_hold_the_payload() {
     let store = guard!();

@@ -45,8 +45,38 @@ use uuid::Uuid;
 
 use crate::error::{AiHubError, Result};
 use crate::guard_data::{
-    Action, Detector, Exemption, GuardError, Label, MaskStyle, Policy, Rule, RuleKind, Validator,
+    Action, Detector, Exemption, GuardError, GuardVerdict, Label, MaskStyle, Policy, Rule, RuleKind,
+    Validator,
 };
+
+/// The things that can happen to a request, and the names an `ai_guard_events` row carries.
+///
+/// **The verdict vocabulary, not [`Action`]'s.** `Action` answers "what does a rule do with a
+/// match" and is `allow`/`flag`/`mask`/`block`; an event answers "what happened to this request"
+/// and is `allowed`/`masked`/`blocked`. The two are near-misses of each other, which is exactly
+/// why the split has to live in one place: the checkpoint used to write `Action::as_wire()` into
+/// this column, `0210`'s check expected the verdict names, and **every insert the guard ever
+/// attempted was rejected** — a masked turn and a refusal alike, silently, because the checkpoint
+/// treats a failed audit as non-fatal. The events screen then showed an empty table for a guard
+/// that was demonstrably acting, which is the one thing an audit screen must never do.
+///
+/// Kept as a single free function rather than a `pub use` of the associated one: a re-export
+/// cannot carry the method's own `#[must_use]`/docs into this module's API, and the name here
+/// reads better at the call sites that use it (`EVENT_ACTIONS.contains(..)`). It delegates, so
+/// there is still exactly one list in the build.
+///
+/// A second copy of this list is the defect, not the fix, and `0210` already proved it by naming
+/// five actions of which the platform could produce three.
+#[must_use]
+pub fn event_actions() -> &'static [&'static str] {
+    GuardVerdict::recordable_names()
+}
+
+/// The one name of [`event_actions`] that means the call was refused.
+///
+/// A named constant because it appears in two places that must not drift — the column's
+/// derivation and the constraint the table enforces — and because `error_code` is set from it.
+pub const EVENT_BLOCKED: &str = "blocked";
 
 /// Columns read back from `ai_guard_rules`.
 const RULE_COLUMNS: &str = "id, organization_id, key, label, custom_label, kind, pattern, \
@@ -303,7 +333,15 @@ pub struct EventRow {
     pub provider_id: Option<Uuid>,
     /// The feature key.
     pub feature: Option<String>,
-    /// `allowed`, `flagged`, `masked`, `blocked` or `remapped`.
+    /// What happened to the **request**: `allowed`, `flagged`, `masked` or `blocked`.
+    ///
+    /// A **verdict** name, not an [`Action`](crate::guard_data::Action) name. The two
+    /// vocabularies are near-misses of each other — `Action` is `allow`/`flag`/`mask`/`block`
+    /// and the verdict is `allowed`/`flagged`/`masked`/`blocked` — and a column holding the
+    /// action was a column no row could ever satisfy: `record_event` wrote `block`, the table
+    /// checked for `blocked`, and the insert failed on **every** call. `flagged` is the past
+    /// tense of an `Allowed` verdict whose rules matched, and `remapped` was a fifth name that
+    /// nothing in this build ever produced; both are gone from the check below.
     pub action: String,
     /// Which rules fired.
     pub rule_keys: Vec<String>,
@@ -1146,13 +1184,30 @@ pub struct NewEvent {
 /// to log a failure here (the chat route warns and continues), because refusing a user's chat
 /// because the audit row did not fit would be a worse outcome than the gap it closes.
 pub async fn record_event(pool: &PgPool, new: NewEvent) -> Result<i64> {
-    // **`Action::Block.as_wire()` is `"block"`, not `"blocked"`.** Comparing against `"blocked"`
-    // here made `blocked` permanently `false` on every row, which meant the `?blocked=true` filter
-    // on the events screen could never match anything — the refusal was on record and invisible,
-    // which is the one outcome an audit trail must not have. The strictest action decides, exactly
-    // as the detector's own verdict does, so a `flag` rule inside a blocked request is still
-    // recorded as a block.
-    let blocked = Action::from_wire(&new.action) == Some(Action::Block);
+    // **The `blocked` flag is the string, not a re-parse of an enum.** An earlier version read
+    // `Action::from_wire(&new.action)`; with the column holding *verdict* names, `"blocked"` is
+    // not an `Action` at all and the parse yielded `None`, so the flag would have been `false` on
+    // every row and `ai_guard_events_blocked_matches_action` would have rejected the insert for
+    // the one row that matters most. The two facts are the same fact, so they are compared
+    // rather than recomputed from a second vocabulary.
+    let blocked = new.action == EVENT_BLOCKED;
+    // A name outside the vocabulary is a **caller** bug, and it is caught here rather than by the
+    // table's check: the check reports `action_known` with no hint that the near-miss vocabulary
+    // (`allow`/`flag`/`mask`/`block`) exists, which is how this column was broken for the length
+    // of three slices — a masked turn and a refusal both failed to insert, and the only symptom
+    // was an absent row on an empty events screen.
+    //
+    // `GuardConfiguration` rather than a validation variant on purpose: nothing a user submitted
+    // is wrong. A rule's action or a payload can never produce this string; only code that filed
+    // the event by hand can, and that is a build fault whose fix is in this repository.
+    if !event_actions().contains(&new.action.as_str()) {
+        return Err(AiHubError::GuardConfiguration(format!(
+            "`{}` is not an event action; an event records the request's verdict, and the \
+             vocabulary is {} (not the per-rule action names allow/flag/mask/block)",
+            new.action,
+            event_actions().join(", ")
+        )));
+    }
     let row: (i64,) = sqlx::query_as(
         "insert into ai_guard_events (organization_id, site_id, user_id, request_id, run_id, \
            provider_id, feature, action, rule_keys, label_counts, match_count, blocked, \

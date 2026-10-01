@@ -838,7 +838,13 @@ async fn a_blocked_turn_is_refused_and_the_provider_is_never_dialled() {
         "exactly one refusal must be on the record: {events}"
     );
     assert_eq!(rows.len(), 1, "one row on the page: {events}");
-    assert_eq!(rows[0]["action"], "block", "{events}");
+    // **`blocked`, not `block`.** The row records what happened to the *request*; `block` is the
+    // per-rule action name and is not in the column's vocabulary at all — writing it there is
+    // what kept every insert in this file failing, silently, for three slices. The events screen's
+    // chip, this assertion and `ai_guard_events_action_known` all speak the verdict name, so a
+    // change here has to change there too.
+    assert_eq!(rows[0]["action"], "blocked", "{events}");
+    assert_eq!(rows[0]["blocked"], true, "{events}");
     assert_eq!(rows[0]["error_code"], "ai_guard_blocked", "{events}");
     assert!(
         !events.to_string().contains(CARD),

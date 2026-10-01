@@ -31,8 +31,21 @@ import { formatTimestamp } from "@/lib/format";
 
 const PAGE_SIZE = 25;
 
-/** The action vocabulary, used to filter and to colour a row. */
-const ACTIONS = ["allowed", "flagged", "masked", "blocked", "remapped"] as const;
+/**
+ * The action vocabulary, used to filter and to colour a row.
+ *
+ * **Three names, not five.** `0210` shipped `allowed`, `flagged`, `masked`, `blocked` and
+ * `remapped`, but `flagged` and `remapped` are not values of the guard's verdict enum
+ * (`clear` / `allowed` / `masked` / `blocked`), so nothing in the platform could ever produce
+ * them: the filter offered two options that return nothing, forever, and looked like a
+ * two-option mistake waiting to happen. `Action::Flag` is what makes `flagged` tempting — a
+ * flagged match is stored as `allowed` with the rule key beside it, because flagging means "send
+ * it, and record that a human should look", not "refuse".
+ *
+ * Kept in step with `GuardVerdict::recordable_names` (`crates/ai-hub/src/guard_data.rs`), which
+ * is the single authority; the API rejects any other name in the `action` filter.
+ */
+const ACTIONS = ["allowed", "masked", "blocked"] as const;
 
 /** How a row's action is coloured. `allowed` is deliberately quiet: it is the common case. */
 function actionClass(action: string): string {
@@ -41,8 +54,6 @@ function actionClass(action: string): string {
       return "bg-danger/10 text-danger";
     case "masked":
       return "bg-warning/10 text-warning";
-    case "flagged":
-      return "bg-muted/70 text-ink";
     default:
       return "bg-muted/40 text-muted";
   }

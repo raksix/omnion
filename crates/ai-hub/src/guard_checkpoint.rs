@@ -262,7 +262,15 @@ pub async fn checkpoint(
 
     let rule_keys = collect_rule_keys(&finding.matches);
     let value_hashes = collect_hashes(&finding.matches);
-    let action = finding.action.as_wire().to_owned();
+    // **The verdict, not the action.** `finding.action` is the strictest *rule* decision
+    // (`allow`/`flag`/`mask`/`block`); an event row records what happened to the *request*
+    // (`allowed`/`flagged`/`masked`/`blocked`). Writing the former into this column is what
+    // broke the audit trail outright: `ai_guard_events_action_known` rejects every one of those
+    // four names, so `record_event` failed on every masked turn and every refusal, and because
+    // a failed audit is deliberately non-fatal the only symptom was an events screen that stayed
+    // empty while the guard was demonstrably acting. The two vocabularies differ by one letter
+    // in every case, which is why this looks correct on a skim and was wrong for three slices.
+    let action = finding.verdict.as_wire().to_owned();
     let match_count = i32::try_from(finding.matches.len()).unwrap_or(i32::MAX);
     let blocked = finding.verdict.is_blocked();
 

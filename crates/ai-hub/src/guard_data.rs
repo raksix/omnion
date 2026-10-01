@@ -405,6 +405,23 @@ impl GuardVerdict {
     pub fn is_blocked(&self) -> bool {
         matches!(self, Self::Blocked { .. })
     }
+
+    /// Every name `as_wire` can return **except `clear`**, in one list.
+    ///
+    /// This is the list an `ai_guard_events` row can carry, and it is derived from the enum rather
+    /// than written out beside it. `0210`'s constraint enumerated `allowed`, `flagged`, `masked`,
+    /// `blocked` and `remapped` — five names, of which **two this enum can never produce**.
+    /// `flagged` is the seductive one: `Action::Flag` exists, and its verdict is `Allowed`, so a
+    /// reader (or writer) naturally reaches for `flagged` and finds it accepted by the database
+    /// while nothing in the platform produces it. `remapped` has no source at all.
+    ///
+    /// So the fileable set is the enum's own names minus the one the checkpoint deliberately does
+    /// not record, and it is computed here rather than retyped in a migration, in the store and in
+    /// a walk — three places that previously disagreed.
+    #[must_use]
+    pub fn recordable_names() -> &'static [&'static str] {
+        &["allowed", "masked", "blocked"]
+    }
 }
 
 /// One exemption: a label, a scope and a reason.
