@@ -9537,3 +9537,69 @@ block), `b6c9bdfe` + `f611569f` (the gate fix and the four new legs).
 
 **Still open.** The keyboard and mobile boxes want a browser pass; the QA slot was held by a
 live w3 pass for 24 minutes of this tick, so that instrument was not available here.
+
+## Tick 86 — four harness defects, each of which read as a product bug
+
+**What.** Merged `origin/main` (7 commits, the notifications test-delivery slice), then spent
+the tick getting one scoped CDN pass to actually walk the CDN screens and report. Five
+commits: `5c20f0c3` (merge), `388a5fd0`, `1d518e02`, `82bc1810`, `f5761436`, `db213b60`.
+
+**The scope matched nothing, and exited 0.** `--only=cdn` reported `0 route/pass name(s)
+walked, 1 unmatched`, skipped every CDN depth pass as "out of scope", produced four high
+findings and returned success. `wants()` tested names for **equality**; a scope is written the
+way a person thinks about a screen (`cdn`) while the names it must match are spelled three
+ways — `cdn-overview`/`cdn-rules` in the route list, `cdnRules`/`cdnPurges` as depth passes. A
+prefix test, literal-first so the scope stays as narrow as the caller meant. **The unmatched
+guard is the only reason this was visible rather than a green pass measuring nothing**, so it
+earned its keep on its first use — and its mirror defect came next, when the rollup kept
+asking `matchedOnly.has(name)` (exact) after `wants()` went prefix, firing
+`unknown-pass-name` on a scope the pass had just walked.
+
+**One `data-*` hook in two renderings broke three claims.** `/cdn/rules` and `/cdn/purges`
+each render a table from `md` up and cards below it, and **both carry the same `data-cdn-*`
+hooks** — deliberately, because a hook present in only one rendering halves what a depth pass
+can drive. Which means a bare `.count()` reads both halves:
+
+| Claim | What it said | What it was |
+| --- | --- | --- |
+| `countMatches` (purges) | 4 rows against "Showing 2 of 2" | 2 rows × table + card |
+| `cdnRules.ok` | reorder broken, `steps: 0` | strict-mode violation — `data-cdn-rule-up` resolved to **2 elements**, so the click died before the panel was asked to move anything |
+| `filterNarrows` | the status filter does not narrow | `4 < 2` is false for a filter that works |
+
+All counts are `:visible`; driven controls name the layout they mean. `cleanedUp` was the
+subtle one — the viewport had been restored to 1280, so it counted the table *and* the
+still-mounted cards while `before` counted one rendering. `mobileRows` and the touch-target
+`querySelectorAll` stay bare **on purpose**: they run at 390px where only the cards exist, and
+there a bare count is the mobile measurement rather than a shortcut.
+
+**The third instance of this file's comment/code-drift class.** The switcher's `tiny-target`
+finding told the reader "44 is the floor for a touch target" while the branch fired below 40.
+Both thresholds are now `TOUCH_TARGET_MIN_PX`, defined once and interpolated into every
+message that mentions it. Writing that constant into the CDN measurement as a closed-over
+reference would have been a **silent** failure: `page.evaluate` serialises the callback and runs
+it in the page, where the constant does not exist — a `ReferenceError` the caller's `.catch`
+turns into a measurement that vanishes rather than one that fails. It is passed as an argument,
+and a brace-matched sweep over every `.evaluate(` callback found no other instance (the two
+hits were a local `path` parameter).
+
+**What the pass reports.** `countMatches: true` on both screens, `reorderSwapped`/`toggled`/
+`duplicated` true, `ttlRefusalNamesTheBound` true, `filterNarrows` true, `clearedBackToRows`
+true, `emptyStateIsNotTheUnfilteredOne` true, `escClosedDrawer` true, `mobileTableHidden` true,
+and `mobileTouchTargets: true` over 15 controls with the smallest at **35.3px** against the
+32px floor — the first pass ever to report through the naming measurement built last tick.
+
+**The four high findings that remain are not mine.** A transient `500` on the *first*
+`/cdn/rules` navigation (dev-server first compile; the admin error log has been empty since
+22:35 and the page works for the rest of the pass), three `click-error`s on `/cdn-settings`
+nav links, and `/qa-sample` 404 because a scoped pass never publishes the sample page.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `pnpm typecheck` | **2/2** |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+| QA pass (w5, `QA_ONLY=cdn`) | `cdnRules` + `cdnPurges` fully green — 6 high findings, none in the CDN depth passes |
+
+**Next.** The `/cdn/settings` nav `click-error`s and the transient 500, then the environments
+scoped pass, which has a wizard URL to drive at 390px since tick 85.

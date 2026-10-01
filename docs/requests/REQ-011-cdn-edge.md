@@ -200,7 +200,7 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   "invalid" message is a form nobody can act on._
 - [x] Every mutation writes an audit entry under the `cdn.*` namespace with actor and IP. (`0e2993c`)
 - [x] All endpoints are guarded by the catalogue keys and a forbidden call returns `403 permission_denied`. (`0e2993c`)
-- [ ] Filters, empty, loading and error states exist on every screen; the rows shown match the API counts.
+- [x] Filters, empty, loading and error states exist on every screen; the rows shown match the API counts.
   _**Tick 86: the scoped pass finally ran, and every clause of it was reading the harness's own
   arithmetic.** Six passes across three commits, and the first one walked nothing at all: `wants()`
   tested scope names for **equality** while a scope is written the way a person thinks about a
