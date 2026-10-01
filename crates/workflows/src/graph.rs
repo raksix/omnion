@@ -2788,4 +2788,80 @@ mod tests {
              again; the registry's trigger types are `trigger.*`"
         );
     }
+
+    /// The sign-out step must not be able to end the walk.
+    ///
+    /// Pass `20261001-012121` died at `walkthrough.cjs:8307` — `locator.count: Target page, context
+    /// or browser has been closed` — with `pages: 55`, `mobile: 0` and **no `workflowBuilder` key
+    /// at all**. The crash site is the only unguarded statement left in `main`, and it sits
+    /// between the route loop and the automation/builder passes, so the one thing the box killed
+    /// the run for was the reason none of this REQ's criteria could be measured. Two ticks were
+    /// then spent arguing about *why* the tab died (memory, shared Chrome, the queue) when the
+    /// harness had already decided the outcome: a cleanup step that throws ends the walk.
+    ///
+    /// The comment at that site said "Sign-out is exercised last so it cannot break the walk",
+    /// and EIGHT passes follow it — the three automation passes and the builder among them. The
+    /// comment described an intention the ordering had stopped implementing, which is the shape
+    /// that keeps recurring on this branch: the code says one thing, the note says another, and
+    /// only a run can tell you which one the product had.
+    ///
+    /// So both halves are asserted here. `signOut` is *wrapped* — a `try` that catches and records
+    /// — and `runWorkflowBuilderDepth` is called *after* it in the source, which is the ordering
+    /// that decides whether a box event can cost the builder its measurement. Asserting the text
+    /// would be theatre; asserting the ORDER is the claim.
+    #[test]
+    fn the_sign_out_step_cannot_end_the_walk() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above crates/workflows");
+        let source = std::fs::read_to_string(repo_root.join("scripts/qa/walkthrough.cjs"))
+            .unwrap_or_else(|e| panic!("the walkthrough is the thing being guarded: {e}"));
+
+        let sign_out = source
+            .find("const signOut = page.locator")
+            .expect("the sign-out step is gone from the pass; this guard would pass vacuously");
+        let guarded = source[..sign_out]
+            .rfind("try {")
+            .expect("the sign-out step is no longer inside a try block — a cleanup step that throws ends the walk");
+        // The nearest `try` must belong to this block, not to some earlier one in `main`: the
+        // distance is what proves the `catch` was written for the sign-out and not inherited.
+        assert!(
+            sign_out - guarded < 400,
+            "the nearest `try` before the sign-out is {guarded_len} lines up; the recovery that \
+             was added for this failure has stopped being attached to it",
+            guarded_len = sign_out - guarded
+        );
+        let after = &source[sign_out..];
+        assert!(
+            after.contains("signout-failed"),
+            "the sign-out `catch` records nothing, so a dead browser during cleanup leaves no \
+             trace in `clicks.jsonl` and the next reader sees only the missing measurements"
+        );
+
+        // The ordering is the claim that costs the measurements.
+        let builder = source
+            .find("runWorkflowBuilderDepth(page, report)")
+            .expect("the builder pass is gone from the walkthrough");
+        assert!(
+            builder > sign_out,
+            "the builder pass runs BEFORE the sign-out step, so a browser that dies during \
+             cleanup is measured before it happens — which is how `20261001-012121` reported 55 \
+             routes and no builder at all"
+        );
+
+        // And the box-level guard the recovery depends on must exist, because a dead tab and a
+        // dead process raise the SAME string (`context.newPage` answers it for either) and only
+        // one of the two can be recovered by opening another tab.
+        assert!(
+            source.contains("browserIsGone") && source.contains("skippedForDeadBrowser"),
+            "the dead-browser flag and its distinct reason string are gone; without them every \
+             pass after a dead browser reports a defect on a screen it never reached"
+        );
+        assert!(
+            source.contains(r#""browser-died""#),
+            "the roll-up names no single finding for a dead browser, so one machine event is \
+             reported once per pass and reads as dozens of screen defects"
+        );
+    }
 }

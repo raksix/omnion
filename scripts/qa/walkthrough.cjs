@@ -1180,12 +1180,28 @@ async function pageIsAlive(page) {
 // the swap is handed the new tab without one call site being edited.
 let installMainPage = null;
 
+// Once the browser PROCESS is gone, opening a page on its context cannot work, and every later
+// pass repeats the same failed attempt and writes the same line. That is what produced seventy-six
+// identical findings on pass `20261001-012121`: one box-level event wearing the costume of
+// seventy-six screen findings, which is the reading that sends the next reader to re-verify seventy
+// screens instead of one machine. The condition is remembered here so it can be named once.
+let browserIsGone = false;
+
 /** Open a replacement tab and sign it in; returns it, or null when there is no browser to ask. */
 async function reviveMainPage() {
+  // A browser that is already known to be gone is not asked again. `browserIsGone` is the
+  // distinction between "the tab died and can be replaced" and "the process died and cannot" —
+  // `context.newPage` answers `Target page, context or browser has been closed` for BOTH, so the
+  // error text alone cannot tell the two apart, and the recovery that costs one sign-in is
+  // indistinguishable from the recovery that costs the run.
+  if (browserIsGone) return null;
   if (!installMainPage) return null;
   try {
-    return await installMainPage();
+    const replacement = await installMainPage();
+    browserIsGone = false;
+    return replacement;
   } catch (cause) {
+    browserIsGone = true;
     log(`the replacement tab could not be opened: ${cause instanceof Error ? cause.message : cause}`);
     return null;
   }
@@ -1228,6 +1244,15 @@ async function runDepthPass(name, pass) {
     if (/Page crashed|Target closed|Target crashed|Session closed|browser has been closed/i.test(reason)) {
       const revived = await reviveMainPage();
       if (revived) log(`depth pass ${name} lost its tab to the box; a new one is in place for the passes after it`);
+      // The browser PROCESS is gone, not the tab, so every pass from here to the end of `main`
+      // would fail on the same dead context. Each one is recorded as a finding about a SCREEN,
+      // and seventy-six identical lines read as seventy-six defects instead of one machine
+      // event -- the pass naming the box is the only thing that keeps the report honest about
+      // what was and was not measured. `skippedForDeadBrowser` is a distinct reason string so
+      // the roll-up can count the shortfall instead of mistaking it for coverage.
+      if (browserIsGone) {
+        return { ok: false, steps: 0, reason: "skippedForDeadBrowser: the browser process is gone, so no screen after this point was measured" };
+      }
     }
     return { ok: false, steps: 0, reason };
   }
@@ -7745,10 +7770,58 @@ async function selfcheckRecovery() {
     secondReportedTheDeadTab: Boolean(second && second.ok === false),
     secondNamedTheCause: Boolean(second && /closed|crash/i.test(second.reason || "")),
     thirdRanOnTheReplacement: Boolean(third && third.ok),
+    // A dead TAB and a dead PROCESS produce the SAME error text -- `context.newPage` answers
+    // `Target page, context or browser has been closed` for either -- so the two recoveries are
+    // indistinguishable by the message and only one of them works. The first three checks above
+    // cover the tab case, which is the case that recovers, and that is why they were green while
+    // pass `20261001-012121` died: the thing that was exercised was not the thing that happens.
+    //
+    // This leg closes the browser outright and asserts the two claims the box-level fix rests on:
+    // the pass that follows names the shortfall rather than reporting a defect on a screen it
+    // never reached, and the next pass is not even attempted -- `installMainPage` is replaced by
+    // one that throws, so a second attempt would be visible as a call rather than inferred from
+    // a log line nobody counts.
+    fourthNamesTheBoxNotTheScreen: await (async () => {
+      await browser.close();
+      browserIsGone = false;
+      let attempts = 0;
+      const working = installMainPage;
+      installMainPage = async () => {
+        attempts += 1;
+        throw new Error("browserContext.newPage: Target page, context or browser has been closed");
+      };
+      const onDeadBrowser = await runDepthPass("on-dead-browser", async () => ({ ok: true, title: await page.title() }));
+      installMainPage = working;
+      return (
+        typeof onDeadBrowser.reason === "string" &&
+        onDeadBrowser.reason.startsWith("skippedForDeadBrowser") &&
+        !/locator|page\./.test(onDeadBrowser.reason)
+      );
+    })(),
+    deadBrowserIsNotRetriedForever: await (async () => {
+      let attempts = 0;
+      const working = installMainPage;
+      installMainPage = async () => {
+        attempts += 1;
+        throw new Error("browserContext.newPage: Target page, context or browser has been closed");
+      };
+      // Reset, because the leg above left the browser known-gone: without this the two passes
+      // below short-circuit on the flag and never reach `installMainPage` at all, which is the
+      // correct behaviour but tests nothing. With the reset, the FIRST pass must try once and
+      // fail, the SECOND must not try at all -- one attempt across two passes is the whole
+      // claim, and asserting `attempts === 0` here would pass against a browser that died for
+      // a reason nobody had recorded.
+      browserIsGone = false;
+      await runDepthPass("dead-again-a", async () => ({ ok: true, title: await page.title() }));
+      await runDepthPass("dead-again-b", async () => ({ ok: true, title: await page.title() }));
+      await runDepthPass("dead-again-c", async () => ({ ok: true, title: await page.title() }));
+      installMainPage = working;
+      return attempts === 1;
+    })(),
   };
   const pass = Object.values(checks).every(Boolean);
   console.log("RECOVERY_SELFCHECK " + JSON.stringify({ pass, checks, secondReason: second && second.reason }));
-  await browser.close();
+  await browser.close().catch(() => {});
   return pass;
 }
 
@@ -8302,15 +8375,34 @@ async function main() {
   await runDepthPass("iam-security-depth", () => runIamSecurityDepth(page, report));
   }  log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
 
-  // Sign-out is exercised last so it cannot break the walk.
-  const signOut = page.locator('button:has-text("Sign out")').first();
-  if ((await signOut.count()) > 0) {
-    await signOut.click().catch(() => {});
-    await page.waitForTimeout(1100);
-    report.signOut = { url: page.url(), reachedLogin: /\/login/.test(page.url()) };
-    await shot(page, "90-after-sign-out");
-    const reLogin = await ensureSignedIn(page, report);
-    report.reLogin = reLogin;
+  // Sign-out is a cleanup step, so it is wrapped rather than left to decide whether the rest of
+  // the run happens. It was commented "exercised last" while EIGHT passes follow it -- the three
+  // automation passes and the builder among them -- so the comment described an intention the order
+  // had long since stopped implementing. The bare `locator.count()` was the one statement in `main`
+  // with no guard at all, and it is the statement pass `20261001-012121` died on: 55 routes read,
+  // then `locator.count: Target page, context or browser has been closed` took the run down with
+  // `pages: 55, mobile: 0` and NO workflow-builder rows, because the crash sat exactly between
+  // the route loop and the passes this REQ needs measured. A cleanup step must not be able to end
+  // a walk; that is the same rule the route loop and every depth pass already follow.
+  try {
+    const signOut = page.locator('button:has-text("Sign out")').first();
+    if ((await signOut.count()) > 0) {
+      await signOut.click().catch(() => {});
+      await page.waitForTimeout(1100);
+      report.signOut = { url: page.url(), reachedLogin: /\/login/.test(page.url()) };
+      await shot(page, "90-after-sign-out");
+      const reLogin = await ensureSignedIn(page, report);
+      report.reLogin = reLogin;
+    }
+  } catch (cause) {
+    const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+    log(`sign-out step failed: ${reason}`);
+    record({ page: "qa", action: "signout-failed", reason });
+    // The same recovery the depth passes use, so the passes after the cleanup still get a tab.
+    if (/Page crashed|Target closed|Target crashed|Session closed|browser has been closed/i.test(reason)) {
+      await reviveMainPage();
+    }
+    report.signOut = { ok: false, reason };
   }
 
   // The passkey pass (REQ-006, slice 3b): a virtual authenticator enrols a passkey on the
@@ -8481,6 +8573,31 @@ async function main() {
   const clicks = clickLines.filter((e) => e.action === "click");
   const findings = [];
   const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
+
+  // A browser that died mid-walk is ONE finding about the BOX, and it is counted before any screen
+  // finding so it is read first.
+  //
+  // This is the shape pass `20261001-012121` produced: `pages: 55`, `mobile: 0`, no
+  // `workflowBuilder` key at all, and seventy-six lines in `clicks.jsonl` all carrying the same
+  // `Target page, context or browser has been closed`. Seventy-six findings is what a reader sees,
+  // and the correct reading is one machine event — which sends them to re-verify seventy screens
+  // that were fine, while the screens the pass actually needed to reach (the automation passes and
+  // the builder sit AFTER the crash site) are silently absent from the report entirely. So the
+  // count is reported, the passes that never ran are named, and it is high: a walk that stopped
+  // early has NOT proved the panel clean, and the whole point of this entry is that a green
+  // summary after a dead browser is a claim nobody checked.
+  const deadBrowserPasses = Object.entries(report)
+    .filter(([, v]) => v && typeof v === "object" && typeof v.reason === "string" && v.reason.startsWith("skippedForDeadBrowser"))
+    .map(([k]) => k);
+  if (browserIsGone || deadBrowserPasses.length) {
+    pushFindings(
+      "high",
+      "browser-died",
+      `the browser process died ${deadBrowserPasses.length ? "before " + deadBrowserPasses.length + " pass(es) could run" : "during the walk"}` +
+        `${deadBrowserPasses.length ? ": " + deadBrowserPasses.join(", ") : ""}` +
+        " — those screens were NOT measured, and the routes already read say nothing about them",
+    );
+  }
 
   // A `--only` filter that matches nothing is a finding, not an empty green report.
   //
