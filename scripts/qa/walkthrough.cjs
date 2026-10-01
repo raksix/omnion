@@ -7378,6 +7378,20 @@ async function runEnvironmentsDepth(page, report) {
     if (Number(duplicates) !== 0) {
       record({ page: "environments", action: "duplicate-slugs-in-clone" });
     }
+    // `cloneCopied` is the whole reason this depth pass exists — "a wizard that creates the row
+    // and reports done while zero rows were copied is the exact failure this request prevents" —
+    // and it was written into `steps` and read by **nothing**. A runner that copied nothing and
+    // one that copied every page both leave `steps.clone.cloneCopied` sitting in `summary.json`,
+    // and the pass returns `ok: true` either way. The pass has never executed, so nothing ever
+    // compared the two.
+    if (!cloneCopied) {
+      record({
+        page: "environments",
+        action: "clone-reported-done-without-copying-the-pages",
+        severity: "high",
+        detail: `job=${job} copied=${copied} production=${productionPages}`,
+      });
+    }
 
     // ---- The detail screen ------------------------------------------------------------------
     await page.goto(`${URL_ADMIN}/environments/${environmentId}`, { waitUntil: "domcontentloaded" }).catch(
@@ -7408,6 +7422,17 @@ async function runEnvironmentsDepth(page, report) {
       namesACount: /\d+ page/.test(discardLines),
     };
     await shot(page, "environments-reclone-confirm");
+    // A confirmation that does not say what it discards is the dialog's entire job — the operator
+    // is about to throw away every staging edit, and "are you sure?" gives them no basis to answer.
+    // Collected, ungated, and on a pass that has never run, so nothing has ever compared it.
+    if (dialogShown && !steps.recloneDialog.namesACount) {
+      record({
+        page: "environments",
+        action: "reclone-confirmation-names-no-count",
+        severity: "high",
+        detail: steps.recloneDialog.discardLines.slice(0, 160),
+      });
+    }
 
     if (dialogShown) {
       await page.click("[data-env-reclone-cancel]").catch(() => {});
@@ -7550,11 +7575,37 @@ async function runEnvironmentsDepth(page, report) {
     steps.promotionsTab = { rows: promotionRows, rendered: (await page.locator("[data-promotions-tab]").count()) > 0 };
     await shot(page, "environments-promotions-tab");
 
+    // The Promotions tab is read back **after a full navigation** precisely so a tab built from
+    // the same in-memory state as the dialog could not pass — which is only a claim if an empty
+    // tab is a failure. It was not one: `rendered` and `rows` were collected and read by nobody,
+    // so the request's "visible in the Promotions tab" criterion was enforced by no code at all.
+    // A promotion requested on this very screen is the row that must be here; a tab with none is
+    // a tab that silently lost a ship.
+    if (!steps.promotionsTab.rendered) {
+      record({ page: "environments", action: "promotions-tab-absent", severity: "high" });
+    } else if (promotionRows === 0) {
+      record({
+        page: "environments",
+        action: "promotions-tab-shows-no-record-after-one-was-requested",
+        severity: "high",
+      });
+    }
+
     if (promotionRows > 0) {
       await page.locator("[data-promotion-expand]").first().click().catch(() => {});
       await page.waitForTimeout(1200);
       const frozenItems = await page.locator("[data-promotion-expanded-items] li").count();
       steps.promotionExpanded = { frozenItems };
+      // The frozen change set is what makes the history auditable — "what exactly did this ship?"
+      // — and the walk proved at request time that a promotion carries items. An expansion that
+      // lists none is a history entry that cannot answer its own question.
+      if (frozenItems === 0) {
+        record({
+          page: "environments",
+          action: "promotion-history-entry-lists-no-frozen-items",
+          severity: "high",
+        });
+      }
       await shot(page, "environments-promotions-expanded");
     }
 
