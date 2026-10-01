@@ -12469,3 +12469,80 @@ The screen-states box stays open, and REQ-010 stays open.
 it should now be `ok: true` with the pair steps present. Then REQ-010's last open code item, the
 CDN purge hook to REQ-011 (the `media.version_created` emitter it subscribes to shipped in slice 2;
 REQ-011 itself is a wave-5 REQ and out of my waves, so this stays a note).
+
+---
+
+## Tick 110 — REQ-033 slice 3d: the event catalogue as a contract
+
+**Committed first, verified second — and the gate found a gate that was not gating.**
+
+The tick opened with a full disk (100%, 673 MB free) and an uncommitted working tree holding
+779 lines of new code written ~10 minutes earlier: `crates/events/src/schema.rs`, the derived
+JSON Schema and sample generator, plus its route, test and panel-type wiring. The first act was
+to commit it, because an uncommitted tree on a full disk is the state where a crash costs the
+work. The second act was to run the gates, which is where the tick's real content is.
+
+### What the tick's own commit was hiding
+
+`cargo test -p omnion-api --test events` did not compile. The test asserted the thing the whole
+slice exists to prove — that the generated schema declares exactly the fields the entry lists —
+and it called `fields_of(entry)`, a helper that was never written. So the assertion that guards
+the slice's central invariant had **never once run**. The unit tests were green (65) and the
+integration target was not built at all, which is the shape of a false gate: the cheap gate
+passes because it does not contain the test.
+
+That is the second time in this REQ that a gate reported a shape it did not have. The first was
+the browser pass that could not run. Here the gate ran, passed its neighbours, and said nothing
+about the code it was named after.
+
+**A gate that was never executed is not a gate.** `cargo test -p <crate> --lib` covers unit tests
+only; an integration target under `apps/api/tests/` is a separate compilation unit and a separate
+`--test` flag, and a slice whose proof lives there has to name it explicitly.
+
+### Second finding: the failure was not mine, and saying so took a commit
+
+With the target compiling, 11 of 12 pass. The twelfth, `every_emitted_name_is_in_the_catalogue`,
+names 10 event strings that emitters publish and the shared catalogue does not list:
+`update.available` (`deployment_check.rs:191`), `organization.module.enabled`/`.disabled`
+(`tenancy_limits.rs`), `organization.member.invited`/`.invitation_queued` (`tenancy_members.rs`).
+That test was written by a sibling (`d36aef5e`) to be able to fail, and the emitters came from
+`d11c9e96` and `d7476893` — other writers' waves. `git show HEAD~1:crates/events/src/catalogue.rs`
+returns **0** matches for those names, so the gap predates this tick's commit and is not
+something it introduced.
+
+Adding the rows is a two-line change and would turn the gate green, which is exactly why it is
+not this tick's move: `crates/events/src/catalogue.rs` is shared infrastructure, the ten names
+belong to three other waves' features, and their payload fields have to be described by whoever
+emits them. A green gate bought by guessing another wave's payload shape is a lie with a
+checkmark. Left red, with the emitters and line numbers recorded, which is what the test was
+built to say.
+
+### The disk
+
+`disk-guard.sh` freed **0 MB** and the reason is worth recording, because the script is correct
+and still missed: its globs are `omnion*/target` and `/dev/shm/*-target`, and this box's real
+weight sits in `omnion-w2-target` (6.0 GB) and `w8build` (3.7 GB) — neither matches a glob. Both
+are **live**: `w2`'s `CARGO_TARGET_DIR` is set in a running `cargo test`, and `w8build` is the
+default `CARGO_TARGET_DIR` of ten of `w8`'s QA scripts, with `w8`'s last commit 20 minutes old.
+`/mnt/apopic/omnion-w8/.tmp-target` (1.5 GB) has no holder and no naming process, but `w8` has
+processes with its worktree as cwd, so the guard's own `worktree_busy` rule says leave it.
+
+Nothing was deleted. A build cache is disposable but a *running* sibling's is not, and the guard
+already encodes the difference — the gap is its globs, not its judgement. Work proceeded on
+tmpfs (`CARGO_TARGET_DIR=/dev/shm/w5target`, 11 GB free), which is why the tick completed at all
+with the disk at 99%.
+
+### Gates
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-events --lib --quiet` | **65 passed**, 0 failed |
+| api unit | `cargo test -p omnion-api --lib --quiet` | **408 passed**, 0 failed |
+| integration | `cargo test -p omnion-api --test events` (`omnion_qa_w5` on 5433) | **11 passed, 1 failed** — the sibling catalogue gap above |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+
+**Browser pass: not owed.** This is not a close tick, and the slot is held by a sibling.
+
+**Next:** the `/developer/oauth-apps` panel screen and its walkthrough route — the last item
+between slice 3 and a QA pass. Then the catalogue rows, once the three waves that emit those
+names describe their payloads.
