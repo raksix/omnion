@@ -144,6 +144,369 @@ pub struct ActivationChange {
 // Manifests
 // ---------------------------------------------------------------------------------------------
 
+/// One problem with a manifest's v2 fields, addressed by the path that would carry it.
+///
+/// A path and a message rather than a typed error, for the same reason [`manifest_shape`]
+/// returns a sentence: the boot loader prints it to an operator's log and the upload screen
+/// renders it as a row, and two call sites writing their own wording is how one file starts
+/// being described two ways inside one product.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestIssue {
+    /// Where the problem is, in the operator's own terms (`tokens.accent.dark`).
+    pub path: String,
+    /// The sentence an operator reads.
+    pub message: String,
+}
+
+impl ManifestIssue {
+    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Check the v2 fields a manifest declares are *usable*, and report every problem.
+///
+/// [`manifest_shape`] answers "does this file parse as a manifest" — it counts `slots` and
+/// `tokens` and notes which v2 fields are present. This answers the question the count cannot:
+/// whether what the theme declares can actually be rendered. The two are deliberately different
+/// in one direction only. A v1 manifest with no v2 fields at all is **fine** (an author's first
+/// upload must not fail on a field the renderer never reads), but a manifest that *declares* a
+/// field has to declare it correctly, because a declared field is read: `sync_bundled` mirrors
+/// it into the gallery, the renderer writes its tokens into CSS custom properties, and the
+/// customize screen offers its settings to an operator who will then type a value the schema
+/// said was impossible.
+///
+/// Nothing here short-circuits. A manifest with three bad slots, a token of the wrong shape and
+/// a default outside its own range gets three issues, not the first one — the same rule the
+/// package validator follows, because an author fixing a manifest one error per upload is an
+/// author who gives up.
+pub fn validate_v2_fields(manifest: &Value) -> Vec<ManifestIssue> {
+    let mut issues = Vec::new();
+    let Some(object) = manifest.as_object() else {
+        return issues;
+    };
+
+    // `slots` — every name must be a slot the builder's picker can actually hold. A manifest
+    // claiming a ninth slot is not forward-compatible here: there is no ninth slot to render,
+    // so the claim can only be wrong.
+    if let Some(slots) = object.get("slots") {
+        match slots.as_array() {
+            Some(list) => {
+                for (index, entry) in list.iter().enumerate() {
+                    let Some(name) = entry.as_str() else {
+                        issues.push(ManifestIssue::new(
+                            format!("slots[{index}]"),
+                            "A slot entry is not a string.",
+                        ));
+                        continue;
+                    };
+                    if !crate::theme_layouts::is_slot(name) {
+                        issues.push(ManifestIssue::new(
+                            format!("slots[{index}]"),
+                            format!(
+                                "`{name}` is not a slot the platform renders. Known slots: {}.",
+                                crate::theme_layouts::SLOTS.join(", ")
+                            ),
+                        ));
+                    }
+                }
+            }
+            None => issues.push(ManifestIssue::new("slots", "`slots` is not a list.")),
+        }
+    }
+
+    // `tokens` — the renderer writes every one of these into a CSS custom property, so a
+    // token is either a plain string or a `{light, dark}` pair. One more level of nesting is
+    // not a future format, it is a value no style rule can read.
+    if let Some(tokens) = object.get("tokens") {
+        match tokens.as_object() {
+            Some(map) => {
+                for (name, value) in map {
+                    if !token_value_is_readable(value) {
+                        issues.push(ManifestIssue::new(
+                            format!("tokens.{name}"),
+                            format!("`{name}` is neither a value nor a `{{light, dark}}` pair."),
+                        ));
+                    }
+                }
+            }
+            None => issues.push(ManifestIssue::new("tokens", "`tokens` is not an object.")),
+        }
+    }
+
+    // `settingsSchema` — the customize screen reads `type`, `default`, `min` and `max` to
+    // describe and bound a setting, so a declaration whose own default is outside its own range
+    // is a manifest that would hand an operator a value the schema forbids.
+    if let Some(schema) = object.get("settingsSchema") {
+        match schema.as_object() {
+            Some(map) => {
+                for (name, spec) in map {
+                    check_setting_spec(name, spec, &mut issues);
+                }
+            }
+            None => issues.push(ManifestIssue::new(
+                "settingsSchema",
+                "`settingsSchema` is not an object of setting name to specification.",
+            )),
+        }
+    }
+
+    // `compatibility` — the engine is the one field with a value the platform compares itself
+    // to, so an unrecognised engine is a theme that will never load rather than a theme that
+    // degrades.
+    if let Some(compatibility) = object.get("compatibility") {
+        match compatibility.as_object() {
+            Some(map) => match map.get("engine").and_then(Value::as_str) {
+                Some(engine) if engine.trim().is_empty() => issues.push(ManifestIssue::new(
+                    "compatibility.engine",
+                    "'engine' is blank; a theme with no engine cannot be checked for compatibility.",
+                )),
+                Some(engine) if !SUPPORTED_ENGINES.contains(&engine) => issues.push(ManifestIssue::new(
+                    "compatibility.engine",
+                    format!(
+                        "`{engine}` is not an engine this platform renders. Supported: {}.",
+                        SUPPORTED_ENGINES.join(", ")
+                    ),
+                )),
+                _ => {}
+            },
+            None => issues.push(ManifestIssue::new(
+                "compatibility",
+                "`compatibility` is not an object.",
+            )),
+        }
+    }
+
+    // `aliases` — an alias is a promise that an installation pinned to an older key resolves,
+    // so an alias that is not a usable key is a key nobody can be pinned to.
+    if let Some(aliases) = object.get("aliases") {
+        match aliases.as_array() {
+            Some(list) => {
+                for (index, entry) in list.iter().enumerate() {
+                    let Some(alias) = entry.as_str() else {
+                        issues.push(ManifestIssue::new(
+                            format!("aliases[{index}]"),
+                            "An alias is not a string.",
+                        ));
+                        continue;
+                    };
+                    if validate_key(alias, "theme alias").is_err() {
+                        issues.push(ManifestIssue::new(
+                            format!("aliases[{index}]"),
+                            format!("`{alias}` is not a usable theme key."),
+                        ));
+                    }
+                }
+            }
+            None => issues.push(ManifestIssue::new("aliases", "`aliases` is not a list.")),
+        }
+    }
+
+    // `previewImage` — the gallery draws this, and it is a path the manifest names. The one
+    // thing that is always wrong is a path that walks: a manifest is a file an author ships
+    // and the loader mirrors into every gallery, so `../` in it is a traversal waiting for a
+    // reader that joins it. Whether the named file *exists* is not this function's question —
+    // the gallery answers that by falling back to a drawn swatch, and an absent image is a
+    // missing file, not a malformed manifest.
+    if let Some(image) = object.get("previewImage") {
+        match image.as_str() {
+            Some(value) if value.trim().is_empty() => issues.push(ManifestIssue::new(
+                "previewImage",
+                "'previewImage' is blank; omit it rather than declaring an empty path.",
+            )),
+            Some(value) if value.split(['/', '\\']).any(|part| part == "..") => {
+                issues.push(ManifestIssue::new(
+                    "previewImage",
+                    format!("`{value}` walks out of the theme's own directory."),
+                ));
+            }
+            Some(_) => {}
+            None => issues.push(ManifestIssue::new(
+                "previewImage",
+                "'previewImage' is a path, not an object.",
+            )),
+        }
+    }
+
+    issues
+}
+
+/// The URL the gallery card uses to draw a theme's preview image.
+///
+/// `None` when the manifest names nothing, or names a file the asset route will not serve —
+/// and the caller then draws a generated swatch, which is honest where an image that 404s is
+/// not. This lives beside the manifest reader rather than in the route because the card
+/// payload and the route have to agree on which URLs exist, and a rule computed twice is a
+/// rule that will be computed two ways.
+pub fn preview_url(key: &str, preview_image: Option<&str>) -> Option<String> {
+    let name = preview_image?;
+    // The leaf, because a manifest may name the file on its own (`preview.svg`) or under a
+    // directory (`styles/preview.png`, which is what the scaffolding CLI writes).
+    let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    // The one name the platform serves for a bundled theme. An uploaded package's bytes live
+    // in object storage and have no route here, so the card falls back for them.
+    if leaf != PREVIEW_ASSET_NAME {
+        return None;
+    }
+    // The key is checked with the platform's own key rule: it becomes a path segment in the
+    // URL the card requests, and a card must never be handed a URL the route would refuse.
+    // `validate_key` lowercases what it accepts, so the check is "accepted AND unchanged" —
+    // a card asking for `/themes/UPPER/assets/preview.svg` would be served a 404 on a
+    // case-sensitive filesystem while the gallery believed it had offered an image.
+    match validate_key(key, "theme key") {
+        Ok(normalised) if normalised == key => {}
+        _ => return None,
+    }
+    Some(format!("/api/v1/themes/{key}/assets/{leaf}"))
+}
+
+/// The one file name a bundled theme's preview image has, across all ten themes.
+pub const PREVIEW_ASSET_NAME: &str = "preview.svg";
+
+/// The engine a manifest may name. One value today; a list rather than a string because the
+/// comparison is "is this engine one of ours", and adding a second engine must not mean
+/// rewriting the comparison.
+const SUPPORTED_ENGINES: [&str; 1] = ["omnion-web"];
+
+/// Whether a token value is something the renderer can put on an element.
+///
+/// Mirrors the rule the package validator applies to a package's `tokens` map, and says the
+/// same thing for the same reason: the value reaches `style` as a CSS custom property, so a
+/// shape the stylesheet cannot read is a token that silently does nothing.
+fn token_value_is_readable(value: &Value) -> bool {
+    match value {
+        Value::String(_) => true,
+        Value::Object(map) => map
+            .get("light")
+            .or_else(|| map.get("dark"))
+            .is_some_and(Value::is_string),
+        _ => false,
+    }
+}
+
+/// Check one `settingsSchema` entry, reporting every problem it carries.
+fn check_setting_spec(name: &str, spec: &Value, issues: &mut Vec<ManifestIssue>) {
+    let Some(map) = spec.as_object() else {
+        issues.push(ManifestIssue::new(
+            format!("settingsSchema.{name}"),
+            "A setting is not an object with a type, a default and its bounds.",
+        ));
+        return;
+    };
+
+    let kind = match map.get("type").and_then(Value::as_str) {
+        Some("number") | Some("text") | Some("color") | Some("select") => map
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Some(other) => {
+            issues.push(ManifestIssue::new(
+                format!("settingsSchema.{name}.type"),
+                format!("`{other}` is not a setting type. Known types: number, text, color, select."),
+            ));
+            String::new()
+        }
+        None => {
+            issues.push(ManifestIssue::new(
+                format!("settingsSchema.{name}.type"),
+                "A setting declares no type; the customize screen would have nothing to render.",
+            ));
+            String::new()
+        }
+    };
+
+    // Bounds only make sense for a number, and a bound on a text setting is a number the
+    // validator would silently never apply.
+    let min = map.get("min").and_then(Value::as_f64);
+    let max = map.get("max").and_then(Value::as_f64);
+    if kind == "number" {
+        if min.is_some() != max.is_some() {
+            issues.push(ManifestIssue::new(
+                format!("settingsSchema.{name}"),
+                "A numeric setting bounds one end and not the other; declare both or neither.",
+            ));
+        }
+        if let (Some(min), Some(max)) = (min, max) {
+            if min > max {
+                issues.push(ManifestIssue::new(
+                    format!("settingsSchema.{name}"),
+                    format!("The minimum ({min}) is above the maximum ({max})."),
+                ));
+            }
+        }
+    } else if min.is_some() || max.is_some() {
+        issues.push(ManifestIssue::new(
+            format!("settingsSchema.{name}"),
+            format!("A {kind} setting declares a numeric bound, which applies to nothing."),
+        ));
+    }
+
+    // The default is what an operator sees before they type anything, so a default the schema
+    // itself forbids is a manifest that opens the screen already in violation.
+    let path = format!("settingsSchema.{name}.default");
+    match map.get("default") {
+        None | Some(Value::Null) => {}
+        Some(value) => match kind.as_str() {
+            "number" => match value.as_f64() {
+                None => issues.push(ManifestIssue::new(
+                    &path,
+                    "A numeric setting's default is not a number.",
+                )),
+                Some(number)
+                    if min.is_some_and(|min| number < min)
+                        || max.is_some_and(|max| number > max) =>
+                {
+                    issues.push(ManifestIssue::new(
+                        &path,
+                        format!(
+                            "The default ({number}) is outside the declared range {}..{}.",
+                            min.map_or_else(String::new, |v| v.to_string()),
+                            max.map_or_else(String::new, |v| v.to_string()),
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            },
+            "text" | "select" => {
+                if !value.is_string() {
+                    issues.push(ManifestIssue::new(
+                        &path,
+                        format!("A {kind} setting's default is not a string."),
+                    ));
+                } else if kind == "select" {
+                    // `select` promises a closed list; a default outside it is a value the
+                    // operator cannot choose, which is worse than no default at all.
+                    if let Some(options) = map.get("options").and_then(Value::as_array) {
+                        let chosen = value.as_str().unwrap_or_default();
+                        if !options.iter().filter_map(Value::as_str).any(|o| o == chosen) {
+                            issues.push(ManifestIssue::new(
+                                &path,
+                                format!("`{chosen}` is not one of the options this setting offers."),
+                            ));
+                        }
+                    }
+                }
+            }
+            "color" => {
+                if !value
+                    .as_str()
+                    .is_some_and(crate::theme_settings::is_hex_colour)
+                {
+                    issues.push(ManifestIssue::new(
+                        &path,
+                        "A colour setting's default is not a hex colour.",
+                    ));
+                }
+            }
+            _ => {}
+        },
+    }
+}
+
 /// What a manifest must carry, and what the loader refuses a file without.
 ///
 /// The v2 contract (docs/03-FRONTEND.md) adds `slots`, `tokens`, `settingsSchema`,
@@ -602,7 +965,230 @@ pub fn describe(theme: &Theme) -> Value {
         "slotCount": shape.slots,
         "tokenCount": shape.tokens,
         "previewImage": theme.manifest.get("previewImage").and_then(Value::as_str),
+        // The URL the card actually requests, computed by the same function the asset route
+        // uses to decide what it will serve. `previewImage` stays too — it is the manifest's
+        // own claim, and an operator reading the card should see what the manifest said.
+        "previewUrl": preview_url(
+            &theme.key,
+            theme.manifest.get("previewImage").and_then(Value::as_str),
+        ),
         "source": theme.source,
         "canDelete": theme.source == "uploaded",
     })
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use serde_json::json;
+
+    use super::{preview_url, validate_v2_fields, ManifestIssue};
+
+    /// The paths of a manifest's problems, in the order they were found.
+    fn paths(issues: &[ManifestIssue]) -> Vec<&str> {
+        issues.iter().map(|issue| issue.path.as_str()).collect()
+    }
+
+    /// A manifest that declares nothing beyond the required keys must produce no issues.
+    ///
+    /// This is the half of the rule that protects a first theme author: v1 is not a failure,
+    /// because the fields it lacks are fields the renderer never reads.
+    #[test]
+    fn a_v1_manifest_declares_nothing_and_is_refused_nothing() {
+        let issues = validate_v2_fields(&json!({ "key": "minimal", "name": "Minimal", "version": "1.0.0" }));
+        assert_eq!(issues, Vec::new(), "a v1 manifest has no v2 fields to get wrong");
+    }
+
+    /// The defect this closes: a bundled or uploaded manifest that DECLARES a setting whose
+    /// own default falls outside the range it declares. The presence check that shipped passes
+    /// this file, so before this validator existed nothing in the platform could object to it.
+    #[test]
+    fn a_default_outside_its_own_declared_range_is_reported() {
+        let manifest = json!({
+            "key": "corporate", "name": "Corporate", "version": "1.0.0",
+            "settingsSchema": {
+                "containerWidth": { "type": "number", "default": 3000, "min": 720, "max": 1600 }
+            }
+        });
+        let issues = validate_v2_fields(&manifest);
+        assert_eq!(paths(&issues), vec!["settingsSchema.containerWidth.default"]);
+        assert!(
+            issues[0].message.contains("outside the declared range"),
+            "the sentence must say what is wrong, got: {}",
+            issues[0].message
+        );
+    }
+
+    /// Every problem, not the first one. An author fixing a manifest one error per upload is an
+    /// author who gives up, which is the same rule the package validator follows.
+    #[test]
+    fn every_problem_is_reported_not_only_the_first() {
+        let manifest = json!({
+            "key": "corporate", "name": "Corporate", "version": "1.0.0",
+            "slots": ["header", "foot"],
+            "tokens": { "accent": { "light": { "deep": "#fff" } } },
+            "settingsSchema": {
+                "containerWidth": { "type": "number", "default": 3000, "min": 720, "max": 1600 },
+                "radius": { "type": "slider", "default": "0.5rem" }
+            },
+            "compatibility": { "engine": "wordpress" },
+            "aliases": ["Not A Key"],
+            "previewImage": "../../etc/passwd.svg"
+        });
+        let issues = validate_v2_fields(&manifest);
+        // The order is the order the walker produces, which for a JSON object is the map's
+        // own order (sorted by name) — not the order the fields appear in the source. An
+        // assertion written against the source order would be asserting a serde detail.
+        assert_eq!(
+            paths(&issues),
+            vec![
+                "slots[1]",
+                "tokens.accent",
+                "settingsSchema.containerWidth.default",
+                "settingsSchema.radius.type",
+                "compatibility.engine",
+                "aliases[0]",
+                "previewImage",
+            ],
+            "seven declared faults, seven rows"
+        );
+    }
+
+    /// A token the renderer cannot put on an element. `{light: {deep: …}}` is one level of
+    /// nesting a style rule cannot read, and the value reaches the page as a CSS custom
+    /// property — so this is a token that silently does nothing.
+    #[test]
+    fn a_token_that_is_neither_a_value_nor_a_pair_is_reported() {
+        for bad in [json!({"light": {"deep": "#fff"}}), json!(7), json!(["#fff"])] {
+            let manifest = json!({
+                "key": "k", "name": "n", "version": "1",
+                "tokens": { "accent": bad }
+            });
+            assert_eq!(paths(&validate_v2_fields(&manifest)), vec!["tokens.accent"]);
+        }
+    }
+
+    /// A string and a `{light, dark}` pair are both readable, and a pair needs only one of the
+    /// two — the same rule the package validator applies, so a bundled theme and an uploaded
+    /// package are never judged by two different definitions of a valid token.
+    #[test]
+    fn the_shapes_the_renderer_can_use_are_accepted() {
+        let manifest = json!({
+            "key": "k", "name": "n", "version": "1",
+            "tokens": {
+                "accent": { "light": "#2f6feb", "dark": "#7aa2f7" },
+                "ink": "#111111",
+                "paper": { "light": "#ffffff" }
+            }
+        });
+        assert_eq!(validate_v2_fields(&manifest), Vec::new());
+    }
+
+    /// A setting bounded at one end only is a bound the validator would never apply, so it is
+    /// reported rather than stored as a promise the platform does not keep.
+    #[test]
+    fn a_setting_bounded_at_one_end_only_is_reported() {
+        let manifest = json!({
+            "key": "k", "name": "n", "version": "1",
+            "settingsSchema": { "baseSize": { "type": "number", "default": 18, "min": 14 } }
+        });
+        let issues = validate_v2_fields(&manifest);
+        assert_eq!(paths(&issues), vec!["settingsSchema.baseSize"]);
+        assert!(issues[0].message.contains("both or neither"), "{}", issues[0].message);
+    }
+
+    /// A bound on a text setting applies to nothing — it is a number no code compares — and a
+    /// `select` default outside its own option list is a value the operator cannot choose.
+    #[test]
+    fn bounds_on_text_and_a_select_default_outside_its_options_are_reported() {
+        let manifest = json!({
+            "key": "k", "name": "n", "version": "1",
+            "settingsSchema": {
+                "fontStack": { "type": "text", "default": "Inter", "min": 10, "max": 20 },
+                "headerVariant": { "type": "select", "options": ["a", "b"], "default": "z" }
+            }
+        });
+        assert_eq!(
+            paths(&validate_v2_fields(&manifest)),
+            vec![
+                "settingsSchema.fontStack",
+                "settingsSchema.headerVariant.default"
+            ]
+        );
+    }
+
+    /// A type the customize screen has no control for, and a setting with no type at all.
+    #[test]
+    fn an_unknown_or_missing_setting_type_is_reported() {
+        let manifest = json!({
+            "key": "k", "name": "n", "version": "1",
+            "settingsSchema": {
+                "gap": { "type": "slider", "default": 4 },
+                "loose": { "default": 4 }
+            }
+        });
+        assert_eq!(
+            paths(&validate_v2_fields(&manifest)),
+            vec!["settingsSchema.gap.type", "settingsSchema.loose.type"]
+        );
+    }
+
+    /// A manifest the renderer would accept, declared in full, must produce nothing — the
+    /// validator that is always right is the one nobody trusts, so the positive case is a
+    /// test and not an assumption.
+    #[test]
+    fn a_manifest_that_renders_reports_nothing() {
+        let manifest = json!({
+            "key": "magazine", "name": "Magazine", "version": "1.0.0",
+            "modes": ["light", "dark"],
+            "slots": ["header", "footer", "home", "blog-list", "single-page", "product", "404", "search"],
+            "tokens": { "canvas": { "light": "#fffdf9", "dark": "#131110" } },
+            "settingsSchema": {
+                "containerWidth": { "type": "number", "default": 1120, "min": 720, "max": 1600 },
+                "baseSize": { "type": "number", "default": 18, "min": 14, "max": 22 },
+                "radius": { "type": "number", "default": 0, "min": 0, "max": 28 }
+            },
+            "compatibility": { "engine": "omnion-web", "minVersion": "0.1.0" },
+            "aliases": ["editorial", "news"],
+            "previewImage": "preview.svg"
+        });
+        assert_eq!(validate_v2_fields(&manifest), Vec::new());
+    }
+
+    /// A manifest naming a slot the platform does not render is the defect this validator
+    /// exists to catch, and the ten shipped themes all shipped it: every one declared
+    /// `single`, while the slot the builder's picker holds is `single-page`. A presence check
+    /// passed those files, because the field was there — and it was wrong.
+    #[test]
+    fn a_slot_the_platform_does_not_render_is_reported() {
+        let manifest = json!({
+            "key": "k", "name": "n", "version": "1",
+            "slots": ["header", "single"]
+        });
+        let issues = validate_v2_fields(&manifest);
+        assert_eq!(paths(&issues), vec!["slots[1]"]);
+        assert!(issues[0].message.contains("single-page"), "{}", issues[0].message);
+    }
+
+    /// The card's URL and the rule that produced it, in the one place both are visible.
+    #[test]
+    fn the_card_url_names_the_file_the_route_serves() {
+        assert_eq!(
+            preview_url("magazine", Some("preview.svg")).as_deref(),
+            Some("/api/v1/themes/magazine/assets/preview.svg")
+        );
+        // A manifest that names a directory is still the leaf that is served.
+        assert_eq!(
+            preview_url("magazine", Some("styles/preview.svg")).as_deref(),
+            Some("/api/v1/themes/magazine/assets/preview.svg")
+        );
+        // A key that cannot name a directory never gets a URL, and a name the platform does
+        // not serve never becomes one.
+        assert_eq!(preview_url("../etc", Some("preview.svg")), None);
+        assert_eq!(preview_url("mine", Some("styles/preview.png")), None);
+        assert_eq!(preview_url("mine", None), None);
+        // `validate_key` accepts `UPPER` by normalising it to `upper`; the URL must not be
+        // built from a spelling the route would refuse, and the route must not be handed one
+        // it cannot resolve on a case-sensitive filesystem.
+        assert_eq!(preview_url("UPPER", Some("preview.svg")), None);
+    }
 }

@@ -93,6 +93,7 @@ pub use themes::{
     Activation, ActivationChange, ActivationRequest, DEFAULT_THEME_KEY, GalleryEntry,
     GalleryView, ManifestShape, SOURCES, Theme, activate, active_theme_key, describe, find_theme,
     gallery, gallery_for_site, manifest_shape, read_activation, restore_previous, sync_bundled,
+    ManifestIssue, PREVIEW_ASSET_NAME, preview_url, validate_v2_fields,
 };
 pub use patterns::{
     MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, NewPattern, NewTemplate, PageFromTemplate,
