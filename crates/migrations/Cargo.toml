@@ -12,6 +12,7 @@ publish = false
 # deployment pipeline. The decision layer is a property of the schema contract, so it lives here
 # rather than in the CLI or the HTTP layer that renders it.
 hex.workspace = true
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

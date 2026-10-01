@@ -46,8 +46,14 @@ pub mod down;
 pub mod error;
 pub mod ledger;
 pub mod lint;
+pub mod lock;
+pub mod policy;
+pub mod runner;
 
 pub use down::DownScript;
 pub use error::{MigrationSafetyError, Result};
 pub use ledger::{Drift, LedgerRow, NewLedgerRow, checksum, detect_drift};
 pub use lint::{PATTERNS, Pattern, Violation, gate_fails, lint};
+pub use lock::{LockView, lock_id, lock_id_text};
+pub use policy::Policy;
+pub use runner::{ApplyReport, Direction, Plan, RunActor, VerifyReport, verify_down};

@@ -8,6 +8,13 @@ pub enum MigrationSafetyError {
     /// The database refused or could not run a query.
     #[error("migration store: {0}")]
     Store(#[from] sqlx::Error),
+    /// A stored document could not be written or read.
+    ///
+    /// Its own variant rather than an unwrap: `banned_patterns` is a `jsonb` column written from
+    /// a map, and the map is built from what an operator's browser sent. A serialisation failure
+    /// there is a refusal with a message, not a panic in a policy save.
+    #[error("migration policy document: {0}")]
+    Document(#[from] serde_json::Error),
     /// A migration file is not named `NNNN_name.sql`.
     #[error("migration file {version:?}: {reason}")]
     InvalidVersion {
