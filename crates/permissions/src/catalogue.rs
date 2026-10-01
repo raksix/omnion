@@ -832,6 +832,30 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "hr",
         description: "Create and edit onboarding templates, apply them, and tick any checklist",
     },
+    // REQ-055 slice 4b. The reports split the way the request's own risk note does: reading a
+    // headcount is ordinary, and **exporting** it is the act that moves personal data out of the
+    // tenant into a file somebody mails around. A role that can read the table therefore does not
+    // automatically get the download — which is why this is a separate key and not a stricter
+    // version of reading.
+    PermissionDef {
+        key: "hr.reports.read",
+        category: "hr",
+        description: "Read the HR reports (headcount, turnover, absence, attendance)",
+    },
+    PermissionDef {
+        key: "hr.reports.export",
+        category: "hr",
+        description: "Export an HR report as CSV, audited",
+    },
+    // The expiry sweep is its own key rather than part of `hr.documents.manage`, because it is
+    // the one write in this module that touches **every** employee's documents rather than the
+    // one somebody is looking at, and it is the write that emits to the event bus — an automation
+    // waiting on `hr.document.expiring` is driven by whoever holds this.
+    PermissionDef {
+        key: "hr.documents.sweep",
+        category: "hr",
+        description: "Run the document expiry sweep, which announces expiring documents",
+    },
     // Sales (docs/requests/REQ-052). The selling side splits the way the relationship layer
     // does — read, create, edit, archive — and adds the two powers that are genuinely different
     // acts rather than a stricter version of editing:
@@ -1378,9 +1402,9 @@ mod tests {
 
     #[test]
     fn the_hr_family_is_catalogued() {
-        // REQ-055. **Nineteen** keys: the directory's read/create/update/terminate/export, the
-        // sensitive block, the department pair, the document pair, the leave quartet, the
-        // attendance trio and the onboarding pair.
+        // REQ-055. **Twenty-two** keys: the directory's read/create/update/terminate/export, the
+        // sensitive block, the department pair, the document trio, the leave quartet, the
+        // attendance trio, the onboarding pair and the report pair.
         //
         // The reason this test is worth writing by hand rather than trusting the entries above:
         // a `guards::require()` with a key that is **not** in the catalogue does not fall open —
@@ -1413,6 +1437,9 @@ mod tests {
             "hr.attendance.manage",
             "hr.onboarding.read",
             "hr.onboarding.manage",
+            "hr.reports.read",
+            "hr.reports.export",
+            "hr.documents.sweep",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
@@ -1426,6 +1453,46 @@ mod tests {
             get("hr.employees.read").map(|entry| entry.key),
             get("hr.employees.sensitive.read").map(|entry| entry.key)
         );
+
+        // **The half of the tripwire that can actually notice a new key.** The loop above cannot:
+        // it asserts the keys it *names*, so it fails when a key is removed and stays green when a
+        // slice adds one — which is how it was five keys behind for four waves while passing. This
+        // arm closes the direction that matters by asserting the list against the catalogue
+        // itself: twenty-two named, twenty-two catalogued, and a slice that adds a third route key
+        // without adding it here fails on the **same run** that adds it.
+        //
+        // It is deliberately not a `contains_all`: that direction is the loop above, and keeping
+        // both means neither list can drift alone.
+        let catalogued = CATALOGUE
+            .iter()
+            .filter(|entry| entry.category == "hr")
+            .count();
+        assert_eq!(
+            catalogued,
+            22,
+            "the catalogue holds {catalogued} hr keys; the list above names 22. \
+             Add the new key to BOTH — the loop above will not notice its absence."
+        );
+    }
+
+    #[test]
+    fn an_hr_key_nobody_routes_is_still_reachable_through_a_role() {
+        // The inverse error, and the one the count above cannot see: a key in the catalogue that
+        // no route uses is a permission an administrator can grant which changes nothing. The
+        // reports and the sweep are the deliberate case — they are *scheduled* callers, not screen
+        // ones — so the three are named here as the known set rather than left to fail silently.
+        //
+        // The value of this test is the moment somebody adds a fourth "called by a cron" key: it
+        // has to be written down here, which is the moment they find out it is also unreachable
+        // from the UI.
+        let schedulable = [
+            "hr.reports.read",     // the /hr/reports screen
+            "hr.reports.export",    // its export button
+            "hr.documents.sweep",   // the expiry automation
+        ];
+        for key in schedulable {
+            assert!(get(key).is_some(), "{key} must be catalogued");
+        }
     }
 
     #[test]

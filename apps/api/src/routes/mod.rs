@@ -103,6 +103,7 @@ pub mod hr;
 pub mod hr_attendance;
 pub mod hr_leave;
 pub mod hr_me;
+pub mod hr_documents;
 pub mod hr_onboarding;
 pub mod health;
 pub mod health_incidents;
@@ -1528,6 +1529,56 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "hr.onboarding.manage"));
 
+    // Documents and reports (slice 4b). Three routers, and the splits are the point:
+    //
+    // * `hr.documents.read` is the cross-employee list — the screen opened when somebody asks
+    //   "whose contract expires next week", which is not the same question as one employee's
+    //   documents, and it is why this is a separate key from `hr.employees.read` rather than a
+    //   query on the employee screen.
+    // * `hr.documents.manage` attaches and removes. Removing deletes the **reference only**: the
+    //   bytes stay in the media pipeline, because another module may be pointing at them.
+    // * `hr.documents.sweep` is its own key rather than part of the pair. It is the one write here
+    //   that touches every employee's documents rather than the one somebody is looking at, and the
+    //   one that emits to the bus — an automation waiting on `hr.document.expiring` is driven by
+    //   whoever holds it.
+    //
+    // **The export is a fourth key, not a stricter read.** `hr.reports.export` exists because
+    // reading a headcount is ordinary and moving it into a file somebody mails around is a
+    // different act; a role that can read the table does not automatically get the download.
+    let hr_documents_read = Router::new()
+        .route("/hr/documents", get(hr_documents::list_documents))
+        .route("/hr/documents/{id}", get(hr_documents::get_document))
+        .route_layer(guards::require(&state, "hr.documents.read"));
+
+    let hr_documents_manage = Router::new()
+        .route(
+            "/hr/employees/{id}/documents",
+            post(hr_documents::attach_document),
+        )
+        .route(
+            "/hr/documents/{id}",
+            delete(hr_documents::delete_document),
+        )
+        .route_layer(guards::require(&state, "hr.documents.manage"));
+
+    // The sweep is a POST and stays one. A reminder a `GET` can trigger is a reminder a prefetcher,
+    // a crawler or a link preview burns out of a month.
+    let hr_documents_sweep = Router::new()
+        .route("/hr/documents/sweep", post(hr_documents::sweep_documents))
+        .route_layer(guards::require(&state, "hr.documents.sweep"));
+
+    let hr_reports_read = Router::new()
+        .route("/hr/reports", get(hr_documents::report_names))
+        .route_layer(guards::require(&state, "hr.reports.read"));
+
+    // `hr.reports.read` guards the router; the export is narrowed *inside* the handler by the
+    // effective-permission check, because the same handler serves both and a second route with a
+    // different path would mean `?format=csv` and `/hr/reports/{name}/export` could disagree about
+    // which one the screen's button is allowed to call.
+    let hr_reports_export = Router::new()
+        .route("/hr/reports/{report}", get(hr_documents::get_report))
+        .route_layer(guards::require(&state, "hr.reports.read"));
+
     let hr_employees_create = Router::new()
         .route("/hr/employees", post(hr::create_employee))
         .route_layer(guards::require(&state, "hr.employees.create"));
@@ -1734,6 +1785,11 @@ pub fn router(state: AppState) -> Router {
         .merge(hr_attendance_manage)
         .merge(hr_onboarding_read)
         .merge(hr_onboarding_manage)
+        .merge(hr_documents_read)
+        .merge(hr_documents_manage)
+        .merge(hr_documents_sweep)
+        .merge(hr_reports_read)
+        .merge(hr_reports_export)
         .merge(crm_create)
         .merge(crm_update)
         .merge(crm_archive)
