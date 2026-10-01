@@ -4344,13 +4344,46 @@ async function runSearchDepth(page, report) {
 
 // ---------------------------------------------------------------- analytics (REQ-007, slice 2)
 
-/** Run one statement against the disposable QA database. */
+/**
+ * Run one statement against the disposable QA database.
+ *
+ * `qaSql` THROWS on a failed statement (`ON_ERROR_STOP=1` plus `execFileSync`), and that is
+ * correct for the pass — a SQL assertion that silently returned "" would compare false against
+ * an expectation and read as a product defect. It is fatal in one specific place, though, and the
+ * place is not the statement's fault.
+ *
+ * `runMembersDepth` interpolates a row id it got from a fixture POST. When that POST fails, the
+ * id is the empty string, the statement becomes `where id = ''`, and Postgres refuses it with
+ * `invalid input syntax for type uuid`. The throw then propagated out of the depth pass, through
+ * the entry point, and killed the whole process — so a CSRF refusal on one fixture line destroyed
+ * the measurement of every step that had already run, including the block editor's, and left a
+ * `summary.json` holding nothing but the fatal string. A fixture that did not take is a FAILURE
+ * of that fixture, not of the run: the remaining steps still have answers, and most of them are
+ * exactly the ones that say whether the product degraded correctly when the fixture is absent.
+ *
+ * So a caller that knows an id may be empty asks for a statement that tolerates it, and the
+ * `uuidOrNull` helper below is the supported way: `where id = null` matches no row and answers
+ * the question honestly ("there is no such member") instead of aborting the pass.
+ */
 function qaSql(statement) {
   return execFileSync(
     "docker",
     ["exec", QA_PG_CONTAINER, "psql", "-U", "omnion", "-d", QA_DB, "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", statement],
     { encoding: "utf8", timeout: 30000 },
   ).trim();
+}
+
+/**
+ * A uuid for interpolation into SQL, or the literal `null` when there is none.
+ *
+ * `null` is the right answer rather than a `''` that happens to parse: a predicate `where id =
+ * null` is never true, so the query returns no row and the step compares against a real
+ * expectation and fails — which is the truth. Quoting the empty id instead turns a fixture that
+ * did not take into a database ERROR, and an ERROR here aborts the pass (see `qaSql`).
+ */
+function uuidOrNull(id) {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id || ""));
+  return uuid ? `'${id}'` : "null";
 }
 
 /**
@@ -7143,12 +7176,40 @@ async function runMembersDepth(page, report) {
   // live session, and one the panel will block. Seeded through the panel's OWN routes so the
   // screen is proved against rows the routes actually produce.
   const waitingEmail = `waiting-${stamp}@example.test`;
+  // `page.request` is the API's HTTP client, not the browser: it carries the panel's cookies but
+  // does NOT run the panel's fetch wrapper, so it never picks up the `x-omnion-csrf` header the
+  // client sends on every cookie-authenticated mutation. The API then refuses the write with
+  // `csrf_unavailable` BEFORE the handler runs — the documented behaviour of a deployment without
+  // a secret, so the refusal is indistinguishable from a broken route when read as a status code.
+  //
+  // That is how `waitingId` came back empty, and the empty id then reached a SQL statement, where
+  // it turned one refused fixture POST into a Postgres error that aborted the whole pass and threw
+  // away every step that had already run. The header is read out of the same readable
+  // `omnion_csrf` cookie the panel's own client uses, so the fixture travels the same road a real
+  // mutation does.
+  const csrfHeader = await page.evaluate(() => {
+    const raw = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("omnion_csrf="))
+      ?.slice("omnion_csrf=".length);
+    return raw ? decodeURIComponent(raw) : "";
+  });
+  steps.hadCsrfToken = Boolean(csrfHeader);
   const created = await page
     .request.post(`${URL_API}/api/v1/members`, {
+      headers: csrfHeader ? { "x-omnion-csrf": csrfHeader } : {},
       data: { site_id: siteId, email: waitingEmail, name: "QA Waiting" },
     })
     .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
     .catch(() => ({ status: 0, body: null }));
+  // The status is recorded even on success, because "the route answered 403 with
+  // csrf_unavailable" and "the route answered 500" are different defects and a single boolean
+  // collapses them into one unreadable red.
+  steps.memberFixtureStatus = created.status;
+  steps.memberFixtureRefusal = /csrf_unavailable/.test(
+    JSON.stringify(created.body || {}),
+  );
   steps.operatorCreatedAMember =
     created.status === 201 && Boolean(created.body && created.body.id);
   const waitingId = (created.body && created.body.id) || "";
@@ -7157,7 +7218,7 @@ async function runMembersDepth(page, report) {
   // fixture that set one would make "invited, never claimed" pass for a row that was claimed.
   steps.invitedHasNoPassword =
     waitingId !== "" &&
-    qaSql(`select coalesce(password_hash, 'NULL') from cms_members where id = '${waitingId}'`) === "NULL";
+    qaSql(`select coalesce(password_hash, 'NULL') from cms_members where id = '${uuidOrNull(waitingId)}'`) === "NULL";
   steps.invitedRowSaysSo = (await page.locator(`[data-member-never-claimed="${waitingId}"]`).count()) > 0;
 
   await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
@@ -7197,7 +7258,7 @@ async function runMembersDepth(page, report) {
   await page.waitForTimeout(2000);
   // Roles REPLACE rather than accumulate, and only SQL can tell that apart from an append.
   steps.rolesAreInSql =
-    qaSql(`select array_to_string(roles, ',') from cms_members where id = '${waitingId}'`) ===
+    qaSql(`select array_to_string(roles, ',') from cms_members where id = '${uuidOrNull(waitingId)}'`) ===
     "reader,archivist";
 
   // ------------------------------------------------------------------ verify takes a real effect
@@ -7206,7 +7267,7 @@ async function runMembersDepth(page, report) {
   await page.locator(`[data-member-action="verify"]`).first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(2000);
   steps.verifiedInSql =
-    qaSql(`select status from cms_members where id = '${waitingId}'`) === "verified";
+    qaSql(`select status from cms_members where id = '${uuidOrNull(waitingId)}'`) === "verified";
 
   // ------------------------------------------------------------------ the panel cookie at a member route
   // Both directions. A visitor cookie presented where a panel cookie is expected must fail, or
@@ -7238,7 +7299,11 @@ async function runMembersDepth(page, report) {
   // A real visitor signs in through the PUBLIC route and keeps the cookie — the three answers
   // below are three different cookies hitting one page.
   const memberEmail = `member-${stamp}@example.test`;
+  // Same header as the first fixture: `page.request` is not the browser's fetch and does not
+  // carry the token on its own. Without it this POST is refused before the handler runs and
+  // `memberId` never becomes an id at all.
   await page.request.post(`${URL_API}/api/v1/members`, {
+    headers: csrfHeader ? { "x-omnion-csrf": csrfHeader } : {},
     data: {
       site_id: siteId,
       email: memberEmail,
@@ -7250,7 +7315,9 @@ async function runMembersDepth(page, report) {
   const memberId = qaSql(
     `select id from cms_members where site_id = '${siteId}' and lower(email) = '${memberEmail}'`,
   );
-  await page.request.post(`${URL_API}/api/v1/members/${memberId}/verify?site_id=${siteId}`).catch(() => {});
+  await page.request.post(`${URL_API}/api/v1/members/${memberId}/verify?site_id=${siteId}`, {
+    headers: csrfHeader ? { "x-omnion-csrf": csrfHeader } : {},
+  }).catch(() => {});
 
   const signin = await page
     .request.post(`${URL_API}/api/v1/public/members/signin?site=main`, {
@@ -7314,6 +7381,7 @@ async function runMembersDepth(page, report) {
   const beforeGrant = await gateProbe(roleSlug, memberCookie);
   steps.roleGateRefusesAMemberWithoutIt = beforeGrant.allowed === false;
   await page.request.patch(`${URL_API}/api/v1/members/${memberId}?site_id=${siteId}`, {
+    headers: csrfHeader ? { "x-omnion-csrf": csrfHeader } : {},
     data: { roles: ["reader", "archivist"] },
   });
   const afterGrant = await gateProbe(roleSlug, memberCookie);
@@ -7338,9 +7406,9 @@ async function runMembersDepth(page, report) {
   await page.locator("[data-member-block-submit]").click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(2200);
   steps.blockedInSql =
-    qaSql(`select status from cms_members where id = '${memberId}'`) === "blocked";
+    qaSql(`select status from cms_members where id = '${uuidOrNull(memberId)}'`) === "blocked";
   steps.blockRemovedTheSessionRow =
-    qaSql(`select count(*) from cms_member_sessions where member_id = '${memberId}'`) === "0";
+    qaSql(`select count(*) from cms_member_sessions where member_id = '${uuidOrNull(memberId)}'`) === "0";
   const afterBlock = await gateProbe(gatedSlug, memberCookie);
   // A blocked member answers `allowed: false` on the probe rather than 401/404, because the
   // probe is a verdict endpoint; the 404 concealment is the PAGE route's job and is proved in
@@ -7392,7 +7460,7 @@ async function runMembersDepth(page, report) {
   await page.locator("[data-member-delete-submit]").click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(2000);
   steps.deletedFromSql =
-    qaSql(`select count(*) from cms_members where id = '${waitingId}'`) === "0";
+    qaSql(`select count(*) from cms_members where id = '${uuidOrNull(waitingId)}'`) === "0";
 
   // ------------------------------------------------------------------ the settings route, on its own
   // The REQ lists `/members/settings` as its own route, so it is visited as its own route rather
@@ -11944,6 +12012,11 @@ async function main() {
       "defaultGatedBehaviourIsNotFound", "screenReady", "policyPanelIsOnScreen",
       "emptyStateIsShownWhenThereAreNoMembers", "emptyStateNamesTheSignupRoute",
       "panelShowsTheGatedBehaviour", "operatorCreatedAMember", "invitedHasNoPassword",
+      // The fixture's own story. A refused fixture POST is the most expensive thing that can go
+      // wrong in this pass, because the empty id it leaves behind used to reach a SQL statement
+      // and abort the whole process — taking every measurement with it. Demanded so a run that
+      // died before them says `missing` instead of reporting green.
+      "hadCsrfToken", "memberFixtureStatus", "memberFixtureRefusal",
       "invitedRowSaysSo", "rowIsOnScreen", "pendingIsNotRenderedAsAFailure",
       "pendingTabMatchesSql", "drawerOpened", "drawerStatesTheBoundary", "rolesAreOnTheInput",
       "rolesAreInSql", "verifiedInSql", "memberCookieIsRefusedAtAPanelRoute",
