@@ -13470,3 +13470,65 @@ build dir — newest of each pair kept, and every stale file checked against `/p
 **Next.** REQ-117's remaining unmeasured surface is the `crm-assignment` depth pass, which is in
 this very run; and acceptance line 21's retention-sweep steps, still unexecuted. Both are browser
 work, so the slot and the disk are the gate on them.
+
+
+## Tick 65 · REQ-117 slice 33 · the clock's badge had a second implementation of the rule
+
+**What.** The module's `assignment::SlaState::of` had **no production caller**, and the gap it left
+was filled by a *second implementation of the same rule* in the panel: `slaState` in
+`apps/admin/lib/crm-intake.ts` derived the same four states from `first_response_at`,
+`first_response_due_at` and a hard-coded `AT_RISK_MINUTES = 60`. The client function's own doc said
+*"when slice 2 lands it takes over this function rather than the screens, so nothing here has to
+change"* — slice 2 landed three ticks ago and nothing changed.
+
+**Why nothing saw it.** Two reasons, and the second is the one worth keeping. The dead-export sweep
+is silent because `slaState` has two callers; the defect is not an unreferenced function but a
+**second rule wearing the first one's coat**. And the two implementations **agree on the seeded
+240-minute policy**, because a quarter of 240 is exactly 60 — so every fixture in this crate, all of
+which use the default, would have passed against both. The two disagreements are a 15-minute policy
+with 5 minutes left (`at_risk` in the module, `on_track` in the panel, then breached with no
+warning), and a lead answered *after* its deadline (`met` in the module, `breached` in the panel —
+red for ever on a lead somebody had answered).
+
+**Fix.** `assignment_store::policy_windows` resolves a page's windows in one read keyed by policy id,
+with the tenancy predicate on the read and `active` deliberately absent (a lead keeps counting down
+under the policy it was assigned under, even after an operator deactivates it for future leads).
+`LeadBody.sla_state` is computed by the module's own rule through one `stamp_sla_states` call per
+response — page and single-row both, and on the writes that *change* the answer (`respond`,
+`set_terminal`). `From<Lead>` writes `none` and says why: it is pure and cannot read the policy
+table, and a default that looked like a real answer is how the second implementation survived the
+first time. The client is a pass-through with **no fallback arithmetic** — recomputing "helpfully"
+when the field is missing is the defect reintroduced with good intentions.
+
+**Proof.** `scripts/qa/run-crm-sla-state.sh` **5/5** against a real database
+(`omnion_qa_w8_slastate`, refuses to start against the pass's own stack), and **PROVEN TO FAIL at
+3/5** with the window read neutralised to a constant `240` — reproducing the client's threshold
+exactly — where the failures quote `Some(15)` expected against `Some(240)` got. The three survivors
+never touch a window's own minutes: they are the regression guards for the opposite mistake (merging
+two policies, losing the tenancy predicate), not witnesses to this fix. Module lib **181 passed, 0
+failed** — unchanged, because nothing in the crate's behaviour moved; the untested surface was the
+caller. `cargo build -p omnion-api` exit 0, admin `tsc --noEmit` exit 0. Sibling gates
+`run-crm-assignment` **14/14** and `run-crm-tenancy-http` **23/23** with its PROVEN TO FAIL intact.
+
+**Not claimed.** No browser pass result. The QA slot is held by **this tick's own earlier pass**
+(holder pid alive, `cwd=/mnt/apopic/omnion-w8` — my own worktree, not a sibling, which three prior
+ticks of this branch misread as w4's); it has walked all six CRM routes and is at 59 routes with no
+`summary.json` written yet, so `crmAssignment`, `respondIsIdempotent` and the retention steps are
+**unmeasured**.
+
+**Two box findings.** `omnion-w8/target` is a **symlink to `/mnt/apopic/w8build`**, which is where the
+running pass's own API binary lives: "reclaim my build dir" and "leave the sibling pass alone" are the
+same act, and a disk triage that deletes the *bigger*-looking directory would have killed the pass.
+Disk triage that works here: group `target/debug/deps` on `(crate, ext)`, keep the **newest** of each
+pair, check every candidate against `/proc/*/fd` — 0.72 GB back. And the reclaim invalidated the
+whole dependency graph, so the next build is a full recompile (~9 min) rather than an incremental one;
+budget for that before starting a build on a full disk. The `rustc-LLVM ERROR: IO failure on output
+stream` that prompted it carries **no `error[]` line** and reads as an unrelated crate's failure.
+
+**Commits.** `e8e18a96` the window read · `d221eafd` the server's answer · `1ca8e6b3` the client
+pass-through · `95974540` the gate. Pushed to `wave8`, tree clean.
+
+**Next.** Read this run's `summary.json` when it appears: `crmAssignment`, `respondIsIdempotent` and
+the `retention*` steps are the three keys that decide whether acceptance lines 21 and 26 can tick. Then
+REQ-117's last unmeasured surface is the browser half of line 19's cross-tenant `404` and the
+REQ-064 form-editor card, which needs REQ-064's forms module and is not on this branch.
