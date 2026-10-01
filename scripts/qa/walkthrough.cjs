@@ -6221,6 +6221,82 @@ async function runSecurityDepth(page, report) {
     }
   }
 
+  // -- the secret inventory (REQ-012, slice 4) ---------------------------------------------------
+  //
+  // The "no untested screen" rule, and this one needs its own assertions because the screen's
+  // whole value is what it does NOT show. Four claims a route count cannot make:
+  //
+  //  1. the limitation note is present — the API states its own blind spot and the screen must
+  //     render it, because an inventory that looks exhaustive when it is partial is the defect;
+  //  2. no row renders a secret VALUE. The browser is the last place a value could leak into a
+  //     screenshot a ticket carries, so the page text is scanned for the shape of one;
+  //  3. there is no edit/rotate control — asserted as an ABSENCE, which is the only way to test a
+  //     deliberate omission, and a "coming soon" button would satisfy a presence check;
+  //  4. the read-only note is present, so the absence above reads as a decision rather than an
+  //     unfinished screen.
+  await page.goto(`${URL_ADMIN}/security/secrets`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-security-secrets-counts], [data-security-secrets-empty]", {
+      timeout: 15000,
+    })
+    .catch(() => {});
+  const secretsReady =
+    (await page.locator("[data-security-secrets-counts]").count()) > 0 ||
+    (await page.locator("[data-security-secrets-empty]").count()) > 0;
+  note({ step: "security-secrets-loaded", rendered: secretsReady });
+  if (!secretsReady) {
+    note({
+      step: "security-secrets-missing",
+      reason: "/security/secrets rendered neither rows nor an empty state",
+    });
+    await shot(page, "security-secrets-missing");
+  } else {
+    note({
+      step: "security-secrets-limitation",
+      present: (await page.locator("[data-security-secrets-limitation]").count()) > 0,
+    });
+    note({
+      step: "security-secrets-readonly-note",
+      present: (await page.locator("[data-security-secrets-readonly]").count()) > 0,
+    });
+
+    const rowCount = await page.locator("[data-security-secret-row]").count();
+    note({ step: "security-secrets-rows", count: rowCount });
+
+    // No value may reach the rendered page. The panel type has no field that could hold one, so
+    // this is the belt to the API walk's braces — and it is the assertion that covers the last
+    // hop the Rust test cannot see.
+    const pageText = await page.evaluate(() => document.body.innerText || "");
+    for (const forbidden of ["ciphertext", "secret_hash", "secretCiphertext", "BEGIN PRIVATE KEY"]) {
+      if (pageText.toLowerCase().includes(forbidden.toLowerCase())) {
+        note({
+          step: "security-secrets-value-leak",
+          reason: `the rendered page mentions ${forbidden}`,
+        });
+      }
+    }
+
+    // A deliberate absence is asserted as an absence. Any control that mutates is a defect here:
+    // rotation happens in the environment and a deploy.
+    const mutatingControls = await page
+      .locator('[data-security-secrets] button, [data-security-secrets] a')
+      .evaluateAll((nodes) =>
+        nodes
+          .map((node) => (node.textContent || "").trim().toLowerCase())
+          .filter((text) =>
+            /\b(edit|rotate|revoke|delete|remove|update|replace|add)\b/.test(text),
+          ),
+      );
+    note({ step: "security-secrets-mutating-controls", found: mutatingControls });
+    if (mutatingControls.length > 0) {
+      note({
+        step: "security-secrets-not-readonly",
+        reason: `the read-only screen offers: ${mutatingControls.join(", ")}`,
+      });
+    }
+    await shot(page, "security-secrets");
+  }
+
   // -- the IP access lists (REQ-012, slice 4) ------------------------------------------------
   //
   // `/security/ip-access` was linked from the posture overview's IP-allow-list row since the
@@ -7449,6 +7525,7 @@ async function main() {
     { path: "/security/sign-in-protection", name: "security-sign-in-protection" },
     { path: "/security/ip-access", name: "security-ip-access" },
     { path: "/security/events", name: "security-events" },
+    { path: "/security/secrets", name: "security-secrets" },
     // The system health centre (REQ-014, slice 1). Walked here and driven by
     // `runHealthDepth` below, which reads the eight service rows, opens a row's
     // checks and presses "Run all checks". "No untested screen" means no
