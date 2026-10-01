@@ -8889,6 +8889,171 @@ async function runSecurityDepth(page, report) {
     "high",
     "the banner is still up one poll interval after the window was closed; writes work again but the panel keeps claiming they do not",
   );
+  // ---- The cluster panel (REQ-024, slice 4) -------------------------------------------------
+  //
+  // This screen is the one place in the request where a route visit proves almost nothing, and
+  // saying why is the point. The QA box is a single instance: no KUBERNETES_SERVICE_HOST, no
+  // service-account token. So there are no replica numbers to assert and no sparkline to draw,
+  // and a pass that asserted "6 of 6 replicas ready" would be asserting a number it invented.
+  //
+  // What CAN be wrong here, and is asserted:
+  //
+  //   1. the screen renders at all, and renders ONE of the two shapes rather than a cluster
+  //      table with nothing in it — the spec's "never a disabled card as a tease" is exactly
+  //      the failure of showing a cluster shell on a single instance;
+  //   2. the single-instance card says WHY, because "you are not in a cluster" and "you are in
+  //      a cluster and its token is missing" are different problems and the operator has to be
+  //      able to tell them apart without reading the logs;
+  //   3. it never shows a replica count, a CPU figure or a memory figure it did not measure —
+  //      the whole slice is about an unreported metric being a dash rather than a zero, and a
+  //      screen that renders a plausible 0 is the failure this pass exists to catch;
+  //   4. the "Sample now" button is not a dead control: pressing it must produce a visible
+  //      outcome, including the honest "nothing to sample" on a single instance.
+  //
+  // Claim 3 reads as over-cautious until it has caught something: a card that says "Uptime 0s"
+  // for a process up for a week is a number, it is plausible, and it is a lie. So the pass
+  // counts figures on the card and requires their absence.
+  await page
+    .goto(`${URL_ADMIN}/deployment/kubernetes`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-cluster-runtime], [data-cluster-notice]', { timeout: 15000 })
+    .catch(() => {});
+
+  const clusterSingle = (await page.locator('[data-cluster-runtime="single"]').count()) > 0;
+  const clusterTable = (await page.locator('[data-cluster-runtime="cluster"]').count()) > 0;
+  const clusterRendered = clusterSingle || clusterTable;
+  note({ step: "cluster-rendered", single: clusterSingle, table: clusterTable });
+  steps["cluster-rendered"] = clusterRendered;
+  await shot(page, "deployment-cluster");
+
+  if (clusterSingle) {
+    const reason =
+      (await page.locator('[data-cluster-reason="single"]').first().textContent()) ?? "";
+    note({ step: "cluster-reason", reason: reason.trim() });
+    // Non-empty and specific. A card rendering "N/A" or an empty paragraph has technically
+    // satisfied "shows a reason" and told the operator nothing at all.
+    steps["cluster-reason-is-specific"] = reason.trim().length > 20;
+    steps["cluster-single-not-a-cluster-table"] = !clusterTable;
+
+    // The numbers this screen must NOT invent on a single instance. Checked as a pattern over
+    // the card's own text, because a "0 m" is indistinguishable from a real reading by eye and
+    // only its absence is a fact.
+    const cardText = (
+      (await page.locator('[data-cluster-runtime="single"]').first().textContent()) ?? ""
+    ).trim();
+    const inventedFigures = /replicas?\b|\d+\s*m\b|\d+\s*(MiB|GiB|KiB)\b/.test(cardText);
+    note({
+      step: "cluster-no-invented-figures",
+      text: cardText.slice(0, 200),
+      invented: inventedFigures,
+    });
+    steps["cluster-single-invents-no-figures"] = !inventedFigures;
+    if (inventedFigures) {
+      record({
+        page: "deployment-cluster",
+        action: "cluster-single-invents-no-figures",
+        severity: "high",
+        detail:
+          "the single-instance card shows a replica or resource figure; this deployment measured none, and a 0 reads as an idle measurement",
+        measured: cardText.slice(0, 200),
+      });
+    }
+  }
+
+  if (clusterTable) {
+    const rows = await page.locator("[data-cluster-workload]").count();
+    note({ step: "cluster-workload-rows", count: rows });
+    // A cluster table with no rows is the "empty cluster shell" the spec forbids; a real cluster
+    // answering with zero workloads is a different, legitimate state and the screen has its own
+    // message for it, so the assertion is on the MESSAGE rather than on the row count.
+    steps["cluster-table-either-rows-or-explains"] =
+      rows > 0 || /no workloads are running/i.test((await page.locator("body").first().textContent()) ?? "");
+  }
+
+  // The sampler's button. On a single instance the honest answer is "nothing to sample", and a
+  // button that reports success without saying which of the two happened is the dead control.
+  const sampleButton = page.getByRole("button", { name: /sample now/i }).first();
+  if ((await sampleButton.count()) > 0) {
+    await sampleButton.click().catch(() => {});
+    await page
+      .waitForSelector('[data-cluster-notice="1"]', { timeout: 20000 })
+      .catch(() => {});
+    const notice = (
+      (await page.locator('[data-cluster-notice="1"]').first().textContent()) ?? ""
+    ).trim();
+    note({ step: "cluster-sample-notice", notice: notice.slice(0, 200) });
+    steps["cluster-sample-reports-an-outcome"] = notice.length > 0;
+    if (notice.length === 0) {
+      record({
+        page: "deployment-cluster",
+        action: "cluster-sample-reports-an-outcome",
+        severity: "high",
+        detail:
+          "the Sample now button was pressed and nothing was reported; on a single instance the honest answer is that there is nothing to sample",
+        measured: "",
+      });
+    }
+    await shot(page, "deployment-cluster-sampled");
+  } else {
+    steps["cluster-sample-reports-an-outcome"] = false;
+    record({
+      page: "deployment-cluster",
+      action: "cluster-sample-button-missing",
+      severity: "high",
+      detail:
+        "the cluster panel has no Sample now control, so the sparkline can only ever fill on a timer nobody can see",
+      measured: "",
+    });
+  }
+
+  // The gates. `rendered` first, for the reason the maintenance pass documents: a screen that
+  // never opened must not report a clean set of sub-claims it never took. The two inside a branch
+  // are only measured when that shape rendered, which on the other shape is legitimately absent
+  // -- so they are scoped rather than failed by it.
+  const clusterGate = (claim, severity, what) => {
+    if (claim.startsWith("cluster-single-") && !clusterSingle) return;
+    if (claim.startsWith("cluster-table-") && !clusterTable) return;
+    const measured = steps[claim];
+    if (measured === true || (typeof measured === "number" && measured > 0)) return;
+    record({
+      page: "deployment-cluster",
+      action: claim,
+      severity,
+      detail: what,
+      measured,
+    });
+  };
+  clusterGate(
+    "cluster-rendered",
+    "high",
+    "/deployment/kubernetes rendered neither a cluster table nor a single-instance card",
+  );
+  clusterGate(
+    "cluster-reason-is-specific",
+    "high",
+    "the single-instance card does not say why there is no cluster; the operator cannot tell a laptop from a cluster with a missing token",
+  );
+  clusterGate(
+    "cluster-single-not-a-cluster-table",
+    "high",
+    "a single-instance deployment rendered a cluster table; this is the disabled-card tease the request forbids",
+  );
+  clusterGate(
+    "cluster-single-invents-no-figures",
+    "high",
+    "the single-instance card shows a replica or resource figure that was never measured",
+  );
+  clusterGate(
+    "cluster-table-either-rows-or-explains",
+    "high",
+    "the cluster table is empty and the screen does not say the cluster answered with no workloads",
+  );
+  clusterGate(
+    "cluster-sample-reports-an-outcome",
+    "high",
+    "pressing Sample now reported nothing, so the control cannot be distinguished from a no-op",
+  );
 
   // ---- The rate-limit policy (REQ-012, slice 2) ---------------------------------------------
   //
@@ -10276,6 +10441,13 @@ async function main() {
     // on and off again, because a screen whose save button is never pressed has not been tested
     // in the only way that matters.
     { path: "/deployment/maintenance", name: "deployment-maintenance" },
+    // The cluster panel (REQ-024, slice 4). Walked as a route, and this is the screen where a
+    // route visit proves least: on this QA box -- a single instance with no KUBERNETES_SERVICE_HOST
+    // -- the honest answer is the process card, and the interesting assertion is exactly that.
+    // A panel that rendered a cluster shell with empty rows here would be the failure the spec
+    // names ("never a disabled card as a tease"), so the depth pass below asserts the card says
+    // single instance and names why, rather than asserting on numbers that cannot exist here.
+    { path: "/deployment/kubernetes", name: "deployment-cluster" },
     // The rollback dialog is reachable only from a card that has a previous version, which a
     // fresh QA database does not have -- so it is opened directly by the driven pass below
     // rather than by clicking a card. Opening a modal by URL is the one honest way to reach a

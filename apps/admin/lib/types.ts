@@ -3189,3 +3189,105 @@ export type DeploymentCheckRunResponse = {
   announced: string[];
   checks: DeploymentChecksResponse;
 };
+
+/** ---------------------------------------------------------------------------------------------
+ * The cluster panel (REQ-024, slice 4).
+ *
+ * A metric is a three-state union rather than `number | null` for the reason the server sends it
+ * this way: the panel must never turn "the runtime did not report it" into a zero, and it must be
+ * able to say WHY a cell is empty. `unknown` carries that reason as a sentence.
+ * ------------------------------------------------------------------------------------------- */
+
+export type ClusterMetric =
+  | { state: "millicores"; value: number }
+  | { state: "bytes"; value: number }
+  | { state: "unknown"; reason: string };
+
+/** One workload's row in the cluster table. */
+export type ClusterWorkload = {
+  name: string;
+  replicas_desired: number;
+  replicas_ready: number;
+  /** `ready / desired` as a percentage, or null when desired is zero — which is a real state. */
+  ready_percent: number | null;
+  rollout_banner: string | null;
+  cpu_request: ClusterMetric;
+  /** Already `unknown` when the workload declares no limit, so there is no second way to say nothing. */
+  cpu_limit: ClusterMetric;
+  cpu_usage: ClusterMetric;
+  /** Null rather than 0 when there is no limit to be a percentage of. */
+  cpu_percent: number | null;
+  cpu_over_limit: boolean;
+  memory_request: ClusterMetric;
+  memory_limit: ClusterMetric;
+  memory_usage: ClusterMetric;
+  memory_percent: number | null;
+  memory_over_limit: boolean;
+  restarts: number;
+  age_seconds: number;
+  age_label: string;
+  cpu_sparkline: ClusterSparkline | null;
+  cpu_expected_samples: number;
+};
+
+/** A normalised sparkline: values as percentages of the band, plus what the panel labels it with. */
+export type ClusterSparkline = {
+  /** One entry per drawn column, 0..100. A 50 is a gap or a flat series, not a measurement. */
+  points: number[];
+  min: number | null;
+  max: number | null;
+  flat: boolean;
+  gaps: number;
+};
+
+/** `GET /api/v1/deployment/cluster`.
+ *
+ *  `runtime` is the literal `"cluster"` and not `"cluster" | "single"`: it is the discriminant
+ *  that lets TypeScript narrow a `DeploymentClusterResponse | DeploymentProcessCard` in the
+ *  screen, and a union of two literals is not a discriminant — the two branches become
+ *  indistinguishable to the compiler and every `reading.runtime === "cluster"` needs a cast
+ *  beside it. The server never sends the other value on a `200`.
+ */
+export type DeploymentClusterResponse = {
+  runtime: "cluster";
+  workloads: ClusterWorkload[];
+  rollout_banner: string | null;
+  /** Every workload over one of its own limits, in words — a clamped bar would not say it. */
+  over_limit: string[];
+  read_at: string;
+  window_minutes: number;
+  sparkline_width: number;
+};
+
+/** The single-instance alternative card. What a non-cluster deployment shows instead. */
+export type DeploymentProcessCard = {
+  runtime: "single";
+  process: { uptime_seconds: number; resident_memory: ClusterMetric } | null;
+  reason: string | null;
+};
+
+/** `GET /api/v1/deployment/cluster/{environment}/samples`. */
+export type ClusterSamplesResponse = {
+  workload: string;
+  window_minutes: number;
+  expected_samples: number;
+  stored_samples: number;
+  gaps: number;
+  sparkline: ClusterSparkline;
+};
+
+/** `POST /api/v1/deployment/cluster/{environment}/sample`. */
+export type ClusterSampleRunResponse = {
+  environment: string;
+  runtime: "cluster" | "single";
+  written: number;
+  pruned: number;
+};
+
+/** `POST /api/v1/deployment/cluster/{environment}/restart`. */
+export type ClusterRestartResponse = {
+  job: DeploymentJob;
+  message: string;
+  workload: string;
+};
+

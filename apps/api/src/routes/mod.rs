@@ -2081,7 +2081,7 @@ pub fn router(state: AppState) -> Router {
         // read one environment's series while restarting another's.
         .route("/deployment/cluster", deployment_cluster)
         .route(
-            "/deployment/cluster/{environment}/samples",
+            "/deployment/cluster/{environment}/samples/{workload}",
             deployment_cluster_samples,
         )
         .route(

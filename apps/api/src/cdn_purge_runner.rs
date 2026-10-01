@@ -56,11 +56,7 @@ const EVENT_BATCH: i64 = 100;
 /// Start the purge worker; the handle is kept by the binary and ends with the process.
 #[must_use]
 pub fn spawn(state: AppState) -> JoinHandle<()> {
-    let poll_ms = state
-        .config()
-        .retention
-        .poll_ms
-        .clamp(1_000, 30_000);
+    let poll_ms = state.config().retention.poll_ms.clamp(1_000, 30_000);
     tracing::info!(poll_ms, "the CDN purge worker started");
 
     tokio::spawn(async move {
@@ -70,7 +66,10 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
         // recorded into a burst of purges at a provider that is doing nothing wrong.
         match invalidation::seed_cursor(state.db().pool()).await {
             Ok(Some(cursor)) => {
-                tracing::info!(cursor, "the CDN invalidation cursor seeded to the end of the bus");
+                tracing::info!(
+                    cursor,
+                    "the CDN invalidation cursor seeded to the end of the bus"
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -137,11 +136,10 @@ pub async fn tick(state: &AppState) -> Result<(), omnion_cdn::CdnError> {
     // could no longer be attributed to the right history row.
     let mut groups: BTreeMap<(Option<Uuid>, Uuid), Vec<PurgeItemRow>> = BTreeMap::new();
     for item in claimed {
-        let site: Option<Uuid> =
-            sqlx::query_scalar("select site_id from cdn_purges where id = $1")
-                .bind(item.purge_id)
-                .fetch_one(pool)
-                .await?;
+        let site: Option<Uuid> = sqlx::query_scalar("select site_id from cdn_purges where id = $1")
+            .bind(item.purge_id)
+            .fetch_one(pool)
+            .await?;
         groups.entry((site, item.purge_id)).or_default().push(item);
     }
 
@@ -239,21 +237,17 @@ async fn purge_row_shape(
     pool: &sqlx::PgPool,
     purge_id: Uuid,
 ) -> Result<(PurgeKind, String), omnion_cdn::CdnError> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        "select kind, provider from cdn_purges where id = $1",
-    )
-    .bind(purge_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(String, String)> =
+        sqlx::query_as("select kind, provider from cdn_purges where id = $1")
+            .bind(purge_id)
+            .fetch_optional(pool)
+            .await?;
 
     // A purge whose parent row vanished cannot be drained: the cascade would have taken
     // the items with it, so reaching here means the row was deleted between the claim and
     // this read. Reporting it as a URL purge would call a provider for nothing.
     match row {
-        Some((kind, provider)) => Ok((
-            PurgeKind::parse(&kind).unwrap_or(PurgeKind::Url),
-            provider,
-        )),
+        Some((kind, provider)) => Ok((PurgeKind::parse(&kind).unwrap_or(PurgeKind::Url), provider)),
         None => Ok((PurgeKind::Url, "origin".to_string())),
     }
 }
@@ -286,7 +280,10 @@ mod tests {
             });
         }
         assert_eq!(groups.len(), 3, "three (site, purge) pairs, three calls");
-        assert_eq!(groups[&(Some(Uuid::from_u128(1)), Uuid::from_u128(10))].len(), 1);
+        assert_eq!(
+            groups[&(Some(Uuid::from_u128(1)), Uuid::from_u128(10))].len(),
+            1
+        );
     }
 
     #[test]

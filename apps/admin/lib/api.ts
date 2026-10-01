@@ -77,6 +77,14 @@ import type {
   DeploymentRollbackOffer,
   DeploymentStep,
   DeploymentVersion,
+  ClusterMetric,
+  ClusterRestartResponse,
+  ClusterSampleRunResponse,
+  ClusterSamplesResponse,
+  ClusterSparkline,
+  ClusterWorkload,
+  DeploymentClusterResponse,
+  DeploymentProcessCard,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   WebhookEndpoint,
@@ -6751,3 +6759,71 @@ export async function saveDeploymentMaintenance(input: {
     },
   );
 }
+
+/** ---------------------------------------------------------------------------------------------
+ * The cluster panel (REQ-024, slice 4).
+ *
+ * The read refuses with a `404` carrying a payload on a single instance rather than answering an
+ * empty cluster, so the caller has to handle the refusal: `fetchDeploymentCluster` returns the
+ * discriminated union instead of throwing, because a 404 here is the normal answer for a single
+ * VPS and a screen that renders an error state for it is wrong on most installations.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The cluster read, or the single-instance card. Never throws for "not a cluster". */
+export async function fetchDeploymentCluster(
+  environment: string,
+): Promise<DeploymentClusterResponse | DeploymentProcessCard> {
+  try {
+    return await request<DeploymentClusterResponse>("/api/v1/deployment/cluster");
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      // The server names which of the three cases it is; showing the operator a generic
+      // "not found" for a cluster whose token is missing sends them looking for the wrong thing.
+      return {
+        runtime: "single",
+        process: null,
+        reason: error.message,
+      };
+    }
+    throw error;
+  }
+}
+
+/** One workload's sample series, for the sparkline. */
+export async function fetchClusterSamples(
+  environment: string,
+  workload: string,
+): Promise<ClusterSamplesResponse> {
+  return request<ClusterSamplesResponse>(
+    `/api/v1/deployment/cluster/${encodeURIComponent(environment)}/samples/${encodeURIComponent(workload)}`,
+  );
+}
+
+/** Restart a workload. `confirm` is required in production and is the workload's name. */
+export async function restartClusterWorkload(input: {
+  environment: string;
+  workload: string;
+  confirm?: string;
+  reason?: string;
+}): Promise<ClusterRestartResponse> {
+  return request<ClusterRestartResponse>(
+    `/api/v1/deployment/cluster/${encodeURIComponent(input.environment)}/restart`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        workload: input.workload,
+        confirm: input.confirm ?? "",
+        reason: input.reason ?? null,
+      }),
+    },
+  );
+}
+
+/** Sample now and prune, so the "sample" button is not a dead control. */
+export async function runClusterSample(environment: string): Promise<ClusterSampleRunResponse> {
+  return request<ClusterSampleRunResponse>(
+    `/api/v1/deployment/cluster/${encodeURIComponent(environment)}/sample`,
+    { method: "POST" },
+  );
+}
+

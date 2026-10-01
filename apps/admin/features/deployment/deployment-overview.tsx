@@ -26,7 +26,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import { ArrowRight, History, RefreshCw, Rocket, ScrollText, Undo2, Wrench } from "lucide-react";
+import { ArrowRight, History, RefreshCw, Rocket, ScrollText, Server, Undo2, Wrench } from "lucide-react";
 import Link from "next/link";
 
 import { EmptyState } from "@/components/empty-state";
@@ -223,6 +223,17 @@ export function DeploymentOverview() {
             >
               <Wrench aria-hidden="true" className="size-3.5" />
               Maintenance
+            </Link>
+            {/* The cluster panel, for the same reason as maintenance: it answers "how much of
+                the cluster is busy", which is the question an operator has while staring at the
+                environment cards. On a single-instance deployment the page renders the process
+                card, so the link is never a dead button. */}
+            <Link
+              href="/deployment/kubernetes"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium hover:bg-quiet-soft"
+            >
+              <Server aria-hidden="true" className="size-3.5" />
+              Cluster
             </Link>
             <button
               type="button"

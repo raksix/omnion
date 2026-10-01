@@ -212,12 +212,17 @@ impl TestRedis {
         }
         let deadline = std::time::Instant::now() + StdDuration::from_secs(15);
         while std::time::Instant::now() < deadline {
-            if std::net::TcpStream::connect_timeout(&self.addr(), StdDuration::from_millis(200)).is_err() {
+            if std::net::TcpStream::connect_timeout(&self.addr(), StdDuration::from_millis(200))
+                .is_err()
+            {
                 return;
             }
             std::thread::sleep(StdDuration::from_millis(50));
         }
-        panic!("the throwaway redis on :{} never released its port", self.port);
+        panic!(
+            "the throwaway redis on :{} never released its port",
+            self.port
+        );
     }
 
     /// Start it again on the **same port**, which is the whole point of the recovery leg.
@@ -256,17 +261,17 @@ impl TestRedis {
     fn wait_until_answering(&self) {
         let deadline = std::time::Instant::now() + StdDuration::from_secs(20);
         while std::time::Instant::now() < deadline {
-            if std::net::TcpStream::connect_timeout(
-                &self.addr(),
-                StdDuration::from_millis(250),
-            )
-            .is_ok()
+            if std::net::TcpStream::connect_timeout(&self.addr(), StdDuration::from_millis(250))
+                .is_ok()
             {
                 return;
             }
             std::thread::sleep(StdDuration::from_millis(50));
         }
-        panic!("the throwaway redis on :{} never started answering", self.port);
+        panic!(
+            "the throwaway redis on :{} never started answering",
+            self.port
+        );
     }
 
     fn addr(&self) -> std::net::SocketAddr {
@@ -351,7 +356,11 @@ async fn a_stopped_dependency_recovers_and_resolves_its_incident() {
     let dir = std::env::temp_dir().join(format!("omnion-health-redis-{}", Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).expect("the temp dir must be creatable");
 
-    if Command::new("redis-server").arg("--version").output().is_err() {
+    if Command::new("redis-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         eprintln!("SKIP: redis-server is not installed, so a real outage cannot be staged");
         harness.dispose().await;
         return;
@@ -365,7 +374,9 @@ async fn a_stopped_dependency_recovers_and_resolves_its_incident() {
     let ctx = context(pool, &client, &storage);
 
     // 1. Up.
-    let (healthy, _) = omnion_health::run_and_record(pool, &ctx).await.expect("the run works");
+    let (healthy, _) = omnion_health::run_and_record(pool, &ctx)
+        .await
+        .expect("the run works");
     assert_eq!(
         healthy
             .services
@@ -382,7 +393,9 @@ async fn a_stopped_dependency_recovers_and_resolves_its_incident() {
 
     // 2. Down, for real.
     server.stop();
-    let (down, policy) = omnion_health::run_and_record(pool, &ctx).await.expect("the run works");
+    let (down, policy) = omnion_health::run_and_record(pool, &ctx)
+        .await
+        .expect("the run works");
     assert_eq!(
         down.services
             .iter()
@@ -400,7 +413,10 @@ async fn a_stopped_dependency_recovers_and_resolves_its_incident() {
     let (incident_id, to_state) = open_incident_row(pool, "redis")
         .await
         .expect("a real outage must open exactly one incident");
-    assert_eq!(to_state, "down", "the incident records the state that opened it");
+    assert_eq!(
+        to_state, "down",
+        "the incident records the state that opened it"
+    );
 
     let degraded = policy
         .transitions
@@ -415,9 +431,14 @@ async fn a_stopped_dependency_recovers_and_resolves_its_incident() {
     // A second run while the outage is ongoing opens nothing new. Without this the walk would
     // accept an implementation that opens one incident per probe run, which is exactly what the
     // request's "one incident per transition" promise is about.
-    let (_, repeat) = omnion_health::run_and_record(pool, &ctx).await.expect("the run works");
+    let (_, repeat) = omnion_health::run_and_record(pool, &ctx)
+        .await
+        .expect("the run works");
     assert!(
-        repeat.transitions.iter().all(|entry| entry.service != "redis"),
+        repeat
+            .transitions
+            .iter()
+            .all(|entry| entry.service != "redis"),
         "a steady outage is not a new transition on every run"
     );
     assert_eq!(
@@ -428,8 +449,9 @@ async fn a_stopped_dependency_recovers_and_resolves_its_incident() {
 
     // 3. Up again, on the same port, through the same client.
     server.restart();
-    let (recovered, policy) =
-        omnion_health::run_and_record(pool, &ctx).await.expect("the run works");
+    let (recovered, policy) = omnion_health::run_and_record(pool, &ctx)
+        .await
+        .expect("the run works");
     assert_eq!(
         recovered
             .services
@@ -509,12 +531,17 @@ async fn a_degradation_reaches_the_endpoints_that_subscribed_to_health() {
         pool,
         subscriber_org,
         "operations",
-        &["health", "health.service.degraded", "health.service.recovered"],
+        &[
+            "health",
+            "health.service.degraded",
+            "health.service.recovered",
+        ],
     )
     .await;
     create_endpoint(pool, other, "content", &["content.published"]).await;
 
-    let dir = std::env::temp_dir().join(format!("omnion-health-fanout-{}", Uuid::new_v4().simple()));
+    let dir =
+        std::env::temp_dir().join(format!("omnion-health-fanout-{}", Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).expect("the temp dir must be creatable");
     let port = free_port();
     let mut server = TestRedis::start(port, &dir);
@@ -523,15 +550,24 @@ async fn a_degradation_reaches_the_endpoints_that_subscribed_to_health() {
     let ctx = context(pool, &client, &storage);
 
     // Healthy first, so the outage below is a *transition* and not a first sighting.
-    omnion_health::run_and_record(pool, &ctx).await.expect("the run works");
+    omnion_health::run_and_record(pool, &ctx)
+        .await
+        .expect("the run works");
 
     server.stop();
-    let (_, degraded_policy) = omnion_health::run_and_record(pool, &ctx).await.expect("the run works");
+    let (_, degraded_policy) = omnion_health::run_and_record(pool, &ctx)
+        .await
+        .expect("the run works");
     let announced = omnion_api::health_events::announce_changes(pool, &degraded_policy).await;
-    assert_eq!(announced, 1, "exactly one fact: the one organization subscribed to `health`");
+    assert_eq!(
+        announced, 1,
+        "exactly one fact: the one organization subscribed to `health`"
+    );
 
     server.restart();
-    let (_, recovery_policy) = omnion_health::run_and_record(pool, &ctx).await.expect("the run works");
+    let (_, recovery_policy) = omnion_health::run_and_record(pool, &ctx)
+        .await
+        .expect("the run works");
     let announced = omnion_api::health_events::announce_changes(pool, &recovery_policy).await;
     assert_eq!(announced, 1, "and exactly one on the way back");
 
@@ -547,7 +583,10 @@ async fn a_degradation_reaches_the_endpoints_that_subscribed_to_health() {
     .fetch_all(pool)
     .await
     .expect("the deliveries must be readable");
-    let names: Vec<&str> = deliveries.iter().map(|(_, name, _)| name.as_str()).collect();
+    let names: Vec<&str> = deliveries
+        .iter()
+        .map(|(_, name, _)| name.as_str())
+        .collect();
     assert!(
         names.contains(&"health.service.degraded") && names.contains(&"health.service.recovered"),
         "the subscribed endpoint must be queued both facts, got {names:?}"
@@ -578,7 +617,10 @@ async fn a_degradation_reaches_the_endpoints_that_subscribed_to_health() {
     .fetch_one(pool)
     .await
     .expect("the leak count must be readable");
-    assert_eq!(leaked, 0, "a health fact must not reach an endpoint that did not subscribe");
+    assert_eq!(
+        leaked, 0,
+        "a health fact must not reach an endpoint that did not subscribe"
+    );
 
     // And with no endpoint at all, nothing is recorded — the "no receiver, no row" promise, which
     // is what keeps a fresh installation's `events` table from filling with dead weight.
@@ -591,7 +633,9 @@ async fn a_degradation_reaches_the_endpoints_that_subscribed_to_health() {
         .await
         .expect("the count must be readable");
     server.stop();
-    let (_, second) = omnion_health::run_and_record(pool, &ctx).await.expect("the run works");
+    let (_, second) = omnion_health::run_and_record(pool, &ctx)
+        .await
+        .expect("the run works");
     omnion_api::health_events::announce_changes(pool, &second).await;
     let after: i64 = sqlx::query_scalar("select count(*)::bigint from events")
         .fetch_one(pool)
@@ -616,7 +660,9 @@ trait IsUuid {
 
 impl IsUuid for serde_json::Value {
     fn is_uuid(&self) -> bool {
-        self.as_str().and_then(|raw| Uuid::parse_str(raw).ok()).is_some()
+        self.as_str()
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .is_some()
     }
 }
 
@@ -630,7 +676,12 @@ async fn create_organization(pool: &PgPool, label: &str) -> Uuid {
         .expect("the test organization must be created")
 }
 
-async fn create_endpoint(pool: &PgPool, organization_id: Uuid, label: &str, events: &[&str]) -> Uuid {
+async fn create_endpoint(
+    pool: &PgPool,
+    organization_id: Uuid,
+    label: &str,
+    events: &[&str],
+) -> Uuid {
     let bound: Vec<String> = events.iter().map(|name| (*name).to_string()).collect();
     sqlx::query_scalar(
         "insert into webhook_endpoints (organization_id, name, url, secret, events) \
