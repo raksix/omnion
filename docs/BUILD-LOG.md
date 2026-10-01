@@ -8450,3 +8450,66 @@ through `/dev/shm`. On this box, write a file to `/dev/shm` first and copy it in
 45 Chrome processes, load 27. REQ-010's screen-state box and this REQ's five screen boxes turn on it.
 
 **Next:** `bash scripts/qa/run.sh --only=media` on a free slot.
+
+## Tick 62 (wave6) — a typo in the pass filter, and what it costs to find out late
+
+**Merged `origin/main` first** (five commits). One conflict, in `docs/BUILD-LOG.md`, resolved with
+`scripts/qa/merge-build-log.py` and verified by multiset rather than by line count: 0 missing lines
+from ours, from theirs and from base, 0 lost headings. The tree also arrived with an **unmerged
+index entry** (`DU docs/qa/QA-LATEST-w7.md`) left by an aborted merge — a sibling's per-run report
+that `.gitignore` already excludes (`docs/qa/QA-LATEST-*.md`, "machine- and run-specific"), so it
+was untracked rather than committed. `002cf34f`.
+
+**What.** The close-gate pass for the four requests blocked on the QA slot for three ticks. The slot
+was free, so it was started — as `QA_ONLY=observability,secrets`.
+
+**That filter matched no route and no depth pass.** `--only` takes hyphenated NAMES
+(`observability-traces`), never a path (`/observability/traces`) and never the plural group. The
+pass queued for the box's single slot, was admitted, reset `omnion_qa_w6` and booted three pm2
+servers — all of which had to happen before the mistake was visible anywhere.
+
+`walkthrough.cjs` does report it, as `empty-pass` / `unknown-pass-name` findings. It reports it from
+**its report roll-up, at the end**. That is the right place for the report and the wrong place for
+the cost: on a box where seven writers queue for one pass, a typo must not cost a slot wait, a
+database reset and three server boots to discover.
+
+**Fixed in `bfc2bdf4`.** `scripts/qa/check-only-filter.cjs` validates the filter against the name
+list read **out of `walkthrough.cjs` itself** — the `routes` array and the `wants("…")` blocks — so a
+second hardcoded copy cannot drift from the routes it guards, which is the drift this harness has
+already been bitten by twice. `run.sh` calls it **before** the slot wait and refuses with exit 2.
+Measured on the filter that motivated it: **exit 2 in 0 seconds, no slot taken**, with the seven
+observability screens named as suggestions.
+
+**The gate caught a false assumption of my own.** `only-filter-gate.test.cjs` asserted the ordering
+by searching for `walkthrough.cjs` as a substring, and matched the guard's own comment prose above
+it — 2/19 red on a correct file. Anchored on the invocation (`node scripts/qa/walkthrough.cjs`), so
+the assertion is about order rather than about prose. 19/19 clean, 2 mutations (checker call removed;
+guard moved after the slot wait) go red, control green.
+
+**The confirming pass is NOT a close, and says so.** w4 held the slot for the whole 40-minute wait
+(`pid 1788091`, `cwd=/mnt/apopic/omnion-w4`, verified by writing screenshots the whole time), so the
+wait expired and the pass proceeded **without one**, at load average 20. It then measured
+**none** of its 23 screens. The evidence is in its own artifacts, not an inference:
+
+- `clicks.jsonl`: the sign-in form was filled with `admin@example.com` and "Sign in" was pressed
+  with **`429 (Too Many Requests)`** — 43 such errors, on the page reached *after* a working session.
+- 40 screens recorded `the session was lost — the browser was on the sign-in form, so this screen
+  was NOT measured`.
+- `summary.json` never advanced past the queued void record: `void: true`.
+
+So all four requests keep their close box **unticked**. The screens are not proven by this run, and
+"the pass ran" is not "the pass measured".
+
+**The limit itself is shared, not local.** The `sign_in` limiter (`crates/security/src/limiter.rs`,
+10 per 300 s) is per-IP, and every pass on this box comes from `127.0.0.1`. Three sibling passes
+were live at once (w4 `:3103`, main `:3100`, w3 queued), so the budget a single pass assumes is
+spending down under it. **A pass must hold the slot to hold the limiter budget** — which makes
+`--only` correctness and slot discipline the same problem, not two.
+
+**Proof:** `scripts/qa/only-filter-gate.test.cjs` 19/19 (2 mutations red, control green); all eight
+pre-existing QA gates green (`session-guard`, `wizard-gate`, `focused-pass-args`, `exports-states`,
+`wave5b-route-coverage`, `depth-pass-thunk`, `wizard-behaviour`, `preferences-restore`);
+`cargo test -p omnion-telemetry` 188/188; `pnpm typecheck` 2/2.
+
+**Next:** re-run the same 23-name pass **holding the slot**. If it cannot get one, leave all four
+close boxes unticked rather than close on a contended run — the unticked box is the honest state.
