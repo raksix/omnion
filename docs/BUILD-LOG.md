@@ -14996,3 +14996,47 @@ reclaiming it is the next tick's first job rather than this one.
 `notifications.send` and binds `session.user.organization_id` as the row's organization, so it can
 address any real account on the platform. That is the same defect class one route up, and whether
 it is a leak or an intended cross-tenant feature is a question about the permission, not the query.
+
+### Tick 74 — REQ-117 · SLICE 42 · the emit route's recipient guard asked the access question (2026-10-01)
+
+**What.** `POST /notifications/emit` did three things and checked only the first: it asked
+`existing_users` (*is this a real account*), stamped every row with the **sender's**
+`organization_id`, and never asked whether the recipient belongs to the sender's tenant.
+`users.organization_id` is nullable, so the two questions diverge for exactly the population the
+tenant boundary exists to protect, and an account holding `notifications.send` could write into
+any other tenant's inbox. Tick 73 fixed this shape in the SLA worker and left the question
+standing; it was the third instance, one route up, with the leak in the *insert*.
+
+**Proof.** RED first, over a real socket with two real tenants: a cross-tenant emit answered
+`202 {"created":1}` and the row landed in a stranger's inbox carrying the *sending* organization.
+A mixed batch wrote **both** rows. → `omnion_notifications::audience` (pure: a tenancy rule only
+exercisable against a live database is a rule nobody exercises) + each row stamped with its
+**recipient's** organization. → `scripts/qa/run-notification-tenancy-http.sh` **7/7, PROVEN TO
+FAIL at 3/7** with the pre-fix guard: exactly the four tenancy legs red, the positive control and
+both status legs green. Regressions: notifications lib **109** (+7), `omnion-api` lib **325**,
+`run-notifications-http.sh` **PASS**, clippy 0 errors, admin `tsc --noEmit` exit 0.
+
+**Three defects of my own, each found only by running the thing.** Leg 5 was green *because of
+the leak* — it disabled tenant A's account while tenant B sent, so it measured the cross-tenant
+write, and after the fix it correctly answered `400`. The repair disabled the **sender**, whose
+session that revokes, so the leg then measured `401 invalid_session`. And the gate's own summary
+printed `PASS 16/7` — impossible, because one `pass()` verb counted fixture steps as assertions;
+`pass` is a log line now, `leg` is the only counter, and the summary refuses to print unless all
+seven legs actually ran (`set -e` never notices a conditional that was not taken).
+
+**The `sign_in` bucket is shared with every other writer on this box, and both gates died on it
+before measuring anything.** `omnion:rl:sign_in:<bucket>:<hash>` is Redis, keyed on the client, and
+nine sibling loops reach their APIs over loopback — measured **25 against a ceiling of 10** on a
+gate making three sign-ins. The limiter refused the member's login; three scope claims then
+reported `401 unauthenticated` on read paths this slice never touched while every emit assertion
+passed. Both gates now count in a Redis **database index of their own** (db 15 / db 14), which
+changes no product code and cannot collide with a sibling. **A refusal reported as a permission
+problem is a rate-limit problem nine times out of ten on a shared box**, and a discarded
+`>/dev/null` on a sign-in is what moved the diagnosis three steps from its cause.
+
+**Next.** The tenancy guard now covers the write path of this route. What has never been asked:
+`GET /notifications` is owner-scoped in the store, but the **admin outbox** takes an
+organization, and `notifications.admin` is a separate power — whether the emit route's new
+recipient-stamping assumption ("the row's organization is the recipient's tenant") holds for the
+router's own `record_with_deliveries` path, which stamps `event.organization_id` and resolves
+recipients through `resolve_recipients`. That is the same sentence one layer down.
