@@ -22,8 +22,18 @@
 # when the pass cannot measure, the report must SAY SO in the first lines a reader sees, and it
 # must never present a default as a measurement.
 #
-# This reads the shipped files, so a re-typed list of properties could not go green while the
+# Reads the shipped files, so a re-typed list of properties could not go green while the
 # real ones stay broken — the same rule `walkthrough-navigation-probe.cjs` follows.
+#
+# `set -uo pipefail` is deliberate, and the `grep -q`-in-a-pipeline traps below are the price of
+# it. With `pipefail` on, `awk ... | grep -q 'x'` is **flaky, not correct**: `grep -q` exits at the
+# first match, `awk` is still writing and takes SIGPIPE (141), and `pipefail` turns that into a
+# failed pipeline — so an `if` over it answers "not present" at random. Measured on this file:
+# 10 identical runs gave `1000100010` with `pipefail` and `1111111111` without it. A gate whose
+# verdict changes run to run on unchanged source is worse than no gate, because it trains the
+# reader to re-run it until it agrees. So every check here is one of:
+#   * `grep -c` compared numerically  (reads the whole stream, no SIGPIPE), or
+#   * `grep -q` with the input **redirected from a file**, never through a pipe.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 4
 
@@ -67,14 +77,20 @@ else
 fi
 
 # ------------------------------------------------- 2. the catch must not destroy a good summary
-if awk '/main\(\)\.catch/,/^}\);/' "$WALK" | grep -q 'kept'; then
+# `awk | grep -q` would be the SIGPIPE trap described at the top, so the slice is written to a
+# scratch file once and grepped from there.
+CATCH=$(mktemp)
+trap 'rm -f "$CATCH"' EXIT
+awk '/main\(\)\.catch/,/^}\);/' "$WALK" > "$CATCH"
+
+if grep -q 'kept' "$CATCH"; then
   check "the failure handler keeps an existing summary.json instead of overwriting it" 1
 else
   check "the failure handler keeps an existing summary.json instead of overwriting it" 0 \
     "main().catch still writes a bare { fatal } summary, destroying the findings the pass had computed"
 fi
 
-if awk '/main\(\)\.catch/,/^}\);/' "$WALK" | grep -q 'reporterFailed'; then
+if grep -q 'reporterFailed' "$CATCH"; then
   check "a reporter that dies after measuring records WHY separately from the results" 1
 else
   check "a reporter that dies after measuring records WHY separately from the results" 0 \
