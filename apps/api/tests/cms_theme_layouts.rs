@@ -322,6 +322,10 @@ async fn create_site(db: &Db, organization_id: Uuid, key: &str) -> omnion_identi
 struct Fixture {
     auth: Auth,
     site: omnion_identity::Site,
+    /// Carried rather than looked up: an install writes `themes.organization_id` and the walk
+    /// has to compare it against the organization that owns the account, so the fixture holds
+    /// the one value both sides must agree on instead of re-deriving it from a session table.
+    organization_id: Uuid,
 }
 
 async fn fixture(state: &AppState, db: &Db) -> Fixture {
@@ -343,7 +347,11 @@ async fn fixture(state: &AppState, db: &Db) -> Fixture {
     .await;
     let site = create_site(db, organization_id, &format!("site-{}", &Uuid::new_v4().simple().to_string()[..8])).await;
     let auth = login(state, db, &email).await;
-    Fixture { auth, site }
+    Fixture {
+        auth,
+        site,
+        organization_id,
+    }
 }
 
 fn slot_uri(fixture: &Fixture, suffix: &str) -> String {
@@ -1250,6 +1258,173 @@ async fn a_valid_package_installs_inactive_and_changes_no_site() -> TestResult {
                 .await
                 .expect("the installed row must exist");
         assert_eq!(source.as_deref(), Some("uploaded"));
+        Ok(())
+    })
+    .await
+}
+
+/// The installed row belongs to the organization that installed it.
+///
+/// The module header says it in one sentence — "an uploaded one belongs to the organization
+/// that installed it" — and the gallery honours it with `(organization_id is null or
+/// organization_id = $2)`. The INSERT that writes the row then hard-coded `null`, which makes
+/// that clause read `organization_id is null` for every uploaded theme in the installation: one
+/// tenant's package is listed in a stranger's gallery, and is invisible to the tenant who
+/// uploaded it. Both are the same missing field.
+///
+/// `null` was load-bearing in exactly one place and it is handled there: a theme belonging to
+/// no organization means "the platform ships this file", which is how the bundled loader seeds
+/// its ten and how `source = 'bundled'` stays truthful. This walk is the only thing that can
+/// tell those two meanings apart, because the wrong value and the right one both leave a
+/// `themes` row that renders.
+#[tokio::test]
+async fn an_installed_package_is_owned_by_the_organization_that_installed_it() -> TestResult {
+    walk!(state, |state, db| async move {
+        let fixture = fixture(&state, &db).await;
+        let package = json!({
+            "manifest": {
+                "key": "acme-owned",
+                "name": "Acme Owned",
+                "version": "1.0.0",
+                "modes": ["light"],
+                "slots": ["header"]
+            },
+            "slots": { "header": [] }
+        });
+
+        let installed = call(
+            &state,
+            request(
+                Method::POST,
+                "/api/v1/themes/install",
+                Some(&fixture.auth),
+                Some(package),
+            ),
+        )
+        .await;
+        assert_eq!(installed.status, StatusCode::OK, "body: {}", installed.body);
+
+        // The row is not "a theme" — it is one organization's theme, and the column is how
+        // the gallery and the removal both know whose it is.
+        let organization_id: Option<Uuid> = sqlx::query_scalar(
+            "select organization_id from themes where key = 'acme-owned' and removed_at is null",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("the installed row must exist");
+        assert_eq!(
+            organization_id,
+            Some(fixture.organization_id),
+            "an uploaded theme belongs to the organization that installed it; a null organization_id \
+             reads as 'the platform ships this file' and is what the bundled loader writes"
+        );
+
+        // And the tenant who uploaded it SEES it. A package nobody can find in the gallery is
+        // installed in a place the product has no screen for. The gallery is the flat
+        // `/api/v1/themes?site=…` — the site-scoped path `/sites/{id}/theme` is the ACTIVATION
+        // route, and the listing resolves its site from the query rather than the path.
+        let gallery = call(
+            &state,
+            request(
+                Method::GET,
+                &format!("/api/v1/themes?site={}", fixture.site.id),
+                Some(&fixture.auth),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(gallery.status, StatusCode::OK, "body: {}", gallery.body);
+        // The entry NESTS the theme (`GalleryEntry { theme, is_active }`), so the key is at
+        // `themes[].theme.key` — reading `themes[].key` yields nothing and an empty list looks
+        // exactly like a gallery that hid the package.
+        let keys: Vec<&str> = gallery.body["themes"]
+            .as_array()
+            .expect("the gallery carries themes")
+            .iter()
+            .filter_map(|t| t["theme"]["key"].as_str())
+            .collect();
+        assert!(
+            keys.contains(&"acme-owned"),
+            "the tenant that installed a package must see it in its own gallery, got {keys:?}"
+        );
+
+        Ok(())
+    })
+    .await
+}
+
+/// A removal by the owning organization removes the row.
+///
+/// The refusal order in `remove_theme` is already right — bundled first, then in-use, then the
+/// row. What was missing is the scope on the last one: with `organization_id = null` on the
+/// installed row, the org-scoped UPDATE matched ZERO rows, the function returned `Ok(())`, and
+/// the caller deleted the stored package bytes anyway. So the platform reported a removal that
+/// changed no row, and the tenant's theme was left in the table as a live, activatable key whose
+/// manifest now points at an object that is gone. This walk reads the row back, because a 200
+/// on a DELETE that matched nothing is exactly the symptom.
+#[tokio::test]
+async fn removing_a_package_by_its_owner_really_removes_the_row() -> TestResult {
+    walk!(state, |state, db| async move {
+        let fixture = fixture(&state, &db).await;
+        let key = "acme-removable";
+        let package = json!({
+            "manifest": {
+                "key": key,
+                "name": "Acme Removable",
+                "version": "1.0.0",
+                "modes": ["light"],
+                "slots": ["header"]
+            },
+            "slots": { "header": [] }
+        });
+        let installed = call(
+            &state,
+            request(
+                Method::POST,
+                "/api/v1/themes/install",
+                Some(&fixture.auth),
+                Some(package),
+            ),
+        )
+        .await;
+        assert_eq!(installed.status, StatusCode::OK, "body: {}", installed.body);
+
+        // The state the walk depends on, read BEFORE the removal: a removal that passes
+        // because the row was never there proves nothing.
+        let live_before = sqlx::query_scalar::<_, i64>(
+            "select count(*) from themes where key = $1 and removed_at is null",
+        )
+        .bind(key)
+        .fetch_one(db.pool())
+        .await
+        .expect("the count must read");
+        assert_eq!(live_before, 1, "the installed package must be live before the removal");
+
+        let removed = call(
+            &state,
+            request(
+                Method::DELETE,
+                &format!("/api/v1/themes/{key}"),
+                Some(&fixture.auth),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(removed.status, StatusCode::OK, "body: {}", removed.body);
+
+        let live_after = sqlx::query_scalar::<_, i64>(
+            "select count(*) from themes where key = $1 and removed_at is null",
+        )
+        .bind(key)
+        .fetch_one(db.pool())
+        .await
+        .expect("the count must read");
+        assert_eq!(
+            live_after, 0,
+            "a removal answered 200 and left the row live: the platform would keep offering a \
+             theme whose stored package was deleted"
+        );
+
         Ok(())
     })
     .await

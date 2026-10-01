@@ -250,6 +250,7 @@ pub async fn install_package(
         &report,
         &package,
         &storage_key,
+        current.user.organization_id,
         Some(current.user.id),
     )
     .await?;

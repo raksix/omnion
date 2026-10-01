@@ -733,6 +733,7 @@ pub async fn install_package(
     report: &PackageReport,
     package: &Value,
     storage_key: &str,
+    organization_id: Option<Uuid>,
     user_id: Option<Uuid>,
 ) -> Result<InstallOutcome> {
     if !report.valid {
@@ -746,21 +747,33 @@ pub async fn install_package(
         .unwrap_or_else(|| json!({}));
     let checksum = package_checksum(package);
 
-    // `storage_key` is not optional bookkeeping, it is the schema's own rule: an uploaded
-    // theme whose package is not stored would be a row claiming a theme that exists nowhere
-    // else, so `themes_upload_storage_check` refuses it. Passing a key the caller invented
-    // would satisfy the constraint while pointing at nothing, so the key travels in from the
-    // route that wrote the bytes.
+    // `organization_id` travels in from the caller and is NEVER invented here.
+    //
+    // It used to be a literal `null`, and that one column is the whole tenancy of this table:
+    // the gallery filters on `(organization_id is null or organization_id = $2)`, where the
+    // `is null` arm means **"the platform ships this file"** — it is how the bundled loader
+    // seeds its ten. An upload that also stored `null` therefore (a) listed one tenant's
+    // package in every other tenant's gallery, and (b) matched NO row in `remove_theme`'s
+    // org-scoped UPDATE, so a DELETE answered 200 and changed nothing while the route went
+    // on to delete the stored package bytes — leaving a live, activatable theme whose manifest
+    // points at an object that no longer exists. One hard-coded `null`, two defects, and the
+    // schema comment that says `null` = bundled was true the whole time.
+    //
+    // `source = 'uploaded'` is the other half of the same distinction and is set here, so the
+    // two must be read together: a bundled row is a file with no owner, an uploaded row is
+    // code belonging to the organization that uploaded it.
     sqlx::query(
         "insert into themes (organization_id, key, name, version, source, manifest, checksum, \
                              storage_key, installed_by, installed_at) \
-         values (null, $1, $2, $3, 'uploaded', $4, $5, $6, $7, now()) \
+         values ($1, $2, $3, $4, 'uploaded', $5, $6, $7, $8, now()) \
          on conflict (key) where removed_at is null do update \
              set name = excluded.name, version = excluded.version, manifest = excluded.manifest, \
                  checksum = excluded.checksum, storage_key = excluded.storage_key, \
+                 organization_id = excluded.organization_id, \
                  installed_by = excluded.installed_by, \
                  installed_at = excluded.installed_at, removed_at = null",
     )
+    .bind(organization_id)
     .bind(&report.theme_key)
     .bind(&report.name)
     .bind(&report.version)
@@ -780,27 +793,46 @@ pub async fn install_package(
 
 /// Remove an uploaded theme.
 ///
-/// Three refusals, and each one is a rule rather than a guard rail: a **bundled** theme can
-/// never be deleted (it is a file, not a row), the **active** theme can never be deleted (the
-/// site would have nothing to render), and a theme that some site still holds layouts for
-/// cannot either (those layouts are the only copy of the work). The order matters: the source
-/// check comes first so a bundled theme answers "bundled", not "active", when both are true.
+/// Four refusals, and each one is a rule rather than a guard rail: a **bundled** theme can never
+/// be deleted (it is a file, not a row), a theme belonging to **another organization** can never
+/// be deleted (an upload is a tenant's code), the **active** theme can never be deleted (the
+/// site would have nothing to render), and a theme that some site still holds layouts for cannot
+/// either (those layouts are the only copy of the work).
+///
+/// The order matters twice over. The source check comes first, so a bundled theme answers
+/// "bundled" rather than "active" when both are true; and the ownership check comes **before**
+/// the in-use check, because "this belongs to somebody else" is the answer an operator needs
+/// and "a site still renders with it" would send them looking for a site they do not own.
+///
+/// The scope check also replaces what used to be here. The UPDATE was org-scoped and its row
+/// count was ignored, so a stranger's key matched zero rows, the function answered `Ok(())`,
+/// and the caller deleted the stored package bytes anyway — a successful removal that removed
+/// nothing, on a theme that then stayed live in the table pointing at an object that was gone.
+/// Comparing `organization_id` in Rust first is what makes that answer impossible rather than
+/// merely unlikely.
 pub async fn remove_theme(
     pool: &PgPool,
     theme_key: &str,
     organization_id: Option<Uuid>,
 ) -> Result<()> {
-    let source: Option<String> = sqlx::query_scalar(
-        "select source from themes where key = $1 and removed_at is null",
-    )
-    .bind(theme_key)
-    .fetch_optional(pool)
-    .await?;
-    let Some(source) = source else {
+    let row: Option<(String, Option<Uuid>)> =
+        sqlx::query_as("select source, organization_id from themes where key = $1 and removed_at is null")
+            .bind(theme_key)
+            .fetch_optional(pool)
+            .await?;
+    let Some((source, owner)) = row else {
         return Err(ContentError::ThemeNotFound(theme_key.to_owned()));
     };
     if source == "bundled" {
         return Err(ContentError::ThemeBundledCannotBeRemoved(theme_key.to_owned()));
+    }
+    // An account with no organization of its own is a platform owner, and may remove any
+    // upload — the same rule `gallery` applies when it shows every bundled theme to an
+    // organization-less account. An account that HAS an organization may remove only its own.
+    if let (Some(org), Some(owner)) = (organization_id, owner) {
+        if org != owner {
+            return Err(ContentError::ThemeNotFound(theme_key.to_owned()));
+        }
     }
 
     let in_use: Option<Uuid> = sqlx::query_scalar(
@@ -813,19 +845,17 @@ pub async fn remove_theme(
         return Err(ContentError::ThemeInUse(theme_key.to_owned()));
     }
 
-    if let Some(org) = organization_id {
-        sqlx::query("update themes set removed_at = now() \
-                    where key = $1 and organization_id = $2 and source = 'uploaded'")
-            .bind(theme_key)
-            .bind(org)
-            .execute(pool)
-            .await?;
-    } else {
-        sqlx::query("update themes set removed_at = now() \
-                    where key = $1 and source = 'uploaded'")
-            .bind(theme_key)
-            .execute(pool)
-            .await?;
+    let removed = sqlx::query("update themes set removed_at = now() \
+                    where key = $1 and source = 'uploaded' and removed_at is null")
+        .bind(theme_key)
+        .execute(pool)
+        .await?;
+    // The row count is the LAST line that can still catch a removal that removed nothing, and
+    // it is read rather than assumed: the caller deletes the stored package bytes the moment
+    // this returns, so a silent zero here is the difference between a clean uninstall and a
+    // theme row with no package behind it.
+    if removed.rows_affected() == 0 {
+        return Err(ContentError::ThemeNotFound(theme_key.to_owned()));
     }
     Ok(())
 }
