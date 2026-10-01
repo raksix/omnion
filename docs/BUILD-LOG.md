@@ -8434,3 +8434,27 @@ walkthrough extension is owed.
 **Next.** Run `QA_STACK=w7 QA_API_PORT=18086 QA_ADMIN_PORT=3106 QA_WEB_PORT=3206 QA_ONLY=ai
 bash scripts/qa/run.sh` when the slot frees. Then REQ-100 (workspace + the closing gate),
 REQ-105, REQ-106, REQ-107, REQ-108.
+
+## tick 50 — REQ-105 slice 1 (commit 602531b0, pushed)
+
+- **What** — `crates/ai-hub/src/guard_data.rs`: the data guard's pure half. The label/action/
+  validator vocabularies, a compiled `Rule`, the `Detector` that every provider call passes
+  through, the organization `Policy`, exemptions, `mask_text`/`remap_text`, the salted value hash
+  and the rule budget. `regex` is now a workspace dependency (it was in the local cargo cache
+  from another writer, so the offline build is fine). 21 new unit tests.
+- **Proof** — `cargo test -p omnion-ai-hub --quiet`: **564 passed, 0 failed** (was 543).
+  `pnpm typecheck` (apps/admin) clean.
+- **The test that went red was the finding.** `an_exemption_narrows_one_label_and_leaves_the_
+  others` asserted that a feature-scoped exemption releases a `block`. The code deliberately
+  does not let an exemption switch a `block` off, so the test failed on a correct
+  implementation. A test written against a rule the code refuses to have is a description of a
+  wish, not a gate; the walk now asserts the `mask` case (which is what the REQ criterion's
+  literal shape is about) and the block case is its own separate test.
+- **Next** — REQ-105 slice 1's other halves: the migration (`0210_ai_guard.sql`, taken above the
+  all-worktree high-water of 0207), the store, the `403 ai_guard_blocked` checkpoint on the chat
+  route, the stub-provider walk that proves a blocked payload never reaches the network, and
+  `/ai/guard` + `/ai/guard/rules`.
+- **ENV** — the QA slot was held by a LIVE w6 pass all tick (pid 480310, cwd w6). The w7 pass is
+  queued behind it (`QA_SLOT_WAIT=5400`) rather than run beside it. Reclaimed 0.72G of my own
+  /dev/shm/w7-target (724 duplicate rlib/rmeta siblings, keeping the newest of each name) —
+  4.6G -> 3.9G, tmpfs 97% -> 94%.
