@@ -9935,3 +9935,59 @@ nav links, and `/qa-sample` 404 because a scoped pass never publishes the sample
 
 **Next.** The `/cdn/settings` nav `click-error`s and the transient 500, then the environments
 scoped pass, which has a wizard URL to drive at 390px since tick 85.
+
+---
+
+## 2026-10-01 · tick 87 · REQ-011 (wave 5) — the CDN pass's 3 `click-error`s were a real defect in the shell, not the CDN
+
+**What.** The tick-86 scoped pass left three `click-error`s on `/cdn/settings`, on the
+navigation links `Sessions`, `Devices` and `Search settings`, and this tick they are not the
+pass's arithmetic. They are a product defect in the panel frame every screen sits in, and the
+CDN screens were simply where the pass happened to notice it.
+
+**The frame.** `app-shell.tsx` renders the sidebar as `<div className="sticky top-0 h-screen">`
+— exactly one viewport tall — and the navigation list inside it as a plain flex column with no
+`overflow`. `h-full` on a flex column **clips** what does not fit and offers no way to reach it.
+With ~34 entries (wave 1's panels, then the identity/access shelves added by REQ-006 and
+REQ-065) the list needs ~1300px of a 900px viewport, and the last three links sit roughly 400px
+below the fold: rendered, in the DOM, correct in a screenshot, and **permanently unclickable**.
+
+**Why the earlier ticks called it a harness or a box problem.** The pass ran at 900px for the
+first time on this screen and reported exactly the three hrefs that fall past the fold; the
+screenshot of the same moment shows a perfectly normal sidebar with nothing overlapping it. A
+screenshot cannot measure reachability, so the finding read as "the harness raced itself" and
+"the box was under pressure" — and the box *was* under pressure, which is a third true thing
+sitting next to the bug. The discriminator is cheap and was available from the first report:
+the three names are the **last three in the list**, and a timing problem does not sort.
+
+**The fix.** The list scrolls; the brand above it and the account block below it do not:
+`min-h-0 flex-1 overflow-y-auto overscroll-contain` on the `<nav>`. `min-h-0` is load-bearing —
+a flex child defaults to `min-height: auto` and would refuse to shrink, so `overflow-y-auto`
+would never engage and the change would look right in review and do nothing.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `pnpm typecheck` | **2/2** |
+| `node --check scripts/qa/probe-sidebar-reach.cjs` | clean |
+| `scripts/qa/probe-sidebar-reach.cjs` — **before** (`HEAD~1`) | **2/5** — `overflow-y: visible`, content `1102px` in `1102px` (clipped, not scrollable), **3 unreachable**: `Sessions`, `Devices`, `Search settings` |
+| `scripts/qa/probe-sidebar-reach.cjs` — **after** (live w5 stack, 1440×900) | **5/5** — `overflow-y: auto`, content `1102px` in `684px`, 28/28 clicked, sign-out stays in frame |
+
+The before run is the interesting half: the two halves of the same probe, one commit apart,
+disagree about the same three links and nothing else. `content 1102px in 1102px` is the finding
+in one number — the list is exactly as tall as its own content inside a frame that is not tall
+enough, which is what "clipped" means mechanically. The admin log for the after run shows
+`GET /settings/iam/sessions 200`, `GET /settings/iam/devices 200`, `GET /settings/search 200`.
+
+**The probe clicks; it does not count.** "Rendered" and "reachable" are different properties and
+only a click measures the second, so the probe clicks every navigation link and navigates back
+between them. `scrollIntoViewIfNeeded` is deliberately *not* allowed to stand in for the click:
+it would exercise the Playwright API and report the bug green. The count version of this probe
+is what several ticks reasoned with, and it cannot see this class at all.
+
+**Next.** The `/qa-sample` 404 (`web-page` high finding) — a scoped pass walks no page-creation
+pass, so the public renderer is asked about a page nothing published; and the transient 500 on
+the *first* `/cdn/rules` navigation, which the API log never logged at all and which the admin
+log attributes to nothing since the 22:35 disk-full crash. Then the environments scoped pass,
+which has a wizard URL to drive at 390px since tick 85.

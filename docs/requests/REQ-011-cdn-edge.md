@@ -321,9 +321,34 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   pass names which button was short rather than only that one was. The box stays open.
 
 - [ ] The CDN screens pass the browser walkthrough with zero high findings.
-  _Blocked on the same missing run, and on the box rather than on the CDN code. `free -g` during
-  the tick-77 pass: 32 G RAM with 0 free and 25 G of swap in use, six writers compiling at once,
-  which made Chromium fail to fetch `/_next/static/chunks/*` with `ERR_INSUFFICIENT_RESOURCES`._
+  _**Tick 87: the three `click-error`s this box was waiting on were a real defect in the panel
+  frame, not the CDN and not the box.** `/cdn/settings` failed on the navigation links
+  `Sessions`, `Devices` and `Search settings`. `app-shell.tsx` renders the sidebar as
+  `sticky top-0 h-screen` — one viewport tall — around a flex list with **no `overflow`**, so
+  `h-full` clips what does not fit and offers no way to reach it. The probe measures 28 links
+  needing 1102px inside a 684px frame, and those three names are **the last three in the
+  list**: a race with the pass's own re-inventory does not sort, and that was the story several
+  ticks told instead, because the file contains a real `navigated-away` branch for it.
+
+  Nothing about it is visible. The screenshot of the failing moment shows an ordinary sidebar
+  with no overlay and no backdrop, and the vision pass has no way to see a control that is
+  rendered, positioned, in the DOM, and cannot be clicked. Fixed by making the list the
+  scrolling part and the brand and the account block the fixed parts
+  (`min-h-0 flex-1 overflow-y-auto overscroll-contain` — `min-h-0` is load-bearing, since a flex
+  child defaults to `min-height: auto` and would keep the list clipped *with* a scrollbar's
+  appearance). Proven both ways against the live w5 stack at 1440×900: with the fix,
+  `scripts/qa/probe-sidebar-reach.cjs` is **5/5** and the admin log shows
+  `GET /settings/iam/sessions`, `/settings/iam/devices` and `/settings/search` all answering
+  `200`; against `HEAD~1` the same probe reports the three as unreachable. The probe **clicks**
+  every link rather than counting them, and `scrollIntoViewIfNeeded` is deliberately not allowed
+  to stand in for the click — it would scroll for the probe and report the bug green.
+
+  The box stays open, and the two findings still standing are named rather than waved at: the
+  `/qa-sample` 404 (a scoped pass walks no page-creation pass, so the public renderer is asked
+  about a page nothing published — a harness scoping question, not a CDN one) and the transient
+  `500` on the *first* `/cdn/rules` navigation, which the API log never logged at all and the
+  admin error log has not written since the 22:35 disk-full crash, so neither log has evidence
+  for it yet either way._
 
 ### QA plan
 
