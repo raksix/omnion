@@ -2145,6 +2145,290 @@ async function runAiStatesDepth(page, report) {
 
 
 /**
+ * The air-gap switch, driven (REQ-106, slice 2).
+ *
+ * The route walk above only proves the screen *renders* in its resting state, which for a
+ * compliance switch is the least interesting thing about it. This pass asks the questions that
+ * matter, in the order an operator would:
+ *
+ *   1. Does the confirmation sheet refuse to submit while the reason is short? The button is
+ *      `disabled` while `onBlocked` is set — an assertion that a **disabled** button stays disabled
+ *      is what makes it a gate, because a sheet that only *warns* is a sheet that can be clicked
+ *      through by anyone in a hurry, and the API's own check is the second line of defence behind
+ *      this one, not the first.
+ *   2. Does a real reason + the typed phrase actually flip the switch, and does the banner appear?
+ *   3. Does the OFF direction skip the reason entirely — the asymmetry the store's docs call out
+ *      as the reason the control can be trusted?
+ *
+ * And it leaves the database as it found it. **The flip is restored in a `finally`,** because a
+ * harness that leaves the air gap ON makes every later pass read a banner, refuse a chat and
+ * measure a screen in an emergency state — the failure would surface as a dozen unrelated findings
+ * in a report written by a different writer, and nobody would connect them to this pass.
+ */
+async function runAirgapDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-airgap", action: "airgap", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    return false;
+  };
+
+  // The API is called directly for setup and teardown rather than through the UI, so the assertions
+  // stay about what the *screen* does. Driving the restore through the UI would mean a failing
+  // assertion could also fail to restore.
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  await page
+    .goto(`${URL_ADMIN}/ai/settings/airgap`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector("[data-airgap-settings]", { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator("[data-airgap-settings]").count()) > 0;
+  note({ step: "load", rendered });
+  if (!rendered) return { ok: false, reason: "the air-gap screen did not render" };
+
+  // --- the resting state ------------------------------------------------------------------
+  // A fresh QA database has the gap OFF and no allow-list. Both must read as deliberate states, not
+  // as blanks: an empty allow-list says loopback and private ranges still count, which is the
+  // sentence that stops an operator from reading "no hosts" as "nothing is local".
+  const resting = await page.evaluate(() => ({
+    state: (document.querySelector("[data-airgap-state]")?.textContent || "").trim(),
+    hostsEmpty: document.querySelectorAll("[data-airgap-hosts-empty]").length,
+    nothingBlocked: document.querySelectorAll("[data-airgap-nothing-blocked]").length,
+    banner: document.querySelectorAll("[data-airgap-banner]").length,
+    verifyResult: document.querySelector("[data-airgap-verify-result]")?.getAttribute("data-result"),
+    verifyText: (document.querySelector("[data-airgap-verify-result]")?.textContent || "").trim(),
+  }));
+  expect(resting.state === "Off", `the gap should read Off in a fresh database, saw "${resting.state}"`);
+  expect(
+    resting.hostsEmpty === 1,
+    "an empty allow-list must explain that loopback and private ranges still count",
+  );
+  expect(resting.nothingBlocked === 1, "with no provider registered the screen must say nothing is refused");
+  expect(resting.banner === 0, "no banner may show while the gap is off — it would train operators to ignore it");
+  expect(
+    resting.verifyResult === "never" && /never verified/i.test(resting.verifyText),
+    "an unrun verification must read as never verified, never as a pass",
+  );
+  note({ step: "resting", ...resting });
+
+  // --- the confirmation refuses a short reason ---------------------------------------------
+  await page.click("[data-airgap-toggle]").catch(() => {});
+  await page.waitForSelector("[data-airgap-confirm]", { timeout: 5000 }).catch(() => {});
+  const sheetOpen = (await page.locator("[data-airgap-confirm]").count()) > 0;
+  note({ step: "sheet", sheetOpen });
+  expect(sheetOpen, "the confirmation sheet did not open");
+
+  const shortReasonDisabled = await page.evaluate(() => {
+    const button = document.querySelector("[data-airgap-confirm-submit]");
+    return button ? button.disabled : null;
+  });
+  expect(
+    shortReasonDisabled === true,
+    "the confirm button must be disabled while the reason is empty — the server check is the second line of defence, not the first",
+  );
+  note({ step: "empty-reason-disabled", shortReasonDisabled });
+
+  // A nine-character reason is still short. The boundary is REASON_MIN = 10 and the screen has to
+  // refuse it *before* the API does, or the operator's first attempt is a round trip and a red
+  // banner rather than a live hint under the field.
+  await page.fill("[aria-label='Reason for turning the air gap on']", "too short").catch(() => {});
+  await page.waitForTimeout(200);
+  const nineCharDisabled = await page.evaluate(() => {
+    const button = document.querySelector("[data-airgap-confirm-submit]");
+    const hint = document.querySelector("[data-airgap-confirm-blocked]");
+    return { disabled: button ? button.disabled : null, hint: (hint?.textContent || "").trim() };
+  });
+  expect(
+    nineCharDisabled.disabled === true,
+    "a nine-character reason must not enable the confirm button (REASON_MIN is 10)",
+  );
+  note({ step: "short-reason", ...nineCharDisabled });
+
+  // A real reason alone is still not enough while providers would block — the acknowledgement and
+  // the typed phrase are separate gates. With an empty provider list the typed phrase is the last
+  // one standing, which is the assertion that keeps this from being a rubber stamp.
+  await page
+    .fill("[aria-label='Reason for turning the air gap on']", "QA depth pass, restoring afterwards")
+    .catch(() => {});
+  await page.waitForTimeout(200);
+  const typedMissingDisabled = await page.evaluate(() => {
+    const button = document.querySelector("[data-airgap-confirm-submit]");
+    return button ? button.disabled : null;
+  });
+  expect(
+    typedMissingDisabled === true,
+    "a valid reason alone must not enable the confirm button — the type-to-confirm is the last gate",
+  );
+
+  await page.fill("[aria-label='Type to confirm']", "TURN THE AIR GAP ON").catch(() => {});
+  await page.waitForTimeout(200);
+  const readyDisabled = await page.evaluate(() => {
+    const button = document.querySelector("[data-airgap-confirm-submit]");
+    return button ? button.disabled : null;
+  });
+  expect(readyDisabled === false, "reason + typed phrase must enable the confirm button");
+  note({ step: "ready", readyDisabled });
+
+  // --- flip it for real --------------------------------------------------------------------
+  await page.click("[data-airgap-confirm-submit]").catch(() => {});
+  await page.waitForSelector("[data-airgap-banner]", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const flipped = await page.evaluate(() => ({
+    banner: document.querySelectorAll("[data-airgap-banner]").length,
+    tone: document.querySelector("[data-airgap-banner]")?.getAttribute("data-tone"),
+    state: (document.querySelector("[data-airgap-state]")?.textContent || "").trim(),
+    reason: (document.querySelector("[data-airgap-reason]")?.textContent || "").trim(),
+    // No local endpoint is registered in a fresh QA database, so the screen owes the operator a
+    // warning rather than a green "all good" — the gap is on and nothing can answer.
+    noLocal: document.querySelectorAll("[data-airgap-no-local]").length,
+  }));
+  expect(flipped.banner === 1, "the banner must appear once the gap is on");
+  expect(flipped.tone === "blocked", `the banner tone must be blocked, saw "${flipped.tone}"`);
+  expect(flipped.state === "On", "the state must read On after the flip");
+  expect(
+    flipped.reason.includes("QA depth pass"),
+    "the recorded reason must be readable on the screen — it is the audit row",
+  );
+  expect(flipped.noLocal === 1, "with no local endpoint the screen must warn that nothing can answer");
+  note({ step: "flipped", ...flipped });
+
+  // The API agrees with what the screen drew. A screen showing "On" over a row the API calls off is
+  // the one disagreement that would make the control a decoration.
+  const readBack = await callApi("GET", "/v1/ai/airgap");
+  expect(
+    readBack.status === 200 && readBack.body?.state?.enabled === true,
+    `the API disagrees with the screen: ${JSON.stringify(readBack.body?.state?.enabled)}`,
+  );
+
+  // --- the OFF direction takes no reason ---------------------------------------------------
+  // The asymmetry is the store's rule, and it is why the control can be trusted: an emergency
+  // action that can be blocked by a validation rule fails closed at the worst moment.
+  await page.click("[data-airgap-toggle]").catch(() => {});
+  await page.waitForSelector("[data-airgap-confirm]", { timeout: 5000 }).catch(() => {});
+  const offHasNoReason = await page.evaluate(() => ({
+    reasonField: document.querySelectorAll("[aria-label='Reason for turning the air gap on']").length,
+    offEnabled: (() => {
+      const button = document.querySelector("[data-airgap-confirm-submit]");
+      return button ? !button.disabled : null;
+    })(),
+  }));
+  expect(
+    offHasNoReason.reasonField === 0,
+    "the OFF sheet must not ask for a reason — it would hide an emergency action behind a field",
+  );
+  expect(
+    offHasNoReason.offEnabled === true,
+    "the OFF confirm must be enabled immediately — a reason field blocking it is exactly the failure",
+  );
+  note({ step: "off-direction", ...offHasNoReason });
+
+  await page.click("[data-airgap-confirm-submit]").catch(() => {});
+  await page.waitForTimeout(800);
+
+  // --- mobile -----------------------------------------------------------------------------------
+  // The request names the confirmation sheet as a full-screen view with the acknowledgement control
+  // above the fold. 390px is where a dialog written for a desktop breaks: the sheet becomes taller
+  // than the viewport and the submit button drops off the bottom, so the operator is left scrolling
+  // in a modal they opened to press one button.
+  await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+  await page.goto(`${URL_ADMIN}/ai/settings/airgap`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-airgap-settings]", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  const mobileResting = await page.evaluate(() => ({
+    noHorizontalScroll: document.documentElement.scrollWidth <= window.innerWidth + 1,
+  }));
+  expect(
+    mobileResting.noHorizontalScroll === true,
+    "the air-gap screen must not scroll sideways at 390px — the allow-list form is a flex row and will overflow",
+  );
+
+  // Open the sheet at 390px and measure where the submit button actually sits.
+  await page.click("[data-airgap-toggle]").catch(() => {});
+  await page.waitForSelector("[data-airgap-confirm]", { timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const mobileSheet = await page.evaluate(() => {
+    const dialog = document.querySelector("[data-airgap-confirm]");
+    const submit = document.querySelector("[data-airgap-confirm-submit]");
+    if (!dialog || !submit) return { present: false };
+    const box = submit.getBoundingClientRect();
+    return {
+      present: true,
+      // The sheet scrolls (`overflow-y-auto` on the overlay), so "above the fold" is measured as
+      // "reachable without the page scrolling" — a button at y=1200 in a scrollable sheet is not
+      // the failure this checks for; a button outside the overlay's scroll box entirely is.
+      submitInOverlay: dialog.contains(submit),
+      submitWidth: Math.round(box.width),
+      submitTall: box.height >= 32,
+      noHorizontalScroll: document.documentElement.scrollWidth <= window.innerWidth + 1,
+    };
+  });
+  expect(mobileSheet.present === true, "the confirmation sheet must open at 390px");
+  expect(
+    mobileSheet.submitInOverlay === true,
+    "the submit button must be inside the sheet at 390px — a fixed footer that falls outside is unreachable",
+  );
+  expect(
+    mobileSheet.submitTall === true,
+    "the submit button must stay a usable tap target at 390px",
+  );
+  expect(
+    mobileSheet.noHorizontalScroll === true,
+    "the confirmation sheet must not scroll sideways at 390px",
+  );
+  await shot(page, "ai-airgap-confirm-390");
+  note({ step: "mobile", ...mobileResting, sheet: mobileSheet });
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  // --- restore ------------------------------------------------------------------------------
+  // Belt and braces: the OFF sheet above already turned it off, but if any assertion above threw,
+  // this still runs and the next writer does not inherit an air gap. The mobile leg left the ON
+  // sheet open, so `Escape` closes it rather than the pass ending on a modal.
+  await page.keyboard.press("Escape").catch(() => {});
+  const restore = await callApi("PUT", "/v1/ai/airgap", { enabled: false });
+  const finalRead = await callApi("GET", "/v1/ai/airgap");
+  note({
+    step: "restore",
+    status: restore.status,
+    enabled: finalRead.body?.state?.enabled ?? null,
+  });
+  expect(
+    finalRead.body?.state?.enabled === false,
+    "the pass must leave the air gap off — a harness that leaves it on poisons every later pass",
+  );
+
+  return {
+    ok: findings.length === 0,
+    steps: steps.length,
+    findings,
+    detail: {
+      ...resting,
+      flipped,
+      mobile: mobileSheet,
+      restored: finalRead.body?.state?.enabled ?? null,
+    },
+  };
+}
+
+
+/**
  * Run one depth pass without letting it end the run.
  *
  * A depth pass is a question asked of a screen; a screen that answers badly is a finding, and a
@@ -10681,6 +10965,14 @@ async function main() {
     report.aiStates = await runDepthPass("ai-states", () => runAiStatesDepth(page, report));
   }
   log(`ai providers: ${JSON.stringify(report.aiProviders)}`);
+
+  // The air-gap switch, driven (REQ-106 slice 2). It flips the switch for real and restores it, so
+  // it runs after the providers pass (which assumes a working remote default) and before anything
+  // that reads a chat.
+  if (inScope("ai")) {
+    report.aiAirgap = await runDepthPass("ai-airgap", () => runAirgapDepth(page, report));
+  }
+  log(`ai airgap: ${JSON.stringify(report.aiAirgap)}`);
 
   // The agent runtime's own pass (REQ-099, slice 1): a key the API refuses **in its field**,
   // a real agent with a permitted tool and an approval-gated one, the list reading the tool
