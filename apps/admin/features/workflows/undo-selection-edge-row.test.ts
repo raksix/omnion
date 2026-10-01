@@ -126,6 +126,110 @@ test("the row presses the gesture it is measuring", () => {
   );
 });
 
+test("the undo is read after the WRITE lands, not after a timer that happens to match it", () => {
+  // **TICK 62'S FINDING: the same defect tick 61 removed from `run-from-here`, in the one
+  // place that tick could not reach, and it is worse here for a reason nobody would guess.**
+  //
+  // The row was:
+  //
+  //     await page.keyboard.press("Control+z");
+  //     await page.waitForTimeout(1200);
+  //     const edgesAfterUndo = (await readGraph())?.edge_count ?? 0;
+  //
+  // `AUTOSAVE_MS` in `builder-view.tsx` is **1_200**. The wait is not a loose guess at how long
+  // a save takes — it is a guess sitting EXACTLY ON the debounce boundary, so the row races the
+  // write it is measuring and the verdict is decided by which side of a timer the autosave
+  // lands on. `edgeRemovedByUndo` is then `false` on a rule whose undo removed the connection
+  // perfectly, and the row goes on to report a selection that was never pruned by a product
+  // that never failed.
+  //
+  // **The obvious fix is wrong, and that is the part worth keeping.** Polling `edge_count` for
+  // stability is satisfied immediately: a graph whose debounce has not fired is *stable*. Two
+  // identical readings of a count prove only that nothing has changed — which is precisely the
+  // state the wait exists to rule out. `settleRun` does not have this hole because it waits for
+  // a run to stop MOVING after having observed it start, so a run that never starts is the
+  // failure it reports rather than a success. `settleGraph` therefore takes the *witness* of a
+  // write: `graph_version` is advanced by every write, so two identical readings of the
+  // VERSION cannot happen until the write has landed.
+  assert.ok(
+    /const undoWrite = await settleGraph\(page, readGraph, edgesVersionBeforeUndo\)/.test(ROW),
+    "the undo must be read after the server says the write landed; a fixed wait races the autosave",
+  );
+  // …and the fixed wait must be GONE from this block, named exactly. It is not merely
+  // unnecessary: 1200 is the boundary itself, so leaving it in place beside the poll would
+  // make the row report the earlier of the two readings and the poll a decoration.
+  assert.ok(
+    !/await page\.waitForTimeout\(\s*\d+\s*\)/.test(ROW),
+    "a fixed delay here is wrong in the same direction every time and only on a loaded box",
+  );
+  // The witness has to be the version the row read BEFORE the gesture. Handing the helper a
+  // version read after the keypress is the same defect wearing a new name: nothing to move
+  // away from, so `changed` is true on any write at all, including an unrelated one.
+  assert.ok(
+    /const edgesVersionBeforeUndo = edgesGraphBeforeUndo\?\.graph_version \?\? 0/.test(ROW),
+    "the version to move away from must be read before the gesture, or any write will do",
+  );
+  // **THE SAME DEFECT ON THE OTHER SIDE OF THE SAME GESTURE, and the `!waitForTimeout`
+  // assertion above is what caught it.** The row clicked the arc and waited a fixed 500ms
+  // before reading the selection. That wait cannot tell a click that MISSED from a click that
+  // landed on a canvas that had not repainted — both read `edgeWasSelected: false`, and this
+  // row then reports two different verdicts for one state: a miss note on one branch and a
+  // prune assertion on the other. So the wait is a poll for the POSITIVE condition, bounded,
+  // and it says out loud when the selection never appeared.
+  assert.ok(
+    /const edgeSelectionWait = await awaitEdgeSelection\(page\)/.test(ROW),
+    "the click must be waited for as a GESTURE; a fixed delay reads a missed click and an unrepainted canvas as the same thing",
+  );
+  // And a helper whose only answer is "settled" is wrong here in the mirror-image way: nothing
+  // has been written yet, so there is no movement to witness and the honest answer is "did it
+  // appear, and how long did it take".
+  const selHelperStart = WALKTHROUGH.indexOf("async function awaitEdgeSelection(");
+  assert.ok(selHelperStart !== -1, "the selection wait helper must exist");
+  const selHelper = WALKTHROUGH.slice(
+    selHelperStart,
+    WALKTHROUGH.indexOf("async function interact(", selHelperStart),
+  );
+  assert.ok(
+    /appeared: false/.test(selHelper),
+    "a selection that never appeared reported as arrived is the miss defect with the sign flipped",
+  );
+  // `settleGraph` itself: stability alone is not the stop condition.
+  const helperStart = WALKTHROUGH.indexOf("async function settleGraph(");
+  // Bounded at the NEXT helper, not at `interact`. `settleGraph` is not the last helper in
+  // that gap — `awaitEdgeSelection` follows it — and a window that spans both is satisfied by
+  // a sibling's `settled: false`. That is not a hypothetical: the identical bug appeared in
+  // `run-from-here-row.test.ts` the moment tick 62 added these helpers, and the mutation that
+  // reports a hung run as settled went STILL GREEN against it.
+  const helperEnd = WALKTHROUGH.indexOf("async function awaitEdgeSelection(", helperStart);
+  assert.ok(helperStart !== -1 && helperEnd > helperStart, "the settle helper must exist");
+  const helper = WALKTHROUGH.slice(helperStart, helperEnd);
+  assert.ok(
+    /current\.state === previous && Number\(previous\) !== Number\(versionBefore\)/.test(helper),
+    "an unwritten graph is STABLE: without the version witness this helper returns settled on the first poll, which is the state it exists to rule out",
+  );
+  assert.ok(
+    /settled: false/.test(helper),
+    "a write that never arrived reported as settled is `run-from-here`'s defect one level over",
+  );
+});
+
+test("the note says whether the write arrived, so an unread graph cannot read as green", () => {
+  // The gates under it — `edgeRemovedByUndo`, `edgeSelectionPruned` — are measured off a graph
+  // the autosave writes. Without this field a reader cannot tell a row that was measured after
+  // a real write from one that was measured against a graph nobody has committed, and the two
+  // look identical in every other field. Same one-switch rule as `runSettled` and
+  // `rowIsMeasurable`: a conjunction nobody can hold under time pressure is how a vacuous gate
+  // gets closed.
+  assert.ok(
+    /\bwriteSettled:\s*undoWrite\.settled/.test(READ_NOTE),
+    "a note that cannot say 'the write never arrived' reports a mid-flight read as a verdict",
+  );
+  // The version pair is the evidence for it: `writeSettled: true` is a claim about a write, and
+  // a claim about a write without the version it moved is an assertion.
+  assert.ok(/\bversionBefore:/.test(READ_NOTE), "the reading must report the version it left");
+  assert.ok(/\bversionAfter:/.test(READ_NOTE), "and the version it found");
+});
+
 test("the point is COMPUTED from the stroke, not merely guarded on it", () => {
   // A bezier's bounding box is the rectangle AROUND the arc, so a bounding-box click lands
   // on the desk — where the canvas handler correctly clears the selection, so the row would

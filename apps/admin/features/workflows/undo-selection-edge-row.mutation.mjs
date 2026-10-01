@@ -52,9 +52,42 @@ const rowWindow = (source) => {
 /** Every mutation: a name, a find, and a replace — all inside the row window. */
 const MUTATIONS = [
   {
-    name: "M1 the keypress is gone — the row reads the state it started in",
-    find: 'await page.keyboard.press("Control+z");\n    await page.waitForTimeout(1200);\n    const edgesAfterUndo',
-    replace: "const edgesAfterUndo",
+    // TICK 62: this target was the OLD row — `press`, then a fixed 1200ms, then the read.
+    // The fixed wait is gone (it was `AUTOSAVE_MS`, so the row raced the write it measured),
+    // so this mutation had to be REWRITTEN rather than relaxed. A harness whose guard fires on
+    // a stale target is doing its job: it refused to mutate anything and named the string it
+    // could not find, instead of silently passing a find/replace that matched nothing.
+    name: "M1 the gesture is gone — the row reads the state it started in",
+    find: 'await page.keyboard.press("Control+z");\n    const undoWrite',
+    replace: "const undoWrite",
+  },
+  {
+    name: "M13 the undo is read after a fixed wait again — the row races the autosave",
+    find: "const undoWrite = await settleGraph(page, readGraph, edgesVersionBeforeUndo);",
+    replace:
+      "const undoWrite = { graph: await readGraph(), settled: true, changed: true };\n    await page.waitForTimeout(1200);",
+  },
+  {
+    name: "M14 the helper settles on STABILITY alone — an unwritten graph is stable, so it returns on the first poll",
+    global: true,
+    find: "if (current.state === previous && Number(previous) !== Number(versionBefore)) {",
+    replace: "if (current.state === previous) {",
+  },
+  {
+    name: "M15 the version witness is read AFTER the gesture, so any write at all counts",
+    find: "const edgesVersionBeforeUndo = edgesGraphBeforeUndo?.graph_version ?? 0;",
+    replace: "const edgesVersionBeforeUndo = 0;",
+  },
+  {
+    name: "M16 the write that never arrived can no longer be said out loud",
+    find: "writeSettled: undoWrite.settled,",
+    replace: "writeSettled: true,",
+  },
+  {
+    name: "M17 the click is waited for with a timer again — a miss and an unrepainted canvas read alike",
+    find: "const edgeSelectionWait = await awaitEdgeSelection(page);",
+    replace:
+      "await page.waitForTimeout(500);\n    const edgeSelectionWait = { selected: 0, appeared: true, attempts: 1 };",
   },
   {
     name: "M2 the click aims at the bounding box — the edge-delete probe defect",
@@ -140,7 +173,19 @@ const original = readFileSync(WALKTHROUGH, "utf8");
 copyFileSync(WALKTHROUGH, BACKUP);
 
 /** Replace inside the row window only, and prove the window is the expected one. */
-const mutate = (find, replace) => {
+const mutate = (find, replace, mutation) => {
+  // A `global` mutation targets a HELPER, which by construction sits outside every row window —
+  // the same problem `run-from-here-row.mutation.mjs` solved with a named second window, except
+  // that a helper has no window to name and no second occurrence to land on. The escape is
+  // explicit and declared per mutation rather than inferred, so a stale `global` cannot quietly
+  // start rewriting the first match somewhere else.
+  if (mutation?.global) {
+    assert.ok(
+      original.includes(find),
+      `a global mutation target is not in the file at all, so it would be a no-op: ${find.slice(0, 60)}`,
+    );
+    return original.replace(find, replace);
+  }
   const { start, end } = rowWindow(original);
   const window = original.slice(start, end);
   assert.ok(
@@ -157,7 +202,7 @@ try {
   console.log("baseline: green");
 
   for (const mutation of MUTATIONS) {
-    writeFileSync(WALKTHROUGH, mutate(mutation.find, mutation.replace));
+    writeFileSync(WALKTHROUGH, mutate(mutation.find, mutation.replace, mutation));
     const result = runSuite();
     writeFileSync(WALKTHROUGH, original);
     if (result.green) {
