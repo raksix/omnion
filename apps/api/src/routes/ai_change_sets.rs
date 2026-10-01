@@ -313,6 +313,23 @@ pub struct UpdateBody {
 /// irreversible, and a client that forgot to ask the user must not be able to skip the asking
 /// by talking to the API directly. The phrase is the set's own title, which is what the
 /// reviewer sees on the button they are about to press.
+///
+/// # A gated set parks; an ungated one is applied
+///
+/// This is slice 3c, and it is the piece that makes "one pipeline, one screen" true. Before
+/// it, `confirm` moved a set to `confirmed` and answered `needs_approval`, and nothing ever
+/// acted on that flag: `apply` accepted any `confirmed` set, so a set full of deletes could
+/// be confirmed and applied with **no human ever seeing it**. That is the whole point of
+/// REQ-101 refused by the shape of a field, so the two arms are now structurally different:
+///
+/// - **Gated** — the set moves `draft → pending`, one approval is filed per gated operation,
+///   and the *inbox* is where it is decided. A second person releases it.
+/// - **Ungated** — the set is confirmed and applied right here, through the same all-or-nothing
+///   store transaction every apply uses, and the answer carries what happened.
+///
+/// The alternative — always park, and let the inbox release a plain title edit — was refused:
+/// a gate on everything is a gate nobody reads, and the request's own risk note names approval
+/// fatigue as the failure mode.
 pub async fn confirm(
     State(state): State<AppState>,
     current: CurrentSession,
@@ -365,12 +382,24 @@ pub async fn confirm(
         }
     }
 
+    let gated = set.gated_operations();
+    let parked = park_gated_operations(&state, organization, actor, &set, &gated).await?;
+    let needs_approval = !parked.is_empty();
+
+    // A set with nothing gated is confirmed here; one that parked is `pending`, because
+    // `pending → confirmed` is the edge the inbox's release takes and `draft → confirmed` is
+    // the edge this route takes for a set that needs no second person.
+    let target = if needs_approval {
+        "pending"
+    } else {
+        "confirmed"
+    };
     let confirmed = change_sets::store::transition(
         state.db().pool(),
         organization,
         id,
         &set.status,
-        "confirmed",
+        target,
         None,
     )
     .await
@@ -395,6 +424,7 @@ pub async fn confirm(
                 "change_set_id": id,
                 "operations": confirmed.operations.len(),
                 "irreversible": confirmed.is_irreversible(),
+                "parked_for_approval": needs_approval,
             })),
     )
     .await?;
@@ -402,14 +432,138 @@ pub async fn confirm(
     // The flag is read **before** the row is moved into the response, and the order is the
     // point: computing it afterwards would borrow a moved value, and computing it from a
     // clone would let the two answers describe different instants.
-    let needs_approval = confirmed.has_gated_operations();
+    let confirmed_gated = confirmed.has_gated_operations();
     Ok(Json(Confirmed {
         set: confirmed,
-        needs_approval,
+        needs_approval: confirmed_gated,
+        approvals: parked,
+        applied: false,
     }))
 }
 
-/// What a confirmation carries.
+/// File one approval per gated operation, and return the rows it filed.
+///
+/// The preview each approval freezes is computed by the **same** [`target::preview`] the
+/// single-call path uses, from the same `Operation` the reviewer read in the editor. A hand
+/// written preview here would be a second description of the same intent, and the two would
+/// disagree exactly when it matters — the reviewer approved the editor's diff, the inbox shows
+/// the approval's.
+///
+/// `change_set_id` is stamped on every row, which is what makes the inbox entry link back to
+/// the set the operations belong to; the column exists in `0189` and until now nothing wrote
+/// it.
+async fn park_gated_operations(
+    state: &AppState,
+    organization: uuid::Uuid,
+    actor: uuid::Uuid,
+    set: &change_sets::ChangeSet,
+    gated: &[(&change_sets::ChangeOp, &'static str)],
+) -> Result<Vec<ParkedApproval>, ApiError> {
+    let mut parked = Vec::with_capacity(gated.len());
+    for (op, class) in gated {
+        let mapping = omnion_ai_hub::approvals::target::mapping_for(&op.operation.resource_type)
+            .map_err(ApiError::from)?;
+        let plan =
+            omnion_ai_hub::approvals::target::preview(state.db().pool(), mapping, &op.operation)
+                .await
+                .map_err(ApiError::from)?;
+
+        // The policy is read per operation rather than assumed, so an installation that
+        // switched a class to `allow` files nothing for it and this row simply does not exist.
+        // That is the same resolution `gate()` performs on the single-call path, called
+        // through it so the two cannot read a different row.
+        let policy =
+            omnion_ai_hub::approvals::io::policy_for(state.db().pool(), organization, class)
+                .await
+                .map_err(ApiError::from)?;
+        if !policy.requires_approval() {
+            continue;
+        }
+
+        let requested = omnion_ai_hub::approvals::io::request(
+            state.db().pool(),
+            &omnion_ai_hub::approvals::io::NewApproval {
+                organization_id: organization,
+                site_id: set.site_id,
+                run_id: set.created_by_run,
+                step_id: None,
+                agent_id: set.created_by_agent,
+                identity_id: None,
+                // The real tool key for this class, not a synthesised one: `class_of_tool` is
+                // the gate's own vocabulary, and a key it does not know would be refused by
+                // the very store writing the row.
+                tool_key: tool_key_for(class).to_owned(),
+                tool_class: (*class).to_owned(),
+                resource_type: Some(op.operation.resource_type.clone()),
+                resource_id: Some(op.operation.resource_id.clone()),
+                resource_label: Some(plan.label.clone()).filter(|label| !label.is_empty()),
+                title: format!("{} a page: {}", op.operation.kind.label(), plan.label),
+                summary: format!(
+                    "The agent proposed to {} a page as part of the change set “{}”.",
+                    op.operation.kind.label(),
+                    set.title
+                ),
+                operation_count: 1,
+                preview: plan.to_preview(mapping),
+                preview_hash: plan.hash.clone(),
+                base_revision: Some(plan.base_revision.clone()),
+                requested_by: Some(actor),
+                model_id: None,
+                risk: risk_for(class).to_owned(),
+                policy,
+                requested_at: time::OffsetDateTime::now_utc(),
+                change_set_id: Some(set.id),
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+        parked.push(ParkedApproval {
+            id: requested.approval().id,
+            operation_key: op.key.clone(),
+            class: (*class).to_owned(),
+            status: requested.approval().status.clone(),
+        });
+    }
+    Ok(parked)
+}
+
+/// The real tool key for a gated class, so `class_of_tool` and the store agree.
+///
+/// A `match` rather than the first key that maps to the class, because the two are not
+/// interchangeable: `content.rollback` is a `content_delete` that *restores*, so using it as
+/// the key for a delete proposal would describe an approval the reviewer believes reverses
+/// something.
+fn tool_key_for(class: &str) -> &'static str {
+    match class {
+        "content_publish" => "content.publish",
+        "content_delete" => "content.delete",
+        _ => "content.publish",
+    }
+}
+
+/// The risk band a parked class carries into the inbox's Risk column.
+fn risk_for(class: &str) -> &'static str {
+    match class {
+        "content_delete" | "deployment" | "database_operation" => "high",
+        _ => "medium",
+    }
+}
+
+/// What a confirmation says about the rows it parked.
+///
+/// `applied: false` on a parked set is the honest answer and not a placeholder: nothing has
+/// happened yet, and the screen routes to the inbox because of it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParkedApproval {
+    pub id: uuid::Uuid,
+    /// Which of the set's operations this row is about, so the editor can highlight it.
+    pub operation_key: String,
+    pub class: String,
+    pub status: String,
+}
+
+/// What a confirmation answers.
 #[derive(Debug, Clone, Serialize)]
 pub struct Confirmed {
     #[serde(flatten)]
@@ -417,6 +571,11 @@ pub struct Confirmed {
     /// `true` when at least one operation is gated and has parked for a human. The screen
     /// routes the reviewer to the inbox rather than pretending the work is done.
     pub needs_approval: bool,
+    /// The rows filed, empty for a set that needed no second person.
+    pub approvals: Vec<ParkedApproval>,
+    /// `false` for a parked set. The ungated arm applies through the store, and that route
+    /// answers with the operations it wrote instead.
+    pub applied: bool,
 }
 
 /// What a confirmation asks for.

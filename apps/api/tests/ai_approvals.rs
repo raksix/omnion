@@ -150,6 +150,7 @@ impl GateStore {
             step_id,
             agent_id: None,
             identity_id: None,
+            change_set_id: None,
             tool_key: "content.publish".to_owned(),
             tool_class: "content_publish".to_owned(),
             resource_type: Some("page".to_owned()),

@@ -47,6 +47,14 @@ pub struct NewApproval {
     pub step_id: Option<Uuid>,
     pub agent_id: Option<Uuid>,
     pub identity_id: Option<Uuid>,
+    /// The change set this request came out of, when a set's gated operation was parked
+    /// instead of run (REQ-101 slice 3c). `None` for the single-call path, which is the
+    /// ordinary case: a run's step parks on its own.
+    ///
+    /// The column has existed since `0189` and nothing wrote it, so every approval in the
+    /// inbox read as though no proposal had produced it — the set a reviewer was deciding came
+    /// from nowhere and the apply had nothing to walk back to.
+    pub change_set_id: Option<Uuid>,
     pub tool_key: String,
     /// The class, resolved by [`class_of_tool`]. Stored because the mapping can grow and a row
     /// that re-derived its class would change meaning under a deployment.
@@ -117,22 +125,7 @@ pub async fn gate(
     let Some(class) = class_of_tool(tool_key) else {
         return Ok(Gate::Ungated);
     };
-    // An organization row wins over the platform default; with neither, [`ClassPolicy::default`]
-    // fails closed.
-    let row: Option<PolicyRow> = sqlx::query_as(
-        "select id, organization_id, tool_class, mode, typed_confirmation, expires_minutes, \
-         updated_by, updated_at from ai_approval_policies \
-         where tool_class = $1 and (organization_id is null or organization_id = $2) \
-         order by organization_id nulls last limit 1",
-    )
-    .bind(class)
-    .bind(organization_id)
-    .fetch_optional(pool)
-    .await?;
-
-    let policy = row
-        .as_ref()
-        .map_or_else(ClassPolicy::default, PolicyRow::policy);
+    let policy = policy_for(pool, organization_id, class).await?;
     if !policy.requires_approval() {
         return Ok(Gate::Ungated);
     }
@@ -146,6 +139,29 @@ pub async fn gate(
         policy,
         requires_confirmation,
     })
+}
+
+/// The policy in force for one class, with an organization row beating the platform default.
+///
+/// Extracted from [`gate`] so a caller that is **not** a tool call — the change-set bridge
+/// (REQ-101 slice 3c), which knows its class from the operation rather than from a tool key —
+/// reads the same row through the same precedence. Two copies of "org row wins, else the
+/// default, else fail closed" is a policy screen that shows one thing and a park that obeys
+/// another.
+pub async fn policy_for(pool: &PgPool, organization_id: Uuid, class: &str) -> Result<ClassPolicy> {
+    let row: Option<PolicyRow> = sqlx::query_as(
+        "select id, organization_id, tool_class, mode, typed_confirmation, expires_minutes, \
+         updated_by, updated_at from ai_approval_policies \
+         where tool_class = $1 and (organization_id is null or organization_id = $2) \
+         order by organization_id nulls last limit 1",
+    )
+    .bind(class)
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .as_ref()
+        .map_or_else(ClassPolicy::default, PolicyRow::policy))
 }
 
 /// Write the request. One row per pending run step: a second request for the same step finds
@@ -179,12 +195,12 @@ pub async fn request(pool: &PgPool, new: &NewApproval) -> Result<Requested> {
 
     let sql = format!(
         "insert into ai_approvals (organization_id, site_id, run_id, step_id, agent_id, \
-         identity_id, tool_key, tool_class, resource_type, resource_id, resource_label, risk, \
-         title, summary, operation_count, irreversible, requires_confirmation, \
-         confirmation_phrase, preview, preview_hash, base_revision, status, requested_by, \
-         model_id, expires_at, created_at) \
+         identity_id, change_set_id, tool_key, tool_class, resource_type, resource_id, \
+         resource_label, risk, title, summary, operation_count, irreversible, \
+         requires_confirmation, confirmation_phrase, preview, preview_hash, base_revision, \
+         status, requested_by, model_id, expires_at, created_at) \
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21, \
-         'pending',$22,$23,$24, now()) \
+         $22, 'pending',$23,$24,$25, now()) \
          on conflict do nothing \
          returning {APPROVAL_COLUMNS}"
     );
@@ -195,6 +211,7 @@ pub async fn request(pool: &PgPool, new: &NewApproval) -> Result<Requested> {
         .bind(new.step_id)
         .bind(new.agent_id)
         .bind(new.identity_id)
+        .bind(&new.change_set_id)
         .bind(&new.tool_key)
         .bind(&new.tool_class)
         .bind(&new.resource_type)
@@ -652,13 +669,9 @@ pub async fn re_preview(pool: &PgPool, organization_id: Uuid, id: Uuid) -> Resul
         )));
     }
 
-    let mapping = super::target::mapping_for(
-        row.resource_type
-            .as_deref()
-            .ok_or_else(|| {
-                AiHubError::InvalidApproval(format!("approval {id} names no resource type"))
-            })?,
-    )?;
+    let mapping = super::target::mapping_for(row.resource_type.as_deref().ok_or_else(|| {
+        AiHubError::InvalidApproval(format!("approval {id} names no resource type"))
+    })?)?;
     let stored = super::plan::Plan::from_preview(&row.preview)?;
     let operation = stored.operation(mapping)?;
     let fresh = super::target::preview(pool, mapping, &operation).await?;
@@ -672,7 +685,9 @@ pub async fn re_preview(pool: &PgPool, organization_id: Uuid, id: Uuid) -> Resul
     //   change ever made the hash collide while the target had moved, the row would still be
     //   refused for a revision that disagrees. Comparing one of the two alone trusts one
     //   invariant; comparing both refuses unless both agree.
-    if fresh.hash == row.preview_hash && fresh.base_revision == row.base_revision.clone().unwrap_or_default() {
+    if fresh.hash == row.preview_hash
+        && fresh.base_revision == row.base_revision.clone().unwrap_or_default()
+    {
         return Ok(RePreview::Unchanged(Box::new(row)));
     }
 
