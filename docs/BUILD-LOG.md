@@ -43,6 +43,16 @@ bare checkout, which is how it was found. Migrated to the shared `support/walk_a
 exists for exactly this (config-side `with_csrf_secret`, `Session::pack`, `apply_credential`,
 `get_all` on the cookies, a `sign_in` budget the six-account fixture needs).
 
+**Suite result, stated honestly.** The full file is `--test-threads=1` and takes 12–15 minutes
+on this box under load 12–18 (six other writers). Run once: **53 passed, 2 failed** in 734 s, and
+both failures were the expired `due_at` below, not these two fixes. After fixing them, the four
+walks that carry this tick's work — the new one plus all three activity walks — run
+**4 passed / 0 failed** together in 95 s. A full-file re-run is the outstanding proof and is
+queued: two further attempts stalled with `utime=0 stime=0` and no PostgreSQL query for minutes at
+a time, which is a harness-level hang under contention, not a failing assertion (each walk passes
+alone and in a batch, and the same 17 in a row pass in 173 s). **Do not read 53/55 as the whole
+file** — the walks after the stall point were not exercised in that run.
+
 **Next:** REQ-051's three browser-only boxes (empty/loading/error, mobile 390×844, keyboard) are
 still unticked and still need a free QA slot — the holder was w8's, live, all tick.
 
