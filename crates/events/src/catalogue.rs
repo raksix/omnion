@@ -448,10 +448,16 @@ catalogue! {
     "security.lockout.released", "security", Live,
     "An operator released an account's brute-force lockout before it expired.",
     [("user_id", Uuid, req)];
-    // `security.lockout.triggered` is NOT here, and the absence is deliberate: the lockout is
-    // applied by `crates/identity`'s own sign-in path, which has no bus handle, and naming a
-    // fact the platform does not record would put it back in the picker as a name that never
-    // fires. It joins the catalogue in the commit that gives the sign-in route an emitter.
+    // `user_id` is the account that was locked, NOT the actor, for the same reason as the
+    // release above, and there is no actor to name here at all: the lock is applied by an
+    // anonymous caller guessing a password. `attempts` is the threshold that fired and
+    // `lockout_minutes` how long it lasts — both are configuration an operator subscribed here
+    // wants, and neither is a credential. What is deliberately absent is the attempted password
+    // and the address: an event bus is a fan-out to third-party receivers, and a brute-force
+    // attempt is exactly the payload nobody should be copying anywhere.
+    "security.lockout.triggered", "security", Live,
+    "An account reached its brute-force threshold and is now locked out.",
+    [("user_id", Uuid, req), ("attempts", Integer, req), ("lockout_minutes", Integer, opt)];
 
     // ---- Tenancy -------------------------------------------------------------------------------
     "site.created", "tenancy", Live,
