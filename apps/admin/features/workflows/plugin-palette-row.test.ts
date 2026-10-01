@@ -56,6 +56,19 @@ const RUST_GRAPH = readFileSync(
   "utf8",
 );
 
+const ROUTES = readFileSync(
+  new URL("../../../../apps/api/src/routes/mod.rs", import.meta.url),
+  "utf8",
+);
+
+const CLIENT_API = readFileSync(
+  // `lib/api.ts` sits under apps/admin, one level up from `features/workflows/` — the first
+  // draft climbed to the repo root and ENOENT'd on a file that exists 1 level down, which is
+  // the same mistake as a wrong API URL: the path is asserted from memory rather than read.
+  new URL("../../lib/api.ts", import.meta.url),
+  "utf8",
+);
+
 /**
  * The row's own source: its banner comment through the note that reports it.
  *
@@ -213,6 +226,43 @@ test("run.sh lets the artifact root move off a full disk", () => {
     WALKTHROUGH,
     /catch \(err\) \{\s*\n\s*log\(`screenshot failed for \$\{name\}: \$\{err\.message\}`\)/,
     "a screenshot that cannot be written must be logged, so a run with no shots is legible",
+  );
+});
+
+test("the row calls a validate route that is actually mounted", () => {
+  // **The second defect this row shipped, and the class is worse than a wrong field name: a URL
+  // that does not exist.** The row asked for `/workflows/{id}/graph/validate`; the mounted route
+  // is `/workflows/{id}/validate` (`mod.rs`), so it got a `404` and reported it as
+  // `saysReEnable: false` — the sentence this row exists to read.
+  //
+  // Asserted three ways, and the third is the one that generalises: the row's own URL must
+  // MATCH a route the API mounts, must MATCH what the client calls, and must MATCH what the rest
+  // of this same walkthrough calls. **A file that already knew the right answer 10,000 lines
+  // above is the finding** — so the third assertion exists to make the row answerable to its
+  // neighbours rather than only to the server, which is what a hand-written URL never is.
+  const rowUrls = [...ROW_CODE.matchAll(/`\/api\/v1\/workflows\/[^`]*`/g)].map((m) => m[0]);
+  const validateCall = rowUrls.find((url) => /validate/.test(url));
+  assert.ok(validateCall, "the row must call a validate endpoint");
+  assert.doesNotMatch(
+    validateCall,
+    /graph\/validate/,
+    "the validate route is `/workflows/{id}/validate` — there is no `/graph/validate` mount",
+  );
+  assert.match(
+    ROUTES,
+    /\.route\("\/workflows\/\{id\}\/validate"/,
+    "the route the row calls must be the one the API mounts",
+  );
+  assert.match(
+    CLIENT_API,
+    /`\/api\/v1\/workflows\/\$\{workflowId\}\/validate`/,
+    "the row must ask for the URL the admin client asks for",
+  );
+  // The sibling row in the same file already uses the mounted path — that is the point.
+  const elsewhere = [...WALKTHROUGH.matchAll(/`\/api\/v1\/workflows\/[^`]*validate[^`]*`/g)];
+  assert.ok(
+    elsewhere.some((m) => !/graph\/validate/.test(m[0])),
+    "somewhere in this walkthrough a validate call must use the mounted path, or the file is guessing",
   );
 });
 

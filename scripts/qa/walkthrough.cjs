@@ -15024,7 +15024,22 @@ note({
           );
           if (!target) return { skipped: "no non-trigger, non-end node to rename" };
           target.type = key;
-          const validateResponse = await fetch(`/api/v1/workflows/${id}/graph/validate`, {
+          // **THE VALIDATE ROUTE IS `/workflows/{id}/validate`, NOT `…/graph/validate`.** The row
+          // invented the `/graph/` prefix and got a `404` — which it then reported as
+          // `validateStatus: 404, saysReEnable: false`, the same reading as "the product called a
+          // disabled plugin a typo". The mounted route is `mod.rs:1924`, the client calls
+          // `/api/v1/workflows/${id}/validate` (`lib/api.ts:5359`), and **the same walkthrough
+          // already uses the correct URL 10,000 lines above this one** (line 12110). So the file
+          // knew the answer and this row did not look.
+          //
+          // **THREE defects in one row, and the third is the one a person would have caught.**
+          // Wrong field name (tick 74's class), then a route that does not exist — both hidden by
+          // a `.catch()` that reported a constant. What makes the row worth the three is that
+          // `pluginProbeReachedServer` is now in the note: the throw that hid the first was
+          // visible as its own field, which is how the `404` was read as a sentence rather than
+          // as a missing route. A diagnostic that reports *how far it got* turns "the product is
+          // wrong" into "the row asked the wrong address", which are different days of work.
+          const validateResponse = await fetch(`/api/v1/workflows/${id}/validate`, {
             method: "POST",
             credentials: "same-origin",
             headers: { "content-type": "application/json" },

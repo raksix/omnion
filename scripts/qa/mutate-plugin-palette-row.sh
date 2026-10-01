@@ -188,6 +188,16 @@ open(p, 'w').write(s)
 PYEOF
 expect_red "M9 a full disk decides the measurement" "test 8"
 
+echo "== M10: the row asks for a route that is not mounted =="
+mutate_walk <<'PYEOF'
+old = 'const validateResponse = await fetch(`/api/v1/workflows/${id}/validate`, {'
+new = 'const validateResponse = await fetch(`/api/v1/workflows/${id}/graph/validate`, {'
+assert old in s, "M10 anchor missing"
+assert s.count(old) == 1, "M10 anchor is not unique"
+s = s.replace(old, new)
+PYEOF
+expect_red "M10 a URL that does not exist" "test 7"
+
 echo "== restore check =="
 restore
 w=$(md5sum "$WALK" | cut -d' ' -f1); r=$(md5sum "$RUN" | cut -d' ' -f1)
