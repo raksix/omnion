@@ -1586,6 +1586,15 @@ export type ChatProposal = {
 export type ChatDone = {
   finish_reason: string | null;
   chars: number;
+  /**
+   * The requester's own view of the answer (REQ-105 slice 3).
+   *
+   * Present while the guard is masking. Absent on an older server — so the screen falls back to
+   * the streamed text rather than blanking the answer it already rendered.
+   */
+  answer?: string;
+  /** Tokens the guard saw and refused to put back, e.g. an ambiguous `[EMAIL_1]`. */
+  guard_withheld?: string[];
   usage: {
     prompt_tokens: number | null;
     completion_tokens: number | null;

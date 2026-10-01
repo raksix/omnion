@@ -482,6 +482,16 @@ export function AiView() {
   const [answer, setAnswer] = useState("");
   const [chatRoute, setChatRoute] = useState<string | null>(null);
   const [chatUsage, setChatUsage] = useState<string | null>(null);
+  /**
+   * The requester's own view of the answer, once the guard has re-mapped it (REQ-105 slice 3).
+   *
+   * A separate slot from `answer` rather than a mutation of it: while the answer streams, the
+   * text on screen must be the placeholders the provider actually saw — substituting mid-stream
+   * would render a transcript that never existed. On `done` this takes over.
+   */
+  const [chatFinalAnswer, setChatFinalAnswer] = useState<string | null>(null);
+  /** Tokens the guard refused to put back, shown rather than silently left on screen. */
+  const [chatWithheld, setChatWithheld] = useState<string[]>([]);
   const [streaming, setStreaming] = useState(false);
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
@@ -741,6 +751,8 @@ export function AiView() {
     setChatUsage(null);
     setChatProposal(null);
     setChatProposalError(null);
+    setChatFinalAnswer(null);
+    setChatWithheld([]);
 
     try {
       await streamChat(
@@ -765,6 +777,13 @@ export function AiView() {
           onProposal: (filed) => setChatProposal(filed),
           onProposalError: (message) => setChatProposalError(message),
           onDone: (done) => {
+            // The guard's re-mapped answer takes over the streamed text. Falling back to the
+            // stream when the server sent no `answer` keeps this screen working against a server
+            // that predates the field, instead of blanking a reply it already rendered.
+            if (typeof done.answer === "string") {
+              setChatFinalAnswer(done.answer);
+            }
+            setChatWithheld(done.guard_withheld ?? []);
             const usage = done.usage?.total_tokens;
             setChatUsage(
               usage
@@ -1563,14 +1582,23 @@ export function AiView() {
               </span>
             ) : null}
           </div>
-          {answer || streaming ? (
+          {(chatFinalAnswer ?? answer) || streaming ? (
             <div
               data-chat-answer
               className="rounded-lg border border-line bg-canvas px-3 py-2 text-[12.5px] whitespace-pre-wrap"
             >
-              {answer}
+              {/* The guard's re-mapped answer once it arrives; the streamed placeholders until
+                  then. A delta the client already read cannot be recalled, so the substitution
+                  is deliberately a swap at the end rather than a rewrite mid-stream. */}
+              {chatFinalAnswer ?? answer}
               {streaming ? <span className="text-muted">▌</span> : null}
             </div>
+          ) : null}
+          {chatWithheld.length > 0 ? (
+            <p data-chat-guard-withheld className="text-[11.5px] text-muted">
+              The data guard withheld {chatWithheld.join(", ")}: more than one value claimed the
+              same placeholder, so it stayed visible rather than guessing which one you meant.
+            </p>
           ) : null}
           {chatUsage ? (
             <p data-chat-usage className="text-[11.5px] text-muted">

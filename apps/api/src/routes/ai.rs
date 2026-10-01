@@ -866,7 +866,11 @@ pub async fn list_models(
 /// Done after the narrowing so the text search and the capability filter see the registry in
 /// provider order — the order the empty state and the row numbering read from — and so the
 /// `nulls last` rules live in one function rather than in two orderings that can disagree.
-fn sort_catalog(models: &mut [ModelBody], providers: &[Provider], sort: omnion_ai_hub::CatalogSort) {
+fn sort_catalog(
+    models: &mut [ModelBody],
+    providers: &[Provider],
+    sort: omnion_ai_hub::CatalogSort,
+) {
     let name_of = |id: Uuid| {
         providers
             .iter()
@@ -1493,6 +1497,14 @@ enum Frame {
         finish_reason: Option<String>,
         chars: usize,
         usage: Option<omnion_ai_hub::ChatUsage>,
+        /// The requester's own view of the answer (REQ-105 slice 3).
+        ///
+        /// A field rather than a replacement for `delta`, because the deltas already went out
+        /// carrying placeholders and cannot be taken back. The client renders the deltas while
+        /// the answer streams and this text when it ends.
+        answer: String,
+        /// Tokens the guard saw and refused to put back, so the screen can say so out loud.
+        guard_withheld: Vec<String>,
     },
     /// The answer proposed a change set that could not be filed (REQ-101, slice 3g).
     ///
@@ -1537,10 +1549,14 @@ impl Frame {
                 finish_reason,
                 chars,
                 usage,
+                answer,
+                guard_withheld,
             } => Event::default().event("done").data(
                 json!({
                     "finish_reason": finish_reason,
                     "chars": chars,
+                    "answer": answer,
+                    "guard_withheld": guard_withheld,
                     "usage": usage.map(|usage| json!({
                         "prompt_tokens": usage.prompt_tokens,
                         "completion_tokens": usage.completion_tokens,
@@ -1705,10 +1721,7 @@ pub async fn chat(
         // that is switched off. That is a routing problem: `422`, the walk's reasons, and the
         // event, because something *is* wrong and it is visible in a specific row.
         let (status, code) = if decision.had_candidates {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "ai.route.unresolved",
-            )
+            (StatusCode::UNPROCESSABLE_ENTITY, "ai.route.unresolved")
         } else {
             (StatusCode::CONFLICT, "no_default_model")
         };
@@ -1815,6 +1828,12 @@ pub async fn chat(
     for (message, text) in messages.iter_mut().zip(guarded) {
         message.content = text;
     }
+    // REQ-105 slice 3: the one answer map for this request, built from every message's own map.
+    // It is carried into the task and **never persisted** — it holds the original values, so a
+    // stored copy would be exactly the data this control exists to contain. It dies with the
+    // request, which is why the only two things derived from it are the requester's answer and a
+    // redacted copy for everybody else.
+    let remap = omnion_ai_hub::guard_checkpoint::CheckpointReport::merged_map(&reports);
     let request = ChatRequest {
         model: resolved.model.model_key.clone(),
         messages,
@@ -2017,6 +2036,23 @@ pub async fn chat(
         }
 
         let answer = outcome.expect("an answer or an early return above");
+        // REQ-105 slice 3: the two readers of this answer, and they are not the same.
+        //
+        // `answer.content` is what the **provider** wrote, so it holds placeholders wherever it
+        // echoed the user's own values. From here the text has two destinations with different
+        // entitlements, and conflating them is the failure this whole slice exists to prevent:
+        //
+        // * the requester typed the address, so their answer puts the value back (`substitute`).
+        //   A model that echoed `[EMAIL_1]` gets a coherent sentence rather than a token.
+        // * the audit row is read by a second person, so it carries the **redacted** text. Writing
+        //   the substituted answer into the audit would copy the very values the guard removed into
+        //   a table it does not control, which is a strictly worse leak than sending them to a model.
+        //
+        // `redact` starts from the answer and puts placeholders back over any original it still
+        // contains, so an answer that quoted the address out of the conversation is covered too.
+        let requester_answer = remap.substitute(&answer.content);
+        let audited_answer = remap.redact(&answer.content);
+
         // The counts the provider reported ride on the row that served the call, and nowhere
         // else: a failed attempt produced no answer and therefore spent no tokens.
         record_usage(
@@ -2039,6 +2075,11 @@ pub async fn chat(
             "chars": answer.content.chars().count(),
             "finish_reason": answer.finish_reason,
             "substitutions": attempts.len().saturating_sub(1),
+            // The **redacted** answer, and the tokens the guard declined to put back. Recorded
+            // rather than omitted so an operator can see that a token appeared and was refused
+            // rather than conclude the guard never fired.
+            "answer": audited_answer,
+            "guard_withheld": remap.withheld(),
             "usage": answer.usage.as_ref().map(|usage| json!({
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,
@@ -2066,13 +2107,16 @@ pub async fn chat(
         // for both would make the two indistinguishable to the caller and to its tests.
         let proposal = match organization_id {
             Some(organization) => {
+                // A filed change set is read by a **reviewer**, which is a second reader: the parser gets the
+                // redacted text, so a proposal row never becomes a second copy of the address the
+                // guard removed. The requester's own answer is unaffected — it is the frame above.
                 crate::routes::ai_change_sets::file_from_chat(
                     &proposal_state,
                     organization,
                     user_id,
                     None,
                     body_run_id,
-                    &answer.content,
+                    &audited_answer,
                 )
                 .await
             }
@@ -2116,6 +2160,15 @@ pub async fn chat(
             finish_reason: answer.finish_reason,
             chars: answer.content.chars().count(),
             usage: answer.usage,
+            // REQ-105 slice 3: the requester's own view of the answer. Carried on the **done**
+            // frame and not on the deltas, because a delta the client has already read cannot be
+            // recalled — substituting into a stream would either leak the value to a reader who
+            // must not see it, or leave a rendered transcript that disagrees with what was sent.
+            // The screen shows placeholders while the answer is written and this text at the end.
+            answer: requester_answer,
+            // The tokens the guard saw and declined to put back, so a requester whose answer
+            // still shows `[EMAIL_1]` learns it was withheld rather than assuming a bug.
+            guard_withheld: remap.withheld().to_vec(),
         };
         let _ = frames.send(frame).await;
 
@@ -2241,9 +2294,7 @@ async fn record_usage(
 /// A model with no price is returned as [`ModelPrice::unpriced`] rather than omitted, so a key
 /// that *is* in the catalog and a key that is not are told apart by the cost function instead of
 /// both collapsing into "no price".
-async fn load_model_prices(
-    pool: &sqlx::PgPool,
-) -> Vec<(String, omnion_ai_hub::cost::ModelPrice)> {
+async fn load_model_prices(pool: &sqlx::PgPool) -> Vec<(String, omnion_ai_hub::cost::ModelPrice)> {
     sqlx::query(
         "select model_key, input_cost_micros_per_mtok, output_cost_micros_per_mtok \
          from ai_models where enabled",
