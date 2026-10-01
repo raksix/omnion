@@ -4721,12 +4721,31 @@ async function runNotificationSettingsDepth(page, report) {
   steps.inAppRefusalExplainsItself = /in-app/i.test(steps.inAppRefusal?.message ?? "");
 
   // 3. Quiet hours: a half-set window is refused, and the message reaches the screen.
-  await page.locator("[data-quiet-toggle]").click({ timeout: 4000 }).catch(() => {});
+  //
+  // The toggle is driven to a KNOWN state rather than clicked blindly. It used to be one
+  // unconditional click wrapped in `.catch()`, and that is a coin toss whose losing side ends
+  // the whole pass: if the checkbox is already checked, the click *unchecks* it, the fields
+  // unmount, the `fill` below is a no-op on a missing locator, nothing differs from the loaded
+  // row, and Save is legitimately disabled — so `locator.click` on the Save button times out
+  // and the fatal surfaces ~50 minutes later, pointing at a button instead of at the toggle.
+  // `data-quiet-toggle` reflects `showQuietHours`, which the load path seeds from the row's own
+  // `quiet_hours_start`, so the current state is readable and the click can be made
+  // conditional. The value being asserted, not the gesture, is the claim.
+  steps.quietToggleSeen = await page.locator("[data-quiet-toggle]").count();
+  const quietOn = steps.quietToggleSeen > 0 && (await page.locator("[data-quiet-toggle]").isChecked());
+  if (!quietOn) {
+    await page.locator("[data-quiet-toggle]").click({ timeout: 4000 }).catch(() => {});
+  }
   await page.waitForTimeout(400);
   steps.quietFieldsAppear = (await page.locator("[data-quiet-start]").count()) > 0;
   await page.locator("[data-quiet-start]").fill("22:00").catch(() => {});
   await page.locator("[data-quiet-end]").fill("07:00").catch(() => {});
   await page.locator("[data-timezone]").selectOption("Europe/Istanbul").catch(() => {});
+  // The window is 22:00→07:00 and the loaded row may already BE that, in which case only the
+  // timezone differs — and the timezone defaults to `UTC` for a fresh account, so this step
+  // still has a change to save. Asserted rather than assumed, because the two legs below that
+  // matter are "it saved" and "it was dirty first".
+  steps.quietIsDirty = await page.locator("[data-pref-save]").isEnabled().catch(() => false);
   await page.locator("[data-pref-save]").click({ timeout: 4000 });
   await page.waitForTimeout(1200);
   steps.quietSaved = (await page.locator("[data-quiet-start]").inputValue().catch(() => "")) === "22:00";
@@ -4788,31 +4807,52 @@ async function runNotificationSettingsDepth(page, report) {
   // Put the row back the way it was, so a later pass in the same run starts from the defaults
   // rather than from whatever this one left behind. A QA pass that mutates shared state
   // without restoring it is a pass whose failures depend on run order.
-  await page.goto(`${URL_ADMIN}/notifications/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1200);
-  await page.evaluate(async () => {
-    const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
-      .then((r) => (r.ok ? r.json() : null))
-      .catch(() => null);
-    if (!current) return;
-    await fetch("/api/v1/notifications/preferences", {
-      method: "PUT",
-      credentials: "same-origin",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        cells: [{ category: "ticket", channel: "email", enabled: true }],
-        settings: {
-          quiet_hours_start: null,
-          quiet_hours_end: null,
-          timezone: "UTC",
-          digest_cadence: "off",
-          digest_weekday: null,
-          digest_hour: 8,
+  //
+  // This write carries the CSRF header, and that is the whole point. A cookie-authenticated
+  // PUT with no `x-omnion-csrf` is refused with `csrf_unavailable` BEFORE the handler runs, so
+  // the restore used to be a no-op that reported success: `await page.evaluate(...)` swallowed
+  // the 403 in its own `.catch()`, and `steps.restored = true` was written unconditionally a
+  // line later. Nothing was restored, so the next pass in the same run started from this one's
+  // leftovers — quiet hours on, digest weekly — and the quiet-hours step then met a row that
+  // already held the values it was about to set. The pass died on the next run's Save button,
+  // pointing at the product. The 20261001-040801 artifacts are the proof: the page shows
+  // 22:00/07:00 and Weekly/Monday 09:00, which is exactly what this function sets.
+  const restoredStatus = await page
+    .evaluate(async () => {
+      const csrf = document.cookie
+        .split(";")
+        .map((part) => part.trim())
+        .find((part) => part.startsWith("omnion_csrf="))
+        ?.slice("omnion_csrf=".length);
+      const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null);
+      if (!current) return null;
+      const response = await fetch("/api/v1/notifications/preferences", {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          ...(csrf ? { "x-omnion-csrf": decodeURIComponent(csrf) } : {}),
         },
-      }),
-    });
-  }).catch(() => {});
-  steps.restored = true;
+        body: JSON.stringify({
+          cells: [{ category: "ticket", channel: "email", enabled: true }],
+          settings: {
+            quiet_hours_start: null,
+            quiet_hours_end: null,
+            timezone: "UTC",
+            digest_cadence: "off",
+            digest_weekday: null,
+            digest_hour: 8,
+          },
+        }),
+      });
+      return response.status;
+    })
+    .catch(() => null);
+  // Reported from what the server answered. A hardcoded `true` here is what let a refused
+  // restore read as a clean one for as long as it did.
+  steps.restored = restoredStatus === 200;
 
   // ---- the test-delivery block (REQ-021, slice 5) ------------------------------------------
   //
