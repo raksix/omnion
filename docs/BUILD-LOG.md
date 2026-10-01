@@ -8115,3 +8115,72 @@ the bottleneck, not the code.
 
 Next: the pass itself if it can take the slot, then REQ-021's keyboard and mobile legs, then
 REQ-016's form-validation and payload-inspector legs.
+
+## Wave 7 · tick 46 · REQ-101 slice 3f — the editor sheet, and a check that outlived its early return
+
+The change-set **list** had an API and no screen. Slice 3f is the screen and the one thing it
+needed that no amount of client code could supply: a diff resolved against the target as it is
+**now**.
+
+**What shipped** (`83530a43`, `4b82686d`):
+
+- `POST /ai/change-sets/{id}/preview` — `ai.approvals.read`, writes nothing. It returns the
+  resolved operations (`diffs` from the same `plan::Plan` the review screen renders, `label`,
+  `cascades`, `base_revision`, `gated_class`, `no_op`) plus `drifted`: the targets whose current
+  revision no longer matches the set's stored `base_revisions`. It deliberately does **not**
+  re-pin them — a preview that refreshed the pins would retire the staleness the confirm route
+  enforces, and the reviewer would stop being asked to look at a target that had moved.
+- `SetView` — the screen shape, adding `editable`, `needs_approval`, `irreversible` and
+  `confirmation_phrase`. All four are read from the same store predicates the `PATCH`'s `where`
+  clause and the confirm route's park use, because a panel re-deriving them from a status list it
+  holds is a panel that drifts the day a status is added — and the drift shows as a button the
+  API refuses, not as a compile error.
+- `/ai/change-sets` (list: status tabs, search, empty + error + loading states) and
+  `/ai/change-sets/[id]` (the editor: per-operation diff cards, inline value edits, drop, reorder,
+  drift banner, typed-confirmation field, Confirm/Discard). Both in the nav, both in
+  `walkthrough.cjs` via `runAiChangeSetsDepth`.
+- The depth pass proves three things only the database can answer: an edit really re-hashes the
+  row, a **stale** hash is refused with `409` and the stored hash does not move, and a set
+  carrying a gated operation parks rather than applies.
+
+**Proof**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-ai-hub --lib` | **511 passed; 0 failed** (skip count 0) |
+| `cargo test -p omnion-api --test ai_change_sets -- --test-threads=1` | **18 passed; 0 failed** in 28.3 s (was 6/18 — see below) |
+| `pnpm typecheck` (apps/admin) | clean |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+
+**The first run was 6 passed / 12 failed, and it was not the database.** The walk URL in the
+state file's hint was the wrong port (5432, not the 5433 this box's QA cluster uses), so the
+harness's own "a skip must not read as a pass" panic fired correctly and named the fix. With the
+port right, **16 passed / 2 failed** — and both failures were real defects in the slice's own
+first draft, not test problems:
+
+1. **A delete writes no field by construction, so "changes nothing" was true of every delete.**
+   The editor's list policy needed a no-op to come back as a *plan* instead of a refusal, so the
+   check was hoisted out of `plan_with_diffs` into the `plan()` wrapper. Hoisting also moved it
+   above the delete's early return — the one operation class that legitimately changes something
+   (the target, and everything cascading from it) became the class the check refused. Caught by
+   the unit walk and by the walk that parks two deletes and releases the set; the second one's
+   message, "`page` changes nothing — every value already matches", naming a **page** while
+   parking a **delete**, is the tell. The predicate is now about "an update whose values already
+   match", with the exemption stated at the check.
+2. **The no-op retry rebuilt the cascade list empty.** The first draft passed `Vec::new()`
+   because "a no-op is an update or a create, and neither reads cascades" — which is false for
+   the case the function exists to serve: since every delete takes the no-op path, that path is
+   exactly where a delete's cascade line travels. The reviewer reads "3 page revisions" to decide
+   anything at all, so the value silently emptied by that reasoning is the worst possible one to
+   drop. `cascades` now crosses the retry, and the clone sits on the **first** call (`Cascade` is
+   not `Copy`, so a clone in the retry arm is an `E0382`).
+
+**Not done this tick.** The browser pass. The single QA slot was held by a **live** `w3` holder
+for the whole tick (34 min at the last check, `kill -0` green, `cwd=/mnt/apopic/omnion-w3`) with
+`w6` queued behind it; load 7–10 and `/mnt/apopic` at 97 %. A holder that is alive is never
+yours to take, so this is a code + walkthrough tick and the two boxes that need a browser — the
+stale banner and the viewer-permission rendering — stay open. The pass is the next tick's first
+action, and `QA_ONLY=ai` is what makes it minutes rather than a full pass.
+
+Next: the `w7` pass over the AI area, then the chat reply that *files* a change set (the entry
+point for the "lands in the same inbox" box), then REQ-099 slice 4.
