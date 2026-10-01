@@ -7257,3 +7257,44 @@ pass that passed.
 
 What the pass DID establish: the depth-pass fix is load-bearing in the one direction that matters —
 a defect that previously ended the whole process no longer ends it.
+
+---
+
+## Tick 50 · REQ-129 slice 3 · backfills, and a cursor that walked backwards
+
+**What.** `0216_migration_backfills_seeds.sql` (four tables, commented reversal, three seeded
+datasets) and `crates/migrations/src/backfill.rs` — the backfill job store, the transition rule,
+the batch statement and `drain`. The API, the two screens and the event emission are the next
+slice; this tick is the crate and the migration, proved.
+
+**The defect the live proof found in the design it was written to confirm.** The cursor was
+stored as `text` and read with `max(key::text)`. Over the keys 1..100 the maximum is `'99'`,
+because text order puts `'99'` after `'100'` — so a restart began **below** where the previous
+batch stopped, re-ran the statement on rows already done, and `rows_done` grew to **2097 for 250
+rows** while every screen would have rendered it as healthy progress. `7ec6f810` reads the last
+key with `order by k desc limit 1` in the key's own type, compares the cursor as `($1::bigint)`,
+and `key_cast` **refuses** a type with no stable text rendering rather than guessing a cast — a
+wrong-position cursor is a backfill that looks healthy while doing the wrong rows, which is the
+failure this whole request exists to prevent.
+
+**The proof found a false pass in itself, twice.** The first fixture filtered `where filled is
+null`, and the proof stayed **green with the cursor bound deleted** — the null filter was doing
+the resume work, so the cursor was never under test. The fixture now selects by cursor alone,
+exactly as a backfill of an existing column does. And a `proven to fail` section asserted the
+broken cursor never finishes; running it refuted that — 1..100 → 99 → 199 → 250 → empty, it
+terminates. The harm is a statement re-running on rows, which for a non-idempotent backfill is
+corruption rather than a hang, and the assertion now measures exactly that.
+
+**Two shell defects worth the space**, both of which silently produced a passing proof:
+`*[!0-9]*` matches the EMPTY string (`*` matches zero characters), so the first batch was
+rejected by its own guard; and `psql -v` interpolation does not work in `-c` mode, so `:'cur'`
+arrived as a bare `:` and the first batch could never run. Neither raised an error the summary
+would have shown — both were "0 checks ran".
+
+**Proof.** `cargo test -p omnion-migrations` **86 passed, 0 failed** (11 new) ·
+`backfill-resume-proof.sh` **18 passed, 0 failed** against a live PostgreSQL, with two
+proven-to-fail sections that go red on the real defect · commits `7ec6f810`, `124fdc2b`.
+
+**Next.** The API surface (`/deployment/backfills` list + detail + pause/resume/run, and the
+seeds route with its production refusal), the two screens, the four events in the catalogue, and
+then the zero-downtime recipe's live-traffic leg.
