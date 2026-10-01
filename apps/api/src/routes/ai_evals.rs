@@ -39,6 +39,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_ai_hub::error::AiHubError;
 use omnion_ai_hub::eval_case;
+use omnion_ai_hub::eval_run;
 use omnion_ai_hub::eval_store::{
     self, CaseChanges, CaseRow, NewCase, NewSuite, SuiteChanges, SuiteRow, MAX_CASE_INPUT_CHARS,
     SCHEDULE_PRESETS,
@@ -47,6 +48,7 @@ use omnion_ai_hub::run_store;
 use omnion_ai_hub::store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
@@ -453,6 +455,25 @@ fn string_list(values: Vec<String>) -> Value {
             .map(Value::String)
             .collect(),
     )
+}
+
+/// Read a stored jsonb array of strings back into a list.
+///
+/// The inverse of [`string_list`], and separate from it on purpose: one takes the strings a form
+/// posted, the other takes what the column holds. A malformed or non-array value reads as an
+/// empty list rather than an error, because the column's own check constraint guarantees the
+/// shape and a snapshot is the wrong place to fail a run over a tool list.
+fn read_string_list(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .filter(|item| !item.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Add the field name to a refusal so the form can mark one input.
@@ -1199,6 +1220,635 @@ fn expected_from_properties(properties: &[(String, String)]) -> Value {
         map.insert(key.clone(), Value::String(value.clone()));
     }
     Value::Object(map)
+}
+
+// -------------------------------------------------------------------------------------------
+// Runs (REQ-107 slice 2)
+// -------------------------------------------------------------------------------------------
+
+/// `GET /ai/evals/runs` query.
+///
+/// Every filter is optional and every one is validated by the store, which answers a refusal
+/// naming the field — so a hand-typed `status=complete` is a `422` saying what the six are
+/// rather than an empty table that reads as "this installation has never run an eval".
+#[derive(Debug, Default, Deserialize)]
+pub struct RunListQuery {
+    /// One suite's runs.
+    pub suite: Option<String>,
+    /// queued / running / passed / failed / error / cancelled, or `incomplete` for the first two.
+    pub status: Option<String>,
+    /// manual / scheduled / gate.
+    pub kind: Option<String>,
+    /// none / pass / block.
+    pub gate: Option<String>,
+    /// Who started it.
+    pub user: Option<Uuid>,
+    /// `oldest` reverses the default.
+    pub order: Option<String>,
+    /// Page size.
+    pub limit: Option<i64>,
+    /// Page offset.
+    pub offset: Option<i64>,
+    /// The stat tiles' window, in days.
+    pub days: Option<i64>,
+}
+
+/// One run on the list row.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunSummary {
+    /// The run.
+    pub run: eval_run::RunRow,
+    /// What the status means for the operator, in one word.
+    pub state: String,
+    /// The same fact as a sentence, for a screen that wants the reason and not the colour.
+    pub state_note: String,
+}
+
+/// `GET /ai/evals/runs` — the run history with its stat tiles.
+pub async fn list_runs(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Query(query): Query<RunListQuery>,
+) -> Result<Json<RunList>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    let pool = state.db().pool();
+
+    // A suite is named by its key, which is what a person types and what a link carries. An
+    // unknown key is a 404 naming it rather than an empty list: "no runs" and "no such suite"
+    // are different facts and the panel renders them differently.
+    let suite_id = match query.suite.as_deref() {
+        Some(key) => Some(
+            eval_store::find_suite(pool, organization, key)
+                .await?
+                .ok_or_else(|| AiHubError::EvalSuiteNotFound(key.to_string()))?
+                .id,
+        ),
+        None => None,
+    };
+
+    let filter = eval_run::RunFilter {
+        suite_id,
+        status: query.status.clone(),
+        kind: query.kind.clone(),
+        gate: query.gate.clone(),
+        user_id: query.user,
+        order: query.order.clone(),
+        limit: query.limit.unwrap_or(50),
+        offset: query.offset.unwrap_or(0),
+    };
+    let runs = eval_run::list_runs(pool, organization, &filter).await?;
+    let stats = eval_run::run_stats(pool, organization, query.days.unwrap_or(7)).await?;
+
+    Ok(Json(RunList {
+        total: runs.len(),
+        is_empty: runs.is_empty(),
+        stats,
+        runs: runs
+            .iter()
+            .map(|run| {
+                let (state, state_note) = run_state(run);
+                RunSummary {
+                    run: run.clone(),
+                    state,
+                    state_note,
+                }
+            })
+            .collect(),
+    }))
+}
+
+/// What a run's status means, in one word and one sentence.
+///
+/// The four that matter are separated because a run list that renders `running` and `queued`
+/// both as "in progress" cannot answer the question an operator opens the screen with, which is
+/// "is it stuck?". `queued` means nothing has claimed it — a runner that is not running, or a
+/// suite whose schedule has not fired — and `running` means a runner has it and is scoring.
+fn run_state(run: &eval_run::RunRow) -> (String, String) {
+    match run.status.as_str() {
+        "queued" => (
+            "queued".to_string(),
+            "Waiting for a runner — nothing has claimed it yet.".to_string(),
+        ),
+        "running" => (
+            "running".to_string(),
+            format!("Scoring — {} of {} case results so far.", {
+                run.passed_cases + run.failed_cases + run.error_cases
+            }, run.total_cases),
+        ),
+        "passed" => (
+            "passed".to_string(),
+            format!("{:.1}% against a threshold of {}%.", run.pass_rate.unwrap_or(0.0), run.threshold_percent),
+        ),
+        "failed" => (
+            "failed".to_string(),
+            format!(
+                "{:.1}% against a threshold of {}% — {} case{} failed.",
+                run.pass_rate.unwrap_or(0.0),
+                run.threshold_percent,
+                run.failed_cases,
+                if run.failed_cases == 1 { "" } else { "s" }
+            ),
+        ),
+        "error" => (
+            "error".to_string(),
+            run.error
+                .clone()
+                .unwrap_or_else(|| "The run ended without producing a verdict.".to_string()),
+        ),
+        "cancelled" => (
+            "cancelled".to_string(),
+            format!("Stopped by an operator — {} partial result kept.", {
+                run.passed_cases + run.failed_cases + run.error_cases
+            }),
+        ),
+        // A status the vocabulary does not know, rendered as itself rather than as `running`:
+        // a newer writer's value shown as "in progress" would be a lie about a run that may well
+        // have finished. This is also why the word is a `String` and not a `&'static str` — the
+        // first version returned the borrowed status and would not compile, which is the type
+        // system saying the arm cannot be a constant.
+        other => (other.to_string(), format!("Unrecognised status `{other}`.")),
+    }
+}
+
+/// `GET /ai/evals/runs` — the list plus the tiles above it.
+#[derive(Debug, Serialize)]
+pub struct RunList {
+    /// How many rows came back.
+    pub total: usize,
+    /// Whether there is nothing at all, so the screen can show its empty state.
+    pub is_empty: bool,
+    /// The tiles: suites, runs in the window, average pass rate, cost.
+    pub stats: eval_run::RunStats,
+    /// The rows.
+    pub runs: Vec<RunSummary>,
+}
+
+/// `POST /ai/evals/suites/{key}/run` body.
+#[derive(Debug, Default, Deserialize)]
+pub struct StartRunBody {
+    /// `manual` or `gate`. A caller cannot ask for `scheduled`: that kind belongs to the
+    /// scheduler, and a hand-posed scheduled run would put a row in the history that no
+    /// schedule produced.
+    pub kind: Option<String>,
+    /// The run to compare against, required for a `gate`.
+    pub base_run_id: Option<Uuid>,
+}
+
+/// `POST /ai/evals/suites/{key}/run` — start a run.
+///
+/// **The run is created, not executed.** This route enqueues; the runner (slice 3) claims and
+/// scores. A route that scored inline would block an HTTP request for the length of a suite —
+/// forty judge calls is minutes — and the request's own runner pattern says the row is created
+/// and claimed. So the answer is `202` with the queued row, and the panel polls.
+///
+/// The model is resolved *here*, before the row is written, and the resolution is what the
+/// snapshot records. A run that resolved its model at claim time would record a snapshot
+/// describing whatever the router said when the runner got to it, which is not what the run was
+/// started against.
+pub async fn start_run(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Path(key): Path<String>,
+    Json(body): Json<StartRunBody>,
+) -> Result<(StatusCode, Json<RunSummary>), ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    let pool = state.db().pool();
+    let suite = eval_store::find_suite(pool, organization, &key)
+        .await?
+        .ok_or_else(|| AiHubError::EvalSuiteNotFound(key.clone()))?;
+
+    if !suite.enabled {
+        return Err(ApiError::bad_request(
+            "invalid_eval",
+            "this suite is switched off; enable it before running it",
+        ));
+    }
+
+    let kind = body.kind.as_deref().unwrap_or("manual");
+    if kind == "scheduled" {
+        return Err(ApiError::bad_request(
+            "invalid_eval",
+            "`kind` may be manual or gate here; a scheduled run is started by the scheduler",
+        ));
+    }
+
+    // The suite's own readiness, refused before a row exists. A run queued for a suite with no
+    // enabled cases would sit in the history as a green 0-of-0 that measures nothing — the exact
+    // false confidence the readiness badge exists to prevent, and it would be recorded rather
+    // than displayed.
+    let (readiness, note) = suite_readiness(&suite);
+    if readiness != "ready" {
+        return Err(ApiError::bad_request("invalid_eval", note));
+    }
+
+    let baseline = match body.base_run_id {
+        Some(id) => Some(id),
+        // No explicit baseline: the suite's own, when it has one. A gate that silently compared
+        // against nothing would report a verdict from a single run and call it a comparison.
+        None => eval_run::get_baseline(pool, suite.id).await?.map(|row| row.run_id),
+    };
+    if kind == "gate" && baseline.is_none() {
+        return Err(ApiError::bad_request(
+            "invalid_eval",
+            "this suite has no baseline run yet — run it once, or pass `base_run_id`",
+        ));
+    }
+
+    // The model under test: a `model`-targeted suite carries its own pin; an `agent` or
+    // `copilot` target resolves through the router, exactly as the agent runtime does, so an
+    // eval and a production turn land in the same decision log.
+    let (model_key, model_id, prompt) = resolve_under_test(pool, organization, &suite).await?;
+
+    // The stored `tools` is jsonb; the snapshot takes a slice of strings. The other
+    // `string_list` in this file builds a jsonb array from a list, so this reads the column
+    // rather than reusing it — two functions with the same name and opposite directions is a
+    // trap for the next reader, so this one says what it does.
+    let tools = read_string_list(&suite.tools);
+    let snapshot = eval_run::build_snapshot(
+        model_key.as_deref(),
+        model_id,
+        &prompt,
+        suite.judge_prompt_version.into(),
+        &tools,
+        suite.temperature,
+        judge_model_key(pool, suite.judge_model_id).await?.as_deref(),
+        suite.judge_prompt.as_deref(),
+        suite.judge_prompt_version.into(),
+        current.user.id.into(),
+    );
+
+    let run = eval_run::create_run(
+        pool,
+        organization,
+        &eval_run::NewRun {
+            suite_id: suite.id,
+            kind: kind.to_string(),
+            snapshot,
+            model_id,
+            judge_model_id: suite.judge_model_id,
+            threshold_percent: suite.threshold_percent,
+            base_run_id: baseline,
+            triggered_by: Some(current.user.id),
+        },
+    )
+    .await?;
+
+    let (state, state_note) = run_state(&run);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RunSummary {
+            run,
+            state,
+            state_note,
+        }),
+    ))
+}
+
+/// The model under test for a suite, as `(key, row id, system prompt)`.
+///
+/// An agent-targeting suite reads the agent's own pin, and a `task`/`copilot` target goes to the
+/// router — the same walk the agent runtime makes, so a suite and the traffic it measures resolve
+/// the same way. A suite that resolved differently would be evaluating a model nobody runs.
+async fn resolve_under_test(
+    pool: &sqlx::PgPool,
+    organization: Uuid,
+    suite: &SuiteRow,
+) -> Result<(Option<String>, Option<Uuid>, String), ApiError> {
+    match suite.target.as_str() {
+        "model" => {
+            let Some(id) = suite.model_id else {
+                return Err(ApiError::bad_request(
+                    "invalid_eval",
+                    "this suite pins no model, so there is nothing to run",
+                ));
+            };
+            // The registry row is read for its `provider/model` string, which the snapshot keeps
+            // because the row id alone is not reproducible once the row is gone.
+            let resolved = model_key_of(pool, id).await?;
+            Ok((resolved, Some(id), String::new()))
+        }
+        "agent" => {
+            let Some(agent_id) = suite.agent_id else {
+                return Err(ApiError::bad_request(
+                    "invalid_eval",
+                    "this suite targets an agent but names none",
+                ));
+            };
+            let Some(agent) = run_store::get_agent(pool, organization, agent_id).await? else {
+                return Err(ApiError::bad_request(
+                    "invalid_eval",
+                    "this suite targets an agent that is not in this organization",
+                ));
+            };
+            let key = match agent.model_id {
+                Some(id) => model_key_of(pool, id).await?,
+                None => None,
+            };
+            Ok((key, agent.model_id, agent.system_prompt))
+        }
+        // A copilot or a task kind is resolved by the router at run time, and the snapshot says
+        // so by carrying no model. Recording the *current* default as though it were pinned
+        // would make a run look reproducible when the next one may pick a different model.
+        _ => Ok((None, None, String::new())),
+    }
+}
+
+/// One model's `provider/model` string, the key the snapshot and the price table both use.
+async fn model_key_of(pool: &sqlx::PgPool, model_id: Uuid) -> Result<Option<String>, ApiError> {
+    // `api.models.model_key` is the bare model name; the wire key the router and the price
+    // table both use is `provider/model`, joined here so the snapshot records what a call would
+    // actually be sent. Reading only `model_key` would make every snapshot ambiguous between
+    // two providers offering a model of the same name.
+    let row: Option<(String, String)> = sqlx::query_as(
+        "select p.name || '/' || m.model_key from ai_models m \
+         join ai_providers p on p.id = m.provider_id where m.id = $1",
+    )
+    .bind(model_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "eval.store_failed",
+            format!("the model registry could not be read for this run: {error}"),
+        )
+    })?;
+    Ok(row.map(|(key, _)| key))
+}
+
+/// The judge model's key, for the snapshot.
+async fn judge_model_key(
+    pool: &sqlx::PgPool,
+    judge_model_id: Option<Uuid>,
+) -> Result<Option<String>, ApiError> {
+    match judge_model_id {
+        Some(id) => model_key_of(pool, id).await,
+        None => Ok(None),
+    }
+}
+
+/// `GET /ai/evals/runs/{id}` — one run with its results and the suites it can be diffed against.
+pub async fn read_run(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RunDetail>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    let pool = state.db().pool();
+    let run = eval_run::find_run(pool, organization, id)
+        .await?
+        .ok_or_else(|| AiHubError::EvalRunNotFound(id.to_string()))?;
+    let results = eval_run::list_case_results(pool, organization, id).await?;
+    let baseline = eval_run::get_baseline(pool, run.suite_id).await?;
+
+    // The diff picker needs something to pick from, and only settled runs of the same suite can
+    // be a baseline — a queued or errored run has no rate to compare against. Offering every
+    // run would put a dead choice in the list.
+    let candidates: Vec<RunOption> = eval_run::list_runs(
+        pool,
+        organization,
+        &eval_run::RunFilter {
+            suite_id: Some(run.suite_id),
+            status: None,
+            kind: None,
+            gate: None,
+            user_id: None,
+            order: Some("oldest".to_string()),
+            limit: 50,
+            offset: 0,
+        },
+    )
+    .await?
+    .into_iter()
+    .filter(|row| row.id != run.id && row.pass_rate.is_some() && !matches!(row.status.as_str(), "queued" | "running"))
+    .map(|row| RunOption {
+        id: row.id,
+        started_at: row.started_at,
+        pass_rate: row.pass_rate,
+        label: format!(
+            "{} — {:.1}%",
+            row.started_at.date().to_string(),
+            row.pass_rate.unwrap_or(0.0)
+        ),
+    })
+    .collect();
+
+    let (state, state_note) = run_state(&run);
+    // `is_empty` is read before the struct takes `results`, for the same reason the diff
+    // summary is built before its struct literal: the value moves, and the borrow after the
+    // move is a compile error rather than a runtime surprise.
+    let is_empty = results.is_empty();
+    Ok(Json(RunDetail {
+        run,
+        state,
+        state_note,
+        results,
+        baseline,
+        diff_candidates: candidates,
+        is_empty,
+    }))
+}
+
+/// `GET /ai/evals/runs/{id}` — the run detail payload.
+#[derive(Debug, Serialize)]
+pub struct RunDetail {
+    /// The run, with its snapshot.
+    pub run: eval_run::RunRow,
+    /// The status in one word.
+    pub state: String,
+    /// The status as a sentence.
+    pub state_note: String,
+    /// One row per case executed.
+    pub results: Vec<eval_run::CaseResultRow>,
+    /// The suite's baseline, if it has one.
+    pub baseline: Option<eval_run::BaselineRow>,
+    /// Settled runs of the same suite the diff picker offers.
+    pub diff_candidates: Vec<RunOption>,
+    /// Whether the run produced no rows at all — a queued run, or one that errored first.
+    pub is_empty: bool,
+}
+
+/// One entry in the diff picker.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunOption {
+    /// The run id.
+    pub id: Uuid,
+    /// When it started.
+    pub started_at: OffsetDateTime,
+    /// Its pass rate, for the label.
+    pub pass_rate: Option<f64>,
+    /// The text the picker shows.
+    pub label: String,
+}
+
+/// `GET /ai/evals/runs/{id}/diff?base={id}` — this run against a baseline, case by case.
+///
+/// The baseline is a **query parameter, never an implicit "the previous run".** An implicit
+/// baseline makes the diff mean something different on every call depending on what else has run
+/// since, and a regression report nobody can reproduce is a regression report nobody acts on.
+pub async fn diff_run(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<DiffQuery>,
+) -> Result<Json<RunDiffView>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    let pool = state.db().pool();
+    let head = eval_run::find_run(pool, organization, id)
+        .await?
+        .ok_or_else(|| AiHubError::EvalRunNotFound(id.to_string()))?;
+
+    let Some(base) = query.base else {
+        return Err(ApiError::bad_request(
+            "invalid_eval",
+            "`base` is required: a diff against an unnamed previous run is not reproducible",
+        ));
+    };
+    let base_run = eval_run::find_run(pool, organization, base)
+        .await?
+        .ok_or_else(|| AiHubError::EvalRunNotFound(base.to_string()))?;
+    if base_run.suite_id != head.suite_id {
+        return Err(ApiError::bad_request(
+            "invalid_eval",
+            "the baseline run belongs to a different suite, so its cases are not comparable",
+        ));
+    }
+
+    let base_results = eval_run::list_case_results(pool, organization, base).await?;
+    let head_results = eval_run::list_case_results(pool, organization, id).await?;
+    let diff = eval_run::diff_runs(&base_results, &head_results);
+
+    // The gate verdict for *this* run against the baseline, recomputed rather than read: the
+    // stored `gate` is what the run concluded when it settled, and the diff view is asking a
+    // fresh question about a pairing the run may never have seen.
+    let verdict = eval_run::decide_gate(
+        head.pass_rate.unwrap_or(0.0),
+        head.threshold_percent,
+        base_run.pass_rate,
+        head.max_regression_points,
+    );
+
+    let summary = format!(
+        "{} improved, {} regressed, {} unchanged{}.",
+        diff.improved,
+        diff.regressed,
+        diff.unchanged,
+        added_and_removed(&diff)
+    );
+    Ok(Json(RunDiffView {
+        run: head,
+        base: base_run,
+        diff,
+        gate: verdict,
+        summary,
+    }))
+}
+
+/// `GET /ai/evals/runs/{id}/diff` query.
+#[derive(Debug, Default, Deserialize)]
+pub struct DiffQuery {
+    /// The run to compare against.
+    pub base: Option<Uuid>,
+}
+
+/// The tail of the diff summary sentence, so added/removed cases are not silently invisible.
+fn added_and_removed(diff: &eval_run::RunDiff) -> String {
+    match (diff.added, diff.removed) {
+        (0, 0) => String::new(),
+        (added, 0) => format!(", {added} new"),
+        (0, removed) => format!(", {removed} dropped"),
+        (added, removed) => format!(", {added} new, {removed} dropped"),
+    }
+}
+
+/// `GET /ai/evals/runs/{id}/diff` — the comparison and its summary line.
+#[derive(Debug, Serialize)]
+pub struct RunDiffView {
+    /// The run being read.
+    pub run: eval_run::RunRow,
+    /// The baseline it is compared to.
+    pub base: eval_run::RunRow,
+    /// One row per case in either run.
+    pub diff: eval_run::RunDiff,
+    /// What this pairing concludes about the threshold and the tolerance.
+    pub gate: eval_run::GateVerdict,
+    /// The sentence above the table.
+    pub summary: String,
+}
+
+/// `POST /ai/evals/runs/{id}/cancel` — stop a run, keeping what it produced.
+///
+/// A run that has already settled answers `409` rather than a cheerful `true`, because "cancel"
+/// on a finished run reads as success in a panel and the operator then waits for a stop that
+/// already happened. The store's guard is what decides, and the route only translates the answer.
+pub async fn cancel_run(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RunSummary>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    let pool = state.db().pool();
+    // Existence first, so a foreign tenant's run is a 404 and not a 409.
+    let before = eval_run::find_run(pool, organization, id)
+        .await?
+        .ok_or_else(|| AiHubError::EvalRunNotFound(id.to_string()))?;
+    if !matches!(before.status.as_str(), "queued" | "running") {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "eval_run_not_cancellable",
+            format!("this run already finished as `{}`", before.status),
+        ));
+    }
+    if !eval_run::cancel_run(pool, id).await? {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "eval_run_not_cancellable",
+            "this run finished while the cancel was in flight",
+        ));
+    }
+    let run = eval_run::find_run(pool, organization, id)
+        .await?
+        .ok_or_else(|| AiHubError::EvalRunNotFound(id.to_string()))?;
+    let (state, state_note) = run_state(&run);
+    Ok(Json(RunSummary {
+        run,
+        state,
+        state_note,
+    }))
+}
+
+/// `POST /ai/evals/suites/{key}/baseline` body.
+#[derive(Debug, Default, Deserialize)]
+pub struct BaselineBody {
+    /// The settled run to take as the baseline.
+    pub run_id: Uuid,
+}
+
+/// `POST /ai/evals/suites/{key}/baseline` — set the suite's baseline.
+///
+/// Setting a baseline is not a read-only act and is not treated as one: it is what every later
+/// regression is measured against, so it takes `ai.evals.manage` and the run must be settled.
+pub async fn set_baseline(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Path(key): Path<String>,
+    Json(body): Json<BaselineBody>,
+) -> Result<Json<eval_run::BaselineRow>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    let pool = state.db().pool();
+    let suite = eval_store::find_suite(pool, organization, &key)
+        .await?
+        .ok_or_else(|| AiHubError::EvalSuiteNotFound(key.clone()))?;
+    Ok(Json(
+        eval_run::set_baseline(pool, organization, suite.id, body.run_id, Some(current.user.id))
+            .await?,
+    ))
 }
 
 #[cfg(test)]

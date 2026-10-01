@@ -261,16 +261,27 @@ fn validate_run(run: &NewRun) -> Result<()> {
                 .to_string(),
         ));
     }
+    // The converse is refused too, and for the same reason. A baseline is the gate's argument:
+    // a manual or scheduled run that carries one is answered by the existence check below as
+    // "not a settled run of this suite", which sends the caller hunting for a tenancy or a
+    // settle-status problem when the request itself never made sense. (The *diff view* is not
+    // affected — it picks a baseline after the fact against a settled run, separately.)
+    if run.kind != "gate" && run.base_run_id.is_some() {
+        return Err(AiHubError::InvalidEval(format!(
+            "only a `gate` run takes a `base_run_id`; a `{}` run is measured on its own",
+            run.kind
+        )));
+    }
     Ok(())
 }
 
 /// The run's own projection, shared by every read so a column cannot be added to one query only.
 const RUN_SELECT: &str = "select r.id, r.suite_id, s.key as suite_key, s.name as suite_name, \
      r.organization_id, r.kind, r.status, r.snapshot, r.model_id, r.judge_model_id, \
-     r.total_cases, r.passed_cases, r.failed_cases, r.error_cases, r.pass_rate, \
+     r.total_cases, r.passed_cases, r.failed_cases, r.error_cases, r.pass_rate::float8, \
      r.threshold_percent, r.gate, r.base_run_id, r.cost_micros, r.duration_ms, \
      r.triggered_by, r.error, r.started_at, r.finished_at, \
-     s.max_regression_points, s.blocking \
+     s.max_regression_points::float8, s.blocking \
      from ai_eval_runs r join ai_eval_suites s on s.id = r.suite_id";
 
 /// Create a run row in `queued`.
@@ -707,7 +718,7 @@ pub fn decide_gate(
 }
 
 /// What [`decide_gate`] concluded.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct GateVerdict {
     /// `pass` or `block`.
     pub gate: &'static str,

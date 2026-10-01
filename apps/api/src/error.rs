@@ -1238,6 +1238,16 @@ impl From<AiHubError> for ApiError {
                 "eval_case_not_found",
                 format!("no eval case `{id}` in this organization"),
             ),
+            // A run (REQ-107 slice 2). A `404` for the same tenancy reason as the pair above —
+            // a run id that answered "exists in another tenant" would make the run screen an
+            // existence oracle over every run in the installation. The same code also answers a
+            // second settle of an already-settled run, because the settle's status guard is
+            // what makes a double settle impossible.
+            AiHubError::EvalRunNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "eval_run_not_found",
+                format!("no eval run `{id}` in this organization"),
+            ),
             AiHubError::EvalSuiteKeyTaken(key) => Self::new(
                 StatusCode::CONFLICT,
                 "eval_suite_key_taken",

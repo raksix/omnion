@@ -977,7 +977,15 @@ pub fn validate_key(key: &str) -> Result<()> {
 }
 
 /// `tools` and `collections` are string arrays, and the run layer indexes them as such.
+///
+/// SQL NULL and JSON `null` both mean "not set", and an unset allow-list is the empty one —
+/// a run with no tool allow-list is a normal run, not a malformed one. `NewSuite::default()`
+/// therefore has to be a valid suite, and so does a caller that leaves the field out. Only a
+/// value that is present and of the wrong shape is a refusal.
 fn validate_string_list(field: &str, value: &serde_json::Value) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
     let Some(list) = value.as_array() else {
         return Err(AiHubError::InvalidEval(format!(
             "`{field}` must be a JSON array of strings"
@@ -1189,6 +1197,11 @@ mod tests {
 
     #[test]
     fn the_tool_allow_list_must_be_an_array_of_strings() {
+        // An unset allow-list is the empty one. `NewSuite::default()` carries `Value::Null` here,
+        // and a default-built suite that the store refuses is a trap for every caller that
+        // fills the struct in with `..Default::default()` — which is most of them.
+        assert!(validate_string_list("tools", &serde_json::Value::Null).is_ok());
+        assert!(validate_string_list("collections", &serde_json::Value::Null).is_ok());
         assert!(validate_string_list("tools", &serde_json::json!(["a", "b"])).is_ok());
         assert!(validate_string_list("tools", &serde_json::json!([1])).is_err());
         assert!(validate_string_list("tools", &serde_json::json!({ "a": 1 })).is_err());
