@@ -2287,6 +2287,26 @@ async function runAirgapDepth(page, report) {
   note({ step: "ready", readyDisabled });
 
   // --- flip it for real --------------------------------------------------------------------
+  // A REMOTE provider, registered so the egress verification has something to aim at.
+  //
+  // Without one the check cannot run — there is no call the gap could let through — and the panel
+  // would be exercised only in its "nothing to verify" branch. The base URL is a public host, which
+  // is the point: the check must REFUSE it, and nothing is ever sent to it, because the refusal
+  // happens before the request. It is registered through the API rather than the form so the
+  // assertion stays about what the *screen* does with the result.
+  const remoteProvider = await callApi("POST", "/v1/ai/providers", {
+    name: "QA remote provider",
+    protocol: "openai_compatible",
+    base_url: "https://api.openai.com/v1",
+    api_key: "qa-not-a-real-key",
+    enabled: true,
+  });
+  expect(
+    remoteProvider.status === 200 || remoteProvider.status === 201,
+    `the remote provider must register for the verification to have a target, got \
+     ${remoteProvider.status} ${JSON.stringify(remoteProvider.body)}`,
+  );
+  await page.waitForTimeout(200);
   await page.click("[data-airgap-confirm-submit]").catch(() => {});
   await page.waitForSelector("[data-airgap-banner]", { timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(600);
@@ -2315,6 +2335,70 @@ async function runAirgapDepth(page, report) {
   expect(
     readBack.status === 200 && readBack.body?.state?.enabled === true,
     `the API disagrees with the screen: ${JSON.stringify(readBack.body?.state?.enabled)}`,
+  );
+
+  // --- the egress verification, driven for real ---------------------------------------------
+  // This is the control the request calls "the loudest alert in this request", and until now the
+  // screen drew its result without ever pressing the button. A panel that renders a badge nobody
+  // can refresh is decoration.
+  //
+  // What is asserted is the INVERSION, which is the whole feature: the check attempts a non-local
+  // call and expects the refusal, so `blocked` is the PASS. The QA database has a fake remote
+  // provider registered below, so the button must come back `blocked` and the badge must go
+  // positive-tinted — and the word must be the one the CHECKER writes, not one the panel invented.
+  const runButton = await page.locator("[data-airgap-verify]").count();
+  expect(runButton === 1, "the verification panel must carry exactly one run button");
+  await page.click("[data-airgap-verify]").catch(() => {});
+  await page
+    .waitForSelector("[data-airgap-verify-message]", { timeout: 15000 })
+    .catch(() => {});
+  const verified = await page.evaluate(() => ({
+    result: document.querySelector("[data-airgap-verify-result]")?.getAttribute("data-result"),
+    text: (document.querySelector("[data-airgap-verify-result]")?.textContent || "").trim(),
+    outcome: document.querySelector("[data-airgap-verify-message]")?.getAttribute("data-outcome"),
+    message: (document.querySelector("[data-airgap-verify-message]")?.textContent || "").trim(),
+    error: document.querySelectorAll("[data-airgap-verify-error]").length,
+  }));
+  note({ step: "verify", ...verified });
+  expect(
+    verified.error === 0,
+    `the verification must not answer with an error: ${verified.message}`,
+  );
+  expect(
+    verified.outcome === "blocked",
+    `a refused call is the PASS and must read "blocked", saw "${verified.outcome}" — a panel \
+     testing for "passed" cannot render green and a breach would read as "Never verified"`,
+  );
+  expect(
+    verified.result === "blocked",
+    `the stored verdict must be the word the checker writes, saw "${verified.result}"`,
+  );
+  expect(
+    /refused/i.test(verified.message),
+    `the sentence must say the call was refused, saw "${verified.message}"`,
+  );
+
+  // The screen re-reads after the run, so the badge cannot sit on the stale pre-run value.
+  await page.waitForTimeout(400);
+  const afterRun = await page.evaluate(() => ({
+    result: document.querySelector("[data-airgap-verify-result]")?.getAttribute("data-result"),
+    text: (document.querySelector("[data-airgap-verify-result]")?.textContent || "").trim(),
+  }));
+  expect(
+    afterRun.result === "blocked" && /verified/i.test(afterRun.text),
+    `the badge must show the fresh verdict after a run, saw "${afterRun.result}" / "${afterRun.text}"`,
+  );
+
+  // The row agrees, read back from the API rather than from the screen's own copy of it.
+  const verifyRow = await callApi("GET", "/v1/ai/airgap");
+  expect(
+    verifyRow.body?.state?.egress_verify_result === "blocked",
+    `the stored row must carry "blocked" after a passing check, saw \
+     ${JSON.stringify(verifyRow.body?.state?.egress_verify_result)}`,
+  );
+  expect(
+    typeof verifyRow.body?.state?.egress_verified_at === "string",
+    "a verification with no timestamp cannot be compared against a later one",
   );
 
   // --- the OFF direction takes no reason ---------------------------------------------------
@@ -2403,6 +2487,14 @@ async function runAirgapDepth(page, report) {
   // sheet open, so `Escape` closes it rather than the pass ending on a modal.
   await page.keyboard.press("Escape").catch(() => {});
   const restore = await callApi("PUT", "/v1/ai/airgap", { enabled: false });
+  // The remote provider goes too. Leaving it would put a public base URL into every later pass's
+  // confirmation list, so the air-gap screen would report "1 non-local provider is refused" in a
+  // stack where nobody registered one — a finding in someone else's report with nothing pointing
+  // back here. Deleted by id in the same teardown that turns the gap off, for the same reason:
+  // an assertion that can fail must not be able to fail the cleanup.
+  if (remoteProvider && remoteProvider.body && remoteProvider.body.id) {
+    await callApi("DELETE", `/v1/ai/providers/${remoteProvider.body.id}`).catch(() => {});
+  }
   const finalRead = await callApi("GET", "/v1/ai/airgap");
   note({
     step: "restore",
