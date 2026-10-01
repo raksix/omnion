@@ -11560,3 +11560,58 @@ committed and queued instead.
 failed-run path the banner lives on — the wizard reaches a *succeeded* finish, so the failure
 branch needs a deploy that genuinely fails before the rollback button can be clicked. Then box
 133's `View Changes`, and the mobile/keyboard sweep.
+
+## Tick 102 · REQ-033 slice 1 — the developer platform's key material (branch `wave5`)
+
+**What.** Picked REQ-033 up off `pending` — the first unstarted request in this wave's order —
+because the four `in-progress` requests ahead of it are each open on exactly one thing, a
+browser pass, and the QA slot is held by a live w8 pass (holder pid 3591518, `/proc/<pid>/cwd` =
+`/mnt/apopic/omnion-w8`). Migration `0223` and the new `omnion-developer` crate: API keys, the
+key lifecycle, and the request log with its filters. This is slice 1 of 4.
+
+**The design decision, stated because it will look like a mistake.** Key material is hashed with
+SHA-256, not the Argon2id `omnion-identity` uses for passwords. A password is a low-entropy
+secret chosen by a person, so a deliberately expensive hash is the defence against a dictionary;
+an API key here is 256 bits from the OS CSPRNG, so there is no dictionary, and paying 19 MiB per
+request would slow the platform's own API to defend a secret that cannot be brute-forced
+anyway. `secret.rs` says the consequence out loud rather than burying it: a leaked database is
+safe; a leaked key is not. The write-only property is enforced in three places instead of one
+test — no `secret` field on the shape a list and a CSV export share, a separate `Minted` type
+only `create`/`rotate` produce, and a scheme prefix on the stored hash so an unreadable row
+authenticates nobody rather than everybody.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-developer` | **19 passed**, 0 failed (default build, no database) |
+| `cargo test -p omnion-developer --features store` | **23 passed**, 0 failed |
+| `pnpm typecheck` | 2/2 successful |
+
+**Two defects the tests caught while writing it, both fixed in the same commit.**
+
+1. `split_token` stripped the `omn_` namespace from the prefix, so the value it returned could
+   never equal the `prefix` column it is looked up against — every authenticated request would
+   have missed its own row. The round-trip test found it. Worth recording *how* this class
+   fails: it presents as "authentication is broken everywhere", not as a defect in a new
+   module, so nothing about the symptom would have pointed at the splitter.
+2. An IP allowlist submitted as nothing but blank rows stored an empty array, which matches no
+   address — locking the owner out of their own key with no explanation on the panel. It now
+   reads as "no restriction", the same as omitting the field.
+
+**Not done, and not ticked.** No acceptance box is checked: every box in this slice is about
+what a *request* does (a key authenticating a real call, scopes enforced, an allowlist refusing
+a source address), and no request path exists yet. The routes, the two screens, the permission
+keys in `crates/permissions/src/catalogue.rs` and the bearer-token middleware are the next slice.
+
+**Environment note for the other writers.** `/mnt/apopic` fell to **100% (430 MB free)** twice
+during this tick — a `patch` write failed outright with `No space left on device`, which is the
+signal that the next write may silently produce a 0-byte file. Reclaimed without touching anyone
+else's work: this worktree's own nine dead `/dev/shm/qa-w5*` build dirs (lsof-clean, 370 MB), a
+dangling image (581 MB), my own orphaned `qa-slot.sh` waiter reparented to PID 1, and
+`rust:1.90-slim-bookworm` (883 MB), which no container references. Builds went to
+`CARGO_TARGET_DIR=/dev/shm/w5-target` for the rest of the tick.
+
+**Next.** Slice 1's remaining half: `/developer/keys` and `/developer/logs` routes and screens,
+the catalogue entries for `developer.keys.*`, and the middleware that turns `omn_<prefix>.<secret>`
+into a scoped session — then the pass.

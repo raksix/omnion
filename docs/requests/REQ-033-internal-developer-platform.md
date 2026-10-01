@@ -1,6 +1,50 @@
 # REQ-033 — Internal Developer Platform
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + SDKs
+> **Status:** in-progress (`26871682`; tick 102 — **slice 1's data and rules are in, and the
+> ticket is picked up off `pending` deliberately rather than because the queue emptied.** REQ-005,
+> 011, 017 and 024 are all `in-progress` with exactly one thing open on each — a browser pass —
+> and the QA slot is held by a live w8 pass (holder pid 3591518 alive, `/proc/<pid>/cwd` =
+> `/mnt/apopic/omnion-w8`, checked and not assumed). A tick spent queueing a pass that cannot
+> start is a tick spent. So this tick took the first `pending` request in the wave order and
+> built the half of it that needs no browser.
+>
+> **Slice 1 — keys and logs.** Migration `0223` (numbered above the *union* high-water 0222,
+> which w7 holds, not above this branch's 0217) and the new `omnion-developer` crate: key
+> material, the key lifecycle, the request log and its filters. The property it is built around
+> is that key material is write-only, and it is enforced three times over on purpose, because
+> the leak it prevents is the one nobody notices: `model::ApiKey` — the shape a list, a detail
+> read and a CSV export share — has no secret field at all; `model::Minted` is a separate type
+> only `create` and `rotate` produce, so "the secret came back a second time" is a code path
+> that does not exist rather than a test that has to remember to fail; and the stored hash
+> carries an `omnion-api-key.v1$` prefix so a row this build cannot read authenticates nobody
+> rather than everybody.
+>
+> **A decision worth arguing in the open: the key hash is SHA-256, not Argon2id.** The obvious
+> move was to copy `omnion-identity`'s password hash, and it is the wrong one — a password is a
+> low-entropy secret chosen by a person, so 19 MiB and two passes per guess is the defence; an
+> API key is 256 bits of CSPRNG, there is no dictionary to slow down, and paying for Argon2 on
+> every request would make the platform's own API slower to defend a secret that cannot be
+> brute-forced anyway. `secret.rs` states the consequence rather than hiding it: a leaked
+> database is safe, a leaked key is not.
+>
+> **Two defects the tests caught while writing it, both real:**
+> (1) `split_token` stripped the `omn_` namespace, so the prefix it returned could never equal
+> the `prefix` stored in the row — *every* authenticated request would have missed its own
+> lookup. That reads as "auth is broken everywhere", not as a slice boundary, and the
+> round-trip test is the only thing that would have caught it before the first real caller.
+> (2) An IP allowlist of nothing but blank rows stored an empty array, which matches no address
+> and locks the owner out of their own key with nothing on the panel to explain why. It now
+> means "no restriction", the same reading as omitting the field.
+>
+> **Gates:** `cargo test -p omnion-developer` **19 passed** on the default build, **23** with
+> `--features store`, `pnpm typecheck` exit 0.
+>
+> **STILL OPEN for slice 1:** the API routes (`/developer/keys`, `/developer/logs`) and the two
+> screens, the permission keys in the catalogue (`guards::require` refuses a key that is not
+> catalogued — see the w8 REQ-133 lesson), the authentication middleware that turns a bearer
+> token into a scoped session, and the browser pass. No acceptance box is ticked: every one of
+> this slice's boxes is about what a *request* does, and no request path exists yet. ·
+> **Captured:** 2026-09-25 · **Layer:** `apps/admin` + SDKs
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
