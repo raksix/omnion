@@ -1,0 +1,25 @@
+[package]
+name = "omnion-graphql-resolvers"
+description = "The GraphQL resolver layer: one implementation of business logic, two transports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# The resolver layer is where the decision layer meets the store, so it is the FIRST crate that
+# links both `omnion-graphql` (pure) and the service crates (impure). Keeping it separate from
+# `apps/api` is what lets the tests in this crate assert the rule that matters — no SQL of its own,
+# only calls to the same service functions the REST handlers call — without a running server.
+#
+# It DOES link `omnion-permissions`, deliberately: `guard()` is the whole point, and a guard that
+# lived in the HTTP layer would be unreachable from a test.
+omnion-graphql = { path = "../graphql" }
+omnion-permissions = { path = "../permissions" }
+omnion-content = { path = "../content" }
+omnion-identity = { path = "../identity" }
+omnion-media = { path = "../media" }
+
+serde_json.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
