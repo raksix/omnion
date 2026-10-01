@@ -7440,3 +7440,71 @@ walkthrough. A third browser pass into that is the documented 29-September failu
 passes OOM-killing each other), and killing a sibling's pass to make room for mine trades one
 loop's evidence for another's. The boxes that name a screen stay unticked until a tick finds the
 box idle, which is the same condition `run.sh`'s own `flock` was added to protect.
+
+---
+
+## Tick 52 — REQ-129 slice 3: a backfill that cannot run now says so, and both screens ship
+
+**What.** Slice 3 finished, from the crate outward. `1b38a561` closes a defect the slice's own
+design had been hiding, `86c3bbbb` catalogues five event names the routes emit with no catalogue
+row, `9e1940e9` ships `/deployment/backfills`, `/deployment/backfills/{id}` and `/deployment/seeds`
+with their typed client and the depth pass that measures them.
+
+**The defect, stated once.** `can_transition` has listed `pending | paused | running -> failed` since
+the state machine was written, and nothing in the crate ever took that edge. A batch whose statement
+errored propagated the database error, the transaction rolled back, and the job sat in `running` with
+`last_error` null — indistinguishable from a job quietly working. **Every walk in the file passed,
+because every walk used a statement that works.** The `failed` column exists, the state machine knows
+it, and the only way to reach it was the database itself.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-migrations --quiet` | 86 passed |
+| `cargo test -p omnion-events --quiet` | 49 passed |
+| `cargo test -p omnion-api --test backfills` | 7 passed (36.2 s) |
+| `pnpm typecheck` (apps/admin) | exit 0 |
+| `node --check scripts/qa/walkthrough.cjs` | parse ok |
+
+**Proven to fail.** `a_failing_batch_stops_the_job_and_keeps_the_cursor_where_it_worked` writes a
+deliberately broken statement (`no_such_column`) and asserts the operator-visible half: 500 naming the
+job AND the column, state `failed`, cursor still the last GOOD key (`null` — nothing succeeded), zero
+rows written, no `backfill.completed`, the event on the bus. Reverting the single transition line
+gives `left: "pending", right: "failed"`.
+
+**The trap in the fix, which the walk caught rather than the compiler.** The first version wrote its
+own `update … set state='failed', stopped_at=now()` and wrapped it in `let _ =` as "best effort".
+There is no `stopped_at` column — the table has `paused_at` / `completed_at` / `last_error` with a
+CHECK tying `failed` to a non-null `last_error`. The statement failed with **42703**, the swallowed
+result hid it, and the job stayed `pending`. So the failure path contained a silent second failure,
+which is the one place a swallowed error is least acceptable: the path exists for when things are
+already broken. The fix routes through the crate's own `transition`, which writes the timestamps and
+the message together.
+
+**Also fixed, and it is the reason the tick is worth more than one commit.** An **unlisted event name
+is invisible to every subscriber**, because the event picker's only source is the catalogue. Five
+names were being emitted into a void. The rows now exist, and the split that earns them is not
+started-vs-resumed but what-else-could-have-happened: a pause, a completion and a failure are
+different facts about a migration in flight, and a receiver that cannot tell them apart either pages
+an operator for a pause or misses a failure.
+
+**The screens keep three distinctions a plausible-looking UI gets wrong.** A declared descriptor is
+not a job (on a fresh installation those are the ONLY rows, and rendering them through the job type
+produces a "0 of 0" bar that reads as "nothing to do"). The cursor is shown beside the counter,
+because slice 3's own proof watched `rows_done` read 2097 for 250 rows while every screen called it
+healthy progress — two independent witnesses, and the bar is deliberately not a percentage because
+`count(*) where col is null` is a table scan this screen has no business running on a keystroke. And
+`load_refused` REPLACES the Load button rather than disabling it, since a button that 409s on press
+is a dead button and the request forbids those.
+
+**Browser pass deliberately NOT started this tick (recorded, not skipped silently).** The slot holder
+PID was dead, so the place file was stale — but the box was not idle: load 15.19 on 6 cores, 28 of
+32 GB used, 35 Chrome processes and two sibling passes (w8 on a focused `--only=crm-assignment`, w3
+queued). A third browser pass into that is the documented 29-September failure, and killing a
+sibling's pass to make room for mine trades one loop's evidence for another's. The box that names a
+screen stays unticked until a tick finds the box idle.
+
+**Next.** REQ-129 slice 3's remaining work is that one browser pass. Then slice 4: the column
+classification map, the anonymised export builder and job, the single-use/expiring download, and the
+upgrade guide finalised with the rollback split.
