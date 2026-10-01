@@ -9903,3 +9903,77 @@ block), `b6c9bdfe` + `f611569f` (the gate fix and the four new legs).
 
 **Still open.** The keyboard and mobile boxes want a browser pass; the QA slot was held by a
 live w3 pass for 24 minutes of this tick, so that instrument was not available here.
+
+---
+
+## Wave 4 · tick 53 · REQ-055 slice 2a — leave end to end (data + API)
+
+**What.** Migration `0198` (`hr_leave_balances`, `hr_leave_requests`), `modules/hr::leave` and
+`::requests`, the `hr.leave.*` quartet, eleven guarded routes and nine DB walks. Five acceptance
+boxes ticked. **The screens are not built** — that is slice 2b — so no browser box is ticked and
+the REQ is not closed.
+
+**The harvest from the queued CRM pass, first.** The pass queued behind a sibling's slot holder
+turned out to be **VOID**: `apiLiveness.up: false` and `voidReasons: ["the QA stack was not
+serving"]`, with a 503 storm and `ERR_CONNECTION_REFUSED` across the whole run. So
+`crmDeals.boardRendered: false` and `boardColumns: 0` — the two counters the previous tick's
+`next_hint` told me to ask about — are a dead API, not a product defect. A VOID pass proves nothing
+about the product, and reading a counter off it would have sent me to hunt a bug that is not there.
+
+**One off-by-one that would have shipped.** `time::Weekday::number_days_from_monday` is
+**zero-indexed** (Monday = 0). The working-week constant reads as Monday–Friday, so pairing the two
+made the working week **Tuesday–Saturday**: every request would have charged one day too many,
+drained the balance a fifth too fast, and drawn a calendar bar over Sunday. No error anywhere, no
+red test — the schema accepts every number. It was caught because the walk asserted a concrete
+range (Mon 5 – Sun 11 Oct 2026 = 5 working days) instead of asserting "some days". The unit test
+now pins the mapping **by named weekday**, so changing the constant means changing the test with it.
+
+**A real gap slice 1 left.** There was no serde adapter for an absent *instant*. `dates::option`
+existed for `Date`, so the only thing an `Option<OffsetDateTime>` field could reach for was the
+**date** adapter — which compiles, and silently serialises a timestamp as `2026-10-01` and reads it
+back as midnight. The field keeps the instant type and loses the time, so two decisions on one day
+would be indistinguishable. Added `dates::instant::option`.
+
+**Four more the walks found, three of them product.**
+
+| Defect | Symptom | Cause |
+|---|---|---|
+| Every date 422'd | No request carrying a date could be created | `time::Date` has no `Deserialize` for `"2026-11-02"`; each needed the module's adapter |
+| Leave-type create 500'd | `COALESCE types text and integer cannot be matched` | `coalesce($5, 0)::numeric` mixed a text bind with an integer literal |
+| Calendar window read `[2027, 95]` | Grid cannot draw its own bounds | `json!` never consults serde, so a `Date` in one is `time`'s tuple — while the bars, which go through `Serialize`, rendered fine |
+| `days` rendered `3.00` | A list saying `3.00` beside a card saying `3` | `numeric(6,2)` always carries two decimals; normalized once at the reader with `trim_scale` |
+
+**And one in the walk itself, which is a class worth remembering.** The error envelope is
+`{"error": {"code", "message"}}`, and the walk read `body["message"]` — a silent `null`. So every
+"the refusal names the conflicting dates" assertion was **passing without ever looking at the
+message**. The status code was right, the criterion was untested. The walk now names the envelope
+once in `error_message`.
+
+**A toolchain trap, recorded because it destroys work silently.** `read_file` caps at 2000 lines;
+`mod.rs` is 2552. Reading it and writing the result back **truncated the file to 1655 lines** and
+left the tree uncompilable, with a `git diff` that looked like a plausible deletion. Caught by
+counting braces against HEAD (263/263 → 64/63). Restored with `git checkout` and redone from a
+two-page read. **Never round-trip a file through `read_file` + `write_file` when it is over the
+cap** — `patch` is the tool for an edit, and a full read is `read_file` in pages.
+
+**Proof**
+
+```
+cargo test -p omnion-module-hr --lib            69 passed   (48 in slice 1, 21 new)
+cargo test -p omnion-permissions --lib          70 passed   (four keys, 10 -> 14)
+cargo test -p omnion-api --test hr_leave         9 passed   against a live PostgreSQL, 148s
+cargo test -p omnion-api --test hr               9 passed   slice 1, no regression, 215s
+turbo run typecheck                              2 successful
+```
+
+The migration was applied with `psql` through all **65** files in order against a scratch database,
+because cargo never opens the file and the crate compiles green against a migration that could not
+be installed. The QA database itself was at migration 188 and had no `hr_employees` at all, so it
+was dropped and recreated before the walks.
+
+**Next.** Slice 2b: the screens. `/hr/leave` (list + absence calendar), `/hr/leave/new`,
+`/hr/leave/{id}` (detail with the decision panel and the timeline), `/hr/leave/types` (the editor),
+the `hr` module nav, and the `/hr/*` routes in `scripts/qa/walkthrough.cjs` — a screen that is not
+in the inventory is not accepted. The browser-gated boxes (empty/loading/error, mobile 390×844,
+REQ-051's CRM screen states, REQ-052's mobile) all stay unticked until that pass can run: the QA
+slot was held by a live `omnion-w3` holder for this whole tick.
