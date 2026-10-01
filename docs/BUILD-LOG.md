@@ -8294,3 +8294,140 @@ without it. Then `run-from-here` for `pillsPainted > 0` beside `inRunButNotPaint
 `edgeSelectionPruned`. The plugin row stays BLOCKED on REQ-121. Before a pass: check the summary
 for `chrome-error://` in a page url and confirm the admin error log is quiet. Always
 `QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202`.
+
+
+## Tick 61 — 2026-10-01 · REQ-004 · the deferred pass RAN, the tick-60 fix worked, and two rows were measuring a correct product
+
+**The pass happened.** Ten ticks deferred. It took the slot at 10:52 (the holder was a live w5
+pass, pid 2579481, `/proc/2579481/cwd` = `/mnt/apopic/omnion-w5`), walked 55 routes and 1,844
+clicks, ran all four of this REQ's target rows — and then the stack stopped answering mid-pass,
+which is the documented 29-September failure: three other passes (w5, w8, w6) were on the box at
+once, 45 Chrome processes, load 13. The pass's own `FATAL: the QA stack stopped answering` is
+recorded rather than retried, because a second pass into that box is what causes it.
+
+**The tick-60 fix is proven on live data, which is the first time its own conjunction could have
+been read.** `step-trace` reports `rowIsMeasurable: true`, `targetFromRun: true`,
+`clickedNode: "wait-3"`, `panelFound: true`, `stepsShown: 1`, `heading: "Step 1"`,
+`subheading: "1 step behind this node."` — the click half of the criterion is genuinely
+exercised, and it got there by a target that came from the run rather than from the pill. The
+proof is not that the row went green; it is that `pillChosenNode: null` sits beside
+`paintedOnTarget: false` and the panel **still opened**, which is precisely the split the fix was
+built for.
+
+**Then the reading turned out to be wrong in two ways, and both are the harness's fault.**
+
+### Finding 1 — the set comparison could not see that it was right
+
+```text
+shownStepNos:           ["1"]      off getAttribute — a STRING
+runStepNos:             [1]        out of JSON       — a NUMBER
+stepsShownButNotInRun:  ["1"]
+stepsInRunButNotShown:  [1]
+```
+
+On a panel that had opened, rendered its one step, and had `stepsWithParams === stepsWithOutput
+=== stepsTotal === 3` waiting on the wire. The sets are **equal**. `["1"].includes(1)` is `false`
+in both directions, so the gate the next tick was going to read — `stepsInRunButNotShown: []` —
+was unsatisfiable on correct code.
+
+This is the fifth instance of this REQ's habit and the first one the existing guard could not
+find, because the guard asserted the comparison's **shape**: both directions present,
+`filter`/`includes` spelled the way the note spells them. All of that was true. It never asked
+whether the two sides could ever be *equal*, and nothing in the expression that performs the
+comparison can answer that. A claim about a use, answered by a claim about a mention — the same
+shape as tick 58's prefix collision, one level down.
+
+The rule is worth stating on its own because it is not the "read the subject" rule the other four
+instances were: **a set comparison between two sources is only a comparison if both sides are the
+same type.** Coerced at the DOM boundary rather than in the comparison, because `stepNo` is
+consumed by `stepsWithoutBothSides`, by `shownStepNos` and by the note's own field, and a
+normalise-at-each-use fix is three chances to forget one.
+
+### Finding 2 — the run was read before the engine had claimed it
+
+`run-from-here` reported `startedFrom: "wait-3"` beside `skipped: 0`, `statuses: ["pending"]`,
+`pillsPainted: 0` and `inRunButNotPainted: ["wait-3","act-3","end-3"]`.
+
+The first field says the run **was** created and **was** started from a mid-graph node. The rest
+say the product does not paint pills, does not write a skipped prefix, and does not reach its own
+nodes. None of that is true: the row clicked the button, waited 2500ms, and read the run once,
+during the window in which the engine had accepted the request and claimed nothing. Four
+readings, all of them "the product is missing this", all downstream of one fixed sleep.
+
+**A wait that measures the wrong thing is worse than no wait, because it yields numbers rather
+than an absence.** `startedFrom` was non-null, so the row looked alive. The 2500 was a guess
+about how long a run takes, and this pass shared its box with three sibling passes — a
+duration-based wait is wrong exactly there and right everywhere else, which is the worst place for
+a guess to live.
+
+`settleRun` polls until the run stops **moving**, and requires two identical readings: one is not
+enough, because two polls inside the same engine tick see the same bytes twice. It reads the
+execution's own status and step statuses rather than the canvas, because the canvas is the thing
+under test — a wait that depends on the subject is the tick-60 defect wearing a different hat. And
+it returns `settled: false` when the run never stops moving, because a helper whose only answer
+is "settled" forces every caller to report a hung run as a finished one. The note carries
+`runSettled` as a single switch, for the same reason `rowIsMeasurable` is one: a conjunction
+nobody can hold under time pressure is how a vacuous gate gets closed.
+
+**What this reading still cannot tell us.** `outputRendered: 0` beside `statuses: ["pending"]` is
+the *same* cause, not a missing output block — the step had not run. The wire says the server
+sent all three. So both conjunctions are still unticked, and the reason is now a named field
+rather than an argument.
+
+### Three of my own new guards were wrong before they were right
+
+This is the part worth keeping, because it is the third time this REQ has produced a guard that
+could not have caught the defect it was written for — and the first time the mutation harness is
+what surfaced it.
+
+1. **M3 was a strawman.** I mutated the payload helper's *call site* (`blocks(block, "inputs")`)
+   while the guard reads the *helper*, and the helper still scoped to the step, so the suite
+   stayed green. A strawman in a mutation harness is worse than no mutation: it reports
+   "SURVIVED" for a defect nobody committed. The mutation now rewrites the helper's own
+   `stepBlock.querySelector`.
+2. **M9 ran against the wrong suite.** The assertion it breaks lives in
+   `step-trace-target.test.ts`, not in the file being run, so "the suite is still green" was an
+   answer about a question nobody asked. A mutation may now name the suite that carries it, and
+   the runner asserts that suite exists rather than trusting the default.
+3. **M11 proved nothing at all.** It *appended* a second early-return beside the real
+   two-reading check and left the real check in place, so the row still required two readings and
+   the harness reported 12/13. The regression has to **remove** the requirement, not sit next to
+   it.
+
+The harness also refused M12 for the right reason before I had finished writing it — the
+`runSettled` field is in the note, which is neither the row window nor the run window. Three
+named windows now exist rather than one wide one, and the refusal is left in place: a wider
+window is a window that can land on the wrong occurrence of a common line.
+
+**Proof.**
+- `node --test --experimental-strip-types apps/admin/features/workflows/*.test.ts` → **333 passed**
+  (331 → 333, +2)
+- `pnpm typecheck` → 2/2 successful
+- `node --check scripts/qa/walkthrough.cjs` → clean (14,515 → 14,601 lines)
+- `step-trace-row.mutation.mjs` → **10/10** (new harness)
+- `run-from-here-row.mutation.mjs` → **13/13** (was 9/9, +4)
+- `step-trace-target` 9/9, `table-mode-row` 8/8, `undo-selection-edge-row` 12/12 — **all four
+  siblings run, not just the two touched**; an unapplied mutation prints a line that looks like a
+  real failure and is easy to scroll past
+- `cargo test -p omnion-workflows --lib` unchanged; no Rust was touched this tick
+
+**A box-level note worth keeping.** The pass died with `/mnt/apopic` at 100% and `/` at 99%, and
+a `patch` failed mid-write with `No space left on device` — leaving a `.hermes-tmp.*` file in
+`scripts/qa/`. The repository was not corrupted (the write is atomic and left no partial edit),
+but the temp file had to be swept by hand before `git status` was clean again. Sweeping own
+`qa-artifacts/` freed 205M and took the mount back to 97%. **A `No space left` error on a write
+is not a failed write**, and the difference is worth checking with `git status` before assuming
+either.
+
+**Next.** One pass, which closes both rows if the run settles: `run-from-here` for
+`runSettled: true` AND `skipped > 0` AND `pillsPainted > 0` AND `inRunButNotPainted: []` AND
+`paintedButNotInRun: []`, then `step-trace` for `rowIsMeasurable: true` AND
+`stepsWithoutBothSides: []` AND `stepsInRunButNotShown: []` AND `stepsShownButNotInRun: []` AND the
+wire equality. `table-save-survives` for `clicked > 0` AND `inspected > 0` AND
+`builderSeesTableEdit: true`; `undo-selection-edge` for `edgeRemovedByUndo` beside
+`edgeSelectionPruned`. The plugin row stays BLOCKED on REQ-121. The `workflow-table` depth pass
+also needs its step name corrected — it posted an action named `log`, which is not one of the ten
+the server accepts, and read the refusal it was given. Always
+`QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202`, and check the box is idle
+before starting one: this tick queued for the slot successfully and still died, because the slot
+was free while the BOX was not.
