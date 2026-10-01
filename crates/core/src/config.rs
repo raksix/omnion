@@ -699,7 +699,122 @@ impl Default for AiHubConfig {
             agent_runner_enabled: true,
             runner_concurrency: DEFAULT_AI_RUNNER_CONCURRENCY,
             log_runner_enabled: true,
+
+/// The installation's Web Push identity (`OMNION_PUSH_*`, REQ-021 slice 6).
+///
+/// One P-256 key pair per installation, generated at deploy time. The request says it is
+/// "generated at deploy time and kept only in the platform secret store", and this is the
+/// honest form of that for a platform whose secret store is REQ-125's and not yet built: the
+/// key material is read from the environment, **write-only in every rendering**, and the
+/// public half is derived from it so the two can never disagree.
+///
+/// **The private half is a key that can push to every subscribed browser in this
+/// installation.** It is `Debug`-redacted for the same reason the SMTP password is: a
+/// process that logs its own VAPID private key is a process whose subscribers can be
+/// spammed by anybody who can read the log.
+///
+/// `is_usable` is the whole point of the struct and it is deliberately strict. A push service
+/// checks that the JWT's `aud` names the endpoint host and that the signature verifies against
+/// the `public_key` the browser was told to trust; a pair where only one half is present, or
+/// where the public half does not match the private one, produces a token that is refused on
+/// every send. Reporting such an installation as ready is the same green light wired to nothing
+/// that the webhook readiness branch was.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PushConfig {
+    /// The P-256 private key, base64url without padding (`OMNION_PUSH_PRIVATE_KEY`).
+    ///
+    /// Raw scalar bytes when decoded, so the value an operator pastes is the one the
+    /// Web Push specification describes and not a DER wrapper around it.
+    private_key: Option<String>,
+    /// The contact address a push service uses to reach an operator about a failing
+    /// subscription (`OMNION_PUSH_CONTACT`), conventionally `mailto:`.
+    ///
+    /// Not a secret and not optional in the specification: a token whose `sub` is not a
+    /// `mailto:` or `https:` URL is rejected outright by some push services.
+    contact: Option<String>,
+}
+
+impl PushConfig {
+    /// The private key, raw 32 bytes, when one is configured and well-formed.
+    ///
+    /// `None` for absent, for empty, and for a value that is not base64url — the third case
+    /// matters because a truncated or padded paste would otherwise be *some* 32 bytes and
+    /// produce a key that signs correctly and matches nobody's expectation.
+    #[must_use]
+    pub fn private_key_bytes(&self) -> Option<Vec<u8>> {
+        let raw = self.private_key.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
         }
+        let bytes = crate::base64url::decode(raw)?;
+        (bytes.len() == 32).then_some(bytes)
+    }
+
+    /// Whether a send could be attempted at all: a usable key **and** a contact address.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.private_key_bytes().is_some() && self.contact().is_some()
+    }
+
+    /// The contact address, when it is one a push service accepts.
+    ///
+    /// The check is on the *scheme* because the specification requires one and because the
+    /// alternative is a token rejected at send time, days after the operator believed push
+    /// was configured.
+    #[must_use]
+    pub fn contact(&self) -> Option<&str> {
+        let raw = self.contact.as_deref()?.trim();
+        let ok = (raw.starts_with("mailto:") || raw.starts_with("https://"))
+            && !raw.contains(char::is_whitespace);
+        ok.then_some(raw)
+    }
+
+    /// Whether a private key was given at all, well-formed or not.
+    ///
+    /// Separate from [`Self::is_usable`] so the settings screen can tell "no push key was
+    /// configured" from "the push key is configured but unusable", which are different fixes.
+    #[must_use]
+    pub fn has_private_key(&self) -> bool {
+        self.private_key
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+    }
+
+    /// The base64url public key, derived from the private half.
+    ///
+    /// Derived rather than configured, because a pair supplied as two strings can disagree and
+    /// the failure is invisible until every send is refused.
+    #[must_use]
+    pub fn public_key(&self) -> Option<String> {
+        let bytes = self.private_key_bytes()?;
+        Some(crate::vapid::public_key_from_private(&bytes)?)
+    }
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            private_key: None,
+            contact: None,
+        }
+    }
+}
+
+/// Render the push settings without the private key.
+impl std::fmt::Debug for PushConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PushConfig")
+            .field(
+                "private_key",
+                &if self.has_private_key() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .field("contact", &self.contact.as_deref().unwrap_or("<none>"))
+            .finish()
     }
 }
 
@@ -793,6 +908,8 @@ pub struct Config {
     pub retention: RetentionConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
+    /// The installation's Web Push identity (REQ-021, slice 6).
+    pub push: PushConfig,
     /// The secret CSRF tokens are derived from (REQ-012, slice 2).
     pub csrf: CsrfSecret,
     /// Logging.
@@ -1039,6 +1156,15 @@ impl Config {
             timeout_ms: read_positive(&read, "OMNION_SMTP_TIMEOUT_MS", DEFAULT_SMTP_TIMEOUT_MS)?,
         };
 
+        // Web Push (REQ-021 slice 6). Read, never generated: a key the platform invents at
+        // boot would change on every restart, and every browser holding a subscription to the
+        // previous key would be silently unreachable. `generate` exists for the deploy-time
+        // step the request describes, and an operator pastes its output into the environment.
+        let push = PushConfig {
+            private_key: read("OMNION_PUSH_PRIVATE_KEY"),
+            contact: read("OMNION_PUSH_CONTACT"),
+        };
+
         // The CSRF secret is the one piece of configuration the platform refuses to invent: a
         // deployment that sets none still boots, and every cookie-authenticated mutation then
         // answers 403 rather than skipping the check. Failing open would turn a missing key into
@@ -1059,6 +1185,7 @@ impl Config {
             ai_hub,
             retention,
             mail,
+            push,
             csrf,
             log,
         };
@@ -1100,6 +1227,7 @@ impl Default for Config {
             ai_hub: AiHubConfig::default(),
             retention: RetentionConfig::default(),
             mail: MailConfig::default(),
+            push: PushConfig::default(),
             // No secret by default, which is the honest default: a default key would be a key
             // every deployment shares, and a shared CSRF secret is no CSRF secret.
             csrf: CsrfSecret::default(),
@@ -1170,6 +1298,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base64url;
 
     fn config_from(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
         let map: std::collections::HashMap<String, String> = pairs
@@ -1414,6 +1543,145 @@ mod tests {
         assert_eq!(config.mail.timeout_ms, DEFAULT_SMTP_TIMEOUT_MS);
         assert!(!config.mail.authenticates(), "no credentials by default");
         assert!(config.mail.is_usable());
+
+        // **Push is off by default, and the reason is that it cannot be on by default.**
+        // Readiness has to report "no push key is configured" rather than inventing a key at
+        // boot: a key the platform mints per process would invalidate every existing browser
+        // subscription on every restart.
+        assert!(!config.push.has_private_key());
+        assert!(!config.push.is_usable());
+        assert!(config.push.public_key().is_none());
+    }
+
+    /// A 32-byte private key, base64url — the same 0x01..=0x20 scalar `vapid`'s tests use, so
+    /// the fixture is one the signing code has already proved is a valid P-256 key.
+    const PUSH_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA";
+    /// A contact address the specification accepts.
+    const PUSH_CONTACT: &str = "mailto:push@omnion.invalid";
+
+    #[test]
+    fn a_configured_push_key_is_usable_and_derives_its_own_public_half() {
+        let config = config_from(&[
+            ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
+            ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
+        ])
+        .expect("a valid key must load");
+
+        assert!(config.push.has_private_key());
+        assert!(config.push.is_usable());
+        assert_eq!(
+            config.push.public_key().as_deref(),
+            crate::vapid::public_key_from_private(&base64url::decode(PUSH_KEY).expect("b64"))
+                .as_deref(),
+            "the public half is derived, never configured — the two cannot disagree"
+        );
+        // And the derived key is one a browser can actually subscribe with.
+        let point =
+            base64url::decode(config.push.public_key().expect("derived").as_str()).expect("b64");
+        assert_eq!(point.len(), 65);
+        assert_eq!(point[0], 0x04, "the uncompressed SEC1 point tag");
+    }
+
+    #[test]
+    fn a_malformed_push_key_is_not_a_usable_key_but_is_still_reported_as_present() {
+        // The distinction is the whole point of `has_private_key`: "you pasted something that
+        // is not a key" and "you pasted nothing" are different fixes, and a readiness screen
+        // that says "no push key configured" for the first one sends the operator looking in
+        // the wrong place.
+        for bad in ["not-base64!", "AAAA", "c2hvcnQ=", "not-a-key-at-all"] {
+            let config = config_from(&[
+                ("OMNION_PUSH_PRIVATE_KEY", bad),
+                ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
+            ])
+            .expect("a bad value must not stop the process booting");
+            assert!(!config.push.is_usable(), "{bad:?} must not be a usable key");
+            assert!(
+                config.push.has_private_key(),
+                "{bad:?} is present but unusable — the operator needs to be told which"
+            );
+            assert!(config.push.public_key().is_none());
+        }
+
+        // **Whitespace is absence, not malformedness.** An environment variable holding
+        // spaces is what a templated deployment file produces when the value was never
+        // substituted, and reporting "a push key is configured but broken" for that sends the
+        // operator to debug a key that does not exist. It reads as nothing configured, which
+        // is the truth.
+        for blank in ["", "   ", "\t"] {
+            let config = config_from(&[
+                ("OMNION_PUSH_PRIVATE_KEY", blank),
+                ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
+            ])
+            .expect("loads");
+            assert!(
+                !config.push.has_private_key(),
+                "{blank:?} is an absent key, not a broken one"
+            );
+            assert!(!config.push.is_usable());
+        }
+    }
+
+    #[test]
+    fn a_key_without_a_contact_is_present_but_not_usable() {
+        // A push service rejects a token whose `sub` is not a mailto: or https: URL, so a
+        // half-configured installation must not claim readiness.
+        let config = config_from(&[("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY)]).expect("loads");
+        assert!(config.push.has_private_key());
+        assert!(config.push.contact().is_none());
+        assert!(!config.push.is_usable());
+    }
+
+    #[test]
+    fn a_contact_without_a_scheme_is_refused() {
+        for bad in [
+            "ops@example.com",
+            "mailto:ops@example .com",
+            "ftp://ops@x.test",
+        ] {
+            let config = config_from(&[
+                ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
+                ("OMNION_PUSH_CONTACT", bad),
+            ])
+            .expect("loads");
+            assert!(config.push.contact().is_none(), "{bad:?} must be refused");
+            assert!(!config.push.is_usable());
+        }
+        let good = config_from(&[
+            ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
+            ("OMNION_PUSH_CONTACT", "https://ops.example.com/push"),
+        ])
+        .expect("loads");
+        assert_eq!(
+            good.push.contact(),
+            Some("https://ops.example.com/push"),
+            "an https contact is as valid as a mailto one"
+        );
+    }
+
+    #[test]
+    fn the_push_private_key_is_never_rendered() {
+        // The value that can push to every subscriber must not appear in a log line, a panic
+        // message or a test failure. This is the SMTP password's rule, applied to the key that
+        // outranks it.
+        let config = config_from(&[
+            ("OMNION_PUSH_PRIVATE_KEY", PUSH_KEY),
+            ("OMNION_PUSH_CONTACT", PUSH_CONTACT),
+        ])
+        .expect("loads");
+
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains(PUSH_KEY),
+            "the private key reached a Debug rendering: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // The whole config renders, and the key is absent from all of it.
+        assert!(!format!("{:?}", config.push).contains(PUSH_KEY));
+        // The public half is not a secret — and it is *not* in the Debug output either,
+        // because `Config`'s own rendering is a field list that names the push section and
+        // nothing more. The browser gets it from the API, which is where it belongs: it is
+        // per-installation data, not a boot log.
+        assert!(!rendered.contains(&config.push.public_key().expect("derived")));
     }
 
     #[test]
