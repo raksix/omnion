@@ -97,10 +97,15 @@ pub struct SuiteRow {
     /// How many of the enabled cases name a `rubric`, i.e. need the judge.
     pub rubric_case_count: i64,
     /// The most recent run's pass rate, or NULL when the suite has never run.
+    ///
+    /// Always NULL in slice 1: `ai_eval_runs` is slice 2's table, and reading it here would
+    /// make this slice's every query fail on a fresh database until that migration lands. The
+    /// column is in the struct and in the projection from the start so slice 2 is a query
+    /// change, not a shape change the panel has to absorb.
     pub last_pass_rate: Option<f64>,
-    /// When the last run finished, or NULL.
+    /// When the last run finished, or NULL. Always NULL in slice 1, as above.
     pub last_run_at: Option<OffsetDateTime>,
-    /// The last run's gate verdict, or NULL.
+    /// The last run's gate verdict, or NULL. Always NULL in slice 1, as above.
     pub last_gate: Option<String>,
 }
 
@@ -134,16 +139,27 @@ pub struct CaseRow {
     /// When it last changed.
     pub updated_at: OffsetDateTime,
     /// The most recent result for this case, or NULL when it has never run.
+    ///
+    /// Always NULL in slice 1, for the same reason as [`SuiteRow::last_pass_rate`]: the table
+    /// that would answer it is slice 2's.
     pub last_status: Option<String>,
-    /// When it last ran.
+    /// When it last ran. Always NULL in slice 1, as above.
     pub last_run_at: Option<OffsetDateTime>,
 }
 
 /// The columns both list queries project.
+// The two `numeric` columns are cast to `float8` in the projection rather than decoded as
+// `BigDecimal`. The request models them as numeric for exact storage — a tolerance of 5.00
+// should not drift — but nothing here does arithmetic that needs the exact decimal: the value
+// is validated, stored, and compared against a run's percentage. `f64` is what the rest of
+// this crate uses for the same kind of number (`temperature`), and mixing two numeric
+// representations across a struct is how a value ends up 0.1 apart from itself on the way
+// through the panel.
 const SUITE_COLUMNS: &str = "s.id, s.organization_id, s.key, s.name, s.description, s.target, \
-     s.agent_id, s.copilot_key, s.task, s.model_id, s.temperature, s.tools, s.collections, \
-     s.threshold_percent, s.max_regression_points, s.blocking, s.schedule, s.judge_model_id, \
-     s.judge_prompt, s.judge_prompt_version, s.enabled, s.created_by, s.created_at, s.updated_at";
+     s.agent_id, s.copilot_key, s.task, s.model_id, s.temperature::float8, s.tools, s.collections, \
+     s.threshold_percent, s.max_regression_points::float8, s.blocking, s.schedule, \
+     s.judge_model_id, s.judge_prompt, s.judge_prompt_version, s.enabled, s.created_by, \
+     s.created_at, s.updated_at";
 
 /// List every suite a tenant owns, newest name order.
 ///
@@ -157,12 +173,14 @@ pub async fn list_suites(pool: &PgPool, organization_id: Uuid) -> Result<Vec<Sui
            (select count(*) from ai_eval_cases c where c.suite_id = s.id and c.enabled) as enabled_case_count, \
            (select count(*) from ai_eval_cases c where c.suite_id = s.id and c.enabled \
               and c.expected ? 'rubric') as rubric_case_count, \
-           (select r.pass_rate from ai_eval_runs r where r.suite_id = s.id \
-              and r.status in ('passed', 'failed') order by r.started_at desc limit 1) as last_pass_rate, \
-           (select r.finished_at from ai_eval_runs r where r.suite_id = s.id \
-              and r.status in ('passed', 'failed') order by r.started_at desc limit 1) as last_run_at, \
-           (select r.gate from ai_eval_runs r where r.suite_id = s.id \
-              and r.status in ('passed', 'failed') order by r.started_at desc limit 1) as last_gate \
+           -- The last-run columns are slice 2's. They are NULL here rather than read from
+           -- ai_eval_runs, because a query that names a table a later migration creates makes
+           -- THIS slice dead until that one lands: the walk failed on a missing relation the
+           -- moment it touched a suite row, which is a slice that only works once its successor
+           -- is finished. Slice 2 replaces the three NULLs with the sub-selects.
+           null::numeric as last_pass_rate, \
+           null::timestamptz as last_run_at, \
+           null::text as last_gate \
          from ai_eval_suites s \
          where s.organization_id = $1 \
          order by s.name, s.key"
@@ -190,12 +208,14 @@ pub async fn find_suite(
            (select count(*) from ai_eval_cases c where c.suite_id = s.id and c.enabled) as enabled_case_count, \
            (select count(*) from ai_eval_cases c where c.suite_id = s.id and c.enabled \
               and c.expected ? 'rubric') as rubric_case_count, \
-           (select r.pass_rate from ai_eval_runs r where r.suite_id = s.id \
-              and r.status in ('passed', 'failed') order by r.started_at desc limit 1) as last_pass_rate, \
-           (select r.finished_at from ai_eval_runs r where r.suite_id = s.id \
-              and r.status in ('passed', 'failed') order by r.started_at desc limit 1) as last_run_at, \
-           (select r.gate from ai_eval_runs r where r.suite_id = s.id \
-              and r.status in ('passed', 'failed') order by r.started_at desc limit 1) as last_gate \
+           -- The last-run columns are slice 2's. They are NULL here rather than read from
+           -- ai_eval_runs, because a query that names a table a later migration creates makes
+           -- THIS slice dead until that one lands: the walk failed on a missing relation the
+           -- moment it touched a suite row, which is a slice that only works once its successor
+           -- is finished. Slice 2 replaces the three NULLs with the sub-selects.
+           null::numeric as last_pass_rate, \
+           null::timestamptz as last_run_at, \
+           null::text as last_gate \
          from ai_eval_suites s \
          where s.organization_id = $1 and s.key = $2"
     );
@@ -219,12 +239,14 @@ pub async fn find_suite_by_id(
            (select count(*) from ai_eval_cases c where c.suite_id = s.id and c.enabled) as enabled_case_count, \
            (select count(*) from ai_eval_cases c where c.suite_id = s.id and c.enabled \
               and c.expected ? 'rubric') as rubric_case_count, \
-           (select r.pass_rate from ai_eval_runs r where r.suite_id = s.id \
-              and r.status in ('passed', 'failed') order by r.started_at desc limit 1) as last_pass_rate, \
-           (select r.finished_at from ai_eval_runs r where r.suite_id = s.id \
-              and r.status in ('passed', 'failed') order by r.started_at desc limit 1) as last_run_at, \
-           (select r.gate from ai_eval_runs r where r.suite_id = s.id \
-              and r.status in ('passed', 'failed') order by r.started_at desc limit 1) as last_gate \
+           -- The last-run columns are slice 2's. They are NULL here rather than read from
+           -- ai_eval_runs, because a query that names a table a later migration creates makes
+           -- THIS slice dead until that one lands: the walk failed on a missing relation the
+           -- moment it touched a suite row, which is a slice that only works once its successor
+           -- is finished. Slice 2 replaces the three NULLs with the sub-selects.
+           null::numeric as last_pass_rate, \
+           null::timestamptz as last_run_at, \
+           null::text as last_gate \
          from ai_eval_suites s \
          where s.organization_id = $1 and s.id = $2"
     );
@@ -243,12 +265,11 @@ pub async fn list_cases(
     suite_id: Uuid,
 ) -> Result<Vec<CaseRow>> {
     let sql = "select c.id, c.suite_id, c.organization_id, c.name, c.input, c.expected, \
-               c.weight, c.tags, c.enabled, c.source, c.source_run_id, c.created_at, c.updated_at, \
-               (select r.status from ai_eval_case_results r where r.case_id = c.id \
-                  order by r.id desc limit 1) as last_status, \
-               (select (select rr.started_at from ai_eval_runs rr where rr.id = r.run_id) \
-                  from ai_eval_case_results r where r.case_id = c.id \
-                  order by r.id desc limit 1) as last_run_at \
+               c.weight::float8, c.tags, c.enabled, c.source, c.source_run_id, c.created_at, \
+               c.updated_at, \
+               -- Slice 2 fills these from ai_eval_case_results; see the note on SuiteRow.
+               null::text as last_status, \
+               null::timestamptz as last_run_at \
              from ai_eval_cases c \
              where c.organization_id = $1 and c.suite_id = $2 \
              order by c.name, c.id";
@@ -267,8 +288,8 @@ pub async fn find_case(
     id: Uuid,
 ) -> Result<Option<CaseRow>> {
     let sql = "select c.id, c.suite_id, c.organization_id, c.name, c.input, c.expected, \
-               c.weight, c.tags, c.enabled, c.source, c.source_run_id, c.created_at, c.updated_at, \
-               null::text as last_status, null::timestamptz as last_run_at \
+               c.weight::float8, c.tags, c.enabled, c.source, c.source_run_id, c.created_at, \
+               c.updated_at, null::text as last_status, null::timestamptz as last_run_at \
              from ai_eval_cases c where c.organization_id = $1 and c.id = $2";
     let row = sqlx::query_as::<_, CaseRow>(sql)
         .bind(organization_id)
@@ -357,13 +378,17 @@ pub struct SuiteChanges {
 /// Called on create and on every edit, because an edit is how a suite is quietly broken: the
 /// editor can clear the judge model and leave a `rubric` case with nothing to judge it, and
 /// the next run then reports every rubric case as an error for a reason nobody changed.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_suite(
     target: &str,
+    agent_id: Option<Uuid>,
+    copilot_key: Option<&str>,
+    task: Option<&str>,
+    model_id: Option<Uuid>,
     threshold_percent: i32,
     max_regression_points: f64,
     temperature: Option<f64>,
     judge_model_id: Option<Uuid>,
-    model_id: Option<Uuid>,
     judge_prompt: Option<&str>,
     schedule: Option<&str>,
     judge_prompt_version: i32,
@@ -372,6 +397,39 @@ pub fn validate_suite(
         return Err(AiHubError::InvalidEval(format!(
             "unknown target `{target}`; expected agent, copilot, task or model"
         )));
+    }
+    // The target and its reference have to agree, and only one may be set. The table constraint
+    // says this too, but a caller that reached it got SQLSTATE 23514 and a constraint name
+    // instead of a sentence naming the target — and the editor needs to know WHICH field to
+    // clear. The run layer is where this matters most: it has to choose one thing to record in
+    // the snapshot, and a suite that names two makes that choice arbitrary.
+    let references = [
+        ("agent_id", agent_id.is_some()),
+        ("copilot_key", copilot_key.is_some()),
+        ("task", task.is_some()),
+        ("model_id", model_id.is_some()),
+    ];
+    let expected = match target {
+        "agent" => "agent_id",
+        "copilot" => "copilot_key",
+        "task" => "task",
+        _ => "model_id",
+    };
+    let set: Vec<&str> = references
+        .iter()
+        .filter(|(_, is_set)| *is_set)
+        .map(|(name, _)| *name)
+        .collect();
+    if set != [expected] {
+        let named = if set.is_empty() {
+            format!("`{expected}` must be set for target `{target}`")
+        } else {
+            format!(
+                "target `{target}` needs only `{expected}`, but {} is also set",
+                set.iter().filter(|name| **name != expected).copied().collect::<Vec<_>>().join(" and ")
+            )
+        };
+        return Err(AiHubError::InvalidEval(named));
     }
     if !(1..=100).contains(&threshold_percent) {
         return Err(AiHubError::InvalidEval(format!(
@@ -477,11 +535,14 @@ pub async fn create_suite(
 ) -> Result<SuiteRow> {
     validate_suite(
         &suite.target,
+        suite.agent_id,
+        suite.copilot_key.as_deref(),
+        suite.task.as_deref(),
+        suite.model_id,
         suite.threshold_percent,
         suite.max_regression_points,
         suite.temperature,
         suite.judge_model_id,
-        suite.model_id,
         suite.judge_prompt.as_deref(),
         suite.schedule.as_deref(),
         1,
@@ -572,11 +633,14 @@ pub async fn update_suite(
 
     validate_suite(
         &current.target,
+        current.agent_id,
+        current.copilot_key.as_deref(),
+        current.task.as_deref(),
+        current.model_id,
         threshold_percent,
         max_regression_points,
         temperature,
         judge_model_id,
-        current.model_id,
         judge_prompt.as_deref(),
         schedule.as_deref(),
         current.judge_prompt_version,
@@ -590,6 +654,18 @@ pub async fn update_suite(
     let prompt_changed = judge_prompt != current.judge_prompt;
     let judge_prompt_version =
         i32::from(prompt_changed) + current.judge_prompt_version;
+
+    // The blocking/rubric rule is checked BEFORE the write, not after it. It was checked after
+    // in the first cut, which meant a refused edit had already cleared the judge before the
+    // refusal was raised: the walk caught it by reading the row back and finding the change
+    // half-applied. A validation that runs after its own write is not a validation.
+    if blocking && judge_model_id.is_none() && suite_has_rubric_cases(pool, id).await? {
+        return Err(AiHubError::InvalidEval(
+            "this suite has a `rubric` case, so `judge_model_id` is required while it is \
+             blocking"
+                .to_string(),
+        ));
+    }
 
     let sql = "update ai_eval_suites set name = $3, description = $4, temperature = $5, \
                  tools = $6, collections = $7, threshold_percent = $8, \
@@ -618,16 +694,6 @@ pub async fn update_suite(
         .rows_affected();
     if affected == 0 {
         return Err(AiHubError::EvalSuiteNotFound(id.to_string()));
-    }
-
-    // A blocking suite that has rubric cases and has just lost its judge is refused here, where
-    // the editor can mark the field, rather than at run time as a page of errors.
-    if blocking && judge_model_id.is_none() && suite_has_rubric_cases(pool, id).await? {
-        return Err(AiHubError::InvalidEval(
-            "this suite has a `rubric` case, so `judge_model_id` is required while it is \
-             blocking"
-                .to_string(),
-        ));
     }
 
     find_suite_by_id(pool, organization_id, id)
@@ -853,8 +919,8 @@ pub async fn cases_for_run(
     suite_id: Uuid,
 ) -> Result<Vec<CaseRow>> {
     let sql = "select c.id, c.suite_id, c.organization_id, c.name, c.input, c.expected, \
-               c.weight, c.tags, c.enabled, c.source, c.source_run_id, c.created_at, c.updated_at, \
-               null::text as last_status, null::timestamptz as last_run_at \
+               c.weight::float8, c.tags, c.enabled, c.source, c.source_run_id, c.created_at, \
+               c.updated_at, null::text as last_status, null::timestamptz as last_run_at \
              from ai_eval_cases c \
              where c.organization_id = $1 and c.suite_id = $2 and c.enabled \
              order by c.name, c.id";
@@ -956,13 +1022,13 @@ mod tests {
 
     #[test]
     fn a_well_formed_suite_validates() {
-        assert!(validate_suite("model", 90, 5.0, None, None, Some(Uuid::from_u128(1)), None, None, 1).is_ok());
+        assert!(validate_suite("model", None, None, None, Some(Uuid::from_u128(1)), 90, 5.0, None, None, None, None, 1).is_ok());
     }
 
     #[test]
     fn a_threshold_outside_one_to_hundred_is_refused_by_field_name() {
         for threshold in [0, 101] {
-            let error = validate_suite("model", threshold, 5.0, None, None, None, None, None, 1)
+            let error = validate_suite("model", None, None, None, Some(Uuid::from_u128(1)), threshold, 5.0, None, None, None, None, 1)
                 .unwrap_err();
             assert!(error.to_string().contains("threshold_percent"), "{error}");
         }
@@ -972,21 +1038,21 @@ mod tests {
     fn a_judge_that_is_the_model_under_test_is_refused() {
         let model = Uuid::from_u128(7);
         let error =
-            validate_suite("model", 90, 5.0, None, Some(model), Some(model), None, None, 1)
+            validate_suite("model", None, None, None, Some(model), 90, 5.0, None, Some(model), None, None, 1)
                 .unwrap_err();
         assert!(error.to_string().contains("judge_model_id"), "{error}");
     }
 
     #[test]
     fn a_temperature_outside_zero_to_two_is_refused() {
-        let error = validate_suite("model", 90, 5.0, Some(2.5), None, None, None, None, 1)
+        let error = validate_suite("model", None, None, None, Some(Uuid::from_u128(1)), 90, 5.0, Some(2.5), None, None, None, 1)
             .unwrap_err();
         assert!(error.to_string().contains("temperature"), "{error}");
     }
 
     #[test]
     fn an_unknown_target_is_refused_with_the_real_ones_named() {
-        let error = validate_suite("pipeline", 90, 5.0, None, None, None, None, None, 1)
+        let error = validate_suite("pipeline", None, None, None, None, 90, 5.0, None, None, None, None, 1)
             .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("pipeline"), "{message}");
@@ -1129,16 +1195,65 @@ mod tests {
     }
 
     #[test]
+    fn a_target_that_disagrees_with_its_reference_is_refused_by_both_fields() {
+        // The column catches this too, but a caller that reached the column got SQLSTATE 23514
+        // and a constraint name; the store has to say which field is wrong.
+        let error = validate_suite(
+            "agent",
+            Some(Uuid::from_u128(3)),
+            None,
+            None,
+            Some(Uuid::from_u128(1)),
+            90,
+            5.0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("model_id"), "the extra field is named: {message}");
+        assert!(message.contains("agent"), "the target is named: {message}");
+    }
+
+    #[test]
+    fn a_target_with_no_reference_at_all_is_refused() {
+        let error = validate_suite("copilot", None, None, None, None, 90, 5.0, None, None, None, None, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("copilot_key"), "{error}");
+    }
+
+    #[test]
+    fn every_target_is_accepted_when_only_its_own_reference_is_set() {
+        for (target, agent, copilot, task, model) in [
+            ("agent", Some(Uuid::from_u128(3)), None, None, None),
+            ("copilot", None, Some("support"), None, None),
+            ("task", None, None, Some("summarize"), None),
+            ("model", None, None, None, Some(Uuid::from_u128(1))),
+        ] {
+            validate_suite(
+                target, agent, copilot, task, model, 90, 5.0, None, None, None, None, 1,
+            )
+            .unwrap_or_else(|e| panic!("{target} with its own reference must validate: {e}"));
+        }
+    }
+
+    #[test]
     fn the_new_suite_fixture_validates_so_the_validation_tests_are_about_the_rule_not_the_fixture() {
         // A fixture that is itself invalid turns every assertion above into a test of the
         // fixture, which is the way a whole block of tests goes green without testing anything.
         validate_suite(
             &suite().target,
+            suite().agent_id,
+            suite().copilot_key.as_deref(),
+            suite().task.as_deref(),
+            suite().model_id,
             suite().threshold_percent,
             suite().max_regression_points,
             suite().temperature,
             suite().judge_model_id,
-            suite().model_id,
             suite().judge_prompt.as_deref(),
             suite().schedule.as_deref(),
             1,

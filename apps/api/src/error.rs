@@ -1220,6 +1220,29 @@ impl From<AiHubError> for ApiError {
             // say what counts as internal. The blocked *call* is not here on purpose: it is a
             // frame inside the chat stream, because the stream has already opened by the time the
             // walk reaches the provider, and a status code is no longer available there.
+            // The eval trio (REQ-107 slice 1). A suite or case that breaks its own rules is a
+            // `400` naming the field, because every one of those refusals belongs to one input
+            // in the editor; a taken key is a `409`, which is a different shape on purpose —
+            // the editor RESOLVES it by offering another key and keeping the rest of the form,
+            // where a `400` would make the operator guess which field collided. A suite or case
+            // id that is not in this organization is a `404`, never a 403, or the suite screen
+            // becomes an existence oracle over every key in the installation.
+            AiHubError::InvalidEval(message) => Self::bad_request("invalid_eval", message),
+            AiHubError::EvalSuiteNotFound(key) => Self::new(
+                StatusCode::NOT_FOUND,
+                "eval_suite_not_found",
+                format!("no eval suite `{key}` in this organization"),
+            ),
+            AiHubError::EvalCaseNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "eval_case_not_found",
+                format!("no eval case `{id}` in this organization"),
+            ),
+            AiHubError::EvalSuiteKeyTaken(key) => Self::new(
+                StatusCode::CONFLICT,
+                "eval_suite_key_taken",
+                format!("an eval suite with the key `{key}` already exists in this organization"),
+            ),
             AiHubError::InvalidAirgap(message) => Self::bad_request("invalid_airgap", message),
             AiHubError::AirgapHostNotFound(id) => Self::new(
                 StatusCode::NOT_FOUND,
