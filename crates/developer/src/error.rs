@@ -9,10 +9,18 @@ use thiserror::Error;
 
 /// What can go wrong in the developer platform.
 ///
-/// `PartialEq` is derived because the CLI poll rule's tests compare outcomes by value: "a poll
-/// too soon returns `SlowDown { seconds: 10 }`" is the assertion, and an assertion that could
-/// only check "it returned *an* error" would pass for every wrong number in the rule.
-#[derive(Debug, Error, PartialEq, Eq)]
+/// **Only the client-facing variants derive `PartialEq`, and it is done by hand.** The CLI poll
+/// rule's tests compare outcomes by value -- "a poll too soon returns `SlowDown { seconds: 10 }`"
+/// -- because an assertion that could only check "it returned *an* error" would pass for every
+/// wrong number in the rule.
+///
+/// The derive cannot be applied to the enum. `Database(sqlx::Error)` is a variant and
+/// `sqlx::Error` is neither `PartialEq` nor `Eq`, so `#[derive(PartialEq)]` here compiles on the
+/// default build -- where the variant is `cfg`'d out and there is nothing to compare -- and fails
+/// only under `--features store`. A gate that runs one of the two builds is a gate that misses
+/// exactly this. The manual impl below compares the client variants and treats the database one
+/// as equal to nothing, which is the truth: no client rule asserts on a database error's value.
+#[derive(Debug, Error)]
 pub enum DeveloperError {
     /// A submitted name was outside the accepted length.
     #[error("name must be between {min} and {max} characters")]
@@ -298,6 +306,95 @@ pub enum DeveloperError {
     #[cfg(feature = "store")]
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+}
+
+/// Compare two errors by variant, for the client-facing half.
+///
+/// See the enum doc for why this is hand-written. The one rule: **a database error never equals
+/// anything**, not even another database error, because nothing outside this module can act on
+/// its contents and an `assert_eq!` that matched on one would be asserting on PostgreSQL's
+/// version string.
+impl PartialEq for DeveloperError {
+    fn eq(&self, other: &Self) -> bool {
+        use DeveloperError as E;
+        match (self, other) {
+            (E::InvalidName { min: a, max: b }, E::InvalidName { min: c, max: d }) => {
+                a == c && b == d
+            }
+            (E::DuplicateScope(a), E::DuplicateScope(b)) => a == b,
+            (E::UnknownEnvironment(a), E::UnknownEnvironment(b)) => a == b,
+            (E::UnknownRateTier(a), E::UnknownRateTier(b)) => a == b,
+            (E::UnknownStatusClass(a), E::UnknownStatusClass(b)) => a == b,
+            (E::KeyNameTaken(a), E::KeyNameTaken(b)) => a == b,
+            (E::InvalidExpiry(a), E::InvalidExpiry(b)) => a == b,
+            (E::InvalidCidr(a), E::InvalidCidr(b)) => a == b,
+            (E::KeyNotActive(a), E::KeyNotActive(b)) => a == b,
+            (E::UnknownAppStatus(a), E::UnknownAppStatus(b)) => a == b,
+            (E::AppNameTaken(a), E::AppNameTaken(b)) => a == b,
+            (E::AppDescriptionTooLong { max: a }, E::AppDescriptionTooLong { max: b }) => a == b,
+            (E::TooManyRedirectUris { max: a }, E::TooManyRedirectUris { max: b }) => a == b,
+            (
+                E::RedirectUriTooLong { index: a, max: b },
+                E::RedirectUriTooLong { index: c, max: d },
+            ) => a == c && b == d,
+            (
+                E::RedirectUriSchemeRefused { index: a },
+                E::RedirectUriSchemeRefused { index: b },
+            ) => a == b,
+            (E::DuplicateRedirectUri { index: a }, E::DuplicateRedirectUri { index: b }) => a == b,
+            (E::DuplicateGrantType { index: a }, E::DuplicateGrantType { index: b }) => a == b,
+            (E::UnknownGrantType(a), E::UnknownGrantType(b)) => a == b,
+            (E::UnknownScaffoldKind(a), E::UnknownScaffoldKind(b)) => a == b,
+            (E::UnknownScaffoldTarget(a), E::UnknownScaffoldTarget(b)) => a == b,
+            (
+                E::ScaffoldRefused {
+                    code: ac,
+                    message: am,
+                },
+                E::ScaffoldRefused {
+                    code: bc,
+                    message: bm,
+                },
+            ) => ac == bc && am == bm,
+            (E::DeviceCodeSlowDown { seconds: a }, E::DeviceCodeSlowDown { seconds: b }) => a == b,
+            // Every remaining variant is a unit one: same variant means equal, anything else
+            // means not. Writing them out rather than listing them in a `matches!` is what
+            // makes the compiler name a variant added later, instead of the new variant
+            // falling through to "not equal" and quietly failing every assertion about it.
+            (E::NoScopes, E::NoScopes)
+            | (E::EmptyScope, E::EmptyScope)
+            | (E::NegativeDuration, E::NegativeDuration)
+            | (E::KeyNotFound, E::KeyNotFound)
+            | (E::KeyUnverifiable, E::KeyUnverifiable)
+            | (E::InvalidKey, E::InvalidKey)
+            | (E::HighTierRefused, E::HighTierRefused)
+            | (E::NoRedirectUris, E::NoRedirectUris)
+            | (E::NoGrantTypes, E::NoGrantTypes)
+            | (E::AppNotFound, E::AppNotFound)
+            | (E::AppNotActive(_), E::AppNotActive(_))
+            | (E::GrantNotRegistered, E::GrantNotRegistered)
+            | (E::RedirectUriNotRegistered, E::RedirectUriNotRegistered)
+            | (E::ScopeNotRegistered, E::ScopeNotRegistered)
+            | (E::CodeChallengeRefused, E::CodeChallengeRefused)
+            | (E::InvalidClient, E::InvalidClient)
+            | (E::RedirectUriMismatch, E::RedirectUriMismatch)
+            | (E::InvalidCode, E::InvalidCode)
+            | (E::GrantMismatch, E::GrantMismatch)
+            | (E::ScaffoldNotFound, E::ScaffoldNotFound)
+            | (E::InvalidDeviceCode, E::InvalidDeviceCode)
+            | (E::DeviceCodePending, E::DeviceCodePending)
+            | (E::DeviceCodeApprovalRefused, E::DeviceCodeApprovalRefused) => true,
+            // A database error equals nothing -- including itself. See the doc above.
+            // Ungated on purpose: the arm below needs one on BOTH builds, and gating this one
+            // left the default build with no fall-through at all. A gate that only ever runs
+            // `--features store` is a gate that misses the build the other six writers run.
+            #[cfg(feature = "store")]
+            (E::Database(_), _) | (_, E::Database(_)) => false,
+            // The remaining pairings are two variants the list above did not cover, which the
+            // compiler proves impossible on this build. Ungated for the same reason.
+            _ => false,
+        }
+    }
 }
 
 /// The crate's result.

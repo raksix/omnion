@@ -40,6 +40,8 @@ pub mod secret;
 #[cfg(feature = "store")]
 pub mod store;
 #[cfg(feature = "store")]
+pub mod store_cli;
+#[cfg(feature = "store")]
 pub mod store_oauth;
 pub mod templates;
 
