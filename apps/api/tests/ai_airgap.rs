@@ -29,6 +29,7 @@
 //! rather than skipping when PostgreSQL is unreachable — a skipped walk proves nothing.
 
 use omnion_ai_hub::airgap_store::{self, SetAirgap};
+use omnion_ai_hub::egress_verify;
 use omnion_ai_hub::client::{ChatMessage, ChatRequest, ProviderTarget};
 use omnion_ai_hub::error::AiHubError;
 use omnion_ai_hub::health_store::NewUsage;
@@ -717,6 +718,256 @@ async fn the_confirmation_lists_exactly_what_would_be_refused() {
         1,
         "the allow-listed host is no longer something the gap would refuse"
     );
+
+    fixture.dispose().await;
+}
+// -------------------------------------------------------------------------------------------
+// Egress verification: the check that expects a refusal (slice 4)
+// -------------------------------------------------------------------------------------------
+
+/// The one thing every test here shares: turn the gap on with a real reason.
+async fn enable_the_gap(fixture: &Airgap) -> Uuid {
+    let actor = fixture.user().await;
+    airgap_store::set_state(
+        &fixture.pool,
+        &SetAirgap {
+            enabled: true,
+            reason: Some("isolation drill for the compliance audit".to_owned()),
+            low_confidence_ack: true,
+            actor: Some(actor),
+        },
+    )
+    .await
+    .expect("the gap turns on");
+    actor
+}
+
+#[tokio::test]
+async fn a_refused_call_is_the_verification_passing() {
+    let fixture = airgap!();
+    fixture.provider("OpenAI", "https://api.openai.com/v1").await;
+    enable_the_gap(&fixture).await;
+
+    // The check runs through the platform's OWN decision, so this is evidence about the chat
+    // path rather than about a parallel harness that could pass while the chat drifted.
+    let result = egress_verify::verify_egress(
+        &fixture.pool,
+        "OpenAI",
+        "https://api.openai.com/v1",
+    )
+    .await
+    .expect("the verification runs");
+
+    // THE INVERSION, asserted. A refusal is the pass; a reader who expected `passes == false`
+    // here would be right to suspect the test, so the comment is the assertion's twin.
+    assert_eq!(result.outcome, egress_verify::EgressOutcome::Blocked);
+    assert!(result.holds(), "a refused call means the installation is holding");
+    assert_eq!(result.target, "api.openai.com", "the host is named");
+
+    // The refusal itself rides along, so the screen can show what the operator would have hit.
+    let refusal = result
+        .refusal
+        .as_ref()
+        .expect("a blocked attempt carries the refusal");
+    assert_eq!(refusal.provider, "OpenAI");
+    assert_eq!(refusal.code(), "ai_airgap_blocked");
+
+    fixture.dispose().await;
+}
+
+#[tokio::test]
+async fn a_local_endpoint_never_counts_as_an_escape() {
+    let fixture = airgap!();
+    fixture.provider("Ollama", "http://127.0.0.1:11434/v1").await;
+    enable_the_gap(&fixture).await;
+
+    // A local host is not something the gap can leak, so verifying it must NOT report an escape
+    // and must not be recorded as a failure. A checker that treated "no refusal" as "escaped"
+    // would paint a healthy local-only installation red — the alarm would cry wolf on exactly the
+    // configuration the whole request is about.
+    let result = egress_verify::verify_egress(&fixture.pool, "Ollama", "http://127.0.0.1:11434/v1")
+        .await
+        .expect("the verification runs");
+    assert_ne!(
+        result.outcome,
+        egress_verify::EgressOutcome::Escaped,
+        "a loopback endpoint is inside the gap, never an escape from it"
+    );
+
+    fixture.dispose().await;
+}
+
+#[tokio::test]
+async fn an_allow_listed_host_is_not_an_escape() {
+    let fixture = airgap!();
+    fixture
+        .provider("Internal", "https://gpu-box.internal/v1")
+        .await;
+    enable_the_gap(&fixture).await;
+    airgap_store::add_host(&fixture.pool, "gpu-box.internal", None, None)
+        .await
+        .expect("an internal host joins the allow-list");
+
+    // Without the allow-list this host would be refused, so it would record a `blocked` PASS and
+    // read as reassuring — while in truth the operator believes it is internal and it is not on
+    // the list. The interesting assertion is the other direction: once allow-listed, a permitted
+    // call is NOT an escape, because "permitted" and "leaked" are different facts.
+    let result = egress_verify::verify_egress(
+        &fixture.pool,
+        "Internal",
+        "https://gpu-box.internal/v1",
+    )
+    .await
+    .expect("the verification runs");
+    assert_ne!(
+        result.outcome,
+        egress_verify::EgressOutcome::Blocked,
+        "an allow-listed host is permitted, so nothing was refused"
+    );
+
+    fixture.dispose().await;
+}
+
+#[tokio::test]
+async fn the_result_is_recorded_on_the_row_with_its_target_and_time() {
+    let fixture = airgap!();
+    fixture.provider("OpenAI", "https://api.openai.com/v1").await;
+    enable_the_gap(&fixture).await;
+
+    let before = airgap_store::read_state(&fixture.pool)
+        .await
+        .expect("the row reads");
+    assert!(
+        before.egress_verify_result.is_none(),
+        "an installation that never verified carries no verdict"
+    );
+
+    let result = egress_verify::verify_egress(
+        &fixture.pool,
+        "OpenAI",
+        "https://api.openai.com/v1",
+    )
+    .await
+    .expect("the verification runs");
+    egress_verify::record_result(&fixture.pool, result.outcome, &result.target, result.verified_at)
+        .await
+        .expect("the attempt is recorded");
+
+    // Read back out of the DATABASE rather than trusting the struct: a writer that updated the
+    // row correctly in memory but wrote the wrong column would otherwise pass.
+    let after = airgap_store::read_state(&fixture.pool)
+        .await
+        .expect("the row reads back");
+    assert_eq!(after.egress_verify_result.as_deref(), Some("blocked"));
+    assert_eq!(
+        after.egress_verify_target.as_deref(),
+        Some("api.openai.com"),
+        "the stored target is the bare host, matching what a refusal names"
+    );
+    assert!(
+        after.egress_verified_at.is_some(),
+        "an attempt with no timestamp cannot be compared against a later one"
+    );
+
+    fixture.dispose().await;
+}
+
+#[tokio::test]
+async fn an_escape_overwrites_the_good_verdict() {
+    let fixture = airgap!();
+    fixture.provider("OpenAI", "https://api.openai.com/v1").await;
+    enable_the_gap(&fixture).await;
+
+    // A pass, recorded first.
+    let good = egress_verify::verify_egress(
+        &fixture.pool,
+        "OpenAI",
+        "https://api.openai.com/v1",
+    )
+    .await
+    .expect("the verification runs");
+    assert_eq!(good.outcome, egress_verify::EgressOutcome::Blocked);
+    egress_verify::record_result(&fixture.pool, good.outcome, &good.target, good.verified_at)
+        .await
+        .expect("recorded");
+
+    // Then the gap is quietly defeated: the host is allow-listed, so the switch now PERMITS the
+    // call. This is the breach the request wants to catch, and it must REPLACE the earlier pass
+    // rather than being averaged with it or hidden behind a timestamp the UI sorts by.
+    airgap_store::add_host(&fixture.pool, "api.openai.com", None, None)
+        .await
+        .expect("the host joins the allow-list");
+    let breached = egress_verify::verify_egress(
+        &fixture.pool,
+        "OpenAI",
+        "https://api.openai.com/v1",
+    )
+    .await
+    .expect("the second verification runs");
+    assert_eq!(
+        breached.outcome,
+        egress_verify::EgressOutcome::Escaped,
+        "a permitted non-local call is a breach, whatever the transport answered"
+    );
+    assert!(!breached.holds());
+    egress_verify::record_result(
+        &fixture.pool,
+        breached.outcome,
+        &breached.target,
+        breached.verified_at,
+    )
+    .await
+    .expect("recorded");
+
+    let after = airgap_store::read_state(&fixture.pool)
+        .await
+        .expect("the row reads back");
+    assert_eq!(
+        after.egress_verify_result.as_deref(),
+        Some("escaped"),
+        "the newest attempt is the one on the row — a stale pass must not outlive a breach"
+    );
+
+    fixture.dispose().await;
+}
+
+#[tokio::test]
+async fn verifying_a_switch_that_is_off_proves_nothing() {
+    let fixture = airgap!();
+    fixture.provider("OpenAI", "https://api.openai.com/v1").await;
+    // Deliberately NOT enabled.
+
+    let result = egress_verify::verify_egress(
+        &fixture.pool,
+        "OpenAI",
+        "https://api.openai.com/v1",
+    )
+    .await
+    .expect("the verification runs");
+
+    // Not `Escaped`. Every call is permitted by definition while the gap is off, so reporting a
+    // breach would page a compliance officer about a correct configuration — and reporting a
+    // pass would be worse. It proves nothing, and says so.
+    assert_eq!(result.outcome, egress_verify::EgressOutcome::Undetermined);
+    assert!(!result.holds());
+
+    fixture.dispose().await;
+}
+
+#[tokio::test]
+async fn a_url_with_no_host_cannot_be_verified() {
+    let fixture = airgap!();
+    enable_the_gap(&fixture).await;
+
+    // A URL the platform cannot parse has no host to classify. `check_call` would refuse it and
+    // hand back a refusal with an EMPTY host — which would read as a clean `blocked` pass having
+    // verified a host that was never named. That is a false assurance, so it is undetermined.
+    let result = egress_verify::verify_egress(&fixture.pool, "OpenAI", "not-a-url")
+        .await
+        .expect("the verification runs");
+    assert_eq!(result.outcome, egress_verify::EgressOutcome::Undetermined);
+    assert!(result.target.is_empty());
+    assert!(!result.holds());
 
     fixture.dispose().await;
 }

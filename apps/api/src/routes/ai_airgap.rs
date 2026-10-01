@@ -32,6 +32,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use omnion_ai_hub::airgap_store::{self, AirgapState, Refusal, SetAirgap};
+use omnion_ai_hub::egress_verify::{self, EgressOutcome};
 use omnion_events::NewEvent;
 use omnion_events::bus;
 use serde::{Deserialize, Serialize};
@@ -145,9 +146,19 @@ async fn build_response(pool: &sqlx::PgPool) -> Result<AirgapResponse, ApiError>
 
 /// The banner's two sentences, in one place.
 ///
-/// The tone is `failed` when the last egress verification passed *nothing* — the request calls
-/// that "the loudest alert in this request", and it must outrank a working gap. A green banner
-/// over a failed verification is the exact false reassurance this control exists to prevent.
+/// The tone is `failed` when the last egress verification did **not** prove the gap holds — the
+/// request calls that "the loudest alert in this request", and it must outrank a working gap. A
+/// green banner over a failed verification is the exact false reassurance this control exists to
+/// prevent.
+///
+/// # "Did not hold" is NOT the same word as the stored outcome
+///
+/// The check names a refusal `blocked` (that is the **pass**) and an escape `escaped`. The banner
+/// therefore cannot test for `blocked` to draw the reassuring tone: a row that says `blocked` is
+/// the good state, and a row that says nothing else is either fine or unknown. This function
+/// reads the outcome through [`EgressOutcome::from_str_lossy`], whose default is
+/// `Undetermined` — **not** a hold — so a `NULL` row, a stale word from an older build, or a
+/// value nobody recognises all leave the reassuring tone out. Only an explicit `blocked` earns it.
 fn banner_for(state: &AirgapState, blocked_count: usize) -> Banner {
     if !state.enabled {
         return Banner {
@@ -157,15 +168,28 @@ fn banner_for(state: &AirgapState, blocked_count: usize) -> Banner {
         };
     }
 
-    if state.egress_verify_result.as_deref() == Some("failed") {
-        return Banner {
-            active: true,
-            tone: "failed".to_owned(),
-            message:
-                "The air gap is on, but the last egress verification let a call through. Until that \
-                 is understood, treat this installation as reachable from the internet."
+    if let Some(stored) = state.egress_verify_result.as_deref() {
+        let outcome = EgressOutcome::from_str_lossy(stored);
+        if !outcome.is_holding() {
+            // Two different sentences, because they demand different actions: an escaped call
+            // is a breach to investigate, and an undetermined one is a check that has not run.
+            let message = match outcome {
+                EgressOutcome::Escaped => format!(
+                    "The air gap is on, but the last egress verification let a call to {} through. \
+                     Until that is understood, treat this installation as reachable from the \
+                     internet.",
+                    state.egress_verify_target.as_deref().unwrap_or("a remote host")
+                ),
+                _ => "The air gap is on, but it has never been verified. Run the egress \
+                      verification before relying on it."
                     .to_owned(),
-        };
+            };
+            return Banner {
+                active: true,
+                tone: "failed".to_owned(),
+                message,
+            };
+        }
     }
 
     let subject = match blocked_count {
@@ -367,26 +391,39 @@ pub async fn remove_host(
 }
 
 // -------------------------------------------------------------------------------------------
-// Egress verification (the endpoint; slice 4 writes the checker behind it)
+// Egress verification
 // -------------------------------------------------------------------------------------------
 
 /// `POST /ai/airgap/verify` body.
 #[derive(Debug, Deserialize)]
 pub struct VerifyBody {
-    /// The host to aim the check at. Optional: with none given the check picks the first
-    /// non-local provider, which is the call that would escape if the gap were broken.
+    /// The **provider name** to aim the check at. Optional: with none given the check picks the
+    /// first non-local provider, which is the call that would escape if the gap were broken.
+    ///
+    /// A provider name rather than a free-form URL on purpose: the check must run through the
+    /// same stored `base_url` the chat path would use, so a caller cannot "verify" a URL the
+    /// installation never routes to and record a pass about it. Accepting a URL would make the
+    /// check measure the caller's typing instead of the installation's configuration.
     #[serde(default)]
     pub target: Option<String>,
 }
 
-/// `POST /ai/airgap/verify`.
+/// `POST /ai/airgap/verify` — attempt a non-local call and expect the refusal.
 ///
-/// The check itself is slice 4's; the route exists now so the settings screen can render the
-/// panel and its last result without a second endpoint appearing later. It answers the last
-/// recorded result rather than pretending to run one — a "verified" badge nobody ran is worse
-/// than no badge.
+/// # A refusal here is a PASS
+///
+/// That inversion is the request's, not a shortcut. The operator needs evidence that the switch
+/// still works, and the only evidence is a call that was stopped. So the endpoint answers **200
+/// with `outcome = "escaped"`** when the gap fails — a loud failure inside a successful HTTP call,
+/// because "the check ran" and "the check passed" are different sentences and the response must
+/// not conflate them. The screen reads `outcome`, not the status line.
+///
+/// The failure is still **recorded** and **announced** ([`announce_verification`]) so it lands in
+/// the event stream beside the refusals, and [`banner_for`] promotes the banner to its `failed`
+/// tone — the state the request calls "the loudest alert in this request".
 pub async fn verify(
     State(state): State<AppState>,
+    session: CurrentSession,
     Json(body): Json<VerifyBody>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = state.db().pool();
@@ -398,17 +435,141 @@ pub async fn verify(
              non-local call is permitted",
         ));
     }
-    let _ = body.target;
 
+    // Which provider to aim at. An explicit name is honoured; otherwise the first non-local
+    // provider, which is by construction the call that would escape.
+    let (name, base_url) = match body.target.as_deref().map(str::trim) {
+        Some(explicit) if !explicit.is_empty() => {
+            let base_url = provider_base_url(pool, explicit).await?;
+            (explicit.to_owned(), base_url)
+        }
+        _ => first_non_local_provider(pool)
+            .await?
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "ai_airgap_nothing_to_verify",
+                    "no non-local provider is registered, so there is no call the air gap could \
+                     let through — register a remote provider first",
+                )
+            })?,
+    };
+
+    let result = egress_verify::verify_egress(pool, &name, &base_url).await?;
+
+    // Recorded before the response is built, so a client that reads the stored row immediately
+    // after a 200 sees the same attempt the response describes.
+    egress_verify::record_result(pool, result.outcome, &result.target, result.verified_at).await?;
+    announce_verification(pool, &result, session.session.user_id).await;
+
+    let message = result.outcome.message(&result.target);
     Ok(Json(json!({
         "enabled": true,
-        "verified_at": current.egress_verified_at.map(|at| at.unix_timestamp()),
-        "target": current.egress_verify_target,
-        "result": current.egress_verify_result,
-        "implemented": false,
-        "message": "the live egress check lands with the doctor slice; the last recorded result is \
-                    shown above",
+        "outcome": result.outcome.as_str(),
+        // `holds` is the field the panel branches on, and it is deliberately not derived from
+        // the HTTP status: an escaped call is a real measurement returned successfully.
+        "holds": result.holds(),
+        "target": result.target,
+        "provider": name,
+        "latency_ms": result.latency_ms,
+        "verified_at": result.verified_at.unix_timestamp(),
+        "message": message,
+        "refusal": result.refusal.as_ref().map(|refusal| json!({
+            "code": refusal.code(),
+            "message": refusal.message(),
+            "provider": refusal.provider,
+            "host": refusal.host,
+        })),
     })))
+}
+
+/// Read one provider's stored base URL.
+///
+/// A bare name is matched against enabled providers only: aiming the check at a switched-off
+/// provider would verify a call the installation would never make anyway, which is a check that
+/// cannot fail and therefore proves nothing.
+async fn provider_base_url(pool: &sqlx::PgPool, name: &str) -> Result<String, ApiError> {
+    let found = sqlx::query_scalar::<_, String>(
+        "select base_url from ai_providers where name = $1 and enabled = true",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| ApiError::from(omnion_ai_hub::error::AiHubError::Database(error)))?;
+
+    found.ok_or_else(|| {
+        ApiError::bad_request(
+            "ai_airgap_unknown_provider",
+            &format!(
+                "no enabled provider named `{name}` is registered — pick one of the providers on \
+                 this screen, or clear the field to let the check choose"
+            ),
+        )
+    })
+}
+
+/// The first enabled provider the air gap would refuse, as `(name, base_url)`.
+///
+/// Ordered by name so the answer is stable between two runs with the same data. A check whose
+/// target moved at random would make two runs incomparable, and the point of storing the target
+/// on the row is to compare a later run against an earlier one.
+///
+/// Returns `None` when every enabled provider is local — the caller turns that into a `400`
+/// rather than inventing a target, because "verify the air gap" against a local host would be a
+/// check that cannot fail.
+async fn first_non_local_provider(pool: &sqlx::PgPool) -> Result<Option<(String, String)>, ApiError> {
+    let hosts = airgap_store::allowlist(pool).await?;
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "select name, base_url from ai_providers where enabled = true order by name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| ApiError::from(omnion_ai_hub::error::AiHubError::Database(error)))?;
+
+    Ok(rows.into_iter().find(|(_, base_url)| {
+        omnion_ai_hub::local_host::host_of(base_url)
+            .and_then(|host| omnion_ai_hub::local_host::classify_host(&host, &hosts).ok())
+            .flatten()
+            .is_none()
+    }))
+}
+
+/// Announce the attempt on the event stream, as the request's event table requires.
+///
+/// Both outcomes are emitted and they are named to prevent a reader flipping them: a subscriber
+/// that alerts on `.failed` must not be woken by a healthy installation. The `passed` event
+/// fires on [`egress_verify::EgressOutcome::Blocked`], which is the *pass*.
+///
+/// Best-effort, exactly like the refusal announcement — an operator must not see a failed
+/// verification because a webhook subscriber was down. But never silent: this row is the
+/// installation's audit trail for a compliance-relevant control.
+async fn announce_verification(
+    pool: &sqlx::PgPool,
+    result: &egress_verify::EgressResult,
+    actor: Uuid,
+) {
+    use egress_verify::EgressOutcome;
+
+    let kind = match result.outcome {
+        EgressOutcome::Blocked => "ai.airgap.verify.passed",
+        EgressOutcome::Escaped => "ai.airgap.verify.failed",
+        // An attempt that could not be made is still worth a record, but under a distinct name:
+        // folding it into `.failed` would page whoever watches compliance events for a
+        // misconfigured check.
+        EgressOutcome::Undetermined => "ai.airgap.verify.undetermined",
+    };
+
+    let event = NewEvent::new(kind)
+        .actor(actor)
+        .payload(json!({
+            "target": result.target,
+            "outcome": result.outcome.as_str(),
+            "latency_ms": result.latency_ms,
+            "message": result.outcome.message(&result.target),
+        }));
+
+    if let Err(error) = bus::emit(pool, event).await {
+        tracing::warn!(%error, kind, "the egress verification event could not be emitted");
+    }
 }
 
 // -------------------------------------------------------------------------------------------
