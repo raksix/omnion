@@ -341,6 +341,14 @@ pub struct Scope {
     /// The organization the query runs in.
     pub organization_id: Uuid,
     /// The caller.
+    ///
+    /// Carried but **not** read by any HR predicate, and that is worth saying out loud: every
+    /// `hr_employees` predicate is expressed against employee ids (`id`, `manager_id`,
+    /// `department_id`), and the one place that used to bind this field compared a platform
+    /// account uuid with an employee uuid. It stays because it identifies the caller in errors
+    /// and audit rows, and because deleting a public field on the strength of a local grep is how
+    /// another module's build breaks on a branch nobody tested. The fix for a field that is bound
+    /// where it does not belong is to stop binding it, not to remove the caller from the scope.
     pub user_id: Uuid,
     /// How much the caller may see.
     pub visibility: Visibility,
@@ -527,10 +535,15 @@ fn push_filters<'a>(
             builder.push_bind(scope.employee_id.unwrap_or(Uuid::nil()));
         }
         Visibility::Team => {
+            // The clause compares `manager_id` — a foreign key to `hr_employees(id)` — against the
+            // caller's **employee** row. Binding `scope.user_id` here compares an account uuid with
+            // an employee uuid, so the clause is satisfied by the one row whose id coincides with
+            // the caller's account and by none of their reports; a manager's team list came back
+            // as the manager alone, which is indistinguishable on screen from having no staff.
             builder.push(" and (e.id = ");
             builder.push_bind(scope.employee_id.unwrap_or(Uuid::nil()));
             builder.push(" or e.manager_id = ");
-            builder.push_bind(scope.user_id);
+            builder.push_bind(scope.employee_id.unwrap_or(Uuid::nil()));
             builder.push(")");
         }
     }
@@ -792,6 +805,13 @@ pub async fn get_employee(pool: &PgPool, scope: &Scope, employee_id: Uuid) -> Re
             // Their own row, or somebody who reports to them. The reporting test is the
             // *direct* one, matching what the list shows at this level: a level that also reached
             // indirect reports would list rows the detail screen then refuses.
+            //
+            // `$4` is the caller's **employee** row, not their platform account. `manager_id` is a
+            // foreign key to `hr_employees(id)`, so binding the account id here compares two
+            // different id spaces: the predicate is true for exactly one row in an organization —
+            // the employee whose id happens to equal the caller's account uuid — and nobody's
+            // direct report is ever in it. A `team` list therefore came back as the caller alone,
+            // which reads as "this manager has no staff" rather than as a broken join.
             let sql = format!(
                 "select exists (select 1 from hr_employees where organization_id = $1 and id = $2 \
                  and (id = $3 or manager_id = $4))"
@@ -800,7 +820,7 @@ pub async fn get_employee(pool: &PgPool, scope: &Scope, employee_id: Uuid) -> Re
                 .bind(scope.organization_id)
                 .bind(employee_id)
                 .bind(scope.employee_id.unwrap_or(Uuid::nil()))
-                .bind(scope.user_id)
+                .bind(scope.employee_id.unwrap_or(Uuid::nil()))
                 .fetch_one(pool)
                 .await?
         }

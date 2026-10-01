@@ -396,18 +396,17 @@ impl MergeDepartmentBody {
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/// The caller's employee row, when their platform account has one.
+/// The caller's employee row, when their platform account has one, or a `404` naming the employee.
 ///
 /// This is what makes `own` mean *the caller's own record* and `team` mean *their own row plus
 /// their direct reports* — a level resolved on a CRM-style "owner" would be meaningless here,
 /// because an organization does not own its people, it employs them.
-async fn employee_of_caller(
-    state: &AppState,
-    organization_id: Uuid,
-    current: &CurrentSession,
-) -> Result<Option<Uuid>, ApiError> {
-    Ok(employees::employee_of_user(state.db().pool(), organization_id, current.user.id).await?)
-}
+///
+/// The function that answers it is [`employees::employee_of_user`]. It used to be wrapped in a
+/// second, `Option`-returning copy here, and the attendance routes grew their own third; the
+/// wrapper survived with no caller, which is the shape a refactor takes when the extraction is
+/// done after the callers rather than before them. One function, one answer, and the 404 is the
+/// caller's decision to make — the attendance routes want it and `scope_of` does not.
 
 /// The caller's visibility level, read from the same department-scoped bindings the CRM uses.
 ///

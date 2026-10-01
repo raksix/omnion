@@ -426,6 +426,84 @@ fn id_of(value: &Value) -> Uuid {
     Uuid::parse_str(value["id"].as_str().expect("an id")).expect("an id")
 }
 
+/// Re-bind an account's role to a **department scope**, which is the only way a role carries a
+/// visibility level: `scope_of` narrows a caller by reading the department bindings' `resource_id`
+/// and parsing it as a level. The level is therefore not a flag on the user, it is a property of
+/// how the role was granted — and a walk that only ever granted `Organization` could not tell a
+/// working narrowing from a widening one.
+///
+/// It **replaces** the level rather than adding one, and that is the second thing worth spelling
+/// out. `scope_of` takes the narrowest level across every department binding the caller holds, so a
+/// helper that only ever granted would make the sequence `own` → `team` → `all` answer `own` for
+/// all three: the walk would then be measuring its own leftovers, and the `team` case would fail
+/// on the one assertion it exists to make (the manager's direct report missing) while pointing at
+/// the module. Revoking first is what makes each step read as the level it names.
+async fn bind_visibility(db: &Db, organization_id: Uuid, user_id: Uuid, level: &str) {
+    sqlx::query(
+        "update role_bindings set revoked_at = now() \
+         where user_id = $1 and organization_id = $2 and scope_type = 'department' \
+           and revoked_at is null",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .execute(db.pool())
+    .await
+    .expect("the previous visibility binding must be revoked");
+
+    let role = role_store::create_role(
+        db.pool(),
+        NewRole {
+            organization_id,
+            key: format!("hr-vis-{}", Uuid::new_v4().simple()),
+            name: "HR Visibility Role".to_owned(),
+            description: "A role carrying a visibility level".to_owned(),
+            priority: 410,
+            inherits_role_id: None,
+        },
+    )
+    .await
+    .expect("the visibility role must be created");
+
+    role_store::set_role_permissions(
+        db.pool(),
+        role.id,
+        &[RolePermissionInput {
+            key: "hr.employees.read".to_owned(),
+            effect: Effect::Allow,
+        }],
+    )
+    .await
+    .expect("the read permission must be written");
+
+    omnion_permissions::bindings::grant(
+        db.pool(),
+        NewBinding {
+            role_id: role.id,
+            user_id,
+            scope: PermScope::Department {
+                organization_id,
+                department: level.to_owned(),
+            },
+            granted_by: None,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("the department binding must be created");
+}
+
+/// The ids a listing returns, sorted, so two listings can be compared as sets.
+fn listed_ids(body: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = body["items"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["id"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    ids.sort();
+    ids
+}
+
 // ---------------------------------------------------------------------------------------------
 // The walks
 // ---------------------------------------------------------------------------------------------
@@ -1184,8 +1262,202 @@ async fn the_list_refuses_an_unknown_sort_and_a_visibility_it_does_not_know() {
     );
 }
 
-/// Every route answers 401 without a session, and a duplicate number or address is a 409 with a
-/// message the form can show.
+/// The three visibility levels are three different answers, and `team` is the one that names
+/// people. The criterion also names the cross-organization 404, which
+/// `the_readers_split_is_real_and_another_organization_is_a_404` already walks.
+///
+/// This walk exists because every other one in the suite granted an **organization**-scoped role,
+/// so `scope_of` always computed `All` and every narrowing branch of the SQL went unexercised — a
+/// narrowing that silently widens passes all of them. That is what makes this one necessary rather
+/// than thorough.
+///
+/// Each level is compared as a **set** of ids, because three levels and one broken comparison is
+/// exactly the shape a status-code assertion cannot see.
+#[tokio::test]
+async fn the_visibility_levels_narrow_to_self_then_to_the_team() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let officer = fixture.token(&fixture.officer).await;
+
+    // The caller: an existing account, so it already holds a role and a session can be made for it.
+    let (user_id, email) =
+        create_account(&fixture.db, Some(fixture.organization), "HR Manager").await;
+    let session = fixture.token(&email).await;
+
+    // The manager, and the people around them. The manager row is linked to the account, which is
+    // what makes `own` mean "the caller's own record" rather than "records the caller happens to
+    // own" — in HR nobody owns the people, they report to them.
+    let manager_id = id_of(
+        &make_employee(
+            &fixture,
+            &officer,
+            fixture.root_department,
+            "Grace",
+            "Hopper",
+            None,
+        )
+        .await,
+    );
+    sqlx::query("update hr_employees set user_id = $2 where id = $1")
+        .bind(manager_id)
+        .bind(user_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the manager must be linked to an account");
+
+    let report_id = id_of(
+        &make_employee(
+            &fixture,
+            &officer,
+            fixture.root_department,
+            "Alan",
+            "Turing",
+            Some(manager_id),
+        )
+        .await,
+    );
+
+    // A report of a report. `team` is the DIRECT reports, so this person sits below it — the row
+    // that catches an implementation which walks the whole reporting chain instead of one level.
+    let indirect_id = id_of(
+        &make_employee(
+            &fixture,
+            &officer,
+            fixture.root_department,
+            "Katherine",
+            "Johnson",
+            Some(report_id),
+        )
+        .await,
+    );
+
+    // A colleague with no reporting line to the manager at all.
+    let colleague_id = id_of(
+        &make_employee(
+            &fixture,
+            &officer,
+            fixture.root_department,
+            "Edsger",
+            "Dijkstra",
+            None,
+        )
+        .await,
+    );
+
+    // One fetch shape for every level: a hand-built URL per level is a second spelling of the
+    // request, and therefore a second place for the walk itself to be wrong.
+    async fn list(
+        fixture: &Fixture,
+        session: &Session,
+        level: Option<&str>,
+    ) -> TestResponse {
+        let query = level.map_or_else(String::new, |value| format!("?visibility={value}"));
+        call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("/api/v1/hr/employees{query}"),
+                Some(session),
+                None,
+            ),
+        )
+        .await
+    }
+
+    // --- own: the caller's own row and nothing else. -----------------------------------------
+    bind_visibility(&fixture.db, fixture.organization, user_id, "own").await;
+    let own = list(&fixture, &session, None).await;
+    assert_eq!(own.status, StatusCode::OK, "{}", own.body);
+    assert_eq!(
+        listed_ids(&own.body),
+        vec![manager_id.to_string()],
+        "own must be the caller's own record only: {}",
+        own.body
+    );
+    // The total the header shows is the count the list can show. A card reading 4 above a one-row
+    // list is a real screen, and the number comes from the count query rather than the page.
+    assert_eq!(
+        own.body["total_estimate"].as_i64(),
+        Some(1),
+        "the total must narrow with the rows: {}",
+        own.body
+    );
+
+    // --- team: the caller plus the direct reports. -------------------------------------------
+    bind_visibility(&fixture.db, fixture.organization, user_id, "team").await;
+    let team = list(&fixture, &session, None).await;
+    assert_eq!(team.status, StatusCode::OK, "{}", team.body);
+    let team_ids = listed_ids(&team.body);
+    let mut expected_team = vec![manager_id.to_string(), report_id.to_string()];
+    expected_team.sort();
+    assert_eq!(
+        team_ids, expected_team,
+        "team is the caller plus the DIRECT reports: {}",
+        team.body
+    );
+    assert!(
+        !team_ids.contains(&indirect_id.to_string()),
+        "a report of a report is below the team level"
+    );
+    assert!(
+        !team_ids.contains(&colleague_id.to_string()),
+        "a colleague with no reporting line is not on the team"
+    );
+    assert_eq!(
+        team.body["total_estimate"].as_i64(),
+        Some(2),
+        "the team total must agree with the team rows: {}",
+        team.body
+    );
+
+    // --- all: the whole organization. --------------------------------------------------------
+    bind_visibility(&fixture.db, fixture.organization, user_id, "all").await;
+    let everything = list(&fixture, &session, None).await;
+    assert_eq!(everything.status, StatusCode::OK, "{}", everything.body);
+    for expected in [manager_id, report_id, indirect_id, colleague_id] {
+        assert!(
+            listed_ids(&everything.body).contains(&expected.to_string()),
+            "all must include {expected}: {}",
+            everything.body
+        );
+    }
+
+    // A query parameter may only **narrow** the granted level. An `all` in the URL is not a way
+    // round a `team` grant, and `own` still wins over a `?visibility=team` in the query.
+    bind_visibility(&fixture.db, fixture.organization, user_id, "team").await;
+    let widened = list(&fixture, &session, Some("all")).await;
+    assert_eq!(widened.status, StatusCode::OK, "{}", widened.body);
+    assert_eq!(
+        listed_ids(&widened.body),
+        team_ids,
+        "a query parameter must not widen a granted level: {}",
+        widened.body
+    );
+    let narrowed = list(&fixture, &session, Some("own")).await;
+    assert_eq!(narrowed.status, StatusCode::OK, "{}", narrowed.body);
+    assert_eq!(
+        listed_ids(&narrowed.body),
+        vec![manager_id.to_string()],
+        "a query parameter may narrow: {}",
+        narrowed.body
+    );
+
+    // A caller bound to a level with NO employee record sees nobody. Answering with the whole
+    // directory because the lookup came back empty is the exact widening the level exists to stop.
+    let (account_without_record, nobody_email) =
+        create_account(&fixture.db, Some(fixture.organization), "HR Nobody").await;
+    bind_visibility(&fixture.db, fixture.organization, account_without_record, "own").await;
+    let nobody = fixture.token(&nobody_email).await;
+    let empty = list(&fixture, &nobody, None).await;
+    assert_eq!(empty.status, StatusCode::OK, "{}", empty.body);
+    assert!(
+        listed_ids(&empty.body).is_empty(),
+        "an account with no employee row has no record that could be its own: {}",
+        empty.body
+    );
+}
+
 #[tokio::test]
 async fn an_unauthenticated_caller_is_refused_everywhere_and_a_duplicate_is_a_409() {
     let Some(fixture) = Fixture::new().await else {
