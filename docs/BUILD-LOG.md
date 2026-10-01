@@ -11202,3 +11202,89 @@ cargo test -p omnion-core --lib   62 passed; 0 failed
 against, the `/notifications/settings` device block (three device API functions in
 `api.ts` still have **zero UI callers**), and `prune_endpoints`/`prune_stale` — which still
 have **zero call sites anywhere**, so a revoked endpoint is not yet pruned. Next tick.
+
+## Tick 53 — REQ-117 slice 22: the key verifier promised constant-time and compared with `==`
+
+Fifth time in five ticks that reading a comment against the code produced the real defect, and
+the first whose subject is a **credential**. `keys::verify_key` has been documented since the
+keyed surface shipped:
+
+> **Comparison is constant-time.** [`verify_key`] hashes first and then compares the digests,
+> so the check does not leak the stored hash byte by byte to a caller willing to time it.
+
+The body was `hash_key(presented) == stored_hash`. **`String == String` returns at the first
+differing byte** — the code said the opposite of the prose, and the surface is the platform's
+one business endpoint whose key *is* the authentication (`POST /crm/intake/{source_key}`, no
+session, no permission guard).
+
+**Nothing measured it, because no behavioural test can.** A wrong key fails to verify on both
+implementations, and all seven existing tests asserted *answers*, not the comparison. The
+property is visible only in the disassembly — which is why the three new tests assert on **the
+source**: no `==`, no `return true`, and a `ct_eq` present.
+
+**Proof.**
+
+- `cargo test -p omnion-module-crm-intake --lib` — **174 passed** (was 172).
+- **Three controls proven to fail independently**, each from a pristine copy of the file:
+
+  | control | caught by |
+  |---|---|
+  | the original `==` | `must not compare with ==` |
+  | an early `return true` **with no `==` anywhere** | `must not return early` |
+  | a fourth hand-rolled `diff |= a ^ b` | `must use subtle` |
+
+  The second is the one worth having: without it, that assertion is merely shadowed by the
+  first, and "three assertions" would have been one assertion wearing three hats.
+- `run-crm-key-lifecycle.sh` **7/7** unchanged — it drives `find_source_by_key`, the live path.
+- `cargo build -p omnion-api` green, admin `tsc --noEmit` exit 0, clippy clean on the new code
+  (the two remaining warnings are pre-existing, in `tests/crm_request_id.rs` and
+  `tests/crm_capture_routing.rs`).
+
+**A fourth control failed to fail, and that is the gate being right.** I tried a
+`len() != len()` early-out before `ct_eq`; the gate passed it. That is correct — the length of
+a SHA-256 digest is a constant of the algorithm, not a secret, and the doc comment argues the
+same thing. I had already written "all four controls" into the REQ status line, so I corrected
+it rather than leave a claim I could not back. **A control that passes because the code is
+right is not a defect in the gate; recording it is what distinguishes that from a gate that
+cannot fail.**
+
+**One test defect of mine, and it is this branch's signature trap for the third time.** The
+`diff |=` assertion failed on its first run — because the file's own doc comments *name* the
+loop they replaced, so `source.contains("diff |=")` matched the prose three lines above. A gate
+that scans the text of the file it lives in cannot distinguish "the code does this" from "this
+file explains that the code stopped doing it", and every *correct* documentation of the fix
+would have forced the assertion to be weakened. It now scans **code lines only**, with `//`
+comments and `"` string literals stripped. This is the same failure as slice 21's migration
+test matching a header comment; the general rule sharpens to **a source-scanning assertion must
+read code, or it will be satisfied by the prose explaining the fix.**
+
+**The honest part, and the part that makes this slice more than a `==`.** `verify_key` has
+**no production caller** — `find_source_by_key` matches the digest in SQL — and that is the
+*better* design on this surface rather than a compromise: the comparison happens inside the
+index lookup, and the alternative (select candidates, compare in Rust) is a full scan of every
+tenant's sources on the one endpoint with no guard, which is exactly the cost slice 21 removed.
+So the fix makes a dead function correct rather than making a live path safer, and **the
+comment now says that plainly** instead of leaving a promise no code keeps. I also wrote a
+`digests_match` helper in the first draft — a second credential verb with zero callers, i.e.
+the dead-export defect class this branch has now hit three times — and deleted it before
+committing.
+
+What actually protects this surface is the **hash**, not the comparison: a digest recovered
+through a timing signal still has to be inverted to be spent. Claiming the constant-time
+property was the thing doing the work is how the next reader ends up storing a clear key and
+trusting the comment, so the doc comment now leads with that distinction.
+
+**No browser pass, and none claimed:** no screen changed, and the QA slot holder is a dead
+pid (`alive=N`) whose worktree cannot be identified — another writer's, not mine to take.
+
+**Next.** The dead-caller sweep has now come back empty twice, and the third instance of this
+REQ's defect class was a *doc comment* — so the detector is still earning its keep. Next target
+is the remaining open item: slice 3's REQ-064 form-editor card is the one screen this REQ
+cannot close without a module that exists on **no branch** (REQ-064's forms), which is a
+cross-writer dependency and not something this loop can resolve by writing harder.
+
+**Commits.** `ec288f40` (the comparison, the three source-level gates, the corrected docs).
+Merge of `origin/main` (20 commits: notifications/health/web-push) landed first, resolving
+`crates/events/src/catalogue.rs` — both sides appended a new event area at the same anchor, so
+both halves are kept — and `docs/BUILD-LOG.md` via `scripts/qa/merge-build-log.py`
+(160 entries, nothing from either side missing).
