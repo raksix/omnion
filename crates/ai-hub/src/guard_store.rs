@@ -1260,11 +1260,16 @@ pub async fn label_stats(
     organization_id: Uuid,
     since: OffsetDateTime,
 ) -> Result<BTreeMap<String, i64>> {
+    // `jsonb_each_text` yields **text**, so `sum(value)` has no overload to resolve and the
+    // query dies with `function sum(text) does not exist`. The cast is not optional and it is
+    // invisible: `label_counts` is a jsonb object written by `record_event` from a
+    // `BTreeMap<String, usize>`, so every value *is* a number and the cast cannot fail at
+    // runtime — but the planner has no way to know that, and it resolves types before rows.
     let rows: Vec<(String, i64)> = sqlx::query_as(
-        "select key, sum(value)::bigint from ai_guard_events, \
+        "select entry.key, sum(entry.value::bigint)::bigint from ai_guard_events, \
            jsonb_each_text(label_counts) as entry(key, value) \
-         where organization_id = $1 and created_at >= $2 \
-         group by key order by key",
+         where ai_guard_events.organization_id = $1 and ai_guard_events.created_at >= $2 \
+         group by entry.key order by entry.key",
     )
     .bind(organization_id)
     .bind(since)

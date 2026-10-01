@@ -1140,6 +1140,32 @@ impl From<AiHubError> for ApiError {
             AiHubError::IdentityConflict(message) => {
                 Self::new(StatusCode::CONFLICT, "identity_conflict", message)
             }
+            // The data guard (REQ-105). The same four-way split, and for the same reason: the
+            // rule form's bad field is a `400` naming the field, a rule id from another tenant
+            // (or a platform row, for the update path) is a `404` — never a 403, or the rules
+            // screen becomes an existence oracle for the whole installation's detection rules —
+            // a taken key is a `409` the panel resolves by offering another, and the rule
+            // budget is a `422`: nothing in the caller's request is wrong, the *configuration*
+            // is, and the fix is on the rules screen.
+            AiHubError::InvalidGuardRule(message) => {
+                Self::bad_request("invalid_guard_rule", message)
+            }
+            AiHubError::GuardRuleNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "guard_rule_not_found",
+                format!("no guard rule `{id}` in this organization"),
+            ),
+            AiHubError::GuardRuleConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "guard_rule_conflict", message)
+            }
+            AiHubError::InvalidGuardExemption(message) => {
+                Self::bad_request("invalid_guard_exemption", message)
+            }
+            AiHubError::GuardConfiguration(message) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "guard_configuration",
+                message,
+            ),
             // Approvals (REQ-101). The same three-way split, and for the same reason: an
             // `invalid_approval` is a field on the review or the policy form (a class nobody
             // has heard of, an expiry of zero, a rejection with no reason), an

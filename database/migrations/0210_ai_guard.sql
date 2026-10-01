@@ -118,13 +118,22 @@ create table if not exists ai_guard_rules (
     constraint ai_guard_rules_validator_known
         check (validator in ('none', 'luhn', 'iban_mod97', 'plausible_phone', 'checksum_national_id')),
     constraint ai_guard_rules_label_present check (char_length(btrim(label)) between 1 and 60),
-    -- A custom rule must say which custom label it reports, and a built-in one must not: the
-    -- `Label::Custom` branch in Rust reads `custom_label`, and a built-in rule carrying one
-    -- would render `custom:` for a label that is not custom.
+    -- `custom_label` has to agree with `label`, and **only** with `label`.
+    --
+    -- The first draft of this constraint also tied the pair to `kind`, and it was wrong in the
+    -- most common direction: it read `(kind = 'custom') implies (label = 'custom')`, so a
+    -- tenant could not add a *second* email pattern — the single most ordinary thing an
+    -- operator does with this screen. `kind` says **who wrote the row** (the platform, or a
+    -- tenant); `label` says **what it detects**. A tenant rule reporting `email` is the normal
+    -- case, not an inconsistency, and the check constraint was refusing it with a 23514 that
+    -- the panel would have had to translate by hand.
+    --
+    -- So the rule is the one the Rust `RuleRow::compile` already implements: a `custom` label
+    -- must carry a name, and a built-in label must not.
     constraint ai_guard_rules_custom_label_consistent
-        check ((kind = 'custom' and label = 'custom' and custom_label is not null
+        check ((label = 'custom' and custom_label is not null
                 and char_length(btrim(custom_label)) between 1 and 60)
-            or (kind = 'builtin' and label <> 'custom' and custom_label is null)),
+            or (label <> 'custom' and custom_label is null)),
     constraint ai_guard_rules_key_shape
         check (key ~ '^[a-z0-9_.-]{2,60}$'),
     constraint ai_guard_rules_priority_range

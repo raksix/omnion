@@ -75,6 +75,7 @@ pub mod ai_agent_workspace;
 pub mod ai_approvals;
 pub mod ai_change_sets;
 pub mod ai_decisions;
+pub mod ai_guard;
 pub mod ai_identities;
 pub mod ai_routing;
 pub mod ai_skills;
@@ -807,6 +808,37 @@ pub fn router(state: AppState) -> Router {
     // and a screen that renders the format has to be able to fetch it before the user can type.
     let ai_chat_proposal_instruction =
         get(ai::proposal_instruction).layer(guards::require(&state, "ai.chat"));
+
+    // The data guard (REQ-105 slice 1). Read and manage are separate powers for the same
+    // reason the approval inbox splits them: the events screen is an audit trail a compliance
+    // reader may hold, while raising a label to `block` is a change to what leaves the
+    // installation.
+    //
+    // The **tester** is `manage`, not `read`, and that is the one that needed arguing. It takes
+    // arbitrary text and answers whether it matches this installation's detection rules — a
+    // small oracle over the rule set, which is a map of what the tenants' data looks like. The
+    // events screen shows the same knowledge without accepting input, so nothing an auditor
+    // wanted is lost by the split.
+    let ai_guard_policy = get(ai_guard::get_policy)
+        .layer(guards::require(&state, "ai.guard.read"))
+        .merge(put(ai_guard::put_policy).layer(guards::require(&state, "ai.guard.manage")));
+    let ai_guard_rules = get(ai_guard::list_rules)
+        .layer(guards::require(&state, "ai.guard.read"))
+        .merge(
+            post(ai_guard::create_rule).layer(guards::require(&state, "ai.guard.manage")),
+        );
+    let ai_guard_test = post(ai_guard::run_test).layer(guards::require(&state, "ai.guard.manage"));
+    let ai_guard_events = get(ai_guard::list_events).layer(guards::require(&state, "ai.guard.read"));
+    let ai_guard_fixtures = get(ai_guard::list_fixtures)
+        .layer(guards::require(&state, "ai.guard.read"))
+        .merge(
+            post(ai_guard::create_fixture).layer(guards::require(&state, "ai.guard.manage")),
+        );
+    let ai_guard_exemptions = get(ai_guard::list_exemptions)
+        .layer(guards::require(&state, "ai.guard.read"))
+        .merge(
+            post(ai_guard::create_exemption).layer(guards::require(&state, "ai.guard.manage")),
+        );
 
     // Task routing and feature overrides (REQ-098 slice 2). Reading a route map is the same
     // knowledge as the provider list — which models exist and what they can do — so it is
@@ -1962,6 +1994,33 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/routing/overrides", ai_routing_overrides)
         .route("/ai/routing/preview", ai_routing_preview)
         .route("/ai/logs/decisions", ai_decisions)
+        // The data guard (REQ-105 slice 1). Each rule and exemption is its own `/ai/guard/...`
+        // method route rather than a second method on the collection, so the permission a
+        // method needs is attached at one place and the panel's 403 names the guard key.
+        .route("/ai/guard/policy", ai_guard_policy)
+        .route("/ai/guard/rules", ai_guard_rules)
+        .route(
+            "/ai/guard/rules/{id}",
+            axum::routing::patch(ai_guard::update_rule)
+                .layer(guards::require(&state, "ai.guard.manage"))
+                .merge(
+                    axum::routing::delete(ai_guard::delete_rule)
+                        .layer(guards::require(&state, "ai.guard.manage")),
+                ),
+        )
+        .route("/ai/guard/test", ai_guard_test)
+        .route("/ai/guard/events", ai_guard_events)
+        .route(
+            "/ai/guard/events/{id}",
+            get(ai_guard::read_event).layer(guards::require(&state, "ai.guard.read")),
+        )
+        .route("/ai/guard/fixtures", ai_guard_fixtures)
+        .route("/ai/guard/exemptions", ai_guard_exemptions)
+        .route(
+            "/ai/guard/exemptions/{id}",
+            axum::routing::delete(ai_guard::delete_exemption)
+                .layer(guards::require(&state, "ai.guard.manage")),
+        )
         .route("/ai/logs/decisions.csv", ai_decisions_csv)
         .route("/ai/logs/decisions/{id}", ai_decision)
         .route("/ai/routing/unresolved", ai_unresolved)

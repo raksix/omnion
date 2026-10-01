@@ -229,6 +229,28 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Change which AI tool classes require approval",
     },
+    // The data guard (REQ-105). Read and manage are separate keys for the same reason the
+    // approval gate splits read from act: the *events* screen is an audit trail an
+    // organization may reasonably hand to a compliance reader, while raising a label to
+    // `block` is a change to what leaves the installation and to what the platform is willing
+    // to answer. A single key would make those two the same decision.
+    //
+    // The tester's read power is the *manage* key rather than the read one, and that is
+    // deliberate: `POST /ai/guard/test` takes a payload an operator pastes and returns the
+    // masked form of it. Handing a read-only auditor the ability to submit arbitrary text to
+    // the detector is a small oracle — it says whether a string of their choosing matches
+    // this installation's detection rules, which is a map of what the tenants' data looks
+    // like. The events screen shows the same information without accepting input.
+    PermissionDef {
+        key: "ai.guard.read",
+        category: "ai",
+        description: "Read the AI data guard's policy, rules and event log",
+    },
+    PermissionDef {
+        key: "ai.guard.manage",
+        category: "ai",
+        description: "Change guard rules, the policy and exemptions, and run the tester",
+    },
     // Workflows (docs/requests/REQ-003): the automation surface — definitions, their runs and
     // the steps a run left behind.
     PermissionDef {
