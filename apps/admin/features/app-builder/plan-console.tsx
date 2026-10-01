@@ -30,7 +30,17 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { AlertTriangle, Download, Loader2, RefreshCw, Search, Sparkles, Trash2, WandSparkles, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Download,
+  Loader2,
+  RefreshCw,
+  Search,
+  Sparkles,
+  Trash2,
+  WandSparkles,
+  X,
+} from "lucide-react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
@@ -39,6 +49,7 @@ import { LoadingTable } from "@/components/loading-table";
 import { StatusBadge } from "@/components/status-badge";
 import {
   ApiError,
+  bulkDeleteAppBuilderPlans,
   deleteAppBuilderPlan,
   downloadAppBuilderPlanExport,
   fetchAppBuilderPlans,
@@ -140,6 +151,21 @@ export function PlanConsole() {
   // claim about the bytes the operator now holds, and only the second can be wrong in a way
   // worth telling them about.
   const [exportNote, setExportNote] = useState<string | null>(null);
+  // **The selection survives a filter change, and that is the point.** An operator who ticks
+  // four plans, narrows the filter to find a fifth and clears it again has expressed one
+  // intent — delete these drafts — and a selection that empties itself on every filter change
+  // makes them tick them all over again. So the ids live in state and the *rows* re-render
+  // under them; a selected plan that is not on screen stays selected and is counted.
+  const [selection, setSelection] = useState<string[]>([]);
+  // The bulk bar's own confirmation. Not `window.confirm`: the count has to be rendered by
+  // the screen that knows the selection, and a native dialog cannot show a plan's status or
+  // name which of the selected plans is applied and therefore about to be refused.
+  const [bulkConfirm, setBulkConfirm] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkError, setBulkError] = useState<string | null>(null);
+  // The bulk's outcome, kept apart from the export's: two notes on one strip would let one
+  // overwrite the other and the operator would lose the record of what just happened.
+  const [bulkNote, setBulkNote] = useState<string | null>(null);
 
   const promptRef = useRef<HTMLTextAreaElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -255,6 +281,11 @@ export function PlanConsole() {
     }
   }, [prompt, title, generating, loadPlans]);
 
+  // Declared above the callbacks that read it: a `useCallback` closing over `plans` while the
+  // declaration sits below it is a TDZ error at runtime that `tsc` catches here and no bundler
+  // does — the same trap as the QA fixture's `runDepthPass`.
+  const plans = page?.plans ?? [];
+
   const discard = useCallback(
     async (plan: AppBuilderPlan) => {
       setBusy({ planId: plan.id, action: "delete" });
@@ -272,6 +303,55 @@ export function PlanConsole() {
     },
     [loadPlans],
   );
+
+  // Delete the whole selection in one call, then say what happened.
+  //
+  // **The outcome is read out of the answer, never out of the selection.** "Deleted 2 plans"
+  // after selecting three is a lie the moment one was applied, and the applied plan is exactly
+  // the one an operator is most likely to have selected by ticking everything: a bulk bar that
+  // reports only its own success teaches a reviewer that applied plans are deletable.
+  const runBulkDelete = useCallback(async () => {
+    if (selection.length === 0) return;
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      const answer = await bulkDeleteAppBuilderPlans(selection);
+      setBulkConfirm(false);
+      setSelection([]);
+      setBulkNote(
+        answer.failures.length === 0
+          ? `${answer.deleted} ${answer.deleted === 1 ? "draft" : "drafts"} deleted.`
+          : `${answer.deleted} of ${answer.requested} deleted · ${
+              answer.failures.length === 1 ? "1 plan stayed" : `${answer.failures.length} plans stayed`
+            } · ${answer.failures.map((refused) => refused.message).join("; ")}`,
+      );
+      await loadPlans();
+    } catch (cause: unknown) {
+      setBulkError(
+        cause instanceof ApiError ? cause.message : "The selection could not be deleted.",
+      );
+    } finally {
+      setBulkBusy(false);
+    }
+  }, [selection, loadPlans]);
+
+  /** `true` when a plan is in the selection — the header's tri-state is derived from this. */
+  const toggleSelected = useCallback((planId: string) => {
+    setSelection((current) =>
+      current.includes(planId)
+        ? current.filter((entry) => entry !== planId)
+        : [...current, planId],
+    );
+  }, []);
+
+  const toggleAllVisible = useCallback(() => {
+    setSelection((current) => {
+      const everyVisibleSelected = plans.every((plan) => current.includes(plan.id));
+      return everyVisibleSelected
+        ? current.filter((id) => !plans.some((plan) => plan.id === id))
+        : [...new Set([...current, ...plans.map((plan) => plan.id)])];
+    });
+  }, [plans]);
 
   // Take the plan away as a file. The button is **always** enabled, unlike delete: an export
   // is a read, and the statuses that block a delete (applied) are exactly the ones an
@@ -341,7 +421,6 @@ export function PlanConsole() {
     [generate, generating],
   );
 
-  const plans = page?.plans ?? [];
   const noProvider = generateError?.toLowerCase().includes("provider") ?? false;
   const promptLength = prompt.trim().length;
   const promptShort = promptLength < MIN_PROMPT;
@@ -349,17 +428,61 @@ export function PlanConsole() {
 
   const filterActive = status !== "" || text !== "" || mine;
 
+  // The header checkbox's half-state. It is `useLayoutEffect` because painting "none selected"
+  // for a frame before flipping to the dash is a lie the operator acts on — they press
+  // select-all believing nothing was ticked.
+  const everyVisibleSelected = plans.length > 0 && plans.every((plan) => selection.includes(plan.id));
+  const someVisibleSelected = plans.some((plan) => selection.includes(plan.id));
+  const selectAllRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = someVisibleSelected && !everyVisibleSelected;
+    }
+  }, [someVisibleSelected, everyVisibleSelected]);
+
+  // The refusal the server is about to send, **derived from the rows on screen** — never
+  // re-derived from a rule the client owns. An applied plan in the selection is named in the
+  // confirmation, so the operator learns what will stay *before* pressing the button rather
+  // than from a note that appeared afterwards.
+  const selectedApplied = useMemo(
+    () => plans.filter((plan) => selection.includes(plan.id) && plan.status === "applied"),
+    [plans, selection],
+  );
+  const selectedDeletable = selection.length - selectedApplied.length;
+
   const rows = useMemo(
     () =>
-      plans.map((plan) => (
+      plans.map((plan) => {
+        const selected = selection.includes(plan.id);
+        return (
         <tr
           key={plan.id}
           ref={(node) => {
             rowRefs.current[plan.id] = node;
           }}
           data-plan-row={plan.id}
-          className="border-t border-line hover:bg-quiet-soft/40"
+          data-plan-selected={selected ? "true" : "false"}
+          className={`border-t border-line transition hover:bg-quiet-soft/40${
+            selected ? " bg-accent-soft/30" : ""
+          }`}
         >
+          <td className="px-3 py-3.5">
+            {/* An applied plan's checkbox is **enabled** and its selection is refused by the
+                server with a sentence that names it. Disabling it would be the alternative, and
+                it is the worse one: a control that silently does nothing on the one row a
+                reviewer most needs to know about is a control they learn to mistrust on every
+                row. The row keeps the tick; the answer says why the plan stayed. */}
+            <label className="sr-only" htmlFor={`select-plan-${plan.id}`}>
+              {`Select ${plan.title || plan.id.slice(0, 8)}`}
+            </label>
+            <input
+              id={`select-plan-${plan.id}`}
+              type="checkbox"
+              checked={selected}
+              data-select-plan={plan.id}
+              onChange={() => toggleSelected(plan.id)}
+            />
+          </td>
           <td className="px-4 py-3.5">
             <Link
               href={`/app-builder/plans/${plan.id}`}
@@ -425,8 +548,9 @@ export function PlanConsole() {
             </div>
           </td>
         </tr>
-      )),
-    [plans, busy, discard, exportPlan, isBusy],
+        );
+      }),
+    [plans, busy, discard, exportPlan, isBusy, selection, toggleSelected],
   );
 
   return (
@@ -674,6 +798,27 @@ export function PlanConsole() {
           </div>
         ) : null}
 
+        {/* The bulk's outcome. Its own strip, and `role="status"` for the same reason the
+            export's is: a toast that vanishes is a claim nobody can re-read, and this one
+            names plans that survived the delete. */}
+        {bulkNote ? (
+          <div
+            role="status"
+            data-bulk-note
+            className="flex items-center justify-between gap-3 border-b border-line bg-quiet-soft/40 px-4 py-2 text-[11.5px] text-muted"
+          >
+            <span>{bulkNote}</span>
+            <button
+              type="button"
+              onClick={() => setBulkNote(null)}
+              aria-label="Dismiss the delete note"
+              className="shrink-0 rounded p-0.5 hover:text-ink"
+            >
+              <X className="size-3" aria-hidden />
+            </button>
+          </div>
+        ) : null}
+
         {listState === "loading" ? (
           <LoadingTable columns={COLUMNS.length} />
         ) : listState === "error" ? (
@@ -718,6 +863,23 @@ export function PlanConsole() {
             <table className="w-full border-collapse text-left text-[13px]">
               <thead>
                 <tr className="border-b border-line text-[11.5px] uppercase tracking-wide text-muted">
+                  <th scope="col" className="w-8 px-3 py-2.5">
+                    {/* A header checkbox that only ever reads `checked` is a control that
+                        cannot be turned off; this one is derived from the visible rows and
+                        unticks them all, and its `ref` paints the indeterminate half-state when
+                        some — but not all — of the page is selected. */}
+                    <label className="sr-only" htmlFor="app-builder-select-all">
+                      Select every plan on this page
+                    </label>
+                    <input
+                      id="app-builder-select-all"
+                      type="checkbox"
+                      ref={selectAllRef}
+                      data-select-all
+                      checked={plans.length > 0 && everyVisibleSelected}
+                      onChange={toggleAllVisible}
+                    />
+                  </th>
                   {COLUMNS.map((column) => (
                     <th key={column} scope="col" className="px-4 py-2.5 font-medium">
                       {column}
@@ -732,6 +894,118 @@ export function PlanConsole() {
             </table>
           </div>
         )}
+
+        {/* The bulk bar. `sticky bottom-0` inside the section, so it is reachable at 390 px
+            without the page scrolling — a delete you have to scroll to find is a delete that
+            gets done in batches of one. */}
+        {selection.length > 0 ? (
+          <div
+            role="region"
+            aria-label="Selected plans"
+            data-bulk-bar
+            className="sticky bottom-0 flex flex-wrap items-center gap-2 border-t border-line bg-surface px-4 py-2.5"
+          >
+            <span data-bulk-count className="text-[12.5px] font-medium">
+              {selection.length} selected
+              {selectedApplied.length > 0
+                ? ` · ${selectedApplied.length} applied and will stay`
+                : ""}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setBulkError(null);
+                setBulkConfirm(true);
+              }}
+              data-bulk-delete
+              disabled={bulkBusy}
+              className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-[12px] text-accent-strong transition hover:bg-canvas disabled:opacity-50"
+            >
+              {bulkBusy ? (
+                <Loader2 className="size-3 animate-spin" aria-hidden />
+              ) : (
+                <Trash2 className="size-3" aria-hidden />
+              )}
+              Delete drafts
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setSelection([]);
+                setBulkNote(null);
+              }}
+              data-bulk-clear
+              className="ml-auto flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[12px] text-muted transition hover:text-ink"
+            >
+              <X className="size-3" aria-hidden />
+              Clear
+            </button>
+          </div>
+        ) : null}
+
+        {/* The confirmation. It names the count, and it names the applied plans that are about
+            to be refused — before the button is pressed, not in a note afterwards. A dialog
+            that only said "delete 3?" would leave the operator to find out which one stayed by
+            looking at the list again. */}
+        {bulkConfirm ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Delete the selected plans"
+              data-bulk-confirm
+              className="w-full max-w-md rounded-xl border border-line bg-surface p-5 shadow-xl"
+            >
+              <h2 className="text-[14px] font-medium">
+                {selectedDeletable === 0
+                  ? "Nothing in this selection can be deleted"
+                  : `Delete ${selectedDeletable} ${selectedDeletable === 1 ? "draft" : "drafts"}?`}
+              </h2>
+              <div className="mt-2 flex flex-col gap-2 text-[12.5px] text-muted">
+                <p>
+                  {selection.length} {selection.length === 1 ? "plan is" : "plans are"} selected.
+                  A plan and its artifacts are removed together, and nothing here has been
+                  applied yet.
+                </p>
+                {selectedApplied.length > 0 ? (
+                  <p data-bulk-applied-note className="text-caution">
+                    {selectedApplied.length === 1 ? "One applied plan stays" : `${selectedApplied.length} applied plans stay`}
+                    {selectedApplied.some((plan) => plan.title)
+                      ? `: ${selectedApplied
+                          .map((plan) => plan.title || plan.id.slice(0, 8))
+                          .join(", ")}. An applied plan is what the live app was built from.`
+                      : ". An applied plan is what the live app was built from."}
+                  </p>
+                ) : null}
+                {bulkError ? (
+                  <p role="alert" data-bulk-error className="text-accent-strong">
+                    {bulkError}
+                  </p>
+                ) : null}
+              </div>
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setBulkConfirm(false)}
+                  data-bulk-cancel
+                  className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void runBulkDelete()}
+                  disabled={bulkBusy || selectedDeletable === 0}
+                  data-bulk-confirm-delete
+                  className="flex items-center gap-2 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {bulkBusy ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : null}
+                  {selectedDeletable === 0 ? "Nothing to delete" : "Delete"}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </section>
     </div>
   );

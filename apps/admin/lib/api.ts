@@ -133,6 +133,7 @@ import type {
   User,
   AppBuilderArtifact,
   AppBuilderBlocker,
+  AppBuilderBulkDelete,
   AppBuilderCounts,
   AppBuilderDecision,
   AppBuilderExample,
@@ -7161,6 +7162,27 @@ export function rejectAppBuilderPlan(planId: string, reason: string): Promise<Ap
 export function deleteAppBuilderPlan(planId: string): Promise<void> {
   return request<void>(`/api/v1/app-builder/plans/${encodeURIComponent(planId)}`, {
     method: "DELETE",
+  });
+}
+
+/**
+ * Remove a selection of drafts in one call (REQ-045 slice 4).
+ *
+ * **`POST /plans/bulk-delete` and not `DELETE /plans/{id}` repeated by the client.** Three
+ * reasons, and the third is the one that decides it:
+ *
+ * * twenty row-level deletes are twenty round trips, twenty audit rows and twenty chances for
+ *   a filter change to land between two of them;
+ * * a per-row delete cannot report a *partial* outcome — it answers `204` or `409` for the
+ *   whole page, so a selection mixing three drafts with the one applied plan would show the
+ *   operator a refusal and leave the three untouched;
+ * * the refusals are the server's. An applied plan has to stay, and the client does not own
+ *   that rule — it re-derives it, it can only ever agree with the store until it does not.
+ */
+export function bulkDeleteAppBuilderPlans(ids: string[]): Promise<AppBuilderBulkDelete> {
+  return request<AppBuilderBulkDelete>("/api/v1/app-builder/plans/bulk-delete", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
   });
 }
 

@@ -2688,3 +2688,22 @@ export type AppBuilderDecision = {
 
 /** What rejecting or deleting a plan answers. */
 export type AppBuilderPlanDecision = { plan: AppBuilderPlan };
+
+/**
+ * One plan a bulk delete would not remove (REQ-045 slice 4).
+ *
+ * The reason is the **server's** sentence, rendered verbatim: a client that re-derived "it
+ * was applied" from the row would one day disagree with the rule the store enforced, and the
+ * reviewer would be told a plan was safe to delete when it is not.
+ */
+export type AppBuilderBulkFailure = { id: string; message: string };
+
+/** What `POST /app-builder/plans/bulk-delete` answers — both halves, always. */
+export type AppBuilderBulkDelete = {
+  /** How many plans the selection named. */
+  requested: number;
+  /** How many are gone. */
+  deleted: number;
+  /** The plans that stayed, each with the reason it did. */
+  failures: AppBuilderBulkFailure[];
+};
