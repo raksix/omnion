@@ -26,6 +26,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
+use omnion_content::branding::{
+    BrandingAsset, BrandingLimits, message_for, validate_branding,
+};
 use omnion_content::theme_settings::{
     self, SettingsChange, SettingsInput, SettingsView, contrast_report, merge_over,
 };
@@ -88,6 +91,13 @@ pub async fn save_settings(
     Json(body): Json<SaveBody>,
 ) -> Result<Json<SettingsView>, ApiError> {
     let site = site_in_scope(&state, &current, site_id).await?;
+
+    // Before the store, not after: a refused save must not leave a draft revision behind for
+    // the history screen to show as the site's newest thing. `body.theme_key` is read as the
+    // client sent it because that is the theme whose limits apply to the payload being saved --
+    // the site's `theme` column is a different question (what is live) and may name another
+    // theme entirely.
+    check_branding(&state, site.id, &body.theme_key, &body.branding).await?;
 
     let revision = theme_settings::save_draft(
         state.db().pool(),
@@ -312,6 +322,132 @@ async fn default_tokens_for(state: &AppState, theme_key: &str) -> serde_json::Va
             .unwrap_or_else(|| json!({})),
         _ => json!({}),
     }
+}
+
+/// A theme manifest, or `{}` when the key names nothing this build ships.
+///
+/// The branding limits are read from `settingsSchema`, so the manifest is the input to the
+/// check rather than a decoration on it. An unknown theme key resolves to an empty manifest and
+/// therefore to the platform defaults — the same "fall back and say so" rule the renderer
+/// applies, applied to the limit the theme would have tightened.
+async fn manifest_for(state: &AppState, theme_key: &str) -> serde_json::Value {
+    match themes::find_theme(state.db().pool(), theme_key).await {
+        Ok(Some(theme)) => theme.manifest,
+        _ => json!({}),
+    }
+}
+
+/// Resolve every media id a `branding` section names into what the library knows about it.
+///
+/// Two facts are read per file and they live in DIFFERENT places, which is the whole reason
+/// this is a function rather than a call into the media crate:
+///
+/// * `size_bytes` and `content_type` are on the `media` row.
+/// * `width`/`height` are NOT on `media` at all — the upload path probes the header and writes
+///   the geometry onto `media_versions` version 1. A resolver that read only `media` would
+///   silently find no dimensions and skip the half of criterion 9 that says "min/max
+///   dimensions", which is exactly how a check that looks installed goes unmeasured.
+///
+/// A file with no version row (a row imported before the probe existed, or a version 1 that
+/// predates it) resolves with no geometry rather than being dropped from the map — it is still
+/// checked for size and type, and the validator is written to say so rather than to guess.
+///
+/// A media id belonging to ANOTHER site is absent from the map on purpose. Scope is enforced by
+/// the query, not by a second comparison afterwards: a cross-site reference becomes
+/// `UnknownAsset`, which is the same answer an operator gets for a file that was deleted, and
+/// the message names the id so the reference is findable.
+async fn resolve_branding(
+    state: &AppState,
+    site_id: Uuid,
+    branding: &serde_json::Value,
+) -> std::collections::HashMap<Uuid, BrandingAsset> {
+    let mut ids = Vec::new();
+    if let Some(object) = branding.as_object() {
+        for key in omnion_content::branding::BRANDING_KEYS {
+            if let Some(text) = object.get(key).and_then(serde_json::Value::as_str) {
+                if let Ok(id) = Uuid::parse_str(text.trim()) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let Ok(rows) = sqlx::query_as::<_, (Uuid, i64, String, Option<i32>, Option<i32>)>(
+        "select m.id, m.size_bytes, m.content_type, v.width, v.height \
+         from media m \
+         left join lateral ( \
+             select width, height from media_versions mv \
+             where mv.media_id = m.id order by mv.version asc limit 1 \
+         ) v on true \
+         where m.site_id = $1 and m.id = any($2)",
+    )
+    .bind(site_id)
+    .bind(&ids)
+    .fetch_all(state.db().pool())
+    .await
+    else {
+        // A query that cannot run leaves every reference unresolved, which surfaces as
+        // `UnknownAsset` — a wrong refusal, not a right one, and visible to the operator
+        // rather than silent. The alternative (skip the check) is a validator that passes
+        // because it could not read.
+        return std::collections::HashMap::new();
+    };
+
+    rows.into_iter()
+        .map(|(id, size_bytes, content_type, width, height)| {
+            (
+                id,
+                BrandingAsset {
+                    media_id: id,
+                    size_bytes,
+                    content_type,
+                    width,
+                    height,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Refuse a save whose branding names files the panel should have caught first.
+///
+/// The refusal carries **every** finding, and the panel splits them by field, because a
+/// refusal that named only the logo would leave an operator who also set an SVG favicon to fix
+/// one mistake, resubmit, and discover the second.
+///
+/// This is a SAVE-time refusal, which is the opposite of the contrast check's rule on purpose.
+/// A low-contrast palette is a legitimate work-in-progress to stage and compare; a 25 MB logo
+/// is not something an author can finish thinking about later, and the media row it names is
+/// already paid for in storage.
+async fn check_branding(
+    state: &AppState,
+    site_id: Uuid,
+    theme_key: &str,
+    branding: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let limits = BrandingLimits::for_theme(&manifest_for(state, theme_key).await);
+    let resolved = resolve_branding(state, site_id, branding).await;
+    let findings = validate_branding(branding, &limits, &resolved);
+    if findings.is_empty() {
+        return Ok(());
+    }
+
+    Err(ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "theme_settings_branding_invalid",
+        findings
+            .iter()
+            .map(message_for)
+            .collect::<Vec<String>>()
+            .join(" · "),
+    )
+    // The structured half is per-field ON PURPOSE, not a flat message list: the panel puts one
+    // line under the input that caused it, and it can only do that if the server told it which
+    // input. The joined message above is what a `curl` sees and what the error banner shows.
+    .with_details(json!({ "findings": findings })))
 }
 
 /// The per-field diff the history screen renders.

@@ -37,7 +37,7 @@
 //! customize screen puts one message under the input that caused it, which is the "field-level
 //! message" the criterion asks for.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -489,6 +489,7 @@ pub fn refuse_branding(findings: &[BrandingFinding]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn id(n: u128) -> Uuid {
         Uuid::from_u128(n)
