@@ -48,6 +48,16 @@ create table if not exists oauth_apps (
     scopes              jsonb not null default '[]'::jsonb,
     grant_types         jsonb not null default '["authorization_code"]'::jsonb,
     status              text not null default 'active',
+    -- *When* the app was withdrawn, as distinct from the fact that it was. `status` answers the
+    -- only question the platform acts on; this answers the one an operator asks ("when did
+    -- somebody retire this, and was it me?"), and it is what the audit trail and the app's own
+    -- detail screen read. Null for a live or merely suspended app.
+    --
+    -- Constrained to travel with `status` below, because half a withdrawal is the dangerous
+    -- direction: a `deleted` app with no timestamp is a row the panel cannot date, and a
+    -- timestamp on an app whose status still reads `active` is an app that keeps issuing codes
+    -- after somebody believed they had stopped it.
+    deleted_at          timestamptz,
     created_by          uuid not null references users (id) on delete cascade,
     created_at          timestamptz not null default now(),
     updated_at          timestamptz not null default now(),
@@ -62,8 +72,13 @@ create table if not exists oauth_apps (
         check (jsonb_typeof(scopes) = 'array' and jsonb_array_length(scopes) > 0),
     constraint oauth_apps_grant_types_known
         check (jsonb_typeof(grant_types) = 'array' and jsonb_array_length(grant_types) > 0),
+    constraint oauth_apps_grant_types_are_known
+        check (grant_types <@ '["authorization_code", "client_credentials"]'::jsonb),
     constraint oauth_apps_status_known
         check (status in ('active', 'suspended', 'deleted')),
+    -- The withdrawal's two halves, together — the same reasoning as the overlap window below.
+    constraint oauth_apps_deletion_is_whole
+        check ((status = 'deleted') = (deleted_at is not null)),
     -- Half an overlap window is the failure this rules out. A previous hash with no expiry is
     -- a credential that stays valid after the operator believed it was revoked; an expiry with
     -- no hash is a countdown to nothing, which reads as a broken rotation.

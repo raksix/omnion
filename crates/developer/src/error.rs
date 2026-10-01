@@ -86,6 +86,144 @@ pub enum DeveloperError {
     #[error("this key is {0}")]
     KeyNotActive(&'static str),
 
+    // --- OAuth applications (REQ-033, slice 3) ---------------------------------
+    //
+    // The rule every variant below follows is the module doc's: **none of them carries a
+    // submitted URL or a secret.** A redirect URI is an attack surface by construction and an
+    // app's secret is a credential; echoing either into an error that reaches a log index or a
+    // browser console undoes the rule the module was written to enforce. What these carry
+    // instead is a *position* — `index: 2` — which is enough for the panel to put a message
+    // under the right row and useless for anybody reading the log.
+    /// A status other than `active`, `suspended` or `deleted`.
+    #[error("{0:?} is not a status an application has")]
+    UnknownAppStatus(String),
+
+    /// An app with this name already exists in the organization.
+    ///
+    /// The unique index `oauth_apps_org_name_key` is the enforcement; this is the message it
+    /// produces *before* the database has to. It exists because a name clash has to land under
+    /// the name box: a `500` carrying a PostgreSQL index name is not an answer a person can act
+    /// on, and the panel's `ApiError.code` is what decides where the message goes.
+    #[error("an application named {0:?} already exists")]
+    AppNameTaken(String),
+
+    /// A description longer than the bound.
+    #[error("the description cannot be longer than {max} characters")]
+    AppDescriptionTooLong {
+        /// The bound that was exceeded.
+        max: usize,
+    },
+
+    /// An app was registered with no redirect URI at all.
+    #[error("an application needs at least one redirect URI")]
+    NoRedirectUris,
+
+    /// More redirect URIs than [`crate::oauth::MAX_REDIRECT_URIS`].
+    #[error("an application may register at most {max} redirect URIs")]
+    TooManyRedirectUris {
+        /// The bound that was exceeded.
+        max: usize,
+    },
+
+    /// One redirect URI was longer than [`crate::oauth::MAX_REDIRECT_URI_LENGTH`].
+    #[error("redirect URI #{index} is longer than {max} characters")]
+    RedirectUriTooLong {
+        /// Which entry in the submitted list, zero-based.
+        index: usize,
+        /// The bound that was exceeded.
+        max: usize,
+    },
+
+    /// One redirect URI's scheme is not one the platform will redirect a browser to.
+    ///
+    /// The *position* rather than the URL, deliberately — see the module doc.
+    #[error("redirect URI #{index} must be https, or http on localhost")]
+    RedirectUriSchemeRefused {
+        /// Which entry in the submitted list, zero-based.
+        index: usize,
+    },
+
+    /// The same redirect URI appeared twice in one submission.
+    #[error("redirect URI #{index} is already registered in this list")]
+    DuplicateRedirectUri {
+        /// Which entry in the submitted list, zero-based.
+        index: usize,
+    },
+
+    /// An app was registered with no grant type.
+    #[error("an application needs at least one grant type")]
+    NoGrantTypes,
+
+    /// The same grant type appeared twice.
+    #[error("grant type #{index} is listed twice")]
+    DuplicateGrantType {
+        /// Which entry in the submitted list, zero-based.
+        index: usize,
+    },
+
+    /// A grant type outside the two this platform implements.
+    #[error("{0:?} is not a grant type this platform has")]
+    UnknownGrantType(String),
+
+    /// The requested app does not exist in this organization — or, deliberately, is not the
+    /// one whose `client_id` was submitted.
+    ///
+    /// One error for both, because an authorization endpoint that distinguishes "no such app"
+    /// from "that app is not yours" is an existence oracle across tenants.
+    #[error("no such application")]
+    AppNotFound,
+
+    /// An app that exists but cannot start a flow right now.
+    #[error("this application is {0}")]
+    AppNotActive(&'static str),
+
+    /// A flow the app is not registered for was requested.
+    #[error("this application is not registered for that grant type")]
+    GrantNotRegistered,
+
+    /// A redirect URI that is not one this app registered was submitted.
+    ///
+    /// Carries no URI: the submitted value is attacker-controlled by definition.
+    #[error("this redirect URI is not registered for the application")]
+    RedirectUriNotRegistered,
+
+    /// A requested scope the app is not registered for.
+    #[error("this application is not registered for one of the requested scopes")]
+    ScopeNotRegistered,
+
+    /// A PKCE challenge that could never be verified, or half a challenge/method pair.
+    #[error("the code challenge is not usable; send S256, or neither value")]
+    CodeChallengeRefused,
+
+    /// A client secret presented to the token endpoint that matched neither the current hash
+    /// nor — during an open overlap — the previous one.
+    ///
+    /// One answer for "no such client", "wrong secret", "expired previous secret" and "this
+    /// app cannot use that grant", because a caller that can tell those apart learns which
+    /// client ids exist.
+    #[error("invalid client credentials")]
+    InvalidClient,
+
+    /// The presented redirect URI did not match the one the code was issued for.
+    ///
+    /// OAuth requires the token request to repeat the same URI the authorization request used,
+    /// and it is a real rule rather than ceremony: a code is bound to a redirect, and accepting
+    /// any other URI is how an intercepted code gets redeemed by whoever reached the endpoint.
+    #[error("the redirect URI does not match the authorization request")]
+    RedirectUriMismatch,
+
+    /// The authorization code is unknown, already spent, or past its expiry.
+    ///
+    /// One answer for all three, and it is the same answer [`Self::InvalidClient`] gives for a
+    /// bad secret: a caller probing codes learns nothing from which of the three it hit.
+    #[error("invalid authorization code")]
+    InvalidCode,
+
+    /// A `client_credentials` request presented a user-bound authorization code, or the
+    /// reverse. The two flows issue different things and swapping them is a privilege change.
+    #[error("this grant cannot be used with that code")]
+    GrantMismatch,
+
     /// The database said no, and the message is one we wrote.
     #[cfg(feature = "store")]
     #[error("database error: {0}")]
@@ -123,6 +261,33 @@ impl DeveloperError {
                 | Self::InvalidKey
                 | Self::HighTierRefused
                 | Self::KeyNotActive(_)
+                // Everything in the OAuth block is the caller's problem: every one of these
+                // is a request that has to change before it can be accepted. `InvalidClient`,
+                // `InvalidCode` and `GrantMismatch` are the interesting three — they describe a
+                // credential that failed, which reads like a server fault but is not, and
+                // answering `500` for a wrong secret would tell a script the platform is down
+                // and invite a retry loop against a credential that will never work.
+                | Self::UnknownAppStatus(_)
+                | Self::AppNameTaken(_)
+                | Self::AppDescriptionTooLong { .. }
+                | Self::NoRedirectUris
+                | Self::TooManyRedirectUris { .. }
+                | Self::RedirectUriTooLong { .. }
+                | Self::RedirectUriSchemeRefused { .. }
+                | Self::DuplicateRedirectUri { .. }
+                | Self::NoGrantTypes
+                | Self::DuplicateGrantType { .. }
+                | Self::UnknownGrantType(_)
+                | Self::AppNotFound
+                | Self::AppNotActive(_)
+                | Self::GrantNotRegistered
+                | Self::RedirectUriNotRegistered
+                | Self::ScopeNotRegistered
+                | Self::CodeChallengeRefused
+                | Self::InvalidClient
+                | Self::RedirectUriMismatch
+                | Self::InvalidCode
+                | Self::GrantMismatch
         )
     }
 
@@ -150,6 +315,30 @@ impl DeveloperError {
             Self::InvalidKey => "invalid_api_key",
             Self::HighTierRefused => "high_tier_refused",
             Self::KeyNotActive(_) => "api_key_not_active",
+            Self::UnknownAppStatus(_) => "unknown_app_status",
+            Self::AppNameTaken(_) => "oauth_app_name_taken",
+            Self::AppDescriptionTooLong { .. } => "oauth_app_description_too_long",
+            Self::NoRedirectUris => "no_redirect_uris",
+            Self::TooManyRedirectUris { .. } => "too_many_redirect_uris",
+            Self::RedirectUriTooLong { .. } => "redirect_uri_too_long",
+            Self::RedirectUriSchemeRefused { .. } => "redirect_uri_scheme_refused",
+            Self::DuplicateRedirectUri { .. } => "duplicate_redirect_uri",
+            Self::NoGrantTypes => "no_grant_types",
+            Self::DuplicateGrantType { .. } => "duplicate_grant_type",
+            Self::UnknownGrantType(_) => "unknown_grant_type",
+            Self::AppNotFound => "oauth_app_not_found",
+            Self::AppNotActive(_) => "oauth_app_not_active",
+            Self::GrantNotRegistered => "grant_not_registered",
+            Self::RedirectUriNotRegistered => "redirect_uri_not_registered",
+            Self::ScopeNotRegistered => "scope_not_registered",
+            Self::CodeChallengeRefused => "code_challenge_refused",
+            // The three flat codes. They are one code each rather than four because they *are*
+            // one answer to a caller, and a client that switches on them must not be able to
+            // branch on which refusal it got.
+            Self::InvalidClient => "invalid_client",
+            Self::RedirectUriMismatch => "redirect_uri_mismatch",
+            Self::InvalidCode => "invalid_authorization_code",
+            Self::GrantMismatch => "grant_mismatch",
             // Gated for the same reason the variant is: without the `store` feature this arm
             // does not exist, and a match that names it is a compile error. The alternative —
             // a `_ =>` arm — would swallow a new client-error variant added later without its

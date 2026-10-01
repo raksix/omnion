@@ -30,11 +30,14 @@
 pub mod authn;
 pub mod error;
 pub mod model;
+pub mod model_oauth;
 pub mod oauth;
 pub mod openapi;
 pub mod secret;
 #[cfg(feature = "store")]
 pub mod store;
+#[cfg(feature = "store")]
+pub mod store_oauth;
 
 pub use authn::{
     AuthenticatedKey, KeyRefusal, address_allowed, cidr_contains, decide, scope_allows,
@@ -43,6 +46,10 @@ pub use error::{DeveloperError, Result};
 pub use model::{
     ApiKey, Environment, KeyStatus, Minted, NewKey, RateTier, RequestLog, RequestLogPage,
     RequestLogQuery, UsageDay, key_rules,
+};
+pub use model_oauth::{
+    AppEdit, AppStatus, AuthorizationRequest, ConsentRequest, MintedApp, NewApp, OAuthApp,
+    app_rules, authorize,
 };
 pub use secret::{MintedKey, mint};
 
