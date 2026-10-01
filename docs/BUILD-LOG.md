@@ -14815,3 +14815,64 @@ API), and the QA slot is held by a live w4 pass (holder pid 1782910,
 **Next.** `fetch_candidates` is the other consumer of the phone arm and queries
 `crm_contacts`, which REQ-051 owns — the same audit has to be run against whatever index
 that module ships, and the answer is not visible from this branch.
+## Tick 71 · REQ-117 slice 39 — the method was one index, this was a whole sweep
+
+**What.** Tick 38 found one rule written twice — once in a query, once in an index — and settled
+it with `explain analyze` rather than a diff. This tick applied that method to the SLA sweep
+as a whole, and the sweep's **first read** was reading the platform's entire lead table to decide
+which tenants to walk. `assignment_store::organizations_with_leads` named no lead status at all,
+while `crm_leads_sla_idx` (migration `0055`) is partial on
+`first_response_at is null and status not in ('spam','rejected','duplicate')`. PostgreSQL offers a
+partial index only when the planner can prove every row the statement would read satisfies the
+predicate, and "no status mentioned" proves nothing about it.
+
+**RED first, and RED was a measurement.** On a 20 204-lead fixture whose live set is 4 rows:
+`Seq Scan on crm_leads`, `Rows Removed by Filter: 20000`, **4.01 ms**. After:
+`Bitmap Index Scan on crm_leads_sla_idx`, **0.113 ms**.
+
+**The second half is the one a plan check alone would have missed.** Both consumer reads —
+`due_reminders` and `due_breaches` — filter `status in ('new', …)`, so a tenant holding only spam
+and rejected leads was walked every minute to produce **two empty result sets**: the fixture's
+statement named ten tenants and both consumers returned `0` rows for nine of them. And `limit`
+bounds *organizations*, so quiet tenants at the end of the ordering can consume the batch a busy
+tenant needs. The performance fix and the correctness fix are the same edit, which is why the gate
+asserts the answer as well as the plan — a narrowing that dropped a tenant with a live clock would
+be silent, permanent data loss with every plan-shaped assertion still green.
+
+**The status rule now has one SQL spelling beside the Rust one it mirrors.** `is_open` cannot reach
+a query and six statements were asking it by hand — the same argument `dedupe::PHONE_DIGITS_SQL`
+makes for the phone rule, one level up. A status added to `is_open` changes the Rust answer and
+leaves the SQL reading a row the clock has stopped on. The predicate takes the **column name** as a
+parameter because three call sites read an aliased table.
+
+**Proof.** `scripts/qa/run-crm-sla-sweep-plan.sh` **7/7**, both predicates read out of
+`vocabulary.rs` rather than retyped. **NEGATIVE CONTROL: the production statement with the
+predicate removed seq-scans**, and a wrong narrowing (adding `'new'` to the closed list) answers
+`0` — the gate can see the performance defect *and* the data-loss one. **Unit guards are
+RED-proven:** narrowing `is_open` to `'new'` turns them red with
+`left: {"new","assigned","contacted","qualified"} right: {"new"}`. Regressions:
+`run-crm-phone-index` **6/6**, `run-crm-attribution` **5/5**, `run-crm-dedupe` **12/12**, module lib
+**189/189**, `omnion-api` builds, admin `tsc --noEmit` exit 0.
+
+**A gate-hygiene defect of my own, and it is the same shape as tick 70's.** `cargo test` reported
+**189/189 green** while a `#[test]` I had inserted had stranded its attribute off the previous
+function — the only evidence was the warning `duplicated attribute` plus
+`the_lists_have_no_duplicates is never used`, and I read the green count first. **A test count is
+not proof that a test ran**; the assertion was verified by `--list` and by narrowing `is_open`.
+
+**Recovered from my own mistake, and the rule is the point.** To keep the commit atomic I ran
+`git stash push` on the three touched files to undo a rustfmt run that had reformatted pre-existing
+code — and then `git stash drop`d it in the same command, which destroyed ~215 lines of uncommitted
+work. **Recovered from the object store** with `git fsck --no-reflogs --unreachable` plus
+`git show --stat` to find the stash commit by the files it touched. The lesson is not the recovery,
+it is the order: **`stash push` and `stash drop` are not one operation**, and a drop in the same
+command as the push means the recovery path is never rehearsed while it is cheap to keep.
+
+**Not claimed.** No browser pass: no screen changed (one predicate, one constant, one gate — all
+below the API), and the QA slot is held by a live w4 pass (holder pid 1782910,
+`cwd=/mnt/apopic/omnion-w4`).
+
+**Next.** `count_breached` and `count_unassigned` now share the constant but are still `count(*)`
+over `crm_leads`, which is a different question from this tick's; and the `escalated_at is null`
+filter in `due_breaches` is a plain `Filter:` on the index rather than part of it — the same
+shape, one column over.
