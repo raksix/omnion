@@ -1,32 +1,39 @@
 # REQ-033 — Internal Developer Platform
 
-> **Status:** in-progress (`a1840487`, `416a58bf`, `dd00be30`; tick 108 — slices 3a and 3b are shipped: the client material and the redirect/PKCE rules, the store, the authorization check, six panel routes behind two new permission keys, and migration `0231`. A real open-redirect defect in 3a's own loopback rule was found by 3b's validator and fixed (`816b89d5`), and the migration number had to be renumbered because w8 had taken `0229`. Gates: `omnion-developer --features store --lib` **104** (was 73), `omnion-api --lib` **397** (was 391), `omnion-permissions --lib` **64**, the OpenAPI drift gate **5/5** with all four new routes documented, and migration `0231` proved against live PostgreSQL by **8 named refusals across 7 constraints** plus 3 positive controls. **Open: the sessionless half** — the authorization request, consent screen and token endpoint — and then the panel screen, which is why the browser pass is not owed on this tick.)
-> are shipped.** The client material and the redirect/PKCE rules, the store, the authorization
-> check, six panel routes behind two new permission keys, and migration `0231`. The sessionless
-> half and the panel screen are still open, so the browser pass is not owed on this tick.) Slice 2
-> remains code-complete and waiting only on a browser pass.
+> **Status:** in-progress (`a1840487`, `416a58bf`, `dd00be30`, `0469249e`, `d497b8f9`, `bfd699dd`, `de3b6620`, `ba95b808`, `4867981f`; tick 109 — slice 3c, the sessionless half, is shipped: the authorization request, the consent screen, the token endpoint and token introspection, in `crates/developer/src/oauth_flow.rs` and `apps/api/src/routes/oauth_flow.rs`, plus migration `0232` for the access tokens. **A live XSS in my own code, found by the consent screen's escaping test**: the three hidden form fields were JSON-encoded, and JSON escapes a quote as `\"` where HTML wants `&quot;`, so a `state` of `"><script>alert(1)</script>` closed the attribute and left a live script tag in the approver's session on the platform's own origin. The same function also rendered an absent value as the four characters `null`, which the token endpoint would have echoed back to the client as a `state` it never sent. The compiler caught a third one: `redirect_with_error` takes `&'static str`, and I had written `error.to_string()` — a client-supplied `response_type` was about to ride in a `Location` header into browser history and `Referer`. Gates: `omnion-api --lib` **408** (was 397), `omnion-developer --features store --lib` **128** (was 104), `tsc --noEmit` clean, and migration `0232` proved against live PostgreSQL by **6 named refusals across 5 constraints** plus 4 positive controls. **Open: the panel screen** at `/developer/oauth-apps` and its walkthrough route, which is why the browser pass is not owed on this tick.)
+> **Three things tick 109 found that the code did not know about itself.** (The previous tick's
+> findings — the `[::1].attacker.example` open redirect, the `0229` migration collision, and the
+> two-fields-one-JSON-key response shape — are in `docs/BUILD-LOG.md` and in the slice 3b notes
+> below.)
 >
-> **Two things this tick found that the code did not know about itself.**
+> **(1) A live stored XSS in the consent screen, reachable by any developer who can register an
+> app in their own tenant.** The three hidden form fields were **JSON-encoded**, and JSON escapes
+> a double quote as `\"` where HTML wants `&quot;`. A `state` of `"><script>alert(1)</script>`
+> therefore rendered as
 >
-> **(1) A real open-redirect defect in slice 3a's own code** (`816b89d5`). 3a fixed IPv6 loopback
-> by taking a bracketed authority whole, so that `split(':')` would not reduce `[::1]` to `[` —
-> and taking it whole *as a literal* accepts `http://[::1].attacker.example/cb`, an attacker's
-> hostname that merely begins with the loopback literal. It is the `starts_with("localhost")` bug
-> one level down, and it was found by 3b's redirect-list validator rather than by 3a's own unit
-> tests: those covered the accepted spellings and the `starts_with` near-misses, and not a
-> bracket-prefixed hostname. The closing bracket is now honoured only when nothing but an
-> optional decimal `:port` follows it, and the regression test lives in the module that holds
-> the predicate as well as in the caller — a test in the caller is fixed by changing the caller
-> and leaves the hole in the shared rule.
+>     <input ... name="state" value="\"><script>alert(1)</script>">
 >
-> **(2) The migration number was already taken.** `0229` is
-> `0229_crm_lead_sla_index_terminal_status.sql` in w8. The migration namespace is shared across
-> every worktree, so when both push, sqlx reads two files numbered 229 and answers
-> `VersionMismatch(29)` for the *whole* database — one writer's numbering choice kills every
-> other writer's suite. Renumbered to **`0231`**, the union high-water across all ten worktrees
-> plus one.
+> with the attribute closed early and the script tag live in the **approver's** session on the
+> platform's own origin. The attacker is the app's tenant; the victim is the person signing in.
+> The general "nothing leaked" assertion is what found it, but it could not say *which* mistake
+> had been made, so the regression test is a standalone one that demonstrates the JSON form
+> **does** break out of the attribute — the difference between the two escapers is the bug.
 >
-> **A third thing, found by the response-shape tests:** `MintedAppResponse` declared
+> **(2) An absent `state` rendered as the four characters `null`.** A hidden input whose value is
+> `null` posts the *string* `"null"`, which `usable_state` accepts, and the token endpoint then
+> echoes it back to the client as a `state` it never sent. The platform was inventing a value on
+> the client's behalf. Absence now renders as an empty attribute.
+>
+> **(3) The borrow checker caught a third, before a test could.** `redirect_with_error` takes
+> `&'static str` for the error code and the description — that signature is the rule, and I had
+> written `&error.to_string()`. `UnknownGrantType` carries the caller's own `response_type` in its
+> message, so a client-supplied value was about to ride in a `Location` header into browser
+> history, proxy logs and the next `Referer`. The fixed `access_denied` goes to the browser; the
+> real reason goes to a `tracing::debug`.
+>
+> **Slice 2 remains code-complete and waiting only on a browser pass.**
+>
+> **A fourth thing from tick 108, found by the response-shape tests:** `MintedAppResponse` declared
 > `previous_secret_expires_at` while the flattened `OAuthApp` already carries a field of that
 > name. Two fields, one JSON key, and the flatter writes first — so on a *creation* the response
 > said `null` while also claiming to have no such field, and a client reading the outer value
@@ -208,7 +215,7 @@ Audit: key create/rotate/revoke, OAuth app create/edit/delete and secret rotatio
 - [ ] The API Explorer lists operations from the served OpenAPI document, and a CI check fails when the document drifts from the running router.
 - [ ] Explorer sends run as the signed-in caller; a call the caller could not make from the UI returns the same `403`.
 - [ ] The Explorer shows status, duration and body, and copies the request as curl, TypeScript and Python with a placeholder instead of a real secret.
-- [ ] OAuth apps reject non-`https` redirect URIs except `http://localhost`, and an authorization-code plus PKCE flow completes end to end. *(the **rejection** half is proved and is where the danger was; the flow's second half is not built yet. `app_rules::validate_redirect_uris` refuses a non-`https` scheme unless the host is exactly `localhost`, `127.0.0.1` or `[::1]`, and the list is checked in full before any of it is stored. The refusal carries the row's **position** and never the URL — `a_non_https_redirect_is_refused_by_position_and_never_echoed_back` asserts both `Display` and `Debug` are free of the submitted string, because `Display` reaches a log and `Debug` reaches a panic message. The loopback exception is narrow enough to survive a look-alike: `localhost.attacker.example`, `127.0.0.1.attacker.example` and `[::1].attacker.example` are all refused — the last of those by the tick-108 fix, found by this validator rather than by 3a's own tests. Every form that *is* accepted is asserted too, so the rule is not merely a refusal.)*
+- [x] OAuth apps reject non-`https` redirect URIs except `http://localhost`, and an authorization-code plus PKCE flow completes end to end. *(both halves are now built and proved. The **rejection** half was slice 3a/3b: `app_rules::validate_redirect_uris` refuses a non-`https` scheme unless the host is exactly `localhost`, `127.0.0.1` or `[::1]`, compared as whole strings and never as a prefix; the refusal carries the row's **position** and never the URL, because `Display` reaches a log and `Debug` reaches a panic message. The **flow** half is slice 3c: `GET /oauth/authorize` validates the client, the grant, the redirect, the scopes and the PKCE challenge **in that order and writes nothing**; `POST /oauth/consent` mints the code, re-running the whole check against the app *as it is now* (the screen was rendered from a GET, and an app can be withdrawn or narrowed in between); `POST /oauth/token` redeems the code single-use, re-checks that the redirect matches the one the code was issued for, verifies the verifier against the stored challenge by hashing both sides, and only then mints a token scoped to the **consented** set. The code→token exchange is proved in the database by `oauth_codes_challenge_is_whole` and `redeem_code`'s `used_at is null` predicate living *inside* the update — a read-then-update would let two simultaneous redemptions both succeed, and that is invisible in every test that redeems a code once.)*
 - [ ] Client secret rotation keeps the previous secret valid until its overlap expiry, then rejects it. *(proved in code and in the database. `rotate_secret` moves the old hash into the overlap slot **by the same expression** that writes the new one — `previous_secret_hash = client_secret_hash` inside the `update` — so there is no window in which the old secret is in neither slot, and migration `0231`'s `oauth_apps_overlap_is_whole` refuses a partial write at the database level. `which_secret_matched` filters the overlap **by the clock before comparing** and returns *which* slot matched: `a_previous_secret_is_honoured_only_inside_its_overlap_and_the_slot_is_reported` asserts the second-before boundary works, the instant of expiry does not, and a window that expired years ago authenticates nobody. The slot name is what lets the audit row distinguish a deployment that has not redeployed from one that has, which is the only reason the overlap exists. The panel half is not built yet.)*
 - [ ] The Events catalog lists only event types the caller may subscribe to, and every sample validates against its own schema.
 - [ ] Request logs filter by key, status class, path prefix and date range, and history stays readable after a key is revoked.
@@ -245,7 +252,9 @@ Visual check: the one-time secret dialog is unmistakable (warning icon, explicit
 3. **OAuth apps + events catalog.** App registration and editing, secret rotation with overlap, authorization-code plus PKCE, catalog from the event registry, webhook deep link.
    **Slices 3a and 3b shipped** (`a1840487`, `416a58bf`, `dd00be30`; tick 108). 3a: the client material, the redirect-URI rule, PKCE and the migration — **renumbered `0229` → `0231`**, because w8 holds `0229_crm_lead_sla_index_terminal_status.sql` and the migration namespace is shared across every worktree (two files numbered 229 make sqlx answer `VersionMismatch(29)` for the whole database). 3b: the store (`crates/developer/src/store_oauth.rs`), the authorization check (`authorize()` in `model_oauth.rs`), the six panel routes, both permission keys, and the seven documented operations.
    **A real open-redirect defect in 3a's own code was found by 3b's tests** (`816b89d5`): `http://[::1].attacker.example/cb` was accepted as loopback, because the fix that stopped `split(':')` reducing `[::1]` to `[` took a bracketed authority whole *as a literal*. The closing bracket is now honoured only when nothing but an optional decimal `:port` follows it.
-   **Open: the sessionless half.** The authorization request, the consent screen and the token endpoint live in their own file, because they take no session, carry a client secret in a body, and resolve their tenant from the *app row* rather than from `organization_of` — merging them with the panel's handlers would mean one endpoint picking a tenant by whichever value arrived first. Then the panel screen and its walkthrough route.
+   **Open: the panel screen.** `/developer/oauth-apps` — list, detail, register, rotate, suspend/withdraw — and the walkthrough route so it is actually clicked. The six panel routes and the store are shipped (slice 3b); the screen that drives them is not.
+   **Slice 3c shipped** (`0469249e`, `d497b8f9`, `bfd699dd`, `de3b6620`, `ba95b808`, `4867981f`; tick 109). The sessionless half: `crates/developer/src/oauth_flow.rs` (the request parsing, the code, the access token, the scope-narrowing rule, the grant provenance) and `apps/api/src/routes/oauth_flow.rs` (the four endpoints, the consent screen, the RFC 6749 error shapes, the introspection response), plus migration `0232` for `oauth_access_tokens`.
+   **Three defects, all in this tick's own code, and the tick is mostly about them.** A **live stored XSS** in the consent screen: the hidden fields were JSON-encoded, and JSON escapes a quote as `\"` where HTML wants `&quot;`, so a `state` of `"><script>…` closed the attribute and left a live script tag in the approver's session on the platform's own origin — reachable by any developer who can register an app in their own tenant, executed in the victim tenant's user's session. An absent value rendered as the four characters `null`, which the consent POST accepts and the token endpoint would echo back as a `state` the client never sent. And the **borrow checker** caught a third before a test could: `redirect_with_error` demands `&'static str`, and I had passed `error.to_string()` — which would have put a caller-supplied `response_type` into a `Location` header, and from there into browser history, proxy logs and the next `Referer`. The signature was the rule; the type error was the compiler enforcing it.
    The event catalogue half of this slice is largely already built by REQ-016 — `/api/v1/events/catalogue` reads the same compiled registry `omnion_events::catalogue` — so what remains there is the developer framing, not a second source of truth.
    Done: a local test client completes the flow and every catalog sample validates against its schema.
 4. **SDKs + CLI + polish.** Scaffold generator, manifest validator, CLI device-code, overview cards, permission-hidden controls, mobile layout.
