@@ -525,11 +525,57 @@ impl Pipeline {
         // The approval gate. Parked rather than refused, and **before** the cap check: a call
         // waiting for a decision is not a call that spent budget, so counting it would let a
         // model whose every call needs approval burn its cap without ever running anything.
+        //
+        // **And the file it parks behind.** A park that writes no `ai_approvals` row is a park
+        // nobody can act on: the inbox has nothing to decide, the trace has nothing to render,
+        // and approving it — which requeues the run — hands the run straight back to this line,
+        // which parks it again. That is not a stall, it is a loop: an approved run would burn
+        // one provider call, one park and one requeue for ever, and the only way out would be
+        // an operator finding the policy screen by instinct. The row is what makes a decision
+        // possible; the decision is what makes the resume possible.
         if self.approvals.iter().any(|key| key == tool.key()) {
-            return Ok(CallOutcome::Parked {
-                tool: tool.key().to_owned(),
-                arguments: crate::run_store::redact_arguments(&call.arguments),
-            });
+            // The class, resolved from the tool's own key. `None` means the key is not one of
+            // the six gated classes — an operator parked a tool by hand that the policy screen
+            // has no row for. That is a *policy* gap, not a store error, so the call still
+            // parks: refusing here would turn "an operator pre-parked an unknown tool" into
+            // "the agent cannot use a tool it was configured with".
+            let class = crate::approvals::class_of_tool(tool.key());
+            let organization_id = self.caller.organization_id;
+            let released = match class {
+                Some(class) => {
+                    let policy = crate::approvals::io::policy_for(pool, organization_id, class)
+                        .await?;
+                    if !policy.requires_approval() {
+                        // An operator switched the class to `allow` after the agent's own
+                        // `approvals` array was written. The array is the agent's list, the
+                        // policy is the platform's, and the policy is the *later* word: the
+                        // change-set bridge already reads it per operation and files nothing
+                        // for an `allow` class (REQ-101 slice 3c), and two answers to "must
+                        // this be approved" is a park an operator cannot clear.
+                        true
+                    } else if self
+                        .already_approved(pool, organization_id, tool.key(), class, &call.arguments)
+                        .await?
+                    {
+                        // The decision already exists: a reviewer approved *this* call. Running
+                        // it is the whole point of the decision, and the approval is single-use
+                        // per request row, so a second identical call in the same run is a
+                        // *new* question and parks again.
+                        true
+                    } else {
+                        self.file_request(pool, tool.key(), class, &policy, &call.arguments)
+                            .await?;
+                        false
+                    }
+                }
+                None => false,
+            };
+            if !released {
+                return Ok(CallOutcome::Parked {
+                    tool: tool.key().to_owned(),
+                    arguments: crate::run_store::redact_arguments(&call.arguments),
+                });
+            }
         }
 
         // The cap, counted from rows so a resumed run does not get a fresh allowance. The row is
@@ -657,6 +703,119 @@ impl Pipeline {
             failed: outcome.failed,
             call_id,
         })
+    }
+
+    /// Whether a reviewer has already approved **this** call, in a previous attempt of this run.
+    ///
+    /// The match is on the *content* of the decision, not merely on the run: an approval row
+    /// naming the run answers "did somebody approve something in this run", and the run's second
+    /// gated call is a different question. Matching on the tool and the preview hash is what
+    /// makes "approve, then run" release exactly one call — a different tool, or the same tool
+    /// with different arguments, is a different question and parks again.
+    ///
+    /// The **redacted** arguments are what go into the preview, because that is what the reviewer
+    /// read and what the row stores. Hashing the raw arguments would never match a row holding a
+    /// redacted secret, and the approved call would park for ever — a refusal that reads as a bug
+    /// and is really a comparison against the wrong side of the redaction.
+    ///
+    /// The step is deliberately **not** part of the match. A resumed run re-numbers its steps
+    /// (the loop counts from one), so the approved row names the step number the first attempt
+    /// used and the second attempt cannot know it.
+    async fn already_approved(
+        &self,
+        pool: &sqlx::PgPool,
+        organization_id: Uuid,
+        tool_key: &str,
+        class: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<bool> {
+        let (_, hash) = gated_preview(tool_key, class, arguments);
+        // Asked of the database rather than decoded into an `Option`: this is a
+        // "does a row exist" question, and a nullable decode cannot answer it.
+        let approved: bool = sqlx::query_scalar(
+            "select exists (select 1 from ai_approvals where organization_id = $1 \
+             and run_id = $2 and tool_key = $3 and preview_hash = $4 and status = 'approved')",
+        )
+        .bind(organization_id)
+        .bind(self.caller.run_id)
+        .bind(tool_key)
+        .bind(hash)
+        .fetch_one(pool)
+        .await?;
+        Ok(approved)
+    }
+
+    /// File the request a parked call waits on, so there is something a person can decide.
+    ///
+    /// Best-effort by design, and the asymmetry is the point: a run that *cannot* write its
+    /// request still parks, because a call whose approval failed to be recorded must not run.
+    /// Refusing the call because the row could not be written would turn a store blip into the
+    /// agent losing a capability — the safe direction is "did not run", not "ran anyway".
+    async fn file_request(
+        &self,
+        pool: &sqlx::PgPool,
+        tool_key: &str,
+        class: &str,
+        policy: &crate::approvals::ClassPolicy,
+        arguments: &serde_json::Value,
+    ) -> Result<()> {
+        let (preview, hash) = gated_preview(tool_key, class, arguments);
+        let label = arguments
+            .get("slug")
+            .or_else(|| arguments.get("name"))
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        let new = crate::approvals::io::NewApproval {
+            organization_id: self.caller.organization_id,
+            site_id: self.caller.site_id,
+            run_id: Some(self.caller.run_id),
+            step_id: self.caller.step_id,
+            agent_id: Some(self.caller.agent_id),
+            identity_id: self.identity_id(),
+            // The single-call path has no change set behind it — a set's own operations are
+            // filed by the editor (REQ-101 slice 3c), and a run-step request naming a set
+            // would make the release path think the set had a gate it never filed.
+            change_set_id: None,
+            operation_key: None,
+            tool_key: tool_key.to_owned(),
+            tool_class: class.to_owned(),
+            // The call is itself the resource, and it has to be *named*. An approval that names
+            // no target is refused at the decision point — `decide` answers
+            // "names no resource, so it cannot be checked for staleness" — which would make every
+            // filed row a request nobody can answer, and the park a run an operator could only
+            // watch. So the id is the tool key plus the preview hash: exactly the call, not a page
+            // or a deployment the tool happens to touch. Freshness then means "is this still the
+            // call that was asked for", which is the question a reviewer is really answering.
+            resource_type: Some("tool_call".to_owned()),
+            resource_id: Some(format!("{tool_key}@{hash}")),
+            resource_label: label.clone(),
+            title: format!("Run the gated tool `{}`", tool_key),
+            summary: format!(
+                "An agent asked to call `{}` as part of its run. Review the arguments and decide.",
+                tool_key
+            ),
+            operation_count: 1,
+            preview,
+            preview_hash: hash,
+            // No revision to pin: a tool call is not an edit of a named row, and a fake
+            // revision would make the trace's freshness check claim a resource the run never
+            // read. The run's step is the record of what happened.
+            base_revision: None,
+            requested_by: self.caller.user_id,
+            model_id: None,
+            risk: crate::catalogue::find(tool_key)
+                .map_or_else(|| "medium".to_owned(), |spec| spec.risk.as_str().to_owned()),
+            policy: policy.clone(),
+            requested_at: time::OffsetDateTime::now_utc(),
+        };
+        if let Err(error) = crate::approvals::io::request(pool, &new).await {
+            tracing::warn!(
+                %tool_key,
+                %error,
+                "a parked tool call could not file its approval request; the call stays parked"
+            );
+        }
+        Ok(())
     }
 
     /// Write the refusal row and answer.
@@ -814,6 +973,36 @@ pub fn as_execution(outcome: &CallOutcome) -> Execution {
             reason: crate::tools::DenyReason::ToolTimeout,
         },
     }
+}
+
+/// The preview a gated tool call is frozen into, and the hash that identifies it.
+///
+/// **One function, and the reason is the release path.** The row a park writes and the row a
+/// resumed run looks for are the same row, and a second copy of this shape would let them drift:
+/// the store would find a hash no park ever produced, every approved run would park again, and
+/// the symptom — "approval does nothing" — points at the approval screen rather than at the two
+/// functions that disagree. So the write side and the read side call this and cannot differ.
+///
+/// The arguments are redacted *before* hashing, so the hash is over what the reviewer actually
+/// read. Hashing the raw arguments would make a call carrying a secret unmatchable against its
+/// own approved row, which parks for ever and reads as a permissions bug.
+fn gated_preview(tool_key: &str, class: &str, arguments: &serde_json::Value) -> (Value, String) {
+    let preview = serde_json::json!({
+        "tool_key": tool_key,
+        "tool_class": class,
+        "arguments": crate::run_store::redact_arguments(arguments),
+    });
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // `to_vec` on a `json!` object cannot fail, but `unwrap_or_default` would hash an empty
+    // byte string and produce a *valid-looking* hash that matches nothing — a silent wrong
+    // answer. A serialisation failure must not be able to invent a decision.
+    let bytes = serde_json::to_vec(&preview).unwrap_or_else(|error| {
+        tracing::warn!(%error, "a gated preview could not be serialised");
+        Vec::new()
+    });
+    hasher.update(&bytes);
+    (preview, format!("{:x}", hasher.finalize()))
 }
 
 /// The tool key a non-ran outcome names.
