@@ -90,6 +90,33 @@ pub fn was_sent(detail: &Value) -> bool {
 /// prior `autoresponder_sent` line for the lead, which is what makes it a race that exactly
 /// one caller can win — a read-then-write pair cannot, because the read is not part of the
 /// same statement.
+///
+/// ## The claim records *claimed*, never *delivered* — and that is the whole fix
+///
+/// `sent` is written `false` on **every** line this function inserts, immediate or delayed,
+/// because the claim is taken *before* the mailer is touched and nothing at that point knows
+/// whether the message went anywhere. It was written `!message.delayed`, so an immediate
+/// message was recorded as delivered at the instant it was reserved — two full sentences
+/// before the socket. Everything downstream keys off that key, and each of them was therefore
+/// looking for a row that could not exist:
+///
+/// * [`release_claim`] deletes `detail->>'sent' <> 'true'`, so a refused **immediate** send
+///   released nothing, the claim stayed, and [`prepare`] answered `AlreadySent` for ever:
+///   the visitor's one reply was lost and the lead was permanently silenced by the very
+///   mechanism that exists to guarantee it. That is this file's header promise ("a failed
+///   send does not silence the lead forever") and the worker's ("a refused mailer releases
+///   the reservation and the next tick retries"), both of which were true for the delayed
+///   path and false for the immediate one — the path every source that never touched the
+///   delay control is on.
+/// * [`mark_sent`] updates the same `<> 'true'` predicate, so the completion of an immediate
+///   send updated **zero** rows and returned `Ok(false)`. The caller cannot tell that from
+///   "another worker won", so no `sent_at` was ever written for an immediate message: the
+///   trail showed *when the line was claimed* and never *when the mail left*.
+///
+/// `delayed` is still written, and it is the fact the caller needs to tell the two apart at
+/// a glance. What it is **not** is evidence of delivery, and nothing reads it as such: the
+/// due sweep requires `sent = 'false'` **and** a non-null `due_at`, and an immediate claim
+/// writes `due_at: null`, so it is never offered to the worker a second time.
 pub async fn claim(pool: &PgPool, lead: &Lead, message: &Message) -> Result<bool> {
     // `due_at` is written as the *formatted string*, never as the `OffsetDateTime` itself.
     // `serde_json::json!` has no special case for `time::OffsetDateTime`, so the value
@@ -112,7 +139,13 @@ pub async fn claim(pool: &PgPool, lead: &Lead, message: &Message) -> Result<bool
         "template": message.template,
         "delayed": message.delayed,
         "due_at": message.due_at.map(crate::autoresponder::date_header),
-        "sent": !message.delayed,
+        // Always `false`, always — see the section on this function. The claim is taken
+        // before the mailer, so "sent" is not a fact any caller could know yet; writing
+        // `!message.delayed` recorded an immediate message as delivered at the moment it
+        // was reserved, which left `release_claim` and `mark_sent` — both keyed on
+        // `sent <> 'true'` — looking for a row that could not exist. A refused immediate
+        // send then released nothing and the lead was `AlreadySent` for ever.
+        "sent": false,
     });
     // The claim is a plain insert whose *uniqueness* arbitrates the race, not a `where not
     // exists` guard. The guard version reads like a lock and is not one: under READ COMMITTED
@@ -161,13 +194,30 @@ pub async fn claim(pool: &PgPool, lead: &Lead, message: &Message) -> Result<bool
 /// Only a line this caller's own failed send may be removed: the condition matches the
 /// recipient as well as the lead, so a claim belonging to a different address (a lead whose
 /// e-mail was corrected between attempts) is left alone.
+///
+/// ## Why the predicate is `delivered_at is absent` and not `sent <> 'true'`
+///
+/// This is the half of migration `0202` that decides whether the platform can recover at
+/// all. `sent` is written `true` at *claim* time — the slot is taken before the mailer is
+/// touched — so a predicate of `sent <> 'true'` selects only rows that are already delivered,
+/// which is the exact inverse of what a release needs. Under the old writer it happened to
+/// work for the delayed path only, because a delayed claim was the one case written with
+/// `sent = false`; an immediate claim was written `sent = true`, so a refused immediate send
+/// released **nothing** and the lead answered `AlreadySent` for ever.
+///
+/// The predicate is therefore the same one `mark_sent` uses: a row with no recorded delivery
+/// is a row whose delivery was never confirmed, and a refused send must be able to take it
+/// back. A row that *does* carry `delivered_at` is left alone — the message went out, and
+/// re-claiming the lead would mail it twice, which is the duplicate this design exists to
+/// prevent. That is also what makes the two functions safe to run in either order after an
+/// upgrade: whichever observes the send first wins the row, and the other finds it excluded.
 pub async fn release_claim(pool: &PgPool, lead_id: Uuid, to: &str) -> Result<bool> {
     let removed: Option<i64> = sqlx::query_scalar(
         "delete from crm_lead_events \
          where id = ( \
            select id from crm_lead_events \
            where lead_id = $1 and kind = $2 and detail->>'to' = $3 \
-             and detail ? 'sent' and detail->>'sent' <> 'true' \
+             and detail ? 'sent' and not (detail ? 'delivered_at') \
            order by id desc limit 1 \
          ) returning id",
     )
@@ -184,13 +234,33 @@ pub async fn release_claim(pool: &PgPool, lead_id: Uuid, to: &str) -> Result<boo
 ///
 /// The claim is updated rather than re-inserted so the timeline shows one line that grew a
 /// `sent_at`, rather than a reservation and a delivery that a reader has to correlate.
+///
+/// ## `delivered_at` is the completion marker, and `sent` is not
+///
+/// The predicate is `delivered_at is absent` rather than `sent <> 'true'`, and the reason is
+/// the whole point of migration `0202`. `sent` answers "is this lead answered?" and is `true`
+/// from the moment the slot is claimed; `delivered_at` answers "did a message actually leave?"
+/// and is only written here, after the mailer returned. Keying the completion on `sent`
+/// meant that an immediate claim — the default — could never be completed at all, so no
+/// delivery instant was ever recorded for it.
+///
+/// `sent_at` is kept as a second, older spelling because a row written by the pre-`0202`
+/// code may already carry it, and a reader that sees two different keys for one fact is worse
+/// than a reader that sees one old key. `delivered_at` is the one new code writes.
+///
+/// Migration `0202` marks the *already wrong* rows with `delivery_unknown: true` and no
+/// `delivered_at`, and this predicate therefore also matches them: an installation upgrading
+/// mid-flight can complete a claim the old code claimed but never recorded, rather than
+/// leaving it permanently uncompletable. A row already carrying `delivered_at` is excluded,
+/// so "exactly once" still holds.
 pub async fn mark_sent(pool: &PgPool, lead_id: Uuid, sent_at: OffsetDateTime) -> Result<bool> {
     let updated: Option<i64> = sqlx::query_scalar(
-        "update crm_lead_events set detail = detail || jsonb_build_object('sent', true, 'sent_at', $2::text) \
+        "update crm_lead_events set detail = detail || \
+           jsonb_build_object('sent', true, 'delivered_at', $2::text, 'sent_at', $2::text) \
          where id = ( \
            select id from crm_lead_events \
            where lead_id = $1 and kind = $3 \
-             and detail ? 'sent' and detail->>'sent' <> 'true' \
+             and detail ? 'sent' and not (detail ? 'delivered_at') \
            order by id desc limit 1 \
          ) returning id",
     )

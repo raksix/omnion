@@ -11626,3 +11626,68 @@ work substitutes. The walkthrough gained legs for the three states a headless pa
 reach (no key on the installation, no device registered, and the `serviceWorker.ready`
 rejection), because that is what distinguishes a block that renders nothing from a block that
 was never wired up — which is how this slice found that three API functions had no callers.
+
+## Tick 54 — REQ-117 slice 24: an immediate autoresponder claim said "sent" before anything was sent
+
+**What.** `autoresponder_store::claim` wrote `sent: !message.delayed`, so a message with no
+send delay — every source that never touched the control, i.e. the default configuration — was
+stored as *delivered* at the instant its slot was reserved, before the mailer was touched. Both
+consumers select on `sent <> 'true'`:
+
+* `release_claim` deleted no row, so a **refused immediate send released nothing**. The claim
+  stood, `prepare` answered `AlreadySent` for ever, and the visitor's one reply was lost —
+  silenced by the mechanism whose entire job is to guarantee it is answered.
+* `mark_sent` updated no row and returned `Ok(false)`, which no caller can tell from "another
+  worker won", so **no immediate message ever recorded a delivery instant**.
+
+The delayed path was correct the whole time, which is why nothing noticed: every test touching
+the delay was green and the defect lived in the branch nobody exercised.
+
+**Proof.**
+
+* `bash scripts/qa/run-crm-autoresponder.sh` → **11 passed, 0 failed** (was 9). The rewritten
+  `a_released_claim_lets_the_next_attempt_answer` now actually calls `release_claim` and asserts
+  the lead is answerable again; `a_delivered_claim_is_neither_released_nor_completed_again` is
+  the control that stops the fix over-correcting.
+* `bash scripts/qa/run-crm-autoresponder-claim.sh` → **10 passed, 0 failed**, new gate.
+  **Three controls proven to fail independently:** **9/10** with the migration's `sent = 'true'`
+  half dropped (the fixed writer's own row is born mislabelled), **9/10** with the repair's
+  `sent` flipped to `false` (it re-opens an answered lead), **9/10** with the `delayed = 'false'`
+  clause dropped.
+* `cargo test -p omnion-module-crm-intake --lib` → **174 passed**, clippy 0 on the touched
+  files, `cargo build -p omnion-api` green, admin `tsc --noEmit` exit 0.
+
+**Lessons.**
+
+1. **A control that appeared to pass was the finding, not a nuisance.** Dropping the migration's
+   `delayed = 'false'` clause changed nothing, because the `sent = 'true'` half already excludes
+   every delayed reservation. The clause protects exactly one shape — `sent: true` with **no
+   `delayed` key at all**, a claim written before the delay feature existed, which `0058`
+   documents in its own words. The gate now asserts that shape, and the control fails at 9/10
+   where it had passed at 10/10. *A clause whose only witness is a shape you had not thought of
+   is a clause not yet proven to earn its place.*
+2. **A gate that inserts its fixture after the code under test has executed is not testing that
+   code.** This gate's first version applied the whole ledger and inserted the legacy row
+   afterwards, so `0202` had already run and both positive assertions were red against a
+   database the repair had never seen. The fix was the ordering, not the assertion. Its first
+   fixture also put three claim rows on one lead and was refused by the very unique index the
+   gate asserts — the constraint catching its own gate.
+3. **The repair must not reopen what the old writer closed.** Flipping the already-wrong rows back
+   to `sent: false` would re-answer leads the operator believes were answered. They keep
+   `sent: true` and gain `delivered_at: null` + `delivery_unknown: true`, so a reader can tell
+   *delivered, and here is when* from *never claimed as delivered at all*.
+4. **One predicate in both consumers is what makes an upgrade safe.** `mark_sent` and
+   `release_claim` now key on `delivered_at is absent`, so whichever observes the send first
+   wins the row and the other finds it excluded — "exactly once" survives the migration instead
+   of depending on the order two functions happen to run in.
+5. **No browser pass, and none claimed:** the QA slot is held by a live w5 pass (holder pid
+   alive, cwd `/mnt/apopic/omnion-w5`) and no screen changed — this fix is in stored state and in
+   two SQL predicates, not in anything a person touches.
+
+**Next.** The dead-caller sweep has come back empty three ticks running, so the detector earning
+the defect is still the comment-against-code read (six for six now). REQ-117's last open screen
+remains slice 3's REQ-064 form-editor card, which needs a module that exists on **no branch** —
+a cross-writer dependency, not something this loop can resolve by writing harder.
+
+**Commits.** the claim, the completion marker, the repair migration, the new gate, the tests that
+drive the release they are named for.

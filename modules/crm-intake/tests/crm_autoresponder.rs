@@ -196,18 +196,121 @@ async fn a_released_claim_lets_the_next_attempt_answer() {
         .await
         .expect("prepare");
     assert!(first.sent(), "the first attempt owns the send");
-    assert!(ar_store::was_sent(
-        &ar_store::existing_claim(&pool, lead.id)
-            .await
-            .expect("reading the claim")
-            .expect("a claim exists")
-    ));
+    assert!(
+        !ar_store::was_sent(
+            &ar_store::existing_claim(&pool, lead.id)
+                .await
+                .expect("reading the claim")
+                .expect("a claim exists")
+        ),
+        "an immediate claim has taken the slot, not delivered a message (migration 0202)"
+    );
 
-    // Nothing to release: the claim was recorded as sent. A second attempt is refused.
+    // While the claim stands, the lead is answered. This is the guarantee that makes
+    // releasing rather than merely logging the right repair: nothing re-answers in the window.
     let second = ar_store::prepare(&pool, &lead, &source, now)
         .await
         .expect("prepare");
-    assert!(!second.sent(), "a sent lead is not sent again");
+    assert!(!second.sent(), "a claimed lead is not sent again");
+
+    // The refusal. **This release is the assertion the test is named for, and the earlier
+    // version of this file never made it** — it asserted only that the second attempt was
+    // refused, which is true whether or not a release is possible, so a build that could
+    // never recover passed it. The delay here is 0, i.e. the IMMEDIATE path: the old writer
+    // stored that claim with `sent = true`, and both `release_claim` and `mark_sent` select on
+    // `sent <> 'true'`, so the release matched no row and the lead was silenced for ever by
+    // the mechanism whose whole job is to guarantee it is answered.
+    assert!(
+        ar_store::release_claim(&pool, lead.id, "retry@example.com")
+            .await
+            .expect("releasing a refused immediate send"),
+        "a refused immediate send must be able to take its claim back"
+    );
+
+    // And the lead is answerable again, from the durable row rather than from the struct.
+    assert!(
+        ar_store::existing_claim(&pool, lead.id)
+            .await
+            .expect("reading the claim")
+            .is_none(),
+        "a released claim leaves no row to occupy the one slot a lead has"
+    );
+    let third = ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("prepare");
+    assert!(
+        third.sent(),
+        "after a release the next attempt owns the send again"
+    );
+
+    drop_org(&pool, org).await;
+}
+
+/// A delivered message is never released and never completed twice.
+///
+/// The negative control for the test above, and the assertion that keeps the fix from
+/// over-correcting. `delivered_at` is what separates the two states, so a row that carries it
+/// must be invisible to **both** `release_claim` and `mark_sent`: releasing it would let the
+/// lead be answered twice, and completing it twice would write two delivery instants onto one
+/// message. Under the old `sent <> 'true'` predicate both of these were vacuous for an
+/// immediate send — they had nothing to select — so "the gate is not too eager" was true for
+/// the wrong reason.
+#[tokio::test]
+async fn a_delivered_claim_is_neither_released_nor_completed_again() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder delivered").await;
+    let source = source_with_autoresponder(&pool, org, 0).await;
+    let lead = accepted_lead(&pool, org, &source, "delivered@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is claimed");
+    assert!(
+        ar_store::mark_sent(&pool, lead.id, now).await.expect("the send completed"),
+        "the mailer returned, so the completion wins the row"
+    );
+
+    let stored = ar_store::existing_claim(&pool, lead.id)
+        .await
+        .expect("reading the claim")
+        .expect("a claim exists");
+    assert!(ar_store::was_sent(&stored), "a delivered claim reads as sent");
+    assert!(
+        stored["delivered_at"].as_str().is_some(),
+        "the delivery instant is recorded, which is the fact an immediate send used to lose"
+    );
+
+    // Both refusals, from the durable row's point of view.
+    assert!(
+        !ar_store::mark_sent(&pool, lead.id, now + time::Duration::minutes(1))
+            .await
+            .expect("the second completion"),
+        "a message already delivered is not delivered twice"
+    );
+    assert!(
+        !ar_store::release_claim(&pool, lead.id, "delivered@example.com")
+            .await
+            .expect("releasing a delivered send"),
+        "a delivered message must not be released back into the queue"
+    );
+    let after = ar_store::existing_claim(&pool, lead.id)
+        .await
+        .expect("reading the claim")
+        .expect("the claim is still standing");
+    assert_eq!(
+        after["delivered_at"], stored["delivered_at"],
+        "neither attempt may rewrite the recorded delivery instant"
+    );
+
+    // And the lead is still answered, which is the promise the two refusals exist for.
+    assert!(
+        !ar_store::prepare(&pool, &lead, &source, now)
+            .await
+            .expect("prepare")
+            .sent(),
+        "a delivered lead is answered once and stays answered"
+    );
 
     drop_org(&pool, org).await;
 }
