@@ -300,6 +300,23 @@ catalogue! {
     "An approved preview was written through its gated pipeline.",
     [("approval_id", Uuid, req), ("resource_type", String, req),
      ("resource_id", String, req)];
+    // The change-set editor (REQ-101 slice 3). All three are `Live` because a proposal nobody
+    // hears about is a proposal nobody confirms: the editor's whole purpose is to put an
+    // operation in front of a human, and a screen that fills up while a person is looking at
+    // a different tab has failed quietly. `confirmed` is the one an operator subscribes to --
+    // it is the only signal that a model's proposed work became a promise, and the payload
+    // carries `irreversible` because a set that deletes is the one worth an e-mail.
+    "ai.changeset.proposed", "ai", Live,
+    "A conversation proposed a set of operations for a person to review.",
+    [("change_set_id", Uuid, req), ("title", String, req),
+     ("operations", Integer, req)];
+    "ai.changeset.confirmed", "ai", Live,
+    "A person confirmed a change set, moving it towards application.",
+    [("change_set_id", Uuid, req), ("operations", Integer, req),
+     ("irreversible", Boolean, req)];
+    "ai.changeset.discarded", "ai", Live,
+    "A person discarded a change set, with the reason they gave.",
+    [("change_set_id", Uuid, req), ("reason", String, req)];
     // The tool registry (REQ-100). `ai.tool.denied` is the one an operator subscribes to: it
     // is the signal that a model tried to reach something it was not granted, which is the
     // visible form of a probing agent. The rest are the panel's own audit trail — a registry
