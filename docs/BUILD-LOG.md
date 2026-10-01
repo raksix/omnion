@@ -1,3 +1,54 @@
+## 2026-10-01 — REQ-106 slice 4: the "Run AI locally" manual, and the pass that compares it to the API
+
+feat(admin) + test(qa): the local-AI documentation page, its nav entry, the walkthrough route and
+a depth pass that refuses a guide which disagrees with the server about what the air gap stops.
+
+Slice 4's `Done when` reads "the docs page matches the shipped behaviour". That phrase is the whole
+design decision, so the page is a **screen** and not a markdown file: a static document cannot know
+whether its claims are true on *this* installation, and the failure it exists to prevent is exactly
+that — an operator who follows the verification steps, gets a green doctor and concludes the install
+is offline-capable while a collection is still pinned to a remote embedding model.
+
+**Three things on the page are read, not written.** The readiness line quotes the doctor's own
+verdict and reads `latest` rather than the `never_run` flag, because the flag is a cached claim
+about the same fact and a page that trusts it re-derives the risk this whole request exists to
+remove. "What stops working" is built from `would_block` — the list **the call path asks before it
+refuses** — so the page cannot name a provider safe while the check would block it. A hand-written
+list is a second copy of the locality rule: it looks right in review, it is right until an operator
+adds a provider, and it is wrong in the direction that is discovered in production.
+
+**The pass asserts both directions, because one direction passes a page that prints nothing.** It
+reads `GET /ai/airgap` before it opens the page, then requires every provider the server would
+block to appear with its name and base URL, and requires every provider the page lists to be one
+the server would block. The second half is the one that catches the realistic defect.
+
+**Falsified before committing:** the verdict branch, by reading `doctor.runs` — a field that does
+not exist. `DoctorList` is `{ latest, previous, never_run }`, so my first cut typechecked against
+a shape I had invented, and it would have rendered "Never verified" on a healthy installation
+because `runs` was undefined at runtime. A typecheck caught it; a careful read of the client module
+is what stopped me assuming the field existed because the natural name for it is `runs`.
+
+**The page also states what this build cannot do.** Knowledge collections are REQ-102's, so there
+is no embedding model to repoint, and the manual says so in words instead of implying the gap
+covers retrieval. Slice 3's rows therefore remain unstarted and untickable on this branch.
+
+Proof: `pnpm --filter @omnion/admin typecheck` clean · `pnpm --filter @omnion/admin build` lists
+`/ai/local/guide` among its routes · `node --check scripts/qa/walkthrough.cjs` clean ·
+`cargo test -p omnion-ai-hub --lib` 614 passed, 0 failed (unchanged; this tick touched no Rust) ·
+`node scripts/qa/probe-depth-fixture.cjs` 6/6.
+
+NOT proved: the browser pass. The QA slot was w4's all tick (holder 1782910, alive by `kill -0` and
+`/proc/1782910/cwd` = `/mnt/apopic/omnion-w4`), and the box had two page crashes on record today
+with 6.1 GB available, so a third concurrent pass was the likely cause of the third crash. The pass
+is written and registered; it has not run. `probe-pass-scope.cjs` is 5/7 here and 2/7 on `main`, so
+its two failures are pre-existing and not this tick's.
+
+Merged `origin/main` first (6 commits). The BUILD-LOG conflict went through `merge-build-log.py`:
+base=7022 ours=9914 theirs=7096 merged=9988, zero entries lost on its own multiset check.
+
+Next: the QA pass, then rows 5/9/11 of this request and REQ-099's closing gate from the counters.
+Slice 3 waits on REQ-102, which is `pending` on all ten worktrees.
+
 ## 2026-10-01 — REQ-106 slice 1 completed · the screens, and the chat that proves an endpoint is real
 
 feat(admin) x2 + test(api) + test(qa): the local endpoints and models screens, the client they
