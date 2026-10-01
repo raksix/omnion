@@ -6823,6 +6823,56 @@ async function runSearchDepth(page, report) {
   report.searchDepth = steps;
 }
 
+/**
+ * Link the signed-in QA account to an employee row, so the self-service surfaces have a subject.
+ *
+ * The module resolves "my" everything from `users.id -> hr_employees.user_id`. The employee screen
+ * creates employees *through its form*, and that form has no user-account field, so an employee the
+ * pass creates is never the person signed in -- which leaves `/hr/me`, `/hr/me/leave` and
+ * `/hr/me/documents` answering the module's correct `404` ("not in the directory yet") and the pass
+ * counting four screens it could not drive. This seeds the link directly.
+ *
+ * Idempotent by construction: it reuses an existing link when one is there, and it never creates a
+ * second employee for the same account. It returns a boolean and **records why** on failure, so a
+ * false here is a named fixture problem rather than a screen that mysteriously will not load.
+ */
+function linkQaAccountToEmployee() {
+  const email = CREDS.email.replace(/'/g, "''");
+  try {
+    const already = qaSql(
+      `select e.id from hr_employees e join users u on u.id = e.user_id where u.email = '${email}' limit 1`,
+    );
+    if (already) return true;
+
+    // The organization comes from the DEPARTMENT, never from `users.organization_id`: on this
+    // fixture that column is NULL (the onboarding path writes it to `onboarding_state` and not
+    // always back to the user), so reading it here would seed an employee in no tenant and every
+    // `/hr/me` read would 400 on tenancy instead of rendering. `cross join lateral` picks the
+    // department and carries its tenant in the same row, and `limit 1` makes the choice total:
+    // with no department the insert selects nothing and the branch below names why.
+    const employeeId = qaSql(
+      `insert into hr_employees
+         (organization_id, user_id, employee_no, first_name, last_name, work_email, position,
+          department_id, employment_type, start_date, employee_status, created_at, updated_at)
+       select d.organization_id, u.id, 'QA-SELF', 'QA', 'Selfservice', '${email}',
+              'Self-service fixture', d.id, 'full_time', current_date, 'active', now(), now()
+       from users u
+       cross join lateral
+         (select id, organization_id from hr_departments order by created_at nulls last limit 1) d
+       where u.email = '${email}'
+       returning id`,
+    );
+    if (!employeeId) {
+      log("hr: the QA account has no user row, or the tenant has no department, so nothing to link");
+      return false;
+    }
+    return true;
+  } catch (failure) {
+    log("hr: linking the QA account to an employee row failed: %s", failure.message);
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------- analytics (REQ-007, slice 2)
 
 /** Run one statement against the disposable QA database. */
@@ -10938,6 +10988,17 @@ async function main() {
   // the request form and checks the previewed day count for a range straddling a weekend -- the
   // same range the leave pass uses, because "the number shown before submit equals the stored
   // value" is worthless if the self-service form answers it with a second implementation.
+  // The self-service surfaces resolve the caller from `user_id`, so an account with no employee
+  // row gets the module's documented `404` ("not in the directory yet") on every one of them --
+  // correct behaviour that the pass then reports as four screens it could not drive. Linking the
+  // signed-in QA account to an employee row is what turns those from "visited" into "driven"; the
+  // alternative is a self-service section that only ever exercises its own empty branch.
+  const selfServiceLinked = linkQaAccountToEmployee();
+  if (!selfServiceLinked) {
+    report.hrMe = { ok: false, reason: "the QA account could not be linked to an employee row", steps: ["link"] };
+    log(`hr me: ${JSON.stringify(report.hrMe)}`);
+  }
+
   if (!onlyGroup("hr")) {
     report.hrMe = await runDepthPass("hr-me", () => runHrMe(page, report));
     log(`hr me: ${JSON.stringify(report.hrMe)}`);
