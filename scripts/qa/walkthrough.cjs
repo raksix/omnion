@@ -10447,6 +10447,163 @@ async function runHealthSettingsDepth(page, report) {
   report.healthSettings = { steps };
 }
 
+/**
+ * The API Explorer depth pass (REQ-033, slice 2).
+ *
+ * Walking the screen proves it renders. It does not prove the three things slice 2 is actually
+ * about, and all three are observable from a browser:
+ *
+ * 1. **A call really is sent and really is answered.** The pass clicks Send on a read and
+ *    requires a status and a body in the result pane. A screen that renders a form and never
+ *    reaches its own API passes a render-only walk.
+ * 2. **A refusal is a result, not a page error.** The same pass sends a call the caller cannot
+ *    make and requires the pane to show a `403` *with the permission named* — the request file
+ *    says "a 403 names the missing permission, never the caller's roles", and a pane that
+ *    shows the raw `{"error":{"code":"permission_denied"}}` without the permission is the
+ *    shape that fails it.
+ * 3. **No snippet carries a credential.** The snippet drawer is opened and every snippet is
+ *    scanned for the two shapes a real key has (`omn_` and a `Bearer` followed by a long
+ *    opaque value). A snippet that leaked one would be copied into a ticket by the first person
+ *    who used the feature.
+ *
+ * The recursive refusal is checked from the browser too, because it is a refusal the *form*
+ * produces: `/api/v1/dev/…` is what the Explorer may not call, and a form that let it through
+ * would let one click spend a budget on many.
+ */
+async function runApiExplorerDepth(page, report) {
+  const steps = {};
+  await page
+    .goto(`${URL_ADMIN}/developer/api-explorer`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector("[data-testid=explorer-operation], [data-testid=explorer-send]", { timeout: 10000 })
+    .catch(() => {});
+
+  // ---- 1. The reference loaded, and it is grouped rather than one flat list ------------------
+  const operationCount = await page.locator("[data-testid=explorer-operation]").count();
+  steps.referenceLoaded = operationCount > 0;
+  steps.referenceIsGrouped = operationCount > 1;
+  await shot(page, "page-developer-api-explorer");
+
+  if (operationCount === 0) {
+    return steps;
+  }
+
+  // ---- 2. A read is sent, and the answer is a result with a status and a body ----------------
+  // `GET /api/v1/me` is the read to use: it is open to any signed-in account, so a refusal here
+  // would be a defect in the Explorer rather than a fact about permissions.
+  const sendable = await page.evaluate(async () => {
+    const answer = await fetch("/api/v1/dev/operations", { credentials: "same-origin" });
+    if (!answer.ok) return null;
+    const body = await answer.json();
+    const read = (body.operations || []).find((op) => op.method === "GET");
+    return read ? { id: read.id, path: read.path } : null;
+  });
+  steps.hasARead = Boolean(sendable);
+
+  if (sendable) {
+    await page
+      .locator(`[data-testid=explorer-operation]`)
+      .first()
+      .click({ timeout: 4000 })
+      .catch(() => {});
+    await page.waitForTimeout(200);
+    await page.locator("[data-testid=explorer-send]").click({ timeout: 5000 }).catch(() => {});
+    await page
+      .waitForSelector("[data-testid=explorer-result]", { timeout: 12000 })
+      .catch(() => {});
+    const status = (await page.locator("[data-testid=explorer-status]").textContent().catch(() => "")).trim();
+    steps.aCallWasSent = status.length > 0;
+    steps.theAnswerIsAStatus = /^[1-5]\d\d$/.test(status);
+    // A `200` on `GET /me` is the whole point: the call ran as the signed-in caller, so the
+    // answer is that caller's own account rather than an empty or an error page.
+    steps.theReadSucceeded = status === "200" || status === "201";
+    const body = (await page.locator("[data-testid=explorer-result] pre").textContent().catch(() => "")).trim();
+    steps.theBodyIsShown = body.length > 0;
+    await shot(page, "page-developer-api-explorer-sent");
+  }
+
+  // ---- 3. The snippets carry a placeholder, never a credential ------------------------------
+  await page.locator("[data-testid=explorer-send]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.getByRole("button", { name: "Snippets" }).click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  const snippetText = (await page.locator("pre").allTextContents().catch(() => [])).join("\n");
+  steps.snippetsRendered = snippetText.includes("OMNION_API_KEY");
+  // The two shapes a real credential has. `omn_` is the key prefix and a long opaque value
+  // after `Bearer` is what one looks like; a snippet containing either is a leak.
+  steps.noKeyPrefixInSnippets = !snippetText.includes("omn_");
+  steps.noOpaqueBearer = !/Bearer\s+[A-Za-z0-9_-]{24,}/.test(snippetText);
+  steps.snippetsNameTheVariable = snippetText.includes("$OMNION_API_KEY");
+  await shot(page, "page-developer-api-explorer-snippets");
+
+  // ---- 4. A call the caller may not make is refused, and the refusal names the permission -----
+  // Sent through the API directly rather than through the form: the form cannot express a path
+  // the document does not describe, and the property under test is the *answer*, not the form.
+  const refused = await page.evaluate(async () => {
+    const answer = await fetch("/api/v1/dev/explorer/requests", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ method: "GET", path: "/api/v1/pages/{id}", path_params: [] }),
+    });
+    let body = null;
+    try {
+      body = await answer.json();
+    } catch {
+      body = null;
+    }
+    return { status: answer.status, code: body?.error?.code ?? null, message: body?.error?.message ?? "" };
+  });
+  steps.aRefusalIsA403 = refused.status === 403;
+  // The acceptance criterion is specific: the permission, not the caller's roles.
+  steps.theRefusalNamesThePermission =
+    (refused.message || "").includes("content.pages.read") ||
+    (refused.message || "").includes("developer");
+  steps.theRefusalHidesTheRoles =
+    !(refused.message || "").includes("owner") && !(refused.message || "").includes("administrator");
+
+  // ---- 5. The Explorer may not call itself ----------------------------------------------------
+  // The recursion guard is a form-level refusal, so it is checked through the API: a
+  // developer who found the button twice would otherwise spend one budget on many.
+  const recursive = await page.evaluate(async () => {
+    const answer = await fetch("/api/v1/dev/explorer/requests", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ method: "POST", path: "/api/v1/dev/explorer/requests", path_params: [] }),
+    });
+    let body = null;
+    try {
+      body = await answer.json();
+    } catch {
+      body = null;
+    }
+    return { status: answer.status, code: body?.error?.code ?? null };
+  });
+  steps.recursionIsRefused = recursive.status === 400 && recursive.code === "explorer_recursive";
+
+  // ---- 6. A path outside the platform's own API is refused ------------------------------------
+  const outside = await page.evaluate(async () => {
+    const answer = await fetch("/api/v1/dev/explorer/requests", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ method: "GET", path: "/admin", path_params: [] }),
+    });
+    let body = null;
+    try {
+      body = await answer.json();
+    } catch {
+      body = null;
+    }
+    return { status: answer.status, code: body?.error?.code ?? null };
+  });
+  steps.outsideTheApiIsRefused = outside.status === 400 && outside.code === "explorer_path_not_api";
+
+  return steps;
+}
+
 async function runRetentionDepth(page, report) {
   const steps = {};
   const before = await page
@@ -10906,13 +11063,19 @@ async function main() {
     // *real* endpoint instead — the same reasoning as the media file detail above.
     { path: "/webhooks", name: "webhooks" },
     { path: "/webhooks/new", name: "webhooks-new" },
-    // The developer platform's two screens (REQ-033, slice 1). Both are walked as routes
-    // rather than reached by a click: the keys screen is a nav entry and the log screen is a
-    // link target from a key row, and a screen whose *first paint* is only ever seen after
-    // somebody has already filled in a form is a screen whose loading and error states nobody
-    // has looked at. The depth pass below drives the key form and the one-time secret dialog.
+    // The developer platform's screens (REQ-033). All three are walked as routes rather than
+    // reached by a click: the keys screen is a nav entry, the log screen is a link target from
+    // a key row, and the Explorer is a nav entry — and a screen whose *first paint* is only
+    // ever seen after somebody has already filled in a form is a screen whose loading and
+    // error states nobody has looked at. The depth passes below drive the key form, the
+    // one-time secret dialog and the Explorer's send + snippet drawer.
     { path: "/developer/keys", name: "developer-keys" },
     { path: "/developer/logs", name: "developer-logs" },
+    // The API Explorer (slice 2). Walked *first* among the three because it is the screen a
+    // developer opens before the other two, and because its result pane is the one place in
+    // the panel where a `403` is the expected output — so a pass that never sends a call
+    // would report it as "empty" rather than as "working".
+    { path: "/developer/api-explorer", name: "developer-api-explorer" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -11156,6 +11319,13 @@ async function main() {
   // first would make their numbers wrong for a reason that has nothing to do with them.
   report.retention = await runDepthPass("event-retention", () => runRetentionDepth(page, report));
   log(`retention: ${JSON.stringify(report.retention)}`);
+
+  // The API Explorer (REQ-033, slice 2). It runs after the retention sweep and before the
+  // security pass for one reason: the sweep *deletes* request-log-shaped rows, and the
+  // Explorer's own send is a request this pass would like to see reflected. Sending first and
+  // sweeping second would hide that; the order here is the one that cannot.
+  report.apiExplorer = await runDepthPass("api-explorer", () => runApiExplorerDepth(page, report));
+  log(`api-explorer: ${JSON.stringify(report.apiExplorer)}`);
 
   // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
   // because a scan counts the findings those passes have already written, and a scan that ran

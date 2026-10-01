@@ -6,7 +6,41 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, Layers, LayoutDashboard, LockKeyhole, LogOut, Menu, Rocket, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X, type LucideIcon } from "lucide-react";
+import {
+  Activity,
+  BarChart3,
+  Bell,
+  Bot,
+  Building2,
+  ClipboardCheck,
+  Compass,
+  FileText,
+  Fingerprint,
+  Gauge,
+  Globe,
+  HardDriveDownload,
+  HeartPulse,
+  Images,
+  Import,
+  KeyRound,
+  Layers,
+  LayoutDashboard,
+  LockKeyhole,
+  LogOut,
+  Menu,
+  Rocket,
+  Scale,
+  ScrollText,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
+  Timer,
+  UserCog,
+  UsersRound,
+  Webhook,
+  X,
+  type LucideIcon,
+} from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -72,6 +106,11 @@ const NAV: readonly NavItem[] = [
   // `/developer` is the section root the REQ names; the keys and logs screens ship with it and
   // the overview arrives with slice 4, so the root is registered once it exists rather than
   // pointing at a screen that has not been built.
+  // The Explorer (REQ-033, slice 2) sits *before* the keys: a developer who opens the
+  // developer section is usually trying to make a call, and the reference is the first
+  // question, not the third. The key screen is where you answer "how do I authenticate"
+  // once the Explorer has told you what the call is.
+  { href: "/developer/api-explorer", label: "Developer · API Explorer", icon: Compass },
   { href: "/developer/keys", label: "Developer · API keys", icon: KeyRound },
   { href: "/developer/logs", label: "Developer · Logs", icon: ScrollText },
   { href: "/sites", label: "Sites", icon: Globe },

@@ -3550,3 +3550,85 @@ export type ApiRequestLogPage = {
   has_more: boolean;
 };
 
+
+// The API Explorer (REQ-033, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/** The slice of JSON Schema the Explorer's form draws. */
+export type ExplorerSchema = {
+  type: "string" | "integer" | "number" | "boolean" | "object" | "array";
+  enum?: string[];
+  format?: string;
+  items?: ExplorerSchema;
+  properties?: { name: string }[] & Record<string, ExplorerSchema>;
+  required?: string[];
+  description?: string;
+};
+
+/** One path or query parameter of a documented operation. */
+export type ExplorerParameter = {
+  name: string;
+  in: "path" | "query";
+  required?: boolean;
+  description?: string;
+  type: string;
+  enum?: string[];
+  format?: string;
+  description_text?: string;
+};
+
+/**
+ * One operation in the Explorer browser.
+ *
+ * `permission` is the permission the route guard checks, not documentation: the Explorer
+ * resolves it before dispatching so a refusal names it. It is also what the browser filters on,
+ * so a role that cannot publish a page does not see a publish button it would only be refused
+ * by.
+ */
+export type ExplorerOperation = {
+  id: string;
+  method: string;
+  path: string;
+  tag: string;
+  summary: string;
+  permission: string | null;
+  parameters: ExplorerParameter[];
+  body: ExplorerSchema | null;
+};
+
+/** `GET /api/v1/dev/operations` — the operations this caller may see. */
+export type ExplorerOperations = { operations: ExplorerOperation[] };
+
+/** What one Explorer call answered. */
+export type ExplorerResult = {
+  status: number;
+  body: string;
+  body_is_json: boolean;
+  duration_ms: number;
+  sent_path: string;
+  request_id: string | null;
+  /** `true` when a layer refused rather than a handler answering. */
+  refused: boolean;
+};
+
+/** One copyable form of a call, with `$OMNION_API_KEY` as the credential. */
+export type ExplorerSnippet = { language: string; code: string };
+
+/** `POST /api/v1/dev/explorer/requests`. */
+export type ExplorerRun = {
+  result: ExplorerResult;
+  snippets: ExplorerSnippet[];
+};
+
+/** What the send form collects. */
+export type ExplorerRunInput = {
+  method: string;
+  /** The template, e.g. `/api/v1/pages/{id}`. */
+  path: string;
+  /** Path parameters, in the template's order. */
+  path_params: string[];
+  /** `name=value` pairs. */
+  query: string[];
+  /** Raw request body. */
+  body?: string;
+};

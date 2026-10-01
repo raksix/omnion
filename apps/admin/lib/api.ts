@@ -193,6 +193,9 @@ import type {
   Promotion,
   PromotionDetail,
   PromotionRequested,
+  ExplorerOperations,
+  ExplorerRun,
+  ExplorerRunInput,
 } from "./types";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
@@ -7067,4 +7070,45 @@ export async function fetchRequestLogs(
 /** One request's metadata — what the log row's drawer opens. */
 export async function fetchRequestLog(id: number): Promise<ApiRequestLog> {
   return request(`/api/v1/request-logs/${encodeURIComponent(String(id))}`);
+}
+
+
+// The API Explorer (REQ-033, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The operations this caller may see, for the browser's left column.
+ *
+ * A separate call from the OpenAPI document rather than a query flag on it: the document is a
+ * standard that a code generator consumes, and an extension to its top level would break one.
+ * The filtered list is the platform's own shape for its own UI.
+ */
+export async function fetchExplorerOperations(): Promise<ExplorerOperations> {
+  return request("/api/v1/dev/operations");
+}
+
+/**
+ * Send one call as the signed-in caller.
+ *
+ * The API refuses this route when the caller's own permissions would refuse the call it is
+ * asked to make, so a `403` here is the same `403` the same person would get from their
+ * terminal — which is the whole reason the Explorer is useful rather than dangerous.
+ */
+export async function runExplorerRequest(input: ExplorerRunInput): Promise<ExplorerRun> {
+  return request("/api/v1/dev/explorer/requests", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * The served OpenAPI document, for a developer who wants to point a generator at it.
+ *
+ * Nothing in the panel calls this — the panel's browser uses {@link fetchExplorerOperations},
+ * which is permission-filtered. It is here because "download the OpenAPI document" is a thing
+ * somebody will want to do, and a reference that can only be seen through a UI is a reference
+ * that cannot be scripted against.
+ */
+export async function fetchOpenApiDocument(): Promise<Record<string, unknown>> {
+  return request("/api/v1/dev/openapi.json");
 }
