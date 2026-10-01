@@ -52,13 +52,19 @@ use crate::error::{AiHubError, Result};
 /// and "what may I offer the user next" (the whole row). A table of successors answers both,
 /// and it makes an illegal transition a *compile-time* list to read rather than an `if` chain
 /// scattered across three call sites that grows a hole each time a status is added.
-pub const STATUSES: [&str; 6] = [
+///
+/// `failed` is a terminal state that the *applier* writes, never a person. It exists because
+/// "all-or-nothing" and "the reviewer can see it did not happen" are two different claims: a
+/// rolled-back set that stayed `confirmed` reads as "still waiting", and the person who has
+/// to re-do the work has no way to tell that from a set that is about to apply.
+pub const STATUSES: [&str; 7] = [
     "draft",
     "pending",
     "confirmed",
     "applied",
     "discarded",
     "expired",
+    "failed",
 ];
 
 /// The status a newly proposed set carries.
@@ -74,8 +80,8 @@ pub fn next_statuses(status: &str) -> &'static [&'static str] {
     match status {
         "draft" => &["pending", "confirmed", "discarded", "expired"],
         "pending" => &["confirmed", "discarded", "expired"],
-        "confirmed" => &["applied", "discarded"],
-        "applied" | "discarded" | "expired" => &[],
+        "confirmed" => &["applied", "discarded", "failed"],
+        "applied" | "discarded" | "expired" | "failed" => &[],
         // A status this build does not know is a row written by a newer one. It is terminal
         // rather than a panic: this code must not be able to take the API down over a status
         // it has not read yet, and it must not move a row whose lifecycle it cannot reason
@@ -150,6 +156,10 @@ pub struct ChangeSet {
     pub created_by: Option<Uuid>,
     pub created_by_agent: Option<Uuid>,
     pub created_by_run: Option<Uuid>,
+    /// Who last edited the operation list. `None` on a row written before the column existed
+    /// or edited by a user who has since been deleted: the operations are the record, the
+    /// name is the convenience.
+    pub updated_by: Option<Uuid>,
     pub confirmed_at: Option<OffsetDateTime>,
     pub applied_at: Option<OffsetDateTime>,
     pub discarded_reason: Option<String>,
@@ -404,6 +414,55 @@ pub fn apply_all<E: OperationExecutor>(
     Ok(applied)
 }
 
+/// The async counterpart of [`OperationExecutor`].
+///
+/// The sync trait exists for the unit walks, where a recorder is a two-line struct. The real
+/// applier is `async` — it previews and writes through a database connection — and giving the
+/// sync trait an `async` method would force every implementor to box a future for a path only
+/// one of them needs. So there are two traits with one loop each, and the loops annotate
+/// through the same [`annotate`].
+///
+/// That shared annotation is the point of the split, not an accident of it. The first version
+/// of the change-set route annotated only its *write*, so a refusal from the **preview** — a
+/// page deleted between proposal and apply — reached the reviewer as "`page` a0d4… does not
+/// exist": a uuid out of a set whose operations all carry keys, when the acceptance criterion
+/// asks for the failing operation. A walk against a real database is what surfaced it, because
+/// only a real database makes the second operation fail in the preview. With the loop in the
+/// store, a new applier cannot forget the annotation.
+pub trait AsyncOperationExecutor {
+    /// Apply one operation.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying write refuses with. The loop treats any error as fatal to the
+    /// whole set: a set is all-or-nothing by definition.
+    fn execute<'a>(
+        &'a mut self,
+        op: &'a ChangeOp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AppliedOp>> + Send + 'a>>;
+}
+
+/// Apply every operation of a set through an async executor, all of them or none.
+///
+/// # Errors
+///
+/// The first operation's refusal, annotated with that operation's key. The caller rolls the
+/// transaction back; this function does not, because it does not own it.
+pub async fn apply_all_with<E: AsyncOperationExecutor + ?Sized>(
+    ops: &[ChangeOp],
+    executor: &mut E,
+) -> Result<Vec<AppliedOp>> {
+    let mut applied = Vec::with_capacity(ops.len());
+    for op in ops {
+        let outcome = executor
+            .execute(op)
+            .await
+            .map_err(|err| annotate(op, err))?;
+        applied.push(outcome);
+    }
+    Ok(applied)
+}
+
 /// Name the operation a refusal came from.
 ///
 /// The annotation is the difference between "the page could not be updated" and "operation
@@ -441,6 +500,7 @@ pub struct ChangeSetRow {
     pub created_by: Option<Uuid>,
     pub created_by_agent: Option<Uuid>,
     pub created_by_run: Option<Uuid>,
+    pub updated_by: Option<Uuid>,
     pub confirmed_at: Option<OffsetDateTime>,
     pub applied_at: Option<OffsetDateTime>,
     pub discarded_reason: Option<String>,
@@ -485,6 +545,7 @@ impl ChangeSetRow {
             created_by: self.created_by,
             created_by_agent: self.created_by_agent,
             created_by_run: self.created_by_run,
+            updated_by: self.updated_by,
             confirmed_at: self.confirmed_at,
             applied_at: self.applied_at,
             discarded_reason: self.discarded_reason,
@@ -500,8 +561,8 @@ impl ChangeSetRow {
 /// and a column added to one of them and not the others is a struct that fails to compile in
 /// a place nobody was looking — which is at least loud, but the fix is a search.
 pub const CHANGE_SET_COLUMNS: &str = "id, organization_id, site_id, title, status, operations, \
-     base_revisions, created_by, created_by_agent, created_by_run, confirmed_at, applied_at, \
-     discarded_reason, created_at, updated_at";
+     base_revisions, created_by, created_by_agent, created_by_run, updated_by, confirmed_at, \
+     applied_at, discarded_reason, created_at, updated_at";
 
 /// The read/append half of the store.
 ///
@@ -687,6 +748,7 @@ pub mod store {
             created_by: new.created_by,
             created_by_agent: new.created_by_agent,
             created_by_run: new.created_by_run,
+            updated_by: None,
             confirmed_at: None,
             applied_at: None,
             discarded_reason: None,
@@ -791,6 +853,21 @@ pub mod store {
     ///
     /// Whatever any operation refuses with — the whole set is rolled back first, and the
     /// refusal names the operation. `Err(InvalidChangeSet)` when the set is not `confirmed`.
+    /// The applier is a **boxed** future rather than an `AsyncFnOnce` bound, and that is a
+    /// deliberate choice with a cost worth naming.
+    ///
+    /// `AsyncFnOnce(&ChangeSet, &mut PgConnection)` is the nicer signature and it does not
+    /// compile for this call shape: the closure has to work for *every* lifetime of both
+    /// arguments, and an `async fn` applier whose future borrows its `&mut PgConnection`
+    /// parameter is not general enough to satisfy that — the compiler says so, in a sentence,
+    /// at the route. Boxing the future sidesteps the higher-ranked requirement: the closure is
+    /// called exactly once, so the future is created exactly once, and a `Pin<Box<dyn Future>>`
+    /// erases the lifetime the compiler wanted quantified.
+    ///
+    /// The cost is one heap allocation per apply, on a path that runs once per confirmed set
+    /// and then writes several pages. That is not a measurable cost, and the alternative that
+    /// avoids it — making the applier a trait with a lifetime-parameterised method — moves the
+    /// same lifetime problem into the trait and adds a type to read.
     pub async fn apply_confirmed<F>(
         pool: &PgPool,
         organization_id: Uuid,
@@ -801,7 +878,9 @@ pub mod store {
         F: for<'c> FnOnce(
             &'c ChangeSet,
             &'c mut sqlx::PgConnection,
-        ) -> Result<Vec<super::AppliedOp>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<super::AppliedOp>>> + Send + 'c>,
+        >,
     {
         let mut tx = pool.begin().await?;
         let sql = format!(
@@ -827,7 +906,7 @@ pub mod store {
             return Err(err);
         }
 
-        let applied = match apply(&set, &mut tx) {
+        let applied = match apply(&set, &mut tx).await {
             Ok(applied) => applied,
             Err(err) => {
                 // An explicit rollback, not a `?`: dropping a transaction is a rollback in
@@ -854,6 +933,45 @@ pub mod store {
 
         tx.commit().await?;
         Ok(applied)
+    }
+
+    /// Record that an apply did not happen, and why.
+    ///
+    /// Called **after** [`apply_confirmed`] has rolled its transaction back, so it is a
+    /// separate statement and not part of it: a `failed` row written inside the transaction
+    /// that failed would be rolled back with it, and the record would be exactly the thing
+    /// that disappears.
+    ///
+    /// The reason is stored in `discarded_reason` — the column the table already has for "a
+    /// human-readable sentence about why this set stopped being live" — rather than a new
+    /// column. A new column would mean a migration for a value that is read by exactly one
+    /// screen, and the row's `status` is what the screen filters on; the reason only has to be
+    /// legible next to it.
+    ///
+    /// The `where status = 'confirmed'` clause is what keeps this from overwriting a row that
+    /// somebody else already moved: a concurrent discard is a decision, and a failed apply
+    /// must not erase it. `Ok(false)` says the row is no longer confirmed, which is the caller's
+    /// signal that there is nothing left to annotate.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the database refuses with.
+    pub async fn mark_failed(
+        pool: &PgPool,
+        organization_id: Uuid,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<bool> {
+        let sql = "update ai_change_sets set status = 'failed', discarded_reason = $3, updated_at = now() \
+             where id = $1 and organization_id = $2 and status = 'confirmed'";
+        let written = sqlx::query(sql)
+            .bind(id)
+            .bind(organization_id)
+            .bind(reason.trim())
+            .execute(pool)
+            .await?
+            .rows_affected();
+        Ok(written > 0)
     }
 }
 
@@ -887,6 +1005,7 @@ mod tests {
             created_by: None,
             created_by_agent: None,
             created_by_run: None,
+            updated_by: None,
             confirmed_at: None,
             applied_at: None,
             discarded_reason: None,
@@ -1138,6 +1257,7 @@ mod tests {
             created_by: None,
             created_by_agent: None,
             created_by_run: None,
+            updated_by: None,
             confirmed_at: None,
             applied_at: None,
             discarded_reason: None,
@@ -1158,6 +1278,7 @@ mod tests {
             created_by: None,
             created_by_agent: None,
             created_by_run: None,
+            updated_by: None,
             confirmed_at: None,
             applied_at: None,
             discarded_reason: None,
@@ -1186,6 +1307,7 @@ mod tests {
             created_by: None,
             created_by_agent: None,
             created_by_run: None,
+            updated_by: None,
             confirmed_at: None,
             applied_at: None,
             discarded_reason: None,
@@ -1201,24 +1323,67 @@ mod tests {
         );
     }
 
-    /// The six statuses the table's constraint allows must be the six the code knows.
+    /// The statuses the table's constraint allows are exactly the statuses the code knows.
     ///
-    /// This is the kind of test that looks like bureaucracy and is not: the SQL constraint in
-    /// `0189_ai_approvals.sql` and this `match` are two independent lists of the same fact, and
-    /// nothing but a test keeps them from drifting. A status added to one and not the other
-    /// would be writable and unmovable.
+    /// This is the kind of test that looks like bureaucracy and is not: the SQL constraint and
+    /// this `match` are two independent lists of the same fact, and nothing but a test keeps
+    /// them from drifting. A status added to one and not the other would be writable and
+    /// unmovable — the row would accept a value the lifecycle cannot reason about.
+    ///
+    /// It **reads the migrations** rather than repeating the list, because slice 3b learned that
+    /// the hardcoded copy is the second source of truth, not the first: adding `failed` meant
+    /// editing the constraint in `0201` and this array, and the compile error that followed was
+    /// the test doing its job only by accident. Reading the SQL makes the assertion survive the
+    /// next status without being edited — and if a migration is renamed the file read fails
+    /// loudly instead of silently checking nothing.
     #[test]
     fn the_known_statuses_are_exactly_the_tables_own() {
+        let migrations = include_str!("../../../database/migrations/0189_ai_approvals.sql")
+            .to_owned()
+            + &include_str!("../../../database/migrations/0201_ai_change_set_failed.sql");
+        // The **last** `check (status in (…))` wins: `0201` drops 0189's constraint and adds
+        // its own, and an earlier copy read from the string would be a stale answer presented
+        // as a current one.
+        let last = migrations
+            .rfind("check (status in (")
+            .expect("a status check exists");
+        let list = &migrations[last + "check (status in (".len()..];
+        let list = &list[..list.find(')').expect("a closed list")];
+
+        let from_sql: Vec<&str> = list
+            .split(',')
+            .map(|part| part.trim().trim_matches('\'').trim())
+            .filter(|part| !part.is_empty())
+            .collect();
         assert_eq!(
-            STATUSES,
-            [
-                "draft",
-                "pending",
-                "confirmed",
-                "applied",
-                "discarded",
-                "expired"
-            ]
+            from_sql,
+            STATUSES.to_vec(),
+            "the code's status list and the table's constraint are the same list"
         );
+
+        // And the constraint the migration chain leaves in place is a check on the seven, not
+        // the six: reading the string cannot tell a `drop constraint` from an `add` unless the
+        // list is compared, which is what the assertion above does.
+        assert!(
+            migrations.contains("ai_change_sets_failed_has_reason"),
+            "a failed set must say why, or it reads as one that is still waiting"
+        );
+    }
+
+    /// `failed` is terminal and reachable only from `confirmed`.
+    ///
+    /// The edge list is the claim: an applier may mark a failure, and nothing else may. A
+    /// `draft → failed` edge would let a proposal be written off before anybody looked at it,
+    /// and a `failed → draft` edge would let a person re-open a set whose operations are already
+    /// the record of something that was tried.
+    #[test]
+    fn a_failed_set_is_terminal_and_only_an_applier_may_write_it() {
+        assert!(can_transition("confirmed", "failed"));
+        assert!(!can_transition("draft", "failed"));
+        assert!(!can_transition("pending", "failed"));
+        assert!(!can_transition("failed", "draft"));
+        assert!(!can_transition("failed", "confirmed"));
+        assert!(!can_transition("failed", "applied"));
+        assert!(next_statuses("failed").is_empty(), "failed is terminal");
     }
 }
