@@ -5611,9 +5611,36 @@ async function runNotificationsDepth(page, report) {
   await page.goto(`${URL_ADMIN}/notifications`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1200);
   steps.errorState = (await page.locator("[data-notification-error]").count()) > 0;
-  // A retry the reader can actually press: an error banner with no way forward is a dead end.
+  // A retry the reader can actually press: an error banner with no way forward is a dead end. The
+  // button is counted **and then pressed with the route still failing**, because a label and a
+  // working control are different things and only the second one re-runs the request.
   steps.errorOffersRetry =
     (await page.locator("[data-notification-error] button").count()) > 0;
+  const retriedList = page
+    .waitForResponse(
+      (r) => r.url().includes("/api/v1/notifications") && r.request().method() === "GET",
+      { timeout: 6000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  if (steps.errorOffersRetry) {
+    await page.locator("[data-notification-error] button").first().click({ timeout: 5000 }).catch(() => {});
+  }
+  steps.retryReRunsTheRequest = await retriedList;
+  // A collected step is not a gate. Every one of the three retry assertions on this screen was
+  // readable in the report and **silent when false**: `steps.errorOffersRetry = false` sits in
+  // the artifact next to every other measurement and nothing reads it, so a screen that shipped
+  // with a dead-end banner would have produced a report indistinguishable from a healthy one.
+  // The CDN pass records its pair; these two did not, and the two screens are the same claim.
+  if (!steps.errorState) {
+    record({ page: "notifications", action: "error-state-never-rendered" });
+  }
+  if (!steps.errorOffersRetry) {
+    record({ page: "notifications", action: "error-banner-offers-no-retry" });
+  }
+  if (steps.errorOffersRetry && !steps.retryReRunsTheRequest) {
+    record({ page: "notifications", action: "retry-does-not-re-run-the-request" });
+  }
   await page.unroute("**/api/v1/notifications?*").catch(() => {});
   await shot(page, "page-notifications-error");
 
@@ -5778,8 +5805,56 @@ async function runNotificationSettingsDepth(page, report) {
   await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1200);
   steps.errorState = (await page.locator("[data-pref-state=error]").count()) > 0;
-  steps.errorOffersRetry =
-    (await page.locator("[data-pref-state=error]").innerText().catch(() => "")).length > 0;
+  // This step was `innerText().length > 0` and it was named `errorOffersRetry`, which is a claim
+  // about a **control** and a measurement about a **string**: the error div is only rendered
+  // with the message inside it, so the assertion was true by construction from the line above
+  // it and could not fail in any build — including one where `load` was never wired to the
+  // button and the reader was left at a dead end. Count the control, then press it and watch the
+  // request go out, which is the standard the CDN rules pass set last tick (`retryReRunsTheRequest`).
+  // A retry the reader cannot see and a retry that re-runs nothing are the same defect.
+  steps.errorOffersRetry = (await page.locator("[data-pref-state=error] button").count()) > 0;
+  const retriedPrefs = page
+    .waitForResponse(
+      (r) => r.url().includes("/api/v1/notifications/preferences") && r.request().method() === "GET",
+      { timeout: 6000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+  if (steps.errorOffersRetry) {
+    await page.locator("[data-pref-state=error] button").first().click({ timeout: 5000 }).catch(() => {});
+  }
+  steps.retryReRunsTheRequest = await retriedPrefs;
+  // The reader must not be stuck: with the route still failing the error **persists** rather than
+  // silently swapping to an empty matrix, which is what "loaded nothing" would look like.
+  //
+  // The wait is not decoration. `waitForResponse` resolves the moment the response lands, which is
+  // *before* React has re-rendered, and this view swaps to a skeleton for the whole request
+  // (`data-pref-state="loading"`) — so a check written straight after the await measures a screen
+  // mid-flight and reports a re-render that may or may not have happened. The window is the same
+  // 1.2s the sibling assertions above use for a settled read.
+  await page.waitForTimeout(1200);
+  steps.errorSurvivesARetryThatStillFails =
+    (await page.locator("[data-pref-state=error]").count()) > 0 &&
+    (await page.locator("[data-pref-state=ready]").count()) === 0;
+  // Same gate as the list above, and the same reason: these three were collected and unread. The
+  // third is the one that matters most here — a settings screen that swallows a failed read and
+  // renders the **matrix** anyway is showing the operator a table of channels that were never
+  // loaded, and a Retry that "works" into that state is worse than no Retry at all.
+  if (!steps.errorState) {
+    record({ page: "notifications/settings", action: "error-state-never-rendered" });
+  }
+  if (!steps.errorOffersRetry) {
+    record({ page: "notifications/settings", action: "error-panel-offers-no-retry" });
+  }
+  if (steps.errorOffersRetry && !steps.retryReRunsTheRequest) {
+    record({ page: "notifications/settings", action: "retry-does-not-re-run-the-request" });
+  }
+  if (steps.retryReRunsTheRequest && !steps.errorSurvivesARetryThatStillFails) {
+    record({
+      page: "notifications/settings",
+      action: "failed-read-rendered-as-loaded-matrix",
+    });
+  }
   await shot(page, "page-notifications-settings-error");
   await page.unroute("**/api/v1/notifications/preferences").catch(() => {});
 
