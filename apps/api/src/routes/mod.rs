@@ -948,6 +948,17 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "ai.evals.manage"));
     let ai_evals_import =
         post(ai_evals::import_cases).layer(guards::require(&state, "ai.evals.manage"));
+    // The runs (REQ-107, slice 2). Reading a run is a QA read; starting one spends real
+    // inference tokens, so `ai.evals.run` is separate from `ai.evals.read` — an audience that
+    // may read results is not automatically an audience that may cause them. Setting a baseline
+    // is likewise a write: it is the yardstick every later regression is measured against.
+    let ai_evals_runs_read = get(ai_evals::list_runs).layer(guards::require(&state, "ai.evals.read"));
+    let ai_evals_run_start = post(ai_evals::start_run).layer(guards::require(&state, "ai.evals.run"));
+    let ai_evals_run_read = get(ai_evals::read_run).layer(guards::require(&state, "ai.evals.read"));
+    let ai_evals_run_diff = get(ai_evals::diff_run).layer(guards::require(&state, "ai.evals.read"));
+    let ai_evals_run_cancel = post(ai_evals::cancel_run).layer(guards::require(&state, "ai.evals.run"));
+    let ai_evals_baseline =
+        post(ai_evals::set_baseline).layer(guards::require(&state, "ai.evals.manage"));
 
     let ai_decisions =
         get(ai_decisions::list_decisions).layer(guards::require(&state, "ai.usage.read"));
@@ -2199,6 +2210,18 @@ pub fn router(state: AppState) -> Router {
             "/ai/evals/cases/{id}",
             ai_evals_case_write.merge(ai_evals_case_delete),
         )
+        // The run history. `/runs` is a sibling of `/suites` rather than a child because a run
+        // is read across suites — "did anything regress today" is not a per-suite question.
+        .route("/ai/evals/runs", ai_evals_runs_read)
+        // The diff is its own path, not a `?base=` parameter merged onto the read: two `get`
+        // handlers on one path is an overlapping method route, which axum rejects when the
+        // router is built — a panic at boot, not a 404. And the pairing is a distinct
+        // resource anyway: it has a verdict of its own that the run itself does not carry.
+        .route("/ai/evals/runs/{id}", ai_evals_run_read)
+        .route("/ai/evals/runs/{id}/diff", ai_evals_run_diff)
+        .route("/ai/evals/runs/{id}/cancel", ai_evals_run_cancel)
+        .route("/ai/evals/suites/{key}/run", ai_evals_run_start)
+        .route("/ai/evals/suites/{key}/baseline", ai_evals_baseline)
         .route("/ai/logs/decisions.csv", ai_decisions_csv)
         .route("/ai/logs/decisions/{id}", ai_decision)
         .route("/ai/routing/unresolved", ai_unresolved)
