@@ -811,6 +811,27 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "hr",
         description: "Correct a recorded day, with a reason, for any employee",
     },
+    // Onboarding (docs/requests/REQ-055, slice 4). Two keys rather than one, because the read and
+    // the write are different facts about an organization:
+    //
+    // * **`hr.onboarding.read`** is the board and the templates. A manager reading who is still
+    //   in progress is exactly the case the board exists for.
+    // * **`hr.onboarding.manage`** owns the templates AND the ticking. The request says an item
+    //   "can be completed by the assigned role or HR" — and the *assigned role* half is the
+    //   employee, who holds no `hr.*` key at all and ticks through `/hr/me/onboarding`. So this
+    //   key is HR applying a template to somebody, and the self-service tick is deliberately not
+    //   behind it: a guard that 403s the employee ticking their own checklist is a checklist that
+    //   HR has to do for them.
+    PermissionDef {
+        key: "hr.onboarding.read",
+        category: "hr",
+        description: "Read the onboarding board and the template catalogue",
+    },
+    PermissionDef {
+        key: "hr.onboarding.manage",
+        category: "hr",
+        description: "Create and edit onboarding templates, apply them, and tick any checklist",
+    },
     // Sales (docs/requests/REQ-052). The selling side splits the way the relationship layer
     // does — read, create, edit, archive — and adds the two powers that are genuinely different
     // acts rather than a stricter version of editing:

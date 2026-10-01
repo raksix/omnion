@@ -1080,6 +1080,22 @@ impl From<HrError> for ApiError {
                 "hr_attendance_already_checked_out",
                 "this day is already clocked out",
             ),
+            // Onboarding (slice 4). Both are `409`, not `400`: the payload is well formed and the
+            // current state says no. `NoSuchTemplate` is a `404` rather than a conflict — it means
+            // the id is wrong, which is the same answer another organization's template gets.
+            HrError::AlreadyApplied { items, .. } => Self::new(
+                StatusCode::CONFLICT,
+                "hr_onboarding_already_applied",
+                format!(
+                    "this template is already applied to the employee, with {items} item(s) on their checklist"
+                ),
+            )
+            .with_details(json!({ "items": items })),
+            HrError::NoSuchTemplate => Self::new(
+                StatusCode::NOT_FOUND,
+                "hr_onboarding_template_not_found",
+                "no such onboarding template in this organization",
+            ),
             HrError::Database(err) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", err.to_string())
             }

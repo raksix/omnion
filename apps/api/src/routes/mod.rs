@@ -103,6 +103,7 @@ pub mod hr;
 pub mod hr_attendance;
 pub mod hr_leave;
 pub mod hr_me;
+pub mod hr_onboarding;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -1490,6 +1491,43 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "hr.attendance.manage"));
 
+    // Onboarding (slice 4). Two routers, and the split is the request's own rule rather than a
+    // finer-grained one: the board and the template catalogue are readable by anybody who manages
+    // people, while applying a template and ticking somebody else's checklist is HR's.
+    //
+    // **The employee's own tick is NOT in either router.** `/hr/me/onboarding` answers it with no
+    // `route_layer` at all, because the request says an item "can be completed by the assigned
+    // role or HR" and the assigned role is frequently the employee themselves — who holds no
+    // `hr.*` key. Putting that route behind `hr.onboarding.manage` would make the one item the
+    // employee owns the one item they cannot tick.
+    let hr_onboarding_read = Router::new()
+        .route("/hr/onboarding", get(hr_onboarding::board))
+        .route("/hr/onboarding/templates", get(hr_onboarding::list_templates))
+        .route(
+            "/hr/onboarding/employees/{id}",
+            get(hr_onboarding::checklist),
+        )
+        .route_layer(guards::require(&state, "hr.onboarding.read"));
+
+    let hr_onboarding_manage = Router::new()
+        .route(
+            "/hr/onboarding/templates",
+            post(hr_onboarding::create_template),
+        )
+        .route(
+            "/hr/onboarding/templates/{id}",
+            patch(hr_onboarding::update_template),
+        )
+        .route(
+            "/hr/employees/{id}/onboarding",
+            post(hr_onboarding::apply_template),
+        )
+        .route(
+            "/hr/onboarding/items/{id}",
+            patch(hr_onboarding::tick_item),
+        )
+        .route_layer(guards::require(&state, "hr.onboarding.manage"));
+
     let hr_employees_create = Router::new()
         .route("/hr/employees", post(hr::create_employee))
         .route_layer(guards::require(&state, "hr.employees.create"));
@@ -1694,6 +1732,8 @@ pub fn router(state: AppState) -> Router {
         .merge(hr_attendance_read)
         .merge(hr_attendance_record)
         .merge(hr_attendance_manage)
+        .merge(hr_onboarding_read)
+        .merge(hr_onboarding_manage)
         .merge(crm_create)
         .merge(crm_update)
         .merge(crm_archive)
