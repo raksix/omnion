@@ -32,11 +32,13 @@ import {
   CheckCircle2,
   CircleDashed,
   Loader2,
+  Undo2,
   XCircle,
 } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { ApiError, cancelDeployment, fetchDeploymentJob, fetchDeploymentLog, runDeploymentPreflight, startDeployment } from "@/lib/api";
+import { RollbackDialog, type RollbackTarget } from "./rollback-dialog";
 import { formatTimestamp } from "@/lib/format";
 import type { DeploymentJob, DeploymentPreflight, DeploymentPreflightRow } from "@/lib/types";
 
@@ -64,6 +66,7 @@ export function DeploymentWizard() {
   const [job, setJob] = useState<DeploymentJob | null>(null);
   const [starting, setStarting] = useState(false);
   const [cancelNote, setCancelNote] = useState<string | null>(null);
+  const [rollback, setRollback] = useState<RollbackTarget | null>(null);
 
   // Step 1 runs the pre-flight as soon as there is a target. An empty `to` is a dead end rather
   // than a report of seven failures, so the screen asks for the version instead.
@@ -230,7 +233,7 @@ export function DeploymentWizard() {
       ) : null}
 
       {step === 2 && job ? (
-        <RunStep job={job} note={cancelNote} onCancel={async () => {
+        <RunStep job={job} note={cancelNote} onRollback={setRollback} onCancel={async () => {
           try {
             const response = await cancelDeployment(job.id);
             setJob(response.job);
@@ -240,6 +243,10 @@ export function DeploymentWizard() {
           }
         }} />
       ) : null}
+
+      {/* The rollback the failed banner offers. Mounted here rather than inside `RunStep` so the
+          dialog's own router navigation ends the wizard's run step instead of fighting it. */}
+      <RollbackDialog target={rollback} onClose={() => setRollback(null)} />
     </section>
   );
 }
@@ -460,10 +467,14 @@ function RunStep({
   job,
   note,
   onCancel,
+  onRollback,
 }: {
   job: DeploymentJob;
   note: string | null;
   onCancel: () => void;
+  /** Open the rollback dialog at the version this job came from. Owned by the parent, which
+   *  mounts the dialog, so the run step never owns a navigation of its own. */
+  onRollback: (target: RollbackTarget) => void;
 }) {
   const [current, setCurrent] = useState<DeploymentJob>(job);
   const [log, setLog] = useState("");
@@ -634,8 +645,27 @@ function RunStep({
           ) : (
             <>
               The deploy did not succeed{current.error ? `: ${current.error}` : ""}. Nothing was
-              verified, so the instance may still be on its previous version — check the log above,
-              then roll back or deploy again.
+              verified, so the instance may still be on its previous version — check the log
+              above, then roll back or deploy again.
+              {/* The banner used to say "roll back" in prose and offer nothing to press, which is
+                  the sentence an operator reads while holding a dead deploy. The rollback target
+                  is the version this job came FROM — the only version the history can vouch for —
+                  and the dialog itself still demands a reason and, on production, the version. */}
+              {current.from_version ? (
+                <button
+                  type="button"
+                  data-testid="failed-rollback"
+                  onClick={() => onRollback({ environment: current.environment, toVersion: current.from_version as string })}
+                  className="ml-2 inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] font-medium text-ink hover:bg-panel"
+                >
+                  <Undo2 aria-hidden="true" className="size-3.5" />
+                  Roll back to {current.from_version}
+                </button>
+              ) : (
+                <span className="ml-2 text-[12px] text-muted">
+                  No earlier version was recorded, so there is nothing to roll back to.
+                </span>
+              )}
             </>
           )}
         </div>
