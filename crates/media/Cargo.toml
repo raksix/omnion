@@ -15,6 +15,9 @@ sha2.workspace = true
 rand.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+# `formatting`/`parsing` for the `HTTP-date` spellings and `macros` for the tests' fixtures. The
+# conditional-request validator renders and re-reads a date in every spelling RFC 9110 requires a
+# recipient to accept, so the workspace default (serde only) is not enough here.
+time = { workspace = true, features = ["formatting", "parsing", "macros"] }
 tracing.workspace = true
-time.workspace = true
 uuid.workspace = true

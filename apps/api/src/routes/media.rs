@@ -401,7 +401,8 @@ pub async fn raw_media(
 ) -> Result<Response, ApiError> {
     let media = media_in_scope(&state, &current, media_id).await?;
     let range = range_header(&headers);
-    serve(&state, &media, "private, max-age=300", range).await
+    let conditional = conditional_headers(&headers, &media.checksum, Some(media.created_at));
+    serve(&state, &media, "private, max-age=300", range, conditional).await
 }
 
 /// The caller's `Range` header, if it carries one.
@@ -428,7 +429,8 @@ pub async fn raw_file(
     let file = crate::routes::media_files::file_in_scope(&state, &current, media_id).await?;
     ensure_servable(&state, &current, &file).await?;
     let range = range_header(&headers);
-    serve_file(&state, &file, "private, max-age=300", range).await
+    let conditional = conditional_headers(&headers, &file.checksum, file.updated_at.or(Some(file.created_at)));
+    serve_file(&state, &file, "private, max-age=300", range, conditional).await
 }
 
 /// Remove one file: the object and its row.
@@ -502,7 +504,8 @@ pub async fn public_media(
     // reason, and conflating them is the mistake this comment is here to stop.
     ensure_scan_allows(&state, &file).await?;
     let range = range_header(&headers);
-    serve_file(&state, &file, "public, max-age=3600", range).await
+    let conditional = conditional_headers(&headers, &file.checksum, file.updated_at.or(Some(file.created_at)));
+    serve_file(&state, &file, "public, max-age=3600", range, conditional).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -587,7 +590,13 @@ async fn serve(
     media: &Media,
     cache_control: &'static str,
     range: Option<&str>,
+    conditional: ConditionalAnswer,
 ) -> Result<Response, ApiError> {
+    // Before the body moves: a revalidation that reads the object store and then decides to send
+    // nothing has cost exactly what an unconditional `200` would have.
+    if conditional.verdict == omnion_media::validators::Conditional::NotModified {
+        return not_modified(&conditional);
+    }
     let plan = serve_plan(&media.content_type);
     let (status, body) = read_window(state, &media.storage_key, range, media.size()).await?;
     // The range headers are decided *before* the body moves into the response, because they
@@ -608,6 +617,7 @@ async fn serve(
     headers.insert(header::CACHE_CONTROL, header_value(cache_control)?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
     apply_range_headers(headers, ranges)?;
+    apply_validators(headers, &conditional)?;
     Ok(response)
 }
 
@@ -621,7 +631,11 @@ async fn serve_file(
     media: &omnion_media::MediaFile,
     cache_control: &'static str,
     range: Option<&str>,
+    conditional: ConditionalAnswer,
 ) -> Result<Response, ApiError> {
+    if conditional.verdict == omnion_media::validators::Conditional::NotModified {
+        return not_modified(&conditional);
+    }
     let plan = serve_plan(&media.content_type);
     let (status, body) = read_window(state, &media.storage_key, range, media.size()).await?;
     // The range headers are decided *before* the body moves into the response, because they
@@ -642,6 +656,7 @@ async fn serve_file(
     headers.insert(header::CACHE_CONTROL, header_value(cache_control)?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
     apply_range_headers(headers, ranges)?;
+    apply_validators(headers, &conditional)?;
     Ok(response)
 }
 
@@ -749,6 +764,83 @@ fn header_value(value: &str) -> Result<HeaderValue, ApiError> {
             err.to_string(),
         )
     })
+}
+
+/// Answer a conditional `GET` with `304` when the caller already holds these bytes.
+///
+/// The three media serve paths — the panel's `raw`, the public renderer and a version's `raw` —
+/// all answer from an address that **names the file rather than its contents**, and a replace
+/// changes the bytes behind that address without changing it. So the response has to carry a
+/// validator, and the server has to honour one, or the panel's own `max-age` window is a promise
+/// the bytes behind it can break.
+///
+/// Three decisions, each a shortcut that produces a plausible wrong answer:
+///
+/// 1. **The check happens before the body is read.** Reading first and comparing after is the same
+///    work as not checking at all, which defeats the entire point: a revalidation that still
+///    pulls every byte off the object store saves the *client* nothing an unconditional `200`
+///    would not have saved it.
+/// 2. **A `304` carries no `Content-Length` and no body** — only the validators. Sending `0`
+///    as the length is the detail that makes several clients treat the response as an empty file,
+///    and a `Content-Range` on it is a lie about a response that is not a range.
+/// 3. **The ETag is weak and the validator is the checksum.** `Media::checksum` is the SHA-256 of
+///    the bytes, and `append_version` rewrites it in the same statement that moves
+///    `storage_key`, so it cannot outlive its object. A validator built from `updated_at` would
+///    instead be changed by a rename and unchanged by a replace that happened without a stamp.
+///
+/// `last_modified` is optional because the version row records `created_at` rather than a change
+/// instant; a row with no recorded instant offers no date validator, which is honest rather than
+/// a missing header a client has to guess about.
+pub(crate) fn conditional_headers(
+    headers: &axum::http::HeaderMap,
+    checksum: &str,
+    last_modified: Option<OffsetDateTime>,
+) -> ConditionalAnswer {
+    let etag = omnion_media::validators::weak_etag_of(checksum);
+    let rendered = last_modified.map(omnion_media::validators::imf_fixdate);
+    let get = |name: header::HeaderName| {
+        headers
+            .get(&name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let verdict = omnion_media::validators::decide(
+        get(header::IF_NONE_MATCH).as_deref(),
+        get(header::IF_MODIFIED_SINCE).as_deref(),
+        &etag,
+        rendered.as_deref(),
+    );
+    ConditionalAnswer { verdict, etag, rendered }
+}
+
+/// What a conditional answer decided, carried with the values a `304` still has to report.
+pub(crate) struct ConditionalAnswer {
+    /// Whether the body is sent or the caller is told it already has it.
+    pub verdict: omnion_media::validators::Conditional,
+    /// The current representation's validator.
+    pub etag: String,
+    /// The current representation's instant, when one was recorded.
+    pub rendered: Option<String>,
+}
+
+/// Write the validators onto a response, whether or not it carries a body.
+pub(crate) fn apply_validators(
+    headers: &mut axum::http::HeaderMap,
+    answer: &ConditionalAnswer,
+) -> Result<(), ApiError> {
+    headers.insert(header::ETAG, header_value(&answer.etag)?);
+    if let Some(last_modified) = &answer.rendered {
+        headers.insert(header::LAST_MODIFIED, header_value(last_modified)?);
+    }
+    Ok(())
+}
+
+/// Build the `304` a revalidated request is answered with.
+pub(crate) fn not_modified(answer: &ConditionalAnswer) -> Result<Response, ApiError> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NOT_MODIFIED;
+    apply_validators(response.headers_mut(), answer)?;
+    Ok(response)
 }
 
 /// Write an audit row; a privileged action is not reported as successful without one.

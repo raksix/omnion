@@ -31,6 +31,7 @@ pub mod storage_settings;
 pub mod transform;
 pub mod usage;
 pub mod validation;
+pub mod validators;
 pub mod versions;
 
 pub use browser::{
