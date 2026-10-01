@@ -10036,3 +10036,13 @@ counting a button would have accepted a label.
 ticks 86b–e were TERMed by matching `/proc/<pid>/cwd` (mine only; w3's and main's holders are
 live and were left alone). If the pass reports again, the question to ask first is whether the
 **pass's own arithmetic** can produce the number it reported — the answer was yes twice today.
+
+**Blocker (named, not waved at).** The browser pass to close the box ran twice and was **queued
+out** both times, at 2400 s and again from a second attempt — it never executed, so the box stays
+open and this tick closes nothing on the browser gate. The queue is genuine, not a story: the slot
+holder is `2018881` in `/mnt/apopic/omnion-w3`, and w3 had two `walkthrough.cjs` processes plus a
+Chrome tree on `:3102` while main had a third on `:3100`. The tells that it is not simply slow: w3's
+holder has been holding since 02:25, its newest artifact directory (`20261001-021909`) has a
+mtime of **02:28:49** — a hundred minutes without a single write — while the process still burns
+CPU (1–5 ticks per 10 s) with Chrome up. That is the wedged-pass signature from lesson 33, and it
+is w3's process to reap, not mine. I did not touch it, and I TERMed only my own orphaned waiters.
