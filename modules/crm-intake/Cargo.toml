@@ -17,6 +17,13 @@ tracing.workspace = true
 sha2.workspace = true
 hex.workspace = true
 rand.workspace = true
+# `keys::verify_key` is the crate's only credential-checking verb, and it compares two SHA-256
+# digests. `subtle` is the constant-time equality the rest of the platform already reaches for
+# in the two places it compares a secret itself (`crates/security/src/csrf.rs` and
+# `crates/permissions/src/service_accounts.rs`), so this makes the third one a dependency
+# rather than a fourth hand-rolled `diff |= a ^ b` loop. Already in the lockfile (2.6.1) — no
+# new crate enters the build.
+subtle = "2"
 # `request_id::scope` is a `tokio::task_local!`, and the reason it is a task-local rather than a
 # thread-local is that `tokio::spawn` moves a future between worker threads (see the module docs).
 # This is the module's only non-optional tokio dependency.
