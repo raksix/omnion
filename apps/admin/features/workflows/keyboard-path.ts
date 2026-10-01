@@ -16,6 +16,7 @@
  */
 
 import type { GraphEdge, GraphNode, GraphNodeType } from "@/lib/api";
+import { HISTORY_LIMIT } from "./builder-history.ts";
 
 /** A node as the keyboard path needs to see it — the id, the type and the port list. */
 export interface KeyboardNode {
@@ -365,7 +366,7 @@ export const SHORTCUT_GROUPS: readonly {
   {
     title: "History and clipboard",
     rows: [
-      { keys: "⌘Z", label: "Undo (the history is 50 steps deep)", locked: true },
+      { keys: "⌘Z", label: historyDepthLabel(), locked: true },
       { keys: "⇧⌘Z or ⌘Y", label: "Redo", locked: true },
       { keys: "⌘C / ⌘V", label: "Copy and paste the selection", locked: true },
       { keys: "⌘D", label: "Duplicate the selection", locked: true },
@@ -388,4 +389,18 @@ export const SHORTCUT_ROWS: readonly ShortcutRow[] = SHORTCUT_GROUPS.flatMap((gr
 /** How many rows the narrow-screen gate would refuse, for the overlay's own footnote. */
 export function lockedShortcutCount(rows: readonly ShortcutRow[] = SHORTCUT_ROWS): number {
   return rows.filter((row) => row.locked).length;
+}
+
+/**
+ * The undo row's depth, as the builder implements it.
+ *
+ * The row used to read "Undo (the history is 50 steps deep)" — a number typed into a string,
+ * answering to nothing. Lower `HISTORY_LIMIT` and the keyboard sheet keeps promising a depth the
+ * stack no longer has, which is the one shape of claim on this REQ nobody could check: a shorter
+ * history is a *silent* regression, since every entry it still keeps undoes correctly. The label
+ * is derived from the constant so the two cannot drift, and `history-depth.test.ts` is what walks
+ * fifty presses of undo to say the number is earned rather than asserted.
+ */
+export function historyDepthLabel(): string {
+  return `Undo (the history is ${HISTORY_LIMIT} steps deep)`;
 }
