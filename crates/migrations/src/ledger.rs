@@ -79,6 +79,19 @@ pub fn checksum(content: &str) -> String {
     hex::encode(digest)
 }
 
+/// sha256 of raw bytes, lowercase hex.
+///
+/// The same digest as [`checksum`] for the same input — it hashes `content.as_bytes()` and so
+/// takes those bytes literally. It exists for a caller holding bytes rather than a `String`:
+/// the export download verifies a stored object against the checksum recorded when it was
+/// produced, and the object comes back as `Vec<u8>`. Round-tripping it through `String` to call
+/// [`checksum`] would panic on any byte sequence that is not valid UTF-8, which is precisely the
+/// input the check exists to catch.
+#[must_use]
+pub fn checksum_bytes(content: &[u8]) -> String {
+    hex::encode(Sha256::digest(content))
+}
+
 /// One row of the ledger, as the ledger screen reads it.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
 pub struct LedgerRow {
@@ -428,6 +441,39 @@ mod tests {
             "a trailing newline is a different file"
         );
         assert_eq!(checksum("").len(), 64, "an empty file still has a checksum");
+    }
+
+    #[test]
+    fn the_byte_form_digests_identically_to_the_text_form() {
+        // The export download verifies a STORED object against the checksum the produce step
+        // recorded, and the object comes back as `Vec<u8>` while the produce step held a
+        // `String`. If these two disagreed, every download would refuse on a checksum mismatch
+        // that no operator could explain — so the equality is the property, not a convenience.
+        for sample in ["", "a", "select 1;", "# watermark\n{\"id\":1}\n"] {
+            assert_eq!(
+                checksum_bytes(sample.as_bytes()),
+                checksum(sample),
+                "the two forms must agree on {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_byte_form_accepts_input_that_is_not_utf8() {
+        // The reason this exists as a separate function rather than as a `String::from_utf8`
+        // inside the caller: a stored object can hold bytes that are not valid UTF-8, and
+        // converting to check one panics — turning a "this file does not match its checksum"
+        // answer into a crash on the single-use download route.
+        let not_utf8: &[u8] = &[0xff, 0xfe, 0x00, 0x80];
+        assert!(
+            std::str::from_utf8(not_utf8).is_err(),
+            "the fixture must actually be invalid UTF-8, or it proves nothing"
+        );
+        // Pinned against `printf '\xff\xfe\x00\x80' | sha256sum`.
+        assert_eq!(
+            checksum_bytes(not_utf8),
+            "5a741968f40e57485ed6e1a1af381adeb2714223c35acedf1ad0670e42df2eb5"
+        );
     }
 
     #[test]

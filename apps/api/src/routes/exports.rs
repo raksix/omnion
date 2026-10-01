@@ -459,8 +459,8 @@ pub async fn run_export(
     let pool = state.db().pool();
 
     let row = sqlx::query(
-        "select id, status, tables, row_limit, window_start, window_end, salt_fingerprint \
-         from anonymized_exports where id = $1",
+        "select id, status, tables, row_limit, window_start, window_end, salt_fingerprint, \
+         watermark from anonymized_exports where id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -481,6 +481,10 @@ pub async fn run_export(
     let row_limit: Option<i64> = row.get("row_limit");
     let window_start: Option<OffsetDateTime> = row.get("window_start");
     let window_end: Option<OffsetDateTime> = row.get("window_end");
+    // Read back from the row rather than recomputed: the watermark is part of the file, so the
+    // file's bytes must match the `checksum` the produce step computes over them, and a
+    // recomputed watermark carrying a fresh timestamp would differ from the stored one.
+    let watermark: String = row.get("watermark");
 
     sqlx::query("update anonymized_exports set status = 'running' where id = $1")
         .bind(id)
@@ -488,13 +492,33 @@ pub async fn run_export(
         .await
         .map_err(|error| ApiError::from_core(error.into()))?;
 
-    let produced = produce(pool, &tables, row_limit, window_start, window_end).await;
+    let produced = produce(pool, &tables, row_limit, window_start, window_end, &watermark).await;
 
     match produced {
         Ok(body) => {
             let checksum = omnion_migrations::ledger::checksum(&body);
             let size = body.len() as i64;
             let key = format!("exports/{id}.ndjson");
+
+            // The bytes are STORED, not merely described. `file_key` is not a label: the row
+            // carries a checksum and a size precisely so that "the bytes I hold are the bytes
+            // this row describes" is a question with an answer — and an answer needs the file.
+            //
+            // The first version of this route computed the body, wrote the checksum and the size
+            // onto the row, and then threw the body away. `GET /{id}/download` had to REBUILD it
+            // from the same tables, which is a second reader of live data at a second instant:
+            // a row written between the two reads lands in the download and not in the checksum,
+            // and a value classified after the run applied at the download but not the checksum.
+            // The audit row would then describe a file no one ever received.
+            state
+                .storage()
+                .put(&key, body.as_bytes(), "application/x-ndjson")
+                .await
+                .map_err(|error| ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "export_store_failed",
+                    format!("the export was produced but could not be stored: {error}"),
+                ))?;
 
             sqlx::query(
                 "update anonymized_exports set status = 'ready', file_key = $2, file_size = $3, \
@@ -662,45 +686,56 @@ pub async fn download_export(
     )
     .await;
 
-    // The body is rebuilt from the plan rather than stored: this route reads the same classified
-    // columns the producer read, so a download can never differ from what the checksum described.
-    let tables: Vec<String> = sqlx::query("select tables from anonymized_exports where id = $1")
+    // The bytes are READ BACK, not rebuilt. `file_key` is the promise the row makes, and this
+    // is where it is kept: the object written at production time is the only body that matches
+    // the `checksum` and `file_size` recorded beside it.
+    //
+    // Rebuilding here was the first version, and it is wrong in a way no unit test can see. The
+    // rebuild re-read the same tables at a LATER instant and re-derived a FRESH salt, so the two
+    // bodies differed twice over — a row written in between appeared in the download but not in
+    // the checksum, and every hashed value came out differently, which also broke the cross-table
+    // join the salt exists to preserve. The file a vendor received was not the file the audit
+    // row described, and no assertion in the suite compared the two.
+    let file_key: String = sqlx::query("select file_key from anonymized_exports where id = $1")
         .bind(id)
         .fetch_one(pool)
         .await
         .map_err(|error| ApiError::from_core(error.into()))?
-        .get("tables");
-    let row_limit: Option<i64> =
-        sqlx::query("select row_limit from anonymized_exports where id = $1")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map_err(|error| ApiError::from_core(error.into()))?
-            .get("row_limit");
-    let window_start: Option<OffsetDateTime> =
-        sqlx::query("select window_start from anonymized_exports where id = $1")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map_err(|error| ApiError::from_core(error.into()))?
-            .get("window_start");
-    let window_end: Option<OffsetDateTime> =
-        sqlx::query("select window_end from anonymized_exports where id = $1")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map_err(|error| ApiError::from_core(error.into()))?
-            .get("window_end");
+        .get("file_key");
 
-    let body = produce(pool, &tables, row_limit, window_start, window_end)
+    let body = state
+        .storage()
+        .get(&file_key)
         .await
-        .map_err(|message| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "export_rebuild_failed",
-                message,
-            )
-        })?;
+        .map_err(|error| ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "export_body_missing",
+            format!(
+                "this export is marked ready but its file could not be read back ({error}). \
+                 Produce it again — the stored object is the only body that matches the \
+                 checksum recorded for it."
+            ),
+        ))?;
+
+    // Verified against the row rather than assumed: a truncated or replaced object must not
+    // leave the platform under a checksum that says otherwise.
+    //
+    // The digest is taken over the BYTES, not over a re-encoding of them as text. The producer
+    // checksummed a `String`; this path holds a `Vec<u8>`, and a `String::from_utf8` round trip
+    // in between would panic on any object that is not valid UTF-8 — which is exactly the input
+    // this check exists to catch rather than crash on.
+    let actual = omnion_migrations::ledger::checksum_bytes(&body);
+    if checksum.as_deref() != Some(actual.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "export_body_checksum_mismatch",
+            format!(
+                "the stored file for this export does not match its recorded checksum \
+                 (recorded {checksum:?}, read {actual}). The download was refused rather than \
+                 handing out a file the audit row does not describe."
+            ),
+        ));
+    }
 
     let filename = format!("attachment; filename=\"omnion-export-{id}.ndjson\"");
     Ok((
@@ -799,6 +834,7 @@ async fn produce(
     row_limit: Option<i64>,
     window_start: Option<OffsetDateTime>,
     window_end: Option<OffsetDateTime>,
+    watermark: &str,
 ) -> Result<String, String> {
     let available = table_columns(pool, tables)
         .await
@@ -922,6 +958,25 @@ async fn produce(
                 .to_string(),
         );
     }
+
+    // The watermark is the FIRST line of the file, and it is a comment.
+    //
+    // `watermark` is a column on the row and the migration says it is "stamped INTO the file as
+    // its first line", but nothing in the builder wrote it: the string was stored, rendered on
+    // the panel, and never put into the bytes. A watermark that only exists in the database is a
+    // watermark nobody outside the database can see, which is the entire reason a dump announces
+    // itself when it lands somewhere else.
+    //
+    // A `#` line rather than a JSON object because the format is NDJSON and every line is meant
+    // to parse: a leading `{` would be a record with no columns, and a reader would have to know
+    // to skip it. `#` is the line-comment convention every NDJSON tool in common use skips.
+    out.insert_str(
+        0,
+        &format!(
+            "# {}\n",
+            watermark.replace(['\n', '\r'], " "),
+        ),
+    );
 
     Ok(out)
 }
