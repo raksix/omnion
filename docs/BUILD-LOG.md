@@ -14138,3 +14138,56 @@ screen boxes on this REQ still turn on it.
 
 **Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
 REQ-012 can close.
+
+## Tick 67 - REQ-117 slice 35: the phone arm of the matcher could never fire
+
+**What.** `store::fetch_candidates` narrowed `crm_contacts` in SQL with
+`regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g') = $3`, where `$3` came from
+`dedupe::normalize_phone`. The expression strips the leading `+` along with the punctuation;
+the function keeps it. The two sides of the comparison were therefore `'+905321112233'` and
+`'905321112233'` - never equal, so **no contact was ever a candidate on the phone key**.
+
+This is not a scoring inaccuracy, it is the second key in the documented match order *not
+existing*. A submission carrying a phone and no e-mail was `Unique` against an installation
+holding that exact contact, and a `reject_duplicate` source filed it as a brand-new lead: the
+one outcome this module exists to prevent. Fifteen ticks of dedupe tests all mapped an e-mail,
+so the first arm answered before the second was ever reached.
+
+**Why nothing saw it.** `dedupe::phone_match` is unit-tested with `normalize_phone` on **both**
+sides, which agrees with itself by construction. Only a query that normalizes the *stored*
+column can disagree with the key - and this is the fifteenth variation of the branch's
+signature defect class, the second one about *two implementations of one rule* rather than one
+implementation of two names (the first was the SLA clock). The module header already names the
+shape: "a `check` constraint and a Rust constant are written twice".
+
+**The fix.** One named expression on both sides: `dedupe::PHONE_DIGITS_SQL` restores the plus
+**only when the source value has one**, so a number stored without a country code still matches
+one submitted without one. The plus is deliberately kept rather than dropped - `+1 555 010 22 33`
+and `+90 555 010 22 33` are two people on two continents who share a tail, and "unifying" the two
+sides by deleting it would merge them. The negative test is load-bearing for exactly that reason.
+
+**Proof.** `scripts/qa/run-crm-dedupe.sh` **12/12, PROVEN TO FAIL at 11/12** with the stored-side
+expression reduced to the pre-fix `regexp_replace` - and the single survivor is
+`a_different_phone_is_not_matched_just_because_a_suffix_is_shared`, which is the guard against
+the wide fix. The RED run named the defect before any product code was touched
+(`left: "new" right: "duplicate"`). Module lib **186** (was 185; +1 shape guard),
+`cargo clippy --all-targets` **0 errors** and 3 pre-existing warnings in files this tick did not
+touch, admin `tsc --noEmit` **exit 0**, sibling `run-crm-attribution.sh` **4/4** - including its
+own phone-key test, which is the check that `dedupe_key`'s recorded shape did not move.
+Commit `fcbd53b1` pushed to `wave8`.
+
+**A credential mask nearly shipped inside the fix.** `patch` wrote `+905****2233` where
+`+905321112233` belonged, in both the test body and its doc comment. It compiles, it reads
+correctly, and `assert_eq!(…, Some("+905****2233"))` would have **passed against the broken
+code** while the query line above it carried the real number - a green test asserting nothing.
+Repaired byte-level with python and verified by counting the real digit string in the file, the
+way the standing rule says: never retype a masked token from a rendered line. Checked the whole
+diff for `***` before committing.
+
+**Not claimed.** No browser pass and no `scripts/qa/run.sh`: the QA slot is held by a live w7
+pass (holder pid 3602963, `cwd=/mnt/apopic/omnion-w7`), and `/mnt/apopic` is at 97 %. No screen
+changed - the fix is entirely below the API - so the pass would have measured nothing new.
+
+**Next.** The unit guard asserts the SHAPE of `PHONE_DIGITS_SQL`, not what `regexp_replace`
+returns, and says so in its own doc comment. The gate is what proves the answer; do not let the
+millisecond test be read as the proof it explicitly is not.
