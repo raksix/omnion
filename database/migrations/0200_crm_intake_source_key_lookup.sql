@@ -58,21 +58,39 @@
 -- reads it would be untested. The lookup resolves the collision with the `kind` filter in the
 -- predicate, which is where that decision already lives.
 --
--- ## Concurrent, because a locked intake table locks the panel
+-- ## Why this is a PLAIN `create index` — the `concurrently` that broke every install
 --
--- `create index concurrently` cannot run inside a transaction, which is exactly why it is
--- spelled out here rather than left to the default: this is an index build over the table the
--- public capture endpoint writes on every submission, and a plain `create index` takes a
--- `ShareLock` for the build that blocks those writes — turning a performance fix into a short
--- outage on the one surface with no permission guard. `concurrently` takes `ShareUpdateExclusive`
--- and lets writes through. The `if not exists` keeps a re-run of this file a no-op rather than a
--- duplicate relation.
+-- The first version of this file built the index with `create index concurrently`, with a long
+-- note defending it: a concurrent build takes `ShareUpdateExclusive` and lets writes through,
+-- where a plain `create index` takes `ShareLock` for the build and would "turn a performance fix
+-- into a short outage on the one surface with no permission guard". That defence is about the
+-- wrong moment. **A migration runs at install, before the platform serves traffic** — there is no
+-- intake endpoint taking submissions yet, so the write path the lock would block does not exist.
+-- The argument was sound and the moment it describes was hypothetical; taken literally it cost
+-- every fresh installation its ability to boot at all:
 --
--- Note for anything running this through a single-connection migration runner: a `concurrently`
--- index cannot be created inside an explicit transaction, so a runner that wraps each migration
--- in one will report `25001 cannot execute CREATE INDEX CONCURRENTLY in a transaction block`.
--- That is the runner's shape, not this migration's, and the index is worth having either way.
-create index concurrently if not exists crm_intake_sources_key_lookup_idx
+--     migration: while executing migration 200: CREATE INDEX CONCURRENTLY cannot run inside a
+--     transaction block
+--
+-- sqlx wraps each migration in a transaction (`crates/core/src/db.rs` → `sqlx::migrate!`), and
+-- `concurrently` is illegal inside one. sqlx *can* be told otherwise — a file whose **first
+-- bytes** are `-- no-transaction` is exempt — and this branch proved the whole mechanism is
+-- subtle enough that it is not worth relying on for one index: the flag is computed at compile
+-- time and baked into the binary, so "the file is right" and "the binary knows it" are two
+-- different facts, the first of which is what a developer edits and the second of which is what
+-- the installer runs. **The index is the same index either way; only the availability
+-- guarantee differs, and at install time there is no availability to protect.**
+--
+-- `crates/core/tests/migration_transaction_directive.rs` keeps the lesson executable: it fails
+-- if a migration ever executes a concurrent build without the directive being the file's first
+-- bytes, and fails if a `-- no-transaction` appears anywhere but line 1, where sqlx cannot see it.
+--
+-- Why nothing caught it, stated because the reason is the reusable part: the gate for this index
+-- applied the migrations with `psql < migration.sql` — outside any transaction — so it measured the
+-- *query plan* on a database the shipped binary could never have reached. The index was proved;
+-- the *installation* never ran. `scripts/qa/run-migration-installs.sh` provisions the other way,
+-- through the product's own runner.
+create index if not exists crm_intake_sources_key_lookup_idx
     on crm_intake_sources (endpoint_key_hash)
     where endpoint_key_hash is not null;
 
