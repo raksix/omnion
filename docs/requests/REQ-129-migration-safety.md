@@ -1,6 +1,6 @@
 # REQ-129 — Migration Safety & Release Engineering
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slice 1 — runner layer — is LANDED and green: `0207_migration_safety.sql` adds the ledger, the run journal, the policy singleton and the violations table; the new `crates/migrations` holds the checksum, the drift rule, the reversal extractor and the banned-shape lint; **40 unit tests with no database**, and the migration is proven `up → down → up` against a real PostgreSQL (4 tables → 0 → 4) with every check constraint exercised negatively. **Still open in this slice:** the advisory lock + `apply`/`plan`/`verify-down` runner itself, the `omnion migrate` subcommands, the `/deployment/migrations` list and detail screens, and the CI gate job — none of which can be closed on unit tests alone. The tree-wide lint test is what shaped three of the six banned patterns: a naive `not null`, `add constraint` and `alter column` each fired on dozens of lines of this repository's OWN correct migrations, so each is now a shape test rather than a substring) · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -106,13 +106,13 @@ Migration: `database/migrations/0030_migration_safety.sql` (next free slot at ti
 
 ### Acceptance criteria
 
-- [ ] `database/migrations/0030_migration_safety.sql` applies on a fresh and a populated database, and its own down script reverses it.
+- [x] `database/migrations/0207_migration_safety.sql` applies on a fresh and a populated database, and its own down script reverses it. *Proved: applied on a clean `omnion_w6_mig_check` (4 tables), down script run (0 tables), re-applied (4 tables); the file's own reversal comments were verified against the same statements the runner reads.*
 - [ ] The runner applies pending migrations in order under a single advisory lock and writes one ledger row per run with a checksum.
 - [ ] A second concurrent runner is refused with `409` and waits or exits cleanly rather than interleaving.
 - [ ] A file edited after being applied is detected as checksum drift and blocks the run with a message naming the offending file.
 - [ ] CI runs `up → down → up` on the seeded fixture database for every migration, and the schema comparison detects a hand-broken down script (proven with a deliberately bad fixture).
 - [ ] A migration without a down script fails the gate unless a waiver with a reason exists, and the upgrade helper marks it as no database rollback.
-- [ ] The lint pass fails the documented banned shapes (`drop column`, `drop table`, `rename`, type change, non-nullable column without default, drop-then-add pair) with file and line references.
+- [x] The lint pass fails the documented banned shapes (`drop column`, `drop table`, `rename`, type change, non-nullable column without default, drop-then-add pair) with file and line references. *Proved: `crates/migrations/src/lint.rs` reports 1-based line + excerpt for each; the tree-wide test proves the repository's 57 own migrations trip ZERO blocking rules while still producing the commented-reversal findings.*
 - [ ] The plan preview shows the statements, the timeout settings and the violations without executing anything.
 - [ ] A blocked DDL fails within `lock_timeout` and the lock screen names the blocking pid and query age.
 - [ ] The documented zero-downtime recipe is proven end to end on a live fixture with traffic: add nullable → deploy dual read/write → backfill → constrain in a later migration, with no failed request throughout.

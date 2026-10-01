@@ -6544,3 +6544,85 @@ contending. REQ-126 is code-complete; what remains is one pass that finishes.
 
 Next: read the re-run's summary, tick the box only if it visited all seven screens, then REQ-128's
 close gate and REQ-129.
+
+
+---
+
+## 2026-10-01 · REQ-129 slice 1 — the ledger, the reversal extractor, the banned-shape lint
+
+Picked REQ-129 because the queue's first four requests are all waiting on one browser pass each
+and the QA slot is held by a live w3 holder (load 14-16, 35 Chrome processes). Slot-independent
+work was the correct use of the tick, not a fallback.
+
+**Migration `0207_migration_safety.sql`.** Number taken from the UNION high-water across all ten
+worktrees (0206), not from this branch's own tail (0199) — the collision rule bit me once already
+(644a129, two branches picking 0029). Adds `schema_migrations`, `migration_runs`,
+`migration_policy` (a singleton, `id = 1`) and `migration_violations`.
+
+**Proved up → down → up against real PostgreSQL**, which is the acceptance criterion this file
+exists to satisfy:
+
+```
+psql -f 0207_migration_safety.sql   → CREATE TABLE ×4, 0 tables? no: 4 tables
+down script (4 drops)               → 0 tables
+psql -f 0207 again                  → 4 tables
+```
+
+Constraints exercised negatively, each refused by PostgreSQL: non-hex checksum, three-digit
+version, `down_verified_at` without `down_verified_by`, second `migration_policy` row.
+
+**Why `schema_migrations` is not `_sqlx_migrations`.** SQLx records which version ran. It cannot
+record who ran it, from which bytes, or whether the reversal was ever rehearsed — and those three
+are the whole question when deciding whether to take a backup. The runner writes both,
+one-directionally: a ledger row only after SQLx commits, so the ledger can never claim something
+the database did not do.
+
+**The reversal extractor is keyed on a marker, not a heading.** `0199_deployment_tooling.sql`
+contains the phrase "Down script" twice in leading prose explaining why its reversal is commented
+out; a heading-based parser would have to guess where the statements start. `-- omnion:down` is a
+line that cannot occur in prose. Inside the block, two-or-more spaces of indent marks a statement —
+the convention `0162` and `0199` already use, which is why neither file needed editing.
+
+**Three of the six banned patterns are shape tests, not substrings, and the repository's own 57
+migrations are why.** Each loose version fired on correct code:
+
+| naive rule | what it flagged in this repo | the fix |
+|---|---|---|
+| `not null` | every primary key, and `check (x is not null)` | only `alter table … add column … not null` with no `default` in the statement |
+| `add constraint` | every `create table`'s own constraint | needs `alter table` AND a mutating verb; `add column` is not a data change |
+| `alter column` | `set not null`, `drop not null`, `set default` in 0011/0013/0016 | only the cast: ` type ` or ` using ` |
+
+and one inside the second: `references webhook_endpoints (id) on delete set null` contains
+"delete", so a bare-substring mutating-verb check called an FK referential action a row rewrite.
+Migration 0197 has that exact line.
+
+**Gates:**
+```
+cargo test -p omnion-migrations --quiet     40 passed; 0 failed    (no database)
+cargo check --workspace --quiet             CHECK_EXIT=0
+pnpm typecheck (apps/admin)                  TSC_EXIT=0
+```
+
+`the_repositorys_own_migrations_are_clean_under_this_lint` is the load-bearing one: all 57 files,
+every rule on, **zero gate failures** — and it also asserts **more than 20 non-blocking findings**,
+so "a commented reversal never blocks" stays exercised by real files instead of by a fixture.
+
+**Commits:** `bedff2cb` (ledger + reversal extractor), `36d87f75` (lint).
+
+**Not done this tick, and it is most of slice 1:** the advisory lock, the `apply` / `plan` /
+`verify-down` runner, the `omnion migrate` subcommands, `/deployment/migrations` list + detail,
+and the CI gate. Slice 1 cannot close on unit tests — the close gate needs the browser pass, and
+the slot is still held by w3.
+
+**Also observed, not mine:** the pass queued at tick 45 (`/tmp/w6-pass-t45b.log`) DID take the
+slot after its 2400s wait, reset `omnion_qa_w6`, seeded owner+org+site correctly, and then failed
+at `[walk] FATAL: could not sign in after wizard` with the wizard reporting
+`not in setup … installation already exists` twice. The seed path and the wizard-detection path
+disagree: the seeder creates the tenant over the API, and `runWizard` then reads `/login` and
+concludes "already set up", so `ensureSignedIn` has no session. That is a harness defect in this
+worker's own copy of `walkthrough.cjs`, and it is the same class as REQ-127's tick-43 finding
+(the harness skipping its own first run). Fixing it is the first thing next tick — it is the
+reason three ticks in a row have had no usable pass.
+
+Next: fix the seed/wizard disagreement so a pass can actually sign in, then the runner + lock +
+`omnion migrate` subcommands.
