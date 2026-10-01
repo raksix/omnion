@@ -201,11 +201,49 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
 - [x] Every mutation writes an audit entry under the `cdn.*` namespace with actor and IP. (`0e2993c`)
 - [x] All endpoints are guarded by the catalogue keys and a forbidden call returns `403 permission_denied`. (`0e2993c`)
 - [ ] Filters, empty, loading and error states exist on every screen; the rows shown match the API counts.
-  _The measurement now exists (`04bc7e73`); it has **not yet reported**. Two blockers, and the first
-  one is the one that mattered for 55 ticks. Until tick 77 the blocker recorded here was the tick-21
-  pass reporting "0 elements" on `/cdn/purges` — a harness-flakiness story, which sent every tick
-  looking at the pass instead of at the pass's own arithmetic. The real finding is that the count
-  match **had no instrument at all**: `runCdnPurgeDepth` stored the header sentence and
+  _**Tick 86: the scoped pass finally ran, and every clause of it was reading the harness's own
+  arithmetic.** Six passes across three commits, and the first one walked nothing at all: `wants()`
+  tested scope names for **equality** while a scope is written the way a person thinks about a
+  screen (`cdn`) and the names it has to match are spelled three ways — `cdn-overview`/`cdn-rules`
+  in the route list, `cdnRules`/`cdnPurges` as depth-pass names. So `--only=cdn` reported
+  `0 route/pass name(s) walked, 1 unmatched`, skipped every CDN depth pass as "out of scope",
+  and exited **0** with four high findings. The unmatched guard is the only reason that was
+  visible rather than a green pass measuring nothing, so it earned its keep on the first use.
+
+  The next three defects are one cause: `/cdn/rules` and `/cdn/purges` each render a table from
+  `md` up and cards below it, and **both renderings carry the same `data-cdn-*` hooks** —
+  deliberately, since a hook in only one rendering halves what a depth pass can drive. So a bare
+  `.count()` reads both halves. The consequences were three claims that looked like product
+  bugs and were not:
+
+  | Claim | Said | Was |
+  | --- | --- | --- |
+  | `countMatches` (purges) | rows 4 vs header "Showing 2 of 2" | 2 rows × table + card |
+  | `cdnRules.ok` | reorder broken, `steps: 0` | strict-mode violation: the `data-cdn-rule-up` locator resolved to **2 elements**, so the click died before the panel was asked to move anything |
+  | `filterNarrows` / `clearedBackToRows` | the status filter does not narrow | `4 < 2` is false for a filter that works |
+
+  Every count is now `:visible`, and every driven control names the layout it means. `cleanedUp`
+  was the subtle one: the viewport had been restored to 1280, so it counted the table *and* the
+  still-mounted card list while `before` counted one rendering. `mobileRows` and the
+  touch-target `querySelectorAll` stay bare **on purpose** — they run at 390px where only the
+  cards exist, and there a bare count is the measurement of the mobile layout, not a shortcut.
+
+  The scope rollup had the mirror defect: it asked `matchedOnly.has(name)` — exact — *after*
+  `wants()` became a prefix test, so it fired `unknown-pass-name` on a scope the pass had just
+  walked. **A guard that fires on a scope it honoured is worse than no guard**: it teaches the
+  reader to ignore the one line that catches a pass pointed at nothing.
+
+  What the pass reports with the counts fixed: `reorderSwapped: true`, `toggled: true`,
+  `duplicated: true`, `ttlRefusalNamesTheBound: true`, `errorState: true`,
+  `emptyStateIsNotTheUnfilteredOne: true`, `escClosedDrawer: true`, `mobileTableHidden: true`,
+  and `mobileTouchTargets: true` over 15 controls with the smallest at 35.3px against the 32px
+  floor. The touch-target measurement was built last tick to *name* the short control; this pass
+  is the first to report through it, and the answer is that nothing is short._
+  _**For the record, the two blockers that preceded this.** The measurement was built at
+  `04bc7e73` and had not reported for 55 ticks, and the reason recorded throughout that time was
+  a harness-flakiness story — the tick-21 pass reporting "0 elements" on `/cdn/purges`, which sent
+  every tick looking at the pass instead of at the pass's own arithmetic. The real finding was
+  that the count match **had no instrument at all**: `runCdnPurgeDepth` stored the header sentence and
   `runCdnRulesDepth` stored a row count, and neither compared either to the API, so the clause
   could not have been ticked by any pass. `04bc7e73` builds it — two deterministic hooks, a
   three-way comparison of DOM rows / API `total` / rendered sentence that **refuses to assert on a
@@ -214,11 +252,6 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   drive of the filtered empty state that no pass had reached (`status=failed AND kind=tag` empties
   the table while the unfiltered one has rows — the only way to tell "nothing matches this filter"
   from "no purges yet")._
-  _**Still unticked, deliberately.** The first scoped pass over these screens has not run: the pass
-  that would measure it was scoped to the tenant surface, and the CDN scope is the next one. The box
-  stays open until a correctly-scoped CDN pass reports the numbers; a measurement that exists but
-  has never spoken is not evidence._
-
   **Tick 82: the filter this clause measures was a control that could not express its own
   values, so the clause was not merely unmeasured — it was unmeetable.** The purge history's
   status filter was an `<input type="search">` whose raw string went to `?status=`.
