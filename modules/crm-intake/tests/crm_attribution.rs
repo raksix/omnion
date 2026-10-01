@@ -238,6 +238,100 @@ async fn a_visitor_identified_by_phone_keeps_their_first_touch() {
     drop_org(&pool, org).await;
 }
 
+/// The defect the test above's fixture was hiding, and it is the **fourth** spelling of the
+/// phone rule rather than a new one.
+///
+/// `store::merge_attribution`'s lookup is
+///
+/// ```text
+/// dedupe_key(mapped)                                       -> "+905****2233"  (normalize_phone KEEPS the +)
+/// … and (lower(email) = $3 or lower(coalesce(phone, '')) = $3)
+/// … where the phone column holds                           -> "+90 555 111 22 33" (mapped, VERBATIM)
+/// ```
+///
+/// `normalize_phone` strips formatting but keeps the country prefix, while the **stored column is
+/// the mapped value with whatever the source's mapping did to it** — and `insert_lead` binds
+/// `mapped.get("phone")` verbatim. So the two sides only agree when the source happens to map
+/// the field *through* the `e164_lite` transform, and a source that does not has a phone arm
+/// that can never match: the key is `+905****2233`, the column is `+90 555 111 22 33`, and
+/// `lower(coalesce(phone,'')) = $3` is false for ever.
+///
+/// **This is the same class as the tick-67 defect one function away, and the sibling fix is why
+/// it is a re-audit rather than a first sighting.** Last tick `fetch_candidates` was given
+/// `dedupe::PHONE_DIGITS_SQL` so its stored side keeps the plus; `merge_attribution` is the very
+/// next query over the same column, it was not in that fix, and it still hand-writes its own
+/// normalization. **When one half of a pair gets the shared rule, the other half is not thereby
+/// correct — it is only the one that was looked at.**
+///
+/// It was invisible for a second reason worth naming: `a_visitor_identified_by_phone_keeps_their_first_touch`
+/// maps the phone **through `e164_lite`**, so the stored column already reads `+905****2233` and the
+/// comparison is trivially true. **A fixture that applies the transform makes the disagreement
+/// disappear rather than fixing it** — the transform is optional on the operator's form, and a
+/// source without it is the ordinary case, not an edge case.
+#[tokio::test]
+async fn a_phone_kept_verbatim_by_the_mapping_keeps_the_first_touch() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "attr-phone-raw").await;
+    // **No `with_transforms`** — that is the difference from the test above, and it is the whole
+    // defect. This is the shape an operator gets from the editor by default.
+    let source_id = source_with(
+        &pool,
+        org,
+        vec![
+            MappingEntry::new("email", "never_sent"),
+            MappingEntry::new("phone", "phone"),
+        ],
+    )
+    .await;
+
+    let visit = |campaign: &str, referrer: &str| {
+        submission(
+            org,
+            source_id,
+            serde_json::json!({
+                "phone": "+90 555 111 22 33",
+                "utm_campaign": campaign,
+                "referrer": referrer,
+                "submitted_in_ms": 4200,
+            }),
+        )
+    };
+
+    store::capture(&pool, &visit("spring-sale", "https://news.example/"))
+        .await
+        .expect("the first visit");
+    store::capture(&pool, &visit("autumn-sale", "https://search.example/"))
+        .await
+        .expect("the second visit");
+
+    // The stored value is the operator's own spelling — read it back rather than assuming, since
+    // a build that normalized on the way in would make this fixture measure something else.
+    let stored_phone: Option<String> =
+        sqlx::query_scalar("select phone from crm_leads where organization_id = $1 limit 1")
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .expect("the stored phone column");
+    assert_eq!(
+        stored_phone.as_deref(),
+        Some("+90 555 111 22 33"),
+        "the column holds the mapped value verbatim; this fixture only measures the defect \
+         while that is true, which is what the missing transform guarantees"
+    );
+
+    let rows = stored_touches(&pool, org).await;
+    assert_eq!(rows.len(), 2, "two submissions, two leads");
+    assert_eq!(
+        rows[1].0.as_deref(),
+        Some("spring-sale"),
+        "a visitor whose phone is stored as typed still keeps the campaign that first brought \
+         them in: normalize_phone keeps the plus and strips the spaces, so the LOOKUP has to \
+         normalize the stored column the same way rather than lower-casing it"
+    );
+
+    drop_org(&pool, org).await;
+}
+
 /// The regression guard for the shape the old code got *right*: a mapping that happens to name
 /// the field `email` must keep working, and a campaign-less second visit must **not** erase
 /// the first one.

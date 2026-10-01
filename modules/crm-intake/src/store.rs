@@ -1772,13 +1772,37 @@ async fn merge_attribution(
     let Some(key) = dedupe::dedupe_key(mapped) else {
         return Ok(later.clone());
     };
-    let row: Option<StoredAttribution> = sqlx::query_as(
+    // **The stored phone column is normalized by the SAME named expression the dedupe query
+    // uses, and that is the whole of this line's second half.**
+    //
+    // The lookup was `lower(coalesce(phone, '')) = $3`, where `$3` is `dedupe_key` —
+    // `normalize_phone`, which strips formatting and *keeps* a leading `+`. But
+    // `insert_lead` binds `mapped.get("phone")` verbatim, so the column holds whatever the
+    // operator's mapping produced: `"+90 555 111 22 33"` when the source does not map the
+    // field through `e164_lite`, and `"+905****2233"` when it does. The first shape can never
+    // equal a key, so **a phone-identified visitor whose source does not apply the transform
+    // lost their first touch on every submission after the first** — the second visit
+    // overwrote the campaign that brought them in, which is precisely what acceptance 6 says
+    // must not happen.
+    //
+    // It survived a gate written for the *same* defect because the gate's one phone fixture
+    // maps through `e164_lite` (`crm_attribution.rs::a_visitor_identified_by_phone_keeps_their_first_touch`),
+    // which pre-normalizes the column and makes the comparison trivially true. **A fixture that
+    // applies the transform hides the disagreement instead of fixing it.**
+    //
+    // This is the tick-67 defect one function away: `fetch_candidates` was given
+    // `dedupe::PHONE_DIGITS_SQL` last tick and this query was not in that fix. The e-mail arm
+    // keeps `lower(...)` — e-mails have case and no punctuation to strip, so lower-casing *is*
+    // the rule there; a phone number has neither, which is why `PHONE_DIGITS_SQL` asserts it
+    // contains no `lower(`.
+    let stored_phone = dedupe::PHONE_DIGITS_SQL.replace("{column}", "phone");
+    let row: Option<StoredAttribution> = sqlx::query_as(&format!(
         "select utm_source, utm_medium, utm_campaign, utm_term, utm_content, click_id, \
                 referrer_host, landing_path, source_path from crm_leads \
          where organization_id = $1 and source_id = $2 \
-           and (lower(email) = $3 or lower(coalesce(phone, '')) = $3) \
+           and (lower(email) = $3 or ({stored_phone}) = $3) \
          order by received_at asc limit 1",
-    )
+    ))
     .bind(organization_id)
     .bind(source.id)
     .bind(&key)
