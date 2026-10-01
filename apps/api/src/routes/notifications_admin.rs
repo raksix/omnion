@@ -861,7 +861,9 @@ mod tests {
 
         headers.insert(
             axum::http::header::USER_AGENT,
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)".parse().expect("a header value"),
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"
+                .parse()
+                .expect("a header value"),
         );
         assert_eq!(
             request_user_agent(&headers).as_deref(),

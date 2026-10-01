@@ -29,9 +29,9 @@
 //! implementations, so a test delivery and a real delivery take the identical code path. A
 //! second sender here would make "the test passed" mean something the queue never does.
 
-use axum::http::StatusCode;
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -167,21 +167,18 @@ pub async fn test_delivery(
     // id, and changing its signature to return one would touch every caller for no reason
     // there. Here the key is unique per (reader, channel, minute) — the same key the insert
     // just used — so this is a lookup by a value the handler itself chose, not a guess.
-    let notification_id = store::find_by_dedupe_key(
-        state.db().pool(),
-        session.user.id,
-        &dedupe_key,
-    )
-    .await
-    .map_err(map_test_error)?
-    .ok_or_else(|| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "test_notification_failed",
-            "the test notification was written but could not be read back",
-        )
-    })?
-    .id;
+    let notification_id =
+        store::find_by_dedupe_key(state.db().pool(), session.user.id, &dedupe_key)
+            .await
+            .map_err(map_test_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "test_notification_failed",
+                    "the test notification was written but could not be read back",
+                )
+            })?
+            .id;
 
     // Enqueue exactly the one channel asked for. `enqueue` writes the in-app row
     // unconditionally, so the row count is the channel plus in-app; only the asked-for row is
@@ -216,8 +213,7 @@ pub async fn test_delivery(
         ));
     };
 
-    let (delivered, detail, response_status) =
-        send_with_transport(&state, &job, channel).await;
+    let (delivered, detail, response_status) = send_with_transport(&state, &job, channel).await;
 
     // The reason is written on the row **and** returned, from the same string. A test that
     // says "not delivered" in the toast while the outbox row says nothing is the one case
@@ -358,4 +354,3 @@ fn map_test_error(error: omnion_notifications::NotificationError) -> ApiError {
         ),
     }
 }
-

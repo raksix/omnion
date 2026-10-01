@@ -7,7 +7,7 @@
 
 mod support;
 
-use support::walk_auth::{Session, CSRF_COOKIE, CSRF_HEADER, PASSWORD, SESSION_COOKIE};
+use support::walk_auth::{CSRF_COOKIE, CSRF_HEADER, PASSWORD, SESSION_COOKIE, Session};
 
 /// The exact shape of a real sign-in response: the session first, the token beside it.
 fn two_cookies() -> Vec<String> {

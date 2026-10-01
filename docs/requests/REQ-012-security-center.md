@@ -1,6 +1,6 @@
 # REQ-012 — Security Center
 
-> **Status:** in-progress — **slices 1, 2 and 3 are code-complete; none has a browser pass. Slice 4 (IP access) is code-complete and its two behavioural boxes are closed (`4ac78836`…`ea324c59`); its screen box is not, for the same reason as the others.** The lockout now emits its event** (`98e66375`…`3de62053`): `security.lockout.triggered` was the one name the catalogue explicitly withheld, and it now has a real emitter plus a live-database walk. **The gap that was real underneath it, named here so it is not re-found:** the brute-force policy the operator tunes on `/security/sign-in-protection` is stored, rendered, checked by the tester and evaluated by the probe — and `crates/identity` locks accounts with its **own** SQL in `register_failure`, so the number an operator tuned is **not** the number that locks their accounts. Two implementations of one policy, only one of them on the request path; slice 3's remaining work is to make them one. *(Two environment notes for whoever runs the next walk: the `omnion` development database is stale — `Migration(VersionMissing(19))` fails all eight tests in `tests/auth.rs` identically, which reads as a broken sign-in and is not one; and a sibling worktree deleting `target/` mid-build surfaces as `failed to create query cache … No such file or directory (os error 2)`, which is the harness, not the code.)* Slice 3 now ENFORCES rather than merely describes, and the enforcement is walked** (`3761c541`…`83d47951`): one `resolve` reads the document the operator edits, the window is honoured from the sign-in log rather than a monotonic column, and the walk counts wrong passwords until the account locks — failing with `left: 10, right: 3` when the legacy column is read instead. `crates/security` (posture registry, findings store, lifecycle, limiter policy, Redis counter, lockout), migrations `0054_security_posture.sql` + `0135_security_headers.sql` + `0151_security_rate_limits.sql`, the `/security` + `/security/findings` + `/security/headers` + `/security/rate-limits` + `/security/sign-in-protection` screens and the API behind four separate powers (`security.read` / `security.scan` / `security.manage` / `security.ip.manage`). Unit tests: **137 crate** + 216 api-lib + 4 migration. **Two boxes closed 2026-09-29 because the limiter is now on the request path** (`c86080a`, `005fed6`, `e2b9ceb`): a scripted burst returns `429` with a `Retry-After`, and the tester agrees with the middleware by match rather than by construction. **The catalogue-key criterion closed 2026-10-01** (`adee1164`, `23228200`) with `apps/api/tests/security.rs` — four walks that call every one of the fifteen `/security` routes as an anonymous caller, as a member holding no key, as an account holding **only** `security.read`, and as the full key holder. **The browser pass has still not run**, and tick 90 established why that is a harness problem rather than a slow one: consecutive ticks were starting competing passes on the same stack, each dropping the other's database mid-walkthrough (`f7a370fa`, `3dc35df1` — `run.sh` now takes a per-stack `flock` and refuses a second pass with exit 4). * **Captured:** 2026-09-25 · **Layer:** core + admin UI
+> **Status:** in-progress — **all four slices are now code-complete. Slice 4 closed 2026-10-03 with the `security.finding.opened` webhook (`e15d1880`, `25306c7b`, `d6c26218`, `73e890b6`), which also uncovered the eleventh instance of this REQ's defect class in the store itself: `upsert_finding` asked `coalesce(xmax, 0)`, `xmax` is an `xid`, so Postgres refused the query and `.unwrap_or(true)` reported every re-ingest as a newly created finding. The slice-4(a) emitter `security.ip_rule.changed` shipped with no catalogue row; the drift gate caught it here. What remains is one thing and it is not a code slice: the browser pass. Six screen boxes across this REQ turn on it, and the definition of done forbids closing on tests alone. The slot was held live by `w4` (`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` and `/proc/<pid>/cwd`) for this entire tick, with 45 Chrome processes and load 13.** The lockout now emits its event** (`98e66375`…`3de62053`): `security.lockout.triggered` was the one name the catalogue explicitly withheld, and it now has a real emitter plus a live-database walk. **The gap that was real underneath it, named here so it is not re-found:** the brute-force policy the operator tunes on `/security/sign-in-protection` is stored, rendered, checked by the tester and evaluated by the probe — and `crates/identity` locks accounts with its **own** SQL in `register_failure`, so the number an operator tuned is **not** the number that locks their accounts. Two implementations of one policy, only one of them on the request path; slice 3's remaining work is to make them one. *(Two environment notes for whoever runs the next walk: the `omnion` development database is stale — `Migration(VersionMissing(19))` fails all eight tests in `tests/auth.rs` identically, which reads as a broken sign-in and is not one; and a sibling worktree deleting `target/` mid-build surfaces as `failed to create query cache … No such file or directory (os error 2)`, which is the harness, not the code.)* Slice 3 now ENFORCES rather than merely describes, and the enforcement is walked** (`3761c541`…`83d47951`): one `resolve` reads the document the operator edits, the window is honoured from the sign-in log rather than a monotonic column, and the walk counts wrong passwords until the account locks — failing with `left: 10, right: 3` when the legacy column is read instead. `crates/security` (posture registry, findings store, lifecycle, limiter policy, Redis counter, lockout), migrations `0054_security_posture.sql` + `0135_security_headers.sql` + `0151_security_rate_limits.sql`, the `/security` + `/security/findings` + `/security/headers` + `/security/rate-limits` + `/security/sign-in-protection` screens and the API behind four separate powers (`security.read` / `security.scan` / `security.manage` / `security.ip.manage`). Unit tests: **208 crate** + 284 api-lib + 4 migration. **Two boxes closed 2026-09-29 because the limiter is now on the request path** (`c86080a`, `005fed6`, `e2b9ceb`): a scripted burst returns `429` with a `Retry-After`, and the tester agrees with the middleware by match rather than by construction. **The catalogue-key criterion closed 2026-10-01** (`adee1164`, `23228200`) with `apps/api/tests/security.rs` — four walks that call every one of the fifteen `/security` routes as an anonymous caller, as a member holding no key, as an account holding **only** `security.read`, and as the full key holder. **The browser pass has still not run**, and tick 90 established why that is a harness problem rather than a slow one: consecutive ticks were starting competing passes on the same stack, each dropping the other's database mid-walkthrough (`f7a370fa`, `3dc35df1` — `run.sh` now takes a per-stack `flock` and refuses a second pass with exit 4). * **Captured:** 2026-09-25 · **Layer:** core + admin UI
 >
 > **The migration gap is not what is blocking the pass.** Earlier revisions of this file and of
 > `docs/BUILD-LOG.md` recorded that `main`'s `0018 → 0021` gap makes `migrate()` fail on any
@@ -155,11 +155,145 @@ Webhook relevance: `security.finding.opened` (critical/high) and `security.locko
 
   **The walk found a real trap while being written, and it is recorded rather than worked around.** Once a deny covers your own address you cannot delete that rule *from the panel* — the layer refuses the request before it reaches the route. The first draft deadlocked on exactly this: its cleanup `DELETE` came from the address it had just blocked. The fix is a third address for the cleanup calls, and the comment names the escape the REQ's own risk note asks for (another network, or the CLI). The assertion that was *wrong* is worth naming too: it asserted a `DELETE` would succeed from an already-blocked address, which is a statement about nothing. Correcting it is what exposed the trap.
 - [x] CIDR validation rejects malformed input (IPv4 and IPv6) with a field-level message. — **closed 2026-10-02, `4ac78836`** with `apps/api/tests/security.rs::a_malformed_cidr_is_refused_with_a_field_level_message`. Nine malformed inputs are refused with `400 invalid_security_input` and the message names what was typed (`203.0.113.0/33`, `2001:db8::/129`, `10.0.0.1/8`, a bare word, an empty string), and three valid ones are **accepted** in the same walk — a parser that refuses everything would satisfy the refusal half, so the acceptance half is asserted too. The host-bit case is the one worth naming: `ipnet` builds a "network" from `10.0.0.1/8` and answers `contains()` correctly, but **Postgres's `cidr` column refuses the same value** with "bits set to right of mask". A parser that only range-checked the prefix would have accepted the rule and turned the operator's typo into a `500` from inside the database; canonicalising instead would have silently widened a rule that reads like one address to sixteen million. It is refused, and the message names the network they meant.
-- [x] Ingesting a dependency report creates findings; re-ingesting the same report does not duplicate them. *(the fingerprint is component+title hashed, the unique index is scoped by version, and `upsert_finding` returns created-or-refreshed; the QA pass asserts the second ingest reports `created: 0`)*
+- [x] Ingesting a dependency report creates findings; re-ingesting the same report does not duplicate them. — **the criterion was ticked 2026-10-01 on a return value that had never once answered the question.** The fingerprint is component+title hashed and the unique index is scoped by version, so the *rows* never duplicated; but `upsert_finding` asked Postgres `coalesce(xmax, 0)`, and `xmax` is an `xid`, so the database refused the query and the answer was `.unwrap_or(true)`. The second ingest therefore reported `created: 1` for a finding that already existed, and the half of this box that reads "created-or-refreshed" was measuring a constant. **Closed 2026-10-03** by `d6c26218`, and the box now rests on a walk that ingests the same report twice and asserts `created: 0, refreshed: 1` **and** that no second delivery was queued — the return value and the event bus agreeing, which is the only form in which this claim is worth anything.
 - [x] Acknowledge/ignore/mark fixed/reopen all persist; ignore without a reason is refused. *(four endpoints' worth of transitions; the refusal is in the store with a field-level message, enforced a second time by the SQL constraint, and the drawer's button is disabled until a reason is typed)*
-- [x] CSV export of findings and security events matches the current filter. *(the findings half shipped: `GET /security/findings.csv` reads the same parser as the list, ignores the page size on purpose, and its 50k cap's refusal names the count. The security-events half is slice 4, with the events screen.)*
+- [x] CSV export of findings and security events matches the current filter. *(the findings half shipped: `GET /security/findings.csv` reads the same parser as the list, ignores the page size on purpose, and its 50k cap's refusal names the count. **The security-events half shipped 2026-10-02** with the events screen: `GET /security/events.csv` reads the same filter, drops the page size on purpose, and its 50k cap names the count. Every cell is neutralised, and on **this** screen the user-agent column is attacker-controlled free text — so the `=`/`+`/`-`/`@` prefix rule applies to a column nobody wrote by hand. The audit `metadata` never reaches the file whole: `summarise_metadata` renders a key-level digest and **drops** credential-named keys outright, because a security event is the row most likely to be forwarded to a third party.)*
 - [ ] `/security/events` shows real sign-in, lockout, denial and settings-change entries.
-- [ ] Secret inventory lists names and rotation age only; no value appears in HTML, JSON or export.
+  — **the BACKEND half is closed 2026-10-02, and the requirement's own wording was half wrong.**
+    `crates/security/src/{events,events_store,events_csv}.rs`, `apps/api/src/routes/security_events.rs`,
+    `GET /security/events` + `GET /security/events.csv`, `apps/admin/features/security/security-events.tsx`
+    and `app/security/events/page.tsx`. The REQ says "a security-event table **from the audit
+    trail**", and that names the wrong single source: the audit trail holds no sign-ins at all,
+    because a failed sign-in happens before there is a session and so before there is an actor to
+    write an entry for. An audit-only projection answers `200` with an empty table on a platform
+    where every requirement is met, and the empty table reads as a working filter. The timeline is
+    therefore a **merge of `audit_log` and `sign_in_attempts`**, and every row names which table it
+    came from (`source`) because a merged list whose rows do not say where they came from is an
+    operator's puzzle during an incident.
+
+    The walk is `apps/api/tests/security.rs::the_timeline_merges_the_audit_trail_and_the_sign_in_log`
+    — one row seeded in **each** table, then: both sources present; the counters agree with the
+    rows; a sign-in row's `actor` is `null` and that absence is asserted as the *fact* it is
+    ("refused before sign-in"); every id is `audit:`/`sign_in:`-prefixed (both tables have an
+    identity column starting at 1, so an id without the source would drop a real row as a
+    duplicate); the filters cross the seam in **both** directions; and the export is the whole
+    filter rather than the page.
+
+    **Proven to fail, twice, and the second time is the argument.** Stubbing the sign-in side
+    (`return Ok((Vec::new(), 0))`) turns the walk red naming the defect:
+    `THE BUG THIS WALK EXISTS FOR: the failed sign-in does not appear … events=["security.headers.updated"]`
+    — the audit row present, the sign-in row gone, on a platform with nothing wrong. It then found
+    **three real bugs the review had missed**, which is the argument for why the walk drives the
+    router rather than the crate:
+    1. `?category=sign_in` answered **`500 security store: column "action" does not exist`**. The
+       shared query builder emits `action ilike`/`action like`, and `sign_in_attempts` has no
+       `action` column — its vocabulary is `outcome`. The sign-in side now builds its own clauses
+       (`email ilike`/`outcome ilike`, and the category as the outcome word).
+    2. `?category=settings_change` returned the **failed sign-in**. A category with no outcome word
+       produced *no* predicate, so the filter matched everything on that side; it now produces
+       `false`, and `sign_in` was added to `outcome_filter` — it is this table's **default**
+       category, so it must select its rows rather than refuse them (its first version returned
+       nothing, and `?category=sign_in` answered zero while the unfiltered timeline showed one).
+    3. `EVENT_COLUMNS` omitted `detail`, so the audit row's digest reached the screen and stopped
+       at the export — the file attached to a ticket was thinner than the screen it came from.
+       The containment assertion that was supposed to catch it could not; a row-width check can,
+       and it is now in `events_csv.rs`.
+
+    **What the screen does not claim.** Permission refusals are **absent**: the guard in
+    `apps/api/src/guards.rs` answers `403` and records nothing, so `denial` resolves to the
+    address rule's `blocked` outcome only. The screen states this in a permanent note rather than
+    leaving an operator to conclude the platform records refusals it does not — recording one
+    per refusal would put a database write on every refused request, and an attacker would decide
+    how fast the audit table fills.
+
+    **Two harness faults found while writing it, both worth naming.** The walk's header save was
+    seeded with `directives: []` and then `name`/`sources`; the policy store correctly refused it
+    twice (`a policy needs a "default-src" directive`, then `needs "script-src"`) because a CSP
+    with no `script-src` is not a policy. The walk was creating a row the product rightly declined
+    to write. And `Harness::fresh()` now sets `OMNION_IP_ACCESS_ALLOW_UNADDRESSED=1`: `oneshot`
+    carries no `ConnectInfo`, and slice 4's own layer refuses an address-less request with
+    `ip_unknown` while any rule is in force — a refusal that is **correct** and is asserted
+    deliberately by `a_denied_network_cannot_reach_the_api`, but which turned every other walk in
+    the file red once a rule existed. Set in the harness once, so the suite does not depend on an
+    operator remembering an environment variable.
+
+    **The screen box is still open**, for the same reason as every other one in this REQ: the
+    browser pass has not run. `scripts/qa/walkthrough.cjs` visits `/security/events` in the
+    desktop and the mobile pass (registered in both inventories) and asserts what a static
+    inventory cannot: the honesty note is present, the counts line reads "N of M", and the
+    category filter is **applied** rather than inert. `3f60ef77` registered the route and
+    extended `runSecurityDepth`; every selector the walk asserts was checked to exist in the
+    component (`counts`/`note`/`row`/`category`/`clear`), because a walk that selects a
+    `data-` attribute the screen never renders is a walk that passes on an empty page — the
+    same false green as an audit-only projection.
+
+    **Recorded so it is not re-found: this REQ's ninth defect was the linker, not the code.**
+    The first run of these tests died in `collect2` with `ld terminated with signal 7
+    [Bus error]` while linking the `security` test binary. The diagnosis is `/mnt/apopic` at
+    **100% (193 MiB free)**; the load average was 13–27 from sibling writers and 30 of 32 GiB
+    of RAM was in use. Reclaiming **only this worktree's** `target/debug/incremental` (795 MiB)
+    and then grouping `target/debug/deps` by `lib<crate>-<16 hex>` and deleting every copy but
+    the newest (835 stale artifacts, 2 691 MiB) returned the disk to 95% / 3.4 GiB and the suite
+    to green in one run. Three rules worth keeping: a linker bus error on this box is a disk
+    symptom until proven otherwise; the reclaim must be scoped by `readlink /proc/<pid>/cwd`
+    because a sibling writer had live cargo in `omnion-w6`; and `CARGO_INCREMENTAL=0` keeps the
+    space from coming back as 115 retries.
+
+    **Gates this tick:** `omnion-security` **188** · `omnion-api --lib` **281** · `--test
+    security` **8/8** (42 s, live PostgreSQL) · `pnpm typecheck` **0** (`tsc --noEmit`, admin +
+    web).
+- [x] Secret inventory lists names and rotation age only; no value appears in HTML, JSON or export. — **closed 2026-10-02, `b877d429`…`d5c74b95`, and the release-blocker box is the one this REQ most nearly lost.**
+
+  The requirement reads as a request for a secrets table. **There is no secrets table and there
+  must not be one**: this is a projection over references, and its entire value is being the one
+  screen in the security centre from which no secret can be read. Three constraints, and the
+  point of each is that the guarantee is structural rather than a promise in a comment:
+
+  * **`SecretRef` has no `value`, `ciphertext`, `hash` or `preview` field.** Adding one would make
+    the struct able to carry a credential, and that ability *is* the risk. A unit test serialises
+    a row and asserts no such key appears.
+  * **There is no `healthy` state, and no `present` one either.** The platform can see that a
+    reference exists and can read nothing about the value behind it, so a state meaning "this
+    secret is fine" would have to be a lie. The strongest form of the rule is that the type
+    cannot express it — and the first draft *did* carry a `Present` variant that no row produced,
+    which would have let a future contributor render "present = fine". It was removed and the
+    test rewritten to pin the whole vocabulary.
+  * **The store selects explicit columns, never `*`.** `*` re-reads the source's own schema, so a
+    source that gains a value column upstream would start appearing in a security screen with no
+    code change here at all. The three sources holding real material (`webhook_endpoints.secret`,
+    `service_account_keys.secret_hash`, `mfa_factors.secret_ciphertext`) are read as **counts**,
+    and the count is what replaced the value.
+
+  **The walk probes the VALUES, not the column names** — `apps/api/tests/security.rs::no_secret_value_reaches_the_inventory_response`. A name scan would pass an aliased column or a value inlined into a note; a literal scan only fails when the actual leak happens. It seeds a webhook secret, a service-account hash and a TOTP ciphertext into a live database, then asserts all three literals are absent from the response **while the reference name is present** — a reference is not a secret, and that asymmetry is the difference between a projection and a dump. The positives are asserted too: an empty body satisfies every containment check in the test while showing an operator a blank screen.
+
+  **It found a real bug on its first run**: `column reference "expires_at" is ambiguous`, because
+  `service_account_keys` and `service_accounts` both carry that column. The query read correctly in
+  review and answered `500` on *every* inventory load — the tenth instance of this REQ's defect
+  class, and the argument for why a walk drives the router rather than reading the SQL.
+
+  **Rotation age is a reading, and the screen says which one.** Rotation happens outside the
+  platform, so `rotated_at` is the reference row's own timestamp and `RotationEvidence` names
+  whether it was **changed** or merely **created**; the panel renders `reference_created` as
+  *"this is not a rotation date"* in words. An environment variable has no evidence at all and
+  shows a dash rather than a blank cell that reads as "recently rotated".
+
+  **The screen states its own blind spot in a permanent note**, because the environment list is
+  maintained by hand — a process cannot enumerate its own environment, so this inventory cannot
+  list a secret it was never told about. The API returns that as a `limitation` field and the
+  panel shows it on every load; `the_limitation_is_not_optional` keeps it from being dropped.
+
+  **Read-only, and proven so.** `the_inventory_cannot_be_written_through` drives all four write
+  verbs with the **full** key set, so the refusal cannot be mistaken for a permission problem —
+  it is the route shape refusing. A screen that could edit a *reference* would invite an operator
+  to believe it could rotate a *secret*.
+
+  **The walkthrough asserts the absence, which is the only way to test a deliberate omission**:
+  it scans every button and link for `edit|rotate|revoke|delete|remove|update|replace|add` — a
+  "coming soon" button would satisfy a presence check — and separately scans the rendered text
+  for value-shaped tokens, because the browser is the last hop neither the type nor the API walk
+  can see and a screenshot on a ticket is where a value would end up.
+
+  208 crate tests, 18 new; the walk lives in `--test security`.
 - [x] CSRF protection rejects a cookie-authenticated mutation without a token. *(derived HMAC over the session id, no table to rotate; `403 csrf_failed` rather than `401` because the caller is authenticated and it is the request that is refused; a bearer machine key is exempt because it is not ambient authority; a deployment with no `OMNION_CSRF_SECRET` refuses rather than skipping)* **The guard existed with nothing to guard against: the token was never issued and the client never sent one, so every panel save answered `403 csrf_failed`. Fixed 2026-09-29** — `cookies::csrf_cookie_for` mints it in all four sign-in paths, sign-out clears both cookies, and `apps/admin/lib/api.ts` echoes it from one place in `request()`. `apps/api/tests/csrf.rs` drives the whole round trip over HTTP, and the "with the token it is **accepted**" half is the assertion the original slice never had: a guard that refuses everything passes the refusal half.*
 - [x] Every endpoint enforces its catalogue key; a forbidden call returns `403 permission_denied`. — **closed 2026-10-01, `adee1164`** with `apps/api/tests/security.rs`, four walks over the live database driving the router in process. The box had been open since the request was written with the note that "the 403 itself is unproven until a pass calls an endpoint without the key" — and the reason is the **seventh instance of this REQ's defect class**: all fifteen `/security` routes do carry a guard (a census of `routes/mod.rs` reads 15/15), but nothing had ever *called* one without the key, so a guard that was only ever satisfied was being counted as a guard. That is exactly how the security centre came to sit behind `analytics.read` until a backup walk happened to sign in as a reader.
       What the walks prove, in order of how much they can catch:
@@ -180,7 +314,23 @@ The walkthrough must visit `/security` and each sub-tab, click "Run checks", ope
 1. **Posture + findings** — schema, check registry, `/security` overview, findings list/detail and status transitions, audit entries. Done: the overview shows real states and a finding can be acknowledged, ignored with a reason and exported. **SLICE 1 COMPLETE 2026-09-29, awaiting the browser pass** (`0054_security_posture.sql`, `crates/security`, `apps/api/src/routes/security.rs`, `features/security/`, `runSecurityDepth`). The CSV export shipped with it: `crates/security/src/csv.rs` renders the filter unpaged, caps at 50k rows with a refusal that names the count, and prefixes a cell starting with `= + - @` with a tab — a findings title can be a hostile package name and a findings export is exactly the document somebody opens in a spreadsheet. 51 crate tests.
 2. **Headers + CSRF** — header policy model, middleware application, CSP preview, CSRF token for cookie-authenticated mutations, `/security/headers`. **Backend complete 2026-09-29** (`crates/security/src/headers.rs`, `csrf.rs`, `header_store.rs`, `0135_security_headers.sql`, `apps/api/src/headers_middleware.rs`, `routes/security_headers.rs`, `GET/PUT /security/headers`). The CSRF half was **not** complete on that date: the layer was on the router, but nothing issued the token and nothing sent it, so every cookie-authenticated mutation was refused. Closed 2026-09-29 by `2274768` + `5210388` + `6a08bd4`. Still open: the `/security/headers` **screen** and the walkthrough entry — the browser pass has not run, so no box that names a screen is ticked.
 3. **Rate limiting + lockout** — Redis-backed limiter, scope table, tester, failed-attempt counting, lockout and unlock, `/security/sign-in-protection` and `/security/rate-limits`. Done: a scripted burst gets `429`, and five failed sign-ins lock the account until it is unlocked. **BACKEND AND BOTH SCREENS COMPLETE 2026-09-29** (`crates/security/src/{limiter,limiter_redis,limiter_store,lockout}.rs`, `0151_security_rate_limits.sql`, `apps/api/src/routes/security_limiter.rs`, `features/security/{rate-limits,sign-in-protection}.tsx`; 137 crate + 216 api-lib + 4 migration tests). **Still open on this slice, and named rather than glossed:** (a) **CLOSED 2026-09-29** — `apps/api/src/rate_limit_middleware.rs` is layered on the router as the outermost layer and `apps/api/tests/rate_limit.rs` drives a real burst over HTTP: `429` with a `Retry-After`, the scope/count/ceiling in the body, the requests under the ceiling served, and the public renderer exempt; (b) **nothing has ever locked an account — and the reason is not the one recorded here before.** The sign-in path *does* call `register_failure` (`crates/identity/src/signin.rs:269`) and the `AccountLocked` branch is wired, so the earlier note that the route skips the lockout was wrong about the code and right about the effect. What actually happens is an ordering problem one layer up: the per-address refusal at `signin.rs:204` fires first and compares `recent_failures_from_address` against **`lockout_attempts`** — the same number as the account threshold — so from any single address the address rule reaches the threshold on the very attempt that would have incremented the account counter. Measured against the live QA API (2026-09-30), twelve wrong passwords for a real account returned `403 address_blocked` (`reason: address_failures`) on the first ten and `429 rate_limited` after, while `users.failed_sign_in_count` stayed at **0** and `locked_until` stayed `never`. The address threshold must be a separate, larger number than the account threshold, or the account lockout is unreachable code and the screen's "currently locked" table is structurally always empty; **CLOSED by `669d584d` + `6be5863e`**: the address threshold is now `lockout_attempts * 3` and `apps/api/tests/auth.rs` walks it over a live database — the account reaches `locked_until` while the address is still allowed, and the CORRECT password is then still refused. **The two screens are walked as of this tick** (`--only=security`, `1ded0b5c`) but the pass has NOT reported yet — the box ran at load 80–107 for the whole tick and two harness faults killed it first (no CSRF secret on the QA API, a masked database password). The boxes naming a screen stay unticked until a pass reports; the harness survives its own failures now, so the next tick is where that closes.
-4. **IP access + events + inventory** — allow/deny evaluation, rules UI, security-event view, secret inventory projection, `security.finding.opened` webhook. **IP access is CODE-COMPLETE 2026-10-02** (`0217_security_ip_rules.sql`, `crates/security/src/{ip_rules,ip_store}.rs`, `apps/api/src/security_ip.rs`, `apps/api/src/routes/security_ip.rs`, `features/security/ip-access.tsx`, `4ac78836`…`4b581fb8`): a denied CIDR is refused over the router with the rule named, the tester agrees with the layer on the same input, and CIDR validation is field-level for both families. 159 security + 269 api --lib + 7 `--test security`. **The events screen and the secret inventory are NOT started**, and slice 4 is not done until they are. Still open, and it is a screen box: the browser pass that visits `/security/ip-access` — including the mobile stacking the QA plan names. Worth recording that the posture overview's IP-allow-list check has linked to `/security/ip-access` since the registry was written and that link is still dead — precisely how `/security/rate-limits` stayed dead until this slice, and a cheap way to spot slice 4's first defect.
+4. **IP access + events + inventory** — allow/deny evaluation, rules UI, security-event view, secret inventory projection, `security.finding.opened` webhook. **THREE OF FOUR PIECES CODE-COMPLETE.**
+
+   **(a) IP access — 2026-10-02** (`0217_security_ip_rules.sql`, `crates/security/src/{ip_rules,ip_store}.rs`, `apps/api/src/security_ip.rs`, `apps/api/src/routes/security_ip.rs`, `features/security/ip-access.tsx`, `4ac78836`…`4b581fb8`): a denied CIDR is refused over the router with the rule named, the tester agrees with the layer on the same input, and CIDR validation is field-level for both families. Two decisions to keep: a request with **no** address is refused (`ip_unknown`) while rules are in force, because allowing it makes every in-process walk pass for the wrong reason; and a rule that blocks the caller is **warned about, not refused** — locking yourself out of one route while the panel is served from another is a legitimate move. Worth re-recording: the posture overview's IP-allow-list check linked to `/security/ip-access` from the moment the registry was written and that link was dead until this slice.
+
+   **(b) Security-event view — 2026-10-02, backend + screen + walkthrough** (`264480a1`…`3f60ef77`): `crates/security/src/{events,events_store,events_csv}.rs`, `apps/api/src/routes/security_events.rs`, `GET /security/events` + `GET /security/events.csv`, `features/security/security-events.tsx`, `app/security/events/page.tsx`, `runSecurityDepth` extended. **The requirement's wording was half wrong and the fix is in the module doc**: "from the audit trail" names one of the two tables a security event lives in, and an audit-only projection answers `200` with an empty sign-in column on a platform meeting every requirement — which reads as a working filter. The timeline is a merge of `audit_log` and `sign_in_attempts` and every row names its `source`. 188 security + 281 api --lib + 8/8 `--test security`.
+
+   **(c) Secret inventory — 2026-10-02, complete** (`b877d429`…`d5c74b95`): `crates/security/src/{secrets,secrets_store}.rs`, `GET /security/secrets`, `features/security/security-secrets.tsx`, `app/security/secrets/page.tsx`, the tab, the walkthrough entry. **The release-blocker box is closed** and it is the one this REQ most nearly lost — see its acceptance entry for why the containment is structural rather than a promise, and for the tenth instance of this REQ's defect class, which the walk found on its first run (`expires_at` ambiguous between two tables; the query read correctly and answered `500` on every load).
+
+   **(d) The `security.finding.opened` webhook — 2026-10-03, complete** (`e15d1880`, `25306c7b`, `d6c26218`, `73e890b6`). The event name joins the catalogue with **identity fields only** — `finding_id`, `severity`, `source` and the package triple. `title`, `description` and `evidence` are absent, and that is the design rather than an omission: all three are content that came from *outside* (a CI vendor's package name, its prose, the raw entry), and this is the first security payload that fans out to a receiver outside the operator's own infrastructure. The walk seeds a subscribed endpoint, ingests a report with a recognisable literal in **every** content field — including the operator `note`, which no receiver needs — then reads the **queued** payload back and asserts each literal is absent while the triage fields are present and `finding_id` resolves to the real row. Values, not column names: a scan for `"title"` would pass a payload that nested or inlined it.
+
+   **The walk also proved the emitter does not fire on a finding that was already known**, which containment alone cannot supply — a nightly CI job re-ingests every morning, so an emitter on the upsert regardless of its branch is an event an operator learns to ignore.
+
+   **And it found the eleventh instance of this REQ's defect class on its first run, and this one was the store's.** `upsert_finding` asked `coalesce(xmax, 0)` — `xmax` is an `xid`, so Postgres raises `COALESCE types xid and integer cannot be matched` on *every* version. The answer sat in a second `select` with `.unwrap_or(true)`, so the error was swallowed and **every ingest since the function was written reported every finding as newly created**. The panel's re-ingest protection has been showing `created: N` instead of `created: 0, refreshed: N`, and the acceptance criterion below was ticked on a return value that had never answered the question. `xmax = 0` now rides the same statement's `RETURNING`, so one round trip answers created-or-refreshed and a failure surfaces as the store error it is (`d6c26218`).
+
+   208 security + 49 events + 284 api --lib + **11/11** `--test security` + the drift gate green.
+
+   Still open, and it is a screen box for (a) and (b) alike: the browser pass. **The box was saturated for this whole tick** — load average 17.8, 30 of 32 GiB RAM in use, 55 Chrome processes, and the QA slot genuinely held live by `w3` (`pid 2624054`, `cwd=/mnt/apopic/omnion-w3`, verified with `kill -0` **and** `/proc/<pid>/cwd`, not by the age of the placeholder). Two consecutive ticks have now recorded a deferral for the same reason, which makes it a standing risk rather than bad luck: **five** screen boxes across this REQ turn on a pass that has not run. The next tick that finds a free slot runs it and closes or names them.
 
 ### Risks / notes
 

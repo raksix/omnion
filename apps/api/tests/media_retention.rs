@@ -1376,7 +1376,14 @@ async fn the_past_restore_window_counts_files_that_are_actually_past_it() {
 
     // Two files, deliberately different sizes, so the byte total cannot pass by accident.
     let small = upload(&fixture.state, &editor, site, "small.txt", b"hi").await;
-    let large = upload(&fixture.state, &editor, site, "large.txt", b"twenty bytes here").await;
+    let large = upload(
+        &fixture.state,
+        &editor,
+        site,
+        "large.txt",
+        b"twenty bytes here",
+    )
+    .await;
     let sizes: Vec<i64> = sqlx::query_scalar("select size_bytes from media where id = any($1)")
         .bind(vec![small, large])
         .fetch_all(fixture.db.pool())

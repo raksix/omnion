@@ -391,6 +391,37 @@ catalogue! {
     "security.lockout.triggered", "security", Live,
     "An account reached its brute-force threshold and is now locked out.",
     [("user_id", Uuid, req), ("attempts", Integer, req), ("lockout_minutes", Integer, opt)];
+    // A finding that *opens* is the one security fact an operator wires to a third party, so
+    // this is the name REQ-012's Events section promises them. Two payload decisions, and both
+    // are about the same thing — **the scan's content must not travel**:
+    //
+    // * `title` and `description` are absent. A dependency title is a package name and a
+    //   description is whatever the CI vendor wrote, which is attacker-influenced free text
+    //   being copied to every receiver the operator has. The finding is *identifiable* from
+    //   `finding_id` alone, because the panel reads it back with the same guard it protects.
+    // * `evidence` is absent for the same reason with more force: it is the raw report entry,
+    //   and the ingest path's own heuristic for "this document carries a credential" is a
+    //   heuristic. A bus is not the place to test it again.
+    //
+    // `severity` IS carried, because the receiver's decision is "page me or file a ticket",
+    // and that decision is unreadable from a finding id alone.
+    "security.finding.opened", "security", Live,
+    "A new finding was raised — a check that found something, or a report that was ingested.",
+    [("finding_id", Uuid, req), ("severity", String, req), ("source", String, req),
+     ("component", String, opt), ("component_version", String, opt), ("fixed_in", String, opt)];
+    // `action` is what makes this one event rather than two: a receiver that has to infer
+    // whether a network was opened or closed from a diff of `cidr` lists is reimplementing this
+    // module. `note` is the operator's own free text and is deliberately absent for the same
+    // reason a finding's title is — this one fans out to third-party receivers.
+    //
+    // This row was MISSING while slice 4(a) shipped, and `every_emitted_name_is_in_the_catalogue`
+    // is what said so: an emitter whose name is not in the catalogue records an event no
+    // endpoint can subscribe to, so the rule an operator believes they are running applies to
+    // nobody. It went unnoticed because nothing in the workspace asserts that gate is green on
+    // the branch it was written on.
+    "security.ip_rule.changed", "security", Live,
+    "An IP access rule was added or removed, and the next request is judged by the new set.",
+    [("action", String, req), ("rule_id", Uuid, req), ("kind", String, req), ("cidr", String, req)];
 
     // ---- Tenancy -------------------------------------------------------------------------------
     "site.created", "tenancy", Live,
@@ -908,7 +939,10 @@ mod tests {
         assert_eq!(order.area, "commerce");
         assert_eq!(order.group(), "order");
 
-        assert!(group_members("commerce").is_empty(), "no event is emitted as commerce.*");
+        assert!(
+            group_members("commerce").is_empty(),
+            "no event is emitted as commerce.*"
+        );
         assert!(!group_members("order").is_empty());
         assert!(lookup("commerce.*").is_none());
     }
@@ -923,7 +957,10 @@ mod tests {
         .expect("valid");
 
         assert_eq!(
-            stored.iter().filter(|name| *name == "page.published").count(),
+            stored
+                .iter()
+                .filter(|name| *name == "page.published")
+                .count(),
             1,
             "the same subscription twice is one subscription"
         );
@@ -949,9 +986,18 @@ mod tests {
     fn an_empty_or_broken_subscription_is_refused() {
         assert!(reconcile(&[]).is_err());
         assert!(reconcile(&["   ".to_owned()]).is_err());
-        assert!(reconcile(&["page".to_owned()]).is_err(), "a bare name is not a name");
-        assert!(reconcile(&["*".to_owned()]).is_err(), "an empty group is not a group");
-        assert!(reconcile(&["PAGE.*".to_owned()]).is_err(), "a group is lower-case");
+        assert!(
+            reconcile(&["page".to_owned()]).is_err(),
+            "a bare name is not a name"
+        );
+        assert!(
+            reconcile(&["*".to_owned()]).is_err(),
+            "an empty group is not a group"
+        );
+        assert!(
+            reconcile(&["PAGE.*".to_owned()]).is_err(),
+            "a group is lower-case"
+        );
     }
 
     #[test]
@@ -971,7 +1017,10 @@ mod tests {
     #[test]
     fn areas_are_listed_once_in_table_order() {
         let areas = areas();
-        assert_eq!(areas.len(), BTreeSet::from_iter(areas.iter().copied()).len());
+        assert_eq!(
+            areas.len(),
+            BTreeSet::from_iter(areas.iter().copied()).len()
+        );
         assert!(areas.contains(&"content"));
         assert!(areas.contains(&"commerce"));
         assert!(
@@ -984,7 +1033,10 @@ mod tests {
     fn the_ceiling_counts_what_the_operator_typed_not_what_it_expanded_to() {
         // Eight groups covering every member of the catalogue: forty-odd names once expanded,
         // eight selections as typed.
-        let typed: Vec<String> = areas().into_iter().map(|area| format!("{area}.*")).collect();
+        let typed: Vec<String> = areas()
+            .into_iter()
+            .map(|area| format!("{area}.*"))
+            .collect();
         assert!(
             typed.len() <= crate::validation::MAX_SUBSCRIPTIONS,
             "the table has more areas than the ceiling allows, so this test cannot say what it means"
@@ -1043,8 +1095,14 @@ mod tests {
             assert_eq!(entry.group(), "health", "{name} is not behind health.*");
         }
         // The pair the request calls out, stated as a pair.
-        assert!(subscribed_to(&["health.*".to_owned()], "health.service.degraded"));
-        assert!(subscribed_to(&["health.*".to_owned()], "health.service.recovered"));
+        assert!(subscribed_to(
+            &["health.*".to_owned()],
+            "health.service.degraded"
+        ));
+        assert!(subscribed_to(
+            &["health.*".to_owned()],
+            "health.service.recovered"
+        ));
     }
 
     #[test]
@@ -1091,7 +1149,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must declare {field}"));
             assert!(found.required, "{name}.{field} is required in the test");
             assert!(
-                entry.required_fields().any(|candidate| candidate.name == field),
+                entry
+                    .required_fields()
+                    .any(|candidate| candidate.name == field),
                 "{name}.{field} must be reachable through required_fields()"
             );
         }

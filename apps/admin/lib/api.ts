@@ -32,6 +32,9 @@ import type {
   CreateIpRuleInput,
   CreateIpRuleResult,
   IpRulesPage,
+  SecretInventory,
+  SecurityEventsFilter,
+  SecurityEventsPage,
   IpTestResult,
   LockedAccountsPage,
   LockoutPolicy,
@@ -4899,6 +4902,68 @@ export function testIpAddress(address: string): Promise<IpTestResult> {
     method: "POST",
     body: JSON.stringify({ address }),
   });
+}
+
+/**
+ * The security-event timeline (REQ-012 slice 4).
+ *
+ * **Two sources, and that is the point.** The audit trail holds privileged actions somebody took;
+ * it holds no sign-ins at all, because a failed sign-in happens before there is a session and so
+ * before there is an actor to write an audit entry for. The server merges both tables and every row
+ * names which one it came from, so this client does not choose — it cannot, and a screen that
+ * could only read one of them would show an operator an empty sign-in list on a platform where
+ * nothing is wrong.
+ *
+ * The filter is sent as a query string built here rather than assembled by the screen, so the
+ * export and the table are guaranteed to be asking the server the same question.
+ */
+export function fetchSecurityEvents(
+  filter: SecurityEventsFilter = {},
+): Promise<SecurityEventsPage> {
+  const params = new URLSearchParams();
+  if (filter.q) params.set("q", filter.q);
+  if (filter.category) params.set("category", filter.category);
+  if (filter.source) params.set("source", filter.source);
+  if (filter.since) params.set("since", filter.since);
+  if (filter.until) params.set("until", filter.until);
+  if (filter.limit) params.set("limit", String(filter.limit));
+  const query = params.toString();
+  return request<SecurityEventsPage>(
+    `/api/v1/security/events${query ? `?${query}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * The same filter as a CSV download.
+ *
+ * A browser navigation rather than a fetch, because the response is a file with
+ * `Content-Disposition: attachment` and the panel's own `request()` wrapper is built for JSON —
+ * reading it as text would hand the operator the CSV body instead of saving it.
+ */
+/**
+ * The secret inventory. Read-only, and the client has no mutation to offer.
+ *
+ * No filter parameter, deliberately: the inventory is small enough to render whole, and a filter
+ * over a list whose point is "what does this platform hold" invites the reading that the screen
+ * is hiding something rather than that it is complete.
+ */
+export function fetchSecretInventory(): Promise<SecretInventory> {
+  return request<SecretInventory>("/api/v1/security/secrets");
+}
+
+export function securityEventsExportUrl(filter: SecurityEventsFilter = {}): string {
+  const params = new URLSearchParams();
+  if (filter.q) params.set("q", filter.q);
+  if (filter.category) params.set("category", filter.category);
+  if (filter.source) params.set("source", filter.source);
+  if (filter.since) params.set("since", filter.since);
+  if (filter.until) params.set("until", filter.until);
+  // Deliberately NOT sent: the server drops the page size for the export, because an operator
+  // who filters to "denials" and exports 50 of 300 has produced a document that reads as a
+  // complete list and is not one.
+  const query = params.toString();
+  return `/api/v1/security/events.csv${query ? `?${query}` : ""}`;
 }
 
 export function unlockAccount(userId: string): Promise<LockedAccountsPage> {

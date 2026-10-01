@@ -316,21 +316,28 @@ pub(crate) async fn decide_request(
     }
 
     let clock = time::OffsetDateTime::now_utc().unix_timestamp();
-    let (verdict, counted) =
-        match omnion_security::limiter_redis::enforce(&limiter.state.redis(), &policies, scope, &client, clock).await {
-            Ok(pair) => pair,
-            Err(error) => {
-                // `enforce` only errors when the document has no row for the scope. Failing open
-                // on a missing row would be silently unlimited, so this is a 500 that names the
-                // gap: an operator who cannot fix a rate limit can see why it is not applied.
-                tracing::error!(error = %error, scope, "no rate-limit policy for this scope");
-                return Some(ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "rate_limiter_misconfigured",
-                    format!("no rate-limit policy for the {scope} scope"),
-                ));
-            }
-        };
+    let (verdict, counted) = match omnion_security::limiter_redis::enforce(
+        &limiter.state.redis(),
+        &policies,
+        scope,
+        &client,
+        clock,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(error) => {
+            // `enforce` only errors when the document has no row for the scope. Failing open
+            // on a missing row would be silently unlimited, so this is a 500 that names the
+            // gap: an operator who cannot fix a rate limit can see why it is not applied.
+            tracing::error!(error = %error, scope, "no rate-limit policy for this scope");
+            return Some(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "rate_limiter_misconfigured",
+                format!("no rate-limit policy for the {scope} scope"),
+            ));
+        }
+    };
 
     if !counted.authoritative {
         // The counter could not be read, so nothing was counted. The verdict `enforce` returned is
@@ -378,11 +385,10 @@ pub(crate) async fn decide_request(
 /// the correct accounting for a request the platform cannot attribute to a person.
 async fn resolve_user_id(limiter: &RateLimiter, headers: &HeaderMap) -> Option<String> {
     let token = crate::cookies::session_token(headers)?;
-    let resolved =
-        omnion_identity::sessions::resolve_session(limiter.state.db().pool(), &token)
-            .await
-            .ok()
-            .flatten()?;
+    let resolved = omnion_identity::sessions::resolve_session(limiter.state.db().pool(), &token)
+        .await
+        .ok()
+        .flatten()?;
     Some(resolved.user.id.to_string())
 }
 

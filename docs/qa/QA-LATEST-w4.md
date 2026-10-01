@@ -1,14 +1,35 @@
 # Omnion QA — latest pass (w4)
 
-- When: ? · artifacts: `qa-artifacts/20261001-110809`
-- Interactions: 0 clicks · 0 field fills · 0 form submissions · 0 screenshots
-- Console errors: 0 · failed requests: 0 · dialogs: 0
-- Programmatic findings: 0 (high 0 · medium 0 · low 0)
+- When: 2026-10-01T12:45:34.253Z · artifacts: `qa-artifacts/20261001-120351`
+- Interactions: 168 clicks · 9 field fills · 2 form submissions · 214 screenshots
+- Console errors: 606 · failed requests: 599 · dialogs: 0
+- Programmatic findings: 1288 (high 1277 · medium 7 · low 4)
 - Vision issues: skipped (no vision API key found (env VISION_MCP_API_KEY or config.yaml))
-
-> **THIS PASS MEASURED NOTHING — it died before it could count anything:** `TypeError: Cannot read properties of undefined (reading 'horizontalOverflow')`
-> The zeros above are defaults, NOT results. Re-run the pass; do not read this file as a
-> result for any screen.
 
 ## Top findings
 
+- **[high] crm-state** — state step failed: contacts_hasAState
+- **[high] crm-state** — state step failed: contacts_readsAsASentence
+- **[high] crm-state** — state step failed: contacts_showsTheRequestId
+- **[high] crm-state** — state step failed: contacts_hasARetry
+- **[high] crm-state** — state step failed: companies_hasAState
+- **[high] crm-state** — state step failed: companies_readsAsASentence
+- **[high] crm-state** — state step failed: companies_showsTheRequestId
+- **[high] crm-state** — state step failed: companies_hasARetry
+- **[high] crm-state** — state step failed: deals_hasAState
+- **[high] crm-state** — state step failed: deals_readsAsASentence
+- **[high] crm-state** — state step failed: deals_showsTheRequestId
+- **[high] crm-state** — state step failed: deals_hasARetry
+- **[high] crm-state** — state step failed: activities_hasAState
+- **[high] crm-state** — state step failed: activities_readsAsASentence
+- **[high] crm-state** — state step failed: activities_showsTheRequestId
+- **[high] crm-state** — state step failed: activities_hasARetry
+- **[high] crm-state** — state step failed: leads_hasAState
+- **[high] crm-state** — state step failed: leads_readsAsASentence
+- **[high] crm-state** — state step failed: leads_showsTheRequestId
+- **[high] crm-state** — state step failed: leads_hasARetry
+- **[high] crm-state** — state step failed: stages_hasAState
+- **[high] crm-state** — state step failed: stages_readsAsASentence
+- **[high] crm-state** — state step failed: stages_showsTheRequestId
+- **[high] crm-state** — state step failed: stages_hasARetry
+- **[high] crm-state** — state step failed: theScreenWasBrokenBeforeTheRetry
