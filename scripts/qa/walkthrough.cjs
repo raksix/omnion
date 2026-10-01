@@ -2792,6 +2792,99 @@ async function runAppBuilderConsole(page, report) {
   }
   await shot(page, "page-app-builder");
 
+  // ---- the bulk bar: a selection, a confirmation that names the count, and the delete ------
+  //
+  // The bulk delete is the one control on this screen whose *absence* was a defect rather than
+  // its behaviour: the acceptance criterion said "bulk delete of drafts" and the console had no
+  // checkbox column at all. So this section drives the control that now exists and reads every
+  // answer **out of the database** — the same rule the rest of this pass follows, because a note
+  // that says "3 deleted" is a claim about a click, and only the table knows what is gone.
+  //
+  // Two fixtures rather than one, because the interesting half of a bulk is the plan it does
+  // NOT delete: one draft and one `applied` plan, ticked together, is a selection where the
+  // confirmation must say one of them stays before the button is pressed.
+  const bulkOrg = (
+    qaSql("select organization_id from app_builder_plans limit 1") ||
+    qaSql("select organization_id from users order by created_at desc limit 1") ||
+    ""
+  ).trim();
+  if (/^[0-9a-f-]{36}$/i.test(bulkOrg)) {
+    const seedBulk = (title, status) => {
+      // `applied_at` and `status` move together — the migration's check refuses one without the
+      // other — so an applied fixture has to set both or the insert is rejected by a constraint
+      // that has nothing to do with what this section is measuring.
+      const appliedAt = status === "applied" ? ", applied_at = now()" : "";
+      const line = qaSql(
+        `insert into app_builder_plans
+           (organization_id, prompt, title, status, plan_version, model_label, created_by${appliedAt ? ", applied_at" : ""})
+         values ('${bulkOrg}', 'QA bulk fixture', '${title}', '${status}', 1, 'qa/mock-model',
+                 (select id from users order by created_at desc limit 1))
+         returning id`,
+      );
+      const first = (line || "").split("\n")[0].trim();
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(first) ? first : "";
+    };
+
+    const draftPlan = seedBulk("QA bulk draft", "draft");
+    const appliedPlan = seedBulk("QA bulk applied", "applied");
+    note({ draftPlan: Boolean(draftPlan), appliedPlan: Boolean(appliedPlan) });
+
+    if (draftPlan && appliedPlan) {
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForSelector("[data-select-all]", { timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(400);
+
+      // Tick exactly the two fixture rows. Ticking by `data-select-plan` rather than by row
+      // index is what keeps this section working when the table grows a column.
+      for (const id of [draftPlan, appliedPlan]) {
+        await page.locator(`[data-select-plan="${id}"]`).check().catch(() => {});
+      }
+      await page.waitForTimeout(300);
+
+      const bulkBarVisible = (await page.locator("[data-bulk-bar]").count()) > 0;
+      const bulkCountText = (await page.locator("[data-bulk-count]").first().innerText().catch(() => "")) || "";
+      note({ bulkBarVisible, bulkCountText });
+      if (!bulkBarVisible || !bulkCountText.includes("2 selected")) {
+        steps.ok = false;
+        steps.reason = `the bulk bar did not appear for a two-plan selection (bar=${bulkBarVisible} text=${JSON.stringify(bulkCountText)})`;
+      }
+
+      // The confirmation must name the applied plan BEFORE the delete is pressed. A dialog
+      // that only said "delete 2?" would leave the operator to discover which one stayed by
+      // looking at the list afterwards.
+      await page.locator("[data-bulk-delete]").click().catch(() => {});
+      await page.waitForSelector("[data-bulk-confirm]", { timeout: 6000 }).catch(() => {});
+      const confirmText =
+        (await page.locator("[data-bulk-confirm]").first().innerText().catch(() => "")) || "";
+      const appliedNamed = confirmText.includes("applied");
+      note({ confirmDialog: confirmText.length > 0, appliedNamed });
+      if (confirmText.length === 0 || !appliedNamed) {
+        steps.ok = false;
+        steps.reason = `the bulk confirmation did not name the applied plan: ${JSON.stringify(confirmText.slice(0, 200))}`;
+      }
+      await shot(page, "page-app-builder-bulk-confirm");
+
+      await page.locator("[data-bulk-confirm-delete]").click().catch(() => {});
+      await page.waitForTimeout(1400);
+
+      // Read the rows back out of the database. The note on screen is a claim about the click;
+      // this is the claim about the store.
+      const draftLeft = qaSql(`select count(*) from app_builder_plans where id = '${draftPlan}'`);
+      const appliedLeft = qaSql(`select count(*) from app_builder_plans where id = '${appliedPlan}'`);
+      const bulkNote = (await page.locator("[data-bulk-note]").first().innerText().catch(() => "")) || "";
+      note({ draftLeft: (draftLeft || "").trim(), appliedLeft: (appliedLeft || "").trim(), bulkNote });
+      if ((draftLeft || "").trim() !== "0") {
+        steps.ok = false;
+        steps.reason = `the bulk reported a delete but the draft plan is still in the table (${draftLeft})`;
+      }
+      if ((appliedLeft || "").trim() !== "1") {
+        steps.ok = false;
+        steps.reason = `the bulk deleted an APPLIED plan — its artifacts are what the live app was built from (rows left: ${appliedLeft})`;
+      }
+      await shot(page, "page-app-builder-bulk-deleted");
+    }
+  }
+
   // ---- the review workspace, opened by a REAL id ----------------------------------------------
   // A fixture, for the reason in the doc comment. The organization is read the way the AI
   // workflow pass reads it: from the table itself when a row exists, from `users` otherwise —
