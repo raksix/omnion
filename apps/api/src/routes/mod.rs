@@ -85,6 +85,7 @@ pub mod deployment_ops;
 pub mod deployment_run;
 pub mod developer;
 pub mod developer_oauth;
+pub mod developer_scaffolds;
 pub mod developer_sdks;
 pub mod environments;
 pub mod explorer;
@@ -1255,6 +1256,29 @@ pub fn router(state: AppState) -> Router {
     let dev_sdk_templates =
         get(developer_sdks::templates).layer(guards::require(&state, "developer.read"));
 
+    // The recorded generations and the archive (REQ-033, slice 4). All three take the SAME
+    // `developer.sdks.scaffold` key the generator takes, and that is the argument: a read-only
+    // developer must not be able to produce an artefact, and a list of what was produced is part
+    // of producing one. A separate read key here would be a key nobody holds and a list nobody
+    // sees.
+    //
+    // The download is the one that matters for the permission argument, and it is not a
+    // `developer.read`: a read-only developer who can fetch the bytes of a scaffold is holding
+    // the source of an extension, which is the artefact, not a description of it.
+    //
+    // GET and POST share `/dev/sdks/scaffolds` and are **merged**, not chained with `.or()` —
+    // `MethodRouter::or` runs the left router's error handling when it returns one, which is not
+    // what "also accept POST here" means. The roles router at the top of this function is the
+    // pattern.
+    let dev_scaffold_records = get(developer_scaffolds::list)
+        .layer(guards::require(&state, "developer.sdks.scaffold"))
+        .merge(
+            post(developer_scaffolds::record)
+                .layer(guards::require(&state, "developer.sdks.scaffold")),
+        );
+    let dev_scaffold_download = get(developer_scaffolds::download)
+        .layer(guards::require(&state, "developer.sdks.scaffold"));
+
     // The CLI device-code flow, and the permission split is the phishing defence rather than a
     // data-visibility question:
     //
@@ -2314,6 +2338,15 @@ pub fn router(state: AppState) -> Router {
         .route("/dev/sdks/templates", dev_sdk_templates)
         .route("/dev/sdks/scaffold", dev_scaffold)
         .route("/dev/manifests/validate", dev_manifest_validate)
+        // The recorded generations and the archive itself. `POST /dev/sdks/scaffold` above is the
+        // *preview*: it returns the file tree and writes nothing, which is what a person wants
+        // while choosing a name. These are the durable half — a row per generation, and the zip
+        // as a file. `GET` and `POST` on `/dev/sdks/scaffolds` are different methods on the same
+        // path, so the literal segment stays above `{id}` for the same reason
+        // `/dev/sdks/templates` is a sibling: axum ranks a `{id}` above a literal only when the
+        // methods differ, and sharing the path here would make one of them unreachable.
+        .route("/dev/sdks/scaffolds", dev_scaffold_records)
+        .route("/dev/sdks/scaffolds/{id}/download", dev_scaffold_download)
         // The device-code flow. `poll` and `approve` are separate segments rather than two
         // methods on one path, for the `Overlapping method route` reason the OAuth block above
         // records: axum builds its router at runtime, so a collision there is a startup panic
