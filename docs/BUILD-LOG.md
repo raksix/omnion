@@ -8371,3 +8371,66 @@ link's 180 M `.tmp`, and stale test executables — with `fuser`/`/proc` confirm
 is never mine to take). It is the only thing that can close three browser boxes at once: the stale
 banner, the viewer-permission rendering, and slice 3g's proposal card. Then REQ-099 slice 4,
 REQ-100, REQ-105, REQ-106, REQ-107, REQ-108.
+
+## tick 49 — REQ-099: the approval round trip, and the gap that hid it
+
+**What.** REQ-099's last open acceptance box read "a tool on the approval list parks the
+run; **approving from the trace resumes it to completion**". The park half had a walk. The
+decision half had a walk (REQ-101 slice 3h, last tick). Nothing had ever run them against
+each other — and the round trip did not exist, because **a run that parked on a gated tool
+wrote no `ai_approvals` row at all**. `io::request` had exactly one production caller, the
+change-set editor, so the single-call path parked a run nobody could decide: the inbox had
+nothing to show, the trace had nothing to render, and the box was unmeetable by clicking.
+
+Filing the row is not sufficient either, which is the part worth writing down. An approval
+requeues the run, and the agent's own `approvals` array still names the tool — so the
+requeued run walked back into the same branch and parked again. An approved run would have
+burned one provider call, one park and one requeue for ever.
+
+Three decisions, each a way the fix could be a new lie:
+
+1. **The release is content-matched, not tool-matched.** An approval answers one call's
+   arguments. A reviewer who approved a publish of `pricing` did not approve a publish of
+   `salaries`, and the same tool with different arguments parks again.
+2. **An `allow` policy row outranks a stale `approvals` array.** The array is the agent's
+   list; the policy row is the platform's later word — the same precedence the change-set
+   bridge already reads per operation. Without it, an operator who switched a class to
+   `allow` could never clear a run that parked before they did.
+3. **A filed request names the call as its own resource** (`tool_call` + `tool@hash`),
+   because `decide` refuses an approval that names no resource. My first version used
+   `resource_id: None`, and every row it filed was undecidable — the walk caught it as
+   `InvalidApproval("names no resource, so it cannot be checked for staleness")`.
+
+The write side and the read side share one `gated_preview`, so the row a park files and the
+row a resumed run matches cannot drift. Arguments are redacted **before** hashing: hashing raw
+arguments would make a call carrying a secret unmatchable against its own approved row, which
+parks for ever and reads as a permissions bug.
+
+**Proof.**
+
+- `cargo test -p omnion-api --test ai_tool_execution -- --test-threads=1` → **23 passed**
+  (was 20; +3).
+- `cargo test -p omnion-api --test ai_approvals` → **32 passed**.
+- `cargo test -p omnion-ai-hub --quiet` → **543 + 2 passed**.
+- `pnpm typecheck` → 2/2 packages clean.
+- **The three new walks are red on the pre-fix body** — the old branch restored verbatim, the
+  suite re-run, fix restored: **0 passed / 3 failed**. The file-it walk fails on the request
+  count, the release and policy walks on the park. An assertion that has never been red is a
+  description, not a gate.
+
+**A test-harness property, not a product defect.** Run at `--test-threads=4` the suite fails
+`a_control_proves_the_fixture_tool_really_writes` at the fixture's own `OnceLock` pool: every
+walk in the file shares the first pool installed, and a parallel walk dropping its scratch
+database breaks the rest. The file's own comment says the suite requires
+`--test-threads=1`. My first two runs used 4 and 3 and the failure was the fixture, not the
+code — read the failing line before blaming the change.
+
+**Open, and why.** The browser pass. The QA slot has been held by a **live** w3 holder for
+most of the tick (pid 2018881, `cwd=/mnt/apopic/omnion-w3`, 129 walks in, alive 1 h 40 m), and
+a live holder is never mine to take. The stale banner, the viewer-permission rendering and
+slice 3g's proposal card are still waiting behind it. This tick changed no screen, so no
+walkthrough extension is owed.
+
+**Next.** Run `QA_STACK=w7 QA_API_PORT=18086 QA_ADMIN_PORT=3106 QA_WEB_PORT=3206 QA_ONLY=ai
+bash scripts/qa/run.sh` when the slot frees. Then REQ-100 (workspace + the closing gate),
+REQ-105, REQ-106, REQ-107, REQ-108.
