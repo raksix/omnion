@@ -11016,3 +11016,43 @@ So **REQ-055 stays `in-progress`.** Three screens are committed and every fast g
 the harness), but a screen is not *accepted* until the browser pass opens it, and this tick did not
 get to prove that. The first act of tick 60 is the pass, not new work — the same way this tick's
 first act was making a half-written file build rather than adding to it.
+
+## Tick 60 — 2026-10-01 · REQ-055 slice 4 · the two 500s closed, and the self-service fixture
+
+**What.** Recovered an interrupted tick: the 10:21 browser pass had found two real `500`s and the
+fixes were sitting uncommitted. Built them, committed them, then found why `/hr/me`, `/hr/me/leave`
+and `/hr/me/documents` could never be driven and fixed the fixture.
+
+**Proof.**
+
+- `cargo test -p omnion-module-hr --quiet` → **132 passed, 0 failed** (private PostgreSQL 17 on 5444).
+- `apps/admin` `tsc --noEmit` → **clean**, exit 0.
+- `node --check scripts/qa/walkthrough.cjs` → clean.
+- The seeded link executed against the live `omnion-pg-w4` container and returned a **non-null**
+  `organization_id` (`1715b24e-65b4-47ac-8a2d-a39e94f3863b`) before the helper was committed; the
+  probe row was deleted afterwards.
+- `git status --porcelain` → empty.
+
+**Defects closed.**
+
+1. `make_interval(days => $1)` — no `bigint` overload, and `EXPIRY_WINDOW_DAYS` is an `i64` bound as
+   `bigint`. A `500` on `/hr/documents` that only met a parameter at request time.
+2. Unaliased headcount aggregates — sqlx's `FromRow` looked for `full_time` inside an expression.
+   A `500` on `/hr/reports/headcount` on every load.
+3. `ReportQuery.from`/`to` were bare `time::Date`; `time`'s serde wants a year and an **ordinal** day,
+   so every string the date picker sends was refused with `400`. Now read through the module's own
+   date adapter, with a test that parses the screen's literal JSON.
+
+**Not a bug.** The `/hr/me*` `404`s are the module's documented answer for an account with no
+employee row, and the screen renders "you are not in the directory yet". The defect was the
+**fixture**: the employee form has no account field, so the signed-in QA account was never in the
+directory and `runHrMe` returned before its first assertion — four screens only ever exercised their
+own empty branch. `linkQaAccountToEmployee()` now seeds the link, taking the tenant from the
+**department** because `users.organization_id` is NULL on this fixture.
+
+**Still open, deliberately not claimed.** The browser pass did not run: it is queued behind a live
+`w3` holder (pid 2624054, cwd verified live). REQ-055 stays `in-progress` — three screens and a
+500-free server are not the same as screens the browser opened.
+
+**Next.** The `/hr` pass, then the four unticked criteria: visibility `own`/`team`/`all`, audit on
+every write, org chart keyboard + counts, event feed to a subscribed webhook, mobile 390×844.
