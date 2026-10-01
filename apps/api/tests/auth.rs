@@ -547,6 +547,255 @@ async fn repeated_wrong_passwords_lock_the_account_and_not_only_the_address() {
     remove_user(&db, user_id).await;
 }
 
+/// The lockout emits `security.lockout.triggered`, and **only once per lock** (REQ-012).
+///
+/// Two claims are asserted here and they are different from each other, which is the point of
+/// the walk:
+///
+/// 1. **The event fires.** The event catalogue carries `security.lockout.triggered` and, until
+///    this commit, nothing emitted it — the `security.*` group of the `/webhooks` picker
+///    advertised a name that would never reach a receiver. The walk reads the row back out of
+///    the `events` table rather than trusting the response, because a sign-in that is *refused*
+///    and a sign-in that is *recorded* are two different claims and only the second one is the
+///    criterion.
+/// 2. **It fires ONCE, not once per attempt.** The counter that applies the lock keeps running
+///    while the lock is in force, so an emitter placed on "the account is locked" rather than on
+///    "this attempt applied the lock" would fire on every subsequent guess — and an attacker
+///    chooses how many guesses to make. That is the difference between an event that records
+///    the account that got caught and a volume metric of somebody's patience.
+///
+/// The walk also checks the payload carries the three fields the catalogue declares as
+/// required, and that it carries **neither** the attempted password nor the client address —
+/// a brute-force attempt is precisely the payload that must not be copied to a third party.
+#[tokio::test]
+async fn a_lockout_emits_the_event_once_and_carries_no_attempted_secret() {
+    let Some((state, db)) = live_state().await else {
+        return;
+    };
+    // One organization, one endpoint subscribed to the security group, and an account that
+    // BELONGS to that organization. The membership is the load-bearing part:
+    // `store::enqueue_fanout` returns zero for an event with no organization, so an account
+    // with `organization_id = null` — which is what every other fixture in this file has —
+    // would produce an event that is written, appears in `/events` as real, and reaches nobody.
+    // That is the exact shape of an emitter that forgot `.organization(...)`, and it is why the
+    // account is created inside the organization rather than with the shared helper.
+    let organization_id: Uuid = sqlx::query_scalar(
+        "insert into organizations (name, slug) values ($1, $2) returning id",
+    )
+    .bind("Lockout walk")
+    .bind(format!("lockout-walk-{}", Uuid::new_v4().simple()))
+    .fetch_one(db.pool())
+    .await
+    .expect("the organization must be created");
+
+    let email = format!("lockout-{}@omnion.test", Uuid::new_v4().simple());
+    let user = users::create_user(
+        db.pool(),
+        NewUser {
+            email: email.clone(),
+            password: PASSWORD.to_owned(),
+            display_name: "Lockout Walk".to_owned(),
+            organization_id: Some(organization_id),
+        },
+    )
+    .await
+    .expect("the account must be created");
+    let user_id = user.id;
+    let endpoint_id: Uuid = sqlx::query_scalar(
+        "insert into webhook_endpoints \
+            (organization_id, name, url, secret, events, enabled) \
+         values ($1, $2, $3, $4, $5, true) returning id",
+    )
+    .bind(organization_id)
+    .bind("Lockout subscriber")
+    .bind("https://receiver.invalid/security")
+    .bind("lockout-walk-secret-value")
+    .bind(vec!["security.*".to_owned()])
+    .fetch_one(db.pool())
+    .await
+    .expect("the endpoint must be connected");
+
+    // This walk's own address and its own limiter counter, for the reason the brute-force walk
+    // above spells out: a shared loopback address spends another walk's budget.
+    let peer = test_peer();
+    let redis = state.redis().clone();
+    redis
+        .connection()
+        .await
+        .expect("the shared Redis must answer before this walk starts guessing");
+    let sign_in_policy = omnion_security::RatePolicy::defaults()
+        .into_iter()
+        .find(|policy| policy.scope == "sign_in")
+        .expect("the sign_in policy must exist in the defaults");
+    let limiter_client = omnion_security::ClientId {
+        user_id: None,
+        ip: peer.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()),
+    };
+
+    let count_events = || {
+        let db = db.clone();
+        async move {
+            let count: i64 = sqlx::query_scalar(
+                "select count(*) from events where name = 'security.lockout.triggered'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("the events table must be readable");
+            count
+        }
+    };
+
+    let before: i64 = count_events().await;
+
+    // Walk to the lock. The account is in an organization, so the threshold is that
+    // organization's `security_policies` row (the column default, 10) — the walk stops the
+    // moment the account locks rather than guessing the number.
+    let mut locked_at = None;
+    for attempt in 1..=40 {
+        let _ = omnion_security::forget(
+            &redis,
+            &sign_in_policy,
+            &limiter_client,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await;
+        let (mut parts, body) = post_login(&email, "definitely-not-the-password").into_parts();
+        if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
+            parts
+                .extensions
+                .insert(axum::extract::ConnectInfo(address));
+        }
+        let response = call_from(
+            &state,
+            Request::from_parts(parts, body),
+            &peer,
+        )
+        .await;
+        if response.body["error"]["code"] == "account_locked" {
+            locked_at = Some(attempt);
+            break;
+        }
+    }
+    assert!(
+        locked_at.is_some(),
+        "no amount of wrong passwords locked the account; the lockout never fired"
+    );
+
+    let after: i64 = count_events().await;
+    assert_eq!(
+        after - before,
+        1,
+        "the lock that just happened emitted {} events; it must emit exactly one",
+        after - before
+    );
+
+    // The payload is read back out of the row, not out of the response: the response is a
+    // refusal and says nothing about what was recorded.
+    let (payload, organization_of_event): (Value, Option<Uuid>) = sqlx::query_as(
+        "select payload, organization_id from events \
+         where name = 'security.lockout.triggered' \
+         order by created_at desc, id desc limit 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("the emitted event must be readable");
+
+    // The lock is what an operator needs to find, and the threshold that caused it is the
+    // number they will immediately want to argue about.
+    assert_eq!(
+        payload["user_id"].as_str(),
+        Some(user_id.to_string().as_str()),
+        "the event must name the account that was locked: {payload}"
+    );
+    assert!(
+        payload["attempts"].as_i64().is_some_and(|n| n >= 1),
+        "the event must carry the threshold that fired: {payload}"
+    );
+    assert!(
+        payload["lockout_minutes"].as_i64().is_some_and(|n| n >= 1),
+        "the event must carry how long the lock lasts; a lockout with no duration in the \
+         payload cannot be scheduled against: {payload}"
+    );
+
+    // Neither of these is a credential, but a brute-force attempt is the one payload nobody
+    // should be copying to a third-party receiver, and a payload field is the easiest place for
+    // it to start. The attempted password never reaches the row today; this asserts it.
+    let text = payload.to_string();
+    assert!(
+        !text.contains("definitely-not-the-password"),
+        "the attempted password must never reach the event bus: {text}"
+    );
+    assert!(
+        !text.contains(&peer),
+        "the client address must never reach the event bus: {text}"
+    );
+
+    // Now the second claim: further guesses against the ALREADY locked account must not add
+    // another event. Without the `newly_locked` distinction this count is the number of times
+    // the attacker chose to try again.
+    for _ in 0..3 {
+        let _ = omnion_security::forget(
+            &redis,
+            &sign_in_policy,
+            &limiter_client,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await;
+        let (mut parts, body) = post_login(&email, "definitely-not-the-password").into_parts();
+        if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
+            parts
+                .extensions
+                .insert(axum::extract::ConnectInfo(address));
+        }
+        let response = call_from(&state, Request::from_parts(parts, body), &peer).await;
+        assert_eq!(
+            response.body["error"]["code"], "account_locked",
+            "the account is locked, so every further guess is refused as a lockout"
+        );
+    }
+    assert_eq!(
+        count_events().await - before,
+        1,
+        "three more guesses against an already-locked account added events; the event records \
+         that an account was caught, and an attacker chooses how many guesses to make"
+    );
+
+    // The event is attributed to the account's organization. This is the field that decides
+    // whether the row below can exist at all, so it is asserted from the stored row rather than
+    // trusted from the emitter.
+    assert_eq!(
+        organization_of_event,
+        Some(organization_id),
+        "the event must belong to the account's organization; without one it fans out to nobody"
+    );
+
+    // And the fan-out actually happened: an event nobody is subscribed to is not delivered.
+    let queued: i64 = sqlx::query_scalar(
+        "select count(*) from webhook_deliveries where endpoint_id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("the delivery queue must be readable");
+    assert_eq!(
+        queued, 1,
+        "the lockout event queued {queued} deliveries for its one subscriber; it must queue \
+         exactly the one"
+    );
+
+    remove_user(&db, user_id).await;
+    sqlx::query("delete from webhook_endpoints where id = $1")
+        .bind(endpoint_id)
+        .execute(db.pool())
+        .await
+        .expect("the endpoint cleanup must run");
+    sqlx::query("delete from organizations where id = $1")
+        .bind(organization_id)
+        .execute(db.pool())
+        .await
+        .expect("the organization cleanup must run");
+}
+
 #[tokio::test]
 async fn disabled_accounts_cannot_sign_in() {
     let Some((state, db)) = live_state().await else {

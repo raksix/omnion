@@ -11,12 +11,14 @@ use axum::extract::State;
 use axum::http::header::{HeaderValue, SET_COOKIE, USER_AGENT};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use omnion_events::{NewEvent, bus};
 use omnion_identity::devices;
 use omnion_identity::security;
 use omnion_identity::sessions::{self, NewSession};
 use omnion_identity::signin::{self, SignInOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
@@ -132,9 +134,47 @@ pub async fn login(
                 "this account is not active",
             ));
         }
-        SignInOutcome::AccountLocked { until } => {
+        SignInOutcome::AccountLocked {
+            until,
+            newly_locked,
+            user_id,
+            organization_id,
+            attempts,
+        } => {
             // A lockout is the account's own state, so the answer says so and carries when it
             // ends — the panel shows it instead of "wrong password" forever.
+            //
+            // The `security.lockout.triggered` event is emitted here, and **only** when this
+            // attempt is the one that applied the lock (`newly_locked`). `crates/identity` has
+            // no bus handle on purpose — the event bus depends on nothing, and an identity
+            // crate that reached for it would put a delivery fan-out on the sign-in path of
+            // every deployment. The API layer owns a bus already and this is the only caller of
+            // the password path, so the emitter sits here rather than in the crate that
+            // applies the lock.
+            //
+            // A failed emission is a log line, never a `500`: the lock is applied and the caller
+            // is already being refused, so failing the request would report a sign-in as broken
+            // when the platform did precisely what it was configured to do.
+            if newly_locked {
+                if let Err(error) = bus::emit(
+                    state.db().pool(),
+                    NewEvent::new("security.lockout.triggered")
+                        .organization(organization_id)
+                        .payload(json!({
+                            "user_id": user_id,
+                            "attempts": attempts,
+                            "lockout_minutes": lockout_minutes_from(until),
+                        })),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "the account was locked but the event was not emitted"
+                    );
+                }
+            }
+
             return Err(ApiError::forbidden(
                 "account_locked",
                 "too many failed attempts — this account is locked for a while",
@@ -160,6 +200,36 @@ pub async fn login(
         vec!["password".to_owned()],
     )
     .await
+}
+
+/// How many minutes a lock has left, rounded **up**, never negative.
+///
+/// The alternative — the difference between two instants, floor-divided — reports a 90-second
+/// lock as `1` and a 30-second lock as `0`, so a subscriber reading the payload sees a lockout
+/// that "lasts nothing". Rounding up is the honest direction for a countdown: it never claims
+/// less time than the account is actually refused, and it never goes negative, which a plain
+/// difference can when the lock expires between the two reads.
+fn lockout_minutes_from(until: OffsetDateTime) -> i64 {
+    lockout_minutes_between(OffsetDateTime::now_utc(), until)
+}
+
+/// [`lockout_minutes_from`] against an explicit "now", so the arithmetic can be tested at its
+/// boundaries.
+///
+/// The split is not ceremony. A test that builds `now + 60 seconds` and lets the function read
+/// its own clock is a test that computes 59.999 seconds and expects the answer for 60 — it fails
+/// or passes by how much of that second the scheduler gave away, which is the same class of
+/// defect as asserting a walk's own counter instead of the row it produced. The production
+/// caller passes the real clock; only the tests pass a fixed one.
+fn lockout_minutes_between(now: OffsetDateTime, until: OffsetDateTime) -> i64 {
+    let seconds = until - now;
+    if seconds <= time::Duration::ZERO {
+        return 0;
+    }
+    // `Duration::whole_minutes` is still unstable, so the division is spelled out rather than
+    // read off the duration — and rounding UP is the whole point, so this is not the
+    // truncating `/`.
+    (seconds.whole_seconds() + 59) / 60
 }
 
 /// End the current session. Idempotent: a request without a session is still a success.
@@ -287,4 +357,62 @@ pub(crate) async fn start_session_with_body<T: Serialize>(
         );
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixed instant, so every boundary below is exact rather than a race.
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("a valid instant")
+    }
+
+    #[test]
+    fn a_lock_always_reports_at_least_the_minute_it_still_refuses() {
+        // The countdown rounds UP, and these are the cases a plain floor-division gets wrong: a
+        // 90-second lock is two minutes of refusal, and a 30-second lock is still one whole
+        // minute the caller cannot sign in for. A subscriber reading `0` there concludes the
+        // account was never really locked.
+        //
+        // The 60/61 pair is the whole reason the arithmetic exists — 60 seconds is 1 minute and
+        // 61 is 2, so a truncating division and a rounding one disagree exactly here, and that
+        // is the only place they do.
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(90)), 2);
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(30)), 1);
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(60)), 1);
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(61)), 2);
+        assert_eq!(lockout_minutes_between(now(), now() + time::Duration::seconds(1)), 1);
+    }
+
+    #[test]
+    fn an_expired_lock_reports_zero_and_never_a_negative_count() {
+        // The lock can expire between the row read and the emission — `until` is read before
+        // the write, and the write is not in the same transaction as the clock. A plain
+        // difference of two instants is negative there, and a negative `lockout_minutes` in a
+        // payload is a number no receiver can render.
+        assert_eq!(
+            lockout_minutes_between(now(), now() - time::Duration::hours(1)),
+            0
+        );
+        assert_eq!(lockout_minutes_between(now(), now()), 0);
+        assert_eq!(
+            lockout_minutes_between(now(), now() - time::Duration::seconds(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn a_long_lock_is_reported_in_whole_minutes_not_seconds() {
+        // The payload field is named `lockout_minutes`, so the unit is part of the contract: a
+        // subscriber that assumed seconds would turn a 15-minute lock into 900,000.
+        assert_eq!(
+            lockout_minutes_between(now(), now() + time::Duration::minutes(15)),
+            15
+        );
+        assert_eq!(
+            lockout_minutes_between(now(), now() + time::Duration::minutes(90)),
+            90
+        );
+    }
 }

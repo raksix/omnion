@@ -10306,10 +10306,14 @@ three fixes committed and every gate green, and the browser leg **still owed** �
 honest state, not the "I ran a pass" reading of the same log.
 
 ## 2026-10-01 · Wave 5 · tick 91 — the overview counters were never driven by a real drain
+## Tick 92 — the name the catalogue was withholding, and the policy it was hiding
 
 **What.** Not a new screen: the second leg of REQ-011 slice 4, which says "a test endpoint
 receives a correctly signed purge payload **and the overview counters reflect it**". The
 payload ships. The counters had a walk and it could not have failed.
+Tick 91 ended with three fixes committed and a browser pass still owed because the box was at
+load 97. This tick picked the first unchecked acceptance box in wave 1 that did **not** need that
+pass, and the reason it was unchecked turned out to be more interesting than the note recorded.
 
 `the_overview_reports_the_queue_the_counters_and_the_last_twenty` queues two purges, drains
 **neither**, and asserts `failure_rate == 0.0` — a value that is *structurally* zero when
@@ -10317,6 +10321,13 @@ nothing has been attempted. A card wired to a constant passes that walk, and tha
 failure: the assertion and the defect it was written to catch are indistinguishable. The same
 shape as the credential field two ticks ago (`a7169471`, where every walk asserted
 `has_credential == false` and a build that stored nothing satisfied it).
+**The note was right and beside the point.** REQ-012's box said *"the sign-in route does not call
+`evaluate_lockout` yet"* — true, and it framed the work as wiring one function into another.
+Reading the two call sites rather than the note is what found the actual defect:
+`evaluate_lockout` is the **security centre's** arithmetic, and it is what the tester, the probe
+and `PUT /security/sign-in-protection` all agree with. `crates/identity` locks accounts with a
+completely separate statement in `register_failure`, reading `security_policies.lockout_attempts`
+from `0011_iam_advanced.sql` — a **different table**, with a default of 10 and a minimum of 3.
 
 `the_overview_counters_follow_a_real_drain_rather_than_the_queue` (`2c0ff769`) drives the
 window through two real drains and reads the counters back off the API. The ORDER is the trick
@@ -10327,6 +10338,12 @@ target by design. First drain therefore runs against the default `origin`; only 
 `generic_http` row exist, with `max_attempts = 1` so the refusal is a **failure** on the first
 pass rather than a retry. A two-attempt budget leaves the item `pending` and the card reads
 1 succeeded / 0 failed, which looks working and is not.
+So the screen, the route, the tester, the probe, the audit entry and the event catalogue were all
+correct, all typechecked, all unit-tested at 137 crate tests — and the number an operator tuned
+was not the number that locked their accounts. It is the eighth instance of this REQ's defect
+class and the most expensive one, because this time every surface agreed with every other surface
+and the product was still inert. **Two implementations of one policy, only one of them on the
+request path.**
 
 Two smaller things the walk had to be taught. `on conflict (site_id)` is unusable against this
 table: uniqueness is a **partial unique index** (`where site_id is not null`), not a
@@ -10334,8 +10351,26 @@ constraint, so the column list matches nothing and PostgreSQL answers `42P10` �
 deleted and reinserted instead. And the pre-drain zeros are asserted, because without them an
 `succeeded_24h` of 1 is also consistent with a counter that ignores the drain and counts the
 queue twice.
+**What shipped** (`98e66375`…`60151851`, four atomic commits):
 
 **Proof.**
+1. `SignInOutcome::AccountLocked` now carries `newly_locked`, `user_id`, `organization_id` and
+   `attempts`. The field that earns its keep is `newly_locked`: `sign_in` *finds* a live lock at
+   the top of the function and `register_failure` *applies* one at the bottom, and both return the
+   same variant. An emitter placed on the first fires on every subsequent guess — and an attacker
+   chooses how many guesses to make, so the event becomes a volume metric of their patience
+   rather than a record of the account that got caught.
+2. The emitter lives in `apps/api/src/routes/auth.rs`. `crates/identity` deliberately has no bus
+   handle — the event bus depends on nothing, and reaching for it would put a delivery fan-out on
+   the sign-in path of every deployment. The API layer owns a bus and the password path has one
+   caller. A failed emission is a `tracing::warn!`, never a `500`: the lock is applied and the
+   caller is already refused, so failing the request would report a sign-in as broken when the
+   platform did precisely what it was configured to do.
+3. `security.lockout.triggered` joins the catalogue — the name its own comment said "joins the
+   catalogue in the commit that gives the sign-in route an emitter". Its payload carries
+   `user_id`, `attempts` and `lockout_minutes`, and deliberately **not** the attempted password
+   and **not** the client address: an event bus fans out to third parties, and a brute-force
+   attempt is precisely the payload nobody should be copying anywhere.
 
 | Gate | Result |
 | --- | --- |
@@ -10346,6 +10381,14 @@ queue twice.
 | the same test alone, `--test-threads=1` | **ok**, 17.76 s |
 | Postgres during the failure | 47/100 connections, **0 ungranted locks** — contention, not deadlock |
 | browser pass | queued behind w6's, which is writing (artifact mtime 04:39:34) |
+**Two things writing the walk found that the design had not.** First, the emitter must carry the
+organization: `store::enqueue_fanout` returns **zero** deliveries for an event with no
+organization, so an emitter that forgot `.organization(...)` would write a row that exists, would
+appear in `/events` as a real record, and would reach nobody — the failure mode that looks most
+like success. The walk's account is therefore created *inside* an organization rather than with
+the org-less `test_user` every other walk in `tests/auth.rs` uses, and the assertion is on the
+queued delivery rather than on the event row. Second, `Duration::whole_minutes()` is still
+unstable on this toolchain (`E0658`), and the first version of the helper used it.
 
 **Next.** The browser pass still has not executed, so REQ-011's last box stays open and this
 tick closes nothing on that gate. Two ticks have now named the queue and both were honest; this
@@ -10355,6 +10398,15 @@ reap it. REQ-017's `/environments` boxes are the next slice in the queue, and ti
 that the panel "has no `/environments/new` route" is **stale**: `apps/admin/app/environments/[id]/page.tsx`
 exists and the wizard is deep-linked as `?wizard=1`, which is the right shape and was measured
 at a phone width by tick 74.
+**The `lockout_minutes` field rounds up, and the test that pins it had to be rewritten.** A
+countdown floored to minutes reports a 90-second lock as `1` and a 30-second lock as `0`, so a
+subscriber reads "this lockout has no duration" for a lockout it can plainly not sign in through.
+Round-up is the honest direction, and it never goes negative — a plain difference of two instants
+*is* negative when the lock expires between the row read and the write, because those are not in
+one transaction. The first version of the unit test computed `now + 60s` and let the helper read
+its own clock: 59.999 seconds, expected 60, failed `left: 1, right: 2`. That is the same defect
+class as a walk asserting its own counter instead of the row it produced, so the arithmetic was
+split into `lockout_minutes_between(now, until)` and the tests pass a fixed instant.
 
 **Merge.** `origin/main` was 6 commits ahead; `scripts/qa/run.sh` auto-merged and
 `docs/BUILD-LOG.md` conflicted as it always does. Resolved with the repo's own
@@ -10363,15 +10415,34 @@ recording: `/mnt/apopic/omnion-w5/target` had been **deleted out from under the 
 another writer's cleanup, and `cargo` reported it as
 `could not write output ... No such file or directory` — the os error 2 signature, not a disk
 full (os error 28). `CARGO_TARGET_DIR=/dev/shm/w5-target` is the standing answer on this box.
+**Proven to fail before believed.** With `if newly_locked` replaced by `if true`, the
+exactly-once assertion reads **`left: 4, right: 1`** — three extra guesses against an
+already-locked account, three extra events. A test that has only ever been seen pass is a test
+nobody knows the direction of.
 
 ## 2026-10-01 · Wave 5 · tick 92 — the gates that were never gates
+Proof this tick: `cargo build -p omnion-api` clean · `cargo test -p omnion-api --lib`
+**261 passed, 0 failed** · `omnion-identity` **49**, `omnion-events` **113**, `omnion-security`
+**137**, all 0 failed · `cargo test --test auth` **8/8** (26.9 s, live PostgreSQL) ·
+`every_live_name_has_an_emitter` + `every_emitted_name_is_in_the_catalogue` **2/2** ·
+`tsc --noEmit` exit 0 · `cargo test --test security` 4/4 re-run on a private
+`CARGO_TARGET_DIR` after a sibling deleted the shared `target/`.
 
 **What.** Not a new screen, and not a fix to one either. The browser gate on REQ-011 and REQ-017
 is still owed, the QA slot is still held by a live sibling, and rather than spend the tick
 re-measuring the queue I did the only work the box allows: read the passes that have **never
 executed** as source instead of as artifacts.
+**Two environment facts worth not rediscovering.** The `omnion` development database is stale —
+`Migration(VersionMissing(19))` fails **all eight** tests in `tests/auth.rs` identically,
+including six that predate this change, which reads as "sign-in is broken" and is a database that
+has not been migrated. And `failed to create query cache … No such file or directory (os error
+2)` is a sibling worktree deleting `target/` mid-build, not a compile error.
 
 Two commits, and they are the same defect wearing different clothes.
+Next: slice 3's remaining work is the one this tick made visible — make `crates/identity`'s
+`register_failure` read the **security centre's** lockout document, so the tuned number is the
+enforced number. Then REQ-012's browser pass (still owed, box permitting) for the boxes that name
+a screen.
 
 **A collected step is not a gate.** `steps.x = ...` lands in `summary.json` where a human reads it
 and no code does. `errorOffersRetry` on the notifications settings screen was
