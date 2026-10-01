@@ -9490,6 +9490,38 @@ async function runAiGuardDepth(page, report) {
   steps.badPatternNotStored =
     qaSql(`select count(*) from ai_guard_rules where key = '${key}_bad'`).trim() === "0";
 
+  // ---- what this guard does NOT catch -----------------------------------------------------------
+  // The residual-risk statement is the one screen whose value is entirely in what it says is
+  // missing, so the walkthrough has to assert the *misses* text exists rather than that the page
+  // renders. A page that renders an empty "misses" column would satisfy every other check here.
+  await page.goto(`${URL_ADMIN}/ai/guard/about`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.aboutRendered = (await page.locator("[data-guard-about]").count()) > 0;
+  steps.aboutNamesEveryLabel =
+    (await page.locator("[data-guard-about-label]").count()) >= 5;
+  // The screen's whole reason to exist: the residual risk has to be on the page, not behind a
+  // hover. A tooltip is opt-in, so a disclosure that only lives in one is a disclosure the
+  // operator who never hovers does not have.
+  steps.aboutStatesTheMisses =
+    (await page.locator("[data-guard-about-misses]").count()) > 0 &&
+    (await page.locator("[data-guard-about-misses]").first().innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim().length > 20;
+  steps.aboutReportsTheDisabledCount =
+    (await page.locator("[data-guard-about-disabled]").count()) > 0;
+  // The disclosure must come from the server's copy of the labels, not from a page-side list, or
+  // it goes stale the moment a rule changes. The counts have to be the measured ones.
+  const aboutBody = await page.request.get(api("/about")).then((r) => r.json()).catch(() => null);
+  steps.aboutServedByTheServer =
+    Array.isArray(aboutBody?.labels) &&
+    aboutBody.labels.length > 0 &&
+    aboutBody.labels.every((l) => typeof l.misses === "string" && l.misses.length > 0);
+  steps.aboutCountsTheBudget =
+    Number(aboutBody?.rule_budget ?? 0) > 0 &&
+    typeof aboutBody?.labels_disabled === "number" &&
+    typeof aboutBody?.all_permissive === "boolean";
+  await shot(page, "ai-guard-about");
+
   // ---- clean-up ---------------------------------------------------------------------------------
   for (const leftover of qaSql(`select id from ai_guard_rules where key = '${key}'`).split("\n").filter(Boolean)) {
     await page.request.delete(api(`/rules/${leftover}`), { failOnStatusCode: false }).catch(() => {});
@@ -10212,6 +10244,7 @@ async function main() {
     { path: "/ai/guard/rules", name: "ai-guard-rules", area: "ai" },
     { path: "/ai/guard/events", name: "ai-guard-events", area: "ai" },
     { path: "/ai/guard/tester", name: "ai-guard-tester", area: "ai" },
+    { path: "/ai/guard/about", name: "ai-guard-about", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
