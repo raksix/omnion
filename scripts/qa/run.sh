@@ -43,6 +43,26 @@ export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
 
+# A dangling `target` symlink kills the pass before it walks a single screen.
+#
+# A worktree can point `target` at a tmpfs directory (`target -> /dev/shm/w3-target`) to keep a
+# multi-gigabyte build off a nearly full disk. That is a symlink, so it SURVIVES whatever emptied
+# /dev/shm — and the next `cargo build` then fails with
+#
+#     error: failed to create directory `/mnt/apopic/omnion-w3/target`
+#     Caused by: Not a directory (os error 20)
+#
+# which is not a disk-full and not a permission problem, and reads like neither. Ten ticks of
+# deferred passes came after the first one; this one queued for the slot, took it, and died on
+# this line. Recreating the link's destination is a second, so the pass repairs what a foreign
+# cleanup emptied and says so, instead of exiting where the next reader sees only an errno.
+# A real directory, or a symlink to a live directory, is left exactly as it is.
+if [ -L target ] && [ ! -d target ]; then
+  target_dest="$(readlink -f target 2>/dev/null || readlink target)"
+  step "target is a dangling symlink to ${target_dest} — recreating it"
+  mkdir -p "$target_dest"
+fi
+
 wait_http() { # url, seconds
   local url="$1" deadline=$(( $(date +%s) + ${2:-120} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
