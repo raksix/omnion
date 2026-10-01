@@ -9813,3 +9813,56 @@ note in this ledger: a measurement that cannot be taken is reported as a **throw
 which kills the pass and takes every later measurement with it, rather than being recorded as an
 absent measurement. The mobile legs for REQ-021 are therefore still unmeasured — and this time the
 cause is in the file that is supposed to be measuring them.
+
+## Tick 49 (wave2-cms) — the pass finally ran end to end, and died on a one-line harness bug
+
+**Merge.** `origin/main` had moved one commit (`9a758c44`, notifications keyboard criterion).
+Merged as `fc8c2c86`; the only conflict was the append-only BUILD-LOG, spliced with
+`scripts/qa/merge-build-log.py` (base 6408 · ours 9754 · theirs 6469 → merged 9815, 0 entries
+lost on either side). Its advisory line-delta (`- pnpm typecheck (apps/admin)`) was the known
+false alarm — the line is present twice in the merged file, twice in ours and twice in theirs.
+
+**The blocker was infrastructure, not code.** The shared `omnion-postgres` (:5433) has been in
+recovery since ~06:42 with **no WAL replay progress**: `pg_controldata` reports the cluster
+`in production`, there is no `recovery.signal` and no `restore_command`, and the startup process
+has used 0:17 of CPU across 31 minutes. Every `FATAL: the database system is in recovery mode`,
+including the seven checks that had been silently SKIPPED for three ticks. That container is
+another writer's, so the fix was a private one: `omnion-postgres-w2` on :5449, the same answer
+w4 already chose with :5444.
+
+**Half a knob.** `reset-db.sh` and the `--only` filter test both read `QA_PG_CONTAINER`, but
+`run.sh` hardcoded `5433` inside `QA_DATABASE_URL` — so pointing the container elsewhere still
+left the API on the dead port. `QA_PG_PORT` now selects it and defaults to 5433, unchanged for
+every other stack (`0a07ccc6`; only the port is rewritten, the password bytes are untouched).
+
+**Two harness defects found by the run itself, both in the instrument.**
+
+1. `qaSql` returned psql's **command tag**, not a row. `insert … returning id` answers with two
+   lines under `-t -A` — the uuid, then `INSERT 0 1` — and `.trim()` welded them into one value
+   that the next statement used as a uuid. The pass died there (`70969a0d`, `-q` plus a filter;
+   proven live: without `-q` two lines, with it the uuid alone). It fataled in whichever module
+   ran second, so a harness defect presented as a sick comments module and a sick database.
+2. The `uuidOrNull` probe needed `cms_members`, which does not exist **before** `reset-db.sh` —
+   the exact order `run.sh` uses. Against a fresh database all 13 checks failed for a reason
+   having nothing to do with quoting (`5ed987ad`). Giving it its own scratch table also exposed
+   a hole that the missing dependency had been hiding: a guard returning literal `null` for
+   every value runs every statement perfectly. The section now ends on a **count** against a
+   seeded row, and the valid-uuid check coerces with `String()` — it used to call `.includes` on
+   the raw return value, so that variant **threw a TypeError and killed the probe**, green by
+   crashing. Verified: baseline 0 failures; all three mutations fail 2–3 checks.
+
+**Gates.** `cargo test -p omnion-content` **314 passed / 0 failed**. `pnpm typecheck` clean
+across 14 packages. QA pass `20261001-074231` walked 56 routes and reported 9 depth passes
+(patterns, notifications, events, webhooks, retention, security, health, forms, menus) before
+the `qaSql` fatal stopped it — so `comments`, `block-editor`, `members`, `seo` and `content-api`
+never ran.
+
+**Criterion 17 and 18 remain unticked, deliberately.** The filter that was the only thing between
+them and a measurement now works, the database answers, and the pass reached the module list —
+but it fataled before the four passes that would produce their numbers. A pass that dies on an
+earlier module is not evidence about a later one.
+
+**Next.** One more pass on the fixed harness, then criterion 17 (block-editor), criterion 18
+(members at both widths), and REQ-019's content-api criterion. `forms` reports 20 false keys
+beginning at `paletteAddsAField` and then failing every write that follows — one upstream cause
+rather than twenty defects, and the first job after the measurement.
