@@ -10979,3 +10979,52 @@ Gates for this half: `tsc --noEmit` clean, `node --check` clean (11 893 → 11 9
 **Still owed, unchanged:** a pass over `9a77f1c4`. The tick-96 pass that is still running was
 built before all five of this tick's commits and cannot see the wizard, the rollback dialog, the
 maintenance screen or the banner — it measures slice 1 and nothing else.
+
+### Tick 98 — the pass could not fail, and neither could my own claims from tick 97
+
+**What.** `4fa4b3b3`. The browser gate is the only thing that can close REQ-024's slices 1, 2 and
+3, and the pass that can do it is still queued behind the tick-96 run. So this tick spent itself
+auditing the instrument rather than the product — and found that the instrument reports success
+whether or not the product works.
+
+**The defect.** A gated claim that failed was recorded and read by nobody. `record()` appends to
+`clicks.jsonl`; the roll-up builds `findings` from `pushFindings`; `run.sh` reads only
+`summary.json`. Nothing connects them. So every `record({ severity: "high", ... })` in the file —
+the CDN purge console, the environments wizard, the security policies, the maintenance window —
+was a defect written down and never counted. The same held for a depth pass that returned
+`ok: false` because a screen never rendered: the strongest statement a pass can make about its own
+coverage, read by no part of the roll-up.
+
+**Proved against artifacts, not inferred.** The tick-86 w5 pass recorded 26 depth passes and wrote
+**0** entries carrying a severity. The w7 pass of 04:39 recorded 17 depth passes of which **16**
+returned `ok: false` — a PostgreSQL in recovery, a media library that never rendered — and its
+`findings` listed not one of them. A sibling's pass was red in every respect a reader would look
+at and green in the only column anyone reads.
+
+**The fix is at the paths that decide**, not at thirty call sites: `record()` promotes an entry
+carrying a severity into a finding from the moment it is declared, and the roll-up raises a high
+finding for any depth pass that returned `ok: false`. `skipped` is out-of-scope coverage and stays
+out of the tally, so a focused pass is not accused of failing at what it was not asked to walk.
+
+**And my own claims from tick 97 were in the same class.** The maintenance window's four claims
+were written `note({ step, reason })`, and this pass's `note` only appends to `steps` and the click
+stream — so a claim that failed was indistinguishable from one that never ran. They are now
+gates, and `rendered` is gated first: a screen that never opened cannot report a clean set of
+sub-claims it never took. The pass I wrote to prove slice 3 could not have failed. Writing a
+measurement and gating it are different acts, and the second is the one that counts.
+
+**Proof.** `node --check` clean. Two self-tests lift the shipped code out of the file and run it,
+because a fix to a measuring instrument that is only checked by reading is the same mistake in a
+new place: the `record()` promotion over a failing fixture yields **2 high** findings and drops
+ordinary records; the depth-pass loop over the real w7 `summary.json` raises **16** findings that
+were silently absent, while a scoped fixture holding one skipped and one failed pass raises exactly
+**1**. Checked the blast radius before shipping: every `ok`-bearing object in two real reports is a
+depth pass, and all 26 in the last green w5 pass are `ok: true`, so a healthy pass gains nothing.
+`pnpm typecheck` 2/2.
+
+**Still owed, unchanged and now sharper.** A pass over `4fa4b3b3` — and for the first time that
+pass can return a non-zero count, so the number in `QA_HIGH` is worth reading. The tick-96 run is
+at page 52 and still holds the w5 stack; it was compiled before every commit in ticks 97 and 98 and
+measures slice 1 only.
+
+**Next.** The pass, then REQ-024 slice 3's tick, then slice 4.
