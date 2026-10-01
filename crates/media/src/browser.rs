@@ -820,7 +820,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn a_metadata_filter_binds_its_key_before_the_operator_writes_itself() {
         // The defect this guards: the clause pushed `metadata -> $2 = $3` as *text* and then

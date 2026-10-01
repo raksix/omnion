@@ -75,7 +75,7 @@ pub fn parse(raw: &Value) -> Result<MetadataPairs> {
                     "expected an object of key/value pairs, found {}",
                     json_kind(other)
                 ),
-            })
+            });
         }
     };
 
@@ -98,7 +98,10 @@ pub fn parse(raw: &Value) -> Result<MetadataPairs> {
         }
         // A key that is only punctuation is a blank row in the editor that an operator cannot
         // see and cannot delete, because the editor hides the keys it does not understand.
-        if !key.chars().any(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
+        if !key
+            .chars()
+            .any(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
             return Err(MediaError::InvalidMetadata {
                 field: format!("metadata.{key}"),
                 reason: "a key needs at least one letter, digit, `_`, `-` or `.`".to_owned(),
@@ -148,7 +151,10 @@ pub fn parse(raw: &Value) -> Result<MetadataPairs> {
     if pairs.len() > MAX_PAIRS {
         return Err(MediaError::InvalidMetadata {
             field: "metadata".to_owned(),
-            reason: format!("a file carries at most {MAX_PAIRS} pairs; {} were sent", pairs.len()),
+            reason: format!(
+                "a file carries at most {MAX_PAIRS} pairs; {} were sent",
+                pairs.len()
+            ),
         });
     }
 
@@ -342,7 +348,10 @@ mod tests {
         let error = parse(&json!({ "licence": long.clone() })).expect_err("long value refused");
         let message = error.to_string();
         assert!(message.contains("metadata.licence"), "{message}");
-        assert!(message.contains(&(MAX_VALUE_LENGTH + 7).to_string()), "{message}");
+        assert!(
+            message.contains(&(MAX_VALUE_LENGTH + 7).to_string()),
+            "{message}"
+        );
     }
 
     #[test]
@@ -390,8 +399,8 @@ mod tests {
         // first draft of this test asserted the jsonb came back *type for type* and failed with
         // `Number(4)` against `String("4")` — the code was right and the test was wrong: a
         // column that stores three json types is a column with three comparison rules.
-        let pairs = parse(&json!({ "campaign": "spring", "licence": "CC0", "pages": 4 }))
-            .expect("parses");
+        let pairs =
+            parse(&json!({ "campaign": "spring", "licence": "CC0", "pages": 4 })).expect("parses");
         assert_eq!(
             to_json(&pairs),
             json!({ "campaign": "spring", "licence": "CC0", "pages": "4" })
@@ -403,7 +412,11 @@ mod tests {
         // A row written by a future release, or by a direct SQL insert, must still render.
         let stored = json!({ "campaign": "spring", "shoot": { "lens": "50mm" } });
         let pairs = from_json(&stored);
-        assert_eq!(pairs.len(), 1, "the pair this release understands survives: {pairs:?}");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "the pair this release understands survives: {pairs:?}"
+        );
         assert_eq!(pairs["campaign"], "spring");
     }
 
