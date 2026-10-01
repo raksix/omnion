@@ -1144,6 +1144,20 @@ export type NotificationChannelReadiness = {
   detail: string;
 };
 
+/**
+ * The installation's push key, and whether a browser can subscribe with it.
+ *
+ * `public_key` is `null` rather than `""` on purpose: it goes straight into
+ * `applicationServerKey`, and an empty string there makes `pushManager.subscribe`
+ * reject the call. `available` is false in the half-configured case too — a key with
+ * no contact address can be used to subscribe but never to send.
+ */
+export type NotificationPushKey = {
+  public_key: string | null;
+  available: boolean;
+  reason: string;
+};
+
 /** The four shapes a routing rule can address. Kept as data for the form's select. */
 export const NOTIFICATION_RECIPIENT_SHAPES = [
   { value: "actor", label: "The actor who caused it", needsTarget: false },

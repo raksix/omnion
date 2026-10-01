@@ -328,7 +328,7 @@ async fn send_with_transport(
 /// Turn a transport's outcome into the three fields the answer carries.
 fn settle(outcome: delivery::TransportOutcome) -> (bool, String, Option<i32>) {
     match outcome {
-        delivery::TransportOutcome::Accepted { status } => (
+        delivery::TransportOutcome::Accepted { status, .. } => (
             true,
             match status {
                 Some(code) => format!("the endpoint accepted the message with {code}"),
@@ -336,7 +336,7 @@ fn settle(outcome: delivery::TransportOutcome) -> (bool, String, Option<i32>) {
             },
             status,
         ),
-        delivery::TransportOutcome::Failed { status, reason } => (false, reason, status),
+        delivery::TransportOutcome::Failed { status, reason, .. } => (false, reason, status),
     }
 }
 

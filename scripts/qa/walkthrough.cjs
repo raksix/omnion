@@ -5835,6 +5835,112 @@ async function runNotificationSettingsDepth(page, report) {
   }
   await shot(page, "page-notifications-test-delivery");
 
+  // ---- the browser push device block (REQ-021, slice 6b) -----------------------------------
+  //
+  // **Why this block has its own legs rather than a screenshot.** The three device API
+  // functions had zero UI callers until this slice, so the screen could render a Web Push
+  // column with nothing behind it and every other leg in this pass would still be green. What
+  // has to be asserted is the *shape of the answer* in each of the three states a headless
+  // Chromium is actually in — an installation with no key, and one with a key and no
+  // registered browser — because those are the two states this pass can reach, and a block
+  // that renders nothing for them is indistinguishable from a block that was never wired up.
+  steps.pushDevicesPresent = (await page.locator("[data-push-devices]").count()) > 0;
+
+  if (steps.pushDevicesPresent) {
+    // Either of these is a valid state; what must not happen is neither.
+    const empty = await page.locator("[data-push-state=empty]").count();
+    const list = await page.locator("[data-push-state=list]").count();
+    const loading = await page.locator("[data-push-state=loading]").count();
+    steps.pushDevicesResolved = empty > 0 || list > 0;
+    steps.pushDevicesNotStuckLoading = loading === 0;
+
+    // The empty state has to *explain* what registering is. A heading with no body is a
+    // button with no explanation, and the reader cannot tell whether this is their phone or
+    // a colleague's laptop.
+    if (empty > 0) {
+      const copy = await page
+        .locator("[data-push-state=empty]")
+        .innerText()
+        .catch(() => "");
+      steps.pushEmptyExplainsScope = /this browser/i.test(copy) && copy.trim().length > 60;
+    }
+
+    // The enable button always exists. Whether it is *enabled* depends on the installation's
+    // key, and both answers are honest — but a block with no button at all is a block with no
+    // way to register, which is the defect this slice was written to close.
+    const enable = page.locator("[data-push-enable]");
+    steps.pushEnableOffered = (await enable.count()) > 0;
+    steps.pushReloadOffered = (await page.locator("[data-push-reload]").count()) > 0;
+
+    // The unavailable notice names the variable. "Push is not configured" sends an operator
+    // to a config file; "set OMNION_PUSH_PRIVATE_KEY" sends them to the right line of it.
+    const unavailable = await page.locator("[data-push-unavailable]").count();
+    if (unavailable > 0) {
+      const notice = await page
+        .locator("[data-push-unavailable]")
+        .innerText()
+        .catch(() => "");
+      steps.pushUnavailableNamesAVariable = /OMNION_PUSH_[A-Z_]+/.test(notice);
+      steps.pushEnableDisabledWhenUnavailable = await enable
+        .first()
+        .isDisabled()
+        .catch(() => false);
+    } else {
+      // No notice means the installation has a key, so the button must be live.
+      steps.pushEnableDisabledWhenUnavailable = false;
+      steps.pushEnableLiveWithKey = !(await enable.first().isDisabled().catch(() => true));
+    }
+
+    // Pressing it in a headless pass cannot succeed — there is no user gesture and no service
+    // worker — and the block must say *that* rather than silently doing nothing or throwing
+    // an unhandled rejection into the console. Chromium without a service worker rejects
+    // `navigator.serviceWorker.ready`, which is the exact leg that catches a missing catch.
+    if (steps.pushEnableOffered) {
+      await enable.first().click().catch(() => {});
+      await page.waitForTimeout(1800);
+      const said = await page.locator("[data-push-error]").count();
+      steps.pushEnableExplainsItself = said > 0;
+      if (said > 0) {
+        const text = await page
+          .locator("[data-push-error]")
+          .innerText()
+          .catch(() => "");
+        steps.pushErrorIsASentence = text.trim().length > 20;
+      }
+    }
+
+    // A remove button that exists on a row must delete that row, and the row must disappear
+    // from the DOM rather than only from the server's answer. Guarded on there being a device:
+    // in a pass with none, this leg is absent and that is recorded rather than passed.
+    const deviceRow = page.locator("[data-push-device]").first();
+    if ((await deviceRow.count()) > 0) {
+      const remove = page.locator("[data-push-remove]").first();
+      steps.pushRemoveOffered = (await remove.count()) > 0;
+      if (steps.pushRemoveOffered) {
+        const before = await page.locator("[data-push-device]").count();
+        await remove.click().catch(() => {});
+        await page.waitForTimeout(1500);
+        const after = await page.locator("[data-push-device]").count();
+        steps.pushRemoveRemovedTheRow = after < before;
+      }
+    }
+
+    // 390px: the block is a flex row of an icon, a name, a hint and a button, which is four
+    // things competing for 390 pixels. The rule is no horizontal scroll, and it is measured on
+    // this block specifically rather than on the page.
+    await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+    await page.waitForTimeout(500);
+    steps.pushDevicesFitNarrow = await page
+      .locator("[data-push-devices]")
+      .evaluate((node) => node.scrollWidth <= node.clientWidth + 1)
+      .catch(() => true);
+    await shot(page, "page-notifications-push-devices-narrow");
+    await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+
+  await shot(page, "page-notifications-push-devices");
+
   return steps;
 }
 

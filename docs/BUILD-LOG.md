@@ -1,3 +1,121 @@
+## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
+
+test(events): revive the whole suite. feat(events): catalogue four names the drift gate
+found already on the bus.
+
+**This tick started as two open REQ-016 boxes about a delivery row's `duration_ms` and the
+retry ladder's `next_attempt_at`, and turned into the discovery that the file which was
+supposed to prove them had not run a single assertion for twenty ticks.**
+
+I went looking for the two boxes because they name claims no walk measured: the main bus walk
+asserts `delivered`, `attempts == 1`, `response_status == 200` and a readable terminal error, and
+nothing anywhere asserted that a *successful* delivery carries a duration or that the retries are
+**increasingly spaced**. The second is not assertable by a walk that waits a fixed sleep between
+ticks — such a walk cannot tell "the ladder backed off" from "the runner happened to tick again
+later" — so it needed a walk of its own. Writing it meant running the suite, and the suite
+reported:
+
+```text
+1 passed; 10 failed          # every failure: 403 csrf_unavailable / csrf_failed
+```
+
+**Ten of eleven walks were re-proving one refusal, and none of them was testing the event bus.**
+
+### The root cause: a fixture that could not present a credential
+
+Tick 59 made the session cookie *ambient* authority. A cookie-authenticated **write** must now
+present a double-submit token beside it, and sign-in is the only place the product issues one.
+This suite never had either half of what it needed:
+
+1. it built its `Config` from the environment and **never set a CSRF secret**, so
+   `refuse_if_needed` returned `csrf_unavailable` — *"a test process has no
+   `OMNION_CSRF_SECRET`"*, and
+2. it minted sessions straight through `sessions::create_session` rather than signing in, so
+   **no token was ever issued**, which turns the same refusal into `csrf_failed` — *"this
+   request carries no CSRF token"*.
+
+Both refusals are the **product working correctly**. The defect was the fixture, and it was
+total: with no credential in hand, every `POST /webhooks`, every page publish, every delivery
+tick was refused before `crates/events` saw a request. `support::walk_auth` already lifts this
+shape for every other suite and its own doc comment records this exact failure — *"a red suite
+that blames the product is the most expensive kind of red"* — and `--test media` had already
+been repaired. This suite was simply never migrated.
+
+The fix is the mechanical one that helper prescribes: `with_csrf_secret(&mut config)` on the
+fixture, `account()` deriving each session's token with
+`omnion_security::derive_csrf_token(secret, session_id)` and **packing** it beside the session
+id, and `request()` calling `apply_credential` so the cookie and the `x-omnion-csrf` header are
+set together. Packing is why the twenty-odd call sites did not change: a walk's `token` argument
+never became a pair.
+
+```text
+cargo test -p omnion-api --test events -- --test-threads=1   11 passed  (was 1 passed, 10 failed)
+cargo test -p omnion-events --lib                             49 passed
+cargo test -p omnion-api --lib                               258 passed
+tsc -p apps/admin/tsconfig.json --noEmit                     clean
+```
+
+### The walk the two boxes needed
+
+`a_delivery_row_measures_its_own_duration_and_its_backoff_grows` reads its rows **out of the HTTP
+body**, because that is the path the screen takes: `duration_ms` and `next_attempt_at` are both
+columns on the deliveries table, so a value present in PostgreSQL but dropped by
+`DeliveryBody::build` would be invisible to an operator while every crate test stayed green. The
+ladder is climbed one attempt at a time — each reschedule strictly later than the one before it,
+and the gaps asserted **exponential** rather than merely monotone. A measured run:
+
+```text
+attempt 1 → +112 ms · attempt 2 → +197 ms · attempt 3 → +358 ms     (retry_base 40 ms)
+```
+
+**The assertion I wrote first was wrong and the ladder was right.** "The schedule is in the
+future" read *after* the walk has slept through the delay is asserting that the test slept long
+enough: with a 40 ms base and an HTTP round trip inside the tick, every collected timestamp is
+legitimately due by the time it is checked. Two earlier versions of that check failed while the
+backoff was doubling perfectly. The distance between consecutive schedules is the deterministic
+measurement of the same fact, and it is what the walk asserts.
+
+### Four blind spots in the drift gate, each pointing the registry the wrong way
+
+With the suite alive, its two pre-existing source-scan failures became visible — and both had the
+same shape as the notification queue defect from tick 88: **a measurement that cannot see what it
+is measuring, whose only "fix" is to make the registry lie in the other direction.** Three of the
+four were in the gate; one was a real gap in the table.
+
+| what the gate could not see | what it then claimed | the honest fix |
+|---|---|---|
+| a **doc comment** quoting `NewEvent::new("health.service.degraded")` as the *wrong* implementation | a name `health.service` was emitted that nothing emits | strip `//` before matching — a false emission would push a row for a sentence |
+| `Announcement::new(…)`, REQ-014's emitter, which **cannot** call `NewEvent::new` (health is platform-level and fans out per listening tenant) | 5 live names with no emitter | teach the gate the second constructor |
+| a name on the **next line** (`json!(…)` payloads) or three lines down (`if hold { … } else { … }`) | `health.*` and `media.hold_released` unbacked | a three-line lookahead, reading *every* line in the window for the marker |
+| a **dotted name inside `#[cfg(test)]`** (`health.service.exploded`, built to prove the catalogue check refuses it) | a catalogue row demanded for a name nothing emits | skip `#[cfg(test)]` modules — granting that row is a **lie** in the registry |
+
+Every one of those four pushes toward demoting real, working events to `Reserved`, which makes
+the picker say "a module ships this" about events the platform already emits. **The gate was not
+protecting the registry from drift; it was demanding the registry stop telling the truth.**
+
+The one real gap it did find: `backup.restored`, `notification.delivery.succeeded`,
+`media.hold_placed` and `media.hold_released` were all **Live facts on the bus that no operator
+could subscribe to**, because the picker reads this table and the table had never heard of them.
+`8d6b5b21` adds the four rows. `notification.delivery.succeeded` requires `test` rather than
+offering it — a receiver that read "succeeded" as a production delivery and paged somebody for a
+message a person deliberately asked the platform to send is the worst outcome of that row — and
+both `media.hold_*` require `reason`, because a retention decision nobody can defend later is not
+a retention decision.
+
+### Not done this tick
+
+The browser pass. `scripts/qa/run.sh` was queued behind live siblings for the whole tick — w4
+first, then w3 — and `QA_SLOT_WAIT=3600` held it rather than letting it collide, which is what
+that limit is for. **It then died at its own 2400 s timeout still queued** (the log's last line is
+`waiting for a QA slot`), so this tick has **no** browser pass and every screen-leg box below
+stays open. That is two consecutive ticks now, and the queue behind a single shared slot is long
+enough that the next tick should not assume it will get one either. So REQ-016's screen legs (the
+endpoint form's field messages, the payload inspector's clipboard contents, and the walkthrough
+inventory line) remain unticked with the reason in the box, and REQ-021's keyboard and mobile legs
+are still written-but-unmeasured.
+
+Next: the QA pass, then the remaining REQ-016 screen legs, then REQ-021's.
+
 ## 2026-09-30 — REQ-014 slice 2's last screen + the 14 committed compile errors nobody's gate could see
 
 feat(health): the service detail page draws a 24 h trend. fix(health): the health
@@ -9537,6 +9655,220 @@ block), `b6c9bdfe` + `f611569f` (the gate fix and the four new legs).
 
 **Still open.** The keyboard and mobile boxes want a browser pass; the QA slot was held by a
 live w3 pass for 24 minutes of this tick, so that instrument was not available here.
+
+### Tick 86 — REQ-021 slice 6a · the Web Push key pair (9fa3d805, 4f8081bf)
+
+**What.** The Web Push acceptance box has been open since REQ-021 was written, and the reason
+was never a missing browser pass. `web_push` was in the closed channel vocabulary, in the
+delivery queue, in the settings matrix and in the readiness table — and the installation had
+**no key to sign with at all**:
+
+```console
+$ grep -rni 'vapid' apps/ crates/ database/ modules/ scripts/
+   (nothing)
+```
+
+The runner was honest about it (`UNTRANSPORTED`: *"a signed payload needs the installation's
+key pair (REQ-037)"*), and the readiness table was not: its `web_push` branch reads
+`config.public_key`, and `grep -rn 'public_key'` over the tree finds only WebAuthn and MFA.
+**A readiness branch that reads a value no writer can produce is a green light wired to
+nothing** — the same defect class as the webhook branch closed last tick, one channel over.
+
+**Proof.** `62` core tests, was `45` — 17 new. Every VAPID test verifies its signature against
+the *published public key* with `p256`'s own verifier rather than against itself.
+
+```
+cargo test -p omnion-core --lib   62 passed; 0 failed
+```
+
+**Three defects found by writing it, two in the production code:**
+
+1. **`aud` three characters short.** `origin_of` sliced the string that had already had the
+   scheme stripped and then added `"://".len()`, producing `https://fcm.googleapi` for
+   `https://fcm.googleapis.com/fcm/send/abc`. A push service answers `401` to that on **every
+   send**, and the outbox has no column that says "your audience was malformed".
+2. **`p256::SigningKey::from_slice` left-pads a short slice.** A private key truncated by one
+   character produced a *valid* key for a different scalar: the browser registers against the
+   public key of the padded value, every send verifies against nobody, and the failure
+   surfaces days later as push that silently stopped working. Now refused on `len() != 32`.
+3. **My own test asserted the wrong property.** I asserted two signatures of one message
+   differ, i.e. that the nonce is randomised. `p256` is RFC 6979 **deterministic**, and that is
+   correct for VAPID — a service verifies the token and never sees a signature over a
+   *different* message. **The test was wrong, not the code**, and I rewrote it to assert
+   determinism *and* that a different `exp` changes the token.
+
+**Still open.** The encrypted-body half (`aesgcm`: ECDH → HKDF → AES-128-GCM), the
+`web_push` transport in `notification_runner.rs`, the public-key route the browser subscribes
+against, the `/notifications/settings` device block (three device API functions in
+`api.ts` still have **zero UI callers**), and `prune_endpoints`/`prune_stale` — which still
+have **zero call sites anywhere**, so a revoked endpoint is not yet pruned. Next tick.
+
+### Tick 87 — REQ-021 slice 6b · the transport, the key route, the devices block
+
+**What.** `web_push` left the runner's `UNTRANSPORTED` list. It was not a channel that
+quietly failed — it was a channel the runner *claimed*, re-queued with "no transport is
+installed for this channel" until the cap, and then wrote to `failed`, for a key pair that
+had shipped the previous tick.
+
+Three things had to exist before a send could happen, and none of them did:
+
+```console
+$ grep -rn 'prune_endpoints' --include=*.rs .     # the "a revoked endpoint is pruned" box
+crates/notifications/src/push.rs:240:   pub async fn prune_endpoints(…)   # a definition
+                                                            # zero call sites, anywhere
+```
+
+- **the destination** — `DeliveryJob.push_targets`, filled by a second query. This forced
+  `DeliveryJob` to **stop deriving `FromRow`**: `sqlx` requires every field of a `FromRow`
+  to be a `Type<Postgres>`, and a `Vec<PushTarget>` is not one, so `#[sqlx(default)]` does
+  not work either. `ClaimedRow` is now what the `SELECT` decodes, and the conversion is one
+  function — so a column list that drifts fails to compile.
+- **the transport** — one ciphertext per device, because a body sealed to a phone's key pair
+  cannot be read by a laptop. One delivery settles once: `sent` when any device accepted,
+  `failed` only when every device refused.
+- **the prune** — a `404`/`410` is collected *during* the send and deleted *after* the row is
+  settled. Deleting inside the loop iterating over its own collection is a second bug
+  layered on the first: the collection shrinks under the loop and a fifth device can be
+  skipped without ever being sent to.
+
+**Proof.**
+
+```
+cargo test -p omnion-core --lib          73 passed
+cargo test -p omnion-notifications --lib 101 passed   (95 → 101, 6 new)
+cargo test -p omnion-api --lib          258 passed   (247 → 258, 11 new)
+cargo test -p omnion-permissions --lib   63 passed
+tsc -p apps/admin/tsconfig.json --noEmit exit 0
+bun build scripts/qa/walkthrough.cjs      parsed (playwright-core external)
+```
+
+**Three defects found by writing it, all three in my own code.**
+
+1. **A doc comment that described a language feature that does not exist.** I wrote that
+   `TransportOutcome::Accepted { status }` keeps compiling because `pruned` is "defaulted",
+   and then claimed `#[serde(default)]` on a struct variant of a type that is not `serde` at
+   all. Rust has no per-field default on a struct variant — the compiler said so. `accepted()`
+   and `failed()` constructors are the fix, and they have a second benefit: a future match arm
+   cannot silently forget a prune by writing `status: None` and stopping.
+2. **`WebPushTransport::new` built the transport without a contact address.** My own doc
+   comment said the constructor required "a usable key **and** a contact", and the code
+   required only the key. Every send would have been refused `401` by the push service for a
+   `sub` claim that is not a URL, days after an operator believed push worked — with no
+   outbox column able to distinguish it from a bad signature. Caught by the test that
+   asserted the constructor's own documented behaviour.
+3. **`request_user_agent` was `fn(&AppState, &CurrentSession) -> Option<String> { None }`** —
+   the **sixth** instance of this REQ's defect class. The right name, called from the right
+   place, returning nothing, with a doc comment two paragraphs above it arguing that the
+   value must come from the request headers "rather than taken from the body". The parameters
+   were there to make the signature look plausible: it took an `AppState` and a
+   `CurrentSession` and needed neither, because neither carries a header map. The
+   `user_agent` column has been `NULL` on every device row since slice 3, so the device list
+   could never answer the only question it exists for — *is this still my phone?*
+
+And one that was a gap rather than a defect: `PushConfig`'s fields are private, which is
+right (a private key is a credential), but "generated at deploy time" means something has to
+hand the platform a key it did not read from the environment. `with_private_key` /
+`with_contact` are that door, and they validate on *read* so "what is configured" and "what
+would a push service accept" stay two separate questions — which is what lets the settings
+screen say "you pasted something that is not base64url" instead of "push is broken".
+
+Commits: `f0d76c5f` (the transport), `473d98ec` (the push-key route + the browser string),
+`40cc566c` (the device block + the walkthrough legs).
+
+**Still open.** The acceptance box wants *subscribe, receive one real notification,
+unsubscribe* — and that needs a real browser. A headless Chromium has no user gesture and no
+service worker, so `pushManager.subscribe` cannot succeed there, and no amount of harness
+work substitutes. The walkthrough gained legs for the three states a headless pass *can*
+reach (no key on the installation, no device registered, and the `serviceWorker.ready`
+rejection), because that is what distinguishes a block that renders nothing from a block that
+was never wired up — which is how this slice found that three API functions had no callers.
+
+**The QA pass did not run: the slot was held for the whole tick.** Not a stale holder — a
+*live* one. `scripts/qa/run.sh` logged `waiting for a QA slot (max 1 concurrent pass)` for
+eleven minutes and the holder changed pids twice underneath it, which is a sibling loop
+(`/mnt/apopic/omnion-w5`, `QA_STACK=w5`) running back-to-back passes. `QA_SLOT_WAIT=3600` in
+`/etc/profile.d/omnion-qa-limits.sh` queued mine rather than letting it collide, which is the
+behaviour that limit exists for, so the pass is *running and waiting*, not failed. The legs
+for the device block are written and unrun; they are recorded here as **written, not
+measured**, because a screenshot is not a leg and an unrun assertion is not a proof.
+
+Next tick runs the pass first — it is the cheapest outstanding work and everything else in
+slice 6 is already committed, tested and pushed.
+
+## Tick 88 — REQ-021 slice 6c: the delivery queue had no producer
+
+**What.** `delivery::enqueue` had **zero production callers**. `store::record` wrote the
+`notifications` row and stopped; the emit route (`POST /api/v1/notifications/emit`) and the event
+router (`router::route`) both went through it; `enqueue` — which writes the
+`notification_deliveries` rows the runner claims — was called from exactly one place, the
+test-delivery route. So for six slices the platform had shipped a durable queue with a claim
+lease, four transports, exponential backoff, a cap, an admin outbox and a live-database
+lifecycle suite, and **no notification had ever produced a delivery row**. The consequences were
+silent and total: no e-mail was sent, no push was delivered, and the drawer's per-channel rows —
+the whole reason `notification_delivery_reader` exists — had nothing to read. "It is in my panel
+but the e-mail never came" was true for a reason nobody could see.
+
+**Why six slices of green tests missed it.** Every walk in `notification_delivery.rs` calls
+`enqueue` itself. That proves the queue *drains*. Nothing proved anything *fills* it, and a
+suite that supplies its own input is a suite that cannot detect a missing wire. The one caller
+that did exist — the test-delivery route — has the job of proving the queue works, so it could
+never be evidence that an ordinary notification produces a delivery.
+
+**The fix.** `store::record_with_deliveries` is the missing join: one insert whose `returning`
+supplies the id, then the reader's own allowed/disabled channel lists (both now answered by
+`preference_store`, so no caller writes its own subtraction), then `enqueue`. The emit route and
+`router::route` both call it. `record` and `enqueue` stay public for the paths that legitimately
+want a different channel set.
+
+**Three defects, all in my own code, all found by writing the walk that had been missing.**
+
+1. **A double insert.** The first shape called `record` and then repeated the insert with
+   `returning id` to recover the id — which writes **two** `notifications` rows for every draft
+   with no `dedupe_key`, because the `on conflict` clause is partial (`where dedupe_key is not
+   null`) and does nothing at all for a null key. Every undeduped notification would have
+   appeared twice and both would have counted in the badge. The walk's `count(*) == 1` is the only
+   assertion that distinguishes the two shapes.
+2. **`chat` queued for a channel with no transport.** `chat` is in the closed vocabulary and the
+   default matrix has it **enabled**, so enqueueing "every allowed channel" writes it `pending`;
+   the runner then claims it, finds no transport, re-queues to the cap and writes `failed` — a
+   channel the platform has not built spending three attempts and appearing in the outbox as a
+   failed delivery. `enqueue` now owns `QUEUEABLE` and writes undrainable channels `skipped` with
+   a reason **distinct** from the reader's own switch-off, because the two send the reader to
+   different places (a setting vs an administrator).
+3. **The fix for (2) was itself a no-op until the walk caught it.** The skip was in a third loop
+   *after* the enabled loop, and `insert_delivery` is `on conflict do nothing` — so the enabled
+   loop had already inserted `chat` as `pending` and the `skipped` row silently did nothing. The
+   code read correct and compiled green. Only reading the status back out of the table (all five
+   `pending`, expected `skipped`) exposed it. The check belongs in the first loop.
+
+**A pre-existing red gate, fixed here.** `the_email_transport_refuses_a_reader_with_no_address…`
+asserts the webhook reason contains `"no endpoint"`; commit `43a86c13` (slice 5) improved that
+sentence to `"no destination"` and left the assertion behind. **This walk has been red since
+slice 5** — a live-database suite that nobody ran because it was known-red, covering the exact
+lifecycle slice 6c is about. The assertion now covers the substance rather than the wording.
+
+**Proof.**
+
+```text
+cargo test -p omnion-notifications --lib    102 passed  (was 101)
+cargo test -p omnion-api --lib              258 passed
+cargo test -p omnion-permissions --lib       63 passed
+tsc -p apps/admin/tsconfig.json --noEmit    exit 0
+cargo test -p omnion-api --test notification_delivery -- --test-threads=1   10 passed
+```
+
+The two new walks (`a_notification_written_by_the_producer_path_arrives_with_its_deliveries`,
+`a_channel_the_reader_switched_off_is_skipped_by_the_producer_path`) call **no `enqueue` of their
+own** — that absence is the assertion — and read the channels, statuses and reasons back out of
+PostgreSQL rather than trusting a returned count.
+
+**Not done this tick.** The browser pass. The QA slot was held for the whole tick by a **live**
+w4 pass (`/tmp/omnion-qa-slot-holders` → pid 4149471, cwd `/mnt/apopic/omnion-w4`); it is
+back-to-back passes, not a stale holder, so `QA_SLOT_WAIT=3600` queued this one rather than letting
+it collide — which is what that limit exists for. The device-block legs from tick 87 and the
+keyboard/mobile legs are therefore still **written, not measured**. Next tick runs the pass first.
+
+Next: the remaining REQ-021 legs, then REQ-016.
 
 ## Tick 86 — four harness defects, each of which read as a product bug
 
