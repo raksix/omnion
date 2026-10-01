@@ -69,7 +69,90 @@ pub async fn record(
     Ok(result.rows_affected() == 1)
 }
 
-/// Record the same notification for several people at once.
+/// Record one notification **and the deliveries its own channel configuration asks for**, and
+/// report what came of each.
+///
+/// **This is the producer side of the whole delivery subsystem, and until this slice existed
+/// nothing in production called it.** `record` writes the `notifications` row; `enqueue` writes
+/// the `notification_deliveries` rows; and the two had no call site that did both. The emit
+/// route recorded rows the runner could never claim (so no e-mail was ever sent, and the drawer
+/// listed no channel at all — "it is in my panel but the e-mail never came" had no row to be a
+/// fact about), and the router did the same for every bus event. Two subsystems, each complete
+/// and each useless alone: a queue with no producer and a producer with no queue. The test
+/// delivery route was the *only* caller, which is why a green suite did not catch it — a suite
+/// that fills the queue itself proves the queue drains, not that anything ever fills it.
+///
+/// **Why the id is returned rather than re-read.** A dedupe that collapses returns no row, so
+/// there is no id to give; a `record` that returned `Option<Uuid>` would make the caller ask
+/// "did I create it, and what is it" as one question, which is the only shape in which the
+/// answer is not two lookups that can disagree. The previous production pattern read the id
+/// back by dedupe key — a lookup by a value the caller chose, which is a guess dressed up as a
+/// query. `None` is the *second* emit of the same fact, and the notification that already
+/// exists already carries its delivery rows.
+///
+/// A caller that wants a different set of channels than the reader's own configuration asks
+/// for — the test delivery route is the one — uses [`record`] and [`delivery::enqueue`]
+/// directly. This function is for the path that must not be able to forget.
+pub async fn record_with_deliveries(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    emitted_by: Option<Uuid>,
+    draft: &NewNotification,
+) -> Result<Option<(Uuid, crate::delivery::EnqueueReport)>> {
+    // **One insert, and that is load-bearing.** An earlier shape of this function called
+    // `record` and *then* repeated the insert with `returning id` to get the id — which writes
+    // **two** `notifications` rows for every draft that carries no `dedupe_key`, because the
+    // `on conflict` clause is partial (`where dedupe_key is not null`) and therefore does
+    // nothing at all for a null key. The reader would have seen every undeduped notification
+    // twice, the badge would have counted both, and the only evidence would have been a count
+    // nobody had a reason to distrust. So the statement below is the *only* write, and its
+    // `returning` is what supplies the id.
+    let validated = draft.clone().build()?;
+    let inserted: Option<Uuid> = sqlx::query_scalar(
+        "insert into notifications \
+         (organization_id, user_id, category, priority, title, body, url, source_type, \
+          source_id, payload, dedupe_key, emitted_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         on conflict (user_id, dedupe_key) where dedupe_key is not null do nothing \
+         returning id",
+    )
+    .bind(organization_id)
+    .bind(validated.user_id)
+    .bind(&validated.category)
+    .bind(&validated.priority)
+    .bind(&validated.title)
+    .bind(&validated.body)
+    .bind(&validated.url)
+    .bind(&validated.source_type)
+    .bind(&validated.source_id)
+    .bind(&validated.payload)
+    .bind(&validated.dedupe_key)
+    .bind(emitted_by)
+    .fetch_optional(pool)
+    .await?;
+
+    // `None` is the *second* emit of the same fact: the partial unique index refused it. The
+    // notification that is already there already carries the delivery rows from the emit that
+    // made it, so there is nothing to add — and re-enqueueing them would be a no-op the caller
+    // would have to learn not to read as "the retry worked".
+    let Some(id) = inserted else {
+        return Ok(None);
+    };
+
+    let allowed =
+        crate::preference_store::allowed_channels(pool, validated.user_id, &validated.category).await?;
+    let disabled = crate::preference_store::disabled_channels(
+        pool,
+        validated.user_id,
+        &validated.category,
+    )
+    .await?;
+
+    let report = crate::delivery::enqueue(pool, id, &allowed, &disabled).await?;
+    Ok(Some((id, report)))
+}
+
+/// Record the same notification for several people at once, deliveries included.
 ///
 /// A module that has to tell forty reviewers that a page is waiting writes one loop over forty
 /// drafts, not forty statements — and the result says how many rows really appeared, so a
@@ -87,6 +170,48 @@ pub async fn record_many(
         }
     }
     Ok(created)
+}
+
+/// Record the same notification for several people, deliveries included, and count the rows.
+///
+/// **The deliveries variant of [`record_many`], and the reason it exists separately is the same
+/// as [`record_with_deliveries`]'s:** a bulk producer that records without enqueueing leaves a
+/// queue nothing ever fills, and the difference is invisible in every number except the drawer.
+///
+/// A deduped recipient counts as `deduped` rather than `created`, and its deliveries are left
+/// exactly as they were: the notification that already exists already carries the delivery rows
+/// from the emit that made it, and re-enqueueing them would only ever be a no-op.
+pub async fn record_many_with_deliveries(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    emitted_by: Option<Uuid>,
+    drafts: &[NewNotification],
+) -> Result<BulkRecord> {
+    let mut report = BulkRecord::default();
+    for draft in drafts {
+        match record_with_deliveries(pool, organization_id, emitted_by, draft).await? {
+            Some((_, enqueued)) => {
+                report.created += 1;
+                report.queued += enqueued.queued;
+                report.skipped += enqueued.skipped;
+            }
+            None => report.deduped += 1,
+        }
+    }
+    Ok(report)
+}
+
+/// What a bulk record produced: the rows, and the deliveries behind them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BulkRecord {
+    /// Notifications that did not exist before this call.
+    pub created: u64,
+    /// Notifications that were already there under the same dedupe key.
+    pub deduped: u64,
+    /// Delivery rows written as `pending`.
+    pub queued: u32,
+    /// Delivery rows written as `skipped`, each with its reason on the row.
+    pub skipped: u32,
 }
 
 // ---------------------------------------------------------------------------------------------
