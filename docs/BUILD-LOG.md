@@ -7216,3 +7216,56 @@ second concurrent pass is what produced pass `20261001-021909`. When the slot fr
 middle one is the row's whole point, because a drag that recorded nothing leaves the button
 disabled and still reports `returned: true` if the card never moved. Then drive the depth claim
 (50 presses) or state plainly that the bound is unproven. Criterion 6 is not close.
+
+## 2026-10-01 · tick 48 · `fix(builder): the undo button could write a discarded graph over another editor's`
+
+**The Reload exit of the two-tab conflict left the undo history pointing at the graph the author
+had just chosen to discard.** `load()` is not a refresh — it is the button the server's own
+sentence offers ("reload to see their change, or keep editing to overwrite it"), and the error
+state's "Try again" calls it too. It replaced `nodes`, `edges`, `versionRef` and the save
+indicator, and told nothing else. So the Undo button stayed **enabled** after the canvas adopted
+another editor's definition, and every entry it held described the old graph.
+
+`doUndo` ends in `queueSave()`, and `queueSave` quotes `versionRef` — which `load` had just
+advanced to the server's current version. So one press of `⌘Z` after a conflict wrote the
+discarded graph back over the other tab, the server **accepted** it (the quoted version was
+current, so no conflict was possible), and the concurrency guard this feature exists for was
+undone by the undo button. No error, no banner, no second refusal — the one control an author
+reaches for when something looks wrong was the one that destroyed the work. The selection had
+the matching defect one screen down: it was never pruned, so the inspector could keep rendering a
+node the loaded graph does not contain.
+
+**The history is emptied, not extended, and that is the decision worth writing down.** Keeping an
+entry for the adoption would be prettier ("undo the reload") and is wrong: undo would restore the
+pre-adoption graph and `queueSave` would write it, so the single press an author is most likely
+to try after a conflict is the one that destroys what they just decided to keep. The selection is
+**pruned rather than cleared**, because the other editor routinely leaves your card alone and a
+reload that dumps the inspector for no reason discards the author's place.
+
+`reload-rebase.ts` is a function rather than three lines in `load` for the same reason
+`conflict.ts` and `node-status.ts` are: a rule that lives only inside a `useCallback` can only be
+tested by reading the component. `selectionRef` is a mirror beside the existing `saveRef`, for
+the existing reason — `load` is a callback declared above the history and is called from a click
+handler that must read the selection as it stands at press time.
+
+**Proof.** `node --test` → **238 passed** (228 before, +10), `pnpm typecheck` clean,
+`cargo test -p omnion-workflows --lib` unchanged (a caller defect, not an engine one). All four
+halves are **proven to bite**, one assertion each: reverting the call, calling it and discarding
+the result, keeping the entries in the module, and clearing instead of pruning.
+
+**Four of this tick's ten assertions were wrong, all in the same direction, and three of them
+demanded the behaviour this feature's own doc comment forbids.** A single click is a *focus* with
+no group (`selectNode` returns `nodes: []`), so "the deleted card's focus falls to the surviving
+card" is false and the honest answer is nothing; had I "fixed" the product to match, a reload
+would have started selecting cards nobody asked it to. `pruneSelection` also falls back to
+`nodes[0]`, the FIRST survivor, not the last — I assumed symmetry with `selectGroup`'s
+focus-the-last because the two felt like they had to agree. Printed the real values before
+touching an expectation, which is now the rule for this file: three of the four reds were my
+fixtures, and the product was right in all three.
+
+**Next.** Nothing is ticked and nothing is measured. The QA slot is held by a live `omnion-w5`
+pass (36 Chrome, `/dev/shm` at 98% with 827M free — a pass would not fit even if it were free),
+so the tick was spent on slot-free measured work. The walkthrough needs a row that reloads after a
+conflict and reads the Undo button's own `disabled` attribute, because `drag-undo` measures the
+reverse: it asserts the button ENABLES after a drag. The 50-press depth claim is still answered
+by the constant `HISTORY_LIMIT = 100` and by nothing else.
