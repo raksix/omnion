@@ -337,7 +337,7 @@ pub async fn raw_with_preset(
         .filter(|p| !p.is_empty())
     else {
         // No preset: the original bytes, through the same headers as before.
-        return serve_original(&state, &media, range).await;
+        return serve_original(&state, &media, range, &headers).await;
     };
 
     let name = match validate_preset_name(requested) {
@@ -350,7 +350,7 @@ pub async fn raw_with_preset(
                 preset = requested,
                 "unusable preset name, serving the original"
             );
-            return serve_original(&state, &media, range).await;
+            return serve_original(&state, &media, range, &headers).await;
         }
     };
 
@@ -366,7 +366,7 @@ pub async fn raw_with_preset(
                     preset = %name,
                     "unknown preset, serving the original"
                 );
-                return serve_original(&state, &media, range).await;
+                return serve_original(&state, &media, range, &headers).await;
             }
         };
 
@@ -452,7 +452,17 @@ async fn serve_original(
     state: &AppState,
     media: &omnion_media::MediaFile,
     range: Option<&str>,
+    request_headers: &axum::http::HeaderMap,
 ) -> std::result::Result<AxumResponse, ApiError> {
+    // This is the panel's real read path — `raw_with_preset` falls through to it whenever no
+    // preset is named — so it is the one a thumbnail in the library grid and a preview pane both
+    // hit. A validator added to `/media/{id}/raw` alone would have been one the walk never
+    // reaches: the route that *looks* like the read path is this one.
+    let conditional =
+        crate::routes::media::conditional_headers(request_headers, &media.checksum, media.updated_at.or(Some(media.created_at)));
+    if conditional.verdict == omnion_media::validators::Conditional::NotModified {
+        return crate::routes::media::not_modified(&conditional);
+    }
     let plan = omnion_media::serve_plan(&media.content_type);
     let (status, bytes) =
         crate::routes::media::read_window(state, &media.storage_key, range, media.size()).await?;
@@ -472,6 +482,7 @@ async fn serve_original(
     headers.insert(header::CACHE_CONTROL, header_value("private, max-age=300")?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
     crate::routes::media::apply_range_headers(headers, ranges)?;
+    crate::routes::media::apply_validators(headers, &conditional)?;
     Ok(response)
 }
 
