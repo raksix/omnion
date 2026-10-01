@@ -11426,6 +11426,80 @@ async function runWorkflowBuilderDepth(page, report) {
   const afterUndo = await page.locator("[data-node-id]").count();
   note({ step: "undo", afterUndo, returned: afterUndo === nodesBeforeKeyboardAdd });
 
+  // A POINTER DRAG is undoable — the half the row above could never answer.
+  //
+  // The `undo` step presses a key, so it exercised the nudge path (`commit("nudge", …)`) and
+  // proved nothing about a mouse: a drag used to write its position and leave the Undo button
+  // grey, and a pass that only ever presses Ctrl+Z reads a healthy history. This row is the one
+  // that can tell the two apart, and each of its numbers is chosen so a stub cannot pass:
+  //
+  //   * `moved` is read off the card's own transform, not off a count — a drag that silently
+  //     failed to move the card leaves before === after and could satisfy "returned" by never
+  //     having changed anything.
+  //   * the undo reading is taken BEFORE the key press. A drag that recorded nothing leaves the
+  //     button disabled, and that is the one number that separates "undo worked" from "Ctrl+Z
+  //     was pressed on an empty history and nothing needed doing".
+  const dragUndo = await page
+    .evaluate(() => {
+      const card = document.querySelector("[data-node-id]");
+      if (!card) return null;
+      const box = card.getBoundingClientRect();
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    })
+    .catch(() => null);
+  let dragUndoNote = { attempted: false };
+  if (dragUndo) {
+    // Read the card's own transform rather than its bounding box: the box moves with the
+    // viewport, so a pan between the two readings would look like a drag that snapped back.
+    const cardX = () =>
+      page
+        .evaluate(() => {
+          const card = document.querySelector("[data-node-id]");
+          if (!card) return null;
+          const m = new DOMMatrixReadOnly(getComputedStyle(card).transform);
+          return Math.round(m.m41);
+        })
+        .catch(() => null);
+    const beforeX = await cardX();
+    // The attribute is present when the button is disabled, so `null` means enabled.
+    // `builder-undo` is the ToolbarButton's testId, and a disabled <button> carries the
+    // attribute in the DOM (rather than losing it), so "attribute present" means disabled.
+    const undoDisabled = () =>
+      page
+        .locator("[data-testid='builder-undo']")
+        .first()
+        .getAttribute("disabled")
+        .catch(() => null);
+    const undoWasDisabled = (await undoDisabled()) !== null;
+    // Several frames, not one: a single move can land inside the same gesture boundary, and a
+    // drag the product never saw is a drag this row cannot judge.
+    await page.mouse.move(dragUndo.x, dragUndo.y).catch(() => {});
+    await page.mouse.down().catch(() => {});
+    for (let frame = 1; frame <= 5; frame += 1) {
+      await page.mouse.move(dragUndo.x + frame * 24, dragUndo.y + frame * 12).catch(() => {});
+      await page.waitForTimeout(60);
+    }
+    await page.mouse.up().catch(() => {});
+    await page.waitForTimeout(500);
+    const afterX = await cardX();
+    const undoEnabledAfterDrag = (await undoDisabled()) === null;
+    await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(900);
+    const afterUndoX = await cardX();
+    dragUndoNote = {
+      attempted: true,
+      before: beforeX,
+      after: afterX,
+      moved: typeof beforeX === "number" && typeof afterX === "number" && afterX !== beforeX,
+      undoWasDisabled,
+      undoEnabledAfterDrag,
+      afterUndo: afterUndoX,
+      returned: afterUndoX === beforeX,
+    };
+  }
+  note({ step: "drag-undo", ...dragUndoNote });
+
   // The connection gesture: press an output port, press a target node, and the server's edge
   // count rises. The refusal is the half that matters — a port the source does not export has
   // to *say so*, and a gesture that refuses silently is indistinguishable from a dead button,
