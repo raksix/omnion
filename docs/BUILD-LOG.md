@@ -11162,3 +11162,83 @@ states, and it is not closed on tests alone.
 
 **Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
 hook to REQ-011.
+
+## Tick 59 — the one section nobody looked at
+
+**REQ-062 acceptance 9 was a dead promise with three parts missing.** `branding` is a `jsonb`
+column — `{ "logo": …, "logoDark": …, "favicon": … }` — and it was the only part of a settings
+payload the platform stored without walking. Tokens, typography and layout all go through
+`check_token_values`, because the renderer writes every string in them into a CSS custom property
+and a value of `12px; background: url(evil)` is a stylesheet injection; branding went in as bare
+jsonb. The criterion asks for "rejects files above the configured size and enforces the declared
+min/max dimensions with a field-level message", and none of the three existed.
+
+**Where the answer comes from is the whole design.** A size limit cannot live in the payload,
+because `branding.logo` names a file that already exists in the library — the payload carries an
+id, not bytes. So `BrandingLimits::for_theme` reads the manifest's `settingsSchema` and keeps the
+**tighter** of the declaration and the platform default, which is the opposite of an override: an
+override would let one installed theme raise the ceiling for a shared installation.
+
+And the dimensions are the sharper half, because **`media` carries no width or height at all.** The
+upload path probes the header and writes the geometry onto `media_versions` version 1. A resolver
+reading only the media table finds no dimensions and quietly skips the entire second half of the
+criterion — a check that looks installed while measuring nothing, which is the same shape as tick
+56's manifest validator that counted fields instead of checking them. `resolve_branding` reads both
+rows in one query, and the walk fixture writes both, so the walk cannot pass by measuring the
+"we could not measure it" path while claiming to measure the dimension check.
+
+**Every finding, not the first.** `check_token_values` refuses the whole payload, which is right
+for a token map; branding is different, because an operator uploading a 2 MB logo and fixing an SVG
+favicon is two independent mistakes and a refusal naming only the first makes them resubmit to
+discover the second. The findings carry their field, the message joins them, and `details` is a
+structured array so the panel can put one line under the input that caused it.
+
+**Proof.**
+- `cargo test -p omnion-content --lib branding` → **18 passed**; **6 verified to fail** against a
+  validator with the size and pixel checks removed (12 passed / 6 failed).
+- `cargo test -p omnion-api --test cms_theme_settings` → **14 passed** on real PostgreSQL; the
+  3 branding walks **verified to fail first** against a route with `check_branding` deleted
+  (**0/3 → 3/3**).
+- `cargo test -p omnion-content --lib` → **346 passed, 0 failed** (was 328).
+- `cargo check -p omnion-api` → clean; the only new warning was an unused `json!` import, moved
+  into the test module.
+
+**The suite had been hanging and the conversion is the fix, not a cleanup.** `cms_theme_settings`
+was the last file in this wave still pointing at whatever `OMNION_DATABASE_URL` named. It ran
+**past twelve minutes** — twelve PostgreSQL sessions parked in `ClientRead`, the process's only
+other thread in `futex_do_wait`, twelve orphaned `omnion_cms_*` databases visible in the server
+— and now finishes its walks in 168 s. On a shared database `seed::ensure` binds Owner to the
+EARLIEST user, which on a seven-writer box is whichever suite inserted first, so a walk leaning on
+Owner without granting it measures the test schedule. Twelve other suites in this wave were
+converted in earlier ticks and this one was simply missed; the tell was a run that produced no
+summary line at all rather than a red one.
+
+It also raised the sign-in budget through `walk_auth::give_the_process_its_own_sign_in_budget`
+rather than writing a `security_settings` row — the old code wrote the row and then called
+`reload_from_store` **twice in the same function**, which reads like two fixes and is one line
+copied.
+
+**Also measured:** `cms_theme_layouts` **17/17** (61 s) on the private Postgres — the suite owed a
+run since tick 58's conversion, and it is green.
+
+**Ops.** The volume hit **100% (0 bytes free)** mid-tick and the linker died with
+`ld terminated with signal 7 [Bus error]`, which is what a full disk looks like from the compiler
+and is worth recognising. Reclaiming this worktree's own `incremental` + `.fingerprint` + stale
+`.tmp*` linker debris + one duplicate `libomnion_api-*.rlib` took it 0 → 2.7 GB. The cost of that
+reclaim is that deleting `.fingerprint` forces a full rebuild of the API crate (~9 min at
+`CARGO_INCREMENTAL=0`), so it is the right move at the START of a tick on a full box and the wrong
+one when a build is already running.
+
+The browser pass was queued on the private `w2` stack and **killed rather than allowed to proceed**
+— the QA slot was held live by w7 (its holder's cwd is `/mnt/apopic/omnion-w7`) and the volume
+fell from 8.7 GB to 5.3 GB (91 %) while the pass waited, with load at 18.2 on six cores. The kill
+left nothing behind: the only place and holder in `/tmp/omnion-qa-slot` are w7's, its holder is
+alive and untouched, and no `omnion-qa-*-w2` pm2 process was ever started.
+
+**Not ticked on the panel half.** The criterion's "field-level message" is returned by the API but
+not yet rendered: the customize screen still edits `branding` through the generic flat editor, so
+a walkthrough is still owed before that half is a visible claim.
+
+**Next.** The screen half of acceptance 9 — a branding editor with per-field messages and the
+limits shown. Then the browser pass the moment the slot frees AND the volume measures free at that
+moment; REQ-062 1/3/16, REQ-063 17 and REQ-064 18 remain browser measurements no run has made.
