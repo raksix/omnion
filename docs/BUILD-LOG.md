@@ -11180,3 +11180,57 @@ desktop and the mobile pass, and which will be visited the first time the box is
 
 **Next.** The browser pass owed for slices 1–4, then slice 4's remaining two thirds: the
 security-event view over the audit trail and the secret-inventory projection.
+## Tick 61 — the self-service leave writes are recorded, and the merge that nearly doubled a rate limit
+
+**What.** Carried tick 60's uncommitted work to completion: `/hr/me/leave` (book) and
+`/hr/me/leave/{id}/cancel` (withdraw) now write an audit row and emit their events, exactly as the
+two HR twins they shadow already did — `f7e35f7b`. Merged 14 commits of `origin/main` first
+(`9a411999`), which is where the tick's real find sits.
+
+**Proof.** `OMNION_DATABASE_URL=…omnion_qa_w4 cargo test -p omnion-api --test hr_me --quiet` →
+**6 passed, 0 failed** (92.24s). `pnpm typecheck` → **EXIT=0**. `node --check walkthrough.cjs` →
+PARSE_OK. Tree clean, `git push -u origin wave4` → `9459be10..f7e35f7b`.
+
+**1. A union conflict that would have charged every request twice.** `routes/mod.rs` conflicted
+where main had inserted its IP-access layer and my branch had inserted its request-id layer. The
+obvious resolution — keep both hunks — is wrong here, and not visibly so: both hunks carried the
+*same* `.layer(rate_limit(limiter_layer.clone()))` line with main's rustfmt reflowed across four
+lines. Keeping both produced **two rate-limit layers**, so every request would be counted against
+its budget twice and every caller would hit 429 at half the documented limit. The comments were
+still green and `cargo build` would have been green; only the diff shows the duplicate. Reading
+the merged hunk instead of concatenating it is the whole difference.
+
+The request-id layer keeps its own comment and its position; main's IP-access layer stays ahead of
+the limiter, which is the order its comment argues for.
+
+**2. The mobile route union is 34 entries, and that number is a claim.** `walkthrough.cjs` conflicts
+the same way, and one side carried `/security/ip-access` while mine carried the six CRM screens and
+`/hr/me/leave`. Resolved by **parsing both sides' route literals and de-duplicating by name**, not
+by picking a side: ours-only = the seven CRM/HR entries, theirs-only = `security-ip-access`, union =
+34, no `name` mapped to two `path`s. Picking "theirs" here would have quietly deleted every mobile
+CRM measurement, and those are exactly the boxes that cannot be ticked without a phone pass.
+
+**3. `VersionMissing(19)` was my own missing variable, not a broken migration.** The first
+`cargo test` run failed all six walks at one line — `db.migrate()` — with `Migration(VersionMissing(19))`.
+The signature of a *migration-numbering* collision, and the shared high-water that causes it is real.
+It was neither: with no `OMNION_DATABASE_URL` in the environment the harness fell back to the
+**main writer's** database on 5433, which is at a different migration version. With
+`OMNION_DATABASE_URL` pointed at `omnion_qa_w4` on :5444 the identical binary is **6/6**. The lesson
+is the cost of the red herring: `VersionMissing` looks exactly like the migration-namespace trap
+that has bitten three times on this box, and the only thing that distinguishes them is which
+database the process opened. **Run the gate against the stack's own database, always** — a gate run
+without `OMNION_DATABASE_URL` is not a red gate, it is a different tenant's gate.
+
+**Browser pass started, still queued (recorded, not skipped silently).** The pass REQ-055 owes is
+running as `QA_STACK=w4 … QA_ONLY=hr` and is waiting at `[qa] waiting for a QA slot (max 1
+concurrent pass)` after ~90 minutes. The holder is **live**: pid 2624054, cwd `/mnt/apopic/omnion-w3`,
+its child a `sleep 5` poll loop — a sibling legitimately waiting on the same inner slot, not the
+stale 6310-second placeholder of 30 September. Not reclaimed; a second Chrome into that is the
+29-September OOM. `/dev/shm` is at 98% (my own `w4-target` 8.8G plus six siblings'), which is why
+the pass keeps its artifact root and target on tmpfs.
+
+**Next.** The HR browser pass when the slot frees — `/hr/me`, `/hr/me/leave`, `/hr/me/documents`,
+`/hr/reports`, `/hr/documents`, `/hr/onboarding` — then the four criteria that only it can prove:
+visibility own/team/all, org chart + keyboard + counts, the event feed reaching a subscribed
+webhook, and mobile 390×844. REQ-055 stays **in-progress**: three screens and a 500-free server are
+not the same as screens the browser opened.
