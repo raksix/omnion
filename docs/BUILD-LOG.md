@@ -1,3 +1,75 @@
+## Tick 61 — REQ-117 slice 29: the rule event the bus emitted to nobody, and a red gate nobody read
+
+**What.** Three defects, one root cause, and the root cause is the branch's oldest enemy wearing a
+new hat: *something correct that nothing could observe.*
+
+1. **`crm.intake.rule.updated` had no catalogue row.** The bus records it on every
+   assignment-rule create and update. The picker never offered the name, so **no receiver could
+   subscribe** — undeliverable by construction, and to an operator wiring an endpoint it looks
+   exactly like a misconfigured receiver.
+2. **`every_live_name_has_an_emitter` had been RED on this branch since `c47d9519`** (tick 36,
+   REQ-133 slice 14). `automation.project.limit.warning` / `.limit_exceeded` were catalogued
+   `Live` and emitted correctly at runtime, through a `match` binding three lines above the
+   constructor. The tick that shipped them ran a different suite.
+3. **Slice 28's fix was still being *enforced*.** `the_public_key_lookup_is_indexed_the_way_its_comment_says`
+   asserted the index is built `CONCURRENTLY` — the exact form tick 59 proved **cannot be
+   installed**. The crate suite had therefore been red for a tick, and the honest repair was
+   blocked by a test that read as protection.
+
+**The root cause is one shape: a name that reaches `bus::emit` as a *variable*.**
+`every_emitted_name_is_in_the_catalogue` walks the workspace for a quoted string at a
+`NewEvent::new(` constructor. A name in a binding is not at a constructor, so the walk cannot see
+it — and then the catalogue row reads as `Live` with no emitter (defect 2), or the name is
+simply absent from a registry nothing checks (defect 1). **The gate names what it can see, and
+"cannot see" and "does not exist" produce the same symptom.** That is why the fix is not a wider
+scanner: a scanner that resolves a parameter resolves a `format!` too, and a gate that accepts a
+wire contract assembled at runtime can no longer name a contract that drifted. Both names are now
+written at their constructors, and `run-event-emitter-visibility.py` fails on the *shape* so the
+second occurrence cannot be written.
+
+**What was deliberately NOT done.** The files contain **sixteen** `crm.*` literals and fifteen
+are **audit actions**, written to `audit_log` through `audit(…)` that never reach the bus. Only
+one is an unemitted bus event. Cataloguing the other fifteen would put fifteen subscriptions in
+the picker that could never receive anything — a registry that lies loudly. The decision is
+recorded in the catalogue row's own comment so the next reader does not "fix" the other fifteen.
+
+**Proof.**
+
+- `scripts/qa/run-event-emitter-visibility.py` — **92 emissions / 388 Rust files / 93 catalogue
+  rows, zero unlisted, no wrapper with a name parameter.** No database: the blind spot is in the
+  source, not the schema.
+- **PROVEN TO FAIL, both checks, independently.** Re-introducing the `name` parameter is
+  reported as `apps/api/src/routes/crm_assignment.rs:546 fn emit`; emitting an uncatalogued name
+  is reported with its file and line. The control for the catalogue row is what makes it a gate
+  rather than a comment.
+- `cargo test -p omnion-api --test events every_` — **2/2**. Was **0/1** on this branch before
+  the first commit, naming both limit rows verbatim; that is the state the branch shipped for 25
+  ticks.
+- `omnion-module-crm-intake --lib` **174** (was 173/1-failed). **PROVEN TO FAIL** with
+  `concurrently` restored in migration 0200 — the assertion fails with the verbatim uninstallable
+  statement, so the inverted test refuses the exact defect slice 28 removed.
+- `omnion-events --lib` **49**, `run-crm-assignment.sh` **14/14** (unchanged),
+  `run-crm-key-lookup-index.sh` **6/6** (unchanged — the plan is served either way),
+  `cargo build -p omnion-api` green, admin `tsc --noEmit` exit 0.
+
+**Not claimed: no browser pass.** The QA slot is held by a live **w5** pass (holder pid alive,
+cwd `/mnt/apopic/omnion-w5`), load 23, `/mnt/apopic` at **99%** (612 M free) and `/dev/shm` was
+at 98% until this tick's own stale target was reclaimed. No screen changed and no REQ closed, so
+nothing was owed. A pass here would have died at 1 700 steps with `fatal`, which is what tick 59
+recorded; recording that honestly is cheaper than running one.
+
+**Commits.** `7e711f3f` the two limit events made visible to the walk, `5474ab4b` the catalogue
+row + the wrapper's parameter removed + the inverted unit test + the new gate, `714f027f` the file
+mode.
+
+**Next.** REQ-133's remaining unticked boxes are all screen observations (the 390 px pass, zero
+high findings) plus two dependency-kind criteria that **cannot exist on this branch** — there is
+no `credentials` table and schedules are columns on `workflows`, so "a credential from project A
+cannot be referenced by project B" and "a move pauses the schedule" name resources this branch
+does not have. The next code slice is REQ-117's assignment simulator screen (acceptance 9, which
+the endpoint shipped for and the panel still does not draw), then the CRM inbox depth screens.
+Everything in either waits on the w8 QA stack the moment the shared slot frees.
+
 ## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
 
 test(events): revive the whole suite. feat(events): catalogue four names the drift gate
