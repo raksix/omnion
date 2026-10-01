@@ -124,6 +124,7 @@ pub mod readyz;
 pub mod scim;
 pub mod search;
 pub mod security;
+pub mod security_events;
 pub mod security_headers;
 pub mod security_ip;
 pub mod security_limiter;
@@ -1702,6 +1703,23 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/security/ip-rules/{id}",
             delete(security_ip::delete).layer(guards::require(&state, "security.ip.manage")),
+        )
+        // Security-event timeline (REQ-012 slice 4). `security.read` for both, including the
+        // CSV: an export changes nothing, and an operator who is allowed to read the trail must
+        // be allowed to take it away with them — a separate `security.manage` on the download
+        // would make the read-only auditor unable to do the one thing their role exists for.
+        //
+        // The static `.csv` segment is registered before nothing else on this path (there is no
+        // `/security/events/{id}`), and the events route carries no `{id}` for the same reason
+        // `/findings/{id}` sits below `/findings/import`: axum ranks a static segment ahead of
+        // a parameter, and a `events.csv` served as JSON is a client that has to guess.
+        .route(
+            "/security/events",
+            get(security_events::get).layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/events.csv",
+            get(security_events::export).layer(guards::require(&state, "security.read")),
         )
         .route(
             "/security/findings/{id}",
