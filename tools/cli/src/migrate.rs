@@ -120,7 +120,13 @@ async fn apply(pool: &PgPool, options: &MigrateOptions) -> Result<(), String> {
     }
 
     let migrator = omnion_core::migrator();
-    let report = runner::apply(pool, &migrator, &policy, &actor)
+    // `runner::apply` takes the pool, the policy and the actor BY VALUE. `PgPool` is an Arc'd
+    // handle, so cloning it shares one pool rather than opening a second — that is what the
+    // `&PgPool` in the signature above is for. The policy and actor are cheap owned structs, so
+    // they move. This compiled as `&pool, &policy, &actor` until a `cargo build -p omnion-cli`
+    // ran: the runner's signatures are `Policy` and `RunActor` by value, so the CLI — and with it
+    // every operator-facing `omnion migrate` command — had not compiled since the surface landed.
+    let report = runner::apply(pool.clone(), &migrator, policy, actor)
         .await
         .map_err(|err| err.to_string())?;
     println!("{}", report.summary);
@@ -229,7 +235,7 @@ async fn status(pool: &PgPool) -> Result<(), String> {
 async fn plan(pool: &PgPool) -> Result<(), String> {
     let migrator = omnion_core::migrator();
     let policy = policy::read(pool).await.map_err(|err| err.to_string())?;
-    let plan = runner::plan(pool, &migrator, &policy)
+    let plan = runner::plan(pool.clone(), &migrator, policy)
         .await
         .map_err(|err| err.to_string())?;
 
