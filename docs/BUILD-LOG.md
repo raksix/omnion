@@ -8875,3 +8875,43 @@ pointing it at 5447 is all the wiring it takes.
 frame carries the substituted text, the audit metadata carries the redacted one. (2) Extend
 `ai_guard_outbound.rs` with the stub-provider walk that reads a substituted answer off `POST /ai/chat`
 and ticks criteria 2–4. (3) Run the w7 pass against 5447 the moment the box has RAM and the slot.
+
+## w7 · tick 56 · REQ-105 slice 3 — the re-map, wired and proved on the wire
+
+**What.** `merged_map` folds every message's own `RemapMap` into one answer map, and the three
+readers of a chat answer now take the text entitled to them: the `done` frame carries the
+requester's `substitute`d answer plus the withheld tokens, while the `audit_log` metadata and the
+filed change set carry `redact`ed text. The chat screen swaps the streamed placeholders for the
+finished answer and says so when a token was withheld. `RemapMap::merge` drops a token two
+different values claim rather than guessing which value the reader meant.
+
+Also fixed, found by an already-red walk: `record_event` compared `action == "blocked"` while
+`Action::Block.as_wire()` is `"block"`, so the `blocked` column was `false` on every row and the
+events screen's `?blocked=true` filter could never match — a refusal on record and invisible.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --quiet` → 587 passed, 0 failed (was 583; +4 merge/withheld tests).
+- `cargo build -p omnion-api` → exit 0.
+- `apps/admin` `tsc --noEmit` → exit 0, empty log.
+- `ai_guard_outbound` walks `the_requester_reads_the_original_back_and_the_audit_row_does_not`,
+  `the_deltas_carry_the_placeholder_and_the_finished_answer_the_original`,
+  `an_ambiguous_placeholder_is_withheld_rather_than_guessed` → 3 passed, 0 failed (35.9 s).
+- Pre-existing walks: `a_masked_turn` ok, `the_same_value` ok, `the_tester` ok, `a_clean` ok.
+
+**Not run / still open.**
+- **The browser pass has NOT run.** The QA slot is held by a *live* w6 walkthrough (holder pid alive,
+  `cwd=/mnt/apopic/omnion-w6`), so it is not mine to take. No screen of this REQ is claimed verified
+  in a browser.
+- `a_blocked_turn_is_refused_and_the_provider_is_never_dialled` is red on its
+  `events["total"] == 1`: no `ai_guard_events` row is written for the refusal. **Verified red on the
+  committed tree with this tick's test file stashed**, so it is not a regression from this slice. The
+  403 and the "provider never dialled" half of that walk do pass. Left for a tick that can own it.
+- Unticked: the permission-gated screen (403 named), `ai.guard.exemption.expired`, `/ai/guard/about`.
+
+**Environment notes.** The shared Postgres on 5433 has recovered, so the private 5447 instance is no
+longer needed for walks. `/dev/shm` was cleared, leaving `target -> /dev/shm/w7-target` a dangling
+symlink (`failed to create directory … Not a directory (os error 20)`); restored. 25 leaked
+`omnion_guardout_*` databases were dropped; an orphaned test binary from this worktree's 06:36 tick
+was reaped (the w6 holder was left alone).
+
+**Next.** Diagnose why the refusal writes no event row, then the browser pass when the QA slot frees.

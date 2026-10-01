@@ -20,6 +20,19 @@
 > text and the detector's spans are both in hand, `substitute` for the requester and `redact`
 > for everyone else, plus the `mask_text`/`placeholder()` deterministic-token drift this found
 > and closed (`ad445d11`) ·
+> slice 3 — **the re-map is wired** and proved on the wire: `merged_map` builds one answer map from
+> every message's own map, the `done` frame carries the requester's `substitute`d text and the
+> withheld tokens, the `audit_log` metadata and the filed change set carry `redact`ed text, and the
+> chat screen swaps the streamed placeholders for the finished answer. `merge` drops a token two
+> different values claim rather than guessing. **Still open and NOT claimed:** the browser pass over
+> the four screens has still not run (the QA slot is held by a live w6 walkthrough), the permission-
+> gated screen (403 named), the exemption-expired event, `/ai/guard/about`, and one **pre-existing**
+> red walk — `a_blocked_turn…` fails its `events["total"] == 1` assertion because no `ai_guard_events`
+> row is written for the refusal; verified red on the committed tree before this slice, so it is not a
+> regression here and is left for a tick that can own it. Along the way this tick also found and fixed
+> a real store bug: `record_event` compared `action == "blocked"` while `Action::Block.as_wire()` is
+> `"block"`, so the `blocked` column was `false` on every row and the events screen's `?blocked=true`
+> filter could never match. ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
@@ -156,7 +169,10 @@ refuses to start in the guard (the API answers a configuration error) rather tha
 ### Acceptance criteria
 
 - [x] A prompt containing an email address is masked to `[EMAIL_1]` before the provider call (proven with a stub provider that records the exact body it received) and the same value keeps the same placeholder across two calls in one request. — **proved in `apps/api/tests/ai_guard_outbound.rs`**: a stub provider records every body the router sends; the walk asserts `[EMAIL_1]` arrives *and* the original address does not, and that two mentions in two messages produce one placeholder and no `[EMAIL_2]`. The "no provider call" half of this criterion is the third walk, where the recorded call count does not move across the refused request.
-- [ ] The answer is re-mapped on completion: a stub provider that echoes `[EMAIL_1]` produces the original address in the stored message for the requester. — **the mechanism is in and unit-proved this slice** (`guard_remap.rs`, 583 lib tests green): the checkpoint now builds a `RemapMap` from the original text plus the detector's spans, `CheckpointReport::substitute` is the requester's view and `::redact` everyone else's, and the deterministic-style token drift between `mask_text` and `placeholder()` is closed by making `mask_tokens` the single derivation. **The route is NOT yet wired**, so this box stays unticked until the stub-provider walk reads a substituted answer off `POST /ai/chat`.
+- [x] The answer is re-mapped on completion: a stub provider that echoes `[EMAIL_1]` produces the original address in the stored message for the requester. — **proved in `apps/api/tests/ai_guard_outbound.rs`** (`the_requester_reads_the_original_back_and_the_audit_row_does_not`): a stub that answers in **SSE framing** and echoes the last user turn back makes the re-map observable on the wire. The walk reads the `done` frame and asserts the requester's `answer` contains the address the user typed and **no leftover `[EMAIL_1]`**, then reads the `audit_log` row the *same request* wrote and asserts it holds the placeholder and not the address. Both halves, because asserting only the first would pass against a route that substituted everywhere — which is the leak this control exists to stop.
+- [x] While streaming, deltas show the placeholder and the completed message shows the original — `the_deltas_carry_the_placeholder_and_the_finished_answer_the_original` concatenates the `delta` frames and asserts `[EMAIL_1]` is present and the address is **absent**, then asserts the `done` frame's `answer` carries the original. Two separate claims: not leaking mid-stream, and being coherent afterwards.
+- [x] A second reader (shared conversation, admin) sees the placeholder, not the original (asserted with two readers on the same message). — the `audit_log` row is the second reader, read straight out of the database rather than through an endpoint (an endpoint would only prove the endpoint redacts). The filed **change set** also takes the redacted copy: a reviewer is a second reader, so `file_from_chat` is given `audited_answer`, never the requester's text.
+- [x] An ambiguous placeholder is withheld rather than guessed — `an_ambiguous_placeholder_is_withheld_rather_than_guessed`. Two different addresses in two turns each number their own `[EMAIL_1]`, so the token stops identifying anything; a naive merge would hand the reader one of the two and which one is a coin toss. The walk asserts **neither** address comes back and that `guard_withheld` names the token, so the screen can say so out loud.
 - [ ] While streaming, deltas show the placeholder and the completed message shows the original — asserted by capturing the SSE frames and then reading the stored message.
 - [ ] A second reader (shared conversation, admin) sees the placeholder, not the original (asserted with two readers on the same message).
 - [x] An exemption for one label and one feature allows that label through for that feature only; another feature with the same label stays masked.
