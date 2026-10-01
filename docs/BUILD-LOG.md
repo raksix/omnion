@@ -11668,10 +11668,26 @@ so both halves are asserted together.
    `omnion_developer::scope_allows` and both callers use it — one spelling of "does this scope
    list grant X" instead of two, which is where a prefix match eventually creeps in.
 
+**The pass is queued, and the box is the reason.** Launched with `QA_OUT_ROOT=/dev/shm/…` and
+`CARGO_TARGET_DIR=/dev/shm/w5-target` (the documented recipe: a pass that measures the most is
+the one that fills the disk, and `/mnt/apopic` was at **98% / 1.2 G** when it started). It is
+waiting on the QA slot, held by a live w7 pass — and the load average is **16 on 6 cores**, with
+three writers building or running full `cargo test` suites at once. So the pass has not run and
+this log does not claim otherwise.
+
+**One process-hygiene note, because the trap does not fire on SIGKILL.** The first launch was
+stopped to move its artifacts onto tmpfs, and its EXIT trap never ran: a SIGKILLed pass leaves
+its `qa-slot.sh` waiter reparented to PID 1 and its place file behind. Both were cleaned up by
+*matching `/proc/<pid>/cwd` against this worktree* — never by pattern, because `pkill -f 'qa-slot'`
+also matches the shell issuing it, and `pkill -f 'QA_STACK=w5'` killed my own command line. The
+w7 waiter seen during that cleanup was left alone. **After stopping a pass, verify three things
+separately: the pass process, the waiter, and the place file — because a live waiter with a dead
+pass is a place nothing can release.**
+
 **Not ticked.** No acceptance box. Every box in this slice is about what a *request* does, and
 the browser pass over this build has not run.
 
-**Next.** The pass over `/developer/keys` and `/developer/logs` — the key form, the one-time
-secret dialog (which refuses to close until the secret is acknowledged), rotation's
-"the old secret stops working immediately" confirmation, the log's filters and its no-bodies
+**Next.** The queued pass over `/developer/keys` and `/developer/logs` — the key form, the
+one-time secret dialog (which refuses to close until the secret is acknowledged), rotation's "the
+old secret stops working immediately" confirmation, the log's filters and its no-bodies
 explanation. Then, once slice 1's box can be ticked, slice 2: the API Explorer.
