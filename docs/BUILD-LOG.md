@@ -7630,3 +7630,71 @@ passes. The box got worse during this tick, not better. The box that names a scr
 **Next.** REQ-129 slice 3's browser pass — the only thing left in it — then slice 4: the column
 classification map, the anonymised export builder and job, the single-use/expiring download, and the
 upgrade guide finalised with the rollback split.
+
+
+---
+
+## Tick 54 — slice 4 (anonymised exports), and the second comment that did not match its code
+
+**What.** Merged 5 commits of `origin/main` first (`7f3a989f`). Third consecutive three-way
+conflict, third UNION: main added `/security/events` to the walkthrough's mobile route list while
+my branch had added the six deployment screens, so the list carries both. Then slice 4 in two
+atomic commits — `31c7e05f` the pure planner + migration, `6b8ffa5d` the six routes.
+
+**The design is fail-closed, and that is the whole request.** `column_classifications` is keyed
+`(table, column)`, and an export whose selected tables include a column with no row is REFUSED with
+`422` naming the columns — not exported with a warning. That is the only version of the feature
+worth shipping, because "a forgotten column is a data incident" is true only if forgetting one is
+unrepresentable. The map is keyed per column rather than per table precisely so that a migration
+which adds a column automatically blocks the next export until somebody classifies it: that turns
+"review the map when a migration adds personal data" from a habit into a property.
+
+**Three defects, all found by tests written alongside the code, all kept in the record.**
+
+1. `class_default_action` returned `keep` for an unrecognised class, because `safe` was the
+   catch-all arm. That function is what a screen shows an operator *before* the map has loaded, so
+   its answer for an unknown class has to be the one that cannot leak. `safe` is now spelled out
+   and the default arm hashes.
+2. `refusal_reason` told the operator a `personal` column "cannot be kept" while `resolve_action`
+   permitted exactly that. **This is the tick 53 defect again, in a different file** — a comment
+   stating an invariant that no code checked, so a test asserting the message passed while the
+   behaviour was wrong. The rule moved into one predicate, `action_is_permitted`, applied to the
+   map's OWN default as well as the caller's override.
+3. Fixing (2) with `class != "secret" ⇒ action != "keep"` then allowed `hash` for a `secret` — the
+   leak the module exists to prevent, since a hash of a credential is the credential with a
+   dictionary attack in front of it. `action_is_permitted` has three bands now, and the test that
+   caught this was the one asserting the *old* promise.
+
+**The single-use download rests on one statement.** `GET /exports/{id}/download` runs a single
+`update … set download_count = download_count + 1 where … download_count = 0 returning …`, so two
+concurrent requests cannot both observe `0` — there is no window to lose and no other route has to
+remember the rule exists. A `select` then `update` would have had one. The refused path re-reads
+the row to answer `410` with the RIGHT one of four reasons (revoked / expired / already downloaded /
+not ready), because a bare `410` sends a support engineer to guess.
+
+**Proof of the gate.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo check -p omnion-api` | clean |
+| `cargo test -p omnion-migrations` | **101 passed** (was 86) |
+| `cargo test -p omnion-events` | 49 passed (3 new export events) |
+| `cargo test -p omnion-permissions` | 68 passed (2 new export keys) |
+| `pnpm typecheck` (apps/admin) | exit 0 |
+
+**The disk trap, caught by checking rather than by trusting.** `/mnt/apopic` reached 97% (2.0 G
+free) and `cargo fmt` died mid-run with `No space left on device` — after it had already rewritten
+58 files I do not own, 3028 insertions of pure formatting churn. The commit that followed would
+have carried another writer's reformatting into their diff. `git diff -w` proved it was whitespace,
+`git checkout` restored all 58, and every source file was then verified non-zero by size —
+`write_file` on a full disk can return success while leaving a 0-byte file, which is why the sizes
+were read rather than inferred from the tool's own report.
+
+**Browser pass NOT run, recorded not skipped.** The slot holder stayed ALIVE in
+`/mnt/apopic/omnion-w3` for the whole tick; load 12.9 on 6 cores, 29/32 GB used, 45 Chrome
+processes.
+
+**Next.** The browser pass that closes slices 3 and 4 together (`/deployment/backfills`,
+`/deployment/backfills/{id}`, `/deployment/seeds`, `/deployment/exports`), including the export
+grep that asserts no classified value survives into the file. Then the live-traffic leg of the
+zero-downtime recipe and `docs/deployment/upgrade.md`.
