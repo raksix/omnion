@@ -7066,3 +7066,59 @@ note in this ledger: a measurement that cannot be taken is reported as a **throw
 which kills the pass and takes every later measurement with it, rather than being recorded as an
 absent measurement. The mobile legs for REQ-021 are therefore still unmeasured — and this time the
 cause is in the file that is supposed to be measuring them.
+
+## Tick 49 — REQ-129 slice 1: the CI gate, the upgrade-helper marking, and the defect both of them found
+
+- **Merged `origin/main`** (9a758c44) with the repository's own `scripts/qa/merge-build-log.py`,
+  which splices both writers' appended lines and proves by multiset that neither dropped anything:
+  `base=6408 ours=7007 theirs=6469 merged=7068 · missing lines: {'ours': 0, 'theirs': 0, 'base': 0} ·
+  lost headings: 0`.
+- **Cleared the disk.** The root filesystem was at **99% (1.4 G free)** and my own
+  `target/` symlink pointed at `/opt/omnion-w6-target` — 16 G on the root fs, a breach of
+  invariant #11. Deduplicating same-crate artifacts in `debug/deps` (1,783 files, 5.4 G)
+  took it to 95% with cargo still building.
+- **Built** `scripts/qa/migration-down-gate.sh` — 21 checks, 5 differential mutations, wired into
+  `.github/workflows/ci.yml`. It is split on purpose: the half proving the comparison can catch a
+  hand-broken down script is pure and runs on every commit; the half proving a reversal executes
+  needs PostgreSQL and skips itself when there is none.
+- **The defect the gate found, which is the substance of this tick.** `structure_restored` was
+  `before == after`. On the live path `before` is the scratch structure with the migration applied
+  and `after` is the same structure with it reversed — the migration's own table is in one and
+  cannot be in the other, so the lists are never equal and **`verify_down` reported `restored:
+  false` for every migration in the tree**, the correct reversals included. All 66 tests passed
+  because every one compared a synthetic list against a copy of itself. Now anchored on what the
+  migration's **up half** created; anchoring on the reversal's declarations was tried first and
+  measured wrong, since a reversal that drops the table and forgets the index declares exactly what
+  it does. The comparison's remaining limit — it cannot see a reversal that removes a relation it
+  did not bring — is documented in the code and pinned by a test rather than left to be discovered.
+- **The release side, where the same class of bug was hiding.** `_policy_exists` tested for a
+  hard-coded `0030_migration_safety.sql`; the migration landed as `0207`, so the gate never became
+  true and the upgrade helper answered `unknown` on every release, permanently. With it true,
+  `destructive_migrations` returned only `-- omnion:no-down` files — so this tree's 53 migrations
+  that ship no down script at all would have read `reversible`, offering a database rollback that
+  does not exist. Split into `declared_irreversible` (a decision) and `unreversible_migrations`
+  (nobody wrote one). Also bound `reversible` to `down-script`: the other two verdicts each had a
+  check and this one did not.
+- **Nine upgrade tests were pinning the pre-REQ-129 world.** Rewritten against temp trees, and —
+  the harder half — against **real** migration filenames: `destructiveness` intersects the tree with
+  the delta by exact name, so a delta of invented names matches nothing and the plan answers
+  `reversible` while the repository holds 53 unreversible migrations. The false promise arrived
+  through the fixtures rather than the code.
+- **Proof.** `cargo test -p omnion-migrations` → **71 passed, 0 failed**. `cargo clippy -p
+  omnion-migrations --all-targets` → clean. `cargo check -p omnion-api` → clean. `cargo test -p
+  omnion-permissions` → **67 passed**. `tsc --noEmit` (apps/admin) → clean.
+  `scripts/qa/migration-down-gate.sh` → **21 passed, 0 failed**, 5 mutations load-bearing.
+  `scripts/qa/release-upgrade.sh` → **32 passed, 0 failed**. `release-upgrade` 48, `release-manifest`
+  46, `release-pipeline` and `release-bundle` suites all OK; `release-pipeline` 12/12 and
+  `release-manifest` 19/19 mutations caught.
+- **Not mine, and reported rather than fixed:** `scripts/qa/release-manifest.sh` reports 2 failures
+  from a **version disagreement committed on `origin/main` by another writer** (81184133,
+  2026-09-26): `themes/minimal/package.json` declares `0.1.1`, the workspace declares `0.1.0`. It
+  is present on `origin/main` and absent from this tree's diff.
+- **BLOCKER (not mine):** the `omnion-postgres` container has been in crash recovery since 06:47 —
+  its startup process is in **D-state on `jbd2_log_wait_commit`**, WAL unmoved for 20+ minutes,
+  `pg_isready` refusing connections. Five writers' database tests hang behind it. The disk relief
+  above did not clear it, and restarting a service five writers share is not this loop's decision.
+  **The browser pass over REQ-126/127/128's screens and REQ-129's two new screens stays queued.**
+- **Next.** Two-concurrent-runners proof and the live `lock_timeout` proof as soon as PostgreSQL
+  answers; then the QA pass that closes 126, 127 and 128 at once.
