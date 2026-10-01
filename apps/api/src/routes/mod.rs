@@ -76,6 +76,7 @@ pub mod ai_approvals;
 pub mod ai_airgap;
 pub mod ai_change_sets;
 pub mod ai_decisions;
+pub mod ai_evals;
 pub mod ai_guard;
 pub mod ai_identities;
 pub mod ai_local;
@@ -917,6 +918,36 @@ pub fn router(state: AppState) -> Router {
             .layer(guards::require(&state, "ai.airgap.manage"));
     let ai_airgap_verify =
         post(ai_airgap::verify).layer(guards::require(&state, "ai.airgap.manage"));
+
+    // The eval suites (REQ-107, slice 1). The three keys that have routes behind them are
+    // `read`, `manage` and — for slice 2's runner — `run`. `manage` and `run` are deliberately
+    // different keys so the person who may weaken the ruler is not the person who presses it.
+    //
+    // `ai.evals.run` and `ai.telemetry.read` are catalogued but NOT mounted yet, and that is the
+    // honest state: no route below is guarded by either, because the runner is slice 2 and the
+    // telemetry screen is slice 4. A guard key with nothing behind it is a promise the platform
+    // cannot keep, so they are declared in the catalogue now (where an installation can already
+    // grant them) and left unmounted until the route that uses them exists.
+    let ai_evals_suites_read =
+        get(ai_evals::list_suites).layer(guards::require(&state, "ai.evals.read"));
+    let ai_evals_suites_create =
+        post(ai_evals::create_suite).layer(guards::require(&state, "ai.evals.manage"));
+    let ai_evals_suite_read =
+        get(ai_evals::read_suite).layer(guards::require(&state, "ai.evals.read"));
+    let ai_evals_suite_write = axum::routing::patch(ai_evals::update_suite)
+        .layer(guards::require(&state, "ai.evals.manage"));
+    let ai_evals_suite_delete = axum::routing::delete(ai_evals::delete_suite)
+        .layer(guards::require(&state, "ai.evals.manage"));
+    let ai_evals_cases_read =
+        get(ai_evals::list_cases).layer(guards::require(&state, "ai.evals.read"));
+    let ai_evals_cases_create =
+        post(ai_evals::create_case).layer(guards::require(&state, "ai.evals.manage"));
+    let ai_evals_case_write = axum::routing::patch(ai_evals::update_case)
+        .layer(guards::require(&state, "ai.evals.manage"));
+    let ai_evals_case_delete = axum::routing::delete(ai_evals::delete_case)
+        .layer(guards::require(&state, "ai.evals.manage"));
+    let ai_evals_import =
+        post(ai_evals::import_cases).layer(guards::require(&state, "ai.evals.manage"));
 
     let ai_decisions =
         get(ai_decisions::list_decisions).layer(guards::require(&state, "ai.usage.read"));
@@ -2151,6 +2182,23 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/airgap/hosts", ai_airgap_hosts)
         .route("/ai/airgap/hosts/{id}", ai_airgap_host_delete)
         .route("/ai/airgap/verify", ai_airgap_verify)
+        // The eval suites (REQ-107, slice 1). `/runs`, `/{key}/run` and `/telemetry` are slice 2
+        // and slice 4 and are deliberately absent: a route that 404s is honest, where a route
+        // that returns "queued" without a runner behind it would be a lie the panel could not
+        // detect.
+        .route("/ai/evals/suites", ai_evals_suites_read.merge(ai_evals_suites_create))
+        .route(
+            "/ai/evals/suites/{key}",
+            ai_evals_suite_read
+                .merge(ai_evals_suite_write)
+                .merge(ai_evals_suite_delete),
+        )
+        .route("/ai/evals/suites/{key}/cases", ai_evals_cases_read.merge(ai_evals_cases_create))
+        .route("/ai/evals/suites/{key}/import", ai_evals_import)
+        .route(
+            "/ai/evals/cases/{id}",
+            ai_evals_case_write.merge(ai_evals_case_delete),
+        )
         .route("/ai/logs/decisions.csv", ai_decisions_csv)
         .route("/ai/logs/decisions/{id}", ai_decision)
         .route("/ai/routing/unresolved", ai_unresolved)

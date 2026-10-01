@@ -285,6 +285,51 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Change guard rules, the policy and exemptions, and run the tester",
     },
+    // The eval suites (REQ-107). FOUR keys rather than two, and the split is the request's own
+    // shape rather than a habit: a suite is a *measurement* of the platform, and the three acts
+    // it supports are genuinely different in what they cost when done by the wrong person.
+    //
+    // `ai.evals.read` sees suites, cases and past results. That is a QA audience, and the data
+    // is the installation's own prompts and outputs — sensitive enough that "everyone who uses
+    // the AI" is not a reasonable default.
+    //
+    // `ai.evals.manage` authors cases. A case is an *assertion about correctness*, so writing
+    // one is a claim about how the platform should behave, and deleting a case removes a
+    // measurement — which is the cheapest way to make a regression gate agree with you. It is
+    // kept away from `run` for exactly that reason: the person who may weaken the ruler should
+    // not also be the person who presses it.
+    //
+    // `ai.evals.run` starts a run. Running is not free — every case is a real inference call
+    // against a real provider, and a suite is trivially large — so it is separated from
+    // authoring. An installation that wants a release engineer to be able to press the gate
+    // without being able to edit what the gate measures grants this one key, and the panel says
+    // so by name on the disabled button rather than hiding it.
+    //
+    // `ai.telemetry.read` is separate from `ai.evals.read` on purpose: the eval screens answer
+    // "is this suite healthy", telemetry answers "is the tool estate healthy" across every
+    // agent and copilot in the installation, including runs that have nothing to do with evals.
+    // A tenant that runs no evals still has agents whose tools are failing, and folding the
+    // two would force that tenant to grant eval access to see its own tool stats.
+    PermissionDef {
+        key: "ai.evals.read",
+        category: "ai",
+        description: "Read AI eval suites, their cases and past results",
+    },
+    PermissionDef {
+        key: "ai.evals.manage",
+        category: "ai",
+        description: "Create, edit and remove eval suites and cases",
+    },
+    PermissionDef {
+        key: "ai.evals.run",
+        category: "ai",
+        description: "Start and cancel eval suite runs",
+    },
+    PermissionDef {
+        key: "ai.telemetry.read",
+        category: "ai",
+        description: "Read agent telemetry: per-tool success, denial and latency statistics",
+    },
     // Workflows (docs/requests/REQ-003): the automation surface — definitions, their runs and
     // the steps a run left behind.
     PermissionDef {
