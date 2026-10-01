@@ -2396,6 +2396,199 @@ async function runAiLocalDoctorDepth(page, report) {
 }
 
 /**
+ * The "Run AI locally" manual, driven (REQ-106, slice 4).
+ *
+ * A documentation screen is the easiest thing in a build to ship wrong, because nothing about it
+ * is load-bearing until an operator follows it in an air-gapped install and finds out. The route
+ * walk proves it renders; this pass proves the three claims that could be wrong:
+ *
+ *   1. **The "what stops working" list is the server's, not the page's.** The pass reads
+ *      `GET /api/v1/ai/airgap` and asserts every provider the server would block appears on the
+ *      page with its base URL — and, in the other direction, that the page lists no provider the
+ *      server would not block. A hand-written list is the failure mode: it looks right in review,
+ *      it is right until an operator adds a provider, and it is wrong in the direction that gets
+ *      discovered in production. Both directions are asserted, because a page that prints nothing
+ *      passes a one-directional check.
+ *
+ *   2. **The verdict is quoted, not guessed.** With no doctor run on record the page must say
+ *      "Never verified" rather than either claiming readiness or rendering a blank. The pass takes
+ *      the words off the DOM and refuses any of the three ready-claims when the doctor has no run.
+ *
+ *   3. **The steps link to screens that exist.** Each step's link is followed; a guide whose
+ *      links 404 is worse than no guide, because it is trusted.
+ *
+ * It runs after the doctor pass, which is what leaves a real run on record — so the readiness
+ * assertion sees a verdict and not only the never-run branch.
+ */
+async function runAiLocalGuideDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-local-guide", action: "ai-local-guide", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    return false;
+  };
+
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  try {
+    // The server's own answer, taken before the page is read so the comparison is against a
+    // snapshot the page could not have influenced.
+    const airgap = await callApi("GET", "/v1/ai/airgap");
+    expect(
+      airgap.status === 200,
+      `reading the air-gap overview should succeed, saw ${airgap.status}: ${JSON.stringify(airgap.body)}`,
+    );
+    const serverBlocked = (airgap.body?.would_block ?? []).map((entry) => ({
+      name: entry.name,
+      base_url: entry.base_url,
+    }));
+
+    await page
+      .goto(`${URL_ADMIN}/ai/local/guide`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    const view = await page.evaluate(() => {
+      const text = document.body.innerText;
+      const blockRows = [...document.querySelectorAll("[data-guide-block]")].map((row) => ({
+        name: (row.querySelector("span")?.textContent || "").trim(),
+        url: (row.querySelector(".font-mono")?.textContent || "").trim(),
+      }));
+      const guide = document.querySelectorAll("[data-local-guide]").length;
+      const stat = (selector) =>
+        (document.querySelector(selector)?.textContent || "").replace(/\s+/g, " ").trim();
+      return {
+        guide,
+        verdict: stat("[data-guide-verdict]"),
+        verdictNote: stat("[data-guide-verdict-note]"),
+        steps: document.querySelectorAll("[data-guide-step]").length,
+        servers: document.querySelectorAll("[data-guide-server]").length,
+        blockRows,
+        blocksEmpty: document.querySelectorAll("[data-guide-blocks-empty]").length,
+        blocks: document.querySelectorAll("[data-guide-blocks]").length,
+        local: stat("[data-guide-stat-local]"),
+        remote: stat("[data-guide-stat-remote]"),
+        wouldBlock: stat("[data-guide-stat-blocked]"),
+        gap: stat("[data-guide-gap-state]"),
+        noLocal: document.querySelectorAll("[data-guide-no-local]").length,
+        links: [...document.querySelectorAll("[data-local-guide] a[href^='/']")].map((a) =>
+          a.getAttribute("href"),
+        ),
+        // The words an over-claiming page would print. Recorded so a failure can say which.
+        readyClaims: ["Ready for air-gapped operation", "Usable, with warnings", "Not ready"].filter(
+          (claim) => text.includes(claim),
+        ),
+      };
+    });
+
+    expect(view.guide === 1, `the guide rendered ${view.guide} times, expected once`);
+    expect(
+      view.steps === 6,
+      `the manual must carry all six steps in order, saw ${view.steps}`,
+    );
+    expect(
+      view.servers >= 3,
+      `the manual must name the supported servers, saw ${view.servers} rows`,
+    );
+
+    // --- the load-bearing comparison, both directions -----------------------------------
+    for (const provider of serverBlocked) {
+      const onPage = view.blockRows.some(
+        (row) => row.url === provider.base_url && row.name === provider.name,
+      );
+      expect(
+        onPage,
+        `the guide does not list ${provider.name} (${provider.base_url}) even though the air-gap check would block it`,
+      );
+    }
+    const serverUrls = new Set(serverBlocked.map((entry) => entry.base_url));
+    for (const row of view.blockRows) {
+      expect(
+        serverUrls.has(row.url),
+        `the guide lists ${row.name} (${row.url}) as blocked, but the air-gap check would not block it`,
+      );
+    }
+    expect(
+      view.blocksEmpty === 1 || view.blocks >= 1,
+      "the 'what stops working' section must render either a list or its empty explanation, never nothing",
+    );
+    if (serverBlocked.length === 0) {
+      expect(
+        view.blocksEmpty === 1,
+        "with nothing to block the page must say so in words, not show an empty list",
+      );
+    }
+
+    // --- the verdict is quoted, not guessed ---------------------------------------------
+    const neverVerified = view.verdict === "Never verified";
+    expect(
+      neverVerified || view.readyClaims.length > 0,
+      `the guide must state a readiness verdict in words, saw "${view.verdict}"`,
+    );
+    if (neverVerified) {
+      expect(
+        view.readyClaims.length === 0,
+        `a guide with no doctor run must not also claim ${view.readyClaims.join(", ")}`,
+      );
+    }
+
+    // --- every step's link resolves -----------------------------------------------------
+    // A `fetch` on the page origin, not an API call: these hrefs are admin *pages*, so the only
+    // thing that can 404 them is the route not existing. Asking the API the same path would
+    // answer 404 for a perfectly healthy page and prove nothing.
+    const uniqueLinks = [...new Set(view.links)];
+    const broken = [];
+    for (const href of uniqueLinks) {
+      const status = await page.evaluate(async (url) => {
+        const answer = await fetch(url, { method: "GET" });
+        return answer.status;
+      }, `${URL_ADMIN}${href}`);
+      if (status === 404) broken.push(href);
+    }
+    expect(
+      broken.length === 0,
+      `the manual links to pages that answer 404: ${broken.join(", ")}`,
+    );
+    note({
+      step: "links",
+      checked: uniqueLinks.length,
+      broken: broken.join(","),
+      targets: uniqueLinks.join(","),
+    });
+
+    await shot(page, "ai-local-guide");
+    note({
+      step: "view",
+      ...view,
+      blockRows: view.blockRows.length,
+      serverBlocked: serverBlocked.length,
+    });
+
+    return { ok: findings.length === 0, steps: steps.length, findings };
+  } catch (cause) {
+    findings.push(`the guide pass threw: ${cause instanceof Error ? cause.message : String(cause)}`);
+    return { ok: false, steps: steps.length, findings };
+  }
+}
+
+/**
  * The air-gap switch, driven (REQ-106, slice 2).
  *
  * The route walk above only proves the screen *renders* in its resting state, which for a
@@ -11232,6 +11425,12 @@ async function main() {
     // doctor and drives it on a real stub endpoint, because the empty state alone proves nothing
     // about the check rows, the fix hints or the history.
     { path: "/ai/local/doctor", name: "ai-local-doctor", area: "ai" },
+    // The "Run AI locally" manual (REQ-106 slice 4). Walked on the bare path, which is the state
+    // that matters: a fresh QA database has no local endpoint, no doctor run and no air-gap
+    // switch, so the route walk measures the page an operator sees BEFORE doing anything — the
+    // one where a guide is most likely to over-claim readiness. The depth pass below then compares
+    // its blocked-provider list against the air-gap API's own answer, in both directions.
+    { path: "/ai/local/guide", name: "ai-local-guide", area: "ai" },
     // The air-gap switch (REQ-106 slice 2). Registered on bare path deliberately: the switch starts
     // OFF in a fresh QA database, and a depth pass that turned it on would leave every later pass
     // reading a banner and a refused chat. The route proves the screen renders in its resting state;
@@ -11428,6 +11627,17 @@ async function main() {
     );
   }
   log(`ai local doctor: ${JSON.stringify(report.aiLocalDoctor)}`);
+
+  // The local-AI manual (REQ-106, slice 4). Immediately AFTER the doctor pass, because the manual's
+  // readiness line quotes the doctor's verdict and running it first is what leaves a run on record
+  // — otherwise the pass could only ever see the never-verified branch, and the branch where a
+  // guide over-claims readiness is the one that would ship a lie.
+  if (inScope("ai")) {
+    report.aiLocalGuide = await runDepthPass("ai-local-guide", () =>
+      runAiLocalGuideDepth(page, report),
+    );
+  }
+  log(`ai local guide: ${JSON.stringify(report.aiLocalGuide)}`);
 
   // The air-gap switch, driven (REQ-106 slice 2). It flips the switch for real and restores it, so
   // it runs after the providers pass (which assumes a working remote default) and before anything
