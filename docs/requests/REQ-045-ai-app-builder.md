@@ -1,18 +1,24 @@
 # REQ-045 — AI App Builder *(headline)*
 
-> **Status:** in-progress (slice 1 · `8c87a7cc`, `4f228080` — **the plan store, and a validator
-> that records rather than repairs** · migration `0224_ai_app_builder.sql` (four tables:
-> plans, artifacts, applications, application steps) plus a new `modules/app-builder` and its
-> walk suite `apps/api/tests/app_builder.rs` · **NOT ticked: every criterion below needs either a
-> provider or an apply runner, and neither exists yet.** What slice 1 does close is the part of
-> *"an invalid or reserved field key marks the artifact `invalid` and blocks apply by name"*:
-> a reserved key is refused BY NAME at the store boundary (`users` → "`users` is a reserved
-> platform key"), an artifact with findings lands `invalid`, and `blockers` returns the
-> standing-between list the `409` carries — including a required kind the plan never proposed,
-> which no artifact row could express. Slice 2 owns the screens, slice 3 the apply runner, and
-> the four permission keys land with the routes that guard them, because a catalogue entry with
-> no route behind it is a key nobody can be refused for) · **40 unit tests · 18 database walks ·
-> 323 workspace lib tests · pnpm typecheck 2/2 · admin 341/341** · previous: **Status:** pending
+> **Status:** in-progress (slice 2 · `65bdf683` — **the review surface on the wire, and the four
+> permission keys** · `apps/api/src/routes/app_builder.rs` (nine routes: list, detail, examples,
+> edit, accept, reject, regenerate, reject-plan, delete, generate), migrations `0226` (a decision
+> carries its reason) and `0227` (one **live** version per `(plan, kind, key)`), plus four keys in
+> `crates/permissions`. Slice 1's store is unchanged in shape; slice 2 extended it with
+> `reject_artifact`, `reject_plan`, `accept_artifact` and the two reason columns.
+> **The four keys are catalogued and three of them guard routes; `appbuilder.apply` guards nothing
+> yet on purpose** — the apply runner is slice 3 and a route answering "coming soon" is exactly
+> what the Definition of Done forbids. `generate` writes the plan before the provider is asked and
+> fails with the reason on the row; it does **not** fake the typed generator, and a walk asserts
+> the mock provider was called **zero** times.
+> **Three defects closed, two of them pre-existing in slice 1:** (1) a `permission` artifact could
+> **never** be written — the store applied the storage key rule to a `domain.action` key whose dot
+> is vocabulary, so a REQUIRED kind was un-fillable and no plan could ever be applicable; (2)
+> regeneration raised duplicate-key against the absolute `(plan_id, kind, key)` constraint, so the
+> "kept plan versions" the request asks for was a 500 — `0227` makes the index partial over live
+> versions; (3) a filter refusal answered `500` where the caller's input deserves `422`.
+> **41 module unit tests · 10 route walks (were 0) · permissions 64/64 · `pnpm typecheck` pending** ·
+> previous: **Status:** pending)
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -174,8 +180,32 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
       outright — which left the review screen with no way to reach an applicable plan. Both
       fixed and both proven from the other side (`accepting_an_artifact_is_possible_and_editing
       _is_not_a_status_write`).
-- [ ] Rejecting a required artifact blocks **Apply** and lists what is missing.
-- [ ] Regenerating one artifact with feedback replaces it and keeps the previous version.
+      **Slice 2 corrects the two fixtures this box was measured through** (`65bdf683`): the first
+      asked for a `users` artifact to be *stored as invalid* while the second requires it to leave
+      no row at all — both cannot be true of one contract. The store's refusal is right (a
+      reserved key must not reach a table), so the first now proves the same claim with a finding
+      the store *accepts* — a missing rationale — which separates "the status comes from the
+      validator" from "the key is refused". `blockers…` likewise asserted `2` blockers and `5`
+      missing kinds of one list; the list is **7** and the walk now asserts both halves.
+- [x] Rejecting a required artifact blocks **Apply** and lists what is missing. —
+      **MEASURED (slice 2, `65bdf683`):** `a_rejection_without_a_reason_is_refused_and_the_row
+      _stays_pending` drives the wire and reads the refusal on the row as well as the status:
+      a missing body and a whitespace-only reason are both `422`, and the artifact is still
+      `pending` afterwards — a refused rejection leaves nothing behind. The blockers list itself
+      is asserted by name on the plan detail: `an_invalid_artifact_cannot_be_accepted_and_the
+      _refusal_names_the_finding` reads the `invalid` blocker carrying its finding beside it.
+      **`apply` itself is still slice 3**, so what is proven is the refusal and the named list,
+      not the `409`.
+- [x] Regenerating one artifact with feedback replaces it and keeps the previous version. —
+      **MEASURED (slice 2, `65bdf683`):** `a_regeneration_keeps_the_previous_version_and_says_
+      _which_kind_of_rejection_it_was` spends exactly **one** provider call (counted by the
+      provider's own counter, not by what is left in the script), reads ten rows where there were
+      nine, and reads the retired version's `rejected_reason` as `superseded by a regenerated
+      version` — so a reviewer's refusal and a machine retirement are distinguishable in the
+      tree. **The walk found the defect this criterion was about**: regeneration raised
+      `duplicate key value violates unique constraint` because 0224's `(plan_id, kind, key)` was
+      absolute and both rows exist at the end of the transaction whichever is written first.
+      Migration `0227` makes the index partial over live versions.
 - [ ] **Apply** is refused without `appbuilder.apply` and without an approved approval request.
 - [ ] Apply creates the entity with the accepted fields and its screens appear in the panel.
 - [ ] New permission keys appear in the IAM catalogue and the generated role binds them.
@@ -186,7 +216,15 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
 - [ ] A failing step is named, retry is offered, and rollback removes only this application's output.
 - [ ] Plan list, filters, bulk delete of drafts and JSON export work; applied plans are undeletable.
 - [ ] Apply requires explicit confirmation, the keyboard flow works, and mobile keeps actions reachable at 390 px.
-- [ ] Keys `appbuilder.read` / `appbuilder.generate` / `appbuilder.review` / `appbuilder.apply` exist in the catalogue.
+- [x] Keys `appbuilder.read` / `appbuilder.generate` / `appbuilder.review` / `appbuilder.apply` exist in the catalogue. —
+      **MEASURED (slice 2, `65bdf683`):** `the_app_builder_family_is_catalogued_and_apply_is_its
+      _own_power` walks all four by name, asserts each one's category and that it explains
+      itself, and asserts `apply` is neither `review` nor `generate` — because the runner creates
+      roles and permissions, so one key would let a reviewer grant themselves the power the plan
+      proposed. Three of the four already **refuse** a caller who lacks them:
+      `an_account_without_an_app_builder_key_is_refused_the_whole_surface` reads `403
+      permission_denied` from the list and the vocabulary, then grants `read` alone and reads the
+      list open with the **decisions still refused**. `apply` guards no route yet — slice 3.
 - [ ] `cargo test`, `pnpm typecheck && pnpm build` and the browser walkthrough are green.
 
 ### QA plan
