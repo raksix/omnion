@@ -389,10 +389,20 @@ pub async fn rotate_key(
 
 /// Look a source up by its public key — the public intake path's only lookup.
 ///
-/// The key is hashed and matched against the stored digest, so this is one indexed equality
-/// and the clear key never reaches the database. An unknown key is `None`, not an error: the
-/// caller answers `401` for both an unknown key and a wrong one, because a distinct answer
-/// for a source that does not exist is a source enumeration.
+/// The key is hashed and matched against the stored digest, and the clear key never reaches
+/// the database. An unknown key is `None`, not an error: the caller answers `401` for both an
+/// unknown key and a wrong one, because a distinct answer for a source that does not exist is
+/// a source enumeration.
+///
+/// **"one indexed equality" was a promise this function's comment made and the schema did not
+/// keep.** No index covered `endpoint_key_hash` when this line was written, so the only
+/// lookup on the platform's one unauthenticated business endpoint was a sequential scan of
+/// every tenant's rows — 13.6 ms at 100k sources, growing with the installation rather than
+/// with the caller's own data, and reachable in full by an attacker holding no key at all.
+/// Migration `0200` adds `crm_intake_sources_key_lookup_idx` (partial on the nulls, not
+/// unique, built `concurrently`); measured on the same fixture it is **0.038 ms and 4
+/// buffers**. `scripts/qa/run-crm-key-lookup-index.sh` asserts the *plan*, not the presence of
+/// an index, because a table small enough to seq-scan keeps an index it never chooses.
 ///
 /// **The predicate reads `kind` as well as the digest**, and that is the second half of
 /// `rotate_key`'s refusal. The digest alone is not the credential boundary — it is the *fact
@@ -2913,5 +2923,68 @@ mod tests {
         assert_eq!(0_i64.clamp(1, crate::vocabulary::MAX_PAGE), 1);
         // And the default page fits under it.
         assert!(LeadQuery::inbox().limit <= crate::vocabulary::MAX_PAGE);
+    }
+
+    /// `find_source_by_key`'s comment promised "one indexed equality" and the schema did not
+    /// keep the promise — so the promise is now checked against the migration that keeps it.
+    ///
+    /// **This is a text check and it is still the right one**, because the thing that failed
+    /// here was never a *wrong* index or a *missing* migration: the column was written by
+    /// `create_source` and `rotate_key` since `0055` and read by nothing else, and a query with
+    /// no index is a perfectly valid query that compiles and passes every behavioural test. Only
+    /// reading the migration can catch "the file names an index and no index was ever created".
+    ///
+    /// The three assertions are the three decisions the migration argues for, so a later
+    /// tidy-up cannot quietly reverse one while the other two still hold: the predicate
+    /// `is not null` (a form source stores no digest, so the nulls must not be indexed), the
+    /// absence of `unique` (a digest reachable on two rows is a state a restored dump leaves
+    /// behind, and the lookup refuses it with its kind predicate rather than by failing to
+    /// match), and `concurrently` (a plain build takes a lock that blocks writes on the one
+    /// endpoint with no permission guard).
+    #[test]
+    fn the_public_key_lookup_is_indexed_the_way_its_comment_says() {
+        let path = format!(
+            "{}/../../database/migrations/0200_crm_intake_source_key_lookup.sql",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let sql = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("cannot read the migration that indexes the public lookup ({error})")
+        });
+
+        assert!(
+            sql.contains("on crm_intake_sources (endpoint_key_hash)")
+                && sql.contains("where endpoint_key_hash is not null"),
+            "the index must cover endpoint_key_hash and be partial on the nulls — a form-bound \
+             source stores no digest, so indexing the nulls makes every keyless source pay for \
+             an entry that can never match"
+        );
+        // Spelled out rather than substring-matched on the whole file, because the comment
+        // header discusses uniqueness in prose and only the statement itself can decide.
+        //
+        // `lines().find()` is NOT enough, and the first version of this assertion was vacuous
+        // because of it: the header *quotes* "create index concurrently" in prose, so the search
+        // returned a comment line, that line never contained "unique", and the assertion passed
+        // against a statement that said `create unique index`. A test that cannot fail is
+        // decoration. The statement is located by skipping the comments — the same reason the
+        // migration's own header argues that `create index concurrently` needs spelling out
+        // (a runner cannot distinguish "not run" from "not written" by reading prose).
+        let statement = sql
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.starts_with("--") && line.starts_with("create "))
+            .unwrap_or_else(|| panic!("0200 contains no create statement:\n{sql}"));
+        assert!(
+            !statement.to_lowercase().contains("unique"),
+            "the index must NOT be unique: tests/crm_key_lifecycle.rs deliberately stores one \
+             real digest on two rows (an endpoint row and a form row it was smuggled onto), and \
+             a unique index would make that state unrepresentable — leaving the kind predicate \
+             untested. Found: {statement}"
+        );
+        assert!(
+            statement.contains("concurrently"),
+            "the build must be CONCURRENTLY: this indexes the table the public capture endpoint \
+             writes on every submission, and a plain build holds a lock that blocks those \
+             writes, turning a performance fix into an outage. Found: {statement}"
+        );
     }
 }
