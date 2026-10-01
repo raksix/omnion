@@ -32,6 +32,7 @@ pub mod error;
 pub mod model;
 pub mod model_oauth;
 pub mod oauth;
+pub mod oauth_flow;
 pub mod openapi;
 pub mod secret;
 #[cfg(feature = "store")]
