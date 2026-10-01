@@ -78,7 +78,11 @@ const wants = (name) => ONLY_ALL || ONLY.includes(name);
  * `ONLY === group` compared a whole list to one string and was false for every list spelling.
  */
 const onlyGroup = (group) => ONLY.includes(group);
-const SCOPED_SECTIONS = { crm: "/crm", sales: "/sales", inventory: "/inventory" };
+// `hr` is listed for the same reason as the other three: the HR depth pass drives the whole chain
+// (raise → preview → decide → calendar), so `--only=hr` has to narrow the ROUTE list too. Without
+// the entry the flag would still run the pass but the walk would visit every other module's screens
+// with it — which is the "scoped pass that is not scoped" shape this table was introduced to stop.
+const SCOPED_SECTIONS = { crm: "/crm", sales: "/sales", inventory: "/inventory", hr: "/hr" };
 const SHOTS = path.join(OUT, "shots");
 const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome";
 const MAX_PER_PAGE = Number(arg("max-per-page", "40"));
@@ -1852,6 +1856,308 @@ async function runInventoryLedger(page, report) {
  * long as the goods were on a van. So the pass reads the stock list's own total before and after
  * and requires them to be equal, which is the property a stocktake six months later depends on.
  */
+
+/**
+ * The stocktake depth pass (REQ-053, slice 4).
+ *
+ * A pass that only visits `/inventory/stocktake` proves the list renders. This drives the chain
+ * that makes the feature real: open a sheet on a real shelf, type a count that disagrees, close
+ * it, and read the report back.
+ *
+ * **The three things it asserts that a rendering check never would:**
+ *
+ * 1. **An uncounted line says so.** The count box is empty and the word "not counted" is on the
+ *    row. This is the UI's half of the invariant the server enforces — a blank box on a stock
+ *    sheet reads as zero to everybody who has counted a shelf, and a warehouse that believes it
+ *    will close a sheet that destroys stock.
+ * 2. **The close button names what it is waiting on** while a line is uncounted, so a refusal is
+ *    not a dead end.
+ * 3. **The report prints both totals and whether they agree.** A report with one number cannot
+ *    fail, and a report that cannot fail is a screenshot.
+ *
+ * The count is written through the real input and the real save button rather than by calling
+ * the API, because the thing being tested is the screen a person uses. It is asserted to be a
+ * *deviation* (a number deliberately different from the expected one) so the close has something
+ * real to post — a count that agrees everywhere closes with zero movements, and a pass that only
+ * ever saw the clean case would have proved the button works and nothing about the variance.
+ */
+
+/**
+ * The HR leave depth pass (REQ-055, slice 2b).
+ *
+ * The acceptance criterion this pass exists for is **"the number shown before submit equals the
+ * stored value"**. That is a claim about two numbers agreeing across a round trip, and no amount of
+ * clicking a screen proves it: a form that renders, submits and lands on a detail page is
+ * compatible with a preview computed in TypeScript that disagrees with the Rust by a weekend.
+ *
+ * So the pass reads the preview **out of the DOM**, submits exactly the range it read, then opens
+ * the stored request and reads its days back. If the two texts differ the pass fails — that is the
+ * whole test. The range is chosen to cross a weekend on purpose, because a Mon–Fri range charges
+ * the same number whichever implementation you ask, and the weekend is where a second
+ * implementation of the working-day rule would quietly differ.
+ *
+ * Three more things it asserts, each a way this feature could look finished and be wrong:
+ *
+ * 1. **The calendar and the list disagree about nothing.** An approved request must appear as a
+ *    bar in the month it belongs to — a request list whose decisions never reach the calendar is
+ *    the classic "the feature works" bug, because each screen on its own looks right.
+ * 2. **A decided request loses its decision panel.** `can_decide` drives the panel; if the panel
+ *    were still there after an approval, the second approver's button would 409 in their face.
+ * 3. **The calendar's bounds are the server's.** The pass reads `data-qa-hr-calendar-window` and
+ *    checks it contains a `today is` clause, because a grid that computed its own "now" is a grid
+ *    that marks the wrong day whenever the browser's clock and the server's disagree.
+ */
+async function runHrLeave(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "hr", action: "hr-leave", ...step });
+  };
+
+  // --- the list and its calendar render -------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/hr/leave`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const listLoaded =
+    (await page.locator("[data-qa-hr-leave-new]").count()) > 0 &&
+    (await page.locator("[data-qa-hr-module-nav]").count()) > 0;
+  note({ step: "list", loaded: listLoaded });
+  if (!listLoaded) {
+    return { ok: false, reason: "the leave screen did not render its request action", steps };
+  }
+  await shot(page, "page-hr-leave");
+
+  // The module shelf must offer both surfaces. A module reachable only by typing a URL is a
+  // module that does not exist for anybody working in the panel.
+  const navOffersLeave = await page.locator('[data-qa-hr-module-link="leave"]').count();
+  const navOffersTypes = await page.locator('[data-qa-hr-module-link="types"]').count();
+  note({ step: "module-nav", offersLeave: navOffersLeave > 0, offersTypes: navOffersTypes > 0 });
+  if (navOffersLeave === 0) {
+    return { ok: false, reason: "the HR module nav does not offer the leave screen", steps };
+  }
+
+  // The window note carries the server's `today`. Its absence means the grid has no bounds of its
+  // own to draw, which is the state the empty-state branch also covers — so both are acceptable
+  // here and the assertion below is about the window *when* a window exists.
+  const windowText = await page
+    .locator("[data-qa-hr-calendar-window]")
+    .first()
+    .textContent()
+    .catch(() => null);
+  if (windowText) {
+    const hasToday = windowText.includes("today is");
+    note({ step: "calendar-window", window: windowText.trim(), hasToday });
+    if (!hasToday) {
+      return {
+        ok: false,
+        reason: `the absence calendar printed a window without the server's today (${windowText.trim()})`,
+        steps,
+      };
+    }
+  } else {
+    note({ step: "calendar-window", window: null, emptyCalendar: true });
+  }
+
+  // --- the form: preview, submit, and the equality that is the criterion ----------------------------
+  await page.goto(`${URL_ADMIN}/hr/leave/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const formLoaded = (await page.locator("[data-qa-hr-leave-form]").count()) > 0;
+  note({ step: "form", loaded: formLoaded });
+  if (!formLoaded) {
+    return { ok: false, reason: "the leave request form did not render", steps };
+  }
+
+  // A Monday-to-Friday range that straddles a weekend is the interesting case. `stamp` picks a
+  // Monday far enough ahead that the request cannot collide with another pass's, and the weekend
+  // it contains is the whole point: Mon–Sun charges 5, Mon–Fri charges 5, and a client that
+  // forgot the weekend would say 7.
+  const base = nextMonday(Date.now() + 21 * 86_400_000);
+  const from = isoOf(base);
+  const to = isoOf(addDays(base, 6));
+
+  await page.locator("[data-qa-hr-leave-from]").first().fill(from);
+  await page.locator("[data-qa-hr-leave-to]").first().fill(to);
+  // The preview is debounced and then round-trips to the API, so wait for the counter itself
+  // rather than for a fixed delay — a pass that sleeps long enough on a fast machine is a pass
+  // that flakes on a loaded one.
+  await page
+    .locator("[data-qa-hr-leave-preview-days]")
+    .first()
+    .waitFor({ state: "visible", timeout: 15000 })
+    .catch(() => {});
+  await page.waitForTimeout(600);
+  const previewDays = await page
+    .locator("[data-qa-hr-leave-preview-days]")
+    .first()
+    .textContent()
+    .catch(() => null);
+  note({ step: "preview", from, to, days: previewDays });
+  if (!previewDays) {
+    return {
+      ok: false,
+      reason: "the form never showed a day count for a Mon-Sun range (the preview route did not answer)",
+      steps,
+    };
+  }
+  await shot(page, "page-hr-leave-new");
+
+  // A weekend-crossing week is 5 working days. Asserting it rather than merely comparing two
+  // strings would catch a preview that returns "1" for everything and a store that agrees.
+  if (previewDays.trim() !== "5") {
+    return {
+      ok: false,
+      reason: `a Monday-to-Sunday range previewed ${previewDays.trim()} days, expected 5 working days`,
+      steps,
+    };
+  }
+
+  await page.locator("[data-qa-hr-leave-reason]").first().fill(`QA walkthrough ${Date.now()}`);
+  await page.locator("[data-qa-hr-leave-submit]").first().click();
+  // The form redirects to the detail of the request it created.
+  await page
+    .locator("[data-qa-hr-detail-timeline]")
+    .first()
+    .waitFor({ state: "visible", timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(900);
+  const landedOnDetail = (await page.locator("[data-qa-hr-detail-timeline]").count()) > 0;
+  note({ step: "submitted", landedOnDetail, url: page.url() });
+  if (!landedOnDetail) {
+    await shot(page, "page-hr-leave-submit-failed");
+    return { ok: false, reason: "submitting the form did not land on the request detail", steps };
+  }
+
+  // **The criterion.** The preview said 5; the stored row must say 5.
+  const detailDays = await page
+    .locator("[data-qa-hr-detail-timeline]")
+    .first()
+    .locator("xpath=..")
+    .textContent()
+    .catch(() => null);
+  const storedMatch = /(\d+(?:\.\d+)?) days?/.exec(detailDays ?? "");
+  const stored = storedMatch ? storedMatch[1] : null;
+  note({ step: "stored-days", preview: previewDays.trim(), stored });
+  if (stored !== previewDays.trim()) {
+    await shot(page, "page-hr-leave-days-mismatch");
+    return {
+      ok: false,
+      reason: `the form previewed ${previewDays.trim()} days but the stored request says ${stored ?? "nothing"}`,
+      steps,
+    };
+  }
+  await shot(page, "page-hr-leave-detail");
+
+  // --- the decision panel, and its disappearance -----------------------------------------------
+  // The pass signs in as the organization owner, who is somebody else's approver but NOT the
+  // requester here, so `can_decide` is expected to be true while the request is pending. If the
+  // screen hides the panel instead, that is reported rather than silently skipped: a form that
+  // cannot be decided is a feature nobody can use, and a pass that shrugs at it proves nothing.
+  const canDecide = (await page.locator("[data-qa-hr-detail-decision]").count()) > 0;
+  note({ step: "decision-panel-present", canDecide });
+  if (!canDecide) {
+    await shot(page, "page-hr-leave-no-decision-panel");
+    return {
+      ok: false,
+      reason: "a pending request raised by this session offers no decision panel",
+      steps,
+    };
+  }
+
+  await page.locator("[data-qa-hr-detail-comment]").first().fill("Approved by the QA walkthrough");
+  await page.locator("[data-qa-hr-detail-approve]").first().click();
+  await page.waitForTimeout(1600);
+
+  // The panel must be gone and the timeline must carry the approver's comment. A panel that
+  // survives its own decision is a double-approve button, and the second click 409s.
+  const panelAfter = (await page.locator("[data-qa-hr-detail-decision]").count()) > 0;
+  const commentShown =
+    (await page.locator('[data-qa-hr-detail-comment="approved"]').count()) > 0;
+  note({ step: "decided", panelStillThere: panelAfter, commentShown });
+  if (panelAfter) {
+    await shot(page, "page-hr-leave-panel-after-decision");
+    return {
+      ok: false,
+      reason: "the decision panel is still on a request that has just been approved",
+      steps,
+    };
+  }
+  if (!commentShown) {
+    await shot(page, "page-hr-leave-no-comment");
+    return {
+      ok: false,
+      reason: "the approval comment is not on the timeline",
+      steps,
+    };
+  }
+
+  // --- the decision reached the calendar ---------------------------------------------------------
+  // An approved request must draw a bar in its own month. Navigating explicitly, because "this
+  // month" is the current month and the request is deliberately in the future.
+  await page.goto(`${URL_ADMIN}/hr/leave`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const barsNow = await page.locator("[data-qa-hr-calendar-bar]").count();
+  note({ step: "calendar-this-month", bars: barsNow });
+
+  // Step forward a month at a time until the approved request's month is on screen. Twenty-four
+  // iterations covers any range a QA fixture could legitimately create; a pass that gave up
+  // early would report "no bar" for a request that is simply in month seven.
+  let foundBar = false;
+  for (let step = 0; step < 24 && !foundBar; step += 1) {
+    if (step > 0) {
+      await page.locator("[data-qa-hr-calendar-next]").first().click().catch(() => {});
+      await page.waitForTimeout(1100);
+    }
+    const label = await page
+      .locator("[data-qa-hr-calendar-bar]")
+      .first()
+      .getAttribute("data-qa-hr-calendar-bar")
+      .catch(() => null);
+    if (label) {
+      foundBar = true;
+      note({ step: "calendar-bar", requestId: label, monthsAhead: step });
+    }
+  }
+  if (!foundBar) {
+    await shot(page, "page-hr-leave-calendar-no-bar");
+    return {
+      ok: false,
+      reason: "an approved request drew no bar in any month of the next two years",
+      steps,
+    };
+  }
+  await shot(page, "page-hr-leave-calendar");
+
+  // A bar is a link to the request — the grid is a table of buttons, not a picture.
+  await page.locator("[data-qa-hr-calendar-bar]").first().click().catch(() => {});
+  await page.waitForTimeout(1400);
+  const barOpensDetail = (await page.locator("[data-qa-hr-detail-timeline]").count()) > 0;
+  note({ step: "calendar-bar-opens-detail", barOpensDetail });
+  if (!barOpensDetail) {
+    return { ok: false, reason: "a calendar bar does not open the request it stands for", steps };
+  }
+
+  return { ok: true, steps: steps.length };
+}
+
+/** The next Monday at or after `ms`, as midnight UTC. */
+function nextMonday(ms) {
+  const date = new Date(ms);
+  const midnight = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+  const weekday = new Date(midnight).getUTCDay();
+  // `getUTCDay` is 0 = Sunday, so Monday is 1 and the days to add are `(8 - weekday) % 7`.
+  return midnight + ((8 - weekday) % 7) * 86_400_000;
+}
+
+/** Add whole days to a UTC millisecond timestamp. */
+function addDays(ms, days) {
+  return ms + days * 86_400_000;
+}
+
+/** Format a UTC timestamp as the `yyyy-mm-dd` a date input takes. */
+function isoOf(ms) {
+  const date = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
+}
 
 /**
  * The stocktake depth pass (REQ-053, slice 4).
@@ -9541,6 +9847,14 @@ async function main() {
     // bespoke function is a screen whose *inventory* presence nobody checks, and the
     // rule is that a new screen is visited from the ordinary list too.
     { path: "/inventory/reports", name: "inventory-reports" },
+    // The HR leave surfaces (REQ-055, slice 2b). All three are in the ordinary route list and not
+    // only inside the depth pass, for the same reason as the reports screen above: a screen the
+    // harness can reach only through a bespoke `page.goto` is a screen whose presence in the
+    // product is never checked. `/hr/leave/{id}` is deliberately NOT here — a placeholder id proves
+    // the not-found state renders and nothing else — and `runHrLeave` opens a real request instead.
+    { path: "/hr/leave", name: "hr-leave" },
+    { path: "/hr/leave/new", name: "hr-leave-new" },
+    { path: "/hr/leave/types", name: "hr-leave-types" },
     // The security centre's five screens (REQ-012, slices 1–3). `runSecurityDepth` drives the
     // overview, the findings store and the header policy, but it never opened the last two —
     // and the same is true of the route list, so two screens that ship with rules, a policy
@@ -9757,6 +10071,14 @@ async function main() {
       () => runInventoryReports(page, report),
     );
     log(`inventory reports: ${JSON.stringify(report.inventoryReports)}`);
+  }
+
+  // The HR leave surfaces (REQ-055, slice 2b). Driven, not merely visited: the pass raises a
+  // request through the real form, compares the previewed day count against the stored one,
+  // approves it and walks the calendar forward until the approved request draws a bar.
+  if (!onlyGroup("hr")) {
+    report.hrLeave = await runDepthPass("hr-leave", () => runHrLeave(page, report));
+    log(`hr leave: ${JSON.stringify(report.hrLeave)}`);
   }
 
   if (!onlyGroup("crm")) {

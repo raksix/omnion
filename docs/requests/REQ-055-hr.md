@@ -1,14 +1,25 @@
 # REQ-055 — HR
 
-> **Status:** in-progress (slice 2a — leave end to end, data + API: migration 0198,
+> **Status:** in-progress (slice 2b — the leave SCREENS: `/hr/leave` (the request list over the absence
+> calendar), `/hr/leave/new` (the form, whose day counter calls `GET /hr/leave/requests/preview`
+> rather than recomputing it), `/hr/leave/{id}` (balance card, timeline, decision panel) and
+> `/hr/leave/types` (the catalogue editor), the module shelf and a `People` sidebar entry — plus
+> `runHrLeave` in the walkthrough and the three `/hr/*` routes in the ordinary inventory list, so
+> no screen exists only inside a bespoke function. The module nav it replaced listed **three
+> routes that rendered nothing** (`/hr/employees`, `/hr/attendance`, `/hr/settings`) — dead buttons
+> in the module's own shelf, which is the first thing that makes a module look unfinished, so the
+> shelf now lists only what the slice ships and the rest arrive with their slices. The decision panel
+> is driven by the server's `can_decide`, never by the status: a panel that survives its own
+> decision is a double-approve button whose second click 409s. **Still unticked: every browser box**
+> — the pass that would tick them is running. Previous: slice 2a — leave end to end, data + API:
+> migration 0198,
 > `modules/hr::leave` and `::requests` (69 unit tests, 21 new), the `hr.leave.*` quartet (14 keys
 > in `omnion-permissions`, 70/70), eleven guarded routes and **nine DB walks, 9/9 GREEN against a
 > live PostgreSQL**. Five boxes ticked. The slice found a real off-by-one in its own week index —
 > `number_days_from_monday` is zero-indexed, so a constant read as Mon–Fri made the working week
 > Tue–Sat and every request would have charged one day too many with no error anywhere; and a
 > real gap slice 1 left, that there was no serde adapter for an absent *instant*, so an
-> `Option<OffsetDateTime>` could only reach for the DATE adapter and lose its time. **The screens
-> are not built yet** — slice 2b — and no browser box can be ticked until they are. Previous:
+> `Option<OffsetDateTime>` could only reach for the DATE adapter and lose its time. Previous:
 > slice 1 — the people core: migration 0196, `modules/hr` (48 unit tests),
 > the `hr.*` permission family (10 keys, 70/70 in `omnion-permissions`), six guarded routers and
 > eight DB walks. Two of the request's own criteria are closed by *construction rather than by a

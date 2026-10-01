@@ -1,13 +1,10 @@
 # Omnion QA — latest pass (w4)
 
-- When: 2026-09-30T22:08:39.667Z · artifacts: `qa-artifacts/20260930-210644`
-- Interactions: 166 clicks · 8 field fills · 4 form submissions · 174 screenshots
-- Console errors: 38 · failed requests: 54 · dialogs: 0
-- Programmatic findings: 136 (high 136 · medium 0 · low 0)
+- When: 2026-10-01T01:07:27.905Z · artifacts: `qa-artifacts/20261001-010038`
+- Interactions: 15 clicks · 1 field fills · 0 form submissions · 108 screenshots
+- Console errors: 214 · failed requests: 213 · dialogs: 0
+- Programmatic findings: 498 (high 490 · medium 7 · low 1)
 - Vision issues: skipped (no vision API key found (env VISION_MCP_API_KEY or config.yaml))
-
-> **THIS RUN IS NOT A VERDICT — 1 reason(s):** the QA stack was not serving (fetch failed).
-> The counts below were computed without the evidence a verdict needs. Re-run the pass.
 
 ## Top findings
 
