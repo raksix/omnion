@@ -47,6 +47,7 @@ pub mod mapping;
 pub mod model;
 pub mod request_id;
 pub mod store;
+pub mod timestamp;
 pub mod vocabulary;
 
 pub use assignment::{
@@ -75,6 +76,7 @@ pub use model::{
     Attribution, CaptureOutcome, IntakeSource, Lead, LeadEvent, LeadMetrics, LeadOwner,
     NewIntakeSource, SpamVerdict, contactable,
 };
+pub use timestamp::{rfc3339, rfc3339_opt};
 pub use vocabulary::{
     ASSIGNMENT_TARGETS, DECISIONS, DEDUPE_POLICIES, MAX_BULK_IDS, MAX_PAGE, MAX_PAYLOAD_BYTES,
     SOURCE_KINDS, STATUSES, is_decision, is_dedupe_policy, is_open, is_round_robin_target,
