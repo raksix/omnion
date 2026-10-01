@@ -14338,7 +14338,39 @@ note({
       return active?.tagName === "INPUT" || active?.tagName === "TEXTAREA" || active?.tagName === "SELECT";
     });
     let paramReadBack = null;
+    let paramReadFrom = null;
     if (inspectorFieldFocused) {
+      // **WHICH node the inspector is editing, read from the focused field's own identity.**
+      // `I` focuses the first field of the *selected* card's form, so the field the keys land
+      // in already knows its subject: `NodeInspector` renders each parameter input with
+      // `id={param-${node.id}-${field.key}}`. That is the node the keystrokes will land in,
+      // read from the element itself rather than inferred from a selection marker that a
+      // commit may have moved.
+      //
+      // Two drafts of this read are both wrong, and both wrong in a way a note reads green.
+      // (1) Finding the node by *type* (`nodes.find(n => n.node_type === "wait")`) asks for a
+      // field the server never sends — `Node` renames it to `type`, and `deny_unknown_fields`
+      // means there is no alias — so the comparison was `undefined === "wait"`, forever
+      // false, `paramReadBack` structurally `null` and `paramWrote` permanently `false` on a
+      // fully working keyboard path. A gate that cannot go green and a gate that cannot go
+      // red look identical in a report; this one could not go green. (2) A fallback that
+      // reaches for `data-inspector-node-id`, an attribute no element writes, is the same
+      // defect wearing a longer name — and `data-inspector` is a **prefix** of
+      // `data-inspector-field`, so any read built on that substring matches the fields and
+      // never the panel (the trap `table-mode-row.test.ts` already pins with an assertion).
+      paramReadFrom = await page
+        .evaluate(() => {
+          const active = document.activeElement;
+          const id = active?.getAttribute?.("id") ?? "";
+          const match = /^param-(.+?)-(.+)$/.exec(id);
+          if (match) return match[1];
+          // No card carries the selection marker after a commit, and the focused element may
+          // be the `label` input rather than a parameter. Both carry the node id in their id.
+          const labelled = /^label-(.+)$/.exec(id);
+          return labelled ? labelled[1] : null;
+        })
+        .catch(() => null);
+
       await page.keyboard.press("Control+a");
       await page.keyboard.type("31");
       await page.waitForTimeout(500);
@@ -14347,8 +14379,12 @@ note({
       await page.keyboard.press("Control+s");
       await page.waitForTimeout(1600);
       const graphAfterParam = (await readGraphAgain()) ?? null;
-      const waited = (graphAfterParam?.graph?.nodes ?? []).find((node) => node.node_type === "wait");
-      paramReadBack = waited?.params?.seconds ?? null;
+      // The wire key is `type` (`#[serde(rename = "type")]` on `Node`), and the wait node's
+      // parameter is `seconds`.
+      const edited =
+        (graphAfterParam?.graph?.nodes ?? []).find((node) => node.id === paramReadFrom) ??
+        (graphAfterParam?.graph?.nodes ?? []).find((node) => node.type === "wait");
+      paramReadBack = edited?.params?.seconds ?? null;
     }
 
     // Validate, then run — both are single keys, and both are read from the screen and the
@@ -14398,8 +14434,13 @@ note({
       committedEdgeTarget: committedEdge?.target ?? null,
       // Step 3: a parameter, typed and read back from the server.
       inspectorFocusedByKey: inspectorFieldFocused,
+      // The node the keystrokes landed in, and whether the read was of THAT node or of a
+      // fallback. A `paramWrote` beside `paramReadFrom: null` is a number about somebody
+      // else's node, so the two travel together and `paramWrote` is false without a subject.
+      paramReadFrom,
+      paramSubjectKnown: paramReadFrom !== null,
       paramReadBack,
-      paramWrote: paramReadBack === 31 || paramReadBack === "31",
+      paramWrote: paramReadFrom !== null && (paramReadBack === 31 || paramReadBack === "31"),
       // Steps 4 and 5.
       problemsPanel: problemsRendered,
       runsAfterKey: Array.isArray(runAfterKey?.runs) ? runAfterKey.runs.length : null,
