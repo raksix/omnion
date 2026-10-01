@@ -10433,3 +10433,68 @@ executed; the honest position is the one tick 92 recorded, one tick further on. 
 environments- or cdn-scoped pass to reach a **healthy** stack must read a red in
 `audit-depth-claims` output as a real product defect — and the first thing to establish, before
 any finding is believed, is that `pg_isready` answers.
+
+---
+
+## Tick 94 — REQ-024 slice 1, the decision layer (and the box's database, again)
+
+**What.** Picked REQ-024 (deployment centre) — the first `pending` request in the wave-5 queue, and
+the one the owner's brief opens with. Its read-only centre is four lines of UI, and the work worth
+doing first is the part underneath that can be wrong **without looking wrong**: the version
+comparison, the channel rule, the pre-flight states, the cancel boundary and the update-check
+dedupe. That is now `crates/deployment` with 41 unit tests, plus the `0211` migration.
+
+Two commits, each pushed:
+
+- `b7d9e1da` — `version.rs` / `preflight.rs` / `job.rs` and the migration.
+- `f8bd11ac` — `manifest.rs`: feed parsing and what an update check may claim.
+
+**Three bugs my own tests caught before either commit, which is the point of writing them as
+claims rather than as coverage.**
+
+1. `availability()` kept the **oldest** release seen so far. The guard was
+   `!matches!(best, Some(b) if b.version < release.version)`, which reads like "keep it" and is
+   the opposite. It is invisible in any test offering a single release, so the two tests that
+   offered three caught it. The fix is one named helper used three times rather than three
+   hand-inverted copies.
+2. The channel check was written on the **candidate** rather than the installation:
+   `self.channel.admits(...)` asked "is a nightly channel allowed to offer things?" (always yes)
+   instead of "may this stable install take a nightly build?" (never). Both sides now read
+   `current.channel`, and the doc says why the distinction is the whole rule.
+3. `may_cancel` was two `any` scans over the slices either side of the current position — three
+   ways to write one predicate and at least one way to get it backwards, which is what it did: it
+   refused the `backup` step, the exact step Cancel exists for. It is now `position < boundary`.
+
+A fourth was found by the database rather than by a test: **`jsonb_object_length` does not exist
+in PostgreSQL.** The constraint on `environment_health` that stops a `degraded` row with no probe
+details never applied — the file failed halfway and the second `deployments` table already
+existed, so an idempotence check would have looked like a pass if the first run had not been
+inspected. Replaced with `details <> '{}'::jsonb`.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-deployment --quiet` | **41/41** |
+| `cargo clippy -p omnion-deployment -- -D warnings` | clean |
+| `pnpm typecheck` | **2/2** |
+| migration on a live database | applies, **re-applies with no error**, and all 9 constraints bite — unknown environment, rollback without a reason, second active job on the *same* environment, finished row without `finished_at`, degraded with empty details, over-long message, end-before-start; a second active job on a **different** environment is allowed, and so are a rollback *with* a reason, degraded *with* details and an open-ended window |
+| browser pass | **not run — the shared PostgreSQL is in recovery.** `omnion-postgres` has been `Up 9 hours (unhealthy)`, `pg_isready` answers *rejecting connections*, and the log shows one continuous `syncing data directory (fsync)` line past **2310 s** with no other progress. The `409` slot is a consequence, not the cause. |
+| `git status` | clean; both commits pushed to `wave5` |
+
+**The migration-numbering note, which is a trap that has already cost this loop two ticks.** The
+`NNN_` prefix is one shared namespace across ten worktrees of a public repo, not per branch. The
+union high-water across `/mnt/apopic/omnion*/database/migrations` is **0210** (w7), so this file
+is `0211`. Choosing the next free number *in this worktree* would have produced `0198` and
+collided with w4's `0198_hr_leave.sql` — which is how `sqlx` ends up refusing to start with
+`VersionMismatch` while every test on the branch is green.
+
+**Next.** Slice 1's remaining half: the read routes (`/deployment/version`, `/environments`,
+`/releases`, `/releases/{version}`, `/history`, `/checks`), the scheduled update check that
+emits `update.available` once per newly seen version, and the `/deployment` screens with the
+card's `View Changes` / `Deploy` / `Rollback` and the honest `(up to date)` line. REQ-011 and
+REQ-017's last boxes stay open, and the ~84 QA gates written in ticks 92–93 are still **unproven** —
+`node --check` and `pnpm typecheck` are all that has touched them, exactly where tick 89's
+assertions sat. The first cdn- or environments-scoped pass to reach a **healthy** stack must read a
+red in `audit-depth-claims` as a real product defect, and must establish `pg_isready` before it
+believes any finding.

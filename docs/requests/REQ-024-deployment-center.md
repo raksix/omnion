@@ -1,6 +1,14 @@
 # REQ-024 — Deployment Center
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + infra
+> **Status:** in-progress (`b7d9e1da`, `f8bd11ac`; tick 94 — **slice 1's decision layer shipped and
+> verified; the routes, the update-check job and the screens are not built yet.** No screen exists,
+> so nothing is ticked in the acceptance list and the slice stays open. What is done is the part
+> that has to be right before any of it can be: the version comparison, the channel rule, the
+> pre-flight states, the cancel boundary, the step plans, the manifest parser and the update-check
+> dedupe — 41 unit tests, clippy clean, plus a migration validated against a real database rather
+> than assumed. Slice 1's remaining half — the read routes, the scheduled check with
+> `update.available`, the history list and the `/deployment` screens — is the next tick's work.)
+> · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -156,6 +164,29 @@ Visual check should see: a health indicator that is unmistakable with text (not 
 ### Slices
 
 1. **Read-only centre.** Migration, version endpoint, environment cards, release list + detail from the cached manifest, update-check job with `update.available`, history list. *Done when:* the card shows current vs available and `View Changes` renders a real release.
+   *Status:* **the decision layer is shipped and green; no route and no screen exists yet**
+   (`b7d9e1da`, `f8bd11ac`). The card in the brief is four lines and one of them is the dangerous
+   one, so the parts that can be wrong without looking wrong are a crate with its own tests
+   rather than expressions at a handler: `Version` is parsed and ordered (so `1.10.0` never
+   sorts below `1.9.0` and build metadata never invents an upgrade), `Channel::admits` is a
+   complete gate, and `Availability` has a third `Blocked { candidate, reason }` variant so a
+   release that exists but may not be offered is reported *with its reason* — the two states where
+   the alternative is an empty field, which the spec names as a bug in its own words.
+   `preflight.rs` keeps `Unknown` as a fourth state distinct from `Pass` and `Warn`: the spec
+   says a check that cannot be answered is visible, never a silent pass, and folding it into
+   `Warn` would make it acknowledgeable. A check the caller forgot is filled in as `Unknown`, so
+   a partial report **blocks** rather than passing with six of seven rows.
+   `job.rs` holds the cancel boundary as a rule: cancellable up to the step before `migrate`, not
+   from it onward, because past that point stopping is a rollback rather than a cancel.
+   `manifest.rs` holds the `update.available` dedupe as a `SeenSet` keyed on **channel +
+   version**, and a feed that cannot be read is a state carrying a reason rather than an error —
+   the spec requires the instance to keep rendering while offline.
+   The `0211` migration carries one-job-per-environment as a **partial unique index** over the
+   three active states (`verifying` included), so the `409` is enforcement rather than a racy
+   check, and it was validated against a live database: every check constraint bites, a second
+   active job on a *different* environment is allowed, and the file applies twice without error.
+   **Not built yet:** the read routes, the scheduled check, the history list and every screen, so
+   no acceptance box is ticked and the slice stays open.
 2. **Deploy wizard.** Pre-flight, deploy job with step records and log streaming, confirm-by-typing, cancel rule, result banner, history detail. *Done when:* a deploy of a locally built version completes end to end with a health verification and a history row.
 3. **Rollback + maintenance.** Rollback with reason and pre-backup, failure-path rollback entry point, maintenance enforcement and banner. *Done when:* a rollback returns the instance to the previous version and a window visibly blocks writes.
 4. **Cluster panel.** Cluster detection, live replica/CPU/memory read, metric sampling for the sparkline, conditional route, workload restart with confirmation. *Done when:* a cluster-backed environment shows real numbers and restart works, while a single-instance environment shows the alternative card with no empty cluster shell.
