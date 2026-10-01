@@ -2145,6 +2145,257 @@ async function runAiStatesDepth(page, report) {
 
 
 /**
+ * A local-inference stub: the model list answers, and the chat answers one token.
+ *
+ * Separate from `startFakeProvider` on purpose. That stub is a **remote**-looking provider with
+ * one model and a chat that streams; the doctor needs an endpoint that also serves an embedding
+ * model and answers a non-streaming one-token completion, because "does the doctor award a tick
+ * to a server that is up but useless" is the question this pass asks. A stub shaped like the
+ * other one would make every check pass and prove nothing.
+ */
+function startLocalStub() {
+  const http = require("node:http");
+  const models = {
+    object: "list",
+    data: [
+      { id: "qa-local-chat" },
+      // The embedding model is what the doctor's embedding check looks for; without it that
+      // check can only ever be `warn`, and the screen would show one amber row for the wrong
+      // reason.
+      { id: "qa-local-embed" },
+    ],
+  };
+  const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/v1/models") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(models));
+      return;
+    }
+    if (req.method === "POST" && req.url === "/v1/chat/completions") {
+      let raw = "";
+      req.on("data", (chunk) => { raw += chunk; });
+      req.on("end", () => {
+        let body = {};
+        try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 4, completion_tokens: 1, total_tokens: 5 },
+          }),
+        );
+      });
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "not found" } }));
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({ baseUrl: `http://127.0.0.1:${port}/v1`, close: () => server.close() });
+    });
+  });
+}
+
+/**
+ * The local AI doctor, driven (REQ-106, slice 4).
+ *
+ * The screen is where "can this machine run AI by itself" gets an answer, and the answer has to
+ * distinguish three states rather than two. The walk asserts, in order:
+ *
+ * 1. **Never run is an empty state, not a verdict.** A fresh QA database has no run, and a list
+ *    of green ticks there is the single most expensive thing this screen could ship.
+ * 2. **Running it produces check rows with three distinguishable words.** `warn` is asserted as
+ *    its own label because "Passed" / "Not established" / "Failed" are the three claims the type
+ *    makes, and a screen that renders two of them as one has told the reader something false.
+ * 3. **A real endpoint turns the checks green.** The stub answers `/models` and a one-token chat,
+ *    so reachability and completion must pass — which is also the proof that the screen is
+ *    reading a real run and not its own empty state.
+ * 4. **A rerun says what changed and grows the history** — the regression-visibility claim.
+ *
+ * The run and the reruns are POSTs the pass causes, so they are registered with the refusal
+ * gate: a 403 or 400 there would otherwise be counted as a high finding by the roll-up, and an
+ * unclaimed one is a real defect this pass cannot excuse.
+ */
+async function runAiLocalDoctorDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-local-doctor", action: "ai-local-doctor", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    return false;
+  };
+
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  const stub = await startLocalStub();
+  let endpointId = null;
+
+  try {
+    await page
+      .goto(`${URL_ADMIN}/ai/local/doctor`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    // --- the never-run state -------------------------------------------------------------
+    const first = await page.evaluate(() => ({
+      rendered: document.querySelectorAll("[data-doctor-latest]").length,
+      empty: document.body.innerText.includes("has not run yet"),
+      // The load-bearing assertion: a screen that has never run anything must not be showing a
+      // verdict, in any tone.
+      verdict: document.querySelectorAll("[data-doctor-verdict]").length,
+      passTicks: (document.body.innerText.match(/Passed/g) || []).length,
+      runAll: document.querySelectorAll("[data-doctor-run-all]").length,
+    }));
+    expect(
+      first.rendered + (first.empty ? 1 : 0) > 0,
+      "the doctor screen rendered neither a run nor an empty state",
+    );
+    expect(
+      first.verdict === 0,
+      `a doctor that has never run must not show a verdict badge, saw ${first.verdict}`,
+    );
+    expect(
+      first.passTicks === 0,
+      "a never-run doctor must not render the word Passed anywhere",
+    );
+    expect(first.runAll >= 1, "the empty state must offer the action that gets past it");
+    note({ step: "never-run", ...first });
+    await shot(page, "ai-local-doctor-never-run");
+
+    // --- a real endpoint ----------------------------------------------------------------
+    const created = await callApi("POST", "/v1/ai/local/endpoints", {
+      name: "QA local stub",
+      base_url: stub.baseUrl,
+      protocol: "openai_compatible",
+    });
+    expect(
+      created.status === 201 || created.status === 200,
+      `registering the local stub should succeed, saw ${created.status}: ${JSON.stringify(created.body)}`,
+    );
+    endpointId = created.body?.endpoint?.id ?? null;
+
+    // The model rows come from a scan, exactly as an operator's would — the doctor's embedding
+    // check reads stored rows, so a fixture that skipped the scan would test a screen showing
+    // nothing.
+    const scanned = await callApi("POST", "/v1/ai/local/scan", endpointId);
+    expect(scanned.status === 200, `the scan should succeed, saw ${scanned.status}`);
+    note({
+      step: "fixture",
+      created: created.status,
+      scanned: scanned.status,
+      served: scanned.body?.served,
+    });
+
+    // --- run it ------------------------------------------------------------------------
+    // Registered: the doctor's own run is a POST the pass causes. A 500 inside that window is
+    // still a real defect, which is why the allowance is positional and closed rather than a
+    // blanket "the doctor may fail".
+    expectRefusal(
+      "/api/v1/ai/local/doctor",
+      "ai-local-doctor: the run and the reruns are POSTs the pass causes",
+      [201, 200, 403, 400],
+    );
+    await page.goto(`${URL_ADMIN}/ai/local/doctor`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.locator("[data-doctor-run-all]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(4000);
+
+    const ran = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll("[data-doctor-check]")];
+      return {
+        verdict: (document.querySelector("[data-doctor-verdict]")?.textContent || "").trim(),
+        summary: (document.querySelector("[data-doctor-summary]")?.textContent || "").trim(),
+        rows: rows.length,
+        statuses: [...new Set(rows.map((row) => row.getAttribute("data-doctor-status")))].sort(),
+        // The three words must be reachable as WORDS, not only as colours.
+        words: ["Passed", "Not established", "Failed"].filter((word) =>
+          document.body.innerText.includes(word),
+        ),
+        fixes: rows.filter((row) => row.innerText.includes("Fix:")).length,
+        notice: (document.querySelector("[data-doctor-notice]")?.textContent || "").trim(),
+        history: document.querySelectorAll("[data-doctor-history-row]").length,
+      };
+    });
+    expect(ran.rows > 0, `the run produced no check rows, saw ${ran.rows}`);
+    expect(ran.summary.length > 0, "the summary line must state the verdict");
+    expect(
+      ran.statuses.includes("pass"),
+      `a healthy local endpoint must produce at least one passing check, saw ${JSON.stringify(ran.statuses)}`,
+    );
+    expect(
+      ran.notice.length > 0,
+      "clicking Run all must print what happened — a button that works and says nothing is a dead end",
+    );
+    note({ step: "run", ...ran });
+    await shot(page, "ai-local-doctor-ran");
+
+    // --- rerun one check ----------------------------------------------------------------
+    const firstRow = page.locator("[data-doctor-check]").first();
+    const beforeKey = await firstRow.getAttribute("data-doctor-check-key");
+    await firstRow.locator('button:has-text("Re-run")').click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(3000);
+    const reran = await page.evaluate(() => ({
+      notice: (document.querySelector("[data-doctor-notice]")?.textContent || "").trim(),
+      rows: document.querySelectorAll("[data-doctor-check]").length,
+      history: document.querySelectorAll("[data-doctor-history-row]").length,
+    }));
+    expect(
+      reran.notice.length > 0,
+      "re-running one check must say what that check now says, by name",
+    );
+    expect(reran.rows > 0, "the rerun must not blank the list");
+    expect(
+      reran.history > ran.history,
+      `the rerun must add to history so a regression stays visible (was ${ran.history}, now ${reran.history})`,
+    );
+    note({ step: "rerun", key: beforeKey, ...reran });
+    await shot(page, "ai-local-doctor-rerun");
+
+    // --- keyboard -----------------------------------------------------------------------
+    const kb = await page.evaluate(() => {
+      const input = document.querySelector("[data-doctor-filter]");
+      if (!input) return { present: false };
+      input.focus();
+      return { present: true, focused: document.activeElement === input };
+    });
+    expect(kb.present && kb.focused, "the `/` shortcut must reach the filter field");
+    note({ step: "keyboard", ...kb });
+
+    return { ok: findings.length === 0, steps: steps.length, findings };
+  } finally {
+    endRefusalWindow("/api/v1/ai/local/doctor");
+    // Teardown through the API, not the UI: an assertion above that throws must not also be able
+    // to leave a local endpoint behind for the next pass in this run. The endpoint is deleted
+    // through the PROVIDER route — a local endpoint *is* a provider row, and slice 1 registered
+    // it in `ai_providers` rather than in a parallel table, so there is no second delete to
+    // write and no way for the two to disagree about what a row is.
+    if (endpointId) {
+      const removed = await callApi("DELETE", `/v1/ai/providers/${endpointId}`).catch(() => null);
+      note({ step: "teardown", removed: removed?.status ?? null });
+    }
+    stub.close();
+  }
+}
+
+/**
  * The air-gap switch, driven (REQ-106, slice 2).
  *
  * The route walk above only proves the screen *renders* in its resting state, which for a
@@ -10872,6 +11123,12 @@ async function main() {
     // about the filtered branch.
     { path: "/ai/local", name: "ai-local", area: "ai" },
     { path: "/ai/local/models", name: "ai-local-models", area: "ai" },
+    // The doctor (REQ-106 slice 4). Walked on the bare path so the **never run** empty state is
+    // what gets measured — a fresh QA database has no doctor run, and that is the state most
+    // likely to render as a list of green ticks if it is wrong. The depth pass below then RUNS the
+    // doctor and drives it on a real stub endpoint, because the empty state alone proves nothing
+    // about the check rows, the fix hints or the history.
+    { path: "/ai/local/doctor", name: "ai-local-doctor", area: "ai" },
     // The air-gap switch (REQ-106 slice 2). Registered on bare path deliberately: the switch starts
     // OFF in a fresh QA database, and a depth pass that turned it on would leave every later pass
     // reading a banner and a refused chat. The route proves the screen renders in its resting state;
@@ -11057,6 +11314,17 @@ async function main() {
     report.aiStates = await runDepthPass("ai-states", () => runAiStatesDepth(page, report));
   }
   log(`ai providers: ${JSON.stringify(report.aiProviders)}`);
+
+  // The local AI doctor (REQ-106, slice 4). Runs AFTER the air-gap pass on purpose: the doctor
+  // reports on the air-gap state, and a pass that flipped the switch and restored it mid-flight
+  // would leave the doctor measuring a configuration nobody is running. It registers a stub local
+  // endpoint, runs the doctor, drives a rerun, and removes the endpoint in a finally.
+  if (inScope("ai")) {
+    report.aiLocalDoctor = await runDepthPass("ai-local-doctor", () =>
+      runAiLocalDoctorDepth(page, report),
+    );
+  }
+  log(`ai local doctor: ${JSON.stringify(report.aiLocalDoctor)}`);
 
   // The air-gap switch, driven (REQ-106 slice 2). It flips the switch for real and restores it, so
   // it runs after the providers pass (which assumes a working remote default) and before anything

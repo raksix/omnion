@@ -222,3 +222,91 @@ export function scanLocalEndpoint(id: string): Promise<{
     body: JSON.stringify(id),
   });
 }
+
+// -------------------------------------------------------------------------------------------
+// The doctor (REQ-106, slice 4)
+// -------------------------------------------------------------------------------------------
+
+/**
+ * One check's verdict.
+ *
+ * `warn` is a **third** answer, not a softer `pass`, and the type says so by having three
+ * members rather than a boolean. The screen's most important decision is which of the three to
+ * draw, and a boolean cannot express the difference between "checked and working" and "not
+ * checked" — which is the difference between a green tick and an honest gap.
+ */
+export type CheckStatus = "pass" | "warn" | "fail";
+
+/** One check, with its cause and the action that resolves it. */
+export type DoctorCheck = {
+  /** Stable key, from the API's `CHECK_KEYS`. */
+  key: string;
+  label: string;
+  status: CheckStatus;
+  /** One line saying what was found. */
+  detail: string;
+  latency_ms?: number | null;
+  /** Present whenever the check is not a pass. */
+  fix?: string | null;
+  /** Which endpoint the check was run against, for the per-endpoint ones. */
+  endpoint?: string | null;
+};
+
+/** A run's overall verdict. Derived server-side from the checks; never sent by the client. */
+export type RunStatus = "passed" | "warned" | "failed";
+
+/** One doctor run. */
+export type DoctorRun = {
+  id: number;
+  status: RunStatus;
+  checks: DoctorCheck[];
+  /** The one-sentence summary, naming the first blocking check when there is one. */
+  summary: string;
+  /** Whether the gap was on when the run happened. */
+  airgap_enabled: boolean;
+  started_at: string;
+  finished_at: string | null;
+  elapsed_ms: number | null;
+};
+
+/** `GET /api/v1/ai/local/doctor`. */
+export type DoctorList = {
+  /** The newest run, or `null` when the doctor has never run here. */
+  latest: DoctorRun | null;
+  /** The runs before it, newest first, so a regression is visible as a change. */
+  previous: DoctorRun[];
+  /**
+   * `true` when nothing has ever run.
+   *
+   * Distinct from "ran and found nothing wrong": the empty state says "never checked", and a
+   * screen that rendered a verdict there would be drawing a claim it has no data for.
+   */
+  never_run: boolean;
+  airgap_enabled: boolean;
+};
+
+/** The last run plus its history. */
+export function fetchDoctor(): Promise<DoctorList> {
+  return request<DoctorList>("/api/v1/ai/local/doctor");
+}
+
+/**
+ * Run every check. The answer is the new run, so the screen can show it without a second read —
+ * a run followed by a GET could show two different moments.
+ */
+export function runDoctor(): Promise<DoctorRun> {
+  return request<DoctorRun>("/api/v1/ai/local/doctor", { method: "POST" });
+}
+
+/**
+ * Re-run one check.
+ *
+ * The API returns the **whole** new list rather than one check, because the summary verdict
+ * describes a whole state. This client therefore replaces the whole screen's data too — a client
+ * that patched in one row would be showing a summary next to checks it never re-ran.
+ */
+export function rerunDoctorCheck(key: string): Promise<DoctorRun> {
+  return request<DoctorRun>(`/api/v1/ai/local/doctor/${encodeURIComponent(key)}`, {
+    method: "POST",
+  });
+}

@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, BookMarked, Bot, ClipboardCheck, Cpu, FileStack, FileText, Fingerprint, Globe, Grid3x3, HardDriveDownload, HeartPulse, History as HistoryIcon, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, Wrench, X } from "lucide-react";
+import { Activity, BarChart3, Bell, BookMarked, Bot, ClipboardCheck, Cpu, FileStack, FileText, Fingerprint, Globe, Grid3x3, HardDriveDownload, HeartPulse, History as HistoryIcon, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Stethoscope, Timer, UserCog, UsersRound, Webhook, Wrench, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -81,6 +81,11 @@ const NAV = [
   // specific endpoint is about that endpoint — listing it beside configuration invites an
   // operator to pull a model with no endpoint chosen.
   { href: "/ai/local", label: "Local AI", icon: Cpu },
+  // The doctor (REQ-106 slice 4). Beside "Local AI" rather than inside it: the endpoints screen
+  // answers "what does this installation talk to" and the doctor answers "does any of it work
+  // with the internet unplugged". The second is the question before switching the air gap on, so
+  // it has to be one click away rather than buried under a specific endpoint.
+  { href: "/ai/local/doctor", label: "Local AI doctor", icon: Stethoscope },
   // The air-gap switch (REQ-106). Under "Local AI" rather than in the settings block, because it is
   // the second half of the same question — the endpoint list says where a call can still go, this
   // says what happens to the ones that cannot. It is the screen an operator opens mid-incident, so
