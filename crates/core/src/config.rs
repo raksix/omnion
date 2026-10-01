@@ -154,6 +154,17 @@ const DEFAULT_CRM_SLA_MAX_ORGANIZATIONS_U64: u64 = 100;
 /// have a cap, so a broken worker shows up within the tick.
 pub const DEFAULT_PROJECT_LIMIT_POLL_MS: u64 = 60_000;
 
+/// A day, for the delivery-log sweeper. Long because a sweep that finds nothing costs a
+/// handful of statements and the rows are the bulk of the outbox.
+pub const DEFAULT_NOTIFICATION_RETENTION_POLL_MS: u64 = 86_400_000;
+
+/// How many organizations one delivery-log sweep walks.
+pub const DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS: i64 = 100;
+
+/// [`DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS`] as the unsigned value the env reader
+/// hands back.
+const DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS_U64: u64 = 100;
+
 /// How many capped projects one pass walks. A pass is four counts and up to four claims per
 /// project, so a thousand projects is a maintenance window; the read is ordered by id so the
 /// projects that wait for the next tick are the same ones every time rather than a rotating
@@ -684,6 +695,35 @@ impl Default for ProjectLimitConfig {
     }
 }
 
+/// The notification delivery-log sweeper (REQ-021, slice 7).
+///
+/// **Its own flag, and the reason is that it deletes rather than sends.** The delivery runner
+/// and this one share the events cadence today, which is right while this worker does not
+/// exist; a deletion and a delivery in one switch means an installation that drains the queue
+/// from a dedicated worker also has to forget retention, and vice versa — the same argument
+/// `0123` makes for why the event sweeper has its own flag next to the event runner's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationRetentionConfig {
+    /// Whether this process sweeps the delivery log
+    /// (`OMNION_NOTIFICATION_RETENTION_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two sweeps (`OMNION_NOTIFICATION_RETENTION_POLL_MS`).
+    pub poll_ms: u64,
+    /// How many organizations one sweep walks
+    /// (`OMNION_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS`).
+    pub max_organizations: i64,
+}
+
+impl Default for NotificationRetentionConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_NOTIFICATION_RETENTION_POLL_MS,
+            max_organizations: DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS,
+        }
+    }
+}
+
 /// Email settings of the `send_email` action (`OMNION_SMTP_*`, `OMNION_MAIL_*`).
 ///
 /// Development defaults point at Mailpit, which the compose stack publishes on `1025`; a
@@ -1000,6 +1040,7 @@ pub struct Config {
     pub crm_sla: CrmSlaConfig,
     /// The project limit notice worker (REQ-133, slice 4).
     pub project_limit: ProjectLimitConfig,
+    pub notification_retention: NotificationRetentionConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// The installation's Web Push identity (REQ-021, slice 6).
@@ -1244,6 +1285,21 @@ impl Config {
         };
 
 
+        let notification_retention = NotificationRetentionConfig {
+            runner_enabled: read_flag(&read, "OMNION_NOTIFICATION_RETENTION_RUNNER", true)?,
+            poll_ms: read_positive(
+                &read,
+                "OMNION_NOTIFICATION_RETENTION_POLL_MS",
+                DEFAULT_NOTIFICATION_RETENTION_POLL_MS,
+            )?,
+            max_organizations: i64::try_from(read_positive(
+                &read,
+                "OMNION_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS",
+                DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS_U64,
+            )?)
+            .unwrap_or(DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS),
+        };
+
         let analytics = AnalyticsConfig {
             runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
             poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
@@ -1294,6 +1350,7 @@ impl Config {
             crm_autoresponder,
             crm_sla,
             project_limit,
+            notification_retention,
             mail,
             push,
             csrf,
@@ -1338,6 +1395,7 @@ impl Default for Config {
             crm_autoresponder: CrmAutoresponderConfig::default(),
             crm_sla: CrmSlaConfig::default(),
             project_limit: ProjectLimitConfig::default(),
+            notification_retention: NotificationRetentionConfig::default(),
             mail: MailConfig::default(),
             push: PushConfig::default(),
             // No secret by default, which is the honest default: a default key would be a key
