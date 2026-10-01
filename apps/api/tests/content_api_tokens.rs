@@ -972,3 +972,136 @@ async fn a_reserved_write_scope_is_stored_but_not_honoured() {
         "a write scope must not imply a read one: {scopes:?}"
     );
 }
+
+/// Criterion 16: each bad field fails with **a field-level message and a named error code**.
+///
+/// The existing `each_bad_field_is_refused_with_its_own_message` proved three of the four
+/// answers are a `400` and that an empty scope list names `scopes`. It could not catch the defect
+/// this test exists for, because it asserted status and *sometimes* a field — and the two cases
+/// that were wrong (a bad origin, an unknown scope) reported `field: "name"`, a field nothing
+/// rejects. A test that checks "a field is named" cannot see a field that is named wrongly.
+///
+/// So this one asserts the FULL contract as a table, and two properties the criterion depends on:
+///
+/// * **Each mistake gets its own field.** Not "some field", the *right* field. This is the
+///   assertion that fails against the old code: `bad origin` and `unknown scope` both answered
+///   `{"field":"name"}`.
+/// * **Each field is distinct.** If two mistakes could share a field, the highlighting is
+///   ambiguous again and the table would pass while the screen still misled someone. `name_taken`
+///   is the control: it is the one case that legitimately belongs to `name`, so if the mapping
+///   were broken the other way — everything reported as a scope or an origin — it fails too.
+#[tokio::test]
+async fn every_refused_field_is_named_and_they_are_all_different() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture.curator().await;
+
+    let post = |name: &'static str, body: Value| {
+        let state = fixture.state.clone();
+        let token = token.clone();
+        async move {
+            call(
+                &state,
+                request(
+                    Method::POST,
+                    "/api/v1/content-api/tokens",
+                    Some(&token),
+                    Some(body),
+                ),
+            )
+            .await
+        }
+    };
+
+    // (label, request body, expected field) — read off the create form's own control names.
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "unknown scope",
+            json!({ "name": "UnknownScope", "site_id": fixture.site, "scopes": ["nope:read"] }),
+            "scopes",
+        ),
+        (
+            "bad origin",
+            json!({
+                "name": "BadOrigin",
+                "site_id": fixture.site,
+                "scopes": ["content:read"],
+                "allowed_origins": ["https://app.example.com/*"]
+            }),
+            "allowed_origins",
+        ),
+        (
+            "bad tier",
+            json!({
+                "name": "BadTier",
+                "site_id": fixture.site,
+                "scopes": ["content:read"],
+                "rate_limit_per_minute": 10_000
+            }),
+            "rate_limit_per_minute",
+        ),
+        (
+            "bad expiry",
+            json!({
+                "name": "BadExpiry",
+                "site_id": fixture.site,
+                "scopes": ["content:read"],
+                "expires_in_days": 13
+            }),
+            "expires_in_days",
+        ),
+        ("empty name", json!({ "name": "   ", "site_id": fixture.site, "scopes": ["content:read"] }), "name"),
+    ];
+
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    for (label, body, field) in cases {
+        let response = post(label, body).await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{label} must be refused, not stored: {}",
+            response.body
+        );
+        let error = &response.body["error"];
+        // A NAMED code: the criterion asks for one, and `invalid_parameter` is a bucket rather
+        // than a name — it is what a caller cannot branch on.
+        let code = error["code"].as_str().unwrap_or("<missing>");
+        assert!(
+            !code.is_empty() && code != "<missing>",
+            "{label} must carry a named error code: {}",
+            response.body
+        );
+        assert_eq!(
+            error["details"]["field"], field,
+            "{label} must be reported on `{field}`, because that is the control the operator has \
+             to change: {}",
+            response.body
+        );
+        seen.push((label, field));
+    }
+
+    // The duplicate is the control for the other direction of the mapping.
+    let first = fixture.create_token(&token, "ControlName", &["content:read"]).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    let duplicate = fixture.create_token(&token, "ControlName", &["content:read"]).await;
+    assert_eq!(duplicate.status, StatusCode::CONFLICT, "{}", duplicate.body);
+    assert_eq!(duplicate.body["error"]["code"], "name_taken", "{}", duplicate.body);
+    assert_eq!(
+        duplicate.body["error"]["details"]["field"], "name",
+        "a taken name is genuinely the name's mistake: {}",
+        duplicate.body
+    );
+
+    // Distinctness. `name_taken` shares the `name` field with a malformed name, which is
+    // correct — both are the name, one 409 and one 400. Nothing else may collide.
+    seen.sort_unstable();
+    for pair in seen.windows(2) {
+        assert_ne!(
+            pair[0].1, pair[1].1,
+            "`{}` and `{}` both report on `{}`: the form cannot highlight one control for two \
+             mistakes",
+            pair[0].0, pair[1].0, pair[0].1
+        );
+    }
+}

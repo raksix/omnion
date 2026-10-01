@@ -607,6 +607,21 @@ fn map_token_error(error: omnion_content::ContentError) -> ApiError {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_parameter", message)
                 .with_details(json!({ "field": "rate_limit_per_minute" }))
         }
+        // The other two members of that trio, added after the tier proved the pattern was a
+        // habit rather than a rule. Before these arms existed, a bad origin and an unknown scope
+        // both fell into the `InvalidText` arm above and were reported on the **name** field:
+        // the create form highlights the field the error names, so the operator edited the name,
+        // the dialog saved, and the scope list or origin was still wrong. Proven live in the
+        // probe this pair was written for — `bad-origin` answered
+        // `{"field":"name"}` for a value typed into the origins box.
+        ContentError::InvalidScope(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_parameter", message)
+                .with_details(json!({ "field": "scopes" }))
+        }
+        ContentError::InvalidOrigin(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_parameter", message)
+                .with_details(json!({ "field": "allowed_origins" }))
+        }
         other => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",

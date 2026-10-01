@@ -57,6 +57,30 @@ pub enum ContentError {
     /// accepted and the limit stays wrong.
     #[error("invalid rate tier: {0}")]
     InvalidRateTier(String),
+    /// A content API token's scope list is empty or names a scope the platform does not offer
+    /// (REQ-019).
+    ///
+    /// **Its own variant for the same reason as [`ContentError::InvalidRateTier`],** and the
+    /// defect that forced the same fix a second time: `validate_scopes` answered `InvalidText`,
+    /// which the API maps to `details.field == "name"`. A caller who submitted an empty scope
+    /// list, or one naming `nope:read`, was told their token's **name** was wrong. The create
+    /// form highlights the field the error names, so the operator edits the name, the dialog
+    /// saves, and the scope list stays wrong — the same silent no-progress loop the tier had.
+    ///
+    /// The two mistakes stay distinguishable inside one variant because the message differs
+    /// ("pick at least one scope" vs "unknown scope: x") and the caller reads the message; what
+    /// the *field* must be is the same either way, and splitting the variant per message would
+    /// be two arms that agree.
+    #[error("invalid scope: {0}")]
+    InvalidScope(String),
+    /// A content API token's origin allow-list entry is not `scheme://host[:port]` (REQ-019).
+    ///
+    /// The third instance of this same defect, and the reason the pattern is now enforced rather
+    /// than remembered: an origin that is not an origin was reported on the **name** field. An
+    /// operator pasting `https://app.example.com/*` read a message about their name, changed their
+    /// name, and saved — with the origin still wrong and now carrying a different one.
+    #[error("invalid origin: {0}")]
+    InvalidOrigin(String),
     /// A lifecycle state is not one of the documented values.
     #[error("invalid status: {0}")]
     InvalidStatus(String),
@@ -448,6 +472,12 @@ impl ContentError {
             // variant is what lets the API put the message on the *tier* field: this match being
             // exhaustive is the whole reason a bad tier cannot again be reported as a bad name.
             Self::InvalidRateTier(_) => "invalid_parameter",
+            // A scope list that is empty or names a scope nobody offers. Same code as any other
+            // bad field; the variant is what puts the message on `scopes` instead of `name`, and
+            // this match being exhaustive is what stops that regressing into `InvalidText`.
+            Self::InvalidScope(_) => "invalid_parameter",
+            // Likewise `allowed_origins`. Third and last of the trio the API maps by field.
+            Self::InvalidOrigin(_) => "invalid_parameter",
         }
     }
 }

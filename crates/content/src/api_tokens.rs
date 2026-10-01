@@ -236,7 +236,7 @@ pub fn validate_name(name: &str) -> Result<String> {
 /// Validate a scope set: non-empty, known, deduplicated, order-preserving.
 pub fn validate_scopes(scopes: &[String]) -> Result<Vec<String>> {
     if scopes.is_empty() {
-        return Err(ContentError::InvalidText(
+        return Err(ContentError::InvalidScope(
             "pick at least one scope".to_string(),
         ));
     }
@@ -244,9 +244,7 @@ pub fn validate_scopes(scopes: &[String]) -> Result<Vec<String>> {
     for scope in scopes {
         let trimmed = scope.trim();
         if !SCOPES.contains(&trimmed) {
-            return Err(ContentError::InvalidText(format!(
-                "unknown scope: {trimmed}"
-            )));
+            return Err(ContentError::InvalidScope(format!("unknown scope: {trimmed}")));
         }
         if !seen.iter().any(|existing| existing == trimmed) {
             seen.push(trimmed.to_owned());
@@ -269,7 +267,7 @@ pub fn validate_origins(origins: &[String]) -> Result<Vec<String>> {
             continue;
         }
         if !is_valid_origin(trimmed) {
-            return Err(ContentError::InvalidText(format!(
+            return Err(ContentError::InvalidOrigin(format!(
                 "not an origin (scheme://host[:port]): {trimmed}"
             )));
         }
