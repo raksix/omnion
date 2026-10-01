@@ -614,6 +614,15 @@ export function updateMediaFile(
     caption?: string;
     description?: string;
     tags?: string[];
+    /**
+     * The whole custom pair set, sent as the editor holds it.
+     *
+     * `{}` clears the pairs; omitting the field leaves them alone. A *merge* would be the
+     * friendlier shape and the wrong one here — a caller that does not know the current set
+     * would drop every pair it did not send, which is how a licence number disappears during a
+     * caption edit.
+     */
+    metadata?: Record<string, string>;
     folder_id?: string | null;
   },
 ): Promise<MediaFile> {

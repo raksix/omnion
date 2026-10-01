@@ -43,6 +43,7 @@ import { LoadingTable } from "@/components/loading-table";
 import { FilePreview, formatDuration, previewKind } from "@/features/media/file-preview";
 import { ScanBadge } from "@/features/media/media-shared";
 import { GrantsTab } from "@/features/media/grants-tab";
+import { MetadataPairsEditor } from "@/features/media/metadata-pairs";
 import { SharesTab } from "@/features/media/shares-tab";
 import { ActivityTab } from "@/features/media/activity-tab";
 import { UsageTab } from "@/features/media/usage-tab";
@@ -597,6 +598,11 @@ function MetadataTab({
           {saving ? "Saving…" : "Save metadata"}
         </button>
       </div>
+
+      {/* Its own block and its own save button: the pairs are a *set*, so a caption edit must not
+          quietly rewrite them, and a "Save metadata" that also emptied the pairs would be a
+          button with two meanings. */}
+      <MetadataPairsEditor file={file} onSaved={onSaved} />
 
       <LegalHold file={file} />
     </div>
