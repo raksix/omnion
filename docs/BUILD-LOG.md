@@ -10252,3 +10252,58 @@ recording: `/mnt/apopic/omnion-w5/target` had been **deleted out from under the 
 another writer's cleanup, and `cargo` reported it as
 `could not write output ... No such file or directory` — the os error 2 signature, not a disk
 full (os error 28). `CARGO_TARGET_DIR=/dev/shm/w5-target` is the standing answer on this box.
+
+## 2026-10-01 · Wave 5 · tick 92 — the gates that were never gates
+
+**What.** Not a new screen, and not a fix to one either. The browser gate on REQ-011 and REQ-017
+is still owed, the QA slot is still held by a live sibling, and rather than spend the tick
+re-measuring the queue I did the only work the box allows: read the passes that have **never
+executed** as source instead of as artifacts.
+
+Two commits, and they are the same defect wearing different clothes.
+
+**A collected step is not a gate.** `steps.x = ...` lands in `summary.json` where a human reads it
+and no code does. `errorOffersRetry` on the notifications settings screen was
+`innerText().length > 0` under a name that claims a **control**: the message lives inside the
+element the preceding line counts, so it was true by construction from its own predecessor and
+no build could fail it — including one where Retry was never wired to `load`. It is now a button
+count, then a press with the route still failing and a watched request going out, which is the
+standard the CDN rules pass set one tick ago. `be34d07d`.
+
+The worse half is that all three retry steps on both screens were read by *nothing*, so a
+dead-end banner produced a report indistinguishable from a healthy one. Both screens now record
+findings, and the settings panel also asserts that a read which keeps failing stays an **error**
+rather than swapping to the ready matrix — a matrix of channels that were never loaded is a
+plausible-looking table of lies, and a Retry that "works" into it is worse than no Retry.
+
+`1894f6d5` is the same audit on `runEnvironmentsDepth`, which has never run a line of its own body
+— the reason twenty-odd ticks recorded it as "owed" rather than "unbuilt". The four claims the
+pass **exists** for were all collected and ungated: `cloneCopied` (whose own doc comment calls a
+job that reports `done` while copying zero rows "the exact failure this request exists to
+prevent"), the re-clone confirmation naming no count, the Promotions tab showing no record after
+that very screen requested one, and a history entry expanding to an empty frozen set. The tab is
+re-read after a full navigation precisely so a tab built from the dialog's in-memory state cannot
+pass — a control worth nothing unless an empty tab fails.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `node --check scripts/qa/walkthrough.cjs` | **ok** |
+| `pnpm typecheck` | **2/2** |
+| the eight selectors the new gates assert on | **all present** in `apps/admin` — a red names a defect, not a typo |
+| `load()` reads `setLoading(true)` before the fetch | the retry genuinely re-runs; the persistence claim is honest |
+| browser pass | **not run** — slot held by w6 (pid 480310, `/proc` cwd `/mnt/apopic/omnion-w6`, `clicks.jsonl` written 04:48:07, 41 min elapsed) |
+| `git status` | clean, `1894f6d5` pushed to `wave5` |
+
+**Next.** These seven new findings are written but **unproven** — `node --check` and
+`pnpm typecheck` are the only things that have touched them, exactly the position tick 89's
+assertions were in. The first environments-scoped pass to reach the box must treat a red here as
+a real product defect until proven otherwise. REQ-011's and REQ-017's last boxes stay open and
+neither REQ closes this tick; the next no-slot work is reading the remaining never-executed depth
+passes the same way.
+
+**Slot, measured.** w6's holder is alive and its click stream is being written, so this is
+"queued behind real work", not tick 89's wedge — the distinction lesson 33 asks for, and it took
+a `stat` rather than a story to get right. Not reaped. `/mnt/apopic` is at 98% and `/dev/shm` at
+95%, which is also why `CARGO_TARGET_DIR=/dev/shm/w5-target` stays the standing answer.
