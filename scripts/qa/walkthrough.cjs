@@ -14047,7 +14047,27 @@ async function runWorkflowTableDepth(page, report) {
           {
             name: "Only step",
             kind: "task",
-            action: "log",
+            // `noop`, and not `log` — which is what this read for four ticks. The server's
+            // own refusal named the ten actions it accepts:
+            //
+            //   step "Only step" names the action "log", which is not one of:
+            //   noop, echo, fail, transient, send_email, comment_revision,
+            //   http_request, publish_page, run_workflow, ai.prompt
+            //
+            // so the create was refused `400`, `workflowId` came back `null`, and every row
+            // below returned early — indistinguishable from a Table mode that renders nothing.
+            // `log` is a plausible name for a logging step and was never a real one; the
+            // lesson is the tick-56 one again, and it is worth stating as its own rule because
+            // the refusal was already being recorded and nobody read it: **a recorded refusal
+            // is only useful if the next reader acts on it.** Four ticks of a green-looking
+            // `create: {status: 400, id: null}` sat in that field while the fix was one word
+            // away and spelled out in the message beside it.
+            //
+            // `noop` is also the right choice for a *probe* specifically: it is the one
+            // action with no side effect, so a table row that saves cannot mail somebody or
+            // publish a page. The criterion is about the two modes agreeing, and the cheapest
+            // way to find out whether they agree is with a step that does nothing.
+            action: "noop",
             params: { message: "table mode probe" },
           },
         ],
