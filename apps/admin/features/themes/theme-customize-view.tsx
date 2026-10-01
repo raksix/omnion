@@ -47,6 +47,7 @@ import type {
   ThemeSettingsView,
 } from "@/lib/api";
 import { useSites } from "@/lib/sites";
+import { ThemeBrandingEditor, findingsFrom } from "./theme-branding-editor";
 
 /** Sections the editor owns, in the order the REQ lists them. */
 type SectionName = "tokens" | "typography" | "layout" | "branding" | "headerFooter";
@@ -135,6 +136,12 @@ export function ThemeCustomizeView() {
   const [busy, setBusy] = useState<"save" | "publish" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Per-field messages from a branding refusal, kept beside the general error banner. The
+  // banner carries the server's joined sentence (which is what a reader of the network tab
+  // sees); these carry the same sentences split by the field that caused them, which is what
+  // the editor puts under each input. One state rather than two error strings, because they
+  // answer the same save and showing only one of them loses half the information.
+  const [brandingMessages, setBrandingMessages] = useState<Record<string, string[]>>({});
   const [openSection, setOpenSection] = useState<SectionName>("tokens");
   const [contrastSeen, setContrastSeen] = useState(false);
   // The form as the last SERVER response left it, kept beside the live form so "is this dirty"
@@ -185,6 +192,18 @@ export function ThemeCustomizeView() {
         return { ...current, [name]: currentSection } as ThemeSettingsInput;
       });
       setContrastSeen(false);
+      // Editing the field that was refused retires its message. Leaving it up would claim the
+      // input is still wrong after the operator has replaced it, and the panel has no way to
+      // know the new value passes — the server says so, on the next save, which is the only
+      // measurement of that.
+      if (name === "branding") {
+        setBrandingMessages((current) => {
+          if (!(key in current)) return current;
+          const next = { ...current };
+          delete next[key];
+          return next;
+        });
+      }
     },
     [],
   );
@@ -236,6 +255,7 @@ export function ThemeCustomizeView() {
     setBusy("save");
     setError(null);
     setNotice(null);
+    setBrandingMessages({});
     try {
       const next = await saveThemeSettings(selectedSite.id, form);
       setView(next);
@@ -246,6 +266,13 @@ export function ThemeCustomizeView() {
         }.`,
       );
     } catch (caught) {
+      // A branding refusal is BOTH kept (the joined sentence, which names every finding) and
+      // split (one message per field, so each message sits under the input that caused it).
+      // Dropping the banner would leave the per-field lines with no explanation of what the
+      // save was; dropping the split would leave a sentence an operator has to parse by hand
+      // to work out which of three assets is at fault.
+      const split = findingsFrom(caught);
+      setBrandingMessages(split);
       setError((caught as ApiError).message);
     } finally {
       setBusy(null);
@@ -520,6 +547,20 @@ export function ThemeCustomizeView() {
                         defaults={themeDefaults}
                         onChange={(key, value) => setSectionValue("tokens", key, value)}
                         onReset={(key) => resetToken("tokens", key)}
+                      />
+                    ) : entry.name === "branding" ? (
+                      /* Branding is the one section that is NOT a flat map of free text: each
+                          key is a media id, so the editor offers the library, shows the limits
+                          the server will enforce, and renders one message per refused field
+                          (criterion 9). The other three keep the shared editor, because a
+                          typography or layout value really is a bare string. */
+                      <ThemeBrandingEditor
+                        siteId={selectedSite.id}
+                        values={values}
+                        limits={view.brandingLimits}
+                        messages={brandingMessages}
+                        onChange={(key, value) => setSectionValue("branding", key, value)}
+                        onClear={(key) => setSectionValue("branding", key, null)}
                       />
                     ) : (
                       /* Typography, layout, branding and header/footer are all the same

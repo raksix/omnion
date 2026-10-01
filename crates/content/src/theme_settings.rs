@@ -119,6 +119,14 @@ pub struct SettingsView {
     pub contrast: Vec<ContrastFinding>,
     /// Token names the theme itself declares, so the panel can offer a reset per token.
     pub default_tokens: Value,
+    /// What the three branding keys will be checked against on the next save.
+    ///
+    /// Sent to the panel rather than left to the client for two reasons: the numbers come from
+    /// the theme manifest and so differ per theme (an operator cannot be told "2 MB" once and
+    /// be right everywhere), and the save-time refusal is a 422 the operator reads AFTER a
+    /// picker has already let them choose the file. Showing the ceiling in the picker is what
+    /// turns the refusal from a surprise into a constraint.
+    pub branding_limits: crate::branding::BrandingLimits,
 }
 
 /// A row in the history list: enough to render, not the whole payload.
@@ -257,6 +265,7 @@ pub async fn settings_view(
     site_id: Uuid,
     active_theme_key: &str,
     default_tokens: Value,
+    branding_limits: crate::branding::BrandingLimits,
 ) -> Result<SettingsView> {
     let (draft, published) = pointers(pool, site_id).await?;
     let revisions = list_revisions(pool, site_id).await?;
@@ -285,6 +294,7 @@ pub async fn settings_view(
         revisions,
         contrast: contrast_report(&tokens),
         default_tokens,
+        branding_limits,
     })
 }
 

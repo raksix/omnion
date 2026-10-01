@@ -6836,6 +6836,14 @@ export type ThemeContrastFinding = {
   message: string;
 };
 
+export type ThemeBrandingLimits = {
+  /** Largest accepted file, in bytes, after the theme manifest narrowed the platform default. */
+  maxBytes: number;
+  minPx: number;
+  maxPx: number;
+  contentTypes: string[];
+};
+
 export type ThemeSettingsView = {
   siteId: string;
   themeKey: string;
@@ -6844,6 +6852,8 @@ export type ThemeSettingsView = {
   revisions: ThemeRevisionSummary[];
   contrast: ThemeContrastFinding[];
   defaultTokens: Record<string, unknown>;
+  /** What the three branding keys are checked against on the next save (criterion 9). */
+  brandingLimits: ThemeBrandingLimits;
 };
 
 /** What `PUT` accepts. Every section defaults, so a partial edit is a legal save. */

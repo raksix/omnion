@@ -84,7 +84,8 @@ pub const BRANDING_CONTENT_TYPES: [&str; 4] =
 ///
 /// Built by [`BrandingLimits::for_theme`]; every field has a platform default, so a theme that
 /// declares nothing is still checked rather than unchecked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BrandingLimits {
     /// Largest accepted file, in bytes.
     pub max_bytes: u64,

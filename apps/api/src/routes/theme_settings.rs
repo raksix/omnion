@@ -83,6 +83,20 @@ pub async fn read_settings(
     Ok(Json(settings_view(&state, site.id).await?))
 }
 
+/// The limits the panel shows beside the three branding inputs.
+///
+/// Read from the SAME manifest and reduced by the SAME [`BrandingLimits::for_theme`] the save
+/// route enforces, because a panel that displayed the platform defaults while a theme had
+/// tightened them would let an operator compose a file the server refuses with no explanation
+/// of the number that refused it. The theme the read uses is the site's ACTIVE one, which is
+/// what the save checks when the body names it.
+async fn branding_limits_for(state: &AppState, site_id: Uuid) -> BrandingLimits {
+    let theme_key = themes::active_theme_key(state.db().pool(), site_id)
+        .await
+        .unwrap_or_default();
+    BrandingLimits::for_theme(&manifest_for(state, &theme_key).await)
+}
+
 /// `PUT /api/v1/sites/{site_id}/theme-settings` — save a draft.
 pub async fn save_settings(
     State(state): State<AppState>,
@@ -304,7 +318,15 @@ pub async fn restore_revision(
 async fn settings_view(state: &AppState, site_id: Uuid) -> Result<SettingsView, ApiError> {
     let active = themes::active_theme_key(state.db().pool(), site_id).await?;
     let defaults = default_tokens_for(state, &active).await;
-    Ok(theme_settings::settings_view(state.db().pool(), site_id, &active, defaults).await?)
+    let branding_limits = branding_limits_for(state, site_id).await;
+    Ok(theme_settings::settings_view(
+        state.db().pool(),
+        site_id,
+        &active,
+        defaults,
+        branding_limits,
+    )
+    .await?)
 }
 
 /// A theme's declared default tokens, or `{}` for a key that is not installed.
