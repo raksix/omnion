@@ -8570,3 +8570,81 @@ the server accepts, and read the refusal it was given. Always
 `QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202`, and check the box is idle
 before starting one: this tick queued for the slot successfully and still died, because the slot
 was free while the BOX was not.
+
+## Tick 62 — the same defect tick 61 fixed, on the other side of the same gesture
+
+**No browser pass.** The box was not free: w5, w8 and w4 were all mid-pass, 45 Chrome, load 13,
+`/mnt/apopic` at 94% and `/` at 99%. Tick 61 queued for the QA slot successfully and still died
+2h in with "the QA stack stopped answering", so a free SLOT is not a free BOX and this tick did
+not start one. Merged `origin/main` first (19 commits behind; `BUILD-LOG.md` the only conflict,
+resolved with `merge-build-log.py`: base=6661 ours=8433 theirs=6800 → merged=8572, exact multiset
+OK).
+
+### What the tick found
+
+`undo-selection-edge` read the server's `edge_count` 1200ms after pressing `Control+z`:
+
+```js
+await page.keyboard.press("Control+z");
+await page.waitForTimeout(1200);
+const edgesAfterUndo = (await readGraph())?.edge_count ?? 0;
+```
+
+`AUTOSAVE_MS` in `builder-view.tsx` is **1_200**. That wait is not a loose guess at how long a save
+takes — it sits exactly ON the debounce boundary, so the row races the write it is measuring and
+`edgeRemovedByUndo` is decided by which side of a timer the autosave falls on. Three sites had it
+(the undo here, and `edge-delete` plus `edge-delete-undo` further down).
+
+**The obvious fix is wrong, and this is the part worth keeping.** Polling `edge_count` for
+stability is satisfied on the first poll: a graph whose debounce has not fired *is* stable. Two
+identical readings of a count prove only that nothing has changed — which is the precise state
+the wait exists to rule out. `settleRun` has no such hole because it waits for a run to stop moving
+*after having observed it start*. So `settleGraph` takes the **witness** of a write:
+`graph_version` is advanced by every write, so two identical readings of the *version* cannot
+happen until the write has landed, and a version that never moves means no write arrived. Both
+notes carry `writeSettled`, and the undo note carries `versionBefore`/`versionAfter` as the
+evidence for that claim.
+
+`awaitEdgeSelection` is the mirror image on the other side of the same gesture: the fixed 500ms
+after the arc click could not tell a click that **missed** from a click that landed on a canvas
+that had not repainted. Both read `edgeWasSelected: false`, and this row reports those as two
+different verdicts — a miss note on one branch, a prune assertion on the other. There is no
+version to witness here (nothing has been written yet), so it is an OR: poll until the selection
+*appears*, and report `appeared: false` when the budget runs out.
+
+### Two of my own guards were wrong again, and one was a regression I caused
+
+1. **The `!waitForTimeout` assertion I wrote caught a second fixed wait in the same row** — the
+   500ms after the click. I was about to narrow the window instead of fixing it, which would have
+   been the tenth instance of this REQ's "loosen the assertion until it agrees".
+2. **Adding the two helpers silently broke a SIBLING's guard.** `run-from-here-row.test.ts`
+   bounded its `settleRun` window at `async function interact(`, which was correct while
+   `settleRun` was the only helper in that gap. Two more landed there, the window grew to cover
+   all three, and the assertion for `settleRun`'s `settled: false` could be satisfied by either
+   sibling's own copy. The mutation harness found it on the first run — `13/13 → 12/13`, M13 STILL
+   GREEN. Both windows now end at the NEXT helper. **A window spanning more than the construct
+   under test is a window satisfied by the wrong occurrence**, and it fails as a green suite
+   reporting a guard that has stopped guarding.
+3. The harness refused M1 by name (its target was the old `press`/`1200`/read shape) instead of
+   silently passing a find/replace that matched nothing — the guard working. M1 was rewritten, not
+   relaxed. Helper mutations need a declared `global` escape, since a helper is outside every row
+   window by construction; the escape asserts its target exists so a stale `global` cannot rewrite
+   the first match elsewhere.
+
+**Proof.**
+- `node --test --experimental-strip-types apps/admin/features/workflows/*.test.ts` → **335 passed**
+  (333 → 335, +2)
+- `pnpm typecheck` → 2/2 successful · `node --check scripts/qa/walkthrough.cjs` → clean
+  (14,515 → 14,892 lines)
+- `undo-selection-edge-row.mutation.mjs` → **17/17** (was 12/12, +5), all new guards bite
+- `run-from-here-row` **13/13** (was 12/13 — the regression above), `step-trace-row` 10/10,
+  `table-mode-row` 8/8, `step-trace-target` 9/9 — **all five siblings run, not just the two
+  touched**; an unapplied mutation prints a line that looks like a real failure
+- `cargo test -p omnion-workflows --lib` → 157 passed; no Rust was touched this tick
+- Commits `c914f430`, `098013f1`, `22db07f4`, all pushed
+
+**Next.** One pass, when the box is idle — check siblings and `/mnt/apopic` first, not the slot.
+It closes `undo-selection-edge` for `writeSettled: true` beside `edgeRemovedByUndo`, and
+`edge-delete`/`edge-delete-undo` for their new `writeSettled`; then `run-from-here` and
+`step-trace` per tick 61's conjunction. `table-save-survives` for `clicked > 0` AND
+`inspected > 0` AND `builderSeesTableEdit: true`. Plugin row stays BLOCKED on REQ-121.
