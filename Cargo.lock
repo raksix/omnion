@@ -1580,6 +1580,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-deployment"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-environment"
 version = "0.1.0"
 dependencies = [

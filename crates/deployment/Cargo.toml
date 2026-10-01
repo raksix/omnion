@@ -1,0 +1,14 @@
+[package]
+name = "omnion-deployment"
+description = "Omnion deployment centre: version and channel rules, release metadata, pre-flight checks and the deployment job model."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
