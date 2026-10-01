@@ -1,6 +1,6 @@
 # REQ-106 — Local & Air-gapped AI Mode
 
-> **Status:** in-progress (slice 1 complete, awaiting its browser pass) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
+> **Status:** in-progress (slice 1 complete; slice 2's storage, events, API and enforcement done — the switch screen and the browser pass are still owed) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -137,10 +137,10 @@ three cannot drift apart; the allow-list widens it, never replaces it.
 
 ### Acceptance criteria
 
-- [ ] With the air gap on, a chat addressed to a remote provider is refused with `403 ai_airgap_blocked` naming the provider and host, and the attempt is logged with `status = 'blocked_airgap'`.
-- [ ] With the air gap on, the same chat addressed to a local endpoint answers normally (round-trip through a local stub server in the test).
+- [~] With the air gap on, a chat addressed to a remote provider is refused with `403 ai_airgap_blocked` naming the provider and host, and the attempt is logged with `status = 'blocked_airgap'`.
+- [x] With the air gap on, the same chat addressed to a local endpoint answers normally (round-trip through a local stub server in the test).
 - [x] A local endpoint that redirects to a non-local host is refused, and the refusal names the redirect target.
-- [ ] Enabling the air gap requires a reason; an empty or too-short reason is a field error, and the audit entry carries the actor, the reason and the time.
+- [x] Enabling the air gap requires a reason; an empty or too-short reason is a field error, and the audit entry carries the actor, the reason and the time.
 - [~] `/api/v1/ai/local/models` lists what the endpoint serves and a pull moves a model from `missing` to `available` through `pulling` with progress visible in the UI; the same key cannot be pulled twice concurrently.
 - [ ] A knowledge collection pinned to a local embedding model indexes and searches with the remote provider unreachable (test runs with the remote endpoint pointed at a closed port).
 - [ ] With the air gap on, a collection whose embedding model is remote is listed as blocked with a "needs a local embedding model" chip and a one-click repoint that works when a local embedding model exists.
@@ -168,6 +168,38 @@ Slice 1 (`f46b2388`, `0b68df62`, `c2285c30`, `e1c4ae94`, `4c6a6c31`, `7affb5a2`,
 renders the server's own `pull_message`, but it has NOT been through a browser pass, and the
 walkthrough routes are registered only — so no screen of this REQ is yet claimed verified.
 The four air-gap rows (1, 2, 4, 8) are slice 2. The remaining rows are slices 3 and 4.
+
+<!--
+Slice 2 (`a2379ab3`, `84e75a4c`, `779a1ca6`, `c2dc38ce`, `f3e15973`, `a499b745`, `b7cfbadd`,
+`5d738557`) proved:
+  * row 2, in full: with the gap ON, the same chat addressed to a local endpoint answers — and it
+    is round-tripped through the platform's own client against a real socket, addressed from the
+    **stored** row's URL rather than the one the test holds, so a save path that mangled the base
+    URL could not pass by re-typing the right one. `ai_airgap a_local_provider_still_answers_
+    while_the_gap_is_on` passed.
+  * row 4, in full: blank / whitespace / nine-character reasons are each refused with a sentence
+    that says WHY the field exists, the row is unchanged by any of them, and a real reason lands
+    with the actor and the time. The two walks also pin the asymmetry — turning the gap OFF takes
+    NO reason and keeps the previous one on the row, because an emergency action that can be
+    blocked by a validation rule is a control that fails closed at the worst moment.
+  * row 1 at [~] and NOT [x], deliberately. The walk proves the refusal (`Ok(Some(Refusal))`), that
+    it names the provider and the host, and that it is logged as `blocked_airgap` — read back out
+    of the database, which also proves the CHECK admits the new word. What is NOT yet walked is
+    the **HTTP** shape: the refusal is a `Failed` SSE frame rather than a 403, because the chat
+    stream has already opened by the time the failover walk reaches a provider. The request says
+    `403`; the stream cannot carry one. The frame carries `code = "ai_airgap_blocked"` and the
+    `blocked_response` 403 exists for the non-streaming paths, but until a walk asserts the frame
+    a reader would be right to say the criterion says one thing and the code does another.
+  * the walk is NOT a failover retry: the refusal returns rather than advancing, because every
+    non-local provider is refused identically and a retryable refusal would keep dialling hosts
+    the operator switched off.
+  * the allow-list widens and removal takes the answer away — the removal is the assertion, since
+    a list that only widens is decoration.
+  * the confirmation list is computed by the same rule the check uses and holds base URLs (rows
+    link to the provider), while the refusal holds bare hosts (the reader is elsewhere). A
+    hand-typed list would under-report, and under-reporting is the direction that hurts.
+  * `ai.airgap.manage` is its own key, not a third of the `ai.local.*` family; reading the switch
+    is `ai.local.read` because it answers the locality badges' question.
 -->
 
 ### QA plan

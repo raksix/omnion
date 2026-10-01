@@ -9538,3 +9538,67 @@ not by the age of the placeholder) for the whole tick, with 45 Chrome processes 
 
 **Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
 REQ-012 can close.
+
+## w7 tick 61 — REQ-106 slice 2, the enforcement half
+
+The switch's storage, event names, permission key, HTTP surface and the pre-call
+check all landed. The switch **screen** and the browser pass are still owed.
+
+| Gate | Command | Result |
+|---|---|---|
+| events | `cargo test -p omnion-events --quiet` | **53 passed** (was 49), 0 failed |
+| ai-hub | `cargo test -p omnion-ai-hub --quiet` | **596 passed**, 0 failed |
+| permissions | `cargo test -p omnion-permissions --quiet` | **65 passed** (63 + 2), 0 failed |
+| api lib | `cargo build -p omnion-api` | 0 errors |
+| walks | `cargo test -p omnion-api --test ai_airgap -- --test-threads=1` | **7/7** vs real PostgreSQL |
+| types | `pnpm typecheck` (admin) | **0 errors** |
+
+**Commits** — `84e75a4c` events · `779a1ca6` the outcome vocabulary · `c2dc38ce`
+the permission key · `f3e15973` the confirmation-list contract · `a499b745` the
+routes · `b7cfbadd` the pre-call check · `5d738557` the walks. Pushed to `wave7`.
+
+**The vocabulary is a contract with two halves, and they move together.** Adding
+`blocked_airgap` meant amending `ai_provider_usage_outcome_check` in `0222` and the
+guard in `health_store::record_usage` in the same commit; the walk proves the
+row lands, which is what a Rust-only widening would have failed on. `0222` was
+amended in place after scanning `_sqlx_migrations` on **every** database on the box
+(nothing has applied it) and checking the shared high-water across the ten
+worktrees — 0221, and 0222 is wave7's alone.
+
+**The refusal is a `Failed` SSE frame, not a 403.** By the time the failover walk
+reaches a provider the chat stream has already opened, so a status code is gone.
+The frame carries `code = "ai_airgap_blocked"` and the message names the provider,
+the host and the route that changes it. Because the request asks for a `403`, the
+criterion is ticked `[~]` rather than `[x]`: the walk proves the refusal and the log
+row, not the HTTP shape. `blocked_response()` exists for non-streaming callers.
+
+**A refusal must not be retryable.** The walk RETURNS instead of advancing, because
+every non-local provider is refused identically — a retryable refusal would keep
+dialling hosts the operator switched off and write one row per provider for a
+single message. An unreadable *switch* is a third thing again and says so
+(`airgap_check_failed`), because an outage and a policy answer demand opposite
+responses from the same screen.
+
+**Two process notes.**
+
+* A sibling's `scripts/qa/disk-guard.sh` deleted this worktree's build target
+  mid-compilation: `failed to create query cache … No such file or directory`. The
+  guard is correct — its reclaimability test reads `CARGO_TARGET_DIR` out of live
+  processes, and a build using the default `target/` symlink sets no such variable,
+  so it is invisible to the check meant to protect it. `CARGO_INCREMENTAL=0` is
+  the cheapest workaround: the whole failure mode is the `incremental/` tree.
+* Two walk failures were **my test's** expectations, not product bugs, and both were
+  caught only because the walk read real rows: `providers_that_would_block` returns
+  base URLs while its doc said "host", and a fabricated `Uuid` for the audit actor
+  tripped the `users` FK. The fixture now inserts a real user — `actor: None` is
+  the shape that proves nothing about who flipped the switch.
+
+**Browser pass: still owed, five slices deep.** The slot is `w8`'s — pid 3591518,
+`cwd=/mnt/apopic/omnion-w8`, live by `kill -0` **and** `/proc`, load 15, 25 Chrome
+processes. The registered walkthrough routes are a promise, not a measurement, so no
+screen of this REQ is claimed verified.
+
+**Next:** the switch screen (`/ai/settings/airgap` — reason, acknowledgement,
+type-to-confirm, the allow-list editor) and the banner on the AI screens; then that
+one pass over `/ai/local`, `/ai/local/models`, `/ai/settings/airgap`, the still-
+unpassed REQ-105 slice 5, and the closes of REQ-099/100/101.
