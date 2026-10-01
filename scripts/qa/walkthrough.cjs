@@ -15230,11 +15230,19 @@ note({
         if (!panel) return null;
         const capture = panel.querySelector("[data-listener-capture-status]");
         const payload = panel.querySelector("[data-listener-payload]");
+        const block = panel.querySelector("[data-listener-capture]");
         return {
           panelFound: true,
           summary: panel.querySelector("[data-listener-summary]")?.textContent?.trim() ?? null,
           // The panel's own sentence, which is the reading that matters.
           captureText: capture?.textContent?.replace(/\s+/g, " ").trim() ?? null,
+          // The KIND, which the sentence alone could not carry until this tick. The capture and
+          // the wait used to render the same "Captured page.published" heading, so
+          // `captureText: /Captured/` passed against a panel that had heard nothing — and the
+          // criterion's own claim (a real event shows up in the inspector) was unmeasurable,
+          // because the uncaptured state and the captured state were one reading. Read the
+          // attribute so a red row names WHICH half is wrong.
+          captureKind: block?.getAttribute("data-listener-capture-kind") ?? null,
           payloadRendered: payload !== null,
           payloadLength: payload?.textContent?.length ?? 0,
           countdown: panel.querySelector("[data-listener-countdown]")?.textContent?.trim() ?? null,
@@ -15294,6 +15302,10 @@ note({
       // The panel's own rendering.
       captureRendered: (armed?.captureText ?? null) !== null,
       captureText: armed?.captureText ?? null,
+      // The kind, which is what `captureText` could not express. Two readings, one heading,
+      // meant a probe could only ever report "something is drawn here"; now the row names the
+      // state, so a red one says whether the event never arrived or arrived unrendered.
+      captureKind: armed?.captureKind ?? null,
       payloadRendered: armed?.payloadRendered ?? null,
       payloadLength: armed?.payloadLength ?? null,
       countdown: armed?.countdown ?? null,
