@@ -104,12 +104,15 @@ a retention decision.
 
 ### Not done this tick
 
-The browser pass. `scripts/qa/run.sh` (pid 352105) has been queued behind a live sibling for the
-whole tick — w4 first, then w3 — and `QA_SLOT_WAIT=3600` held it rather than letting it collide,
-which is what that limit is for. So REQ-016's screen-legs boxes (the endpoint form's field
-messages, the payload inspector's clipboard contents, and the walkthrough inventory line) remain
-unticked with the reason in the box, and REQ-021's keyboard and mobile legs are still
-written-but-unmeasured.
+The browser pass. `scripts/qa/run.sh` was queued behind live siblings for the whole tick — w4
+first, then w3 — and `QA_SLOT_WAIT=3600` held it rather than letting it collide, which is what
+that limit is for. **It then died at its own 2400 s timeout still queued** (the log's last line is
+`waiting for a QA slot`), so this tick has **no** browser pass and every screen-leg box below
+stays open. That is two consecutive ticks now, and the queue behind a single shared slot is long
+enough that the next tick should not assume it will get one either. So REQ-016's screen legs (the
+endpoint form's field messages, the payload inspector's clipboard contents, and the walkthrough
+inventory line) remain unticked with the reason in the box, and REQ-021's keyboard and mobile legs
+are still written-but-unmeasured.
 
 Next: the QA pass, then the remaining REQ-016 screen legs, then REQ-021's.
 
