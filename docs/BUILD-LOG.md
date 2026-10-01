@@ -6919,3 +6919,43 @@ inspector — is written and unmeasured, and for three ticks each has been "the 
 run". The reason was never that the pass was slow. It was that consecutive ticks were starting
 competing passes that destroyed each other, and the resulting failure mode is a report full of
 findings measured against a database that was dropped underneath the walk.
+
+## Tick 47 · REQ-129 slice 1: the runner, and the CLI that reaches it (cddfff37, 76ecebe4)
+
+- **What.** `crates/migrations` gained `lock.rs` (one advisory key, distinct from SQLx's on
+  purpose), `policy.rs` (the singleton, its bounds enforced in Rust before the write) and
+  `runner.rs` (plan executes nothing, apply refuses drift-then-policy before the first statement,
+  verify_down cannot be pointed at a live database). `omnion migrate` gained `up`, `status`,
+  `plan` and `verify-down`. `omnion_core` now exposes the embedded bundle so the CLI, the runner
+  and a future panel all read the same one.
+- **Proof.** `cargo test -p omnion-migrations -p omnion-cli` → **86 passed, 0 failed**.
+  `pnpm typecheck` (apps/admin) → exit 0. `scripts/qa/migration-cli-proof.sh` → **36/36** against
+  real PostgreSQL on 5433: a 58-migration apply leaves 58 ledger rows and 58 SQLx rows, a second
+  apply is a no-op, `plan` writes nothing, `verify-down --version 0207 --scratch <db>` rehearses
+  and records the rehearsal, a corrupted checksum makes `status` exit 1 naming the file and both
+  hashes, and `plan` exits 1 while `up` still succeeds.
+- **Six defects the proof found and the unit tests could not.** The apply never wrote SQLx's
+  `_sqlx_migrations` row, so the next boot would re-apply the whole set and 0207 would fail on the
+  tables it had just made; `set local lock_timeout = $1` is a syntax error (SET takes no bind
+  parameters) and killed every apply before it wrote anything; the applied set read one ledger
+  instead of the union, so the 57 pre-ledger migrations read as pending; `version::text` is
+  `"207"` against the ledger's `"0207"`, so the backfill's `not in` matched nothing and it reported
+  "0 written" on a database with 57 unrecorded versions; SQLx replaces underscores with spaces in
+  `description`, so every filename this crate produced was `0207_migration safety.sql`; and the
+  down-script gate was refusing the **apply** rather than the gate, which — 53 of this tree's 58
+  migrations predating the rule — made Omnion uninstallable on every fresh database.
+- **A mutation that survived, and the test it earned.** Setting the reversal-block switch to
+  `false` left 57/57 green: this repository writes its reversals COMMENTED, so the comment rule
+  drops them anyway and only a reversal written as LIVE statements exercises the switch. The new
+  test asserts that case, and all three mutations (dollar-quote dropped, reversal switch broken,
+  structure compared by length) now fail.
+- **Reading correction worth recording.** The reversal parser keyed on a marker (`-- omnion:down`)
+  that **zero of 58 files use**, including the two that document the convention; the convention
+  that exists is a `-- Down script` heading. The parser found 0 reversals and would have made the
+  gate refuse the entire repository. It now accepts both, marker first, and a tree-wide test
+  asserts it reads exactly the 5 files that carry one — measured by an independent scan, not by
+  relaxing a threshold.
+- **Next.** `/deployment/migrations` list + detail + the `409` HTTP mapping and the two-runner
+  concurrency proof, the CI gate job on a seeded fixture with a hand-broken down fixture, then the
+  policy and lock screens. The w6 walkthrough ran this tick (120 pages) but its result has not
+  been read; this tick's changes are CLI- and crate-side and add no screen.
