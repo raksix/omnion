@@ -9714,3 +9714,141 @@ Both now have assertions written and waiting (`scripts/qa/walkthrough.cjs`: the 
 pressed, the inversion is asserted as `blocked` = pass, the message must say "refused", the badge
 must leave its "never" state on the same screen, and the stored word is read back from the API). The
 next tick with a quiet box runs one command to collect them.
+
+## Tick 97 — REQ-012 migration box: "fresh" was the easy half
+
+**What.** Closed the migration acceptance criterion of the security centre by proving the half
+nobody had: `0151` and `0217` applied to a database that already holds somebody's data.
+
+The criterion said "fresh **and populated**" and only the first word had ever been walked. The
+gap between those two words is the entire criterion — a migration applied to an empty database
+only proves it can create a table, and none of the failures that stop a platform from booting
+are of that kind. `0151` runs three `alter table` statements against a row that already carries
+an operator's saved header policy; `0217` hangs foreign keys off `users` rows that already
+exist. Both are invisible to a fresh-database test.
+
+**The walk.** `apps/api/tests/migration_gap.rs::the_security_migrations_apply_to_a_populated_database`
+migrates the whole tree, seeds a tenant, an account, **locks that account**, saves
+`{"hsts": true}` and records a finding and a check result — then rolls back *only* versions 151
+and 217 in the ledger and drops their objects by hand, so the two files run against that data.
+Rolling back "everything from 151 on" would have re-run the ~40 migrations between them and
+proved sibling writers' work instead of this criterion.
+
+Assertions: the locked account is **still present and still locked**; the saved policy survived
+the alters with its document intact; `0054`'s two tables kept their rows untouched by a migration
+added beside them; `0217`'s rule keeps its `created_by`. Each is one an empty table cannot
+produce.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| migration walk | `cargo test -p omnion-api --test migration_gap -- --test-threads=1` | **5 passed**, 0 failed |
+| crate | `cargo test -p omnion-security --quiet` | **208 passed** |
+| events | `cargo test -p omnion-events --quiet` | **49 passed** |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed** |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **11/11** |
+| drift | `cargo test -p omnion-api --test events every_emitted_name_is_in_the_catalogue` | **passed** |
+| types | `pnpm typecheck` | **0 errors** |
+
+**Proven to fail twice, because both halves of that setup can silently no-op — which is the
+general hazard here.** An assertion in a walk you built yourself is worth exactly as much as the
+setup is capable of failing.
+
+* Neutralising the ledger rollback means the migration never runs, and the read dies on
+  `column "rate_limits" does not exist`. A green run therefore genuinely required the migrations
+  to have executed — and this is the trap this file is full of: a rollback helper that deleted
+  nothing, or a `drop table if exists` that matched no name, would leave a test that passes
+  against migrations that never executed.
+* A `0151` sabotaged into `update security_settings set headers = '{}'` fails on precisely the
+  assertion written for it: *the upgrade must not revert a policy an operator had already
+  saved: {}*. That is the production disaster this criterion is written against, and **on a fresh
+  database it is undetectable** — `0135` inserts that row itself with `{}`, so "the document
+  survived the upgrade" and "the document is the default" are indistinguishable there.
+
+That second point is the finding worth carrying forward: the fresh-database test was green, and
+it *could not have been otherwise*. A green test on the wrong starting state is not weak
+evidence, it is evidence about nothing.
+
+**Note for the next writer, recorded so it is not re-found.** `cargo fmt -p omnion-api` sweeps
+the crate's whole module tree. It was run this tick and `git diff -w` was checked afterwards to
+confirm it touched nothing but `migration_gap.rs` — the token-level check comes *before* the
+style commit, not after.
+
+**Browser pass: still owed, and still not startable.** The slot is held live by `w8`
+(`pid 3591518`, `cwd=/mnt/apopic/omnion-w8`, verified with `kill -0` **and**
+`/proc/<pid>/cwd` — not by the age of the placeholder file), 25 Chrome processes, load 17. Six
+screen boxes on this REQ still turn on it.
+
+**Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
+REQ-012 can close.
+
+## Tick 98 — the media serve path had no validator at all
+
+**What.** `crates/media/src/validators.rs` (new, 20 tests) plus the four media serve paths, so a
+`GET` can say "I already hold these bytes" and be told `304`. The ETag is the row's `checksum`,
+which `append_version` rewrites in the same statement that moves `storage_key`.
+
+**The defect, and why nothing had caught it.** The serve path set `private, max-age=300` at a URL
+that **names the file rather than its contents**, and the tree carried no `ETag` and no
+`If-None-Match` handling anywhere — `grep -rn 'IF_NONE_MATCH\|NOT_MODIFIED\|ETAG' apps/ crates/`
+returned one unrelated SCIM line. Two facts therefore held at once and neither was visible: every
+repeat request pulled the whole object off the store, and a **replace changed the bytes behind an
+address that had promised they had not changed**. A visitor, the panel or a CDN honouring that
+`max-age` saw the previous photograph for five minutes after an operator corrected it. It is the
+uncalled `prune_candidates` defect class again, one module over: a TTL and a URL that together
+describe a promise nothing on the request path keeps.
+
+**Three decisions that are not decoration.**
+
+1. **The validator is the checksum, not a timestamp.** `updated_at` is stamped by a rename, a tag
+   edit and a folder move, so it changes when the bytes did not and fails to describe the one
+   change that did. The checksum is the identity of the pixels, and the walk asserts a validator
+   built from anything else cannot pass.
+2. **A version validates against its own checksum.** `serve_bytes` used the version row; had it
+   borrowed the file's validator it would answer `304` for a historical version the caller has
+   never seen.
+3. **The check happens before the body is read.** Reading first and deciding afterwards costs what
+   an unconditional `200` costs, which defeats the entire point.
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **219 passed**, 0 failed (was 179) |
+| walk | `cargo test -p omnion-api --test media -- --test-threads=1` | **16 passed**, 0 failed |
+| types | `apps/admin` `tsc --noEmit` | **0 errors** |
+
+The crate's 20 new tests, and the full 16-test walk suite green against a fresh database on port
+5433 (`omnion_cond`) — including the three walks this change touches: the range walk, the replace
+walk and the new conditional one. The walk
+`a_conditional_get_is_answered_from_the_bytes_and_a_replace_moves_the_validator` drives the real
+router over live PostgreSQL: upload, read the validator, revalidate to a `304` with an **empty
+body**, `*`, the date fallback, then **replace** — and assert the stale validator is answered
+`200` with the *new* bytes, that the new validator then settles, that version 1 revalidates against
+itself and is **not** answered by the file's current validator, and that an unparseable validator
+gets the representation rather than a `304`.
+
+**Proven to fail twice, because both halves of a self-written suite can no-op.**
+
+* The weak marker removed (`const WEAK = ""`) → the quoting test fails. A validator that stops
+  being weak is one that claims a byte-for-byte uniqueness the platform cannot promise.
+* The date comparison replaced by `true` → **two** tests fail. That is the bug this tick nearly
+  shipped: a shadowed `since` binding in the first draft made `If-Modified-Since` match *anything*,
+  which would have sent a `304` for every client that sent a date. The suite caught it.
+
+One test of mine was **wrong, not the code**: it asserted a client dated *after* the resource gets
+the bytes. A client cannot be right about the future, so `304` is correct and the test was fixed —
+the direction of that comparison is the whole content of the case.
+
+**Note for the next writer.** `cargo fmt -p omnion-media` sweeps the crate's whole module tree —
+it reformatted `duplicates.rs`, `grants.rs`, `retention.rs`, `scanning.rs`, `shares.rs`,
+`storage_settings.rs` and `usage.rs`, none of them mine. Revert them (`git checkout --`) rather
+than committing a sibling's reformat into this tick. Related: `/mnt/apopic` hit **100%** mid-tick
+(482 MB free) and an `open(...).write()` on `apps/api/tests/media.rs` died with `ENOSPC` **after
+truncating the file to 1862 lines**. The file was recovered with `git checkout --` and re-applied
+through `/dev/shm`. On this box, write a file to `/dev/shm` first and copy it into place.
+
+**Browser pass: still owed, and still not startable.** The slot is held live by `w6`
+(`pid 2904616`, `cwd=/mnt/apopic/omnion-w6`, verified with `kill -0` **and** `/proc/<pid>/cwd`),
+45 Chrome processes, load 27. REQ-010's screen-state box and this REQ's five screen boxes turn on it.
+
+**Next:** `bash scripts/qa/run.sh --only=media` on a free slot.
