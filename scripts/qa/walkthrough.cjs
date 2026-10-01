@@ -4366,11 +4366,27 @@ async function runSearchDepth(page, report) {
  * the question honestly ("there is no such member") instead of aborting the pass.
  */
 function qaSql(statement) {
-  return execFileSync(
+  const raw = execFileSync(
     "docker",
-    ["exec", QA_PG_CONTAINER, "psql", "-U", "omnion", "-d", QA_DB, "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", statement],
+    ["exec", QA_PG_CONTAINER, "psql", "-U", "omnion", "-d", QA_DB, "-v", "ON_ERROR_STOP=1", "-q", "-t", "-A", "-c", statement],
     { encoding: "utf8", timeout: 30000 },
-  ).trim();
+  );
+  // `-t -A` turns off headers and padding, but it does NOT suppress the COMMAND TAG: an
+  // `insert … returning id` answers with two lines, the uuid and then `INSERT 0 1`. `.trim()`
+  // turned that into the single value "5f72…787\nINSERT 0 1", which is then interpolated into
+  // the next statement as a uuid and Postgres answers `invalid input syntax for type uuid`.
+  //
+  // The symptom is a crash in whichever module ran second — the comments fixture — so the
+  // defect looks like a product bug in comments and like a broken database, and the real cause
+  // (a helper that returns stdout rather than a row) is in the harness. `-q` is the flag that
+  // actually silences the tag; the filter is the belt to its braces, because `select` answers
+  // with no tag and only DML produces one.
+  return raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l !== "" && !/^(INSERT|UPDATE|DELETE|SELECT|CREATE|DROP|ALTER)\s+\d+\s+/.test(l))
+    .join("\n")
+    .trim();
 }
 
 /**
