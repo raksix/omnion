@@ -13,6 +13,7 @@ pub mod backup_schedule_runner;
 pub mod backup_sweep_runner;
 pub mod cdn_purge_runner;
 pub mod deployment_check;
+pub mod deployment_runner;
 pub mod client_ip;
 pub mod cookies;
 pub mod dto;

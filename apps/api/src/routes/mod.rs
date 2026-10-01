@@ -80,6 +80,7 @@ pub mod cdn_purge;
 pub mod commands;
 pub mod content;
 pub mod deployment;
+pub mod deployment_run;
 pub mod environments;
 pub mod health;
 pub mod health_incidents;
@@ -1110,6 +1111,35 @@ pub fn router(state: AppState) -> Router {
     let deployment_checks_run =
         post(deployment::run_check_now).layer(guards::require(&state, "deployment.manage"));
 
+    // The deploy wizard (REQ-024, slice 2). Pre-flight and deploy are POSTs on the environment
+    // path slice 1 already mounts, so they **merge** onto it: registering a second
+    // `/deployment/environments/{environment}` is a panic at startup in axum, and the merge is
+    // the only shape that lets one path carry a GET and two POSTs with three different keys.
+    let deployment_environment_one = deployment_environment_one.merge(
+        post(deployment_run::preflight)
+            .layer(guards::require(&state, "deployment.manage"))
+            .merge(
+                post(deployment_run::start_deploy)
+                    .layer(guards::require(&state, "deployment.manage")),
+            ),
+    );
+    // The job routes. Reading a job and its log is `deployment.read` — they return the same
+    // values the history screen already shows — while cancel is `deployment.manage`, because
+    // stopping a run is an action on the environment, not a read of it.
+    let deployment_job = get(deployment_run::get_job)
+        .layer(guards::require(&state, "deployment.read"))
+        .merge(
+            post(deployment_run::cancel_job).layer(guards::require(&state, "deployment.manage")),
+        );
+    // The log, as a stream and as a cursor poll. One key for both: a client that cannot hold an
+    // `EventSource` open has exactly the same right to read the log, and splitting the read
+    // across two keys would make the fallback the path nobody holds.
+    let deployment_job_log = get(deployment_run::stream_log)
+        .layer(guards::require(&state, "deployment.read"))
+        .merge(
+            get(deployment_run::poll_log).layer(guards::require(&state, "deployment.read")),
+        );
+
     // Staging environments (REQ-017). Reading the list and one environment is `deployment.read`;
     // creating one, re-cloning it and cancelling a clone is `deployment.preview`; archiving one
     // is `deployment.rollback`. Three keys rather than one, because looking at a staging copy,
@@ -1993,6 +2023,8 @@ pub fn router(state: AppState) -> Router {
         .route("/deployment/history", deployment_history)
         .route("/deployment/checks", deployment_checks)
         .route("/deployment/checks/run", deployment_checks_run)
+        .route("/deployment/jobs/{id}", deployment_job)
+        .route("/deployment/jobs/{id}/log", deployment_job_log)
         .route("/environments", environments)
         .route("/environments/{id}", environment_one)
         .route("/environments/{id}/clone", environment_one_clone)

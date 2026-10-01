@@ -16,12 +16,13 @@
 
 pub mod error;
 pub mod job;
+pub mod jobs;
 pub mod manifest;
 pub mod preflight;
 pub mod version;
 
 pub use error::{FeedContext, StoreError};
-pub use job::{Job, JobKind, JobStatus, Step, StepStatus, may_cancel, plan_steps};
+pub use job::{Job, JobKind, JobStatus, Step, StepStatus, cancel_refusal, may_cancel, plan_steps};
 pub use manifest::{
     CheckResult, Manifest, RejectedEntry, SeenSet, parse_manifest, run_check, stale_banner,
 };

@@ -144,6 +144,14 @@ pub enum StepStatus {
     Failed,
     /// Not run, because an earlier step failed.
     Skipped,
+    /// A status this build does not know.
+    ///
+    /// Its own variant for the same reason `preflight::CheckState::Unknown` exists: a step whose
+    /// stored status is unrecognised is **not** pending, because pending is the state the wizard
+    /// offers to start. Coercing it would let a re-run of an already-finished step be launched
+    /// against a release that wrote a status this build has never heard of. It is never written
+    /// — `as_str` exists for values the database accepts, and this one has no column.
+    Unknown,
 }
 
 impl StepStatus {
@@ -155,6 +163,25 @@ impl StepStatus {
             StepStatus::Done => "done",
             StepStatus::Failed => "failed",
             StepStatus::Skipped => "skipped",
+            // Never stored: the column's check constraint has no such value. The arm exists so
+            // the match is total, and `unknown` is what the API serialises it as.
+            StepStatus::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a stored step status, with the same unknown-value rule as [`JobStatus::parse`].
+    ///
+    /// `None` for anything this build does not know, so a step written by a newer release
+    /// renders as `unknown` in the timeline rather than being coerced into "pending" — a pending
+    /// step is one the wizard will let the operator start, and a step that already ran is not.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(StepStatus::Pending),
+            "running" => Some(StepStatus::Running),
+            "done" => Some(StepStatus::Done),
+            "failed" => Some(StepStatus::Failed),
+            "skipped" => Some(StepStatus::Skipped),
+            _ => None,
         }
     }
 }
