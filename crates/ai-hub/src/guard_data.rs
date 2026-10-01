@@ -501,10 +501,15 @@ impl Policy {
 }
 
 /// How a masked span is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `numbered` is the default, and the default is the readable one: a deterministic
+/// `[EMAIL:a1b2c3]` is what a *later* turn in the same request needs, but `[EMAIL_1]` is what a
+/// human reading the events table or a test asserting a body can name without copying a hash.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaskStyle {
     /// `[EMAIL_1]`, `[EMAIL_2]` — ordered by first appearance.
+    #[default]
     Numbered,
     /// `[EMAIL:a1b2c3]` — the same value always renders the same way, so a model that repeats
     /// the placeholder in a later turn refers to the same value.

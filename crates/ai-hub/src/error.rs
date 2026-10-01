@@ -193,6 +193,51 @@ pub enum AiHubError {
     /// The provider could not be reached.
     #[error("the AI provider did not answer: {0}")]
     Transport(String),
+    /// A guard rule breaks one of the guard's own rules (REQ-105).
+    ///
+    /// Its own code, for the same reason `InvalidTool` and `InvalidApproval` have one: the
+    /// refusal belongs on a *field* of the rule form — a key that is not `[a-z0-9_.-]{2,60}`,
+    /// an expression that does not compile, a priority outside 1–999 — and a client that
+    /// mapped this onto `invalid_tool` would print "the tool is invalid" above the pattern
+    /// input. Every message names the field and the rule it broke.
+    ///
+    /// A **compiled** pattern is what makes this variant exist at all: an invalid expression
+    /// is a field error at save time and can never reach a request, so there is no second
+    /// error shape for a bad rule.
+    #[error("invalid guard rule: {0}")]
+    InvalidGuardRule(String),
+    /// No guard rule carries that id in this organization.
+    ///
+    /// `NotFound`, never a 403, for the same tenancy reason as [`Self::ApprovalNotFound`]: a
+    /// rule id that exists in another tenant must not be distinguishable by status code, or
+    /// the rules screen becomes an existence oracle for the whole installation's detection
+    /// rules — which is a map of the platform's own knowledge about what its tenants' data
+    /// looks like.
+    #[error("no guard rule `{0}` in this organization")]
+    GuardRuleNotFound(Uuid),
+    /// A guard rule with that key already exists in this scope.
+    ///
+    /// A `409` rather than a `400`: the request is well-formed and the *state* refuses it —
+    /// the folded unique index did its job, and the panel resolves it by offering a different
+    /// key instead of rewriting what the operator typed.
+    #[error("{0}")]
+    GuardRuleConflict(String),
+    /// An exemption breaks one of its own rules (REQ-105).
+    ///
+    /// Its own code rather than `InvalidGuardRule`, because the refusal belongs on a different
+    /// form: an exemption has a **reason** and an **expiry**, and "an exemption needs a reason"
+    /// printed above a regex input would be the wrong sentence above the wrong control.
+    #[error("invalid guard exemption: {0}")]
+    InvalidGuardExemption(String),
+    /// The guard refused to build: too many enabled rules (REQ-105).
+    ///
+    /// A configuration error surfaced on the request that hit it, and its own code because
+    /// the fix is on the rules screen rather than in the payload. The request is explicit that
+    /// this "refuses to start in the guard (the API answers a configuration error) rather than
+    /// slowing every call" — which is why it is not a 400: nothing about the caller's payload
+    /// is wrong.
+    #[error("{0}")]
+    GuardConfiguration(String),
     /// The provider answered, but refused the request.
     #[error("the AI provider answered with status {status}: {message}")]
     Upstream {
@@ -260,6 +305,16 @@ impl AiHubError {
             Self::ChangeSetNotFound(_) => "change_set_not_found",
             Self::IdentityNotFound(_) => "identity_not_found",
             Self::IdentityConflict(_) => "identity_conflict",
+            // The guard codes (REQ-105). Four distinct shapes, not one, because the four answers
+            // land on four different screens: a bad field is a `400` naming the field, a missing
+            // id is a `404` (never a 403 — a rule id that exists must not be confirmable by its
+            // status code), a taken key is a `409` the panel resolves by offering another, and
+            // the rule budget is a configuration error with no field to blame.
+            Self::InvalidGuardRule(_) => "invalid_guard_rule",
+            Self::GuardRuleNotFound(_) => "guard_rule_not_found",
+            Self::GuardRuleConflict(_) => "guard_rule_conflict",
+            Self::InvalidGuardExemption(_) => "invalid_guard_exemption",
+            Self::GuardConfiguration(_) => "guard_configuration",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::InvalidChatRequest(_) => "invalid_chat_request",
             Self::Transport(_) => "provider_unreachable",
