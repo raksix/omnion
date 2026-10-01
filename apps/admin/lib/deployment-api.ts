@@ -1,0 +1,365 @@
+/**
+ * The typed client for the deployment centre's release surface (REQ-128, slice 4's screens).
+ *
+ * It is its own module rather than another 300 lines appended to `api.ts` for two reasons that are
+ * both about legibility rather than size: `api.ts` is one flat list of every surface the panel
+ * speaks, and a reviewer looking for "what does the upgrade screen know about a rollback" should
+ * not have to page past nine hundred unrelated types; and this module's payloads are the ones with
+ * a **contract about honesty** — the cached-manifest banner, the `missing_kinds` list, the
+ * `unavailable` reason, the `renderable: false` that says *why* — and those read differently when
+ * they are next to each other than when they are 4,000 lines apart.
+ *
+ * ## The shapes are the API's, verbatim
+ *
+ * `ReleaseArtifact`, `BundleFile`, `Destructiveness`, `Step`, `Checklist` and `Rollback` mirror the
+ * serde output of `crates/deployment`. A screen that re-declared a field as optional because "the
+ * API might not send it" would be a screen that renders `undefined` as an empty cell, which is the
+ * blank the request explicitly forbids.
+ *
+ * ## Nothing here can carry a credential
+ *
+ * `BundleRequest` has no field a password can arrive in — the domain, registry, tag, TLS mode and
+ * size preset are the whole vocabulary — so the type is the guarantee rather than a scan. The
+ * generated files reference secrets **by name**, and the screen says so.
+ */
+
+import { request, ApiError } from "./api";
+
+export { ApiError };
+
+// -------------------------------------------------------------------------------------------
+// Artifacts
+// -------------------------------------------------------------------------------------------
+
+/** One published artifact of one release. */
+export type ReleaseArtifact = {
+  id: number;
+  version: string;
+  /** `image`, `cli`, `chart`, `sbom` or `compose`. */
+  kind: string;
+  /** The image reference, the binary name or the chart name. */
+  name: string;
+  /** The image digest, or the file checksum. `null` when the publisher sent none. */
+  digest: string | null;
+  platforms: string[];
+  size_bytes: number | null;
+  download_url: string | null;
+  published_at: string | null;
+  manifest_version: string;
+};
+
+/** A cached release, with the coverage the panel computed from the rows that exist. */
+export type CachedRelease = {
+  version: string;
+  channel: string;
+  source_commit: string | null;
+  core_min: string | null;
+  fetched_at: string;
+  migration_count: number;
+  /** The publisher's own claim, cached verbatim and never treated as a verification. */
+  migrations_destructive: boolean;
+  published_kinds: string[];
+  /** The kinds this version did NOT publish — an explicit list, not blank rows. */
+  missing_kinds: string[];
+};
+
+/** `GET /api/v1/deployment/artifacts`. */
+export type ArtifactsResponse = {
+  artifacts: ReleaseArtifact[];
+  releases: CachedRelease[];
+  /** The complete vocabulary, so a client computes nothing and guesses nothing. */
+  artifact_kinds: string[];
+  total: number;
+};
+
+/** `GET /api/v1/deployment/artifacts` — every cached artifact, newest release first. */
+export function fetchArtifacts(version?: string): Promise<ArtifactsResponse> {
+  const query = version ? `?version=${encodeURIComponent(version)}` : "";
+  return request<ArtifactsResponse>(`/api/v1/deployment/artifacts${query}`);
+}
+
+/** One release in full. */
+export type ReleaseDetail = {
+  version: string;
+  channel: string;
+  source_commit: string | null;
+  core_min: string | null;
+  migrations: string[];
+  migrations_destructive: boolean;
+  notes_md: string;
+  upgrade_notes_url: string | null;
+  fetched_at: string;
+  raw: unknown;
+  /** Answered against THIS build, so the screen can say what the comparison means. */
+  core_minimum_satisfied: boolean;
+};
+
+/** `GET /api/v1/deployment/artifacts/{version}`. */
+export function fetchRelease(version: string): Promise<{
+  release: ReleaseDetail;
+  artifacts: ReleaseArtifact[];
+  published_kinds: string[];
+  missing_kinds: string[];
+}> {
+  return request(`/api/v1/deployment/artifacts/${encodeURIComponent(version)}`);
+}
+
+// -------------------------------------------------------------------------------------------
+// Bundles
+// -------------------------------------------------------------------------------------------
+
+/** One file of a generated bundle. */
+export type BundleFile = {
+  name: string;
+  size: number;
+  sha256: string;
+};
+
+/** The bundle generator's vocabulary. Anything outside it is a 400 naming the field. */
+export const BUNDLE_KINDS = ["compose-small", "compose-enterprise", "helm"] as const;
+export type BundleKind = (typeof BUNDLE_KINDS)[number];
+
+/** The TLS modes the chart and both stacks understand. */
+export const TLS_MODES = ["existing-secret", "cert-manager", "none"] as const;
+
+/** The size presets, with the numbers the request says must be shown rather than named. */
+export const SIZE_PRESETS = [
+  { key: "small", label: "Small", detail: "2 vCPU · 4 GiB · 1 replica" },
+  { key: "medium", label: "Medium", detail: "4 vCPU · 8 GiB · 2 replicas" },
+  { key: "large", label: "Large", detail: "8 vCPU · 16 GiB · 3 replicas" },
+] as const;
+
+/** The generator's request. **No field here can carry a secret value.** */
+export type BundleRequest = {
+  name: string;
+  kind: BundleKind;
+  version: string;
+  domain: string;
+  tls_mode: string;
+  registry: string;
+  tag: string;
+  preset: string;
+  observability: boolean;
+};
+
+/** A stored bundle, as the list and the detail both return it. */
+export type EnvironmentBundle = {
+  id: string;
+  name: string;
+  kind: string;
+  version: string;
+  /** The record the platform built, not the request the caller sent. */
+  config: Record<string, unknown>;
+  checksum: string;
+  files: BundleFile[];
+  commands: string[];
+  generated_by?: string | null;
+  generated_at?: string;
+  download_count?: number;
+  last_downloaded_at?: string | null;
+};
+
+/** `GET /api/v1/deployment/bundles`. */
+export function fetchBundles(): Promise<{ bundles: EnvironmentBundle[]; total: number }> {
+  return request("/api/v1/deployment/bundles");
+}
+
+/** `POST /api/v1/deployment/bundles` — answers `201` with the generated file list. */
+export function createBundle(input: BundleRequest): Promise<
+  EnvironmentBundle & { note: string }
+> {
+  return request("/api/v1/deployment/bundles", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `GET /api/v1/deployment/bundles/{id}`. */
+export function fetchBundle(id: string): Promise<EnvironmentBundle> {
+  return request(`/api/v1/deployment/bundles/${encodeURIComponent(id)}`);
+}
+
+/** The render answer: what a real tool would read, and why this host cannot run it. */
+export type BundleRender = {
+  bundle_id: string;
+  kind: string;
+  /** The command whose output the operator wants: `helm template` or `docker compose config`. */
+  tool: string;
+  renderable: boolean;
+  reason: string;
+  files: BundleFile[];
+  commands: string[];
+  config: Record<string, unknown>;
+};
+
+/** `POST /api/v1/deployment/bundles/{id}/render`. */
+export function renderBundle(id: string): Promise<BundleRender> {
+  return request(`/api/v1/deployment/bundles/${encodeURIComponent(id)}/render`, {
+    method: "POST",
+  });
+}
+
+/**
+ * `GET /api/v1/deployment/bundles/{id}/files/{name}` — the file's bytes.
+ *
+ * A `fetch` rather than a link, because the checksum travels in a response **header** and the
+ * screen shows it beside the download: a plain anchor would download the file and discard the one
+ * value that makes the download verifiable. The name is encoded per segment — a bundle's own file
+ * list is the only set of names the endpoint serves, and a name with a slash in it must not become
+ * a path.
+ */
+export async function downloadBundleFile(
+  id: string,
+  name: string,
+): Promise<{ blob: Blob; checksum: string }> {
+  const response = await fetch(
+    `/api/v1/deployment/bundles/${encodeURIComponent(id)}/files/${encodeURIComponent(name)}`,
+    { credentials: "same-origin", headers: { accept: "*/*" } },
+  );
+  if (!response.ok) {
+    let message = `The file could not be downloaded (status ${response.status}).`;
+    try {
+      const body = (await response.json()) as { error?: { message?: string } };
+      if (body.error?.message) message = body.error.message;
+    } catch {
+      /* a body that is not JSON is the status line above */
+    }
+    throw new ApiError(response.status, "bundle_file_unavailable", message);
+  }
+  return {
+    blob: await response.blob(),
+    checksum: response.headers.get("x-checksum-sha256") ?? "",
+  };
+}
+
+// -------------------------------------------------------------------------------------------
+// The upgrade plan
+// -------------------------------------------------------------------------------------------
+
+/** One ordered step. `command` is `null` for a step whose check is a path to open instead. */
+export type PlanStep = {
+  kind: string;
+  text: string;
+  command: string | null;
+  destructive: boolean;
+  point_of_no_return: boolean;
+  migrations?: string[];
+  image?: string;
+  notes_url?: string;
+  check?: { path: string; expect_status: number; how: string } | null;
+};
+
+/** What is known about whether the database can go back. */
+export type Destructiveness = {
+  /** `reversible`, `destructive` or **`unknown`**. */
+  verdict: string;
+  /** The sentence the screen shows, carrying the answer to "why". */
+  reason: string;
+  destructive_migrations: string[];
+  /** `down-script`, `restore-from-backup` or `unknown`. */
+  database_rollback: string;
+  /** Which input decided it: `migration-marker`, `manifest` or `policy-absent`. */
+  source: string;
+};
+
+export type ChecklistItem = {
+  index: number;
+  kind: string;
+  text: string;
+  destructive: boolean;
+};
+
+export type Rollback = {
+  application: { available: boolean; command: string | null };
+  database: {
+    available: boolean;
+    method: string;
+    verdict: string;
+    command?: string | null;
+    reason?: string | null;
+  };
+};
+
+export type UpgradePlan = {
+  from_version: string;
+  to_version: string;
+  topology: string;
+  bundle_kind: string | null;
+  image: string | null;
+  migrations_applied: string[];
+  destructive: Destructiveness;
+  /** Index of the point-of-no-return step. */
+  point_of_no_return: number | null;
+  steps: PlanStep[];
+  rollback: Rollback;
+  checklist: {
+    items: ChecklistItem[];
+    requires_acknowledgement: boolean;
+    acknowledged: boolean;
+    complete: boolean;
+  };
+  acknowledged_by?: string | null;
+};
+
+export type StoredPlan = {
+  id: string;
+  from_version: string;
+  to_version: string;
+  topology: string;
+  destructive_verdict: string;
+  destructive_acknowledged_by: string | null;
+  destructive_acknowledged_at: string | null;
+  created_by: string | null;
+  created_at: string;
+};
+
+/** `GET /api/v1/deployment/upgrade-plan`. */
+export function fetchUpgradePlan(params: {
+  to?: string;
+  channel?: string;
+  topology?: string;
+  bundle_kind?: string;
+}): Promise<{
+  summary: {
+    current_version: string;
+    target_version: string | null;
+    plan: UpgradePlan | null;
+    stored: StoredPlan | null;
+    problems: string[];
+    requires_acknowledgement: boolean;
+    unavailable: string | null;
+  };
+  problems: string[];
+  running_version: string;
+  channel: string;
+  topology: string;
+}> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value) query.set(key, value);
+  }
+  const suffix = query.toString();
+  return request(`/api/v1/deployment/upgrade-plan${suffix ? `?${suffix}` : ""}`);
+}
+
+/**
+ * `POST /api/v1/deployment/upgrade-plan/acknowledge`.
+ *
+ * The verdict is required, and the API parses `<plan id>@<verdict>` out of it — so the screen
+ * always sends the plan's OWN verdict rather than a literal the operator picked from a list. An
+ * acknowledgement that does not say what was accepted is a consent to an unknown.
+ */
+export function acknowledgeUpgradePlan(planId: string, verdict: string): Promise<{
+  id: string;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  verdict: string;
+  from_version: string;
+  to_version: string;
+  topology: string;
+}> {
+  return request("/api/v1/deployment/upgrade-plan/acknowledge", {
+    method: "POST",
+    body: JSON.stringify({ verdict: `${planId}@${verdict}` }),
+  });
+}

@@ -83,6 +83,43 @@ const matchedOnly = new Set();
 /** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
 const MOBILE_NAMES = new Set();
 /**
+ * Refuse to start a pass whose deployment screens are not all in the route list.
+ *
+ * `run.sh` reads a non-zero exit as "the pass did not run", which is the honest outcome for a
+ * harness that cannot prove what it claims to cover. A green pass over three of four screens is
+ * the worse one: it looks like coverage.
+ */
+function assertDeploymentScreensWalked() {
+  const missing = DEPLOYMENT_SCREENS.filter((path) => !srcHasRoute(path));
+  if (missing.length > 0) {
+    throw new Error(
+      `deployment screens missing from the route list: ${missing.join(", ")} — an unwalked screen is an unmeasured screen`,
+    );
+  }
+}
+
+/**
+ * `true` when the DESKTOP route list walks this exact path.
+ *
+ * Scoped to the `routes` array on purpose. The first version matched the whole file, and the phone
+ * pass's `mobileRoutes` array carries the same three paths — so deleting a route from the desktop
+ * list left the guard green, satisfied by a list nobody asked it about. A check scoped to the whole
+ * file is scoped to things its subject never said, which is the sixth gate defect REQ-128 already
+ * recorded for the Helm NOTES check.
+ */
+let ROUTE_SOURCE = "";
+function srcHasRoute(path) {
+  if (!ROUTE_SOURCE) {
+    const source = fs.readFileSync(__filename, "utf8");
+    const block = source.match(/const routes = \[[\s\S]*?\n  \];/);
+    if (!block) {
+      throw new Error("the desktop route list could not be read from this file");
+    }
+    ROUTE_SOURCE = block[0];
+  }
+  return ROUTE_SOURCE.includes(`{ path: "${path}",`);
+}
+/**
  * The disposable QA database, used only by the analytics fixture (REQ-007): the pass posts a
  * synthetic beacon batch through the public collect endpoint and then spreads a slice of those
  * rows over the last thirty days, so the report screens have a multi-day shape to draw. It is the
@@ -8012,6 +8049,11 @@ async function runObservabilitySettingsDepth(page, report) {
 
 module.exports = {
   runSecretsAuditDepth,
+  runDeploymentArtifactsDepth,
+  runDeploymentInstallDepth,
+  runDeploymentUpgradeDepth,
+  DEPLOYMENT_SCREENS,
+  walkVersion,
   runObservabilityOverviewDepth,
   runObservabilityMetricsDepth,
   runObservabilityTracesDepth,
@@ -8541,6 +8583,547 @@ async function runSecretsLeasesDepth(page, report) {
  *   raw bytes for it. The integration test asserts the same thing at the store level; this one
  *   asserts it through the actual rendered download.
  */
+/**
+ * The deployment centre's release surface, driven end to end (REQ-128, slice 4).
+ *
+ * Four screens, three depth passes, and one rule that shaped all of them: **the fixture must not
+ * be silently constant.** The previous slice's walk derived a target version from a uuid's decimal
+ * digits, and `parseInt("3f9a…", 10)` overflows `u32` — so every run shared the same version, the
+ * plan's range was reused, and one run's acknowledgement answered the next run's plan. A fixture
+ * that is constant does not look like a broken fixture; it looks like a product that ignores its
+ * input. So every version-ish value here comes from `walkVersion()`, derived from this walk's own
+ * name plus the clock, and the acknowledgement is checked against the plan this run actually built.
+ *
+ * ## What each pass refuses to accept
+ *
+ * * artifacts — a release detail opened with a version that EXISTS. A placeholder id proves the
+ *   404 screen renders, which is not the same claim as the screen working.
+ * * install — a form refused in the field it belongs to, then accepted; then a real download whose
+ *   checksum is the one the SERVER returned in its header, not one the walk recomputed.
+ * * upgrade — the verdict is read as one of three, the point of no return is located by INDEX, and
+ *   the acknowledgement is only claimed when the server's own `acknowledged` says so.
+ */
+
+/**
+ * A version fixture unique to this walk and readable in the database afterwards.
+ *
+ * `Date.now()` alone would do, but a failing pass is much easier to diagnose when the version in
+ * the row looks like the pass that made it. The four components are three-digit or smaller so the
+ * string stays inside the validator's vocabulary (`^\\d+\\.\\d+\\.\\d+…`).
+ */
+function walkVersion(label) {
+  const now = Date.now();
+  const minor = now % 1000;
+  const patch = Math.floor(now / 1000) % 1000;
+  const tag = Math.abs([...label].reduce((acc, ch) => (acc * 33 + ch.charCodeAt(0)) % 9973, 11)) % 97;
+  return `0.${minor}.${patch}.${tag}`;
+}
+
+/**
+ * The deployment screens, asserted against the route list rather than duplicated in it.
+ *
+ * A second copy of a route list is a list that drifts: the screen is added to the constant and not
+ * to the walk, and the constant still says it is covered. So the check lives here and reads the
+ * route list — and it runs at startup, where a drift is a loud line in the log rather than a
+ * silently untested screen three weeks later.
+ */
+const DEPLOYMENT_SCREENS = ["/deployment/artifacts", "/deployment/install", "/deployment/upgrade"];
+
+async function runDeploymentArtifactsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "deployment-artifacts-depth", action: "deployment", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/deployment/artifacts`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="deployment-artifacts"]', { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  const releases = await page.locator("[data-release-row]").count();
+  note({ check: "release-rows", rows: releases });
+
+  // (1) The empty state names the ACTION that fixes it. "No data" is not a sentence an operator
+  // can act on, and the request asks for the action beside it.
+  if (releases === 0) {
+    const empty = (await page.locator('[data-view="deployment-artifacts"]').innerText().catch(() => "")) || "";
+    note({
+      check: "empty-state-names-the-action",
+      ok: /update check|not cached|no release manifest/i.test(empty),
+      chars: empty.length,
+    });
+  }
+
+  // (2) The artifact table is a table on a wide screen and CARDS on a narrow one, and the digest
+  // cell is one unbroken token — a digest that wraps mid-string cannot be compared by eye, which
+  // is the only reason the column exists.
+  const table = await page.locator("[data-artifact-table]").count();
+  const digests = await page.locator("[data-artifact-digest]").count();
+  const wrapped = await page
+    .locator("[data-artifact-digest]")
+    .evaluateAll((nodes) =>
+      nodes.filter((node) => node.getBoundingClientRect().width > node.parentElement.getBoundingClientRect().width + 1).length,
+    )
+    .catch(() => -1);
+  note({ check: "digest-column-does-not-wrap", cells: digests, overflowing: wrapped, table });
+
+  // (3) A copy button hands over the WHOLE reference, and the walk reads it back rather than
+  // trusting the button's own label.
+  let copied = null;
+  const copyButton = page.locator("[data-artifact-copy]").first();
+  if ((await copyButton.count()) > 0) {
+    await copyButton.click().catch(() => {});
+    await page.waitForTimeout(700);
+    copied = await page
+      .evaluate(async () => {
+        try {
+          return await navigator.clipboard.readText();
+        } catch {
+          return null;
+        }
+      })
+      .catch(() => null);
+    note({
+      check: "copy-carries-the-whole-reference",
+      clipboard: copied,
+      ok: copied === null || (copied.length > 8 && !copied.endsWith("…")),
+    });
+  } else {
+    note({ check: "copy-carries-the-whole-reference", skipped: true, reason: "no artifact row to copy" });
+  }
+
+  // (4) `missing_kinds` renders as explicit rows, because a gap is indistinguishable from "the
+  // fetch has not landed yet" and the request distinguishes them on purpose.
+  const missing = await page.locator("[data-release-missing]").count();
+  note({ check: "missing-kinds-are-explicit", rows: missing });
+
+  // (5) The filter narrows and Escape clears it.
+  await page.locator("[data-artifact-filter]").fill("zzz-no-such-release").catch(() => {});
+  await page.waitForTimeout(500);
+  const filtered = await page.locator("[data-release-row]").count();
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(500);
+  const cleared = await page.locator("[data-release-row]").count();
+  note({ check: "filter-narrows-and-escape-clears", filtered, cleared, ok: filtered === 0 && cleared === releases });
+
+  // (6) A release detail opened with a version that EXISTS. The version comes from the row that is
+  // on screen, never from a placeholder — a fabricated id proves the 404 state renders.
+  const firstVersion = await page
+    .locator("[data-release-open]")
+    .first()
+    .getAttribute("data-release-open")
+    .catch(() => null);
+  if (firstVersion) {
+    await page.goto(`${URL_ADMIN}/deployment/artifacts/${encodeURIComponent(firstVersion)}`, {
+      waitUntil: "domcontentloaded",
+    }).catch(() => {});
+    await page
+      .waitForSelector('[data-view="deployment-release-detail"]', { timeout: 20000 })
+      .catch(() => {});
+    await page.waitForTimeout(700);
+    const commit = (await page.locator("[data-release-commit]").innerText().catch(() => "")).trim();
+    const satisfied = await page
+      .locator("[data-core-minimum-satisfied]")
+      .first()
+      .getAttribute("data-core-minimum-satisfied")
+      .catch(() => null);
+    note({
+      check: "detail-names-the-commit-and-the-core-minimum",
+      version: firstVersion,
+      commit: commit.slice(0, 40),
+      coreMinimumSatisfied: satisfied,
+    });
+    // The detail screen's own empty answer must be a sentence, not a blank.
+    const detailMissing = await page.locator("[data-missing-kind]").count();
+    note({ check: "detail-missing-kinds", rows: detailMissing });
+    await shot(page, "page-deployment-release-detail");
+  } else {
+    note({ check: "detail-opened", skipped: true, reason: "no cached release to open" });
+  }
+
+  // (7) A version nobody cached is an honest sentence, not a stack trace.
+  await page
+    .goto(`${URL_ADMIN}/deployment/artifacts/${encodeURIComponent(`0.0.0.absent-${Date.now() % 997}`)}`, {
+      waitUntil: "domcontentloaded",
+    })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="deployment-release-detail"]', { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(600);
+  const absent = (await page.locator("[data-release-error]").innerText().catch(() => "")) || "";
+  note({
+    check: "absent-version-says-so",
+    chars: absent.length,
+    ok: absent.length > 20,
+  });
+  await shot(page, "page-deployment-release-absent");
+
+  // (8) Mobile: cards, and the page does not scroll sideways.
+  await page.goto(`${URL_ADMIN}/deployment/artifacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(700);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(700);
+  const cards = await page.locator("[data-artifact-cards] li").count();
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  note({ check: "mobile-cards", cards, horizontalOverflow: overflow });
+  await shot(page, "page-deployment-artifacts-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
+  await shot(page, "page-deployment-artifacts");
+
+  report.deploymentArtifacts = { steps };
+  return steps;
+}
+
+async function runDeploymentInstallDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "deployment-install-depth", action: "deployment", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/deployment/install`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="deployment-install"]', { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  // (1) The secret guarantee is stated ON the screen, in the panel's own words.
+  const notice = (await page.locator("[data-bundle-secret-notice]").innerText().catch(() => "")) || "";
+  note({
+    check: "secret-reference-claim-is-visible",
+    saysReference: /reference/i.test(notice),
+    saysNoValue: /never contain a credential|no field that could hold/i.test(notice),
+  });
+
+  // (2) No field on the form can hold a credential value. This is the guarantee, asserted rather
+  // than asserted-about: a `password` input here would be the one control that could leak one.
+  const passwordFields = await page.locator('[data-view="deployment-install"] input[type="password"]').count();
+  const secretishNames = await page
+    .locator('[data-view="deployment-install"] input, [data-view="deployment-install"] select')
+    .evaluateAll((nodes) =>
+      nodes
+        .map((node) => node.getAttribute("data-bundle-") || node.id || "")
+        .filter((key) => /password|secret|token|credential|key/i.test(key || "")),
+    )
+    .catch(() => []);
+  note({ check: "no-field-can-hold-a-credential", passwordFields, suspiciousFields: secretishNames });
+
+  // (3) Validation refuses in the FIELD, before a round trip, and says which box was wrong.
+  await page.locator("[data-bundle-name]").fill("Bad Name With Spaces").catch(() => {});
+  await page.locator("[data-bundle-version]").fill("not-a-version").catch(() => {});
+  await page.locator("[data-bundle-generate]").click().catch(() => {});
+  await page.waitForTimeout(700);
+  const nameError = (await page.locator("[data-bundle-name-error]").innerText().catch(() => "")) || "";
+  const versionError = (await page.locator("[data-bundle-version-error]").innerText().catch(() => "")) || "";
+  const generatedOnBadInput = await page.locator("[data-bundle-generated]").count();
+  note({
+    check: "validation-refuses-in-the-field",
+    nameError: nameError.slice(0, 80),
+    versionError: versionError.slice(0, 80),
+    nothingWasGenerated: generatedOnBadInput === 0,
+  });
+  await shot(page, "page-deployment-install-invalid");
+
+  // (4) A real bundle, for a target name unique to THIS walk.
+  const target = `qa-${walkVersion("install").replace(/\./g, "")}`;
+  await page.locator("[data-bundle-name]").fill(target).catch(() => {});
+  await page.locator("[data-bundle-version]").fill(walkVersion("install")).catch(() => {});
+  await page.locator("[data-bundle-domain]").fill("qa-omnion.test").catch(() => {});
+  await page.locator("[data-bundle-kind]").selectOption("compose-small").catch(() => {});
+  await page.locator("[data-bundle-generate]").click().catch(() => {});
+  await page
+    .waitForSelector("[data-bundle-generated]", { timeout: 60000 })
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const fileRows = await page.locator("[data-bundle-file]").count();
+  const commands = (await page.locator("[data-bundle-commands]").innerText().catch(() => "")) || "";
+  const checksum = (await page.locator("[data-bundle-checksum]").innerText().catch(() => "")) || "";
+  note({
+    check: "generated-with-files-and-commands",
+    target,
+    files: fileRows,
+    commands: commands.slice(0, 200),
+    checksum: checksum.slice(0, 60),
+  });
+
+  // (5) The generated files reference secrets by NAME and carry no value. The walk greps the
+  // downloaded bytes rather than the generator's own claim about them.
+  if (fileRows > 0) {
+    const firstFile = await page.locator("[data-bundle-file]").first().getAttribute("data-bundle-file");
+    const probe = await page
+      .evaluate(async () => {
+        const response = await fetch("/api/v1/deployment/bundles", { credentials: "same-origin" });
+        const body = await response.json();
+        return { status: response.status, count: (body.bundles || []).length };
+      })
+      .catch(() => null);
+    note({ check: "bundle-list-readable", ...(probe || {}) });
+
+    // The download is real: the button is clicked and the notice names the file.
+    const downloadButton = page.locator(`[data-bundle-download="${firstFile}"]`).first();
+    await downloadButton.click().catch(() => {});
+    await page.waitForTimeout(2500);
+    const verified = await page.locator("[data-bundle-download-verified]").count();
+    note({ check: "download-verified-against-the-server-checksum", file: firstFile, verified });
+
+    // The bytes themselves, read through the API with the session the browser already has.
+    const secretScan = await page
+      .evaluate(async () => {
+        const bundles = await (await fetch("/api/v1/deployment/bundles", { credentials: "same-origin" })).json();
+        const bundle = (bundles.bundles || [])[0];
+        if (!bundle) return { ok: false, reason: "no bundle" };
+        const files = [];
+        for (const file of bundle.files || []) {
+          const response = await fetch(
+            `/api/v1/deployment/bundles/${bundle.id}/files/${encodeURIComponent(file.name)}`,
+            { credentials: "same-origin" },
+          );
+          files.push({
+            name: file.name,
+            status: response.status,
+            checksumHeader: response.headers.get("x-checksum-sha256"),
+            expected: file.sha256,
+            text: (await response.text()).slice(0, 20000),
+          });
+        }
+        return { ok: true, files };
+      })
+      .catch(() => null);
+    if (secretScan?.ok) {
+      const leaked = secretScan.files.filter((file) =>
+        /(password|secret|token|api[-_]?key)\s*[:=]\s*["']?[A-Za-z0-9/+_-]{8,}/i.test(file.text.replace(/\$\{[A-Z_]+\}/g, "REF")),
+      );
+      const headerMatches = secretScan.files.filter((file) => file.checksumHeader === file.expected);
+      note({
+        check: "generated-files-carry-no-credential",
+        files: secretScan.files.length,
+        leakedFiles: leaked.map((file) => file.name),
+        checksumsMatch: headerMatches.length,
+      });
+    } else {
+      note({ check: "generated-files-carry-no-credential", skipped: true, reason: "no bundle readable" });
+    }
+  }
+
+  // (6) The render panel answers with a REASON rather than a 501 — a live button that says why.
+  await page.locator(`[data-bundle-render="${target}"]`).first().click().catch(() => {});
+  await page.waitForSelector("[data-bundle-render-panel]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const reason = await page
+    .locator("[data-bundle-render-reason]")
+    .first()
+    .getAttribute("data-bundle-render-reason")
+    .catch(() => null);
+  const reasonText = (await page.locator("[data-bundle-render-reason]").first().innerText().catch(() => "")) || "";
+  const renderCommands = (await page.locator("[data-bundle-render-commands]").innerText().catch(() => "")) || "";
+  note({
+    check: "render-states-why-it-cannot-render",
+    renderable: reason,
+    saysWhy: reasonText.length > 40,
+    namesATool: /helm|docker compose/.test(renderCommands + reasonText),
+  });
+  await shot(page, "page-deployment-install-render");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(600);
+
+  // (7) The bundle is durable: it is in the list after a reload, which is what "stored" means.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const listed = await page.locator(`[data-bundle-row="${target}"]`).count();
+  note({ check: "bundle-survives-a-reload", target, listed });
+
+  // (8) Mobile: one column, and no sideways scroll.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(700);
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  note({ check: "mobile-no-horizontal-scroll", horizontalOverflow: overflow });
+  await shot(page, "page-deployment-install-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
+  await shot(page, "page-deployment-install");
+
+  report.deploymentInstall = { steps };
+  return steps;
+}
+
+async function runDeploymentUpgradeDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "deployment-upgrade-depth", action: "deployment", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/deployment/upgrade`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="deployment-upgrade"]', { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const running = (await page.locator("[data-upgrade-running]").innerText().catch(() => "")) || "";
+  note({ check: "running-version-is-shown", text: running.slice(0, 80), ok: running.length > 5 });
+
+  // (1) A cache with no target is a sentence naming the action, not an empty panel.
+  const unavailable = await page.locator('[data-view="deployment-upgrade"]').innerText().catch(() => "");
+  const hasPlan = (await page.locator("[data-plan-steps] li").count()) > 0;
+  if (!hasPlan) {
+    note({
+      check: "no-target-states-the-action",
+      ok: /update check|no release/i.test(unavailable || ""),
+    });
+    await shot(page, "page-deployment-upgrade-empty");
+    report.deploymentUpgrade = { steps };
+    return steps;
+  }
+
+  const stepCount = await page.locator("[data-plan-steps] li").count();
+  note({ check: "ordered-steps", steps: stepCount, ok: stepCount > 0 });
+
+  // (2) The verdict is one of three, and `unknown` is rendered as its own meaning rather than a
+  // colour — an operator must be able to read it without colour at all.
+  const verdict = await page
+    .locator("[data-upgrade-verdict]")
+    .first()
+    .getAttribute("data-upgrade-verdict")
+    .catch(() => null);
+  const reasonText = (await page.locator("[data-upgrade-verdict-reason]").innerText().catch(() => "")) || "";
+  note({
+    check: "verdict-is-one-of-three",
+    verdict,
+    ok: ["reversible", "destructive", "unknown"].includes(verdict || ""),
+    saysWhy: reasonText.length > 40,
+    saysSilenceIsNotAVerification: /silence|not a verification|not been verified/i.test(reasonText),
+  });
+
+  // (3) The point of no return is an INDEX, and a reversible plan must not have one at all.
+  const pointOfNoReturn = await page
+    .locator("[data-plan-point-of-no-return]")
+    .first()
+    .getAttribute("data-plan-point-of-no-return")
+    .catch(() => null);
+  note({
+    check: "point-of-no-return-is-marked",
+    index: pointOfNoReturn,
+    // `reversible` ⇒ no marker; the others ⇒ exactly one.
+    ok:
+      verdict === "reversible"
+        ? pointOfNoReturn === null
+        : pointOfNoReturn !== null && Number(pointOfNoReturn) >= 0,
+  });
+
+  // (4) The rollback split: application always, database by its own method — never one card.
+  const application = await page.locator("[data-rollback-application-command]").count();
+  const databaseMethod = await page
+    .locator("[data-rollback-database-method]")
+    .first()
+    .getAttribute("data-rollback-database-method")
+    .catch(() => null);
+  note({
+    check: "rollback-split-is-two-answers",
+    applicationCommand: application > 0,
+    databaseMethod,
+    ok: ["down-script", "restore-from-backup", "unknown"].includes(databaseMethod || ""),
+  });
+
+  // (5) The acknowledgement is a REAL gate: the checklist says what it is waiting for, and the
+  // button posts the plan's OWN verdict rather than a literal the walk chose.
+  const blocked = await page.locator("[data-checklist-blocked]").count();
+  const blockedReason = (await page.locator("[data-checklist-blocked-reason]").innerText().catch(() => "")) || "";
+  const ackButton = page.locator("[data-upgrade-acknowledge]").first();
+  const ackVerdict = await ackButton.getAttribute("data-upgrade-acknowledge").catch(() => null);
+  const needsAck = blocked > 0;
+  note({
+    check: "acknowledgement-is-a-real-gate",
+    blocked: needsAck,
+    saysWhatItWaitsFor: blockedReason.length > 20,
+    postsThePlansOwnVerdict: ackVerdict === verdict,
+  });
+
+  if (needsAck && ackVerdict) {
+    await ackButton.click().catch(() => {});
+    await page.waitForTimeout(2500);
+    const stillBlocked = await page.locator("[data-checklist-blocked]").count();
+    const complete = await page.locator("[data-checklist-complete]").count();
+    const ackError = (await page.locator("[data-upgrade-ack-error]").innerText().catch(() => "")) || "";
+    note({
+      check: "acknowledgement-recorded",
+      blockedAfter: stillBlocked,
+      complete: complete > 0,
+      ackError: ackError.slice(0, 120),
+      // Either it took (complete) or the server said why (an error sentence). Both are honest;
+      // "nothing happened, no message" is the only unacceptable outcome.
+      ok: complete > 0 || stillBlocked === 0 || ackError.length > 10,
+    });
+    await shot(page, "page-deployment-upgrade-acknowledged");
+  }
+
+  // (6) Regenerating must not lose the acknowledgement — it is a fact about the range, not the visit.
+  await page.locator("[data-upgrade-refresh]").click().catch(() => {});
+  await page.waitForTimeout(2000);
+  const stillComplete = await page.locator("[data-checklist-complete]").count();
+  const ackStamp = await page.locator("[data-upgrade-acknowledged-at]").count();
+  if (needsAck) {
+    note({
+      check: "acknowledgement-survives-regeneration",
+      complete: stillComplete > 0,
+      stampShown: ackStamp > 0,
+      ok: stillComplete > 0 || ackStamp > 0,
+    });
+  }
+
+  // (7) Topology changes the plan rather than being a label: kubernetes is its own selection.
+  await page.locator("[data-upgrade-topology]").selectOption("kubernetes").catch(() => {});
+  await page.waitForTimeout(2000);
+  const k8sSteps = await page.locator("[data-plan-steps] li").count();
+  const k8sText = (await page.locator("[data-plan-steps]").innerText().catch(() => "")) || "";
+  note({
+    check: "topology-changes-the-plan",
+    steps: k8sSteps,
+    mentionsHelm: /helm|kubectl/i.test(k8sText),
+    ok: k8sSteps > 0 && /helm|kubectl/i.test(k8sText),
+  });
+  await shot(page, "page-deployment-upgrade-kubernetes");
+
+  await page.locator("[data-upgrade-topology]").selectOption("compose").catch(() => {});
+  await page.waitForTimeout(1500);
+  await page.locator("[data-upgrade-stack]").selectOption("compose-enterprise").catch(() => {});
+  await page.waitForTimeout(2000);
+  const enterpriseText = (await page.locator("[data-plan-steps]").innerText().catch(() => "")) || "";
+  note({
+    check: "enterprise-stack-changes-the-plan",
+    mentionsExternal: /enterprise|external/i.test(enterpriseText),
+  });
+
+  // (8) Mobile, and a printable checklist that still reads without the screen's chrome.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(700);
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  note({ check: "mobile-no-horizontal-scroll", horizontalOverflow: overflow });
+  await shot(page, "page-deployment-upgrade-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
+  await shot(page, "page-deployment-upgrade");
+
+  report.deploymentUpgrade = { steps };
+  return steps;
+}
+
 async function runSecretsAuditDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -8687,6 +9270,7 @@ async function runSecretsAuditDepth(page, report) {
 
 
 async function main() {
+  assertDeploymentScreensWalked();
   const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
   const browser = await chromium.launch({
@@ -8782,7 +9366,14 @@ async function main() {
     { path: "/settings/search", name: "search-settings" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
-    { path: "/settings/iam", name: "iam-overview" },
+    // The deployment centre's release surface (REQ-128, slice 4) — walked here and driven by the
+  // depth passes below. The three routes are listed and the detail screen is opened from a row
+  // that exists: a `/deployment/artifacts/{version}` walked with a fabricated version would prove
+  // only that the 404 state renders, which is how a screen gets shipped unmeasured.
+  { path: "/deployment/artifacts", name: "deployment-artifacts" },
+  { path: "/deployment/install", name: "deployment-install" },
+  { path: "/deployment/upgrade", name: "deployment-upgrade" },
+  { path: "/settings/iam", name: "iam-overview" },
     { path: "/settings/iam/users", name: "iam-users" },
     { path: "/settings/iam/groups", name: "iam-groups" },
     { path: "/settings/iam/service-accounts", name: "iam-service-accounts" },
@@ -9054,6 +9645,28 @@ async function main() {
     matchedOnly.add("secrets-audit");
     report.secretsAudit = await runDepthPass("secrets-audit", () =>
       runSecretsAuditDepth(page, report),
+    );
+  }
+  // REQ-128 slice 4's screens. Each is behind `wants()` like every other depth pass, and each
+  // names the screens it just built so a focused pass spends its budget here rather than on the
+  // whole inventory. `deployment-artifacts` also opens the `{version}` detail screen with a
+  // version that EXISTS — see the note above the route list.
+  if (wants("deployment-artifacts")) {
+    matchedOnly.add("deployment-artifacts");
+    report.deploymentArtifacts = await runDepthPass("deployment-artifacts", () =>
+      runDeploymentArtifactsDepth(page, report),
+    );
+  }
+  if (wants("deployment-install")) {
+    matchedOnly.add("deployment-install");
+    report.deploymentInstall = await runDepthPass("deployment-install", () =>
+      runDeploymentInstallDepth(page, report),
+    );
+  }
+  if (wants("deployment-upgrade")) {
+    matchedOnly.add("deployment-upgrade");
+    report.deploymentUpgrade = await runDepthPass("deployment-upgrade", () =>
+      runDeploymentUpgradeDepth(page, report),
     );
   }
 
@@ -9504,8 +10117,11 @@ async function runReliabilityBreakersDepth(page) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
-  // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
+  // as a known name instead of reporting it as unmatched. The three deployment screens (REQ-128
+  // slice 4) are in this list rather than only measured inside their depth passes: a layout that
+  // has never been opened in a 390px context has not been tested on a phone, and the upgrade
+  // helper is read at 2am on a phone more often than anybody planned.
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been

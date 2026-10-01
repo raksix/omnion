@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, BellRing, Bot, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Bot, Boxes, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -55,6 +55,15 @@ const NAV = [
   { href: "/observability/exporters", label: "Exporters", icon: Radio },
   { href: "/observability/alerts", label: "Alert rules", icon: BellRing },
   { href: "/observability/settings", label: "Observability settings", icon: SlidersHorizontal },
+  // The deployment centre's release surface (REQ-128, slice 4). It sits beside System Health
+  // rather than under Settings because the three answers are the same operator question asked at
+  // three moments: "what am I running" (artifacts), "how do I install this somewhere else"
+  // (install) and "how do I get to the next version, and what does it cost me if I have to go
+  // back" (upgrade). An upgrade helper filed under a settings sub-path is a helper nobody opens
+  // at 2am, which is exactly when it is needed.
+  { href: "/deployment/artifacts", label: "Release artifacts", icon: Package },
+  { href: "/deployment/install", label: "Install bundle", icon: Boxes },
+  { href: "/deployment/upgrade", label: "Upgrade helper", icon: ArrowUpCircle },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

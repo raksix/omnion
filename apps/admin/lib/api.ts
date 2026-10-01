@@ -251,7 +251,17 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/**
+ * The panel's one fetch: same-origin, JSON in and out, the session cookie always sent, the CSRF
+ * header added on a write, and a thrown {@link ApiError} carrying the API's own code and message.
+ *
+ * Exported because a surface with its own module (the deployment centre's release client in
+ * `deployment-api.ts`) must speak through THIS function rather than re-implementing it — a second
+ * fetch that forgets the CSRF header would make every write on that surface fail with a 403 that
+ * reads like a permissions problem, and one that forgets `credentials` would sign an operator out
+ * on the first read.
+ */
+export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
