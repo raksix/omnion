@@ -1319,6 +1319,219 @@ async fn an_applied_plan_is_not_deletable_and_the_two_refusals_are_different() {
     assert_eq!(refused.body["error"]["code"], "plan_applied");
 }
 
+/// The bulk delete removes a page of drafts and names every plan it would not remove.
+///
+/// Five claims, and each is a way this could have answered `204` and looked finished:
+///
+/// * **The response is the truth of the call.** `deleted` and `failures` are both present and
+///   they add up to what the caller asked for — an answer carrying only a count renders a
+///   partial bulk as a complete one, and the console's next action is to trust that number.
+/// * **An applied plan is refused BY NAME and is still there.** The refusal is per plan rather
+///   than a `409` for the whole call, because a selection that mixes three drafts with the one
+///   plan the live app was built from must still delete the three.
+/// * **Another tenant's plan is refused with the SAME sentence as one that never existed.**
+///   A different sentence for the stranger case confirms the existence of every id a caller
+///   guessed, which is a cross-tenant oracle built out of a delete endpoint.
+/// * **The rows are read out of the database afterwards**, not read off the response: a bulk
+///   that reported `deleted: 3` while writing nothing is exactly the failure this walk exists
+///   to catch, and only the database can tell.
+/// * **An empty selection is refused.** A button that reports success for an empty selection
+///   cannot be told apart from one that was never wired.
+#[tokio::test]
+async fn a_bulk_delete_removes_the_drafts_and_names_what_it_would_not() {
+    let harness = harness!();
+    let tenant = tenant_with_tenant(&harness, "bulk").await;
+    grant_reviewer(&harness, &tenant).await;
+
+    let first = seed_plan(&harness, tenant.organization_id, tenant.user_id).await;
+    let second = seed_plan(&harness, tenant.organization_id, tenant.user_id).await;
+
+    // The one plan the live app was built from. Its artifacts are history, so it stays.
+    let applied = seed_plan(&harness, tenant.organization_id, tenant.user_id).await;
+    sqlx::query(
+        "update app_builder_plans set status = 'applied', applied_at = now() where id = $1",
+    )
+    .bind(applied)
+    .execute(harness.db.pool())
+    .await
+    .expect("the plan must become applied");
+
+    // A plan of another tenant, named in the same selection.
+    let stranger = other_tenant_with_tenant(&harness, "bulk-stranger").await;
+    // The stranger is granted the read key **in its own tenant**. Without it the check below
+    // would answer `403 permission_denied` before tenancy ever ran, and the walk would be
+    // measuring the guard rather than the rule it claims to prove — a stranger with no key
+    // cannot tell you whether somebody else's bulk deleted its plan.
+    grant_keys(
+        &harness,
+        stranger.user_id,
+        stranger.organization_id,
+        &["appbuilder.read"],
+    )
+    .await;
+    let foreign = seed_plan(&harness, stranger.organization_id, stranger.user_id).await;
+    // And one that never existed, so the two refusals are asserted against different causes.
+    let never = Uuid::new_v4();
+
+    let refused_empty = harness
+        .call(post(
+            "/api/v1/app-builder/plans/bulk-delete",
+            json!({ "ids": [] }),
+            Some(&tenant.token),
+        ))
+        .await;
+    assert_eq!(
+        refused_empty.status,
+        StatusCode::BAD_REQUEST,
+        "an empty selection is a caller mistake, not a successful no-op: {:?}",
+        refused_empty.body
+    );
+    assert_eq!(refused_empty.body["error"]["code"], "selection_required");
+
+    let answered = harness
+        .call(post(
+            "/api/v1/app-builder/plans/bulk-delete",
+            json!({ "ids": [first, second, applied, foreign, never] }),
+            Some(&tenant.token),
+        ))
+        .await;
+    assert_eq!(answered.status, StatusCode::OK, "{:?}", answered.body);
+
+    // The arithmetic is the claim: three went, two did not, five were asked about.
+    assert_eq!(answered.body["requested"], 5, "{:?}", answered.body);
+    assert_eq!(answered.body["deleted"], 2, "{:?}", answered.body);
+    let failures = answered.body["failures"]
+        .as_array()
+        .expect("a bulk answer carries its refusals")
+        .clone();
+    assert_eq!(
+        failures.len(),
+        3,
+        "one refusal per plan that stayed: {failures:?}"
+    );
+
+    let applied_message = failures
+        .iter()
+        .find(|entry| entry["id"] == json!(applied.to_string()))
+        .map(|entry| entry["message"].as_str().unwrap_or_default().to_owned())
+        .expect("the applied plan is refused by name");
+    assert!(
+        applied_message.contains(&applied.as_simple().to_string()[..8])
+            && applied_message.contains("applied"),
+        "the refusal names the plan and why it stays, so an operator can see it on screen: {applied_message}"
+    );
+
+    // The stranger's plan and the one that never existed get the SAME sentence — the whole
+    // point being that they are indistinguishable from each other.
+    let stranger_message = failures
+        .iter()
+        .find(|entry| entry["id"] == json!(foreign.to_string()))
+        .map(|entry| entry["message"].as_str().unwrap_or_default().to_owned())
+        .expect("another tenant's plan is refused");
+    let never_message = failures
+        .iter()
+        .find(|entry| entry["id"] == json!(never.to_string()))
+        .map(|entry| entry["message"].as_str().unwrap_or_default().to_owned())
+        .expect("a plan that is not there is refused");
+    assert_eq!(
+        stranger_message, never_message,
+        "a tenant's refusal that differs from \"not there\" is a cross-tenant oracle: {failures:?}"
+    );
+
+    // Read the rows back OUT of the database. The response claims two deletions; only the
+    // database can say whether they happened.
+    let survivors: Vec<String> =
+        sqlx::query_scalar("select id::text from app_builder_plans where id = any($1) order by id")
+            .bind(&[first, second, applied, foreign, never])
+            .fetch_all(harness.db.pool())
+            .await
+            .expect("the plans table must be readable");
+    // Compared as a **set**, not as a list: the query sorts by `id` and the expectation is
+    // written in the order the walk created the plans, so a literal comparison would be a test
+    // of uuid byte order dressed up as a test of what survived. Sorting both sides is also the
+    // version that cannot start failing the day `seed_plan` changes.
+    let mut expected = vec![foreign.to_string(), applied.to_string()];
+    expected.sort();
+    let mut survivors = survivors;
+    survivors.sort();
+    assert_eq!(
+        survivors, expected,
+        "only the two refusals may remain — the other tenant's plan AND the applied one"
+    );
+
+    // The stranger's plan is untouched by somebody else's bulk, and still readable by its owner.
+    let still_theirs = harness
+        .call(get(
+            &format!("/api/v1/app-builder/plans/{foreign}"),
+            Some(&stranger.token),
+        ))
+        .await;
+    assert_eq!(
+        still_theirs.status,
+        StatusCode::OK,
+        "a bulk in one tenant must not remove another tenant's plan: {:?}",
+        still_theirs.body
+    );
+}
+
+/// A bulk is the same power as the single delete, so the guard is the same key.
+///
+/// Three of the four keys refuse an account that holds none of them, and this walk is what
+/// keeps `bulk-delete` a fourth rather than a way in: a member holding `read` sees the list,
+/// and the bulk is refused with the same `403 permission_denied` the single delete answers.
+#[tokio::test]
+async fn a_bulk_delete_is_refused_without_the_review_key() {
+    let harness = harness!();
+    let tenant = tenant_with_tenant(&harness, "bulk-guard").await;
+    // A member of the same tenant, so the refusal is the guard's and not the tenancy's.
+    let member = member_without_keys(&harness, &tenant).await;
+    grant_keys(
+        &harness,
+        member.user_id,
+        member.organization_id,
+        &["appbuilder.read"],
+    )
+    .await;
+
+    let plan_id = seed_plan(&harness, tenant.organization_id, tenant.user_id).await;
+
+    let listed = harness
+        .call(get("/api/v1/app-builder/plans", Some(&member.token)))
+        .await;
+    assert_eq!(
+        listed.status,
+        StatusCode::OK,
+        "`read` alone must open the list, or the refusal below proves nothing: {:?}",
+        listed.body
+    );
+
+    let refused = harness
+        .call(post(
+            "/api/v1/app-builder/plans/bulk-delete",
+            json!({ "ids": [plan_id] }),
+            Some(&member.token),
+        ))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "reading a plan is not deleting one: {:?}",
+        refused.body
+    );
+    assert_eq!(refused.body["error"]["code"], "permission_denied");
+
+    let still_there: Option<String> =
+        sqlx::query_scalar("select id::text from app_builder_plans where id = $1")
+            .bind(plan_id)
+            .fetch_optional(harness.db.pool())
+            .await
+            .expect("the plans table must be readable");
+    assert!(
+        still_there.is_some(),
+        "a refused bulk deletes nothing: the row must survive"
+    );
+}
+
 /// The plan exports as a **file**, and the file is the same plan the screen shows.
 ///
 /// Four claims, each of which is a way this could have been answered by a JSON body on a
@@ -1383,7 +1596,8 @@ async fn a_plan_exports_as_an_attachment_carrying_the_plan_the_screen_shows() {
         .await;
 
     assert_eq!(
-        document["id"], plan_id.to_string(),
+        document["id"],
+        plan_id.to_string(),
         "the file is the plan the caller asked for"
     );
     assert_eq!(document["schema"], "omnion.app-builder.plan/1");

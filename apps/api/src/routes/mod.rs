@@ -910,6 +910,14 @@ pub fn router(state: AppState) -> Router {
     let app_builder_plans =
         get(app_builder::list_plans).layer(guards::require(&state, "appbuilder.read"));
 
+    // The bulk delete. A **static** segment rather than `/plans/{id}/bulk-delete`, because axum
+    // ranks a static segment ahead of a capture — and a path that means "the plan whose id is
+    // `bulk-delete`" is not a path anybody should have to reason about. `appbuilder.review`, the
+    // same power as the single delete: a bulk is the same power over several rows, not a lesser
+    // one.
+    let app_builder_bulk_delete =
+        post(app_builder::bulk_delete_plans).layer(guards::require(&state, "appbuilder.review"));
+
     let app_builder_examples =
         get(app_builder::examples).layer(guards::require(&state, "appbuilder.read"));
 
@@ -1942,6 +1950,7 @@ pub fn router(state: AppState) -> Router {
         // a sibling, and a parameterised route registered first would read `examples` as a plan
         // id and answer "no such plan" for a request that is perfectly valid.
         .route("/app-builder/plans", app_builder_plans)
+        .route("/app-builder/plans/bulk-delete", app_builder_bulk_delete)
         .route("/app-builder/examples", app_builder_examples)
         .route("/app-builder/generate", app_builder_generate)
         .route("/app-builder/plans/{id}", app_builder_plan)

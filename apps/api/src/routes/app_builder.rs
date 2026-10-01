@@ -61,6 +61,13 @@ const LIST_PAGE_DEFAULT: i64 = 20;
 /// Most rows a page returns.
 const LIST_PAGE_MAX: i64 = 100;
 
+/// Most plans one bulk delete may carry.
+///
+/// The console selects a page (20 rows by default), so the bound is generous rather than
+/// tight: it exists to stop a request that would hold the table's worth of ids in one
+/// statement, not to shape the interface. `media.manage`'s bulk bar uses the same number.
+const MAX_BULK_SELECTION: usize = 100;
+
 /// The three sample prompts the landing page offers, exactly as the request names them.
 const EXAMPLES: &[(&str, &str)] = &[
     (
@@ -756,6 +763,119 @@ pub async fn delete_plan(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// What a bulk delete asks for.
+#[derive(Debug, Deserialize)]
+pub struct BulkDeleteBody {
+    /// The plans to remove. An applied one is refused by name rather than deleted.
+    pub ids: Vec<Uuid>,
+}
+
+/// One plan a bulk delete would not remove.
+#[derive(Debug, Serialize)]
+pub struct BulkDeleteFailure {
+    /// The plan the caller named.
+    pub id: Uuid,
+    /// Why it is still there.
+    pub message: String,
+}
+
+/// The answer to a bulk delete: what went, and what stayed.
+///
+/// **Both halves, always.** A response carrying only `deleted` renders a partial bulk as a
+/// complete one — the operator's next action is to trust the count, and an applied plan that
+/// silently survived would leave them believing the console is empty when it is not.
+#[derive(Debug, Serialize)]
+pub struct BulkDeleteAnswer {
+    /// How many plans the request named.
+    pub requested: usize,
+    /// How many are gone.
+    pub deleted: usize,
+    /// The plans that are still there, each with the reason.
+    pub failures: Vec<BulkDeleteFailure>,
+}
+
+/// `POST /api/v1/app-builder/plans/bulk-delete` — remove a selection of drafts.
+///
+/// **Three decisions, each of which had a cheaper alternative that would have been wrong.**
+///
+/// 1. **The answer is `200` with per-plan failures, not `204` and not `409`.** "Two of five
+///    deleted, one was applied" is the truth of the call, and a status code can only say
+///    whether *anything* went. The console's confirmation already names how many drafts are
+///    about to go, so it can render the outcome in the same shape it asked in.
+/// 2. **The selection is resolved inside the caller's organization before anything is
+///    written.** `delete_plans` reads the rows with the tenant predicate and hands only what
+///    is left to the `delete`, because the ids are the caller's — nothing inside a `delete`
+///    looks at an organization, so a handler that passed the array straight through would be
+///    deleting other tenants' plans and calling it a 200.
+/// 3. **`appbuilder.review`, the same key the single delete carries.** A bulk is not a lesser
+///    power; it is the same power over several rows at once, and guarding it differently would
+///    mean the least-privileged reviewer could delete a page of drafts one row at a time but
+///    not in bulk — which is a rule nobody would write on purpose.
+///
+/// An empty `ids` is refused rather than answered as "nothing to do": a button that reports
+/// success for an empty selection is a button that cannot be distinguished from one that was
+/// never wired.
+pub async fn bulk_delete_plans(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<BulkDeleteBody>,
+) -> Result<Json<BulkDeleteAnswer>, ApiError> {
+    if body.ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "selection_required",
+            "name the plans to delete — an empty selection deletes nothing and reports nothing",
+        ));
+    }
+    if body.ids.len() > MAX_BULK_SELECTION {
+        return Err(ApiError::bad_request(
+            "selection_too_large",
+            format!(
+                "a bulk delete carries at most {MAX_BULK_SELECTION} plans; \
+                 the console selects one page at a time"
+            ),
+        ));
+    }
+
+    // Same tenancy resolution as every other route here: a platform account must name the
+    // tenant, and a scoped account gets its own.
+    let organization_id = organization_of(&current, None)?;
+
+    let report = builder::delete_plans(state.db().pool(), &body.ids, Some(organization_id))
+        .await
+        .map_err(store_error)?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "app_builder.plan.bulk_deleted")
+            .organization(Some(organization_id))
+            .target(
+                "app_builder_plan",
+                format!("{} plans", report.deleted.len()),
+            )
+            .metadata(json!({
+                "requested": report.requested(),
+                "deleted": report.deleted.len(),
+                "failed": report.failures.len(),
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok(Json(BulkDeleteAnswer {
+        requested: report.requested(),
+        deleted: report.deleted.len(),
+        failures: report
+            .failures
+            .into_iter()
+            .map(|refused| BulkDeleteFailure {
+                id: refused.id,
+                message: refused.message,
+            })
+            .collect(),
+    }))
+}
+
 /// `GET /api/v1/app-builder/plans/{id}/export` — the plan as a JSON file.
 ///
 /// **A download, not a JSON body.** The console's bulk bar offers "Export plan JSON" next to
@@ -801,10 +921,7 @@ pub async fn export_plan(
         .map_err(store_error)?;
 
     let body = builder::render_plan_export(&builder::build_plan_export(
-        &plan,
-        &artifacts,
-        counts,
-        &blockers,
+        &plan, &artifacts, counts, &blockers,
     ))
     .map_err(store_error)?;
     let filename = builder::export_filename(&plan);
