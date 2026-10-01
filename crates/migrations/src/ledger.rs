@@ -464,14 +464,18 @@ mod tests {
         // inside the caller: a stored object can hold bytes that are not valid UTF-8, and
         // converting to check one panics — turning a "this file does not match its checksum"
         // answer into a crash on the single-use download route.
-        let not_utf8: &[u8] = &[0xff, 0xfe, 0x00, 0x80];
+        // Built through a runtime value rather than written as a literal: a literal of invalid
+        // bytes is a constant the compiler can inspect, and it warns on every build that the
+        // `from_utf8` below can never succeed — which is true here and says nothing. The bytes
+        // come from a `Vec` so the check stays an assertion about a real slice.
+        let not_utf8: Vec<u8> = vec![0xff, 0xfe, 0x00, 0x80];
         assert!(
-            std::str::from_utf8(not_utf8).is_err(),
+            std::str::from_utf8(&not_utf8).is_err(),
             "the fixture must actually be invalid UTF-8, or it proves nothing"
         );
         // Pinned against `printf '\xff\xfe\x00\x80' | sha256sum`.
         assert_eq!(
-            checksum_bytes(not_utf8),
+            checksum_bytes(&not_utf8),
             "5a741968f40e57485ed6e1a1af381adeb2714223c35acedf1ad0670e42df2eb5"
         );
     }
