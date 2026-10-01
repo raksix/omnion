@@ -1,6 +1,6 @@
 # REQ-106 — Local & Air-gapped AI Mode
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
+> **Status:** in-progress (slice 1 backend) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -139,9 +139,9 @@ three cannot drift apart; the allow-list widens it, never replaces it.
 
 - [ ] With the air gap on, a chat addressed to a remote provider is refused with `403 ai_airgap_blocked` naming the provider and host, and the attempt is logged with `status = 'blocked_airgap'`.
 - [ ] With the air gap on, the same chat addressed to a local endpoint answers normally (round-trip through a local stub server in the test).
-- [ ] A local endpoint that redirects to a non-local host is refused, and the refusal names the redirect target.
+- [x] A local endpoint that redirects to a non-local host is refused, and the refusal names the redirect target.
 - [ ] Enabling the air gap requires a reason; an empty or too-short reason is a field error, and the audit entry carries the actor, the reason and the time.
-- [ ] `/api/v1/ai/local/models` lists what the endpoint serves and a pull moves a model from `missing` to `available` through `pulling` with progress visible in the UI; the same key cannot be pulled twice concurrently.
+- [~] `/api/v1/ai/local/models` lists what the endpoint serves and a pull moves a model from `missing` to `available` through `pulling` with progress visible in the UI; the same key cannot be pulled twice concurrently.
 - [ ] A knowledge collection pinned to a local embedding model indexes and searches with the remote provider unreachable (test runs with the remote endpoint pointed at a closed port).
 - [ ] With the air gap on, a collection whose embedding model is remote is listed as blocked with a "needs a local embedding model" chip and a one-click repoint that works when a local embedding model exists.
 - [ ] `/api/v1/ai/airgap/verify` reports a pass when the refusal happens and a failure when a call escapes; a failure turns the `/ai/local` banner red and emits `ai.airgap.verify.failed`.
@@ -149,6 +149,16 @@ three cannot drift apart; the allow-list widens it, never replaces it.
 - [ ] The "Run AI locally" documentation page exists, names the supported servers, the verification steps, and what stops working while the gap is on.
 - [ ] Every screen has empty, loading and error states with a real action; `/ai/local` renders with no endpoint registered at all.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
+
+<!--
+Slice 1 (`f46b2388`, `0b68df62`, `c2285c30`, `e1c4ae94`, `4c6a6c31`, `7affb5a2`, `fe16365c`) proved:
+  * the redirect refusal, against a stub that answers 302 — ticked above.
+  * `/api/v1/ai/local/models` lists, and a pull is CLAIMED (missing -> pulling -> available) with a
+    second concurrent pull refused WITH A REASON, read off `rows_affected` — that half is proved;
+    "progress visible in the UI" is NOT, because no `/ai/local` screen exists yet. Left as [~]
+    with the missing half named rather than quietly ticked.
+The four air-gap rows (1, 2, 4, 8) are slice 2. The remaining rows are slices 3 and 4.
+-->
 
 ### QA plan
 

@@ -9230,3 +9230,79 @@ desktop and the mobile pass, and which will be visited the first time the box is
 
 **Next.** The browser pass owed for slices 1–4, then slice 4's remaining two thirds: the
 security-event view over the audit trail and the secret-inventory projection.
+
+## w7 · tick 59 · REQ-106 slice 1 — one function decides what "local" means
+
+**What.** The first third of "run with no external calls at all": a local endpoint the platform
+treats as an ordinary provider, the models such an endpoint serves, and the single function that
+decides which hosts are local. Seven atomic commits, pushed.
+
+**A merge that shipped conflict markers, and what fixing it cost.** The first job this tick was
+`cbed134c` — a merge that committed literal `@@KEEP_THEIRS@@` markers into this append-only journal.
+Both parents (`da3ba241`, `963bc7ca`) are clean, so the merge was replayed deterministically with
+the repo's own `merge-build-log.py` `splice()` rather than by hand (`f6bf96a2`). Verified by the
+tool's **entry-level** gate: every `## ` entry of both sides survives contiguously — Tick 93 from
+ours, Tick 94 / `ip-access` from main's REQ-012 slice 4.
+
+The instructive half is the guard that fired first and was **wrong**. A substring scan for
+`<<<<<<<` reported "markers still present" on a splice that was already clean — because this log
+contains *prose about* `<<<<<<<`, describing an earlier occurrence of this same bug on this same
+branch. Conflict markers are **line-anchored**; a substring scan matches a sentence that talks
+about them. The fix was to anchor the scan, and the lesson is the general one: **a detector must
+test the shape of the thing it is detecting, not the presence of its characters**, or it will
+spend its refusal on the one document that legitimately mentions the marker.
+
+**Locality is written, not requested.** `ai_providers.locality` is derived by `is_local_host()` at
+save time and `host_kind` records *which* rule fired (`loopback` / `private` / `allowlisted`).
+Slice 2's air-gap check reads this column: a row an operator marked `local` while pointing at a
+public host would make that switch a decoration, so the walk registers a public host and is
+refused, then loopback, then reads `locality` and `host_kind` **back**. The default is `remote` —
+a default, not a value to keep, since every existing provider row already points at a remote host.
+`null` would have been a third answer ("unknown"), and unknown in the column the security switch
+reads is the shape that makes a security switch quietly permissive.
+
+**One rule, three callers, and the reason for the purity.** `local_host.rs` has no database and no
+pool on purpose: the endpoint save path, the slice-2 enforcement check and the slice-4 doctor all
+have to answer "local or not", and three copies of that rule is three chances for the answer to
+diverge between a save, an enforcement and a health check. `classify_host` returns the *kind*, not
+a bool — "allowlisted" is the difference between a host the platform proves by name and a host an
+operator vouched for, and the air-gap switch must tell those apart.
+
+**"The host was local" is true only until the first response.** The client is built with
+redirects disabled *and* the handler builds a refusal naming the location it was pointed at,
+because "blocked" alone teaches an operator nothing. The walk proves this against a stub that
+answers `302` — a configuration assertion would pass on a client that ignores the setting, which is
+exactly the thing the criterion is about.
+
+**Pulls are claimed, not checked.** `begin_pull` is one statement that flips `missing` → `pulling`
+and reports whether it won; `select`-then-write has a window in which two operators both read
+`missing` and both download. The second click is refused *with a reason*, read off
+`rows_affected`, so the walk cannot pass against a store that merely looks right. A failed pull
+keeps its row and the server's own words — deleting it would leave a table quietly shorter than
+the server with no record of what failed. A cancelled pull returns to `missing` rather than
+claiming to be pulling forever, and a pull in flight cannot be removed.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo build -p omnion-ai-hub -p omnion-api` | exit 0 |
+| `cargo test -p omnion-ai-hub --quiet` | **596 passed**, 0 failed (was 587; +9) |
+| `cargo test -p omnion-api --test ai_local` | **8 passed**, 0 failed |
+| `apps/admin` `tsc --noEmit` | exit 0, empty log |
+| `0219` vs every sibling worktree | uniquely mine — no collision on the shared ledger |
+| walks ran against PostgreSQL | 11.04 s (not skipped; the harness panics rather than skip) |
+
+**Not run, recorded rather than skipped silently.** The **browser pass has NOT run**, for two
+independent reasons. First, **this is not a close tick**: slice 1's "done when" is *"a local
+endpoint serves a chat **and** a pull moves through `pulling` to `available` while a bad key
+surfaces the server's error"*, and there is no chat round-trip yet — so the slice is
+**backend-complete, not done**. Second, the box is wrong: the QA slot's holder is **alive** —
+pid `1689806`, `cwd=/mnt/apopic/omnion-w4` verified through `/proc`, not through the place file —
+and load is 14.2 on 6 cores with 7G free of 32. A second browser pass into that is the documented
+29-September OOM. **No screen of this REQ is claimed verified**, because none exists yet.
+
+**Next.** Slice 1's remaining half: `/ai/local` and `/ai/local/models`, the chat round-trip against
+a local stub, the walkthrough routes, and then the pass. The same single pass still owes REQ-105
+slice 5 and the closes of REQ-099/100/101 — five more screens on that queue, none of which this
+tick could put in front of a browser.
