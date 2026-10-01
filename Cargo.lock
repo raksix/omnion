@@ -1610,6 +1610,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac",
+ "omnion-security",
  "p256",
  "rand 0.8.8",
  "reqwest",
@@ -1764,6 +1765,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "hmac",
+ "ipnet",
  "omnion-core",
  "redis",
  "serde",

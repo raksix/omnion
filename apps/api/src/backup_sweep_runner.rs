@@ -64,7 +64,10 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
 }
 
 /// One sweep over every tenant that has a backup, plus the platform's own.
-pub async fn tick(state: &AppState, max_tenants: i64) -> omnion_backup::Result<omnion_backup::SweepReport> {
+pub async fn tick(
+    state: &AppState,
+    max_tenants: i64,
+) -> omnion_backup::Result<omnion_backup::SweepReport> {
     let pool = state.db().pool();
 
     // Once per tick, before the loop — see the module comment. A missing settings row is not
@@ -100,7 +103,10 @@ pub async fn tick(state: &AppState, max_tenants: i64) -> omnion_backup::Result<o
         );
     }
     if report.is_idle() {
-        tracing::debug!(walked = report.walked, "the backup retention sweep found nothing to remove");
+        tracing::debug!(
+            walked = report.walked,
+            "the backup retention sweep found nothing to remove"
+        );
     }
 
     Ok(report)

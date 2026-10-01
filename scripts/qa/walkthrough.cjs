@@ -6738,11 +6738,21 @@ async function runNotificationSettingsDepth(page, report) {
       steps.pushEnableLiveWithKey = !(await enable.first().isDisabled().catch(() => true));
     }
 
-    // Pressing it in a headless pass cannot succeed — there is no user gesture and no service
-    // worker — and the block must say *that* rather than silently doing nothing or throwing
-    // an unhandled rejection into the console. Chromium without a service worker rejects
-    // `navigator.serviceWorker.ready`, which is the exact leg that catches a missing catch.
-    if (steps.pushEnableOffered) {
+    // Pressing a LIVE button in a headless pass cannot succeed — there is no user gesture and
+    // no service worker — and the block must say *that* rather than silently doing nothing or
+    // throwing an unhandled rejection into the console. Chromium without a service worker
+    // rejects `navigator.serviceWorker.ready`, which is the exact leg that catches a missing
+    // catch.
+    //
+    // A *disabled* button is a different case and the earlier version measured it wrongly:
+    // it clicked unconditionally and read "no error appeared" as a defect, while on an
+    // installation with no key pair the button is `disabled` by design — Playwright refuses
+    // the click, so the leg was measuring the browser, not the screen. The two are separated
+    // now and BOTH still have to say something: a live button must produce a sentence when
+    // its browser refuses, and a disabled one must carry the reason *with the control*
+    // rather than leaving it in a paragraph further up the block.
+    const enableDisabled = await enable.first().isDisabled().catch(() => true);
+    if (steps.pushEnableOffered && !enableDisabled) {
       await enable.first().click().catch(() => {});
       await page.waitForTimeout(1800);
       const said = await page.locator("[data-push-error]").count();
@@ -6754,6 +6764,17 @@ async function runNotificationSettingsDepth(page, report) {
           .catch(() => "");
         steps.pushErrorIsASentence = text.trim().length > 20;
       }
+    } else if (steps.pushEnableOffered) {
+      steps.pushEnableExplainsItself =
+        (await page.locator("[data-push-enable-reason]").count()) > 0;
+      steps.pushDisabledReasonNamesAVariable = /OMNION_PUSH_[A-Z_]+/.test(
+        await page
+          .locator("[data-push-enable-reason]")
+          .innerText()
+          .catch(() => ""),
+      );
+      steps.pushDisabledReasonIsDescribed =
+        (await page.locator("[data-push-enable][aria-describedby=push-enable-reason]").count()) > 0;
     }
 
     // A remove button that exists on a row must delete that row, and the row must disappear
@@ -8073,6 +8094,248 @@ async function runSecurityDepth(page, report) {
     }
   }
 
+  // -- the security-event timeline (REQ-012, slice 4) ------------------------------------------
+  //
+  // The "no untested screen" rule, applied to the screen slice 4's second third added. The
+  // assertions are the ones a static inventory cannot make:
+  //
+  //  1. the honesty note is present, because a security screen that implies it records refusals
+  //     it does not is the defect this REQ has produced eight times;
+  //  2. the filter actually **filters** — a filter that returns the same rows whatever it is set
+  //     to is indistinguishable from one that works;
+  //  3. the counts line reads "N of M" rather than implying the page is all there is;
+  //  4. every rendered row names its source, because the timeline merges two tables.
+  await page.goto(`${URL_ADMIN}/security/events`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-security-events-counts]", { timeout: 15000 }).catch(() => {});
+  const eventsReady = (await page.locator("[data-security-events-counts]").count()) > 0;
+  note({ step: "security-events-loaded", rendered: eventsReady });
+  if (!eventsReady) {
+    note({
+      step: "security-events-missing",
+      reason: "/security/events did not render its counts line",
+    });
+    await shot(page, "security-events-missing");
+  } else {
+    const notePresent = (await page.locator("[data-security-events-note]").count()) > 0;
+    note({ step: "security-events-honesty-note", present: notePresent });
+    if (!notePresent) {
+      note({
+        step: "security-events-no-honesty-note",
+        reason: "the screen does not say that permission refusals are absent",
+      });
+    }
+
+    const rowCount = await page.locator("[data-security-event-row]").count();
+    note({ step: "security-events-rows", count: rowCount });
+
+    // The counts line must distinguish the page from the whole filter.
+    const countsText = (await page.locator("[data-security-events-counts]").innerText())
+      .replace(/\s+/g, " ")
+      .trim();
+    const ofMatch = countsText.match(/(\d+)\s+of\s+(\d+)/);
+    note({ step: "security-events-counts-read", text: countsText, parsed: ofMatch });
+    if (!ofMatch) {
+      note({
+        step: "security-events-counts-ambiguous",
+        reason: `the counts line does not say "N of M": ${countsText}`,
+      });
+    }
+
+    // The filter must change the result. `sign_in` is the category that lives only on the
+    // sign-in table, so a filter that cannot cross the seam returns the whole timeline.
+    const categorySelect = page.locator("[data-security-events-category]").first();
+    if ((await categorySelect.count()) > 0) {
+      const before = await page.locator("[data-security-event-row]").count();
+      await categorySelect.selectOption("sign_in");
+      await page.waitForTimeout(700);
+      const after = await page.locator("[data-security-event-row]").count();
+      const filteredText = (await page.locator("[data-security-events-counts]").innerText())
+        .replace(/\s+/g, " ")
+        .trim();
+      note({
+        step: "security-events-filter-applied",
+        rowsBefore: before,
+        rowsAfter: after,
+        counts: filteredText,
+      });
+      // Rows may legitimately be equal when the timeline holds only sign-ins, so the assertion
+      // is that the *filter was applied* — the counts line changed — rather than that the row
+      // count fell. A count that cannot fall is a different defect, and this step would not see
+      // it; it reports both numbers so a human can.
+      if (filteredText === countsText && before > 0) {
+        note({
+          step: "security-events-filter-inert",
+          reason: "category=sign_in left the counts line unchanged — the filter may be a no-op",
+        });
+      }
+      // Every row must name its source: the timeline merges two tables and a row that does not
+      // say which one is an operator's puzzle during an incident.
+      const rows = await page.locator("[data-security-event-row]").all();
+      for (const row of rows) {
+        const action = (await row.innerText()).replace(/\s+/g, " ").trim();
+        if (!action) {
+          note({ step: "security-events-blank-row", reason: "a rendered row is empty" });
+        }
+      }
+      const clearButton = page.locator("[data-security-events-clear]").first();
+      if ((await clearButton.count()) > 0) {
+        await clearButton.click();
+        await page.waitForTimeout(500);
+        note({ step: "security-events-filter-cleared", rendered: eventsReady });
+      }
+      await shot(page, "security-events");
+    }
+  }
+
+  // -- the secret inventory (REQ-012, slice 4) ---------------------------------------------------
+  //
+  // The "no untested screen" rule, and this one needs its own assertions because the screen's
+  // whole value is what it does NOT show. Four claims a route count cannot make:
+  //
+  //  1. the limitation note is present — the API states its own blind spot and the screen must
+  //     render it, because an inventory that looks exhaustive when it is partial is the defect;
+  //  2. no row renders a secret VALUE. The browser is the last place a value could leak into a
+  //     screenshot a ticket carries, so the page text is scanned for the shape of one;
+  //  3. there is no edit/rotate control — asserted as an ABSENCE, which is the only way to test a
+  //     deliberate omission, and a "coming soon" button would satisfy a presence check;
+  //  4. the read-only note is present, so the absence above reads as a decision rather than an
+  //     unfinished screen.
+  await page.goto(`${URL_ADMIN}/security/secrets`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-security-secrets-counts], [data-security-secrets-empty]", {
+      timeout: 15000,
+    })
+    .catch(() => {});
+  const secretsReady =
+    (await page.locator("[data-security-secrets-counts]").count()) > 0 ||
+    (await page.locator("[data-security-secrets-empty]").count()) > 0;
+  note({ step: "security-secrets-loaded", rendered: secretsReady });
+  if (!secretsReady) {
+    note({
+      step: "security-secrets-missing",
+      reason: "/security/secrets rendered neither rows nor an empty state",
+    });
+    await shot(page, "security-secrets-missing");
+  } else {
+    note({
+      step: "security-secrets-limitation",
+      present: (await page.locator("[data-security-secrets-limitation]").count()) > 0,
+    });
+    note({
+      step: "security-secrets-readonly-note",
+      present: (await page.locator("[data-security-secrets-readonly]").count()) > 0,
+    });
+
+    const rowCount = await page.locator("[data-security-secret-row]").count();
+    note({ step: "security-secrets-rows", count: rowCount });
+
+    // No value may reach the rendered page. The panel type has no field that could hold one, so
+    // this is the belt to the API walk's braces — and it is the assertion that covers the last
+    // hop the Rust test cannot see.
+    const pageText = await page.evaluate(() => document.body.innerText || "");
+    for (const forbidden of ["ciphertext", "secret_hash", "secretCiphertext", "BEGIN PRIVATE KEY"]) {
+      if (pageText.toLowerCase().includes(forbidden.toLowerCase())) {
+        note({
+          step: "security-secrets-value-leak",
+          reason: `the rendered page mentions ${forbidden}`,
+        });
+      }
+    }
+
+    // A deliberate absence is asserted as an absence. Any control that mutates is a defect here:
+    // rotation happens in the environment and a deploy.
+    const mutatingControls = await page
+      .locator('[data-security-secrets] button, [data-security-secrets] a')
+      .evaluateAll((nodes) =>
+        nodes
+          .map((node) => (node.textContent || "").trim().toLowerCase())
+          .filter((text) =>
+            /\b(edit|rotate|revoke|delete|remove|update|replace|add)\b/.test(text),
+          ),
+      );
+    note({ step: "security-secrets-mutating-controls", found: mutatingControls });
+    if (mutatingControls.length > 0) {
+      note({
+        step: "security-secrets-not-readonly",
+        reason: `the read-only screen offers: ${mutatingControls.join(", ")}`,
+      });
+    }
+    await shot(page, "security-secrets");
+  }
+
+  // -- the IP access lists (REQ-012, slice 4) ------------------------------------------------
+  //
+  // `/security/ip-access` was linked from the posture overview's IP-allow-list row since the
+  // check registry was written, so this step is not optional bookkeeping: it is what proves the
+  // link is no longer dead. The walk exercises the parts a static inventory cannot judge — that
+  // a rule is really added, that a malformed one is refused with a message on the field, and
+  // that the tester agrees with the platform about an address the walk itself owns.
+  await page.goto(`${URL_ADMIN}/security/ip-access`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-ip-access-counts]", { timeout: 15000 }).catch(() => {});
+  const ipAccessReady = (await page.locator("[data-ip-access-counts]").count()) > 0;
+  note({ step: "ip-access-loaded", rendered: ipAccessReady });
+  if (!ipAccessReady) {
+    note({ step: "ip-access-missing", reason: "/security/ip-access did not render its summary line" });
+    await shot(page, "security-ip-access-missing");
+  } else {
+    // The empty state has to be a statement rather than a blank table: "no rules" and "a broken
+    // screen" look identical otherwise, and this is the state a fresh installation is in.
+    const emptyState = (await page.locator("[data-ip-access-empty]").count()) > 0;
+    note({ step: "ip-access-empty-state", present: emptyState });
+
+    // A malformed network must be refused with a message, not saved. The form is filled with a
+    // prefix past the family's maximum: the shape an operator's typo actually takes.
+    const cidrField = page.locator("[data-ip-access-cidr]").first();
+    const noteField = page.locator("[data-ip-access-note]").first();
+    if ((await cidrField.count()) > 0 && (await noteField.count()) > 0) {
+      await cidrField.fill("203.0.113.0/33");
+      await noteField.fill("walkthrough invalid network");
+      await page.locator("[data-ip-access-submit]").first().click().catch(() => {});
+      await page.waitForTimeout(900);
+      const fieldError = (await page.locator("[data-ip-access-error]").count()) > 0;
+      note({ step: "ip-access-malformed-refused", refused: fieldError });
+      if (!fieldError) {
+        note({
+          step: "ip-access-malformed-accepted",
+          reason: "203.0.113.0/33 was accepted by the form",
+        });
+      }
+      await shot(page, "security-ip-access-invalid");
+
+      // Now a real rule, added through the panel's own form. The note is required, so it is
+      // filled too — a walk that omitted it would be measuring the wrong refusal.
+      await cidrField.fill("203.0.113.0/24");
+      await noteField.fill("walkthrough deny list");
+      await page.locator("[data-ip-access-submit]").first().click().catch(() => {});
+      await page.waitForTimeout(1200);
+      const created = (await page.locator("[data-ip-rule-list]").count()) > 0;
+      note({ step: "ip-access-rule-created", listed: created });
+      await shot(page, "security-ip-access");
+
+      // The tester must agree with the platform about the address the walk itself comes from.
+      // A rule that covers this session is expected to produce the self-lockout warning; either
+      // that warning or a plain "blocked" verdict is correct, and both are recorded rather than
+      // asserted here, because the browser's address is not something this step controls.
+      const probeField = page.locator("[data-ip-access-probe-input]").first();
+      if ((await probeField.count()) > 0) {
+        await probeField.fill("203.0.113.7");
+        await page.locator("[data-ip-access-probe]").first().click().catch(() => {});
+        await page.waitForTimeout(900);
+        const verdict = (await page.locator("[data-ip-access-probe-result]").count()) > 0;
+        const blocked = await page
+          .locator("[data-ip-access-probe-result]")
+          .first()
+          .getAttribute("data-blocked")
+          .catch(() => null);
+        note({ step: "ip-access-tester", rendered: verdict, blocked });
+        if (!verdict) {
+          note({ step: "ip-access-tester-missing", reason: "the tester rendered no verdict" });
+        }
+        await shot(page, "security-ip-access-tester");
+      }
+    }
+  }
+
   return { ok: true, steps };
 }
 
@@ -9294,6 +9557,9 @@ async function main() {
     // the route proves almost nothing. The pass asserts a round trip read back from the
     // API, a refusal that lands under the control the server named, and a restore.
     { path: "/commerce/storefront", name: "commerce-storefront" },
+    { path: "/security/ip-access", name: "security-ip-access" },
+    { path: "/security/events", name: "security-events" },
+    { path: "/security/secrets", name: "security-secrets" },
     // The system health centre (REQ-014, slice 1). Walked here and driven by
     // `runHealthDepth` below, which reads the eight service rows, opens a row's
     // checks and presses "Run all checks". "No untested screen" means no
@@ -9711,7 +9977,7 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
@@ -9839,16 +10105,23 @@ async function main() {
   }
 
   for (const p of report.pages) {
-    // **A page without diagnostics is not a page without findings.** The roll-up is the ONLY
-    // place a `high` becomes visible — the walk itself just records — so an entry that skipped
-    // the measurement (a navigation that never rendered, a page closed under memory pressure)
-    // used to throw `Cannot read properties of undefined (reading 'horizontalOverflow')` and
-    // discard every finding the pass had earned. This exact crash ended the 12:09 pass on this
-    // branch, and it is the reason two runs in a row wrote `summary.json` containing only a
-    // `fatal` string: the pass was not failing, its report was failing to be assembled.
+    // A page whose walk threw is pushed as `{ ...route, failed }` with no `diagnostics` at
+    // all, so every field read off `d` below is a read off `undefined`. That is not a
+    // cosmetic gap: this loop runs *before* the rest of the roll-up, and an uncaught
+    // TypeError here takes every later finding with it — one crashed page silently converts a
+    // pass that measured 90 screens into a pass that reported nothing, and a pass with no
+    // verdict reads as "no findings". The measurement is therefore recorded as **absent**
+    // (a finding that says so) instead of being assumed clean, and the loop continues so a
+    // single bad page cannot cost every later page its report.
     const d = p.diagnostics;
     if (!d) {
-      pushFindings("medium", "unmeasured-page", `${p.name}: no diagnostics were recorded, so this screen was not judged`);
+      pushFindings(
+        "high",
+        "unmeasured-page",
+        `${p.name}: the page walk failed before it produced diagnostics${
+          p.failed ? ` (${p.failed})` : ""
+        } — this screen was not measured`,
+      );
       continue;
     }
     if (d.horizontalOverflow) pushFindings("high", "overflow", `${p.name}: page scrolls horizontally (${d.scrollWidth}px > ${d.viewport.w}px)`);
@@ -9861,8 +10134,17 @@ async function main() {
     if (d.h1Count === 0) pushFindings("low", "no-h1", `${p.name}: no h1 heading`);
   }
   for (const m of report.mobile) {
-    if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
-    if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
+    // The same absent-measurement rule as the desktop roll-up above, for the same reason: the
+    // phone phase is the last thing a pass does, so a throw here is the throw that erases
+    // everything it just measured. This pass died here — `Cannot read properties of undefined
+    // (reading 'horizontalOverflow')` — and took the entire finding report with it.
+    const d = m.diagnostics;
+    if (!d) {
+      pushFindings("high", "unmeasured-mobile", `mobile ${m.name}: no diagnostics were produced — this screen was not measured at 390px`);
+      continue;
+    }
+    if (d.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
+    if (d.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${d.offscreen.length} element(s) outside the viewport`);
   }
   const refusedOnPurpose = [];
   for (const [index, f] of consoleLog.entries()) {

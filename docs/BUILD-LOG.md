@@ -13011,3 +13011,334 @@ which, or the next person spends an hour reading a screen instead of reading a l
 **Next tick.** `pg_isready` **before** starting anything, and a disk check beside it: this box's
 database spent 56 minutes recovering earlier today and went back under the load of nine writers. The
 measurement is written, compiled and typechecked; nothing about it needs another line of code.
+
+## Tick 91 — the eighth key, the disabled button, and the pass that was erasing its own report
+
+Three defects from tick 90's measurement, all found by reading the measurement rather than
+the code, and all mine.
+
+**1. `/` did focus the filter — something else then took the focus back.**
+`slashFocusedFilter: false` was recorded as "`/` is not wired", and the natural fix would have
+been to add a handler. The handler was already there: `notification-list.tsx` binds `/` on the
+table body and focuses `notification-search`. `components/global-search.tsx` binds the same key
+on `window` and focuses its own input. Both run for one keystroke, and the window listener runs
+second — document listeners fire in registration order — so it answered a key the page had
+already claimed and moved focus straight back out. `50221aeb` guards on
+`event.defaultPrevented`: `preventDefault` is set by whoever claimed the key first, so a page
+with its own `/` keeps it and every page without one still gets the global box.
+
+**2. A disabled push button with its reason in a paragraph above it.**
+`pushEnableExplainsItself: false` sat next to `pushUnavailableNamesAVariable: true`: the notice
+named `OMNION_PUSH_*` correctly while the button beside it was disabled and silent. That is the
+dead control the definition of done forbids, and the same shape as the webhook `chat`-channel
+defect. `36259f96` renders the reason next to the button, names it in `title`, and points
+`aria-describedby` at it so a screen reader hears it *before* the click.
+
+**3. The pass erased its own report when a page threw.** A page whose walk fails is pushed as
+`{ ...route, failed }` with no `diagnostics` key; the roll-up then read `d.horizontalOverflow`
+off `undefined` and threw. The throw landed in the mobile phase — the last thing a pass does —
+so one crashed page took every finding with it, and a pass that reported nothing reads exactly
+like a pass with no findings. That is how tick 90's mobile legs stayed unmeasured. `71375c41`
+records an absent measurement as a high finding naming the screen, continues the roll-up, and
+separates a *live* push button (must produce a sentence when the browser refuses) from a
+*disabled* one (must carry its reason) — the old leg clicked unconditionally, and clicking a
+disabled button measures Playwright's refusal rather than the screen.
+
+Proof this tick: `cargo build -p omnion-api` clean · `cargo test -p omnion-notifications --lib`
+**102 passed, 0 failed** · `pnpm --filter @omnion/admin typecheck` exit 0 · `node --check
+scripts/qa/walkthrough.cjs` clean · focused pass `QA_ONLY='notifications-depth'` running.
+
+Next: read the pass's `slashFocusedFilter`, `pushEnableExplainsItself`,
+`pushDisabledReasonNamesAVariable` and `pushDisabledReasonIsDescribed` legs, and the REQ-021
+mobile legs that tick 90's crash never reached.
+
+**The pass is still walking, and the box is why.** At 07:31 the focused
+`QA_ONLY='notifications-depth'` pass had been walking for 55 minutes with its last screenshot
+at 07:23 and `node scripts/qa/walkthrough.cjs` at **0.0% CPU in state S** — not crashed, not
+finished, waiting on a browser whose renderer gets no time. `uptime` reads **load 97** on a
+six-core box: six sibling worktrees are compiling at once, and `QA_SLOT_WAIT=60` had already
+spent its budget and proceeded without a place because the shared slot belongs to the w5 pass
+(`/tmp/omnion-qa-slot` holder alive, cwd `/mnt/apopic/omnion-w5`). So this tick ends with the
+three fixes committed and every gate green, and the browser leg **still owed** — which is the
+honest state, not the "I ran a pass" reading of the same log.
+
+## Tick 92 — the name the catalogue was withholding, and the policy it was hiding
+
+Tick 91 ended with three fixes committed and a browser pass still owed because the box was at
+load 97. This tick picked the first unchecked acceptance box in wave 1 that did **not** need that
+pass, and the reason it was unchecked turned out to be more interesting than the note recorded.
+
+**The note was right and beside the point.** REQ-012's box said *"the sign-in route does not call
+`evaluate_lockout` yet"* — true, and it framed the work as wiring one function into another.
+Reading the two call sites rather than the note is what found the actual defect:
+`evaluate_lockout` is the **security centre's** arithmetic, and it is what the tester, the probe
+and `PUT /security/sign-in-protection` all agree with. `crates/identity` locks accounts with a
+completely separate statement in `register_failure`, reading `security_policies.lockout_attempts`
+from `0011_iam_advanced.sql` — a **different table**, with a default of 10 and a minimum of 3.
+
+So the screen, the route, the tester, the probe, the audit entry and the event catalogue were all
+correct, all typechecked, all unit-tested at 137 crate tests — and the number an operator tuned
+was not the number that locked their accounts. It is the eighth instance of this REQ's defect
+class and the most expensive one, because this time every surface agreed with every other surface
+and the product was still inert. **Two implementations of one policy, only one of them on the
+request path.**
+
+**What shipped** (`98e66375`…`60151851`, four atomic commits):
+
+1. `SignInOutcome::AccountLocked` now carries `newly_locked`, `user_id`, `organization_id` and
+   `attempts`. The field that earns its keep is `newly_locked`: `sign_in` *finds* a live lock at
+   the top of the function and `register_failure` *applies* one at the bottom, and both return the
+   same variant. An emitter placed on the first fires on every subsequent guess — and an attacker
+   chooses how many guesses to make, so the event becomes a volume metric of their patience
+   rather than a record of the account that got caught.
+2. The emitter lives in `apps/api/src/routes/auth.rs`. `crates/identity` deliberately has no bus
+   handle — the event bus depends on nothing, and reaching for it would put a delivery fan-out on
+   the sign-in path of every deployment. The API layer owns a bus and the password path has one
+   caller. A failed emission is a `tracing::warn!`, never a `500`: the lock is applied and the
+   caller is already refused, so failing the request would report a sign-in as broken when the
+   platform did precisely what it was configured to do.
+3. `security.lockout.triggered` joins the catalogue — the name its own comment said "joins the
+   catalogue in the commit that gives the sign-in route an emitter". Its payload carries
+   `user_id`, `attempts` and `lockout_minutes`, and deliberately **not** the attempted password
+   and **not** the client address: an event bus fans out to third parties, and a brute-force
+   attempt is precisely the payload nobody should be copying anywhere.
+
+**Two things writing the walk found that the design had not.** First, the emitter must carry the
+organization: `store::enqueue_fanout` returns **zero** deliveries for an event with no
+organization, so an emitter that forgot `.organization(...)` would write a row that exists, would
+appear in `/events` as a real record, and would reach nobody — the failure mode that looks most
+like success. The walk's account is therefore created *inside* an organization rather than with
+the org-less `test_user` every other walk in `tests/auth.rs` uses, and the assertion is on the
+queued delivery rather than on the event row. Second, `Duration::whole_minutes()` is still
+unstable on this toolchain (`E0658`), and the first version of the helper used it.
+
+**The `lockout_minutes` field rounds up, and the test that pins it had to be rewritten.** A
+countdown floored to minutes reports a 90-second lock as `1` and a 30-second lock as `0`, so a
+subscriber reads "this lockout has no duration" for a lockout it can plainly not sign in through.
+Round-up is the honest direction, and it never goes negative — a plain difference of two instants
+*is* negative when the lock expires between the row read and the write, because those are not in
+one transaction. The first version of the unit test computed `now + 60s` and let the helper read
+its own clock: 59.999 seconds, expected 60, failed `left: 1, right: 2`. That is the same defect
+class as a walk asserting its own counter instead of the row it produced, so the arithmetic was
+split into `lockout_minutes_between(now, until)` and the tests pass a fixed instant.
+
+**Proven to fail before believed.** With `if newly_locked` replaced by `if true`, the
+exactly-once assertion reads **`left: 4, right: 1`** — three extra guesses against an
+already-locked account, three extra events. A test that has only ever been seen pass is a test
+nobody knows the direction of.
+
+Proof this tick: `cargo build -p omnion-api` clean · `cargo test -p omnion-api --lib`
+**261 passed, 0 failed** · `omnion-identity` **49**, `omnion-events` **113**, `omnion-security`
+**137**, all 0 failed · `cargo test --test auth` **8/8** (26.9 s, live PostgreSQL) ·
+`every_live_name_has_an_emitter` + `every_emitted_name_is_in_the_catalogue` **2/2** ·
+`tsc --noEmit` exit 0 · `cargo test --test security` 4/4 re-run on a private
+`CARGO_TARGET_DIR` after a sibling deleted the shared `target/`.
+
+**Two environment facts worth not rediscovering.** The `omnion` development database is stale —
+`Migration(VersionMissing(19))` fails **all eight** tests in `tests/auth.rs` identically,
+including six that predate this change, which reads as "sign-in is broken" and is a database that
+has not been migrated. And `failed to create query cache … No such file or directory (os error
+2)` is a sibling worktree deleting `target/` mid-build, not a compile error.
+
+Next: slice 3's remaining work is the one this tick made visible — make `crates/identity`'s
+`register_failure` read the **security centre's** lockout document, so the tuned number is the
+enforced number. Then REQ-012's browser pass (still owed, box permitting) for the boxes that name
+a screen.
+
+
+## Tick 93 — REQ-012 slice 3: the enforced threshold is now the tuned threshold
+
+**What.** Slice 3's remaining work, done. `omnion_security::enforce::resolve` is the single
+implementation of "how many failures lock an account" (`3761c541`), `register_failure` reads it and
+honours the failure **window** from the sign-in log rather than a monotonic counter (`171c7998`),
+the walk that tells the two implementations apart ships (`789e388c`), and the per-test peer address
+is fixed at its root (`83d47951`). Four atomic commits, pushed.
+
+**The defect, stated once.** `/security/sign-in-protection` writes `security_settings.lockout` and
+the sign-in path locked from `security_policies.lockout_attempts` — a different table, from a
+different migration, with a different default. Four of the six fields an operator could tune had no
+reader on the request path at all. Every screen, the tester and the probe agreed with each other and
+all of them described something inert.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-identity -p omnion-security --lib` | 114 + 139 passed |
+| `cargo test -p omnion-api --lib` | 261 passed |
+| `cargo test -p omnion-events --lib` | 49 passed |
+| `cargo test -p omnion-permissions --lib` | 63 passed |
+| `cargo test -p omnion-api --test security` | 5 passed (42.7s) |
+| `cargo test -p omnion-api --test auth` | 8 passed (15.6s) |
+| `pnpm typecheck` | exit 0 |
+
+**Proven to fail.** `the_threshold_on_the_screen_is_the_threshold_that_locks` reverts to the legacy
+read and reads `left: Some(10), right: Some(3)`; green again with the fix. Two walks, two
+numbers — the only way to tell them apart.
+
+**The regression this tick nearly shipped backwards, and the trap in it.** Enforcing the document's
+default of 5 (against the IAM column's 10) turned **three unrelated auth walks** red with
+`address_blocked`. Diagnosis, in order, because the first two answers were both wrong:
+
+1. The stale `omnion` development database (real: `VersionMissing(19)` fails all eight auth tests
+   identically — but it accounted for 3 of 6 failures, not all of them).
+2. My new walk polluting its neighbours (wrong: it does not; isolating its peer address changed
+   nothing).
+3. The actual cause — the address rule keys on the **IP** and ignores the port, so
+   `tests/auth.rs::test_peer` varied only the port and every walk in the file shared one
+   `127.0.0.1` budget of `attempts × 3`. At 10 that budget was 30 failures and no walk reached it;
+   at 5 it is 15 and three walks tripped over each other. `attempts: 10` hardcoded was verified to
+   restore 8/8, which is what made the diagnosis certain rather than plausible.
+
+The lesson is the one worth keeping: the tempting repair is to put the 10 back, which makes the
+tests green and the screen a lie again. The harness was wrong, not the product.
+
+**Next.** REQ-012's browser pass is still owed for the boxes that name a screen
+(`/security`, `/security/events`, the locked-accounts table and its unlock). Slices 4 and 5 follow.
+**Browser pass deliberately not started this tick (recorded, not skipped silently).** Tick 93 is
+not a REQ-close tick, and the box this tick proved is a backend walk rather than a screen box. The
+slot was free — the holder PID is dead, so the place file is stale — but the box was not: load 7.15
+on 6 cores, swap 23.5G of 32G used, 35 Chrome processes and two sibling passes (w5, w8) mid
+walkthrough. A third browser pass into that is the documented 29-September failure (consecutive
+passes OOM-killing each other), and killing a sibling's pass to make room for mine trades one
+loop's evidence for another's. The boxes that name a screen stay unticked until a tick finds the
+box idle, which is the same condition `run.sh`'s own `flock` was added to protect.
+
+
+## Tick 94 — REQ-012 slice 4: a denied CIDR is refused, and the screen that was always linked
+
+**What.** Slice 4's IP-access half, done: the rules, the table, the evaluator, the request-path
+layer, the four routes and `/security/ip-access`. Six atomic commits, pushed. The events screen
+and the secret inventory are slice 4's other two thirds and are **not** started.
+
+**The defect this closes, stated once.** `/security/ip-access` has been linked from the posture
+overview's IP-allow-list row since the check registry was written — a link to a route that did not
+exist. And once the routes did exist, nothing read them: an operator could deny `203.0.113.0/24`,
+watch the row appear, and go on being served from it. The criterion is worded *"a denied CIDR
+cannot reach the API"*, which asks for a **refusal**, not a configuration.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-security --lib` | 159 passed (was 137) |
+| `cargo test -p omnion-api --lib` | 269 passed (was 261) |
+| `cargo test -p omnion-api --test security -- --test-threads=1` | 7 passed (42.1 s) |
+| `cargo test -p omnion-api --test migration_gap` | 4 passed, fresh database |
+| `tsc --noEmit` (apps/admin) | exit 0 |
+
+**Proven to fail before it was believed.** Removing the layer application from the router turns
+`a_denied_network_cannot_reach_the_api` red naming the criterion. **The failure payload is the
+best argument in this entry**: with the layer gone, the same response carried
+`{"key":"ip_rules","state":"pass","detail":{"fact":1,"summary":"1 IP access rules are configured"}}`
+— the screen reporting the access list as healthy while the platform served the very network it
+described. Screen and platform disagreeing inside one payload is the ninth instance of this REQ's
+defect class, and it is why the walk drives the **router** rather than the crate.
+
+**Three decisions worth keeping.**
+
+1. **A request with no address is refused, not waved through.** With rules in force it answers
+   `403 ip_unknown`. That is what makes the criterion a claim about the platform: if every
+   in-process request were allowed for want of an address, the walk that proves a CIDR is refused
+   would pass for the wrong reason. The harnesses opt in through a named env var, off by default.
+2. **A rule that blocks the caller is warned about, not refused** — `blocks_you` comes from the
+   server because only the server knows the address the request came from, and the rule is saved
+   either way. Locking yourself out of one route is legitimate; refusing it would only teach the
+   operator which input avoids the check.
+3. **The host-bit CIDR is refused, and the message names the network meant.** `ipnet` accepts
+   `10.0.0.1/8` and answers `contains()` correctly; **Postgres's `cidr` column refuses the same
+   value** with "bits set to right of mask". A range-check-only parser would have accepted it and
+   turned a typo into a `500` from inside the database, and canonicalising it would have silently
+   widened a rule that reads like one address to sixteen million.
+
+**A trap the walk found in itself, and one it found in the product.** The self-lockout walk
+deadlocked on its first draft: its cleanup `DELETE` came from the address it had just blocked, and
+the layer refused it before the route was reached — **once a deny covers your own address you
+cannot delete that rule from the panel.** The walk now uses a third address, and the comment names
+the escape the REQ's own risk note asks for. The *assertion* that was wrong is the other half: it
+expected a `DELETE` to succeed from an already-blocked address, which is a statement about
+nothing; correcting it is what exposed the trap.
+
+**Browser pass deliberately not started (recorded, not skipped silently).** Load 8–25 across the
+tick, two to three sibling walkthroughs at any moment, 45–46 Chrome processes, 0 GB free RAM, and
+the one-pass-per-box slot held live by `omnion-w3` for its whole duration. A fourth pass into that
+is the documented 29-September OOM failure. The boxes that name a screen stay unticked — that now
+includes `/security/ip-access`, whose walkthrough entry is written and registered in both the
+desktop and the mobile pass, and which will be visited the first time the box is idle.
+
+**Next.** The browser pass owed for slices 1–4, then slice 4's remaining two thirds: the
+security-event view over the audit trail and the secret-inventory projection.
+
+## Tick 95 — the secret inventory, and the box that could have leaked a credential
+
+**REQ-012 slice 4, third piece.** Two ships this tick: the security-event view (finished by the
+previous tick and committed here) and the secret inventory, which is the REQ's one
+**release-blocker** box.
+
+**What shipped.** `crates/security/src/{secrets,secrets_store}.rs`, `GET /security/secrets`
+(read-only, `security.read`), `features/security/security-secrets.tsx`, the tab, the walkthrough
+entry. Plus the events view's four commits, which the previous tick left uncommitted in the tree.
+
+**The requirement reads as a request for a secrets table, and there is no secrets table.** This is
+a projection over references, and its entire value is being the one screen in the security centre
+from which no secret can be read. So the guarantee is structural rather than a comment:
+
+- `SecretRef` has no `value`/`ciphertext`/`hash`/`preview` field — adding one would make the
+  struct able to carry a credential, and that ability *is* the risk.
+- There is **no `healthy` state and no `present` one**. The platform can see that a reference
+  exists and can read nothing about the value behind it. The first draft carried a `Present`
+  variant no row produced, which would have let a future contributor render "present = fine"; it
+  was removed and the test rewritten to pin the whole vocabulary.
+- The store selects explicit columns, **never `*`** — `*` re-reads a source's schema, so a source
+  gaining a value column upstream would start appearing in a security screen with no code change
+  here. The three sources holding material are read as **counts**.
+
+**Proof (commands and results).**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-security --quiet` | **208 passed**, 0 failed (18 new) |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **9/10**, the 10th a `dispose()` teardown flake (`UnexpectedEof`) that passes in isolation — a harness fault, not an assertion |
+| types | `pnpm typecheck` | **0 errors** (admin + web) |
+
+The containment walk is `no_secret_value_reaches_the_inventory_response`. It **probes the values,
+not the column names** — a name scan would pass an aliased column or a value inlined into a note,
+while a literal scan only fails when the actual leak happens. It seeds a webhook secret, a
+service-account hash and a TOTP ciphertext into a live database and asserts all three literals are
+absent from the response **while the reference name is present**. The positives matter as much: an
+empty body satisfies every containment check in the test while showing an operator a blank screen.
+
+**Three defects this tick, and the two that were not the code.**
+
+1. **A real one, found by the walk on its first run:** `column reference "expires_at" is
+   ambiguous` — `service_account_keys` and `service_accounts` both carry that column. The query
+   read correctly in review and answered `500` on *every* inventory load. **The tenth instance of
+   this REQ's defect class**, and the argument for why a walk drives the router rather than reading
+   the SQL.
+2. **A harness fault, twice:** the walk built its own `Bearer` header when the test credential is a
+   packed `session\x1fcsrf` pair, so the request failed at header parsing instead of at the route
+   — which reads as a product defect and is not one. `the_inventory_cannot_be_written_through`
+   now goes through the shared `request()` helper.
+3. **The blocker was the linker, not the code.** The first run died in `collect2` with
+   `ld terminated with signal 7 [Bus error]`. `/mnt/apopic` was at **100% (193 MiB free)** with
+   load 13–27 and 30/32 GiB RAM used. Reclaiming **only this worktree's** `target/debug/incremental`
+   (795 MiB) and then grouping `target/debug/deps` by `lib<crate>-<16 hex>` and keeping only the
+   newest of each (835 stale artifacts, 2 691 MiB) returned the disk to 95% and the suite to
+   green in one run. **Rule worth keeping: a linker bus error on this box is a disk symptom until
+   proven otherwise, and the reclaim must be scoped by `readlink /proc/<pid>/cwd`** — a sibling
+   writer had live cargo in `omnion-w6`.
+
+**One decision worth carrying forward.** `unverifiable` is rendered **neutral**, not amber.
+Almost every row on this screen is unverifiable, because that is the honest state for almost every
+secret; painting it amber would paint the whole screen amber and train the operator to ignore the
+tone. Only `missing` and `expired` are coloured, because only those are actionable.
+
+**Browser pass: still owed, and it is now a standing risk rather than bad luck.** Two consecutive
+ticks recorded a deferral for the same reason. This tick the slot was held by `w4`
+(`pid 1689806`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` **and** `/proc/<pid>/cwd`, not
+by the age of the placeholder), load 12.9, 45 Chrome processes. **Six screen boxes in this REQ now
+turn on a pass that has not run**, and the definition of done forbids closing a REQ on tests alone.
+
+**Next:** slice 4's last piece — the `security.finding.opened` webhook — then the browser pass on
+a free slot.

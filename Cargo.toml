@@ -72,6 +72,12 @@ percent-encoding = "2"
 bytes = "1"
 url = "2"
 
+# IP access rules (REQ-012 slice 4): matching an address against a CIDR is a range comparison,
+# and both families plus the prefix arithmetic are the easy part to get subtly wrong. `ipnet`
+# is already in the lockfile as a transitive dependency of `axum`'s client stack, so pinning it
+# here costs the workspace nothing to resolve.
+ipnet = "2.12"
+
 # The `omnion` command line (tools/cli) reads the first-run password without echoing it.
 rpassword = "7"
 
