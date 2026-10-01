@@ -1,6 +1,6 @@
 # REQ-019 — Headless CMS
 
-> **Status:** in-progress (slice 3 is **COMPLETE** — `b6e753ed` + `1319b675` + `7400f3ee` built the
+> **Status:** in-progress (tick 53 — criterion 16 CLOSED, and it was not closed when this tick read the code: two of its three cases named the WRONG field. `validate_scopes` and `validate_origins` answered `ContentError::InvalidText`, which `map_token_error` maps to `details.field == "name"` — so an unknown scope and a wildcard origin each answered `{"field":"name"}` for input typed into the scope list and the origins box (`35de796e`). The criterion's own premise was broken, not just unmet: `map_token_error` carries a comment saying "the create dialog highlights the field the error names", and `CreateTokenForm` was catching `ApiError` and handing over only `.message`, so the field arrived nowhere and the comment described a dialog that did not exist (`9befc1a6`). This is the THIRD and FOURTH instance of the `InvalidRateTier` mistake — the variant that ended it predates these two callers, so fixing the rate tier left the same hole open next door. **The test that could not have caught it is the lesson:** `each_bad_field_is_refused_with_its_own_message` already covered all three cases and passed, because it asserted status and *sometimes* a field; a test that checks "a field is named" is blind to a field named wrongly. The replacement asserts the full table AND that no two mistakes share a field, and is verified to fail against the old validators. Gates: content-api tokens 12/12, `omnion-content --lib` 314/0, `pnpm typecheck` exit 0 (14 pkgs). Criteria 9, 17 and 18 stay open — 9 and 17 are browser measurements and 18 is the walkthrough; no pass ran this tick, the slot is held live by w4 (holder 1689806) with 3 GB RAM available and 45 chrome processes, and on this box that is the cliff that took the shared Postgres down on 29 September. PREVIOUS: tick 52 closed the merge that main's security-events slice opened, its conflict resolved as a verified union.)
 > Explorer, the last half, and the two criteria it exists for are ticked. **The Explorer
 > DISPATCHES rather than proxies**, and that is forced by a fact about this product rather than
 > chosen: a token's plaintext is shown once and stored as a digest, so no value exists anywhere
@@ -299,8 +299,23 @@ Migration `0014_content_api_tokens.sql` (number is a placeholder — renumber to
   **Two things this criterion forced into the API, both of which existed only as panel-side arithmetic:** the endpoint leaderboard (accumulated server-side in the same pass as the
   per-token rows, over the same live window, so the two numbers one screen apart cannot disagree) and `last_used_at` per token (the table cannot answer "is this token doing anything"
   without it). **Measured by `qa-sql` + the walk, pending the `--only=content-api` pass.**
-- [ ] `POST /api/v1/content-api/tokens` with an invalid origin, an empty scope list or a duplicate name each fail with a field-level message and a named error
-  code.
+- [x] `POST /api/v1/content-api/tokens` with an invalid origin, an empty scope list or a duplicate name each fail with a field-level message and a named error
+  code. **Proven by `every_refused_field_is_named_and_they_are_all_different` (`apps/api/tests/content_api_tokens.rs`,
+  12/12), and the criterion was NOT met when this tick read the code: two of the three cases named
+  the WRONG field.** `validate_scopes` and `validate_origins` both answered `ContentError::InvalidText`,
+  which `map_token_error` maps to `details.field == "name"`, so an unknown scope and a wildcard
+  origin each answered `{"code":"invalid_parameter","details":{"field":"name"}}` for values typed
+  into the scope list and the origins box — the third and fourth instance of the mistake
+  `InvalidRateTier` had already been split out to stop, in a variant that predates it. The create
+  form highlights the field the error names, so the operator edits the token's name, the dialog
+  saves, and the origin is still wrong. Both validators now raise their own variants and the API
+  maps them to `scopes` / `allowed_origins` (`35de796e`), and the form actually consumes the field
+  it is sent rather than discarding it (`9befc1a6`). The new test asserts the whole contract as a
+  table AND that no two mistakes report on one field — a test that only checked "a field is named"
+  could not have seen a field named wrongly, which is why the defect survived the suite that
+  already covered these three cases. **Verified to fail first** against the old validators with
+  `unknown scope must be reported on \`scopes\` ... {"field":"name"}`. `pnpm typecheck` exit 0
+  across 14 packages.
 - [ ] An anonymous browser cannot read the token list (`401`), and a role without `content.api.read` sees no Tokens tab.
 - [ ] The QA walkthrough covers `/content-api`, `/content-api/explorer`, `/content-api/docs` and `/content-api/usage` with zero high findings.
 

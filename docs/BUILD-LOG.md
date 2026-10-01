@@ -10278,3 +10278,57 @@ in its own harness.
 **Next.** `--only=block-editor` at the first tick that finds the slot free **and** RAM above the
 cliff — not merely the volume with room, since on this box RAM is the binding constraint first.
 Then `--only=members` for criterion 18, then REQ-019's content-api criterion.
+
+## 2026-10-01 · tick 53 — the criterion that was satisfied on paper and named the wrong field twice
+
+**What.** `origin/main` had moved five commits (the `/security/events` slice), so the tick opened
+by merging it: one conflict, the `mobileRoutes` line both writers edit, resolved as a union and
+verified **per-parent by containment** rather than by line count — 85 functions, 31 `--only` keys
+and 71 route entries present from either side, 0 missing (`c6d51cd1`). The BUILD-LOG was already
+spliced by git, and its 148 + 95 entries were checked with the same shape (0 lost from each parent).
+
+Then REQ-019 criterion 16: *an invalid origin, an empty scope list or a duplicate name each fail
+with a field-level message and a named error code.* The suite already had a test for it. It passed,
+and **two of the three cases pointed at the wrong control.**
+
+`validate_scopes` and `validate_origins` both answered `ContentError::InvalidText`, which
+`map_token_error` maps to `details.field == "name"`. Proven against the running API before any
+change:
+
+```text
+P empty-scope:   400 {"code":"invalid_parameter","details":{"field":"scopes"}}
+P bad-origin:    400 {"code":"invalid_parameter","details":{"field":"name"}}    ← the bug
+P unknown-scope: 400 {"code":"invalid_parameter","details":{"field":"name"}}    ← the bug
+P dup-name:      409 {"code":"name_taken","details":{"field":"name"}}
+```
+
+`InvalidRateTier` already exists as its own variant for precisely this reason, and its doc comment
+records the same loop: *"a field-level message pointing at the wrong field is worse than no field at
+all, because it sends someone to fix something that was never broken."* Fixing the tier left the
+identical hole two doors down, in a variant that predates it. So this is the **third and fourth**
+instance, not a new class — and the reason the pattern is now enforced rather than remembered.
+
+**And the panel never used the answer.** `map_token_error` carries a comment saying *"the create
+dialog highlights the field the error names"*, and `CreateTokenForm` was catching `ApiError` and
+handing `onError` only `.message`. The field arrived nowhere. The comment described a dialog that
+did not exist, which is why reading the code rather than the comments mattered here.
+
+**Proof.**
+- `every_refused_field_is_named_and_they_are_all_different` asserts the whole contract as a table
+  AND that no two mistakes report on one field. **Verified to fail first** against the old
+  validators: `unknown scope must be reported on \`scopes\` ... {"field":"name"}`.
+- `content-api tokens` **12/12**, `omnion-content --lib` **314/0**, `pnpm typecheck` **exit 0**
+  across 14 packages.
+- Both halves committed separately: `35de796e` (server) and `9befc1a6` (the form marks the control
+  with `data-offender` / `aria-invalid` and prints a specific note under the origins box).
+
+**Why the existing test passed.** `each_bad_field_is_refused_with_its_own_message` asserted status
+and *sometimes* a field. **A test that checks "a field is named" is blind to a field named wrongly** —
+the defect lived in the field's VALUE, and nothing read the value. The replacement reads the table.
+
+**Next.** Criteria 9 and 17 are browser measurements and 18 is the walkthrough; none ran. The slot
+is held live by w4 (holder 1689806, `/mnt/apopic/omnion-w4`), the box has 3 GB RAM available and 45
+chrome processes, and `/mnt/apopic` had to be reclaimed mid-tick (100% full, `write_file` answering
+`No space left on device`) — reclaiming this worktree's own `incremental` (2.1G) and nothing else.
+`--only=content-api` at the first tick that finds the slot free and RAM above the cliff, then
+REQ-063's criterion 17 (`--only=block-editor`).
