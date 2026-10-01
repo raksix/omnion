@@ -20,6 +20,16 @@
 //! A claim for a *delayed* message is not a send at all — it reserves the slot and names the
 //! instant the message becomes due, so a lead answered after the delay is not answered twice
 //! and a lead answered before it is not answered at all.
+//!
+//! **A reservation is either completed or released; nothing else ends it.** Both directions
+//! matter and the second one is the easy half to omit. `mark_sent` completes the row once the
+//! mailer returns, and `release_claim` hands it back when the send fails — a reservation left
+//! standing is a lead the sweep keeps *offering*, so every way the sweep can decline one has to
+//! release it. Declining without releasing is not a quiet no-op: the claim still satisfies the
+//! sweep's own WHERE clause (`sent = 'false'` and a `due_at` in the past), so the same
+//! reservation is re-declined and re-noted on every tick, for ever. That was the defect this
+//! file now carries two tests for — one per decline path, because the two are separate arms and
+//! fixing one while leaving the other is how a branch keeps the same bug in a new place.
 
 use serde_json::Value;
 use sqlx::PgPool;
@@ -431,12 +441,30 @@ pub async fn due_reservations(
         // to them. Re-rendering costs one thing — a template edited inside the delay sends
         // the new wording — and buys the other: a source that was *switched off* inside the
         // delay stops answering, which is what an operator who turned it off asked for.
+        // The recipient the claim was taken for. A release is only allowed to remove *that*
+        // claim — the same rule `release_claim` itself enforces, read here so both decline
+        // paths below cannot disagree about whose row they are giving back.
+        let claimed_to = detail
+            .get("to")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
         let autoresponder = Autoresponder::from_json(&source.autoresponder);
         if !autoresponder.is_configured() {
             tracing::info!(
                 lead_id = %lead_id,
                 "a reserved autoresponder's source is no longer configured — not sending"
             );
+            // **Released, not merely noted.** This arm used to record the skip and `continue`,
+            // which left the claim standing exactly as the sweep found it: `sent: false` with a
+            // `due_at` in the past, which is precisely this sweep's own WHERE clause. The
+            // reservation was therefore offered again on the next tick, declined again on the
+            // same grounds and noted again — once a minute, for ever, on a source its operator
+            // switched off. The note is still written: it is the trail line that says *why*
+            // nothing went out, which is a different fact from whether the claim survives. The
+            // order matters — the note first, because `release_claim` deletes the claim row and
+            // a note written afterwards would outlive it while the release did not.
             record_skip(
                 pool,
                 &lead,
@@ -445,6 +473,7 @@ pub async fn due_reservations(
                 serde_json::json!({ "reserved_at": detail.get("due_at").cloned().unwrap_or(Value::Null) }),
             )
             .await?;
+            release_claim(pool, lead_id, &claimed_to).await?;
             continue;
         }
         let context = Recipient {
@@ -461,22 +490,33 @@ pub async fn due_reservations(
         let message = match autoresponder.deliver(&context, now, false) {
             Delivery::Ready(message) => message,
             other => {
-                // The lead was rejected or turned to spam inside the delay. The reservation
-                // is released rather than left pending, so the trail stops promising a mail
-                // that will never be justified to answer.
-                if matches!(other, Delivery::AlreadySent) {
-                    release_claim(pool, lead_id, detail.get("to").and_then(Value::as_str).unwrap_or_default())
-                        .await?;
-                } else {
-                    record_skip(
-                        pool,
-                        &lead,
-                        &source,
-                        other.reason(),
-                        serde_json::json!({ "reserved": true }),
-                    )
-                    .await?;
-                }
+                // The lead was rejected, turned to spam, or lost its address inside the delay.
+                //
+                // **Every decline releases the reservation — and the two this arm used to
+                // separate are now one, because one of them was unreachable.** `AlreadySent`
+                // was the only variant that released, and `deliver` is called below with
+                // `already_sent` hardcoded `false`, so that variant could not be produced here
+                // at all: the branch was a comment with an arm on it. Every decline a sweep can
+                // actually make therefore fell to the `else`, which wrote a note and left the
+                // claim row standing — `sent: false`, `due_at` in the past, which is precisely
+                // this sweep's own WHERE clause. So the same reservation was offered again next
+                // tick, declined again on the same grounds and noted again: one trail line per
+                // minute, for ever, for a lead nobody is ever going to answer.
+                //
+                // The note stays and the release joins it. They are different facts — the note is
+                // *why* nothing went out, the release is *that nothing is still owed* — and a
+                // trail line alone answers only the first. The note is written first because
+                // `release_claim` deletes the claim row; a note written after would describe a
+                // reservation that is already gone.
+                record_skip(
+                    pool,
+                    &lead,
+                    &source,
+                    other.reason(),
+                    serde_json::json!({ "reserved": true }),
+                )
+                .await?;
+                release_claim(pool, lead_id, &claimed_to).await?;
                 continue;
             }
         };
