@@ -170,7 +170,7 @@ pub async fn list_tokens(
     State(state): State<AppState>,
     current: CurrentSession,
 ) -> Result<Json<Vec<TokenBody>>, ApiError> {
-    let tokens = api_tokens::list_tokens(state.db().pool(), organization_of(&current)).await?;
+    let tokens = api_tokens::list_tokens(state.db().pool(), organization_of(&current)?).await?;
     let mut bodies = Vec::with_capacity(tokens.len());
     for token in &tokens {
         bodies.push(token_body(&state, token).await?);
@@ -320,7 +320,7 @@ pub async fn create_token(
     let now = OffsetDateTime::now_utc();
     let created = api_tokens::create_token(
         state.db().pool(),
-        organization_of(&current),
+        organization_of(&current)?,
         body.site_id,
         &body.name,
         &body.scopes,
@@ -335,7 +335,7 @@ pub async fn create_token(
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "content.api.token.create")
-            .organization(organization_of(&current))
+            .organization(organization_of(&current)?)
             .target("api_token", created.token.id)
             .metadata(json!({
                 "name": created.token.name,
@@ -375,7 +375,7 @@ pub async fn update_token(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateTokenRequest>,
 ) -> Result<Json<TokenBody>, ApiError> {
-    let existing = api_tokens::get_token(state.db().pool(), organization_of(&current), id)
+    let existing = api_tokens::get_token(state.db().pool(), organization_of(&current)?, id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such token"))?;
     if let Some(site_id) = existing.site_id {
@@ -390,7 +390,7 @@ pub async fn update_token(
             .expires_in_days
             .map(|days| api_tokens::expiry_from_preset(days, OffsetDateTime::now_utc())),
     };
-    let updated = api_tokens::update_token(state.db().pool(), organization_of(&current), id, &changes)
+    let updated = api_tokens::update_token(state.db().pool(), organization_of(&current)?, id, &changes)
         .await
         .map_err(map_token_error)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such token"))?;
@@ -398,7 +398,7 @@ pub async fn update_token(
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "content.api.token.update")
-            .organization(organization_of(&current))
+            .organization(organization_of(&current)?)
             .target("api_token", id)
             .metadata(json!({ "scopes": updated.scopes })),
     )
@@ -414,7 +414,7 @@ pub async fn rotate_token(
 ) -> Result<Json<CreatedTokenBody>, ApiError> {
     // Scoped read first: rotation is a manage action, and a rotation of somebody else's token
     // would be a way to break a third party's integration while the row stays visible.
-    let existing = api_tokens::get_token(state.db().pool(), organization_of(&current), id)
+    let existing = api_tokens::get_token(state.db().pool(), organization_of(&current)?, id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such token"))?;
     if existing.revoked_at.is_some() {
@@ -431,7 +431,7 @@ pub async fn rotate_token(
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "content.api.token.rotate")
-            .organization(organization_of(&current))
+            .organization(organization_of(&current)?)
             .target("api_token", id)
             .metadata(json!({ "prefix": rotated.prefix })),
     )
@@ -456,14 +456,14 @@ pub async fn revoke_token(
     current: CurrentSession,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let revoked = api_tokens::revoke_token(state.db().pool(), organization_of(&current), id).await?;
+    let revoked = api_tokens::revoke_token(state.db().pool(), organization_of(&current)?, id).await?;
     if !revoked {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such token"));
     }
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "content.api.token.revoke")
-            .organization(organization_of(&current))
+            .organization(organization_of(&current)?)
             .target("api_token", id)
             .metadata(json!({})),
     )
@@ -487,11 +487,27 @@ pub async fn revoke_token(
 /// an account without one has nothing this surface can answer — a `403` that explains itself
 /// rather than a null that silently produces an empty list. The empty list is the answer that
 /// looks like "you have no tokens" when the truth is "this account is not a tenant".
-pub fn organization_of(current: &CurrentSession) -> Uuid {
-    current
-        .user
-        .organization_id
-        .expect("an organization account is required by the content API surface")
+///
+/// **This used to `expect()` and it was the single worst defect this REQ produced.** A `CurrentSession`
+/// without an `organization_id` — which is what the QA owner account *is*, because the seed makes it a
+/// primary account before onboarding runs — unwound the worker thread and dropped the connection with no
+/// response at all: `curl` reported `000`, not a status, and the panel rendered "The API answered with
+/// status 500" for a request that was never answered. The doc comment above already described the right
+/// behaviour, so the code contradicted the sentence written to describe it.
+///
+/// Two reasons the panic looked like a 500 rather than a panic: axum's tower layer turns a worker panic
+/// into a dropped connection, and the panel's own error wrapper fills in a status for one. A defect that
+/// needs two layers of translation to become a lie is a defect that survives every test that only reads
+/// status codes — which is every test here.
+pub fn organization_of(current: &CurrentSession) -> Result<Uuid, ApiError> {
+    current.user.organization_id.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "no_organization",
+            "This account is not attached to an organization yet. Content API tokens belong to one, \
+             so there is nothing to list until onboarding finishes.",
+        )
+    })
 }
 
 /// Resolve a site and refuse it when it belongs to somebody else.
@@ -640,4 +656,80 @@ pub fn auth_failure_response(failure: &AuthFailure) -> ApiError {
         AuthFailure::StoreUnavailable { .. } => unreachable!("handled before this match"),
     };
     ApiError::new(StatusCode::UNAUTHORIZED, failure.code(), message)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use omnion_identity::sessions::Session;
+    use omnion_identity::users::User;
+
+    /// A session whose account is **not** attached to an organization — the QA owner account, and
+    /// any platform-level account, is exactly this.
+    fn platform_account() -> CurrentSession {
+        CurrentSession {
+            user: User {
+                id: Uuid::from_u128(7),
+                organization_id: None,
+                email: "owner@example.test".to_owned(),
+                display_name: "Owner".to_owned(),
+                status: "active".to_owned(),
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+            session: Session {
+                id: Uuid::from_u128(8),
+                user_id: Uuid::from_u128(7),
+                created_at: time::OffsetDateTime::now_utc(),
+                expires_at: time::OffsetDateTime::now_utc(),
+                last_seen_at: None,
+                absolute_expires_at: None,
+                device_id: None,
+                auth_methods: vec!["password".to_owned()],
+                revoked_at: None,
+                revoke_reason: None,
+                step_up_at: None,
+            },
+            token: "t".to_owned(),
+        }
+    }
+
+    /// The panic this replaced cost a full QA pass and looked like a `500` in the panel.
+    ///
+    /// The assertion is on the *error*, not on "does not panic": a function that returned a
+    /// `Default` would also not panic, and an empty token list is the answer this doc comment
+    /// calls out as the lie — it reads as "you have no tokens" when the truth is "you are not a
+    /// tenant". So the test pins the status, the code, and the word that tells an operator what
+    /// to do about it.
+    #[test]
+    fn an_account_without_an_organization_is_refused_with_a_code_that_says_why() {
+        let error = organization_of(&platform_account()).expect_err("must refuse, not unwrap");
+        assert_eq!(
+            error.status(),
+            StatusCode::FORBIDDEN,
+            "a platform account is not authorized for a tenant-scoped surface"
+        );
+        assert_eq!(
+            error.code(),
+            "no_organization",
+            "the code is what a client branches on; 'forbidden' alone sends an integrator \
+             looking for a permission they do not have"
+        );
+        assert!(
+            error.message().contains("organization"),
+            "the message must name the missing thing, got {:?}",
+            error.message()
+        );
+    }
+
+    /// A tenant account still resolves, or the refusal above would just be "always 403".
+    #[test]
+    fn a_tenant_account_still_resolves_to_its_organization() {
+        let mut session = platform_account();
+        let organization = Uuid::from_u128(9);
+        session.user.organization_id = Some(organization);
+        assert_eq!(
+            organization_of(&session).expect("a tenant account resolves"),
+            organization
+        );
+    }
 }

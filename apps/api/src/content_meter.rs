@@ -322,18 +322,119 @@ pub async fn flush(state: &AppState) -> omnion_content::api_token_usage::FlushRe
         return omnion_content::api_token_usage::FlushReport::default();
     }
 
+    let live: std::collections::BTreeSet<Uuid> = buckets
+        .iter()
+        .map(|bucket| bucket.token_id)
+        .collect();
+    // Key set per token, so the survivor filter below can drop a dead token's keys without
+    // rebuilding each key from a `Bucket` (which does not carry the Redis spelling — only the
+    // `BucketKey` the counter was written under does).
+    let key_of: Vec<(Uuid, String)> = buckets
+        .iter()
+        .zip(keys.iter())
+        .map(|(bucket, key)| (bucket.token_id, key.clone()))
+        .collect();
+
     match omnion_content::api_token_usage::record_window(state.db().pool(), &buckets).await {
         Ok(report) => {
             clear(redis, &keys).await;
             report
         }
         Err(error) => {
+            // **A foreign-key violation is not a transient failure, and treating it as one is a
+            // denial of service the platform inflicts on itself.** A token can be deleted (or an
+            // organization can be), which cascades its `api_token_usage_daily` rows away while its
+            // Redis counters survive for the retention. Every flush after that fails on the FK —
+            // once a minute, forever — and because `record_window` writes the buckets in sequence and
+            // returns on the first error, a token that is still *alive* never gets its rows written
+            // either. One deleted token stops metering for every token on the box.
+            //
+            // The fix has to be a `delete` rather than a skip: the counters belong to a row that no
+            // longer exists, and `on delete cascade` has already removed its history, so keeping the
+            // key only makes the next flush fail the same way.
+            let dead = dead_tokens(state.db().pool(), &live).await;
+            if !dead.is_empty() {
+                let dropped: std::collections::BTreeSet<String> = key_of
+                    .iter()
+                    .filter(|(token_id, _)| dead.contains(token_id))
+                    .map(|(_, key)| key.clone())
+                    .collect();
+                let survivors: Vec<omnion_content::api_token_usage::Bucket> = buckets
+                    .iter()
+                    .filter(|bucket| !dead.contains(&bucket.token_id))
+                    .cloned()
+                    .collect();
+                let survivors_keys: Vec<String> = key_of
+                    .iter()
+                    .filter(|(token_id, _)| !dead.contains(token_id))
+                    .map(|(_, key)| key.clone())
+                    .collect();
+                clear(redis, &dropped.into_iter().collect::<Vec<_>>()).await;
+                tracing::warn!(
+                    dead_tokens = dead.len(),
+                    "dropped content usage counters for tokens that no longer exist; Redis cannot \
+                     cascade a database delete, so the dead token's window is cleared here",
+                );
+                if survivors.is_empty() {
+                    return omnion_content::api_token_usage::FlushReport::default();
+                }
+                // The write may have failed for the dead token *only*. The survivors get their own
+                // attempt, and only *their* keys are cleared on success — clearing a key that was not
+                // written is what would lose a day.
+                return match omnion_content::api_token_usage::record_window(
+                    state.db().pool(),
+                    &survivors,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        clear(redis, &survivors_keys).await;
+                        report
+                    }
+                    Err(retry) => {
+                        // No clear, on purpose: the next tick re-reads the same window and adds it
+                        // again, so a transient database failure costs a duplicate-free retry
+                        // rather than a lost day.
+                        tracing::error!(
+                            error = %retry,
+                            "the content usage flush failed; the window is kept"
+                        );
+                        omnion_content::api_token_usage::FlushReport::default()
+                    }
+                };
+            }
             // No clear, on purpose: the next tick re-reads the same window and adds it again, so a
             // transient database failure costs a duplicate-free retry rather than a lost day.
             tracing::error!(error = %error, "the content usage flush failed; the window is kept");
             omnion_content::api_token_usage::FlushReport::default()
         }
     }
+}
+
+/// The tokens in `live` that are no longer in `api_tokens`.
+///
+/// One `exists` query per token, and only on the error path. A `left join` over the whole table
+/// would answer the same question, but it would cost a full scan on **every** flush to protect
+/// against a case that only happens when a token has been deleted — the common case (every token
+/// alive) would pay for the rare one.
+///
+/// `true` on a query that itself fails: a database that cannot answer "does this token exist"
+/// is a database whose `record` already failed for a different reason, and reporting the token as
+/// dead here would **delete live counters** over a transient outage. Erring towards "keep the
+/// keys" is the only safe direction for a function whose output is a `DEL`.
+async fn dead_tokens(pool: &sqlx::PgPool, live: &std::collections::BTreeSet<Uuid>) -> std::collections::BTreeSet<Uuid> {
+    let mut dead = std::collections::BTreeSet::new();
+    for token_id in live {
+        let exists: bool = sqlx::query_scalar("select exists(select 1 from api_tokens where id = $1)")
+            .bind(token_id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(true);
+        if !exists {
+            dead.insert(*token_id);
+        }
+    }
+    dead
 }
 
 /// The limiter key one content token's budget lives under.

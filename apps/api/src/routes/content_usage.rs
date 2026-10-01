@@ -161,7 +161,7 @@ pub async fn usage(
     Query(query): Query<UsageQuery>,
     current: CurrentSession,
 ) -> Result<Json<UsageBody>, ApiError> {
-    let organization_id = organization_of(&current);
+    let organization_id = organization_of(&current)?;
     let days = query.days.unwrap_or(DEFAULT_WINDOW_DAYS).clamp(1, 365);
 
     let rows = api_token_usage::for_organization(state.db().pool(), organization_id, days)
