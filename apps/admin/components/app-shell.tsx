@@ -96,6 +96,12 @@ const NAV = [
   // says what happens to the ones that cannot. It is the screen an operator opens mid-incident, so
   // burying it in /settings would put the control furthest from the incident.
   { href: "/ai/settings/airgap", label: "Air gap", icon: LockKeyhole },
+  // The eval suites (REQ-107 slice 1). Beside the air gap rather than under settings: it is the
+  // screen an engineer opens when a model or prompt change is about to be promoted, and the
+  // question it answers — "does this still hold?" — is the same one the air-gap switch answers
+  // about locality. It is the only AI entry that measures the platform rather than configuring
+  // it, so it reads as the last of the AI group.
+  { href: "/ai/evals", label: "Agent evals", icon: ClipboardCheck },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

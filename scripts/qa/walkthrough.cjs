@@ -2609,6 +2609,368 @@ async function runAiLocalGuideDepth(page, report) {
  * measure a screen in an emergency state — the failure would surface as a dozen unrelated findings
  * in a report written by a different writer, and nobody would connect them to this pass.
  */
+/**
+ * The eval suites, driven (REQ-107, slice 1).
+ *
+ * The suite list is walked on its bare path (the empty state is what a fresh QA database has and
+ * the state most likely to render as a table that reads like "everything passes"), so this pass
+ * exists for the half the route walk cannot reach: the `[key]` screen, whose case editor and
+ * config form are the whole of slice 1's UI. There is no key to put in a route literal, so the
+ * suite is created through the API and the screen it produced is visited.
+ *
+ * What it asserts, and why each one is a place this slice could have lied:
+ *
+ * 1. **A suite with no cases says so on the row, in words.** The request's own risk note is that
+ *    "a suite of ten easy cases passes everything"; the inverse trap is a green row beside zero
+ *    cases. The badge must read `empty` and the sentence must be on the page, not in a tooltip —
+ *    a colour alone is unreadable to a colour-blind operator scanning a table.
+ * 2. **The case editor offers exactly the properties the scorer implements.** Counted from the
+ *    server's own `properties` list against the checkboxes on screen, so a property that is
+ *    authorable but unscorable cannot pass.
+ * 3. **A case that asserts nothing is refused, naming the field.** This is the acceptance row the
+ *    slice exists to satisfy, and the assertion is that the *field* is marked — a refusal with no
+ *    field on a ten-property form is a red form and no red box.
+ * 4. **The CSV import is partial and reports the line it refused.** Two good rows and one bad one:
+ *    the good ones must land and the bad one must be reported *by line number*. An import that
+ *    refused the whole file would be easy to build and would not satisfy the QA plan's
+ *    "reported by line".
+ * 5. **A `rubric` case on a blocking suite with no judge is refused naming the judge model** —
+ *    the combination rule, checked through the API the form posts to.
+ *
+ * Everything it creates is removed in a `finally`: a suite left behind makes the next pass in this
+ * run measure a populated list while its own assertions read about an empty one.
+ */
+async function runAiEvalsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-evals", action: "ai-evals", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    return false;
+  };
+
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  const suiteKey = `qa-evals-${Date.now().toString(36)}`;
+
+  try {
+    // --- a suite with no cases -----------------------------------------------------------
+    const listed = await callApi("GET", "/v1/ai/evals/suites");
+    expect(listed.status === 200, `the suite list should answer 200, saw ${listed.status}`);
+    const suiteCount = listed.body?.total ?? -1;
+    note({ step: "suite-list", status: listed.status, total: suiteCount });
+
+    const created = await callApi("POST", "/v1/ai/evals/suites", {
+      key: suiteKey,
+      name: "QA eval suite",
+      description: "Created by the walkthrough",
+      target: "model",
+      model_id: null,
+      threshold_percent: 90,
+      blocking: false,
+    });
+    expect(
+      created.status === 201 || created.status === 200,
+      `creating a suite should succeed, saw ${created.status}: ${JSON.stringify(created.body)}`,
+    );
+    const suiteId = created.body?.suite?.id ?? null;
+
+    await page
+      .goto(`${URL_ADMIN}/ai/evals`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    // The load-bearing assertion: a suite that measures nothing must not look healthy.
+    const emptyRow = await page.evaluate((key) => {
+      const rows = [...document.querySelectorAll("[data-eval-suite-row]")];
+      const row = rows.find((node) => (node.textContent || "").includes(key));
+      return {
+        rows: rows.length,
+        found: Boolean(row),
+        readiness: row?.querySelector("[data-eval-readiness]")?.getAttribute("data-eval-readiness") ?? null,
+        badge: (row?.querySelector("[data-eval-readiness]")?.textContent || "").trim(),
+        note: (row?.querySelector("[data-eval-readiness-note]")?.textContent || "").trim(),
+        // The run button is slice 2's. It must be present and disabled rather than a dead button
+        // that posts to a route which 404s.
+        runDisabled: Boolean(row?.querySelector("[data-eval-run-disabled]:disabled")),
+      };
+    }, suiteKey);
+    expect(emptyRow.found, "the suite the pass created is not on the list");
+    expect(
+      emptyRow.readiness === "empty",
+      `a suite with no cases must not read as ready, saw "${emptyRow.readiness}"`,
+    );
+    expect(
+      emptyRow.note.length > 0,
+      "the readiness sentence must be on the page, not only in a title attribute",
+    );
+    expect(
+      emptyRow.runDisabled,
+      "Run now is slice 2 and must be disabled with its reason, not a button that 404s",
+    );
+    note({ step: "empty-readiness", ...emptyRow });
+    await shot(page, "ai-evals-list-populated");
+
+    // --- the detail screen and its property checkboxes ------------------------------------
+    await page
+      .goto(`${URL_ADMIN}/ai/evals/${encodeURIComponent(suiteKey)}`, {
+        waitUntil: "domcontentloaded",
+      })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+
+    await page.locator("[data-eval-case-form], button:has-text('New case')").first().click().catch(() => {});
+    await page.waitForTimeout(800);
+
+    const editor = await page.evaluate(() => {
+      const form = document.querySelector("[data-eval-case-form]");
+      return {
+        open: Boolean(form),
+        checkboxes: form ? form.querySelectorAll('input[type="checkbox"]').length : 0,
+        propertyChips: form
+          ? [...form.querySelectorAll("code")].map((node) => node.textContent?.trim()).filter(Boolean)
+          : [],
+      };
+    });
+    expect(editor.open, "the case editor did not open");
+    // Two switches (Enabled, and the properties group is checkboxes) — the property count is
+    // asserted against the server's own list rather than a literal, so a property added to the
+    // scorer is a missing checkbox here and fails loudly.
+    const serverProperties = (await callApi("GET", `/v1/ai/evals/suites/${suiteKey}`))?.body
+      ?.properties?.length;
+    expect(
+      serverProperties > 0,
+      "the server must publish the property list the editor is built from",
+    );
+    if (editor.open) {
+      // `Enabled` is the one checkbox that is not a property, so the count is properties + 1.
+      expect(
+        editor.checkboxes === serverProperties + 1,
+        `the editor must offer every scorable property: ${editor.checkboxes} checkboxes for ${serverProperties} properties plus the Enabled switch`,
+      );
+    }
+    note({ step: "case-editor", serverProperties, ...editor });
+    await shot(page, "ai-evals-case-editor");
+
+    // --- a case that asserts nothing is refused, naming the field -------------------------
+    expectRefusal(
+      "/api/v1/ai/evals/suites",
+      "a case with no property is refused by the acceptance rule this slice exists for",
+    );
+    const noProperty = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/cases`, {
+      name: "asserts nothing",
+      input: "hello",
+      expected: {},
+    });
+    expect(
+      noProperty.status === 400,
+      `a case with no expected property must be refused, saw ${noProperty.status}: ${JSON.stringify(noProperty.body)}`,
+    );
+    const noPropertyField = noProperty.body?.error?.details?.field ?? null;
+    expect(
+      noPropertyField === "expected",
+      `the refusal must name the field the form marks, got ${JSON.stringify(noPropertyField)}`,
+    );
+    note({ step: "refuse-no-property", status: noProperty.status, field: noPropertyField });
+    endRefusalWindow("/api/v1/ai/evals/suites");
+
+    // --- a real case, then the rubric/blocking/judge rule ----------------------------------
+    const good = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/cases`, {
+      name: "greets by name",
+      input: "Greet Ada",
+      expected: { contains: "Ada" },
+      weight: 2.5,
+      tags: ["smoke", "qa"],
+    });
+    expect(
+      good.status === 201 || good.status === 200,
+      `a valid case should be created, saw ${good.status}: ${JSON.stringify(good.body)}`,
+    );
+    expect(
+      good.body?.case?.input?.prompt === "Greet Ada",
+      "a plain-text input must be normalized to `{prompt}` so both editors store the same shape",
+    );
+
+    const second = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/cases`, {
+      name: "second case",
+      input: "Greet Grace",
+      expected: { exact: "hello grace" },
+    });
+    expect(
+      second.status === 201 || second.status === 200,
+      `the second case should be created, saw ${second.status}`,
+    );
+
+    // The rule: a blocking suite holding a rubric case needs a judge. The suite is made blocking
+    // with no judge, and the refusal must name the judge model rather than the case.
+    await callApi("PATCH", `/v1/ai/evals/suites/${suiteKey}`, { blocking: true });
+    expectRefusal(
+      "/api/v1/ai/evals/suites",
+      "a rubric case on a blocking suite with no judge names the judge model",
+    );
+    const rubric = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/cases`, {
+      name: "needs a judge",
+      input: "Summarise this",
+      expected: { rubric: "The summary is accurate and short" },
+    });
+    expect(
+      rubric.status === 400,
+      `a rubric case on a blocking suite with no judge must be refused, saw ${rubric.status}: ${JSON.stringify(rubric.body)}`,
+    );
+    expect(
+      (rubric.body?.error?.details?.field ?? null) === "judge_model_id",
+      `the refusal must name the judge model field, got ${JSON.stringify(rubric.body?.error?.details)}`,
+    );
+    note({ step: "refuse-rubric-without-judge", status: rubric.status });
+    endRefusalWindow("/api/v1/ai/evals/suites");
+
+    // --- the CSV import is partial and reports its line ------------------------------------
+    const csv = [
+      "name,input,expected,weight,tags",
+      'imported one,Say hi,"{""exact"":""hi""}",1,imported',
+      "imported two,Say yo,\"{\"\"contains\"\":\"\"yo\"\"}\",1,imported",
+      // A row whose weight is not a number: refused, and the report must name this line.
+      "bad weight,Say nope,\"{\"\"exact\"\":\"\"nope\"\"}\",heavy,imported",
+    ].join("\n");
+    const imported = await callApi("POST", `/v1/ai/evals/suites/${suiteKey}/import`, { csv });
+    expect(
+      imported.status === 200 || imported.status === 201,
+      `the import should answer, saw ${imported.status}: ${JSON.stringify(imported.body)}`,
+    );
+    expect(
+      (imported.body?.imported?.length ?? 0) === 2,
+      `two valid rows must import even though a third is bad, got ${imported.body?.imported?.length}`,
+    );
+    const problems = imported.body?.problems ?? [];
+    expect(
+      problems.length === 1 && problems[0].line === 4,
+      `the bad row must be reported by its line number, got ${JSON.stringify(problems)}`,
+    );
+    expect(
+      problems.every((problem) => (imported.body.imported ?? []).every((row) => row.source === "import")),
+      "every imported case must record its source",
+    );
+    note({
+      step: "import",
+      imported: imported.body?.imported?.length ?? 0,
+      problems,
+    });
+
+    // --- the detail screen, populated ------------------------------------------------------
+    await page
+      .goto(`${URL_ADMIN}/ai/evals/${encodeURIComponent(suiteKey)}`, {
+        waitUntil: "domcontentloaded",
+      })
+      .catch(() => {});
+    await page.waitForTimeout(2000);
+    const populated = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll("[data-eval-case-row]")];
+      return {
+        rows: rows.length,
+        chips: document.querySelectorAll("[data-eval-case-property]").length,
+        readiness: document
+          .querySelector("[data-eval-readiness]")
+          ?.getAttribute("data-eval-readiness"),
+        // The config tab must exist and be reachable; a tab that is rendered but never wired
+        // is the "dead button" the definition of done forbids.
+        tabs: document.querySelectorAll("[data-eval-tab]").length,
+      };
+    });
+    expect(populated.rows >= 4, `the cases the pass created must be listed, saw ${populated.rows}`);
+    expect(
+      populated.chips >= 4,
+      `each case must show the properties it asserts, saw ${populated.chips} chips`,
+    );
+    expect(populated.tabs >= 2, "the suite screen must offer its Cases and Config tabs");
+    // With cases and no judge, the badge must now say the rubric case needs one.
+    expect(
+      populated.readiness === "needs_judge",
+      `a suite whose rubric case has no judge must say so, saw "${populated.readiness}"`,
+    );
+    note({ step: "detail-populated", ...populated });
+    await shot(page, "ai-evals-detail");
+
+    // The config tab, opened by clicking it rather than by assumption.
+    await page.locator("[data-eval-tab='config']").first().click().catch(() => {});
+    await page.waitForTimeout(800);
+    const config = await page.evaluate(() => {
+      const form = document.querySelector("[data-eval-config-form]");
+      return {
+        open: Boolean(form),
+        judgeSelect: Boolean(form?.querySelector("select[aria-label='Judge model']")),
+        threshold: Boolean(form?.querySelector("input[aria-label='Pass threshold']")),
+      };
+    });
+    expect(config.open, "the Config tab must render the configuration form");
+    expect(config.judgeSelect, "the config form must offer a judge model");
+    expect(config.threshold, "the config form must offer the pass threshold");
+    note({ step: "config-tab", ...config });
+    await shot(page, "ai-evals-config");
+
+    // --- mobile ---------------------------------------------------------------------------
+    await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+    await page.waitForTimeout(600);
+    const mobile = await page.evaluate(() => ({
+      overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    }));
+    expect(
+      mobile.overflow <= 1,
+      `the suite screen must not scroll sideways at 390px, overflow ${mobile.overflow}px`,
+    );
+    note({ step: "mobile", ...mobile });
+    await shot(page, "ai-evals-mobile", true);
+    await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+    return { ok: findings.length === 0, steps: steps.length, findings, suiteKey, suiteId };
+  } finally {
+    endRefusalWindow("/api/v1/ai/evals/suites");
+    // Teardown through the API: a suite left behind would make the next pass in this run measure
+    // a populated list while its own assertions describe an empty one. The delete needs its own
+    // key as `confirm`, which is exactly the rule the screen enforces by hand.
+    if (suiteKey) {
+      const removed = await callApi(
+        "DELETE",
+        `/v1/ai/evals/suites/${encodeURIComponent(suiteKey)}?confirm=${encodeURIComponent(suiteKey)}`,
+      ).catch(() => null);
+      note({ step: "teardown", status: removed?.status ?? null });
+    }
+  }
+}
+
+/**
+ * The air-gap switch, driven (REQ-106, slice 2).
+ *
+ * The screen is where an installation decides whether inference can leave the machine. The pass
+ * asserts, in order:
+ *   1. The switch starts OFF in a fresh QA database, and the direction of the flip is the
+ *      asymmetric one: turning it ON demands a reason and a typed phrase, turning it back OFF
+ *      demands neither. The store's docs call out that asymmetry as the reason the control can
+ *      be trusted, so this pass checks it.
+ *   2. Does a real reason + the typed phrase actually flip the switch, and does the banner appear?
+ *   3. Does the OFF direction skip the reason entirely — the asymmetry the store's docs call out
+ *      as the reason the control can be trusted?
+ *
+ * And it leaves the database as it found it. **The flip is restored in a `finally`,** because a
+ * harness that leaves the air gap ON makes every later pass read a banner, refuse a chat and
+ * measure a screen in an emergency state — the failure would surface as a dozen unrelated findings
+ * in a report written by a different writer, and nobody would connect them to this pass.
+ */
 async function runAirgapDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -11437,6 +11799,15 @@ async function main() {
     // the confirmation sheet and the flip are driven by the depth pass below, which restores the
     // switch to OFF in a finally so the harness leaves the database as it found it.
     { path: "/ai/settings/airgap", name: "ai-airgap", area: "ai" },
+    // The eval suites (REQ-107, slice 1) — two routes, and the second is a *dynamic* one, which
+    // is why it is registered differently. The suite list is walked on the bare path so the
+    // **empty** state is measured: a fresh QA database has no suite, and that is the state where
+    // a screen is most likely to render an empty table that reads like "everything passes". The
+    // detail route is not in this list at all — there is no key to put in a path literal — so the
+    // depth pass below creates a suite through the API and visits the screen it produced. That
+    // is the only way a `[key]` screen is ever opened, and it is why the list alone is not
+    // enough: the case editor and the config form live entirely on the detail screen.
+    { path: "/ai/evals", name: "ai-evals", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
@@ -11646,6 +12017,15 @@ async function main() {
     report.aiAirgap = await runDepthPass("ai-airgap", () => runAirgapDepth(page, report));
   }
   log(`ai airgap: ${JSON.stringify(report.aiAirgap)}`);
+
+  // The eval suites (REQ-107, slice 1): the case editor, the property checkboxes, the
+  // "asserts nothing" refusal, the partial CSV import and the mobile layout. It runs after the
+  // air-gap pass because that one restores the switch in a `finally`, and a suite that needs a
+  // judge should never be created while inference is deliberately cut off.
+  if (inScope("ai")) {
+    report.aiEvals = await runDepthPass("ai-evals", () => runAiEvalsDepth(page, report));
+  }
+  log(`ai evals: ${JSON.stringify(report.aiEvals)}`);
 
   // The agent runtime's own pass (REQ-099, slice 1): a key the API refuses **in its field**,
   // a real agent with a permitted tool and an approval-gated one, the list reading the tool
