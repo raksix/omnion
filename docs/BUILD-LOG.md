@@ -11234,3 +11234,51 @@ the pass keeps its artifact root and target on tmpfs.
 visibility own/team/all, org chart + keyboard + counts, the event feed reaching a subscribed
 webhook, and mobile 390×844. REQ-055 stays **in-progress**: three screens and a 500-free server are
 not the same as screens the browser opened.
+
+## 2026-10-01 — w4 tick 62: the QA reporter was lying, and the lie was green
+
+**What.** No product code changed this tick. The w4 browser pass that has been queued since tick 60
+ran, walked the HR module, took 232 screenshots and 292 clicks — and then the pass **reported a
+clean run**, which it had not earned. `docs/qa/QA-LATEST-w4.md` was left saying `0 clicks · 0
+screenshots · 0 findings` with a `?` timestamp. That file is what a REQ gets closed on.
+
+**Proof.** Three failures in a row, the last two silent:
+
+1. `/hr/attendance` (route `hr-attendance-roster`) threw `page.evaluate: Execution context was
+   destroyed, most likely because of a navigation` out of its page walk. A page whose walk throws
+   is pushed as `{ ...route, failed }` with **no `diagnostics` key**.
+2. The findings roll-up guards that (`if (!d)` → an `unmeasured-page` **high** finding, added
+   earlier for exactly this). The markdown reporter's *Per-page diagnostics* loop did not, so
+   `d.horizontalOverflow` read off `undefined` and threw — **after** `summary.json` was written,
+   **before** `report.md`. The on-disk artifacts were correct the whole time.
+3. `main().catch` then **overwrote** the complete `summary.json` with `{ fatal: ... }`, and `run.sh`
+   reads that file with `?? 0` defaults. A `{fatal}` summary has no `counts`, so every counter
+   defaulted to 0 and a 232-screenshot pass was published as an empty one.
+
+**Fix + gate.** `8c03e97f`. All three steps, plus `scripts/qa/silent-green-report-probe.sh`:
+**8/8 on this tree, 7 FAIL on `HEAD`** with the control check (the crashing route is still
+inventoried) passing on both, so the probe cannot be green on the defect it was written for.
+Verified against the **real** artifact rather than a mock: the old generator on
+`qa-artifacts/20261001-110809/summary.json` prints the clean-looking report verbatim; the new one
+prints the same numbers with a banner refusing them.
+
+```
+PASS  every d.horizontalOverflow read is guarded by a preceding 'if (!d)'
+PASS  the markdown report marks an unmeasured page instead of reading through it
+PASS  the failure handler keeps an existing summary.json instead of overwriting it
+PASS  a reporter that dies after measuring records WHY separately from the results
+PASS  a fatal pass leads the report with a banner instead of defaulting to zero
+PASS  the banner says the zeros are defaults, not results
+PASS  reporterFailed and fatal are reported as different verdicts
+PASS  the route that crashed (hr-attendance-roster) is still in the inventory
+```
+
+**Why this was nearly missed.** The pass *looked* fine: artifacts present, screenshots on disk, the
+process exited 0 through `run.sh`, which prints `[qa] done`. Only the report was wrong. A harness
+that can turn its own failure into a green light is not a slow gate — it is a gate that lies, and
+the four REQ-055 criteria still unticked are precisely the ones a browser has to prove.
+
+**Next.** The HR browser pass is re-running now with the fixed reporter (slot holder is mine:
+pid 1689806, cwd `/mnt/apopic/omnion-w4`). REQ-055 stays **in-progress** — its four remaining
+criteria (org chart + keyboard + counts, the event feed reaching a subscribed webhook, empty/
+loading/error states, mobile 390×844) still owe a pass that can be believed.

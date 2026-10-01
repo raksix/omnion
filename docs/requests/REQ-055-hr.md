@@ -1,8 +1,14 @@
 # REQ-055 — HR
 
-> **Status:** in-progress (slice 4's first half — ONBOARDING, the data core, the API and **9/9
-> walks green** against a live PostgreSQL. Three defects found along the way, one of them a
-> product bug and two of them about the gates themselves.)
+> **Status:** in-progress (tick 62 — no product code this tick. The browser pass REQ-055 has been
+> owed since tick 60 finally got the slot, walked HR, took 232 screenshots and 292 clicks, and
+> then **reported itself clean** because its own reporter crashed and destroyed its results. That
+> defect is fixed and gated in `8c03e97f`; the pass is re-running with the fixed reporter. The
+> four criteria below stay unticked until a pass that can be believed returns, because every one
+> of them is a claim about a rendered screen and this one is exactly what lied.)
+>
+> Prior: slice 4's first half — ONBOARDING, the data core, the API and **9/9 walks green** against
+> a live PostgreSQL.
 >
 > **1. A real bug the walks found and `cargo test` could not: `due_on` serialised as `[2026,61]`.**
 > `time::Date`'s `serde` impl writes a year and an **ordinal day**. That is correct and
