@@ -7940,3 +7940,79 @@ the conjunction is the whole claim. Then `undo-selection-edge` for `edgeRemovedB
 `edgeSelectionPruned`, then the run-from-here / pill / table-mode rows, all written and none
 measured. The plugin row stays BLOCKED on REQ-121. REQ-004 is far from close: the QA pass has
 not run in five ticks and every criterion needing one is open.
+
+## Tick 57 — the row read ONE step and called it the node, and the wire probe read one payload
+
+**What.** Criterion 2's second half reads "*clicking the node opens that step's **inputs and
+output***". The probe read the panel like this:
+
+```js
+const block = panel.querySelector(`[data-step-trace-payload="${name}"]`);
+```
+
+`querySelector` is the **first match**, and the panel renders one Inputs/Output pair inside
+*every* `[data-step-trace-step]` container. So a node with two steps — exactly the branching
+case the `diverged` pill exists to advertise — reported `stepsShown: 2` beside **one** step's
+payloads, and the second step could have rendered nothing with every number in the note
+unchanged. `stepsShown` counted blocks while `inputsRendered` counted one: two counts over two
+different sets, and only the first was a gate.
+
+**The product guards this loss twice, on purpose, and says so.** `step-detail.ts`: *"a map
+keyed by node is the shape that loses the second branch, and this function's only job is to be
+the one place that answers 'which steps is this node', **so the loss cannot happen twice**"* —
+and `runDetailForNode` returns a list rather than a lookup. The read made it exactly once.
+This is the twelfth instance in this REQ and the second with that particular shape: a guard
+that exists, is documented, is correct, and is discarded by the thing that was supposed to
+check it. Nothing about the row looked wrong; it answered a smaller question than the
+criterion asks, and the smaller question had a number in it.
+
+**The same missing half, a second time, and in the same note.** The wire probe read
+`step.params` and never `step.output`:
+
+```js
+hasParams: step.params !== undefined,
+```
+
+so the note carried `stepsWithParams === stepsTotal > 0` — the gate the criterion was written
+against — while `outputRendered`, the other half of the sentence, was measured against a panel
+that could only ever have been fed by a half-populated wire. A server that sent `params` and
+dropped `output` was a **healthy reading**. Tick 56 found this in the pill row; here it is in
+the row that sits directly under it, which is what makes it a habit rather than an accident.
+
+**The fix, and the three readings that make it falsifiable.** The read is scoped to each
+step's own container; `hasBothSides` is a conjunction because "inputs and output" is one; and
+`stepsWithoutBothSides` **names** the steps that failed rather than counting them — a count of
+one is the same number whether it is step 2 or a step the reader cannot find. The panel's
+`data-step-trace-step` numbers are now compared against the run's steps for that node **in both
+directions** (`stepsShownButNotInRun` / `stepsInRunButNotShown`), because a one-sided set
+comparison is exactly the shape tick 56 spent itself on, one row up. `hasOutput` uses
+`"output" in step` rather than a truthiness test: an explicit `null` ("the step produced
+nothing") is a different fact from an absent key ("the server never sent it"), and the panel
+renders two different sentences for precisely that pair.
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **317
+passed** (313 before, +4) · `pnpm typecheck` → 2/2 successful · `node --check` clean
+(14,303 → 14,372 lines) · `cargo test -p omnion-workflows --lib` → **157 unchanged** (a
+QA-instrument change, not a product one; the target had been swept, so this was a cold build)
+· **eight mutations red**, each naming the assertion it turned.
+
+**M8 came back red this time, and that is the tick-55 lesson turning into a rule.** It types
+`stepsWithOutput: 3` in place of the computed count — the literal that satisfied the field two
+ticks ago — and the new assertion catches it, because the count is now asserted as a *read*
+with its DOM/`in`-operator source named. A passing note can be written by hand, and the only
+defence that has ever worked is asserting where the number came from.
+
+**No browser pass, sixth tick.** The slot's holder is a live w6 pass — pid 2887474,
+`/proc/2887474/cwd` = `/mnt/apopic/omnion-w6`, started 08:27, twenty minutes before this tick
+opened. Load 41, 65 Chrome. A separate and smaller finding this tick: `target` is a symlink to
+`/dev/shm/w3-target`, and cargo could not create through the dangling link
+(`Not a directory (os error 20)`) — the directory has to exist before the first build, which
+is cheap to forget after a disk guard sweeps tmpfs.
+
+**Next.** Run the pass, and read `step-trace` for `stepsWithoutBothSides: []` **and**
+`stepsInRunButNotShown: []` **and** `stepsWithParams === stepsWithOutput === stepsTotal > 0`
+— the three are a conjunction, and any one alone is satisfied by a panel that opened one step
+of a two-step node. Then `undo-selection-edge` for `edgeRemovedByUndo` beside
+`edgeSelectionPruned`, then the table-mode row, written and unmeasured. The plugin row stays
+BLOCKED on REQ-121. REQ-004 is far from close: the QA pass has not run in six ticks and every
+criterion needing one is open.
