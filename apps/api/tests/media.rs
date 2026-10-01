@@ -9,7 +9,7 @@
 //! machine without Docker.
 
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use omnion_api::rate_limit_middleware::RateLimiter;
 use omnion_api::routes;
@@ -73,6 +73,10 @@ struct TestResponse {
     accept_ranges: Option<String>,
     /// `Content-Range` on the response, when the answer was a window.
     content_range: Option<String>,
+    /// `ETag` — the representation's validator, which the conditional walk echoes back.
+    etag: Option<String>,
+    /// `Last-Modified` — the date fallback a validator-less client may use.
+    last_modified: Option<String>,
     body: Value,
     bytes: Vec<u8>,
 }
@@ -134,6 +138,8 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     let nosniff = header_text(header::X_CONTENT_TYPE_OPTIONS).as_deref() == Some("nosniff");
     let accept_ranges = header_text(header::ACCEPT_RANGES);
     let content_range = header_text(header::CONTENT_RANGE);
+    let etag = header_text(header::ETAG);
+    let last_modified = header_text(header::LAST_MODIFIED);
 
     let bytes = response
         .into_body()
@@ -158,6 +164,8 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         nosniff,
         accept_ranges,
         content_range,
+        etag,
+        last_modified,
         body,
         bytes,
     }
@@ -2771,6 +2779,263 @@ fn png(width: u32, height: u32) -> Vec<u8> {
 /// The body is compared as **bytes** against the object that was uploaded, not by length: a
 /// length check passes by accident on an off-by-one, and the last byte of an object is precisely
 /// where a window implementation loses one.
+/// A conditional `GET` is answered from the row's own checksum, so a replace invalidates it.
+///
+/// This walk exists because of a defect the range walk beside it could not see. The serve path set
+/// `private, max-age=300` at a URL that names the file rather than its contents, and the tree
+/// carried no `ETag` and no `If-None-Match` handling at all — `grep -rn 'IF_NONE_MATCH\|NOT_MODIFIED'
+/// apps/ crates/` returned nothing. So two facts held at once and neither was visible: every repeat
+/// request pulled the whole object, and a replace changed the bytes behind an address that had
+/// promised they had not changed.
+///
+/// The load-bearing assertion is **step 6**. A validator built from anything but the content — a
+/// timestamp, a version counter, the row's `updated_at` — passes "echo the validator, get a 304"
+/// and fails exactly there: the client is holding the pre-replace bytes and must be told the
+/// representation moved.
+#[tokio::test]
+async fn a_conditional_get_is_answered_from_the_bytes_and_a_replace_moves_the_validator() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+
+    let original = b"the first photograph, which is the one everybody has cached".to_vec();
+    let replacement = b"a completely different photograph with a different length".to_vec();
+
+    let upload = call(
+        &fixture.state,
+        upload_request(&library, Some(&editor), "hero.png", "image/png", &original),
+    )
+    .await;
+    assert_eq!(upload.status, StatusCode::CREATED, "body: {}", upload.body);
+    let media_id = id_of(&upload.body);
+    let raw = format!("/api/v1/media/{media_id}/raw");
+
+    // 1. The `200` carries a validator. Without one, every client below is guessing.
+    let first = call(
+        &fixture.state,
+        request(Method::GET, &raw, Some(&editor), None),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(
+        first.bytes, original,
+        "the first read is the bytes that were uploaded"
+    );
+    let etag = first
+        .etag
+        .clone()
+        .expect("a serve response must offer a validator");
+    assert!(
+        etag.starts_with("W/\"") && etag.ends_with('"'),
+        "the validator is a weak quoted entity-tag, got {etag:?}"
+    );
+    let last_modified = first
+        .last_modified
+        .clone()
+        .expect("a serve response must offer a date too");
+
+    // 2. The same validator is answered `304` with **no body**.
+    let revalidated = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some(&etag), None),
+    )
+    .await;
+    assert_eq!(
+        revalidated.status,
+        StatusCode::NOT_MODIFIED,
+        "a caller holding these bytes must not be sent them again"
+    );
+    assert!(
+        revalidated.bytes.is_empty(),
+        "a 304 carries no body: {} bytes arrived",
+        revalidated.bytes.len()
+    );
+    assert_eq!(
+        revalidated.content_range, None,
+        "a 304 is not a range, so it carries no Content-Range"
+    );
+    assert_eq!(
+        revalidated.etag.as_deref(),
+        Some(etag.as_str()),
+        "the 304 repeats the validator so the client can refresh its own"
+    );
+
+    // 3. `*` asks whether a representation exists, and one does.
+    let star = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some("*"), None),
+    )
+    .await;
+    assert_eq!(
+        star.status,
+        StatusCode::NOT_MODIFIED,
+        "If-None-Match: * with a representation present is a 304"
+    );
+
+    // 4. The date fallback, for a client that sent no validator.
+    let by_date = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), None, Some(&last_modified)),
+    )
+    .await;
+    assert_eq!(
+        by_date.status,
+        StatusCode::NOT_MODIFIED,
+        "the date fallback answers a client that held no validator"
+    );
+
+    // 5. **The replace.** Same URL, same id, different bytes.
+    let replaced = call(
+        &fixture.state,
+        replace_request(
+            &format!("/api/v1/media/{media_id}/versions"),
+            &editor,
+            "hero.png",
+            "image/png",
+            &replacement,
+            "a corrected photograph",
+        ),
+    )
+    .await;
+    assert_eq!(
+        replaced.status,
+        StatusCode::CREATED,
+        "the replace must succeed, body: {}",
+        replaced.body
+    );
+
+    // 6. The stale validator must be told the representation moved — and this is the assertion a
+    // timestamp-based validator cannot pass.
+    let after = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some(&etag), None),
+    )
+    .await;
+    assert_eq!(
+        after.status,
+        StatusCode::OK,
+        "a replace changes the bytes behind an unchanged URL, so the old validator must not match"
+    );
+    assert_eq!(
+        after.bytes, replacement,
+        "and the bytes that arrive are the new ones, not the ones the caller held"
+    );
+    let new_etag = after
+        .etag
+        .clone()
+        .expect("the new representation carries its own validator");
+    assert_ne!(
+        new_etag, etag,
+        "the validator is the content, so different bytes are a different validator"
+    );
+
+    // 7. The new validator is the current one, and it is what a second revalidation echoes.
+    let settled = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some(&new_etag), None),
+    )
+    .await;
+    assert_eq!(
+        settled.status,
+        StatusCode::NOT_MODIFIED,
+        "after the replace the new validator settles"
+    );
+
+    // 8. An old **version** validates against its own bytes, never against the file's current
+    // ones. A version route comparing against the file would answer `304` for a picture the caller
+    // has never seen.
+    let version_raw = format!("/api/v1/media/{media_id}/versions/1/raw");
+    let version_one = call(
+        &fixture.state,
+        request(Method::GET, &version_raw, Some(&editor), None),
+    )
+    .await;
+    assert_eq!(version_one.status, StatusCode::OK);
+    assert_eq!(
+        version_one.bytes, original,
+        "version 1 still holds the pre-replace bytes"
+    );
+    let version_etag = version_one
+        .etag
+        .clone()
+        .expect("a version answers with its own validator");
+    assert_ne!(
+        version_etag, new_etag,
+        "the historical version is a different representation from the current file"
+    );
+    let version_revalidated = call(
+        &fixture.state,
+        conditional_request(&version_raw, Some(&editor), Some(&version_etag), None),
+    )
+    .await;
+    assert_eq!(
+        version_revalidated.status,
+        StatusCode::NOT_MODIFIED,
+        "a version revalidates against itself"
+    );
+    let version_with_the_file_etag = call(
+        &fixture.state,
+        conditional_request(&version_raw, Some(&editor), Some(&new_etag), None),
+    )
+    .await;
+    assert_eq!(
+        version_with_the_file_etag.status,
+        StatusCode::OK,
+        "the current file's validator must not answer for a historical version"
+    );
+    assert_eq!(
+        version_with_the_file_etag.bytes, original,
+        "and it sends the version's own bytes"
+    );
+
+    // 9. A validator the origin cannot parse is not an absent one: the representation is sent,
+    // never a `304` nobody asked for.
+    let garbage = call(
+        &fixture.state,
+        conditional_request(&raw, Some(&editor), Some("not-a-tag"), None),
+    )
+    .await;
+    assert_eq!(
+        garbage.status,
+        StatusCode::OK,
+        "an unreadable validator gets the bytes"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// A `GET` carrying the caller's revalidation headers.
+///
+/// Built from the request helper and then having its headers appended, rather than from a
+/// `RequestBuilder`: `request()` returns the finished `Request`, and a builder does not exist
+/// after it. `append` is what a conditional request needs anyway — the session and CSRF headers
+/// are already there, and the validator is one more.
+fn conditional_request(
+    uri: &str,
+    token: Option<&str>,
+    if_none_match: Option<&str>,
+    if_modified_since: Option<&str>,
+) -> Request<Body> {
+    let mut built = request(Method::GET, uri, token, None);
+    let headers = built.headers_mut();
+    if let Some(validator) = if_none_match {
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(validator).expect("a validator must be a header value"),
+        );
+    }
+    if let Some(date) = if_modified_since {
+        headers.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_str(date).expect("a date must be a header value"),
+        );
+    }
+    built
+}
+
 #[tokio::test]
 async fn a_range_request_answers_a_window_and_says_what_it_sent() {
     let Some(fixture) = Fixture::new().await else {
