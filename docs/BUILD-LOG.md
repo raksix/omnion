@@ -8086,3 +8086,60 @@ check the summary for `chrome-error://` in a page url and confirm the admin erro
 The plugin row stays BLOCKED on REQ-121. `target` is a symlink to `/dev/shm/w3-target` and
 the dir was missing again after the disk guard swept it — `mkdir -p /dev/shm/w3-target` first,
 or cargo fails with `Not a directory (os error 20)`, which reads like a broken symlink.
+
+## Tick 59 — the table-mode read was honest and still impossible
+
+**What.** `table-save-survives` spent two ticks being moved off the wire and onto the canvas, and
+the gate it produced **cannot be satisfied by any product, this one included**. `NodeInspector`
+renders under `{selectedNode ? … : null}` — builder-view.tsx line 2745 — and nothing selects a
+node when a builder opens, so `querySelector('[data-inspector="<id>"]')` matched nothing on a
+correct screen: `inspected: 0`, `builderSeesTableEdit: false`, with no defect able to turn it.
+This is the tick-57 defect for the third time and the same one: **the read was moved off the
+wire but never made *possible*.** A row that is unsatisfiable is worse than no row, because it
+fails *misleadingly* — tick 60 would have opened the inspector hunting a bug in correct code.
+
+The row now walks the cards and **clicks** each one, waiting for that node's own panel. Which
+card is not guessed: the criterion never says which node the table's save landed on, so a probe
+that picked one would be asserting an assumption and would be red for the wrong reason whenever
+the answer was a different node. A card whose click missed is `Escape`d, because a half-armed
+connect gesture would otherwise survive into the `run` and `unfinished-save` rows below and turn
+their clicks into edge targets. `clicked` and `inspected` are reported separately, and
+`fieldsByNode` names the field that was wrong.
+
+**Three of this tick's own failures were the test's anchors, not the row**, and they are the
+same class the file was written to catch. Two windows were pinned to `const canvasRead = await
+page` and the rewrite removed that statement, so both reported `actual: -1, expected: -1` — a
+message that reads like a missing row. The node-scoping regex still named the old `nodeId`
+closure, which is a subtler version of the same thing: **a page-side `evaluate` callback cannot
+close over a Node-side loop variable**, so had the read stayed implicit the browser would have
+thrown `nodeId is not defined` inside the page rather than failing an assertion. And the
+`waitForTimeout(1500)` assertion was red against a row that has no delay, because **the window's
+own comment quotes the delay in order to explain why it is wrong** — a test that greps a window
+containing its own explanation always finds the mistake it is warning about. `REVERSE_CODE` now
+strips prose before the code assertions run, which is the prefix-collision lesson of tick 58
+(`data-inspector` inside `data-inspector-field`) applied one level up: a token in a *mention*
+satisfies a claim made about a *use*.
+
+**Proof.**
+- `node --test --experimental-strip-types apps/admin/features/workflows/*.test.ts` → **328 passed**
+  (326 before, +2)
+- `pnpm typecheck` → 2/2 successful
+- `node --check scripts/qa/walkthrough.cjs` → clean (14,410 → 14,451 lines)
+- **five mutations red**, each naming the assertion it turned: M4 drop the click loop, M5 read
+  the panel page-wide, M6 collapse `clicked`/`inspected` back into one number, M7 accept any
+  non-empty field, M8 restore the fixed delay
+
+**Not ticked, and why.** No browser pass: the slot's holder is a LIVE w6 pass — pid 2887474,
+`/proc/2887474/cwd` = `/mnt/apopic/omnion-w6`, 517 files written in the fifteen minutes before
+this tick's checks. `cargo test --workspace --lib` is still running against the `/dev/shm/w3-target`
+symlink (`mkdir -p` first, or cargo fails with `Not a directory (os error 20)`).
+
+**Next.** The pass, which is the ninth tick it has been deferred. Read `table-save-survives` for
+`clicked > 0` **and** `inspected > 0` **and** `builderSeesTableEdit: true` — a conjunction, and
+the first two are what make the third mean anything. Then `step-trace` for
+`stepsWithoutBothSides: []` AND `stepsInRunButNotShown: []` AND
+`stepsWithParams === stepsWithOutput === stepsTotal > 0`, then `run-from-here` for
+`inRunButNotPainted: []` beside `pillsPainted > 0`, then `undo-selection-edge` for
+`edgeRemovedByUndo` beside `edgeSelectionPruned`. The plugin row stays BLOCKED on REQ-121.
+Before a pass: check the summary for `chrome-error://` in a page url and confirm the admin error
+log is quiet. Always `QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202`.
