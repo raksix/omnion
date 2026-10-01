@@ -1,8 +1,10 @@
 # REQ-105 — AI Data Guard (PII protection)
 
 > **Status:** in-progress (slice 1 detector/policy/budget: `602531b0`; the migration, the store
-> and the two API halves: `94fde861`, `26f09f3a` — the `403 ai_guard_blocked` checkpoint on the
-> chat route, the screens and the browser pass are outstanding) ·
+> and the API: `94fde861`, `26f09f3a`; the **outbound checkpoint every provider call passes
+> through** — `d96d7f37`, which is the half that makes this a control rather than a screen: a
+> blocked payload is refused with `403 ai_guard_blocked` before any provider is dialled, and the
+> verdict is proved with a detector built in the test and no database in the picture) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
@@ -142,11 +144,11 @@ refuses to start in the guard (the API answers a configuration error) rather tha
 - [ ] The answer is re-mapped on completion: a stub provider that echoes `[EMAIL_1]` produces the original address in the stored message for the requester.
 - [ ] While streaming, deltas show the placeholder and the completed message shows the original — asserted by capturing the SSE frames and then reading the stored message.
 - [ ] A second reader (shared conversation, admin) sees the placeholder, not the original (asserted with two readers on the same message).
-- [ ] An exemption for one label and one feature allows that label through for that feature only; another feature with the same label stays masked.
+- [x] An exemption for one label and one feature allows that label through for that feature only; another feature with the same label stays masked.
 - [ ] An expired exemption stops applying on the next request and emits `ai.guard.exemption.expired`.
-- [ ] Saving an invalid regex is refused with a field error and stores nothing; the validate endpoint returns the same message.
+- [x] Saving an invalid regex is refused with a field error and stores nothing; the validate endpoint returns the same message.
 - [ ] The tester returns matches with labels and spans, the masked text and the verdict, and performs no provider call (stub provider records zero calls).
-- [ ] The payload never appears in `ai_guard_events`, in the audit log or in the API response of the events endpoints — asserted by a test that greps the stored row text for the original value.
+- [x] The payload never appears in `ai_guard_events`, in the audit log or in the API response of the events endpoints — asserted by a test that greps the stored row text for the original value.
 - [ ] A caller without `ai.guard.manage` sees Rule actions and the tester disabled with the missing permission named; the API answers 403.
 - [ ] `/ai/guard/about` states the residual risk, and no other guard screen claims detection is complete.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.

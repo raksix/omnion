@@ -8507,3 +8507,61 @@ REQ-105, REQ-106, REQ-107, REQ-108.
   walk that proves a blocked payload never reaches the network, then `/ai/guard`,
   `/ai/guard/rules` and the walkthrough registration. Then the queued w7 pass, which is still
   the only thing that can close REQ-099 and REQ-100.
+
+---
+
+## 2026-10-01 · w7 · REQ-105 slice 1 — the outbound checkpoint (`d96d7f37`)
+
+**What.** `crates/ai-hub/src/guard_checkpoint.rs` — the one place where a payload is decided
+before a provider can see it, wired into `POST /ai/v1/ai/chat` between the capability check and
+the construction of the `ChatRequest`. Everything before this tick could *report* what the guard
+would do (rules, policy, events, the API); nothing stopped anything. The slice's criterion is a
+property rather than a shape, and both halves are asserted with a detector built from rules the
+test wrote itself and **no database in the picture** — which is what makes them statements about
+this function rather than about the platform: a blocked payload never reaches the network, and a
+clear one arrives byte-identical.
+
+**Three assumptions I had to correct against the code, all of them mine:**
+
+- **`organization_id` is `Option<Uuid>`, not `Uuid`.** A user with no organization is a normal
+  account shape in this platform, and the rest of the AI family already models it (`DecisionContext`
+  carries the same `Option`). Skipping the checkpoint for those users would make the guard's
+  coverage depend on how the account was created — a silent gap in the exact direction the guard
+  exists to close. They are inspected too, against the `organization_id is null` platform rows
+  that `list_rules` returns for any id. They are **not** audited, because
+  `ai_guard_events.organization_id` is `not null references organizations (id)`: a nil id would
+  fail the insert on every such call. The refusal still happens; the missing row is the honest
+  record for a request that belongs to no tenant.
+- **`resolved.model` is an `AiModel`, not a `ResolvedModel`.** It carries `provider_id` and has no
+  nested provider, so a provider-scoped rule is matched by id on the chat path, not by name. I
+  also invented a `finish_chat(...)` helper to share the two org paths, which does not exist —
+  the single-path `unwrap_or(Uuid::nil())` is shorter and does not duplicate the stream tail.
+- **`ApiError` has `with_details(Value)`, not `with_detail(key, value)`.** Written from memory as
+  a chain of two calls; it does not compile. One grep, not two failures.
+
+**Design worth keeping.** Auditing is best-effort and never changes the verdict: a refused audit
+row is an audit problem, not a request problem, so it surfaces on `CheckpointReport::audit_error`
+for the caller to `warn` about. Refusing a user's chat because the log did not fit is a worse
+outcome than the gap it closes. A `Clear` payload writes no event row at all — the audit records
+the guard *acting*, and one row per ordinary message would drown the events an operator opens the
+screen to read.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --lib --quiet` → **575 passed** (564 before, 11 new)
+- `cargo test -p omnion-api --test ai_guard -- --test-threads=1` → **9 passed** — the existing
+  DB-backed walks, unchanged by the new error variant and the chat-path wiring
+- `cargo build -p omnion-api` → clean; zero warnings attributable to any file I touched
+
+**ENV.** The QA slot is held by a **live w5 pass** (pid 1822875/1822938, `cwd=/mnt/apopic/omnion-w5`)
+for the whole tick, so no browser pass was attempted and none was stolen — my tick50 pass is still
+queued behind it. `/dev/shm` was at **100%** again; reclaimed 0.79G of duplicate `(name, hash)`
+rlib/rmeta siblings from *my own* target only (`lsof` confirmed nothing of mine was open), taking
+tmpfs from 249M to 1.4G free. A `cargo build | grep -E '^error' | head -40` run reported no errors
+while printing `BUILD_DONE` — the errors were past the truncation. **Piping a build to `head` and
+reading the absence of output as success is how a red gate gets committed**; the log file is now
+the only thing read.
+
+**Next.** The stub-provider walk that records the exact body a provider received (the half of the
+masking criterion that is not yet proved), then `/ai/guard` and `/ai/guard/rules` with the
+walkthrough registration, then slice 2 (masking + re-mapping). The queued w7 pass remains the only
+thing that can close REQ-099 and REQ-100.
