@@ -1903,6 +1903,99 @@ pub async fn chat(
                 error: None,
             };
 
+            // # The air gap, inside the walk and before any byte
+            //
+            // This is the one check that cannot be a failover *retry*: a refused call must never
+            // move to the next provider, because every non-local provider is refused the same
+            // way, and a walk that advanced would keep dialling hosts the operator has switched
+            // off. So the refusal ends the request rather than feeding the retry path — it is a
+            // `Failed` frame, not an `Err` on the attempt, and `attempts` records it as the
+            // attempt that produced the answer the user sees.
+            //
+            // `check_call` reads the switch and re-derives locality from the URL and the
+            // allow-list rather than trusting `ai_providers.locality`, which was written at save
+            // time and can be stale. It returns `Ok(None)` on the hot path for an installation
+            // that never enables the gap, so this costs one row read when it is off and is the
+            // entire price of the guarantee when it is on.
+            if let Some(refusal) =
+                match omnion_ai_hub::airgap_store::check_call(
+                    &pool,
+                    &current.name,
+                    &current.base_url,
+                )
+                .await
+                {
+                    Ok(decision) => decision,
+                    // The check itself failed — the switch row or the allow-list could not be
+                    // read. `?` is NOT available here (the task returns `()`), and that is
+                    // correct: this is an outage, not a refusal, and the two must not be
+                    // confused. Fail CLOSED but say so. A gap whose check cannot run is a gap
+                    // that cannot be trusted, and the message tells the operator exactly that
+                    // instead of pretending the call was blocked for policy.
+                    Err(error) => {
+                        let message = format!(
+                            "the air-gap check could not run ({error}), so the call to \"{}\" \
+                             ({}) was stopped rather than sent. This is a platform fault, not \
+                             the air gap refusing it: check that the AI settings tables are \
+                             reachable.",
+                            current.name,
+                            omnion_ai_hub::local_host::host_of(&current.base_url)
+                                .unwrap_or_else(|| "an unparseable host".to_owned()),
+                        );
+                        tracing::error!(%error, "the air-gap check could not be read");
+                        attempts.push(omnion_ai_hub::Attempt {
+                            error: Some(message.clone()),
+                            ..attempt
+                        });
+                        record_usage(
+                            &pool,
+                            &attempts,
+                            &served_by,
+                            &model_key,
+                            None,
+                            "error",
+                            started.elapsed(),
+                        )
+                        .await;
+                        let _ = frames
+                            .send(Frame::Failed {
+                                code: "airgap_check_failed",
+                                message,
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            {
+                attempts.push(omnion_ai_hub::Attempt {
+                    error: Some(refusal.message()),
+                    ..attempt
+                });
+                record_usage(
+                    &pool,
+                    &attempts,
+                    &served_by,
+                    &model_key,
+                    None,
+                    // A fourth vocabulary word, and the only call path that writes it: `refused`
+                    // means the PROVIDER said no (its own filter, its own 4xx) and an operator
+                    // reading that row looks upstream for a cause that is not there. This row
+                    // says the switch stopped it, which has a different owner and a different
+                    // fix.
+                    "blocked_airgap",
+                    started.elapsed(),
+                )
+                .await;
+                announce_airgap_refusal(&pool, &refusal, "chat", &model_key).await;
+                let _ = frames
+                    .send(Frame::Failed {
+                        code: refusal.code(),
+                        message: refusal.message(),
+                    })
+                    .await;
+                return;
+            }
+
             // The first byte is the boundary failover may act on: after it the caller has seen
             // part of an answer, and a replay would be a second, different answer.
             let first_byte = Arc::new(AtomicBool::new(false));
@@ -2466,6 +2559,32 @@ async fn announce_unresolved(
 
     if let Err(error) = bus::emit(pool, event).await {
         tracing::warn!(%error, "the ai.route.unresolved event could not be emitted");
+    }
+}
+
+/// Announce one air-gap refusal (REQ-106 slice 2).
+///
+/// Best-effort and installation-wide, exactly like `announce_unresolved`: the gap is a property
+/// of the installation rather than of a tenant, and the count of these events is the switch's
+/// evidence that it is doing anything. A `warn` rather than an error is deliberate — the call was
+/// refused correctly whatever happens to the bus, and an operator must not see a failed request
+/// because a webhook subscriber was down. But it is never swallowed silently: a switch that
+/// refuses quietly is a switch nobody can verify.
+async fn announce_airgap_refusal(
+    pool: &sqlx::PgPool,
+    refusal: &omnion_ai_hub::airgap_store::Refusal,
+    task: &str,
+    model_key: &str,
+) {
+    let event = NewEvent::new("ai.airgap.call_refused").payload(json!({
+        "provider": refusal.provider,
+        "host": refusal.host,
+        "task": task,
+        "model_key": model_key,
+    }));
+
+    if let Err(error) = bus::emit(pool, event).await {
+        tracing::warn!(%error, "the ai.airgap.call_refused event could not be emitted");
     }
 }
 
