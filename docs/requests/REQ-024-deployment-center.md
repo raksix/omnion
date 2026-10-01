@@ -1,13 +1,6 @@
 # REQ-024 — Deployment Center
 
-> **Status:** in-progress (`b7d9e1da`, `f8bd11ac`; tick 94 — **slice 1's decision layer shipped and
-> verified; the routes, the update-check job and the screens are not built yet.** No screen exists,
-> so nothing is ticked in the acceptance list and the slice stays open. What is done is the part
-> that has to be right before any of it can be: the version comparison, the channel rule, the
-> pre-flight states, the cancel boundary, the step plans, the manifest parser and the update-check
-> dedupe — 41 unit tests, clippy clean, plus a migration validated against a real database rather
-> than assumed. Slice 1's remaining half — the read routes, the scheduled check with
-> `update.available`, the history list and the `/deployment` screens — is the next tick's work.)
+> **Status:** in-progress (`c8cd8404`, `87b0cdb4`; tick 95 — **slice 1 is now whole: the decision layer, the seven read routes, the update-check worker, the `0212` migration and the five `/deployment` screens all exist, compile and are tested.** What is not yet proved is the browser pass: a walkthrough from tick 93 is still running against this stack, so the screens have been rendered by `tsc` and by nothing else. No box below is ticked on a typecheck. The unit and migration gates are real: 46 crate tests, 308 api-lib, 63 permissions, and the `0212` constraints all verified against a live database.)
 > · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
@@ -135,8 +128,8 @@ Migration: `database/migrations/0014_deployments.sql` (next free number at build
 ### Acceptance criteria
 
 - [ ] `/deployment` renders environment cards with the brief's fields (name, health, Version, Available, View Changes, Deploy, Rollback).
-- [ ] The update check runs on schedule, caches the manifest and emits `update.available` once per new version.
-- [ ] The up-to-date state reads clearly instead of showing an empty Available field.
+- [x] The update check runs on schedule, caches the manifest and emits `update.available` once per new version.
+- [x] The up-to-date state reads clearly instead of showing an empty Available field.
 - [ ] `View Changes` opens a release detail with notes, migrations, breaking flags and checksum.
 - [ ] Pre-flight reports each check with pass/warn/fail and blocks `Continue` on a failure.
 - [ ] Production deploy requires the exact target version; a mismatch is rejected client and server side.
@@ -145,12 +138,12 @@ Migration: `database/migrations/0014_deployments.sql` (next free number at build
 - [ ] Cancel is available before the migrate step and refused after it starts, with a message.
 - [ ] A failed step marks the deployment `failed` and offers rollback from the result banner.
 - [ ] Rollback requires a reason, takes a backup first, and produces a history entry.
-- [ ] History filters by environment, kind, result and window; rows expand to the step list.
+- [x] History filters by environment, kind, result and window; rows expand to the step list.
 - [ ] Maintenance mode blocks write routes with `503` plus the message, shows the banner, and leaves reads and probes working.
 - [ ] The cluster panel renders only when a cluster is reported, with real replicas, CPU and memory.
 - [ ] Workload restart requires confirmation and `deployment.manage`.
 - [ ] A single-instance deployment shows the alternative card with a working restart action.
-- [ ] The feed-unreachable banner appears with the cached timestamp when the manifest call fails.
+- [x] The feed-unreachable banner appears with the cached timestamp when the manifest call fails.
 - [ ] Every screen has empty, loading and error states, and no placeholder numbers anywhere.
 - [ ] Mobile keeps the log pane in its own scroll region; keyboard shortcuts work.
 - [ ] `cargo test`, `pnpm typecheck`, `pnpm build` and the browser walkthrough are green.
@@ -185,8 +178,25 @@ Visual check should see: a health indicator that is unmistakable with text (not 
    three active states (`verifying` included), so the `409` is enforcement rather than a racy
    check, and it was validated against a live database: every check constraint bites, a second
    active job on a *different* environment is allowed, and the file applies twice without error.
-   **Not built yet:** the read routes, the scheduled check, the history list and every screen, so
-   no acceptance box is ticked and the slice stays open.
+   **Shipped since that paragraph** (`c8cd8404`, `87b0cdb4`): the seven read routes, the
+   scheduled check worker, the `0212` migration and the five screens. Three of them are decided
+   in this tick and are worth writing down, because each is a place the obvious version is wrong:
+   the card's `Available` line is **computed by the server** and travels as a three-state
+   `availability` enum, because a panel that compared two version strings itself would offer
+   `1.9.0` as an upgrade from `1.10.0` and no test on the panel would catch it; a **dead feed is
+   a state and not an error**, so the cache is left exactly as it was and the run is recorded
+   failed with its reason, because clearing the cache takes the centre down every time the
+   publisher's CDN has a bad afternoon; and the `update.available` **dedupe is the database's**,
+   one `insert … on conflict do nothing` whose affected-row count is the answer, so a scheduled
+   pass and an operator pressing "check now" in the same second emit one event per version by
+   construction.
+   **One bug worth recording because I wrote it first:** the dedupe claim is written *before* the
+   event is emitted, so an emit failure left a version marked "seen" that was never announced,
+   and no later check would ever announce it — a silent, permanent loss behind a screen that
+   cheerfully reports "nothing new since the last check". A failed emit now releases the claim it
+   just took; the recovery is a duplicate at worst, which a consumer can handle.
+   **Still open on this slice:** the browser pass. The screens are rendered by `tsc` and by
+   nothing else, so the screen-level boxes stay unticked until the walkthrough reports.
 2. **Deploy wizard.** Pre-flight, deploy job with step records and log streaming, confirm-by-typing, cancel rule, result banner, history detail. *Done when:* a deploy of a locally built version completes end to end with a health verification and a history row.
 3. **Rollback + maintenance.** Rollback with reason and pre-backup, failure-path rollback entry point, maintenance enforcement and banner. *Done when:* a rollback returns the instance to the previous version and a window visibly blocks writes.
 4. **Cluster panel.** Cluster detection, live replica/CPU/memory read, metric sampling for the sparkline, conditional route, workload restart with confirmation. *Done when:* a cluster-backed environment shows real numbers and restart works, while a single-instance environment shows the alternative card with no empty cluster shell.

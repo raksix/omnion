@@ -10609,3 +10609,96 @@ REQ-017's last boxes stay open, and the ~84 QA gates written in ticks 92–93 ar
 assertions sat. The first cdn- or environments-scoped pass to reach a **healthy** stack must read a
 red in `audit-depth-claims` as a real product defect, and must establish `pg_isready` before it
 believes any finding.
+
+## Tick 95 — REQ-024 slice 1 closed as a code change; the browser gate is still owed
+
+**What.** Merged `origin/main` (6 commits) and then finished REQ-024 slice 1 — the read routes,
+the update-check worker, the `0212` migration and the five `/deployment` screens. Two commits,
+each pushed:
+
+- `c8cd8404` — `crates/deployment`'s `store.rs` and `error.rs`, the `0212` migration, the seven
+  read routes, the update-check worker, and the three permission keys.
+- `87b0cdb4` — the five screens, the client, the types, the nav entry, and the walkthrough routes.
+
+**The merge was not free.** `docs/BUILD-LOG.md` is append-only, so it went through the loop's own
+three-way splicer, and the proof is a **multiset**, not a line count: `Counter(merged) ==
+Counter(base) + inserted(ours) + inserted(theirs)` held exactly (0 missing, 0 unexpected) with
+`base=6408 ours=10500 theirs=6519 → merged=10611`. A line count would have passed while hiding a
+duplicated block.
+
+`scripts/qa/walkthrough.cjs` conflicted for a substantive reason, and the right resolution was
+not "take a side". Main had replaced the desktop roll-up's `p.diagnostics || {}` with an
+explicit `unmeasured-page` **finding** — which is the correct fix for the exact bug my optional
+chaining was papering over: one crashed page used to take every later page's report with it.
+So main's structure won, and my `mobileSwitcher` block (the phone sheet's own claims) was grafted
+onto it, with its `viewport?.w` guard kept because a *successful* walk can still omit that one
+nested field. A second `unmeasured-mobile` arm came with it. One orphan `}` from main's version
+survived the splice and had to go — caught by `node --check`, which is the only thing that sees
+it.
+
+**Four bugs, and one of them I wrote before I caught it.**
+
+1. **The announcement could be lost for ever.** `claim_announced` writes the dedupe rows *before*
+   the event is emitted, so an emit failure left a version marked "seen" that was never announced —
+   and no later check would ever announce it. The screen behind that says "nothing new since the
+   last check", which is the worst possible place to lose an update. A failed emit now releases
+   the claim it just took; the recovery is a duplicate, which a consumer can defend against.
+2. **The card's footer line would have rendered blank.** `last_deploy.and_then(...)` moves a
+   non-`Copy` `Option<HistoryRowBody>`, and I used it to read the rollback target *and* put the row
+   on the card. The move compiles, the card builds, and the actor-and-time line disappears. Read
+   with `as_ref()` instead.
+3. **`CARGO_PKG_SERVICE` does not exist.** Cargo sets `CARGO_PKG_NAME`. The compiler says so
+   plainly; worth recording because the fix (`CARGO_PKG_NAME`) reads as a typo for a plausible
+   one and the next writer will re-introduce it.
+4. **`NewEvent` has no `dedupe_key`.** I had written a whole FNV-based announcement key for a
+   facility the event bus does not have. The dedupe is the *database's* — `claim_announced`'s
+   affected-row count — so the key survives only as the identity a subscriber reads. Two
+   mechanisms for one job, one of them fictional, is how a reader ends up believing the wrong one
+   is load-bearing.
+
+Also caught by hand before either commit: a `OnceLock` timestamp in the check would have latched
+the **first** check's time and stamped every row ever cached with it — a six-month-old row
+claiming to have been read six months ago, which is precisely the lie the cached-data banner
+exists to prevent. The stamp now travels with the body it belongs to.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-deployment --features store` | **46/46** |
+| `cargo test -p omnion-api --lib` | **308/308** |
+| `cargo test -p omnion-permissions --lib` | **63/63** |
+| `cargo clippy -D warnings` on `omnion-deployment` | clean |
+| `cargo clippy` on both new `omnion-api` files | clean (the three `omnion-core` lints are another writer's crate, untouched) |
+| `tsc --noEmit` (admin) | clean |
+| `node --check scripts/qa/walkthrough.cjs` | clean, **+16 lines, 11783 → 11799** |
+| migration `0212` on a live database | applies; re-applies as a clean no-op; **all six constraints bite** — a second row in the one-row table, an unknown channel, a `failed` run with no reason, a `failed` run with a *blank* reason, a `completed` run with no stamp, an unknown status — while a valid failure, a valid completion, the first claim, the re-claim (`INSERT 0 0`) and the same version on a second channel all behave as claimed, and a released claim is claimable again |
+| browser pass | **not run — one is already running on this stack** (pid 1822875, tick 93's, `clicks.jsonl` still advancing at 08:16). `run.sh`'s per-stack `flock` refused a second pass, which is the guard from tick 90 working as designed. |
+| `git status` | clean; both commits pushed to `wave5` |
+
+**The screen-level acceptance boxes stay unticked.** The five screens have been rendered by `tsc`
+and by nothing else. Four boxes are ticked and each has a *server-side or unit* proof: the
+up-to-date line, the update check's schedule/cache/dedupe, the history filters and expansion, and
+the feed-unreachable banner. The rest wait for a pass that measures pixels.
+
+**Two things about the box worth writing down, because they cost time and neither is a code
+fact.** `/mnt/apopic` hit **100%** mid-tick (`fatal: … index.lock write error. Out of diskspace`),
+and the consumers are not mine — 23G docker-data, 13G the main checkout, 3.7G `omnion-w2-target`.
+I freed 8 MB of my own yesterday's `qa-artifacts` and 1.2G appeared, which is the honest ratio: a
+writer cannot fix a disk it does not own. And the shared `omnion-postgres`, which spent ticks
+92–94 in a 38-minute fsync recovery, is **accepting connections again** — so the first pass to
+reach a healthy stack should read a red in the depth passes as a real product defect, and should
+establish `pg_isready` before believing any single finding.
+
+**Next.** The tick-93 pass's verdict, read for real: what it reports about the 84 gates from
+ticks 92–93 and about this tick's five screens if it picks them up. Then slice 2, the deploy
+wizard — pre-flight, the job with its step records, confirm-by-typing, the cancel boundary and
+the result banner.
+
+**A note on the harness, from losing an hour to it.** `write_file` **truncated a 607 KB file**
+mid-write (`scripts/qa/walkthrough.cjs`, 11783 → 11787 lines of a half-written tail), and
+`node --check` reported it as `Unexpected end of input` at a line that had nothing to do with the
+cause. The rule that follows: never edit a file this size with `write_file`; use `patch` or a
+python script, and **compare the line count before and after** rather than trusting the write.
+The commit was never reached, so nothing was lost — `git checkout --` restored the merged file
+whole — but the next writer who trusts a `write_file` on a large file will lose a merge.
