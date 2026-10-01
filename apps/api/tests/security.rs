@@ -1890,3 +1890,252 @@ async fn the_inventory_cannot_be_written_through() {
 
     harness.dispose().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The `security.finding.opened` webhook (REQ-012, slice 4d)
+// ---------------------------------------------------------------------------------------------
+
+/// **The walk this piece exists for: an opened finding travels as an identity, not as content.**
+///
+/// The request's Events section names `security.finding.opened` as the one security event an
+/// operator subscribes to, and that makes it the first security payload on the platform that
+/// fans out to a receiver *outside* the operator's own infrastructure by default. Everything the
+/// REQ does with a finding — its title, its description, its evidence — is content that came
+/// from outside: a package name a CI vendor chose, prose from the report, the raw entry itself.
+/// So the claim to prove is narrow and worth proving against bytes:
+///
+/// 1. ingest a report whose finding carries **recognisable literals in every content field**;
+/// 2. let the platform emit and queue the fan-out to a subscribed endpoint;
+/// 3. read the queued payload back and assert every one of those literals is **absent**,
+///    while the fields a receiver needs to triage are **present**.
+///
+/// A name scan would pass this walk. The literals themselves are the probe — including one
+/// placed where only a careless payload builder would put it: the finding's `note`, a field no
+/// receiver needs and that a future editor could plausibly add without thinking.
+///
+/// **The negatives are not enough on their own**, and the second half of this walk is the part
+/// that catches the emitter that fires nothing: the same report ingested twice must queue a
+/// delivery the *first* time and **none** the second. An emitter on the `upsert` regardless of
+/// its `created` branch passes every containment assertion above while paging a receiver every
+/// morning for a finding that is a year old.
+#[tokio::test]
+async fn an_opened_finding_reaches_a_receiver_as_an_identity_and_not_as_content() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    // Four literals, one per field the emitter could plausibly reach for. They are deliberately
+    // long and recognisable so a substring scan cannot miss a truncated or re-encoded copy.
+    const TITLE_LITERAL: &str = "LIVEVALUE-DEPENDENCY-TITLE";
+    const DESCRIPTION_LITERAL: &str = "LIVEVALUE-REPORT-DESCRIPTION-PROSE";
+    const EVIDENCE_LITERAL: &str = "LIVEVALUE-EVIDENCE-ENTRY";
+    const NOTE_LITERAL: &str = "LIVEVALUE-OPERATOR-NOTE";
+
+    let organization = create_organization_row(&harness.db, "FindingEvents").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(&harness, operator_id, organization, &["security.scan"]).await;
+
+    // An endpoint subscribed to the one name. Its `secret` is a real value and is deliberately
+    // in the table: if any part of the delivery path inlined the endpoint row into the payload,
+    // the literal scan below would catch it.
+    sqlx::query(
+        "insert into webhook_endpoints (organization_id, name, url, secret, events) \
+         values ($1, 'security-events-walk', 'https://example.test/hook', $2, \
+                 array['security.finding.opened'])",
+    )
+    .bind(organization)
+    .bind("whsec_LIVEVALUE_SIGNINGSECRET_0123456789")
+    .execute(harness.db.pool())
+    .await
+    .expect("the subscribed endpoint must exist for the fan-out to mean anything");
+
+    let report = json!({
+        "findings": [{
+            "title": TITLE_LITERAL,
+            "severity": "critical",
+            "description": DESCRIPTION_LITERAL,
+            "component": "walk-dependency",
+            "version": "1.2.3",
+            "fixed_in": "1.2.4",
+            "evidence": EVIDENCE_LITERAL,
+            "note": NOTE_LITERAL,
+        }]
+    });
+
+    let first = harness
+        .call(post(
+            "/api/v1/security/findings/import",
+            json!({ "source": "dependency", "report": report.clone() }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        first.status,
+        StatusCode::OK,
+        "the first ingest must succeed: {}",
+        first.text
+    );
+    assert_eq!(
+        first.body["created"], 1,
+        "the first ingest opens the finding: {}",
+        first.text
+    );
+    assert_eq!(
+        first.body["refreshed"], 0,
+        "nothing was known before: {}",
+        first.text
+    );
+
+    // -- the delivery a subscriber receives ----------------------------------------------------
+    let queued: Vec<(Value, Uuid)> = sqlx::query_as(
+        "select e.payload, d.endpoint_id from webhook_deliveries d \
+         join events e on e.id = d.event_id \
+         where e.name = 'security.finding.opened' and e.organization_id = $1",
+    )
+    .bind(organization)
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the queued delivery must be readable");
+
+    assert_eq!(
+        queued.len(),
+        1,
+        "opening one finding to one subscribed endpoint must queue exactly one delivery, got {}",
+        queued.len()
+    );
+
+    let (payload, endpoint_id) = queued.into_iter().next().expect("checked above");
+    let endpoints: Uuid = sqlx::query_scalar(
+        "select id from webhook_endpoints where organization_id = $1 \
+         and name = 'security-events-walk'",
+    )
+    .bind(organization)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the endpoint row must be readable");
+    assert_eq!(
+        endpoint_id, endpoints,
+        "the delivery must be addressed to the endpoint that subscribed to the name"
+    );
+
+    // THE CLAIM. Values, not column names: a payload that aliased the field, nested it or
+    // inlined it into another string would pass a scan for `"title"` and fail this one.
+    let rendered = payload.to_string();
+    for literal in [
+        TITLE_LITERAL,
+        DESCRIPTION_LITERAL,
+        EVIDENCE_LITERAL,
+        NOTE_LITERAL,
+        "whsec_LIVEVALUE_SIGNINGSECRET_0123456789",
+    ] {
+        assert!(
+            !rendered.contains(literal),
+            "THE LEAK THIS WALK EXISTS FOR: the delivery payload carries the finding's content \
+             ({literal:.24}…). A receiver holds content it cannot un-send."
+        );
+    }
+    // Field names are asserted too — the weaker half, and the one that reads as the strong one
+    // if you stop here. A `title: null` satisfies it while still telling the receiver a title
+    // exists, and the literal scan above is what makes null acceptable rather than fatal.
+    let object = payload.as_object().expect("the payload is an object");
+    for forbidden in ["title", "description", "evidence", "note"] {
+        assert!(
+            !object.contains_key(forbidden),
+            "the payload declares {forbidden}: {rendered}"
+        );
+    }
+
+    // -- the positives, or the walk above passes on a payload nobody can use --------------------
+    let finding_id = payload["finding_id"]
+        .as_str()
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "the payload must carry the finding's id — a receiver cannot open what it cannot \
+                 name: {rendered}"
+            )
+        });
+    assert_eq!(
+        payload["severity"], "critical",
+        "severity is the one thing a receiver cannot compute from an id: {rendered}"
+    );
+    assert_eq!(
+        payload["source"], "dependency",
+        "the receiver must be able to tell a CI report from a platform check: {rendered}"
+    );
+    assert_eq!(
+        payload["component"], "walk-dependency",
+        "the triage triple is the package: {rendered}"
+    );
+    assert_eq!(
+        payload["component_version"], "1.2.3",
+        "…the version present…: {rendered}"
+    );
+    assert_eq!(
+        payload["fixed_in"], "1.2.4",
+        "…and the version that fixes it: {rendered}"
+    );
+
+    // The id must be a **real, readable** finding rather than a string the emitter invented —
+    // otherwise "go look at finding X" sends the receiver to a 404 on every delivery.
+    let stored: Option<String> = sqlx::query_scalar(
+        "select title from security_findings where id = $1 and organization_id = $2",
+    )
+    .bind(finding_id)
+    .bind(organization)
+    .fetch_optional(harness.db.pool())
+    .await
+    .expect("the finding table must be readable");
+    assert_eq!(
+        stored.as_deref(),
+        Some(TITLE_LITERAL),
+        "the delivered id must resolve to the finding that opened: {stored:?}"
+    );
+
+    // -- the emitter must not fire on a finding that was already known ------------------------
+    // This is the half a containment walk cannot supply. A nightly CI job re-ingests the same
+    // report every morning; an endpoint that paged on all of them would be muted by the second
+    // run, and the operator would learn to ignore it — which is the outcome a "webhook" that
+    // works perfectly well has silently produced.
+    let second = harness
+        .call(post(
+            "/api/v1/security/findings/import",
+            json!({ "source": "dependency", "report": report }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        second.status,
+        StatusCode::OK,
+        "the second ingest must succeed: {}",
+        second.text
+    );
+    assert_eq!(
+        second.body["created"], 0,
+        "the finding was already known: {}",
+        second.text
+    );
+    assert_eq!(
+        second.body["refreshed"], 1,
+        "re-ingesting is a refresh, not an opening: {}",
+        second.text
+    );
+
+    let after: i64 = sqlx::query_scalar(
+        "select count(*) from webhook_deliveries d \
+         join events e on e.id = d.event_id \
+         where e.name = 'security.finding.opened' and e.organization_id = $1",
+    )
+    .bind(organization)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the delivery count must be readable");
+    assert_eq!(
+        after, 1,
+        "re-ingesting an already-known finding queued {after} deliveries; it must queue none — \
+         an event that fires on every CI run is an event an operator learns to ignore"
+    );
+
+    harness.dispose().await;
+}
