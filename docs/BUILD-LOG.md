@@ -12027,3 +12027,51 @@ it collide — which is what that limit exists for. The device-block legs from t
 keyboard/mobile legs are therefore still **written, not measured**. Next tick runs the pass first.
 
 Next: the remaining REQ-021 legs, then REQ-016.
+
+## Tick 56 (wave8) · REQ-117 slice 26 — the two arms whose `continue` was the bug, and the batch they starved
+
+**What.** `due_reservations` drops a row in four places. Two of them — no lead left, no source
+left — `continue`d without releasing the claim, on the reasoning their own comment gives:
+*"a reservation whose lead or source is gone is not an error … a sweep that refused to move on
+would retry the same dead row on every tick for ever."* The reasoning is correct and the code
+does the opposite: the claim row stayed `sent: false` with a `due_at` in the past, which is the
+sweep's own WHERE clause, so it was re-read and re-skipped once a minute for ever.
+
+The consequence that is not noise: the sweep is `order by due_at asc, id asc limit N` and an
+orphan is the OLDEST row in the table by construction. Orphans sort to the front of every batch
+and spend its budget on rows the worker cannot send. **Five orphans ahead of one live lead,
+`limit 5`, the sweep returns zero sendable rows** — the live lead is never offered, on any tick.
+
+Reachable from the panel: `crm_leads.source_id` is `on delete set null` (0055), so
+`DELETE /crm/intake/sources/{id}` — the button that retires a form — orphans its pending
+reservations. Third instance of the same defect class after slices 24 and 25, found by reading
+the comment against the code (8 for 8).
+
+**Fix.** Both arms release, `claimed_to` read once at the top of the loop before any arm can
+drop the row. No note is written — there is no source left to name.
+
+**Proof.**
+- `scripts/qa/run-crm-autoresponder.sh` — **15/15** (was 13). Both probes written before the
+  fix and **red on the unmodified source**.
+- **PROVEN TO FAIL at 13/15**: scripted removal of exactly the two added `release_claim` calls
+  (not a revert) — those two assertions red, all thirteen unrelated green.
+- `scripts/qa/run-crm-autoresponder-claim.sh` — 10/10.
+- `cargo test -p omnion-module-crm-intake --lib` — **174**.
+- `cargo build -p omnion-api` green · clippy 0 on both touched files · admin `tsc --noEmit` exit 0.
+- Merged origin/main first (2 commits: the notifications queue producer) — BUILD-LOG merged
+  with `scripts/qa/merge-build-log.py`, 166 entries, both sides intact.
+
+**My own defect, and it is the fifth repeat of this branch's signature test defect in a new
+shape.** The starvation fixture was wrong twice and measured nothing either time. It reserved
+the LIVE lead *first*, so it sorted ahead of the orphans on both keys and **passed against
+unreleased code**. Corrected, it then asserted recovery inside one pass — which the fix cannot
+promise, because the `limit` is applied by Postgres before Rust sees a row, so the tick that
+releases a batch has already spent it. What a release buys is that the *next* tick is clean.
+
+**No browser pass, and none claimed:** no screen changed.
+
+**Next.** REQ-117's remaining open work is slice 3's REQ-064 form-editor card — a cross-writer
+dependency on a module that exists on no branch (checked this tick: `cms_forms` is on
+`wave2-cms` only, and `database/migrations/0125_cms_forms.sql` is not on this branch). REQ-118
+(catalogue/cart/checkout) stays unstarted behind REQ-008's commerce engine, `commerce_products`
+being in zero migrations on any branch.
