@@ -8361,13 +8361,48 @@ async function main() {
   // A pass whose stack died reports `fatal: the QA stack stopped answering` and exits
   // non-zero, which is the opposite of a red pass: it is a no-result run, and a no-result
   // run is re-run rather than acted on.
+  // Three ticks of passes were thrown away on this line, and the reason is that it treats a
+  // TIMEOUT as proof of death. A timeout is not a verdict: this box hosts six writers, and a
+  // Next render under load routinely takes longer than the budget here, so `catch` fired on a
+  // perfectly healthy stack, `return true` was called "stack-gone", and 1,844 real clicks were
+  // discarded with `QA_FINDINGS=0 QA_CLICKS=1844` — a run that measured the entire panel and
+  // reported nothing. The reading has to distinguish three states the old body could not:
+  //
+  //   * answered with a status below 500 -> alive. A 404 or a 401 is the panel REPLYING, and a
+  //     process that is answering is a process that is running. The old body called 5xx dead,
+  //     which is backwards: a 500 is a Next render that threw and came back up, and on this box
+  //     a stack under memory pressure answers 500 while serving everything else fine.
+  //   * refused / reset -> dead. `ECONNREFUSED` and `ECONNRESET` mean nothing is listening, and
+  //     no amount of retrying changes that.
+  //   * timed out -> UNKNOWN, and unknown is not dead. This is retried below with a longer
+  //     budget, and only a timeout that survives every attempt may call the stack gone.
+  //
+  // The third state is the one that needs no extra witness: a timeout that survives all three
+  // budgets is read as gone, because the only way to tell a timeout from a dead port without
+  // retrying is to assume, and this gate has already assumed once and lost three passes to it.
   const stackGone = async () => {
-    try {
-      const res = await context.request.get(`${URL_ADMIN}/login`, { timeout: 8000 });
-      return !res || res.status() >= 500;
-    } catch {
-      return true;
+    // Anything the request can tell us about the connection is decisive; only a timeout is not.
+    let lastErr = null;
+    // The first attempt keeps the old budget so a dead stack is still detected quickly; the
+    // retries widen it, because the failure this fixes is a busy box, not a slow one.
+    for (const timeout of [8000, 15000, 25000]) {
+      try {
+        await context.request.get(`${URL_ADMIN}/login`, { timeout });
+        // The request completed, so the stack answered, and THAT is the whole test. The status
+        // is deliberately not consulted: a 500 from Next is a render that threw and the process
+        // that came back up to send it, which is the opposite of gone, and reading it as death is
+        // what cost three ticks of passes. Anything below 500 is likewise an answer.
+        return false;
+      } catch (err) {
+        lastErr = err;
+        const text = String((err && err.message) || err);
+        // A connection the stack refused or reset is a decision, not a delay.
+        if (/ECONNREFUSED|ECONNRESET|EPIPE|socket hang up|ECONNABORTED/i.test(text)) return true;
+        // Anything else here is a timeout, a proxy hiccup or a DNS blip: retry with more room.
+      }
     }
+    log(`stack liveness: ${lastErr ? String(lastErr.message || lastErr) : "unknown"} after three attempts`);
+    return true;
   };
   report.assertStackAlive = async () => {
     if (await stackGone()) {
