@@ -10952,3 +10952,28 @@ it they were competing for one shared counter — a different failure wearing th
 The sweep is measured again, on the harder case: a walk **killed** rather than panicking left 5
 `omnion_cms_forms_*` databases behind, and the next run took all 5 out. Cleanup that only runs
 on the success path is not cleanup.
+
+**Addendum 2 (same tick) — the same omission, five more files.** Running the converted suites
+surfaced a pattern rather than a bug: `cms_comments`, `cms_newsletter`, `cms_seo`,
+`cms_featured_media` and `cms_members` each declared `const CSRF_SECRET`, derived every request's
+token from it, and **never put it in the `Config` they built**. The deployment under test had no
+secret, so sign-in issued no token and every authenticated write was refused `csrf_unavailable`
+— a code whose message names a deployment problem rather than the suite's omission, which is
+exactly why it survived: the walks that never wrote stayed green and the ones that wrote were
+red for a reason that pointed away from the file. Each had a comment saying the secret "must
+match the `OMNION_CSRF_SECRET` the run script exports" — describing the *token* side and
+skipping the *config* side.
+
+Then the limiter, one file at a time, because a **per-walk database does not fix it**: the
+counters are in one Redis shared by all seven writers, and a sign-in carries no session, so its
+budget is keyed on the peer address. `cms_comments` was 10/12 with both failures inside its own
+`login`; `cms_forms` **hung**; five more files had not caught up. The tell is a failure whose
+stack points at a helper that is not the thing being tested.
+
+**Counts on a clean database, one suite at a time.** `content_blocks` **21/21** (93 s) ·
+`cms_forms` **13/13** (198 s) · `cms_seo` **15/15** (194 s) · `cms_members` **11/11** (124 s).
+
+One reading worth keeping: `cms_newsletter`'s `a_confirmation_link_that_expired_is_refused_and_
+names_the_reason` failed in the shared run and **passes in 33 s on its own**. A suite failing
+only while another suite shares the box is a contention reading, not a defect — and the two look
+identical in a summary line, which is why the re-run is owed a quiet box rather than a fix.
