@@ -31,6 +31,11 @@ omnion-audit = { path = "../../crates/audit" }
 omnion-ai-hub = { path = "../../crates/ai-hub" }
 omnion-automation = { path = "../../crates/automation" }
 omnion-content = { path = "../../crates/content" }
+# Deployment tooling (REQ-128): the release cache, the artifacts, the bundles and the upgrade
+# plan. Its own crate because the decision layer — which steps, in what order, and what is known
+# about whether the database can be rolled back — is a property of the release contract and not of
+# the HTTP layer that renders it.
+omnion-deployment = { path = "../../crates/deployment" }
 omnion-core = { path = "../../crates/core" }
 omnion-events = { path = "../../crates/events" }
 # System health (REQ-014). Its own crate rather than a module of the security centre: the

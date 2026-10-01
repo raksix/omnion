@@ -215,6 +215,21 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "deployment",
         description: "Roll a deployment back",
     },
+    // REQ-128 slice 4 added two, and both are separate powers rather than extra detail on the
+    // ones above:
+    //
+    // * `bundle.generate` writes a row AND shells out to the release pipeline's generator. An
+    //   account that may only read releases must not be able to make the panel run a program;
+    //   giving it `deployment.read` for that would make the read key the most powerful one in
+    //   the deployment family.
+    // * `manage` already exists for the deployment centre's own writes; the upgrade
+    //   acknowledgement rides it rather than inventing a key, because accepting that a database
+    //   can only be restored is the same decision as rolling a deployment back.
+    PermissionDef {
+        key: "deployment.bundle.generate",
+        category: "deployment",
+        description: "Generate an environment bundle and render what it produces",
+    },
     // Identity and access management.
     PermissionDef {
         key: "iam.permissions.read",
@@ -779,6 +794,27 @@ mod tests {
             get("reliability.manage").map(|entry| entry.description),
             get("reliability.intake.manage").map(|entry| entry.description),
             "two powers with one description are one power written twice"
+        );
+    }
+
+    #[test]
+    fn the_deployment_family_is_catalogued_and_generation_is_separate_from_reading() {
+        for key in [
+            "deployment.read",
+            "deployment.preview",
+            "deployment.deploy",
+            "deployment.rollback",
+            "deployment.bundle.generate",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+        }
+        // The bundle generator shells out to a program and writes a row, so it may not ride the
+        // read key. This is asserted rather than assumed because a route that guarded a
+        // subprocess with `deployment.read` would be green in every catalogue test and be the
+        // most powerful key in the family.
+        assert_ne!(
+            "deployment.bundle.generate", "deployment.read",
+            "generation is a write, not a read"
         );
     }
 

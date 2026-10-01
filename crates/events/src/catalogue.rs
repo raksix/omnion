@@ -428,6 +428,29 @@ catalogue! {
     "secrets.deployment_key_revoked", "secrets", Live,
     "A deployment key was revoked.",
     [("deployment_key_id", Uuid, req), ("name", String, req), ("reason", String, opt)];
+    // ---- Deployment tooling (REQ-128) ------------------------------------------------------------
+    // Three of the request's six names. `release.artifact.published` and `release.manifest.updated`
+    // belong to the update check that FETCHES a manifest, which is REQ-024's fetch and not this
+    // request's cache; they are declared there rather than here so a name is not in two places.
+    // `deployment.bundle.downloaded` is a download counter, not a fact anybody subscribes to, and
+    // it is deliberately NOT declared: an event that lands in every webhook for a file download
+    // is noise in the one channel the request calls out as worth subscribing to.
+    //
+    // The payloads carry versions, digests and flags — never a file body and never a credential,
+    // because these names are exactly the two an operator watching a fleet of installs
+    // subscribes to.
+    "deployment.bundle.generated", "deployment", Live,
+    "An environment bundle was generated for a target.",
+    [("bundle_id", Uuid, req), ("name", String, req), ("kind", String, req),
+     ("version", String, req), ("checksum", String, opt)];
+    "deployment.upgrade_plan.created", "deployment", Live,
+    "An upgrade plan was generated from the running version to a cached release.",
+    [("from_version", String, req), ("to_version", String, req), ("topology", String, req),
+     ("destructive_verdict", String, req), ("migrations", Integer, opt)];
+    "deployment.upgrade_plan.acknowledged", "deployment", Live,
+    "An operator accepted a range's destructiveness warning.",
+    [("plan_id", Uuid, req), ("from_version", String, req), ("to_version", String, req),
+     ("verdict", String, req)];
     "secrets.root_key_rotated", "secrets", Live,
     "The root encryption key was rotated and existing versions were re-wrapped.",
     [("job_id", Uuid, req), ("from_key_id", Uuid, opt), ("to_key_id", Uuid, opt),

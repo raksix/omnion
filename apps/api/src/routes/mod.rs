@@ -80,9 +80,12 @@ pub mod analytics;
 pub mod auth;
 pub mod automation;
 pub mod backups;
-pub mod restore_jobs;
 pub mod commands;
 pub mod content;
+pub mod restore_jobs;
+// Deployment tooling (REQ-128, slice 4). The release cache, the artifact list, the bundle
+// generator and the upgrade plan.
+pub mod deployment;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -105,13 +108,13 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
+pub mod notifications;
+pub mod notifications_admin;
+pub mod notifications_test;
 pub mod observability;
 pub mod observability_alerts;
 pub mod observability_overview;
 pub mod observability_traces;
-pub mod notifications;
-pub mod notifications_admin;
-pub mod notifications_test;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
@@ -121,13 +124,13 @@ pub mod reliability_limits;
 pub mod reliability_retries;
 pub mod scim;
 pub mod search;
-pub mod security;
-pub mod security_headers;
-pub mod security_limiter;
 pub mod secrets;
 pub mod secrets_audit;
 pub mod secrets_credentials;
 pub mod secrets_leases;
+pub mod security;
+pub mod security_headers;
+pub mod security_limiter;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
@@ -1185,8 +1188,65 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/health/maintenance-windows/{id}",
-            delete(health_incidents::delete_window)
-                .layer(guards::require(&state, "health.manage")),
+            delete(health_incidents::delete_window).layer(guards::require(&state, "health.manage")),
+        )
+        // The deployment centre's release surface (REQ-128, slice 4).
+        //
+        // Three permissions, and the split is the one the request draws: reading what this
+        // install is running and what releases exist is `deployment.read`; GENERATING a bundle
+        // writes a row and shells out to the pipeline's generator, so it is its own key and it
+        // is rate limited; acknowledging a destructive-migration warning is `deployment.deploy`,
+        // the same power that rolls the workloads, because accepting that the database can only
+        // be restored is part of deciding to deploy.
+        //
+        // `deployment.deploy` and NOT a `deployment.manage`: the family has `read`, `preview`,
+        // `deploy` and `rollback`, and a guard naming a key outside the catalogue refuses EVERY
+        // account in the installation — the acknowledgement route would have answered 403 to the
+        // instance owner, and every unit test in `omnion-deployment` would still have been green
+        // because none of them builds a router. The integration walk caught it on its first run.
+        //
+        // `/deployment/upgrade-plan/acknowledge` is registered BEFORE `/deployment/artifacts/{version}`
+        // would ever shadow it — axum's router prefers a literal segment over a capture, so the
+        // order here is documentation rather than a requirement, and the comment says so rather
+        // than implying the position matters.
+        .route(
+            "/deployment/artifacts",
+            get(deployment::list_artifacts).layer(guards::require(&state, "deployment.read")),
+        )
+        .route(
+            "/deployment/artifacts/{version}",
+            get(deployment::read_release).layer(guards::require(&state, "deployment.read")),
+        )
+        .route(
+            "/deployment/bundles",
+            get(deployment::list_bundles)
+                .layer(guards::require(&state, "deployment.read"))
+                .merge(
+                    post(deployment::create_bundle)
+                        .layer(guards::require(&state, "deployment.bundle.generate")),
+                ),
+        )
+        .route(
+            "/deployment/bundles/{id}",
+            get(deployment::read_bundle).layer(guards::require(&state, "deployment.read")),
+        )
+        .route(
+            "/deployment/bundles/{id}/files/{name}",
+            get(deployment::download_bundle_file).layer(guards::require(&state, "deployment.read")),
+        )
+        .route(
+            "/deployment/bundles/{id}/render",
+            post(deployment::render_bundle)
+                .layer(guards::require(&state, "deployment.bundle.generate")),
+        )
+        .route(
+            "/deployment/upgrade-plan",
+            get(deployment::read_upgrade_plan).layer(guards::require(&state, "deployment.read")),
+        )
+        .route(
+            "/deployment/upgrade-plan/acknowledge",
+            post(deployment::acknowledge_upgrade_plan)
+                .layer(guards::require(&state, "deployment.deploy")),
         )
         .route(
             "/security/overview",
@@ -1273,12 +1333,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/reliability/rate-limits/evaluate",
-            post(reliability_limits::evaluate)
-                .layer(guards::require(&state, "reliability.manage")),
+            post(reliability_limits::evaluate).layer(guards::require(&state, "reliability.manage")),
         )
         .route(
             "/reliability/rate-limits/refusals",
-            get(reliability_limits::list_refusals).layer(guards::require(&state, "reliability.read")),
+            get(reliability_limits::list_refusals)
+                .layer(guards::require(&state, "reliability.read")),
         )
         .route(
             "/reliability/rate-limits/{id}",
@@ -1384,7 +1444,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(
                     patch(security::patch_status).layer(guards::require(&state, "security.manage")),
                 ),
-    );
+        );
     let analytics_reports = Router::new()
         .route("/analytics/overview", get(analytics::overview))
         .route("/analytics/pages", get(analytics::pages))
@@ -1473,8 +1533,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/reliability/intake/rejections",
-            get(reliability_intake::rejections)
-                .layer(guards::require(&state, "reliability.read")),
+            get(reliability_intake::rejections).layer(guards::require(&state, "reliability.read")),
         )
         .route(
             "/reliability/intake/{id}",
@@ -2175,7 +2234,9 @@ pub fn router(state: AppState) -> Router {
         // The request log stays outside the limiter (see the bottom of this chain) so a request
         // BURNED the budget is still a line an operator can find — a rate-limited request with no
         // log line is the one rejection the log cannot answer questions about.
-        .layer(crate::rate_limit_middleware::rate_limit(limiter_layer.clone()))
+        .layer(crate::rate_limit_middleware::rate_limit(
+            limiter_layer.clone(),
+        ))
         // The platform budgets sit INSIDE the gateway limiter, so a caller over both budgets is
         // refused by the outer one and the operator's first stop is the document they configured
         // first. The reverse order would mean the newer, less-tuned layer always wins, and a

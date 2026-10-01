@@ -1,0 +1,20 @@
+[package]
+name = "omnion-deployment"
+description = "Omnion deployment tooling: the release manifest cache, artifact rows, environment bundles and upgrade plans."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Infrastructure like `omnion-telemetry` and `omnion-audit`: it knows what a release manifest
+# is and what an upgrade plan must refuse to claim, and nothing about any one cloud. The
+# decision layer (which steps, in what order, with what verdict) is a property of the release
+# contract, so it lives here rather than in the HTTP layer that renders it.
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true

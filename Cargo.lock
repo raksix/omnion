@@ -1369,6 +1369,7 @@ dependencies = [
  "omnion-backup",
  "omnion-content",
  "omnion-core",
+ "omnion-deployment",
  "omnion-events",
  "omnion-health",
  "omnion-identity",
@@ -1485,6 +1486,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omnion-deployment"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
