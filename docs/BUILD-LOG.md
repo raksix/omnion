@@ -12628,3 +12628,89 @@ with the disk at 99%.
 **Next:** the `/developer/oauth-apps` panel screen and its walkthrough route — the last item
 between slice 3 and a QA pass. Then the catalogue rows, once the three waves that emit those
 names describe their payloads.
+
+## Tick 111 — REQ-033 slice 3: the panel screen, the catalogue, and a deep link that went nowhere
+
+Two code items closed the slice, and both started from the same discovery: **tick 110 had built
+`/developer/oauth-apps` and the REQ file never learned it.** Three lines in REQ-033 still said the
+screen was unbuilt. That is worse than having no status — the next writer reads it, believes the
+screen does not exist, and rebuilds it. `f26b96d8` corrects it, and the correction is a real check
+rather than a note: the pass names 33 `data-oauth-app-*` hooks and the view carries all 33,
+cross-checked hook-for-hook, because a rename on either side leaves a pass that measures the
+*previous* screen and reports it green. That cross-check is now
+`scripts/qa/probe-dev-event-screen.cjs`'s first job for the catalogue screen.
+
+### The deep link
+
+`/developer/events` (`6e994015`) is the developer framing of the registry, and it is deliberately
+**not** a second copy of `/events`. REQ-016's screen answers "what happened?" — a feed, a window, a
+cursor, a retention panel. This one answers "what CAN happen, and what will I receive when it
+does?" for someone writing a subscriber, so it keeps the deep link, the copyable schema and the
+server-generated sample, and drops the feed. Both read the same compiled registry, so the two
+screens cannot disagree about what the platform knows; they differ on the question.
+
+**The Subscribe link was a dead button.** It points at `/webhooks/new?event=<name>`, and
+`EndpointForm` read no query parameter at all. The link landed on a working page and did nothing —
+invisible to a route walk, because the route is fine, and invisible to every compile-time gate. Two
+rules make it honest now: it applies **once** and **only when creating**, because a deep link must
+not silently add a subscription to an endpoint that is already live and already delivering; and it
+applies **after** the catalogue arrives, because the subscribable set is the live names only, so a
+reserved name in the URL is simply not found — the correct outcome, not a case to handle.
+
+**`useSearchParams` costs a Suspense boundary on every route that renders the form**, not only the
+one the link points at. `/webhooks/new` and `/webhooks/[id]/edit` were both outside one. `tsc` is
+green either way; the failure is at build time, which is why `next build` ran as a gate this tick.
+
+### A colour that does not exist
+
+The error banner used `text-danger`. **This palette has no `--color-danger`** — it is `caution`. A
+class defined nowhere is still a well-formed Tailwind class, so the banner renders in the
+*inherited* colour: an error that does not look like one. The main writer's media probe found this
+exact class in `scanning-view.tsx` and `file-detail.tsx` (tick 101); finding it a second time, in
+new code, on a different wave, is the argument for a gate rather than a note. The probe now checks
+a developer surface's hooks against the pass **and** its colour tokens against `globals.css`, and
+it is proven to fail in both directions — `text-danger` reinstated fails 2 of 22, and
+`data-dev-event-not-subscribable` renamed fails the hook check. Both mutations were reverted and
+the view verified byte-identical afterwards, because a probe that leaves the tree dirty proves
+nothing about the tree it restored.
+
+### The pass can fail
+
+`runDevEventsDepth` (`318321cd`) carries fourteen claims, and the shape is the point.
+`runDepthPass` reports failure only on a **thrown** error and `run.sh` reads only `summary.json`,
+so the tempting shape — append booleans to a `steps` object and return it — produces fourteen
+numbers that nothing ever reads. Several older passes in this file have exactly that shape. Each
+claim here is `check(name, value)` and the pass throws naming the ones that did not hold.
+
+Two claims are inverses of each other on purpose: `theDefaultScopeHidesReserved` is satisfied by a
+scope filter that does *nothing*, so `theReservedScopeShowsOnlyReserved` has to be asserted too.
+And `theDeepLinkPreselectsTheEvent` follows the link and checks the ticked box carries the event's
+**name**, not merely that some box is ticked — a form that ticked a different subscription would
+satisfy a count, and the count is the weaker claim.
+
+`theSampleCoversEveryRequiredField` is the one that can fail while both halves are valid JSON: it
+compares the sample's keys against the schema's `required` list rather than counting fields, so a
+registry that gained a required field without regenerating its sample shows up on screen and
+nowhere else.
+
+### Gates
+
+| Gate | Command | Result |
+|---|---|---|
+| developer | `cargo test -p omnion-developer --features store --lib --quiet` | **128 passed**, 0 failed |
+| media (merged) | `cargo test -p omnion-media --lib --quiet` | **248 passed**, 0 failed |
+| oauth contract | `node scripts/qa/probe-oauth-contract.cjs` | **56/56** |
+| dev-event screen | `node scripts/qa/probe-dev-event-screen.cjs` | **22/22**, proven to fail 2/22 both ways |
+| types | `pnpm typecheck` | **2 successful, 2 total** |
+| build | `next build` (apps/admin) | compiled; `/developer/events` in the route list |
+| syntax | `node --check` (walkthrough, probe) | clean |
+
+**Browser pass: not owed.** Not a close tick, and the global QA slot is held by a live `w3` run
+(holder pid 2914377, cwd `/mnt/apopic/omnion-w3`). `/mnt/apopic` is at 100% with 501 MB free, so a
+pass launched now would measure the box. The work is committed and queued rather than reported as a
+pass that never ran.
+
+**Next:** the browser pass over `/developer/oauth-apps` and `/developer/events` — the single thing
+now standing between slice 3 and `done`. Then the catalogue rows for the ten emitted-but-unregistered
+names (`update.available`, `organization.module.*`, `organization.member.*`), which stay red on
+purpose until the three waves that emit them describe their payloads.
