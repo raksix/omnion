@@ -1013,6 +1013,87 @@ async function awaitEdgeSelection(page, { attempts = 12, interval = 250 } = {}) 
   return { selected: await read(), appeared: false, attempts };
 }
 
+/**
+ * The node-side twin of `awaitEdgeSelection`, for the same reason and with the same contract.
+ *
+ * "Click a card, wait a fixed 500ms, count `[data-node-selected='true']`" cannot tell a click that
+ * missed the card from one that landed on a canvas that had not repainted, and the locked-builder
+ * row reported those two as one number. It is also not a *write* gesture — a selection changes no
+ * graph — so it is outside the class `settleGraph` covers, which is exactly the gap that let the
+ * fixed sleep survive there while the guard for write gestures ran beside it.
+ *
+ * The name is deliberately not "awaitSelection": a connection selection writes
+ * `[data-edge-selected]` and a node selection writes `[data-node-selected]`, they are mutually
+ * exclusive on a canvas, and the defect this guards against is reading the wrong one — which is
+ * what `undo-selection`'s sibling row documents at length.
+ */
+async function awaitNodeSelection(page, { attempts = 12, interval = 250 } = {}) {
+  const read = () =>
+    page
+      .evaluate(() => document.querySelectorAll("[data-node-selected='true']").length)
+      .catch(() => 0);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const selected = await read();
+    if (selected > 0) return { selected, appeared: true, attempts: attempt + 1 };
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  return { selected: await read(), appeared: false, attempts };
+}
+
+/**
+ * Wait long enough that a write which WAS going to happen would have happened.
+ *
+ * ## The negative case, and why it needs its own helper
+ *
+ * Every other settle helper in this file waits for a change to arrive. This one waits for a
+ * change to stay ABSENT, and those are opposites: the write-gesture guard added in tick 63 found
+ * the locked-builder row asserting `Del` and `Control+z` do nothing while reading the graph after
+ * `waitForTimeout(600)` — shorter than `AUTOSAVE_MS` (1_200). That is not a fast lock, it is an
+ * unwritten graph, and the two look identical: every number identical, banner present, verdict
+ * "the lock held". **A negative assertion measured before the write window closes is not a
+ * negative assertion.**
+ *
+ * ## Why this is not `settleGraph`
+ *
+ * `settleGraph` takes a version and waits for it to MOVE, so on a lock that works it returns
+ * `settled: false` after burning the whole budget — the right answer to the wrong question. This
+ * helper instead waits out a full debounce window with margin, and then reports the version it
+ * saw. The caller still asserts the graph did not change; this only guarantees the reading was
+ * taken late enough that a change *would* have been visible, so `unchanged: true` means "the
+ * write was given its chance and did not come" rather than "nobody waited".
+ *
+ * The margin is not decorative: the lock's own repaint, the click handler's async guard and the
+ * autosave timer can all land in either order, and a window equal to `AUTOSAVE_MS` is the same
+ * boundary race tick 62 found at `waitForTimeout(1200)`.
+ */
+async function awaitGraphUnchanged(page, readGraph, versionBefore, { windowMs = 3000 } = {}) {
+  const deadline = Date.now() + windowMs;
+  // Poll the whole way out rather than sleeping once: the point is not the final reading but the
+  // knowledge that no version ever moved inside the window, which is what makes "unchanged" a
+  // statement about the server rather than about the instant it was asked.
+  let moved = false;
+  let after = null;
+  while (Date.now() < deadline) {
+    after = await readGraph().catch(() => null);
+    if ((after?.graph_version ?? 0) !== versionBefore) {
+      moved = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  if (!moved) after = await readGraph().catch(() => null);
+  return {
+    graph: after,
+    versionBefore,
+    versionAfter: after?.graph_version ?? null,
+    observedForMs: windowMs,
+    // The whole point: `unchanged` here means "the write was given its chance and did not come",
+    // not "nobody waited". A caller that ignores this can report a lock as held on an unwritten
+    // graph.
+    unchanged: !moved,
+  };
+}
+
 async function interact(page, pageName, report) {
   const inventory = () =>
     page.evaluate((max) => {
@@ -11850,11 +11931,25 @@ async function runWorkflowBuilderDepth(page, report) {
 
   // Undo removes the node the keyboard just added, and the *server* agrees — an undo that
   // only rewinds the screen would save a graph the canvas no longer shows.
+  //
+  // **AND WAIT FOR THE WRITE.** This used to be `waitForTimeout(900)`, which is shorter than
+  // `AUTOSAVE_MS` (1_200) — so it read the canvas *before* the autosave it was asserting had
+  // happened. `returned` compares a DOM count that the undo repaints optimistically, which is
+  // why the row could go green against a server that never received the write.
+  const versionBeforeUndoKey = (await readGraph().catch(() => null))?.graph_version ?? 0;
   await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
   await page.keyboard.press("Control+z");
-  await page.waitForTimeout(900);
+  const undoKeyWrite = await settleGraph(page, readGraph, versionBeforeUndoKey);
   const afterUndo = await page.locator("[data-node-id]").count();
-  note({ step: "undo", afterUndo, returned: afterUndo === nodesBeforeKeyboardAdd });
+  note({
+    step: "undo",
+    afterUndo,
+    returned: afterUndo === nodesBeforeKeyboardAdd,
+    // The server's own count is the authority for the same reason it is on the edge rows: a
+    // canvas can rewind without a graph ever being written.
+    nodesOnServer: undoKeyWrite.graph?.node_count ?? null,
+    writeSettled: undoKeyWrite.settled,
+  });
 
   // A POINTER DRAG is undoable — the half the row above could never answer.
   //
@@ -11913,9 +12008,14 @@ async function runWorkflowBuilderDepth(page, report) {
     await page.waitForTimeout(500);
     const afterX = await cardX();
     const undoEnabledAfterDrag = (await undoDisabled()) === null;
+    // **AND WAIT FOR THE WRITE**, for the same reason the key-undo row above does: the undo of a
+    // drag is `doUndo` → `queueSave`, so the server has to have the position before the row can
+    // claim the graph went back. The 900ms this replaces is shorter than `AUTOSAVE_MS`, so the
+    // old reading was of a canvas the undo had repainted and a server that had not been told.
+    const versionBeforeDragUndo = (await readGraph().catch(() => null))?.graph_version ?? 0;
     await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
     await page.keyboard.press("Control+z");
-    await page.waitForTimeout(900);
+    const dragUndoWrite = await settleGraph(page, readGraph, versionBeforeDragUndo);
     const afterUndoX = await cardX();
     dragUndoNote = {
       attempted: true,
@@ -11926,6 +12026,9 @@ async function runWorkflowBuilderDepth(page, report) {
       undoEnabledAfterDrag,
       afterUndo: afterUndoX,
       returned: afterUndoX === beforeX,
+      // `returned` is a reading off the canvas, which the undo repaints optimistically. Without
+      // this field it is also the answer for a graph the server was never told about.
+      writeSettled: dragUndoWrite.settled,
     };
   }
   note({ step: "drag-undo", ...dragUndoNote });
@@ -12169,8 +12272,22 @@ async function runWorkflowBuilderDepth(page, report) {
     // The gesture under test. `Control+z` is the same key the `drag-undo` row uses, but the
     // reading is on the selection rather than the position, and this one undoes an ADD rather
     // than a drag.
+    //
+    // **AND WAIT FOR THE WRITE TO LAND.** This used to be `waitForTimeout(1200)` and a single
+    // read, and 1200 is exactly `AUTOSAVE_MS` — so the row was racing the debounce it was
+    // measuring and `cardRemovedByUndo` was decided by which side of a timer the autosave fell
+    // on. Tick 62 found that same shape in the undo's three siblings and fixed them; this is
+    // the FOURTH site, and it survived because the fix was written from the row that reported
+    // it rather than from a search for the pattern. That is the actual lesson: fixing the sites
+    // a report names leaves every unnamed site holding the defect.
+    //
+    // The witness is the server's `graph_version`, for the reason `settleGraph` documents —
+    // an unwritten graph is STABLE, so counting cards cannot tell "the undo has not been
+    // saved yet" from "the undo saved nothing", and the first is what a 1200ms sleep guesses
+    // at. `writeSettled: false` below says which of those two readings the fields are about.
+    const versionBeforeUndoAdd = (await readGraph().catch(() => null))?.graph_version ?? 0;
     await page.keyboard.press("Control+z");
-    await page.waitForTimeout(1200);
+    const undoAddWrite = await settleGraph(page, readGraph, versionBeforeUndoAdd);
     const postRead = await page
       .evaluate((victim) => {
         const selectionTextEl = document.querySelector("[data-builder-selection]");
@@ -12194,6 +12311,16 @@ async function runWorkflowBuilderDepth(page, report) {
       cardsBefore,
       cardWasSelected: undoSelVictim !== null,
       toolbarOfferedTheSelection: preRead.duplicateEnabled && preRead.copyEnabled,
+      // **READ THIS FIRST, FOR THE SAME REASON `runSettled` IS.** Every field below describes
+      // a canvas and a selection that the autosave rewrites, and this row used to read them
+      // 1200ms after the keypress — exactly `AUTOSAVE_MS`. A canvas whose debounce has not
+      // fired IS stable, so the old wait was satisfied by the very state it existed to rule
+      // out. `writeSettled: false` means the write never arrived, and the readings under it are
+      // then about a graph nobody has committed yet — `cardRemovedByUndo: true` on a false here
+      // would be a card that vanished from the canvas without the undo ever having been saved.
+      writeSettled: undoAddWrite.settled,
+      graphVersionBefore: versionBeforeUndoAdd,
+      graphVersionAfter: undoAddWrite.graph?.graph_version ?? null,
       // The undo actually removed the card the selection named. If this is false the rest of
       // the row is about a graph that still holds the node.
       cardRemovedByUndo: postRead.victimStillDrawn === false,
@@ -13929,12 +14056,27 @@ note({
 
     // Five mutations, three by pointer and two by key. Each one is followed by a read of the
     // server's copy, and a lock that refused them all leaves every number identical.
+    //
+    // **THE READS BELOW MUST OUTLAST THE WRITE WINDOW, AND THESE TWO DID NOT.** The key
+    // gestures were followed by `waitForTimeout(600)` / `(800)` — both *shorter* than
+    // `AUTOSAVE_MS` (1_200) — so this row was asserting that a write did NOT happen before the
+    // autosave that would have performed it had any chance to run. A working lock and an
+    // unsaved graph are byte-identical readings: every number unchanged, banner present, verdict
+    // "read-only". **A negative assertion measured before the write window closes is not a
+    // negative assertion** — the mirror of the 1200ms race tick 62 found, and the reason
+    // `awaitGraphUnchanged` exists rather than another `settleGraph`.
+    const versionBeforeLockKeys = (await readGraphAgain().catch(() => null))?.graph_version ?? 0;
     await page.locator("[data-palette-node='wait']").first().click({ timeout: 4000, force: true }).catch(() => {});
-    await page.waitForTimeout(600);
+    // `settleCanvasCards` for the DOM read and `awaitGraphUnchanged` for the server read, because
+    // they answer different questions. The card count is a reading of the CANVAS, which repaints
+    // optimistically; the version is a reading of the SERVER, which only the autosave moves. A
+    // fixed sleep was standing in for both at once, which is how one number came to serve as
+    // evidence for two unrelated claims.
+    await settleCanvasCards(page);
     const afterAddAttempt = await page.locator("[data-node-id]").count();
 
     await page.keyboard.press("Delete");
-    await page.waitForTimeout(600);
+    await settleCanvasCards(page);
     const afterDeleteKey = await page.locator("[data-node-id]").count();
 
     await page.keyboard.press("c");
@@ -13946,7 +14088,9 @@ note({
     await page.waitForTimeout(300);
 
     await page.keyboard.press("Control+z");
-    await page.waitForTimeout(800);
+    // Give the key gestures a full debounce window and read the version they would have moved.
+    // `undoRefused` below is then a claim about the server, not about an instant.
+    const lockKeysWindow = await awaitGraphUnchanged(page, readGraphAgain, versionBeforeLockKeys);
 
     // And the control the criterion names at the end: a locked builder must still be
     // *readable*, so a card can be selected and the inspector still shows the node's state.
@@ -13955,10 +14099,17 @@ note({
     );
     let selectable = null;
     let inspectorStillReads = null;
+    let selectionAppeared = null;
     if (kbNodeIds.length > 0) {
       await page.locator(`[data-node-id="${kbNodeIds[0]}"]`).first().click({ timeout: 4000 }).catch(() => {});
-      await page.waitForTimeout(500);
-      selectable = await page.locator("[data-node-selected='true']").count();
+      // Wait for the SELECTION to appear rather than for a duration to elapse — and report
+      // whether it did, because "the card was not selectable" and "the click landed on a canvas
+      // that had not repainted" are the same count and different defects.
+      const lockedSelection = await awaitNodeSelection(page);
+      selectionAppeared = lockedSelection.appeared;
+      selectable = lockedSelection.appeared
+        ? await page.locator("[data-node-selected='true']").count()
+        : 0;
       inspectorStillReads = await page
         .locator(`[data-inspector="${kbNodeIds[0]}"]`)
         .first()
@@ -14005,11 +14156,24 @@ note({
       edgesBefore: beforeEdges,
       edgesAfter: afterEdges,
       edgesUnchanged: beforeEdges === afterEdges,
+      // `beforeVersion` is the version the row started at; `lockKeysWindow` is the version after
+      // the key gestures were given a full write window. Reading it from the window rather than
+      // from the final `readGraphAgain()` is deliberate — the final read happens after more
+      // viewport and selection work, and the claim is about the key gestures.
       undoRefused: beforeVersion === afterVersion,
+      // Whether that version was ever MOVED during the window. `undoRefused` on its own is also
+      // the answer for a graph nobody had time to write, and this is the field that separates
+      // "the lock refused the undo" from "the undo was never given its chance".
+      keysWriteWindowMs: lockKeysWindow.observedForMs,
+      versionDuringKeyWindow: lockKeysWindow.versionAfter,
+      keysUnchangedDuringWindow: lockKeysWindow.unchanged,
       versionBefore: beforeVersion,
       versionAfter: afterVersion,
       // Read-only is not unusable.
       cardStillSelectable: selectable,
+      // Whether the selection ever appeared, so `cardStillSelectable: 0` is not also the answer
+      // for a click that landed on a canvas that had not repainted.
+      selectionAppeared,
       inspectorStillReads,
       tableMode: tableSaves,
     });
