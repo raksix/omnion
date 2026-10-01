@@ -1,21 +1,53 @@
 # REQ-055 — HR
 
-> **Status:** in-progress (slice 2d — the CLOCK: migration `0206_hr_attendance.sql` with one row
-> per employee per day, the uniqueness being what makes a second punch answerable without a race
-> and an API retry idempotent; `check_out > check_in` and "a day has a punch" as facts in the schema
-> rather than rules the service is trusted to apply; the module's check-in/check-out/correct plus
-> the month projection with `minutes_worked` derived on read and never accepted as an input; **ten**
-> routes split in two — `/hr/me/*` (check-in, check-out, month, export) with **no `route_layer` at
-> all**, because the person pressing the button is an employee and an employee holds no `hr.*` key,
-> while `/hr/attendance/*` (roster, summary, export, corrections) is behind `hr.attendance.*` and
-> refuses **by key name** rather than a generic code — and two screens, `/hr/me/attendance` (the
-> punch button reflecting the DAY's state rather than being a constant, the 409 rendering the punch
-> the server found) and `/hr/attendance` (the organization's day, with the exception badges never
-> carrying meaning in hue alone). Commits `0c01b1a8`, `242d6aae`, `b0832292`.
+> **Status:** in-progress (slice 3 + slice 1's missing screens — the PEOPLE CORE and the clock's
+> verdict)
 >
-> **Two defects, and the first is the one that mattered.** 1. The migration was **half-guarded**:
-> the table had `if not exists`, the three indexes below it did not, so the file applies on a clean
-> database — and then wedges every database where the schema arrived by another route with
+> **Two things this tick, and the first one is a gap four writers should know about.**
+>
+> **1. Slice 1 had shipped an API with no screen at all.** The migration, the eleven routes, the
+> store, the org chart and the merge had existed since the first days of the module — and the
+> module's own nav said so in a comment and pointed at three surfaces instead of five. Leave,
+> attendance and onboarding are all rows that point at a person, and the person could not be seen.
+> This tick builds the two screens slice 1 named (`/hr/employees`, `/hr/departments` — the tree
+> and the org chart on one screen), the client behind them (eleven calls, placed **above** the
+> leave section because the file's header described a module that could not see an employee), and
+> the two nav entries. Commits `30411d95`, `48c8dbe8`.
+>
+> **2. The shared database has been down for hours, so this writer stood up its own.** The
+> container on 5433 that all ten writers share is wedged in crash recovery — `docker inspect` still
+> reports `running / restarts=0 / oom=false` while every connection is refused, which is exactly
+> the shape that sends somebody hunting for a product bug. **It was not restarted**: restarting a
+> shared database is not a local decision, and nine sibling passes would have been taken down by
+> it. Instead this worktree runs a private PostgreSQL 17 on **127.0.0.1:5444** (`omnion-pg-w4`,
+> its own volume, bound to loopback), and both the DB walks and the browser pass are pointed at
+> it. Nothing about that touches the shared instance.
+>
+> **The verdict the last tick owed, at last: `hr_attendance` is 10/10 green** in 215 s against the
+> private instance — ten refusals and facts, not ten renderings: the day is the organization's and
+> not the browser's, a check-out without a check-in is refused, a second punch is refused *with the
+> punch it found*, an account holding no `hr.*` key punches and reads its own day, and somebody
+> else's month is refused in both directions. The attendance criterion is ticked on that basis.
+>
+> **Proof so far:** `cargo test -p omnion-module-hr` **87/87**; `hr_attendance` **10/10**; real
+> `tsc -p tsconfig.json --noEmit` **exit 0**; `node --check` on the harness clean.
+>
+> **Next:** the browser pass for the two new screens, then slice 3 proper (onboarding templates,
+> documents, reports) and slice 4, which closes REQ-055.
+>
+> **Previous: slice 2d — the CLOCK.** Migration `0206_hr_attendance.sql` with one row per employee
+> per day, the uniqueness being what makes a second punch answerable without a race and an API
+> retry idempotent; `check_out > check_in` and "a day has a punch" as facts in the schema rather
+> than rules the service is trusted to apply; the module's check-in/check-out/correct plus the
+> month projection with `minutes_worked` derived on read and never accepted as an input; **ten**
+> routes split in two — `/hr/me/*` with **no `route_layer` at all**, because the person pressing
+> the button is an employee and an employee holds no `hr.*` key, while `/hr/attendance/*` is
+> behind `hr.attendance.*` and refuses **by key name** — and two screens. Commits `0c01b1a8`,
+> `242d6aae`, `b0832292`.
+>
+> **And two defects from it.** 1. The migration was **half-guarded**: the table had
+> `if not exists`, the three indexes below it did not, so the file applies on a clean database —
+> and then wedges every database where the schema arrived by another route with
 > `42P07 relation "hr_attendance_employee_day_uniq" already exists`. The error aborts the file, so
 > the ledger never records version 206, so every later `migrate()` walks into it again: **ten
 > walks, all dying in setup before a single assertion ran.** Guarding the indexes makes the file
@@ -25,12 +57,8 @@
 > everything — a nested route lit the tab a person was not looking at. It now sorts descending and
 > takes the first match on a **segment** boundary.
 >
-> **Proof so far:** `cargo test -p omnion-module-hr` **87/87**; the real `tsc` binary **exit 0**
-> (not `npx tsc | tail`, which has twice now reported green having checked nothing).
->
-> **Still unticked: the attendance criterion AND every browser box.** The ten DB walks are
-> committed but have never returned a verdict: the box ran at load **215** — four processes in
-> D-state, both disks 95–98 %, ten writers and three Chromes on six cores — and `ss` shows the
+> **The walk that owed a verdict then ran into starvation:** D-state, both disks 95–98 %, ten
+> writers and three Chromes on six cores — and `ss` showed the
 > test process on a Postgres socket with `Recv-Q 325` and **zero CPU ticks over 20 s**, i.e. the
 > client waiting on a server with no cycles. Starved, not failing. The QA slot is held by a live
 > `w6` pass, the third tick running. Previous: slice 2c — the SELF-SERVICE surface: eight
@@ -228,7 +256,7 @@ Webhook relevance: `hr.leave.approved` is consumed by the calendar module (absen
 - [x] A request beyond the remaining balance is refused unless the type allows negative balances, and the balance card shows entitled/used/pending/remaining consistently before and after the decision. *(Slice 2: `hr.leave.manage` owns the type, so a caller who can request leave cannot raise the entitlement they are measured against — the walk asserts that refusal. The balance is **recomputed** from the request rows inside the decision transaction, never incremented; the walk's `assert_card_adds_up` checks `entitled = used + pending + remaining` at every step (fresh, pending, after approval, after a refused second decision, after a cancellation), which is the only assertion that catches a drifting increment. An unpaid type, and any type with `allow_negative`, skip the check entirely — refusing "unpaid leave" against a 0-day entitlement would refuse the one leave type that is always allowed. A type nobody has used yet still shows its entitlement, with `seeded: false`, so the select does not quietly lose every type nobody has taken.)*
 - [x] Approving a request updates `used_days`, emits `hr.leave.approved` and makes the employee show as "on leave" in the roster for those dates. *(Slice 2, partly: `used_days` moves from 0 → 3 and `pending` → 0, the event is on the bus and the **absence calendar** shows the bar for those dates — the "on leave" roster the criteria name is slice 3's attendance roster, and the calendar is the surface this slice owns. The event payload is asserted to carry ids and dates and **not** the reason or the decision comment: a reason is a person's own words and a subscriber may be a third party's webhook. A second decision is refused with 409 and the balance is asserted **unchanged**, which is the double-clicked-approve button and the two-approvers-race case. A type with `requires_approval = false` is approved on creation and **still emits** the same event, because an automation waiting on it would otherwise never run in exactly the organization that believes it is running unattended.)*
 - [x] Rejecting with a comment is visible on the request timeline; cancelling a pending request releases the balance and is audited. *(Slice 2: the detail response carries a `timeline` and the walk asserts the approver's comment is on the `rejected` step and that `can_decide` is false afterwards — a decided request offering a decision panel is how a "Decide" button ends up on leave HR has already approved. Cancelling moves pending → 0 and the same dates become available again, which is the one thing a naive "refuse any overlap" check gets wrong. Both write an audit entry. An **approved** request cannot be cancelled: it is history, ended by the leave happening, not by pretending it was never agreed.)*
-- [ ] Attendance check-in/check-out records the right day, refuses a checkout without check-in and a second check-in the same day (idempotent for API callers).
+- [x] Attendance check-in/check-out records the right day, refuses a checkout without check-in and a second check-in the same day (idempotent for API callers). *(Slice 2d, and the verdict the walk owed finally arrived: **10/10 DB walks green** in 215 s. Ten cases, each a refusal or a fact rather than a rendering — the day recorded is the organization's day and not the browser's, `check_out` without a `check_in` is refused, a second punch is refused **with the punch it found** rather than a bare 409, an account holding no `hr.*` key punches and reads its own day, somebody else's month is refused in *both* directions, and the remaining two refusals the schema could answer without touching the clock. Run against a **private PostgreSQL on 5444** because the shared container every writer shares has been wedged in crash recovery for hours — restarting a shared database is not a local decision, and a walk that cannot connect is an unmeasured pass, not a failing one.)*
 - [ ] Monthly summary lists worked hours per employee and flags missing checkout and over/under hours, and the CSV export matches the grid.
 - [ ] Applying an onboarding template creates the items with due dates derived from the start date; ticking an item is reflected in the progress bar and emits completion when the last item is ticked.
 - [ ] Document upload stores through media, downloads with the right name/type, and an expiring document produces one `hr.document.expiring` event.

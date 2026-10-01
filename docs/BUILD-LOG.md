@@ -10728,3 +10728,53 @@ note in this ledger: a measurement that cannot be taken is reported as a **throw
 which kills the pass and takes every later measurement with it, rather than being recorded as an
 absent measurement. The mobile legs for REQ-021 are therefore still unmeasured — and this time the
 cause is in the file that is supposed to be measuring them.
+
+## Tick 57 (wave4) — the people core's screens, and a private database because the shared one is down
+
+**What.** REQ-055 had shipped slice 1's migration, its eleven API routes, the store, the org
+chart and the merge on day one — and **no screen at all**. The module's own nav said so in a
+comment and pointed at three surfaces instead of five; leave, attendance and onboarding are all
+rows that point at a person and the person could not be seen. This tick builds the two screens
+slice 1 named, the client behind them and the nav entries, and it finally returns the verdict the
+`hr_attendance` walks owed.
+
+**The gap, stated plainly because it is the kind that survives review:** a slice can be marked
+`in-progress` with its API green, its walks written and its unit tests passing, and still have
+shipped **zero user-visible surface**. Nothing in the gate catches it — `cargo test` cannot see a
+missing screen, and the walkthrough only visits routes that are already in its inventory. The
+route list is the only thing that makes an absent screen visible, which is why "no untested
+screen" also has to be read as "no untested *and no uninventoried* screen".
+
+**Proof.**
+
+- `cargo test -p omnion-module-hr --quiet` → **87 passed, 0 failed**.
+- `cargo test -p omnion-api --test hr_attendance` → **10 passed, 0 failed** in 215 s. Ten
+  refusals and facts, not ten renderings: the day recorded is the organization's and not the
+  browser's; a check-out without a check-in is refused; a second punch is refused *carrying the
+  punch it found* rather than a bare 409; an account holding no `hr.*` key punches and reads its
+  own day; somebody else's month is refused in **both** directions.
+- `tsc -p tsconfig.json --noEmit` → **exit 0** (the real binary; `npx tsc | tail` has twice now
+  reported green having checked nothing).
+- `node --check scripts/qa/walkthrough.cjs` → clean.
+
+**The database, and the decision behind it.** The shared container on 5433 that all ten writers
+use has been wedged in crash recovery for hours. `docker inspect` still reports
+`running / restarts=0 / oom=false` while every connection is refused, and the startup process sits
+in **D (disk sleep)** with the box at 99 % — which is the exact combination that sends somebody
+hunting for a product bug. **It was not restarted.** Restarting a shared database is not a local
+decision and nine sibling passes would have gone down with it. This worktree instead runs a
+private PostgreSQL 17 on `127.0.0.1:5444` (container `omnion-pg-w4`, its own volume, loopback
+only) and points both the DB walks and the browser pass at it. The two lessons worth keeping:
+`inspect` reporting `running` proves a container is up, not that its service is answering; and
+"the test cannot connect" is an **unmeasured** pass, which is a different thing from a failing one
+and must never be recorded as a pass.
+
+**The QA pass.** Not yet returned. It runs from a **copy** of `scripts/qa/run.sh` with the port
+and `dirname $0` rewritten, because editing the shared script nine other writers run mid-tick is
+worse than editing nothing. That copy exposed a third thing worth knowing: `reset-db.sh` already
+takes `QA_PG_CONTAINER` as an override, so the database reset needed **no** patch at all — the
+port was hardcoded but the container name was not, and reading the helper rather than editing it
+is what made the pass startable in one attempt instead of three.
+
+**Next.** The browser verdict for `/hr/employees` and `/hr/departments`; then slice 3 proper
+(onboarding templates, documents, reports) and slice 4, which closes REQ-055.
