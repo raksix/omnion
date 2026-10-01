@@ -125,12 +125,23 @@ pub struct ChecklistItem {
     /// Who owns it.
     pub owner_role: Option<String>,
     /// When it is due, derived at apply time from the employee's start date.
+    ///
+    /// **`#[serde(with = "dates::option")]`, not the bare derive.** `time::Date` has a `serde`
+    /// impl that serialises as `[2026, 61]` — year and ordinal day — which is *correct* and
+    /// unreadable by every client in this repository. The module's `dates` module exists so a
+    /// calendar day is `YYYY-MM-DD` on the wire exactly once; a field that skips it is a screen
+    /// rendering `undefined`, and it is invisible to `cargo test` because nothing in the Rust
+    /// side reads its own JSON back.
+    #[serde(with = "crate::dates::option")]
     pub due_on: Option<Date>,
     /// The offset the template carried, kept beside the derived date (see the module docs).
     pub due_offset_days: Option<i32>,
     /// Whether the step wants a file.
     pub requires_file: bool,
-    /// When it was ticked.
+    /// When it was ticked. The wire form is an RFC-3339 string for the same reason `due_on` is a
+    /// `YYYY-MM-DD` string: `time`'s tuple representation is correct and unreadable, and a
+    /// checklist row whose tick is `[2026,304,16,12,8,45]` is a screen that cannot say when.
+    #[serde(with = "crate::dates::instant::option")]
     pub done_at: Option<time::OffsetDateTime>,
     /// Who ticked it.
     pub done_by: Option<Uuid>,
@@ -621,21 +632,36 @@ pub async fn board(pool: &PgPool, organization_id: Uuid) -> Result<Vec<Checklist
 
 /// Tick or untick one item, and say whether that finished the checklist.
 ///
-/// The return carries the **whole** checklist rather than the new row because the caller needs
-/// the bar's two numbers to redraw, and because the completion event fires on the transition this
-/// write performed — a handler that re-read the checklist afterwards could read a state another
-/// write has since changed and fire an event for a completion that is not there.
+/// The note rides the same statement as the tick. Two writes would mean a client that wants "done,
+/// and here is why the contract took three weeks" has to make two requests, and a screen that
+/// needs a second request for the note is a screen where the note is usually never written — and
+/// an interrupted pair leaves an item ticked with no explanation.
+///
+/// `None` means "leave the note alone", which is a different thing from `Some("")`: a client that
+/// sends an empty note is clearing it, and `coalesce` would silently keep the old text.
 pub async fn tick_item(
     pool: &PgPool,
     organization_id: Uuid,
     item_id: Uuid,
     done: bool,
+    note: Option<&str>,
     actor: Uuid,
 ) -> Result<Checklist> {
+    if let Some(text) = note {
+        if text.len() > 2000 {
+            return Err(HrError::invalid(
+                "onboarding item",
+                "note",
+                "the note is longer than 2000 characters",
+            ));
+        }
+    }
+
     let employee_id: Option<Uuid> = sqlx::query_scalar(
         "update hr_onboarding_items set \
            done_at = case when $3 then now() else null end, \
            done_by = case when $3 then $4 else null end, \
+           note = coalesce($5, note), \
            updated_at = now() \
          where organization_id = $1 and id = $2 \
          returning employee_id",
@@ -644,6 +670,7 @@ pub async fn tick_item(
     .bind(item_id)
     .bind(done)
     .bind(actor)
+    .bind(note)
     .fetch_optional(pool)
     .await?;
 
@@ -653,7 +680,32 @@ pub async fn tick_item(
         .ok_or(HrError::NotFound("checklist"))
 }
 
-/// Attach a note to one item.
+/// The checklist one item belongs to, as it stood — `None` when the item does not exist.
+///
+/// Separate from [`tick_item`] on purpose: the handler needs the state **before** the write to
+/// decide whether this write is the transition, and re-reading it afterwards would read whatever
+/// another writer has since done, which is how an automation gets a completion event for a
+/// checklist somebody unticked a second earlier.
+pub async fn checklist_for_item(
+    pool: &PgPool,
+    organization_id: Uuid,
+    item_id: Uuid,
+) -> Result<Option<Checklist>> {
+    let employee_id: Option<Uuid> = sqlx::query_scalar(
+        "select employee_id from hr_onboarding_items where organization_id = $1 and id = $2",
+    )
+    .bind(organization_id)
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(employee_id) = employee_id else {
+        return Ok(None);
+    };
+    checklist_of(pool, organization_id, employee_id).await
+}
+
+/// Attach a note to one item, without ticking it.
 pub async fn annotate_item(
     pool: &PgPool,
     organization_id: Uuid,
