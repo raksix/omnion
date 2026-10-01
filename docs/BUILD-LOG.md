@@ -13823,3 +13823,73 @@ not by the age of the placeholder) for the whole tick, with 45 Chrome processes 
 
 **Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
 REQ-012 can close.
+
+## Tick 66 - every timestamp the CRM sent was a string no browser can parse, and the walkthrough had been recording the proof on every pass since the screen shipped
+
+**What.** `OffsetDateTime::to_string()` is a `Display` impl, and it renders
+`2026-10-01 15:32:24.365355685 +00:00:00` - a **space** where RFC 3339 and ISO 8601 both put
+`T`. Every browser parses the second form and none parse the first: `new Date("2026-10-01 15:32:24
+… +00:00:00")` is `Invalid Date`, so the value was not a timestamp offset by anything, it was
+not a timestamp. Thirteen read paths in `apps/api/src/routes/crm_intake.rs` answered
+`first_response_at`, `received_at`, `created_at`, `updated_at`, `escalated_at`, `converted_at`,
+`first_response_due_at`, `last_received_at` and `next_before` that way, and the panel rendered
+the **words** "Invalid Date" through `toLocaleString()`.
+
+**Why it survived.** This is the fourteenth variation of the branch's signature defect and the
+first one a *captured value* hid rather than a missing one. `respondedLabel` has been written
+into the walkthrough's `steps` on every pass since the lead-detail screen shipped - the pass
+that found it printed `"respondedLabel":"Responded Invalid Date"` into its own log and carried
+on - because a measurement nobody judges cannot fail. Thirteen previous instances were the
+*absence* of something; this one is the presence of a correct-looking value.
+
+**The unit tests could not have caught it, and that is the transferable part.** Every test in
+the crate holds timestamps as `OffsetDateTime` and never crosses the boundary, so the eight
+bytes a `Date` object receives are unreachable from a Rust test. A defect that exists only in
+the serialised form is invisible to every test that does not serialise.
+
+**Fix.** `modules/crm-intake/src/timestamp.rs`: `rfc3339` / `rfc3339_opt`, one named function
+rather than fourteen `format(&Rfc3339)` call sites - a call site that keeps `.to_string()`
+compiles perfectly and is wrong, so the *named* function is the thing that can be found. All
+thirteen sites now go through it. The client half is `absoluteInstant` in
+`apps/admin/lib/crm-intake.ts`, which the detail screen's three raw `new Date()` calls now
+share: the inbox already had a tolerant reader (`relativeInstant`, which degrades to an em
+dash) and the detail screen had an intolerant one, and two readers of the same field is how a
+screen disagrees with itself about whether a date exists.
+
+**Proof.** `scripts/qa/run-crm-timestamps.mjs` **14/14, PROVEN TO FAIL at 11/14** with the
+formatter's body reduced to `Ok::<String, ()>(at.to_string())` - a neutralisation that
+**compiles** and returns a plausible `String`, which is the whole point: the first attempt
+used `Err::<String, ()>(())`, failed to compile, and the gate reported "the driver did not
+build", i.e. it measured its own plumbing where the product's wrongness belonged. The driver
+is a cargo crate that depends on the product crate by `path`, so the asserted value is the
+shipped function's return value and not a copy of its rule; node decides parseability, because
+node is the engine the panel's `new Date()` runs on.
+
+**The gate also had to be taught to name the defect.** The negative control's first two runs
+were both *false* - first a green gate against a neutralised body, then a build error standing
+in for a detected defect. Both are the same mistake from opposite ends: **a gate that reads
+the source proves the fix was written down; a gate that runs the code proves it works**, and a
+gate that cannot be told apart from a broken toolchain is a gate whose failures get ignored.
+
+**Also fixed, in the harness rather than the product.** `respondedLabelIsNotAnInvalidDate`,
+`respondedLabelNamesAnInstant` and `detailShowsNoInvalidDates` now judge the value that was
+being recorded. The assertion is on the *rendered text*: a parse is what the client does, and
+a screen that showed a raw ISO string would pass a parse and still be unreadable.
+
+**Not claimed.** No browser pass result. The pass in flight is this branch's own tick-64 run
+(holder pid alive, `cwd=/mnt/apopic/omnion-w8`, at the media depth passes with no
+`summary.json` yet), so the new harness assertions are unmeasured, and the box is at
+`/mnt/apopic` **100 % (0 bytes free)** with load 27 - which is also why the earlier build
+failed with `No space left on device` and not with a code error. Reclaimed 1.2 GB of my own
+orphaned `/dev/shm/w8-timestamps` and moved the build to tmpfs; the disk is nine writers deep
+and 2.7 GB of it is `w8build`, the same directory the running pass's API binary lives in.
+
+**The wider blast radius is real and is not mine to fix.** `to_string()` on an instant is
+platform-wide: `backups.rs`, `health_incidents.rs`, `health_panel.rs`, `media_grants.rs`,
+`notifications.rs` and more all serialise timestamps that way. This tick changed
+`crm_intake.rs` only, because that is this writer's file. Recorded rather than fixed, because
+"fix it everywhere" in a shared repo is how two writers end up in the same file.
+
+**Next.** Read `summary.json` when the in-flight pass writes it and check the three new
+assertions by name. Then the module lib count and `cargo build -p omnion-api`, which the
+box's disk state forced into a tmpfs target.
