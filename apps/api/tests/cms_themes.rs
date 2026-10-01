@@ -28,13 +28,13 @@ use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::{Config, CsrfSecret};
+use omnion_core::config::{Config, CsrfSecret, DatabaseConfig};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::sites::{self, NewSite};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
-use omnion_security::{CSRF_HEADER, derive_csrf_token};
+use omnion_security::{CSRF_HEADER, RatePolicy, derive_csrf_token};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -135,30 +135,170 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
-async fn live_state() -> Option<(AppState, Db)> {
-    let mut config = Config::from_env().expect("environment must be valid");
-    // A cookie-authenticated write is refused outright when the process has no CSRF secret
-    // configured, so a suite that leaves it to the environment measures 403s on whatever
-    // machine happens to run it — which is how a whole file of walks can be red for a reason
-    // that has nothing to do with themes.
-    config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!("SKIP: PostgreSQL is not reachable ({error})");
+/// What a walk needs: its own database, its router, and the handle that drops the database.
+struct Harness {
+    state: AppState,
+    db: Db,
+    maintenance: Db,
+    database: String,
+}
+
+impl Harness {
+    /// Open a throwaway database with every migration applied.
+    ///
+    /// **A database of its own, and this suite previously did not have one.** It ran against
+    /// whatever `OMNION_DATABASE_URL` named — on a writer's box, the *shared* QA database
+    /// every other stack and every other writer also points at. Two consequences, and both of
+    /// them are how a suite reports numbers nobody earned:
+    ///
+    /// * Two walks inserting the same `themes.key` collide on `themes_key_live_idx`, so the
+    ///   failure is a duplicate-key error on a fixed fixture name rather than anything about
+    ///   the behaviour under test.
+    /// * A run whose credentials were wrong connected nowhere, took the skip branch below, and
+    ///   reported `13 passed` — with every walk having done nothing. A green line and an
+    ///   empty run are the same output.
+    ///
+    /// `event_retention` and a dozen other suites already do this; this one had not caught up.
+    async fn fresh() -> Option<Self> {
+        let mut config = Config::from_env().expect("environment must be valid");
+        // A cookie-authenticated write is refused outright when the process has no CSRF
+        // secret configured, so a suite that leaves it to the environment measures 403s on
+        // whatever machine happens to run it.
+        config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
+
+        let maintenance = match Db::connect(&config.database).await {
+            Ok(db) => db,
+            Err(error) => {
+                announce_skip(&format!("PostgreSQL is not reachable ({error})"));
+                return None;
+            }
+        };
+
+        let database = format!("omnion_themes_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        if let Err(error) = sqlx::query(&format!("create database \"{database}\""))
+            .execute(maintenance.pool())
+            .await
+        {
+            announce_skip(&format!("a throwaway database could not be created ({error})"));
             return None;
         }
+
+        let db = Db::connect(&DatabaseConfig {
+            url: swap_database(&config.database.url, &database),
+            max_connections: 4,
+        })
+        .await
+        .expect("the fresh database must connect");
+        db.migrate().await.expect("migrations must apply");
+
+        let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
+        let state = AppState::new(
+            BuildInfo::new("omnion-api", "0.0.0-test"),
+            config,
+            db.clone(),
+            redis,
+            test_storage(),
+        );
+        give_the_suite_its_own_sign_in_budget(&state);
+
+        Some(Self {
+            state,
+            db,
+            maintenance,
+            database,
+        })
+    }
+
+    /// Drop the throwaway database. Called even when a walk panics, by the `walk!` macro.
+    async fn dispose(self) {
+        self.db.pool().close().await;
+        let database = self.database;
+        sqlx::query(&format!("drop database if exists \"{database}\" with (force)"))
+            .execute(self.maintenance.pool())
+            .await
+            .expect("the throwaway database must be removed");
+    }
+}
+
+/// Give this process a sign-in budget large enough for the walks in it.
+///
+/// **The counter is shared even though the policy need not be.** The limiter's counters live
+/// in one Redis, and a sign-in request carries no session, so its budget is keyed on the
+/// peer address — `ip:127.0.0.1` for every walk in every suite on this box, in every writer's
+/// worktree. The stored `sign_in` policy is ten requests per five minutes, and this file
+/// signs in once per walk across thirteen walks. So the eleventh sign-in is refused with a
+/// `429` naming a rate limit on a suite that was never testing rate limits, and every walk
+/// after it dies on a line that has nothing to do with themes.
+///
+/// Raising the policy fixes the *decision* but not the counter: a raised ceiling still counts
+/// against the same shared key, which is the thing that actually exhausts. What matters here
+/// is that this suite is the only writer of its own number, so the refusal is now a fact
+/// about the suite instead of a race with nine other writers.
+///
+/// Only `sign_in` moves. The other ceilings are the ones a deployment ships, and raising
+/// them would let a suite be the reason a genuinely over-budget request stops being refused.
+fn give_the_suite_its_own_sign_in_budget(state: &AppState) {
+    let policies: Vec<RatePolicy> = RatePolicy::defaults()
+        .into_iter()
+        .map(|mut policy| {
+            if policy.scope == "sign_in" {
+                policy.limit = 10_000;
+                policy.burst = 0;
+            }
+            policy
+        })
+        .collect();
+    omnion_api::rate_limit_middleware::install(omnion_api::rate_limit_middleware::RateLimiter::new(
+        state,
+        policies,
+    ));
+}
+
+/// Point a connection string at a different database, keeping host, port and credentials.
+fn swap_database(url: &str, database: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (url, None),
     };
-    db.migrate().await.expect("migrations must apply");
-    let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
-    let state = AppState::new(
-        BuildInfo::new("omnion-api", "0.0.0-test"),
-        config,
-        db.clone(),
-        redis,
-        test_storage(),
+    let prefix = base
+        .rsplit_once('/')
+        .expect("the URL must contain a database path")
+        .0;
+    match query {
+        Some(query) => format!("{prefix}/{database}?{query}"),
+        None => format!("{prefix}/{database}"),
+    }
+}
+
+/// Say a walk did not run, in a way cargo cannot hide.
+///
+/// The skip branch used to `eprintln!` and return `Ok(())`, which is a test that passes
+/// because it declined to do anything — and cargo captures the message, so a reading of the
+/// summary alone cannot tell a skip from a pass. The count is now reported as an atom and
+/// asserted at the end of the run by `every_walk_that_skipped_said_so`, so a run that skipped
+/// anything is *red*, and the reason is printed on stdout where it survives capture.
+static SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn announce_skip(reason: &str) {
+    SKIPPED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    println!("WALK SKIPPED: {reason}");
+}
+
+/// The suite's own honesty gate.
+///
+/// A file of walks that skips everything and reports `ok` is the worst outcome a test suite
+/// can produce, because it is indistinguishable from success in every artifact a human or a
+/// CI job reads. This test fails if any walk in the file declined to run — which is the only
+/// way the skip becomes visible in the same summary a pass would have appeared in.
+#[test]
+fn every_walk_that_skipped_said_so() {
+    let skipped = SKIPPED.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        skipped, 0,
+        "{skipped} walk(s) in this file were SKIPPED, not passed. Their output above says why \
+         (a database that cannot be reached, or one that cannot be created). A skipped walk \
+         reports `ok`, which is how a suite that measured nothing becomes a green line."
     );
-    Some((state, db))
 }
 
 async fn create_organization(db: &Db) -> Uuid {
@@ -346,10 +486,18 @@ async fn publish_page(db: &Db, site_id: Uuid, slug: &str) {
 macro_rules! walk {
     ($state:expr, $body:expr) => {
         async {
-            match live_state().await {
-                Some((state, db)) => $body(state, db).await,
+            match Harness::fresh().await {
+                Some(harness) => {
+                    let state = harness.state.clone();
+                    let db = harness.db.clone();
+                    let outcome = $body(state, db).await;
+                    harness.dispose().await;
+                    outcome
+                }
+                // The skip is counted in `announce_skip`, and
+                // `every_walk_that_skipped_said_so` turns a non-zero count into a red run.
                 None => {
-                    eprintln!("SKIP: no database, this walk did not run");
+                    announce_skip("no database, this walk did not run");
                     Ok(())
                 }
             }
@@ -367,7 +515,14 @@ async fn the_gallery_names_the_active_theme_and_offers_no_rollback() -> TestResu
         let organization_id = create_organization(&db).await;
         let site = create_site(&db, organization_id, "gallery-fresh").await;
         mirror_bundled(&db, &["minimal", "corporate", "agency"]).await;
-        let (_, email) = create_account(&db, organization_id).await;
+        let (user_id, email) = create_account(&db, organization_id).await;
+        // Granted HERE rather than assumed. This walk used to take no grant at all and pass
+        // only because `seed::ensure` binds the Owner role to the EARLIEST user in the
+        // database — which, on a shared test database, is whichever walk inserted first. On a
+        // database of its own this walk was refused `permission_denied` with `"considered": 0`,
+        // which is the guard saying it found no binding to count. A test that depends on
+        // another test's ordering is a test whose result belongs to the schedule.
+        grant(&db, organization_id, user_id, &READER_PERMISSIONS, "Theme Reader").await;
         let auth = login(&state, &db, &email).await;
 
         let response = call(
@@ -578,6 +733,19 @@ async fn rolling_back_a_site_that_never_switched_is_refused() -> TestResult {
 
 /// Re-activating the ACTIVE theme spends nothing — the trap that makes a naive upsert turn
 /// *Restore previous* into a no-op.
+///
+/// **What this walk asserts changed, and why the old version could not be kept.** It used to
+/// assert that a re-activation leaves `rollbackTarget` ABSENT, which was true while the FIRST
+/// activation of a site's life recorded no displaced theme at all (a site with no `site_themes`
+/// row has no previous key, so there was nothing to roll back to). That null was the defect:
+/// the site was rendering `minimal`, the operator's only ever switch was `minimal → corporate`,
+/// and the button was hidden while a perfectly reversible change sat behind it. `activate` now
+/// displaces the site's RESOLVED theme, so the target exists and *should* be offered.
+///
+/// The trap the walk was written for is still real, so it is asserted in the form that
+/// survives: a naive `on conflict do update set previous_theme_key = $active` would move the
+/// target onto the theme already in use, and a rollback would then "restore" the current
+/// theme. Here the target must stay `minimal` — a DIFFERENT key — after two re-activations.
 #[tokio::test]
 async fn re_activating_the_active_theme_keeps_the_rollback_target() -> TestResult {
     walk!(state, |state: AppState, db: Db| async move {
@@ -615,6 +783,16 @@ async fn re_activating_the_active_theme_keeps_the_rollback_target() -> TestResul
 
         let first = activate("corporate").await;
         assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+        assert_eq!(
+            first.body["previousThemeKey"], json!("minimal"),
+            "the FIRST activation of a site's life displaces the theme the site was already \
+             rendering, which is the row that used to be absent"
+        );
+        assert_eq!(
+            first.body["gallery"]["rollbackTarget"], json!("minimal"),
+            "so the operator's only ever switch is reversible from the moment they make it"
+        );
+
         // The same key, twice more.
         for _ in 0..2 {
             let again = activate("corporate").await;
@@ -624,10 +802,10 @@ async fn re_activating_the_active_theme_keeps_the_rollback_target() -> TestResul
                 again.body["previousThemeKey"], Value::Null,
                 "a repeated activation of the key already in use displaces nothing"
             );
-            assert!(
-                again.body["gallery"]["rollbackTarget"].is_null(),
-                "so the rollback button must stay ABSENT, or it would restore the theme that was \
-                 already in use"
+            assert_eq!(
+                again.body["gallery"]["rollbackTarget"], json!("minimal"),
+                "and the target from the EARLIER switch must survive it: a rollback that \
+                 restored the theme already in use would report work it did not do"
             );
         }
         Ok(())
@@ -786,7 +964,12 @@ async fn a_tenant_upload_is_not_in_another_tenants_gallery() -> TestResult {
             .as_array()
             .expect("array")
             .iter()
-            .filter_map(|entry| entry["key"].as_str())
+            // The gallery nests the theme under `theme`: a row is
+            // `{ theme: ThemeCard, isActive: bool }`, not a bare theme. Reading `entry["key"]`
+            // asks a field that is not there, so `keys` was EMPTY and the assertion below
+            // compared an empty list against `minimal` — a test that could only ever fail, on a
+            // gallery that was correct all along.
+            .filter_map(|entry| entry["theme"]["key"].as_str())
             .collect();
         assert!(
             !keys.contains(&"tenant-theme"),
@@ -808,7 +991,12 @@ async fn bundled_themes_are_mirrored_in_place_and_carry_no_tenant() -> TestResul
         grant(&db, organization_id, user_id, &READER_PERMISSIONS, "Theme Reader").await;
         let auth = login(&state, &db, &email).await;
 
-        mirror_bundled(&db, &["corporate", "agency"]).await;
+        // `minimal` is mirrored HERE rather than being assumed present. This walk asserted the
+        // gallery contains the bundled default while only ever mirroring two OTHER keys, so
+        // it passed only against a database another walk had already populated — which is
+        // exactly what a shared test database lets happen, and exactly what the throwaway
+        // database this suite now uses makes impossible.
+        mirror_bundled(&db, &["minimal", "corporate", "agency"]).await;
         // A second boot with a newer version of one of them.
         omnion_content::themes::sync_bundled(
             db.pool(),
@@ -852,7 +1040,12 @@ async fn bundled_themes_are_mirrored_in_place_and_carry_no_tenant() -> TestResul
             .as_array()
             .expect("array")
             .iter()
-            .filter_map(|entry| entry["key"].as_str())
+            // The gallery nests the theme under `theme`: a row is
+            // `{ theme: ThemeCard, isActive: bool }`, not a bare theme. Reading `entry["key"]`
+            // asks a field that is not there, so `keys` was EMPTY and the assertion below
+            // compared an empty list against `minimal` — a test that could only ever fail, on a
+            // gallery that was correct all along.
+            .filter_map(|entry| entry["theme"]["key"].as_str())
             .collect();
         assert!(keys.contains(&"corporate") && keys.contains(&"agency"), "{keys:?}");
         Ok(())
@@ -904,4 +1097,313 @@ fn a_manifest_needs_a_key_a_name_and_a_version() {
     assert_eq!(shape.modes, vec!["light", "dark"]);
     assert!(shape.extras.contains(&"settingsSchema"));
     assert!(shape.extras.contains(&"compatibility"));
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Rollback and the settings revision (REQ-062, acceptance 5)
+// ---------------------------------------------------------------------------------------------
+
+/// Save a settings revision and publish it, returning the tokens the site is live with.
+async fn publish_settings_revision(db: &Db, site_id: Uuid, accent: &str) -> i32 {
+    let view = omnion_content::theme_settings::settings_view(
+        db.pool(),
+        site_id,
+        omnion_content::themes::DEFAULT_THEME_KEY,
+        json!({ "accent": { "light": "#123456" } }),
+    )
+    .await
+    .expect("the settings view must read");
+    let input = omnion_content::theme_settings::SettingsInput {
+        theme_key: "minimal".to_owned(),
+        tokens: json!({ "accent": { "light": accent } }),
+        typography: json!({}),
+        layout: json!({}),
+        branding: json!({}),
+        header_footer: json!({}),
+        default_mode: "light".to_owned(),
+    };
+    let _ = view;
+    let draft = omnion_content::theme_settings::save_draft(db.pool(), site_id, &input, None)
+        .await
+        .expect("the draft must save");
+    let change = omnion_content::theme_settings::publish(db.pool(), site_id, None)
+        .await
+        .expect("the draft must publish");
+    change
+        .revision_no()
+        .unwrap_or_else(|| panic!("a publish must name the revision it made live, not {draft:?}"))
+}
+
+/// The tokens the site is live with, read from the published pointer rather than from a draft.
+async fn live_tokens(db: &Db, site_id: Uuid) -> Option<serde_json::Value> {
+    omnion_content::theme_settings::published_tokens(db.pool(), site_id)
+        .await
+        .expect("the published pointer must read")
+}
+
+/// The criterion, in the form that can catch the defect it was written for: "Restore previous
+/// brings back the previous theme **and its published settings revision**, confirmed by
+/// comparing the rendered page."
+///
+/// The comparison is against [`live_tokens`] — the published pointer the renderer reads — and
+/// not against a draft. A rollback that republished into the draft would pass a test reading
+/// the draft and leave the public site on the wrong colours, which is the whole failure.
+#[tokio::test]
+async fn a_rollback_brings_back_the_settings_the_displaced_theme_was_published_with() -> TestResult
+{
+    walk!(state, |state: AppState, db: Db| async move {
+        let organization_id = create_organization(&db).await;
+        let site = create_site(&db, organization_id, "rollback-settings").await;
+        mirror_bundled(&db, &["minimal", "corporate"]).await;
+        publish_page(&db, site.id, "themed").await;
+        let (user_id, email) = create_account(&db, organization_id).await;
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.activate", "themes.customize"],
+            "Theme Owner",
+        )
+        .await;
+        let auth = login(&state, &db, &email).await;
+
+        // 1. The site publishes settings of its own and activates `corporate`.
+        let minimal_revision = publish_settings_revision(&db, site.id, "#101010").await;
+        let activate = call(
+            &state,
+            request(
+                Method::POST,
+                &format!("/api/v1/sites/{}/theme", site.id),
+                Some(&auth),
+                Some(json!({ "theme_key": "corporate" })),
+            ),
+        )
+        .await;
+        assert_eq!(activate.status, StatusCode::OK, "{}", activate.body);
+
+        // 2. The site switches look entirely, and publishes DIFFERENT settings.
+        let corporate_revision = publish_settings_revision(&db, site.id, "#f0f0f0").await;
+        assert_ne!(
+            minimal_revision, corporate_revision,
+            "the fixture must actually move between two live revisions"
+        );
+        assert_eq!(
+            live_tokens(&db, site.id).await,
+            Some(json!({ "accent": { "light": "#f0f0f0" } })),
+            "the site is live with the corporate revision's colours"
+        );
+
+        // 3. Activate `minimal` again — this is the write that must CAPTURE the settings
+        //    being displaced. A rollback can only bring back what an activation recorded.
+        let back_to_minimal = call(
+            &state,
+            request(
+                Method::POST,
+                &format!("/api/v1/sites/{}/theme", site.id),
+                Some(&auth),
+                Some(json!({ "theme_key": "minimal" })),
+            ),
+        )
+        .await;
+        assert_eq!(back_to_minimal.status, StatusCode::OK, "{}", back_to_minimal.body);
+        assert_eq!(back_to_minimal.body["restoredSettingsRevisionNo"], json!(null));
+
+        // 4. Now change the look again while `minimal` is active, so a rollback has to
+        //    distinguish "the theme that comes back" from "the colours that come with it".
+        publish_settings_revision(&db, site.id, "#00ff00").await;
+
+        let rollback = call(
+            &state,
+            request(
+                Method::POST,
+                &format!("/api/v1/sites/{}/theme/rollback", site.id),
+                Some(&auth),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(rollback.status, StatusCode::OK, "{}", rollback.body);
+        assert_eq!(rollback.body["themeKey"], json!("corporate"));
+
+        // The theme came back on its own before this tick, so asserting only the key would
+        // have passed against a rollback that changed nothing a visitor can see.
+        let restored_no = rollback.body["restoredSettingsRevisionNo"]
+            .as_i64()
+            .and_then(|number| i32::try_from(number).ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the rollback must report the settings revision it republished, got {}",
+                    rollback.body
+                )
+            });
+        assert_ne!(
+            restored_no, corporate_revision,
+            "the revision it restores is a NEW one: a restore is recorded, not pointed at"
+        );
+
+        // 5. THE ASSERTION: the public site's colours are the ones the RESTORED THEME was
+        //    published with — `#f0f0f0`, which is what `corporate` was live with — and not
+        //    the `#00ff00` that was live a moment ago under `minimal`.
+        //
+        //    The revision restored is `#f0f0f0`'s and not the earlier `#101010`, because the
+        //    activation in step 3 recorded the settings live at the moment IT displaced
+        //    something — which is what "the previous theme AND its published settings
+        //    revision" means. Restoring the oldest revision would restore a state the site
+        //    had already left. Step 4 is what gives this assertion teeth: `#00ff00` is live
+        //    right up to the rollback, so a rollback that republishes nothing is visibly
+        //    different from one that republishes the right thing.
+        assert_eq!(
+            live_tokens(&db, site.id).await,
+            Some(json!({ "accent": { "light": "#f0f0f0" } })),
+            "a rollback that restores the KEY but not the SETTINGS leaves the restored theme \\
+             rendering under another theme's colours — a complete, valid, wrong page"
+        );
+
+        // 6. And the history recorded it: the newest revision is the restore, and it points
+        //    at the revision it came from rather than at the one it displaced.
+        let revisions = omnion_content::theme_settings::list_revisions(db.pool(), site.id)
+            .await
+            .expect("the history must read");
+        let newest = revisions
+            .first()
+            .expect("the restore wrote a revision, so the history has one");
+        assert_eq!(
+            newest.revision_no, restored_no,
+            "the number the response reported is the number the history holds"
+        );
+        assert!(
+            newest.restored_from_no.is_some(),
+            "a restore is recorded as coming FROM something, or the history cannot tell a \\
+             restore from an ordinary save"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// A site that published nothing has nothing to bring back, and the rollback must say so
+/// rather than invent a revision or fail the switch it was asked for.
+#[tokio::test]
+async fn a_rollback_of_a_site_that_published_no_settings_still_restores_the_theme() -> TestResult
+{
+    walk!(state, |state: AppState, db: Db| async move {
+        let organization_id = create_organization(&db).await;
+        let site = create_site(&db, organization_id, "rollback-nothing").await;
+        mirror_bundled(&db, &["minimal", "corporate"]).await;
+        let (user_id, email) = create_account(&db, organization_id).await;
+        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner").await;
+        let auth = login(&state, &db, &email).await;
+
+        let activate = call(
+            &state,
+            request(
+                Method::POST,
+                &format!("/api/v1/sites/{}/theme", site.id),
+                Some(&auth),
+                Some(json!({ "theme_key": "corporate" })),
+            ),
+        )
+        .await;
+        assert_eq!(activate.status, StatusCode::OK, "{}", activate.body);
+
+        let rollback = call(
+            &state,
+            request(
+                Method::POST,
+                &format!("/api/v1/sites/{}/theme/rollback", site.id),
+                Some(&auth),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            rollback.status,
+            StatusCode::OK,
+            "nothing to republish is not a refusal — the theme still comes back: {}",
+            rollback.body
+        );
+        assert_eq!(rollback.body["themeKey"], json!("minimal"));
+        assert_eq!(
+            rollback.body["restoredSettingsRevisionNo"],
+            json!(null),
+            "the honest answer is null; a revision invented here would put a row in a history \\
+             the site never had"
+        );
+        assert!(
+            omnion_content::theme_settings::list_revisions(db.pool(), site.id)
+                .await
+                .expect("the history must read")
+                .is_empty(),
+            "and no revision row was written for a rollback that republished nothing"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// A re-activation must not spend the rollback target's settings pointer.
+///
+/// The naive "read the published revision, write it on every activation" version of this
+/// feature passes both walks above and still breaks here: re-activating the theme a site is
+/// already on writes no activation row, so a version that captured the pointer on the
+/// *forward* path instead of inside the shared writer would overwrite the rollback target's
+/// settings with the CURRENT ones — and the next rollback would restore a revision that was
+/// never the one being displaced.
+#[tokio::test]
+async fn re_activating_the_active_theme_leaves_the_rollback_settings_target_alone() -> TestResult {
+    walk!(state, |state: AppState, db: Db| async move {
+        let organization_id = create_organization(&db).await;
+        let site = create_site(&db, organization_id, "reactivate").await;
+        mirror_bundled(&db, &["minimal", "corporate"]).await;
+        let (user_id, email) = create_account(&db, organization_id).await;
+        grant(&db, organization_id, user_id, &["themes.activate"], "Theme Owner").await;
+        let auth = login(&state, &db, &email).await;
+
+        publish_settings_revision(&db, site.id, "#101010").await;
+        let activate = call(
+            &state,
+            request(
+                Method::POST,
+                &format!("/api/v1/sites/{}/theme", site.id),
+                Some(&auth),
+                Some(json!({ "theme_key": "corporate" })),
+            ),
+        )
+        .await;
+        assert_eq!(activate.status, StatusCode::OK, "{}", activate.body);
+
+        let captured = omnion_content::themes::pending_rollback_settings_revision(db.pool(), site.id)
+            .await
+            .expect("the pending pointer must read");
+        assert!(
+            captured.is_some(),
+            "the activation that displaced a published state recorded its revision"
+        );
+
+        // Re-activate the theme already in use. This is a no-op by design, so it must write
+        // nothing at all — including the pointer.
+        let again = call(
+            &state,
+            request(
+                Method::POST,
+                &format!("/api/v1/sites/{}/theme", site.id),
+                Some(&auth),
+                Some(json!({ "theme_key": "corporate" })),
+            ),
+        )
+        .await;
+        assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+        assert_eq!(again.body["restored"], json!(false));
+
+        assert_eq!(
+            omnion_content::themes::pending_rollback_settings_revision(db.pool(), site.id)
+                .await
+                .expect("the pending pointer must read"),
+            captured,
+            "a no-op re-activation must not repoint the rollback target at the CURRENT settings"
+        );
+        Ok(())
+    })
+    .await
 }
