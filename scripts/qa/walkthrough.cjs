@@ -925,6 +925,94 @@ async function settleRun(page, readRun, { attempts = 40, interval = 500 } = {}) 
   return { ...(await read()), settled: false };
 }
 
+/**
+ * Wait for a graph write to land on the SERVER, and report whether it ever did.
+ *
+ * `settleRun` above is the run-side twin of this, and tick 61's pass is what both exist for.
+ * The shape is the same one a third time, in the one place tick 61 could not reach:
+ *
+ *     await page.keyboard.press("Control+z");
+ *     await page.waitForTimeout(1200);
+ *     const edgesAfterUndo = (await readGraph())?.edge_count ?? 0;
+ *
+ * `AUTOSAVE_MS` in `builder-view.tsx` is **1_200**. The sleep is not merely a guess at how
+ * long a save takes — it is a guess that happens to sit exactly ON the debounce boundary, so
+ * the row races the thing it is measuring and the outcome is decided by which side of a
+ * timer the autosave lands on. `edgeRemovedByUndo` is then false on a rule whose undo
+ * removed the connection perfectly well, and the row reports a selection that was never
+ * pruned by a product that never failed.
+ *
+ * **The obvious fix is wrong, and this is why.** Polling `edge_count` for stability alone is
+ * satisfied immediately: a graph that has not been written yet is *stable*. Two identical
+ * readings of a count prove only that nothing has changed, which is the true state of a page
+ * whose debounce has not fired. That is `settleRun`'s lesson one level down — it also waits
+ * for stability, but it waits for the run to stop MOVING after having observed it start, so a
+ * run that never starts is the failure it reports rather than a success.
+ *
+ * So this helper takes the *witness* of a write: `graph_version` is advanced by every write
+ * (`replace_graph` refuses a stale version), so two identical readings of the VERSION cannot
+ * happen until the write has landed, and a version that never moves means no write arrived.
+ * Callers pass the version they read BEFORE the gesture. `settled` is then a claim about the
+ * write, and `changed` says whether it was the write they were waiting for.
+ *
+ * The polling runs inside `page.evaluate`, for the same reason `settleRun`'s does: every read
+ * of an authenticated endpoint in this file goes through the browser, so it carries the
+ * session cookie. A `fetch` from Node would be a 401 that reads exactly like an unwritten
+ * graph.
+ */
+async function settleGraph(page, readGraph, versionBefore, { attempts = 30, interval = 400 } = {}) {
+  const read = async () => {
+    const graph = await readGraph();
+    const version = graph?.graph_version ?? 0;
+    return { graph, state: `${version}` };
+  };
+  let previous = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const current = await read();
+    // Stability AND movement. Two identical readings of the version prove the write has
+    // landed — a version that never moves is a version that was never written.
+    if (current.state === previous && Number(previous) !== Number(versionBefore)) {
+      return { ...current, settled: true, changed: true };
+    }
+    if (current.state === previous) {
+      return { ...current, settled: false, changed: false };
+    }
+    previous = current.state;
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  return { ...(await read()), settled: false, changed: false };
+}
+
+/**
+ * Wait for a click on the canvas to show up as a selection, and say whether it ever did.
+ *
+ * The other half of `settleGraph`'s problem, on the other side of the same gesture. The row
+ * clicked the arc and then waited a fixed 500ms before reading `[data-edge-selected='true']`,
+ * which is a duration standing in for a repaint — and the two outcomes it cannot tell apart
+ * are the expensive pair: a click that missed, and a click that landed on a box that had not
+ * repainted yet. Both read `selected: 0`, and this row's whole note then blames the product
+ * for a gesture the harness never finished.
+ *
+ * Unlike `settleGraph` there is no version to witness here, because nothing has been written
+ * yet — so this is an OR rather than a settle: poll until the selection APPEARS, and report
+ * `appeared: false` when the budget runs out. That is the honest shape for a precondition:
+ * waiting for the positive condition, bounded, and saying so when it never arrived. A helper
+ * that could only say "settled" here would be wrong for the same reason it is right on the
+ * server side.
+ */
+async function awaitEdgeSelection(page, { attempts = 12, interval = 250 } = {}) {
+  const read = () =>
+    page
+      .evaluate(() => document.querySelectorAll("[data-edge-selected='true']").length)
+      .catch(() => 0);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const selected = await read();
+    if (selected > 0) return { selected, appeared: true, attempts: attempt + 1 };
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  return { selected: await read(), appeared: false, attempts };
+}
+
 async function interact(page, pageName, report) {
   const inventory = () =>
     page.evaluate((max) => {
@@ -12166,13 +12254,24 @@ async function runWorkflowBuilderDepth(page, report) {
     })
     .catch(() => null);
   let undoSelEdgeNote = { attempted: false };
-  const edgesBeforeUndo = (await readGraph())?.edge_count ?? 0;
+  const edgesGraphBeforeUndo = await readGraph().catch(() => null);
+  const edgesBeforeUndo = edgesGraphBeforeUndo?.edge_count ?? 0;
+  // The version the write has to move. `settleGraph` cannot tell "the debounce has not fired
+  // yet" from "the debounce fired and wrote nothing" by stability alone — both are a graph
+  // that has not changed — so it is handed the version to move away from.
+  const edgesVersionBeforeUndo = edgesGraphBeforeUndo?.graph_version ?? 0;
   if (undoSelEdgePoint) {
     await page.mouse.move(undoSelEdgePoint.x, undoSelEdgePoint.y).catch(() => {});
     await page.mouse.down().catch(() => {});
     await page.mouse.up().catch(() => {});
   }
-  await page.waitForTimeout(500);
+  // The click is a gesture, not a timer. This used to be `waitForTimeout(500)`, and the two
+  // outcomes it could not tell apart are the expensive pair for this row: a click that missed
+  // the arc, and a click that landed on a canvas that had not repainted. Both read
+  // `edgeWasSelected: false`, and the row then reports a selection that was never pruned by a
+  // product that never failed — the miss note and the prune assertion are the SAME outcome
+  // read as two different verdicts.
+  const edgeSelectionWait = await awaitEdgeSelection(page);
   const edgePre = await page
     .evaluate(() => {
       const el = document.querySelector("[data-builder-selection]");
@@ -12198,13 +12297,27 @@ async function runWorkflowBuilderDepth(page, report) {
       onEdge: undoSelEdgePoint?.onEdge ?? null,
       inViewport: undoSelEdgePoint?.inViewport ?? null,
       edgesOnCanvas: (await page.locator("[data-edge]").count()) ?? 0,
+      // Whether the selection was given a chance to appear at all, and how long it took when
+      // it did. Without this, "the click missed the curve" is also the answer for a canvas
+      // that had not repainted — the row's own point (off-viewport vs card on the arc) is only
+      // a useful diagnosis once the other cause has been ruled out.
+      selectionAppeared: edgeSelectionWait.appeared,
+      selectionAttempts: edgeSelectionWait.attempts,
       reason: edgesBeforeUndo === 0 ? "the rule has no connection to select" : "the click missed the curve",
     };
   } else {
     // The same gesture as the node half — one keypress, and the graph is replaced wholesale.
+    //
+    // AND WAIT FOR THE WRITE TO LAND. This used to be `waitForTimeout(1200)` followed by a
+    // single `readGraph()`, and 1200 is exactly `AUTOSAVE_MS`: the row was racing the debounce
+    // it was measuring, so `edgeRemovedByUndo` was decided by which side of a timer the
+    // autosave fell on. `settleGraph` waits for the SERVER's `graph_version` to stop moving
+    // after having moved, and says out loud whether it ever did — a graph that never changes
+    // is an unwritten graph, not a settled one, and a helper that could only answer "settled"
+    // would report that as a finished undo.
     await page.keyboard.press("Control+z");
-    await page.waitForTimeout(1200);
-    const edgesAfterUndo = (await readGraph())?.edge_count ?? 0;
+    const undoWrite = await settleGraph(page, readGraph, edgesVersionBeforeUndo);
+    const edgesAfterUndo = undoWrite.graph?.edge_count ?? 0;
     const edgePost = await page
       .evaluate(() => {
         const el = document.querySelector("[data-builder-selection]");
@@ -12218,6 +12331,15 @@ async function runWorkflowBuilderDepth(page, report) {
     undoSelEdgeNote = {
       attempted: true,
       edgesBefore: edgesBeforeUndo,
+      // **READ THIS FIRST, FOR THE SAME REASON `runSettled` IS.** Every gate below measures
+      // the state of a graph the autosave writes, and this row used to read that graph 1200ms
+      // after the keypress — exactly `AUTOSAVE_MS`. A graph whose debounce has not fired is
+      // STABLE, so the old wait was satisfied by the very state it was supposed to rule out.
+      // `writeSettled: false` says the write never arrived, and the two readings under it are
+      // then about a graph nobody has committed yet.
+      writeSettled: undoWrite.settled,
+      versionBefore: edgesVersionBeforeUndo,
+      versionAfter: undoWrite.graph?.graph_version ?? null,
       // THE PRECONDITION THAT MAKES THE ASSERTION MEANINGFUL. The undo has to have taken
       // the connection away: if the count did not fall, the row is reading a canvas that
       // still holds the edge, and `selected === 0` is then the correct answer for a reason
@@ -12361,9 +12483,15 @@ note({
   const edgeSelected = (await page.locator("[data-edge-selected='true']").count()) > 0;
   if (edgeSelected) {
     await page.keyboard.press("Delete");
-    await page.waitForTimeout(1200);
+    // The same two-step this row needed before the undo: read the version, then wait for the
+    // SERVER to say it moved. 1200ms is `AUTOSAVE_MS`, so a fixed wait here races the write.
+    const edgeDeleteWrite = await settleGraph(
+      page,
+      readGraph,
+      (await readGraph())?.graph_version ?? 0,
+    );
     const afterEdgeDelete = await page.locator("[data-edge]").count();
-    const edgesAfter = (await readGraph())?.edge_count ?? 0;
+    const edgesAfter = edgeDeleteWrite.graph?.edge_count ?? 0;
     const selectionReadout = await page
       .locator("[data-builder-selection]")
       .first()
@@ -12378,15 +12506,27 @@ note({
       // The server is the authority: a canvas that hides the line while the graph keeps it is
       // a ghost edge that returns on reload, and the count is what says so.
       removed: edgesAfter < edgesBefore,
+      // Whether the write this reading depends on ever arrived. A row whose gates are all
+      // measured off a graph nobody has committed is not green, it is unread.
+      writeSettled: edgeDeleteWrite.settled,
       readout: selectionReadout,
     });
     await shot(page, "page-workflow-builder-edge-deleted");
     // Undo puts it back: the history has to know about edge deletes too.
     await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
     await page.keyboard.press("Control+z");
-    await page.waitForTimeout(1200);
-    const edgesRestored = (await readGraph())?.edge_count ?? 0;
-    note({ step: "edge-delete-undo", edgesRestored, restored: edgesRestored === edgesBefore });
+    const edgeUndoWrite = await settleGraph(
+      page,
+      readGraph,
+      edgeDeleteWrite.graph?.graph_version ?? 0,
+    );
+    const edgesRestored = edgeUndoWrite.graph?.edge_count ?? 0;
+    note({
+      step: "edge-delete-undo",
+      edgesRestored,
+      restored: edgesRestored === edgesBefore,
+      writeSettled: edgeUndoWrite.settled,
+    });
   } else {
     note({
       step: "edge-delete",
