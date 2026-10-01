@@ -129,7 +129,6 @@ pub mod reliability_idempotency;
 pub mod reliability_intake;
 pub mod reliability_limits;
 pub mod reliability_retries;
-pub mod restore_jobs;
 pub mod scim;
 pub mod search;
 pub mod secrets;
