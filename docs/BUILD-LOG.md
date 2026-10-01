@@ -10583,3 +10583,90 @@ not by the age of the placeholder) for the whole tick, with 45 Chrome processes 
 
 **Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
 REQ-012 can close.
+
+## 2026-10-01 · tick 55 — the checkbox said a criterion was met, and a second copy of it said it was not
+
+**A tick of documents, and one product defect that only reading side by side could have found.**
+
+### A ticked box and an unticked twin
+
+REQ-019 line 215 was a byte-for-byte duplicate of line 213 — the same sentence, once `[x]` and
+once `[ ]`. `git blame` puts the `[x]` copy on `e82aa9747` (yesterday's rate-tier fix) and the
+`[ ]` original on `3e99f4d0a` from 26 September. So that commit **added a ticked line instead of
+ticking the one that was there**, and the checklist ended up claiming a criterion was both met and
+unmet, one row apart, for a day.
+
+Nothing downstream reads those rows, so nothing went red. That is the point: the instrument that
+reports on work reported something that could not be true, and a reader skimming for open boxes
+would have gone looking for a rotation bug that does not exist. A sweep over all 134 request files
+normalising each criterion to its first sentence found **exactly one** such pair, so this was a
+single slip and not a habit — but the sweep is now how the class is looked for, because nothing
+about the document's shape would ever have surfaced it.
+
+### The product defect: a layout that claims more than it draws
+
+`degrade_tree` is the walk that removes a block's dead files before the renderer draws the tree.
+Its sibling `filter_for_viewport` — the same walk, one step earlier, on the same public route —
+drops a child container whose filtering emptied it and rewrites the `columns` prop to the count
+that survived. `degrade_tree` did neither: it recursed, kept whatever came back, and stopped.
+
+The renderer reads a `columns` block's grid from the **prop** and draws one cell per **child**, so
+the two have to agree, and after a deletion they did not:
+
+- a container that kept one cell of two still shipped `columns: 2` — the theme lays out two
+  tracks, one of them empty, and the gap is as wide as the content that used to be there;
+- a container that lost every cell still shipped as an empty grid section — the shell of a layout
+  with nothing in it, on exactly the page whose missing content is gone.
+
+The serving path shows it plainly:
+
+```json
+{"type":"columns","props":{"columns":2},"children":[{"type":"column","props":{}}, …]}
+```
+
+The public route filters for the viewport and *then* degrades, so a container can lose cells twice
+over — once to `hide_on`, once to a file somebody trashed. Both halves of the rule were already
+written one function away and had simply never been copied across.
+
+**The tempting fix is the wrong one.** "Drop every empty column" would also delete the gap an
+author made on purpose — the validator calls that a warning and the page publishes with it — so the
+same empty cell would vanish or survive depending on whether an unrelated file was deleted. The
+rule is `filter_for_viewport`'s exactly: had blocks, now has none. Both halves are pinned,
+because the two fixes are one character apart and one of them silently relayouts a page.
+
+**Proof: 3 new content unit tests (317/0, from 314) and 2 new API walks (9/9).** The walks are
+verified to fail first against the old walk — reverting only the fix and running them yields the
+payload above — and they read the state *before* the deletion, so a walk cannot pass on a page that
+never carried two cells. They assert on the payload a **visitor** receives, because "the page lays
+out correctly" is a claim about what the theme receives, not about what the store holds.
+
+One of my own assertions was wrong first and the code said so: I wrote the emptying case as a
+deleted *image*, which degrades to a text block and therefore never empties its column — so the
+test passed against the defective code. The emptying case is a gallery that lost every file and
+had no caption, which `degrade_tree` drops on purpose. A test that passes against the bug is
+worse than no test, because it is then cited as coverage.
+
+### Gates
+
+- `cargo test -p omnion-content --lib` → **317 passed, 0 failed** (was 314).
+- `cargo test -p omnion-api --test content_block_media` → **9 passed, 0 failed**, real PostgreSQL.
+- `tsc --noEmit` → **exit 0** on `apps/web` and `apps/admin`, run as the direct compiler.
+  `pnpm typecheck` reported a turbo **cache hit** on the merged tree, which checked nothing; the
+  direct runs are the ones that count, and turbo's silence is not a green gate.
+- One trap worth writing down: the suite failed **9/9** on the first run with
+  `csrf_unavailable`, which reads as the platform refusing every write. `OMNION_CSRF_SECRET` was
+  unset in the shell, and the suite's documented fallback only covers the *token*, not the
+  *middleware* — the process carries no secret, so it refuses before the token is even checked.
+  Run it the way `run.sh` does. All nine failing identically, including eight that were green an
+  hour earlier, is the tell that the instrument is wrong rather than the product.
+
+**Not ticked, deliberately:** no acceptance criterion. This fixes a rendering path that no
+criterion names and that the queued `--only=block-editor,members` pass does not exercise, so it
+closes nothing. The pass is still waiting on a slot held live by `w8` (`pid 3591518`,
+`cwd=/mnt/apopic/omnion-w8`, verified by `kill -0` **and** `/proc/<pid>/cwd`), and this volume sat
+at 2.9 GB free and falling, so it was started, waited honestly, and is killed rather than allowed
+to hit `QA_SLOT_WAIT` and proceed into a full disk. This worktree's own `target/debug/incremental`
+(656 MB) went first.
+
+**Next:** REQ-063 acceptance 17 and REQ-064 acceptance 18, both browser measurements, both owed a
+pass against a build newer than the last one that ran.
