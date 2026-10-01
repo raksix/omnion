@@ -37,6 +37,7 @@ omnion-deployment = { path = "../../crates/deployment", features = ["store"] }
 omnion-ai-hub = { path = "../../crates/ai-hub" }
 omnion-automation = { path = "../../crates/automation" }
 omnion-content = { path = "../../crates/content" }
+omnion-developer = { path = "../../crates/developer", features = ["store"] }
 omnion-core = { path = "../../crates/core" }
 omnion-events = { path = "../../crates/events" }
 # System health (REQ-014). Its own crate rather than a module of the security centre: the

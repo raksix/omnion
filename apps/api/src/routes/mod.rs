@@ -77,6 +77,7 @@ pub mod backups;
 pub mod cdn;
 pub mod cdn_cache;
 pub mod cdn_purge;
+pub mod developer;
 pub mod commands;
 pub mod content;
 pub mod deployment;
@@ -1088,6 +1089,39 @@ pub fn router(state: AppState) -> Router {
         post(cdn_purge::test_settings).layer(guards::require(&state, "cdn.manage"));
     let cdn_adapters = get(cdn_purge::adapters).layer(guards::require(&state, "cdn.read"));
 
+    // The developer platform (docs/requests/REQ-033, slice 1). Two keys and the split is the
+    // point: reading a key's metadata is an auditor's question, minting one is a much larger
+    // power, so a role that can see which integrations exist cannot thereby add another.
+    //
+    // `/api-keys` merges a GET and a POST, and `/api-keys/{id}` merges a GET and a DELETE, for
+    // the reason `/events/retention` already does: one path with one `MethodRouter` per verb.
+    // Rotate is a **sub-path** rather than a second `POST` on `/api-keys/{id}` — two handlers
+    // for the same method on one path is not an ambiguous route to axum, it is a panic while the
+    // router is *built*, which takes down every route in the application. The REQ-024 wizard
+    // shipped with that bug for one tick and 339 passing tests did not see it.
+    let api_keys = get(developer::list_keys)
+        .layer(guards::require(&state, "developer.keys.read"))
+        .merge(
+            post(developer::create_key).layer(guards::require(&state, "developer.keys.manage")),
+        );
+    let api_key_one = get(developer::get_key)
+        .layer(guards::require(&state, "developer.keys.read"))
+        .merge(
+            delete(developer::revoke_key).layer(guards::require(&state, "developer.keys.manage")),
+        );
+    let api_key_rotate = post(developer::rotate_key)
+        .layer(guards::require(&state, "developer.keys.manage"));
+    // The request log rides the read key — it is the same question as the key list, answered one
+    // row at a time.
+    let request_logs =
+        get(developer::list_request_logs).layer(guards::require(&state, "developer.keys.read"));
+    // The single-row read is its own path for the same reason `/events/catalogue` is a literal
+    // sibling rather than a child: `{id}` registered first would read `catalogue` as an id. Here
+    // the ids are numbers and the paths do not collide, but the drawer and the page are
+    // different shapes and a `GET` cannot answer both from one route.
+    let request_log_one =
+        get(developer::get_request_log).layer(guards::require(&state, "developer.keys.read"));
+
     // The deployment centre (REQ-024, slice 1). Six reads and one write, and the write is
     // `deployment.manage` because "check for updates now" reaches out to the network and
     // rewrites the release cache — it is not a read even though it answers a question.
@@ -2093,6 +2127,16 @@ pub fn router(state: AppState) -> Router {
         .route("/cdn/rules/reorder", cdn_rule_reorder)
         .route("/cdn/rules/{id}", cdn_rule)
         .route("/cdn/rules/{id}/toggle", cdn_rule_toggle)
+        // The developer platform (REQ-033, slice 1). Mounted in the order the literal segments
+        // require: `/api-keys/{id}/rotate` is registered before nothing in particular here, but
+        // `/request-logs` and `/request-logs/{id}` are two shapes of the same verb, and axum
+        // matches the longer literal first only because the parameterised one is a different
+        // arity — registering both is safe, registering two *methods* on one is not.
+        .route("/api-keys", api_keys)
+        .route("/api-keys/{id}", api_key_one)
+        .route("/api-keys/{id}/rotate", api_key_rotate)
+        .route("/request-logs", request_logs)
+        .route("/request-logs/{id}", request_log_one)
         .route("/cdn/status", cdn_status)
         .route("/cdn/purges", cdn_purges)
         .route("/cdn/purges/{id}", cdn_purge_one)

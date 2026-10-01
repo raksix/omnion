@@ -5,6 +5,12 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  ApiKey,
+  ApiKeyDetail,
+  ApiKeysResponse,
+  ApiRequestLog,
+  ApiRequestLogPage,
+  MintedApiKey,
   CdnAdapterInfo,
   CdnCacheRule,
   CdnCacheRuleInput,
@@ -6950,3 +6956,115 @@ export async function runClusterSample(environment: string): Promise<ClusterSamp
   );
 }
 
+// The developer platform (REQ-033, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * List the organization's API keys.
+ *
+ * The return type is `ApiKeysResponse` rather than `ApiKey[]` because the API answers an object:
+ * a bare array is the shape you cannot add a summary to later without changing every client's
+ * type on the day you do.
+ */
+export async function fetchApiKeys(): Promise<ApiKeysResponse> {
+  return request("/api/v1/api-keys");
+}
+
+/**
+ * One key and its daily usage, in one round trip.
+ *
+ * `days` is bounded by the API (1–365) so a client cannot ask for a decade of bars and get a
+ * thousand-point chart nobody reads.
+ */
+export async function fetchApiKey(keyId: string, days = 30): Promise<ApiKeyDetail> {
+  return request(`/api/v1/api-keys/${encodeURIComponent(keyId)}?days=${days}`);
+}
+
+/** What `POST /api/v1/api-keys` accepts. */
+export type CreateApiKeyInput = {
+  name: string;
+  scopes: string[];
+  environment: "live" | "sandbox";
+  rate_tier?: "standard" | "high";
+  /** CIDR blocks. Omit the field entirely for "any source" — an empty array means the same. */
+  ip_allowlist?: string[];
+  /** 30, 90, 365, or omit for "never". */
+  expires_in_days?: number;
+};
+
+/**
+ * Mint a key. The response carries `secret` and this is the only time it will.
+ *
+ * The caller is responsible for showing it once and then discarding it — there is no endpoint
+ * to fetch it again, which is the point.
+ */
+export async function createApiKey(input: CreateApiKeyInput): Promise<MintedApiKey> {
+  return request("/api/v1/api-keys", { method: "POST", body: JSON.stringify(input) });
+}
+
+/**
+ * Rotate a key: a new secret, the old one dead immediately.
+ *
+ * No overlap window, and the panel says so — see the REQ-033 slice-1 note on why rotation and
+ * the OAuth client-secret rotation (slice 3, which *does* overlap) are different operations.
+ */
+export async function rotateApiKey(keyId: string): Promise<MintedApiKey> {
+  return request(`/api/v1/api-keys/${encodeURIComponent(keyId)}/rotate`, { method: "POST" });
+}
+
+/** Revoke a key. The row and its history stay; the credential stops working. */
+export async function revokeApiKey(keyId: string): Promise<void> {
+  await request(`/api/v1/api-keys/${encodeURIComponent(keyId)}`, { method: "DELETE" });
+}
+
+/** The filters `GET /api/v1/request-logs` accepts. Every one is optional. */
+export type RequestLogFilters = {
+  api_key_id?: string;
+  /** By public prefix — what a key row's "View logs" link uses. */
+  key_prefix?: string;
+  status?: number;
+  status_class?: "2xx" | "3xx" | "4xx" | "5xx";
+  path_prefix?: string;
+  method?: string;
+  /** How far back. The API defaults to 24 hours when this is omitted. */
+  since_hours?: number;
+  min_duration_ms?: number;
+  limit?: number;
+  offset?: number;
+};
+
+/**
+ * Build the log query string.
+ *
+ * Empty values are *omitted* rather than sent blank: `?status_class=` would arrive as an empty
+ * string, fail the API's closed-list validation with a 400, and read as "the filter is broken"
+ * rather than "the filter is not set".
+ */
+export function requestLogQuery(filters: RequestLogFilters): string {
+  const params = new URLSearchParams();
+  for (const [name, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    params.set(name, String(value));
+  }
+  const query = params.toString();
+  return query.length > 0 ? `?${query}` : "";
+}
+
+/**
+ * A filtered page of the request log.
+ *
+ * Metadata only. There is no body to return, so the absence of payload data is the schema
+ * rather than a redaction somebody has to remember to apply.
+ */
+export async function fetchRequestLogs(
+  filters: RequestLogFilters = {},
+): Promise<ApiRequestLogPage> {
+  return request(`/api/v1/request-logs${requestLogQuery(filters)}`);
+}
+
+/** One request's metadata — what the log row's drawer opens. */
+export async function fetchRequestLog(id: number): Promise<ApiRequestLog> {
+  return request(`/api/v1/request-logs/${encodeURIComponent(String(id))}`);
+}

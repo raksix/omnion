@@ -10906,6 +10906,13 @@ async function main() {
     // *real* endpoint instead — the same reasoning as the media file detail above.
     { path: "/webhooks", name: "webhooks" },
     { path: "/webhooks/new", name: "webhooks-new" },
+    // The developer platform's two screens (REQ-033, slice 1). Both are walked as routes
+    // rather than reached by a click: the keys screen is a nav entry and the log screen is a
+    // link target from a key row, and a screen whose *first paint* is only ever seen after
+    // somebody has already filled in a form is a screen whose loading and error states nobody
+    // has looked at. The depth pass below drives the key form and the one-time secret dialog.
+    { path: "/developer/keys", name: "developer-keys" },
+    { path: "/developer/logs", name: "developer-logs" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },

@@ -3460,3 +3460,93 @@ export type ClusterRestartResponse = {
   workload: string;
 };
 
+// The developer platform (REQ-033, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One API key, as the API returns it.
+ *
+ * There is no `secret` field, and that is the design rather than an omission: the secret is
+ * write-only, so this type — the one the list, the detail screen and every filter read from —
+ * cannot carry one even if the API were changed to try. `MintedApiKey` is the separate type that
+ * only `create` and `rotate` return.
+ */
+export type ApiKey = {
+  id: string;
+  organization_id: string;
+  name: string;
+  /** The public identifier. Safe to show, log and quote in a support conversation. */
+  prefix: string;
+  scopes: string[];
+  environment: "live" | "sandbox";
+  rate_tier: "standard" | "high";
+  /** CIDR blocks, or `null` for "any source address". */
+  ip_allowlist: string[] | null;
+  expires_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  rotated_at: string | null;
+  created_by: string;
+  created_at: string;
+  status: "active" | "pending" | "revoked" | "expired";
+};
+
+/**
+ * The response of `POST /api/v1/api-keys` and `POST /api/v1/api-keys/{id}/rotate`.
+ *
+ * It *is* an `ApiKey` with one extra field — the API flattens the key to the top level — so a
+ * client that already reads a key needs no new shape to read a minted one. The presence of
+ * `secret` is the signal the panel uses to open the one-time dialog.
+ */
+export type MintedApiKey = ApiKey & {
+  /** Shown exactly once. The API will never return it again. */
+  secret: string;
+};
+
+/** `GET /api/v1/api-keys`. */
+export type ApiKeysResponse = {
+  keys: ApiKey[];
+};
+
+/** One day of a key's usage chart. */
+export type ApiKeyUsagePoint = {
+  day: string;
+  requests: number;
+  errors: number;
+  p95_ms: number | null;
+};
+
+/** `GET /api/v1/api-keys/{id}` — the key plus its chart, in one round trip. */
+export type ApiKeyDetail = {
+  key: ApiKey;
+  usage: ApiKeyUsagePoint[];
+};
+
+/** One request in the log. Metadata only: there is no body field, by design. */
+export type ApiRequestLog = {
+  id: number;
+  organization_id: string;
+  /** Which key authenticated it, or `null` for a session-authenticated call. */
+  api_key_id: string | null;
+  actor_user_id: string | null;
+  method: string;
+  /** Path without the query string. */
+  path: string;
+  status: number;
+  duration_ms: number;
+  /** The id the caller can quote in a bug report. */
+  request_id: string;
+  bytes_in: number | null;
+  bytes_out: number | null;
+  error_code: string | null;
+  created_at: string;
+};
+
+/** `GET /api/v1/request-logs`. */
+export type ApiRequestLogPage = {
+  items: ApiRequestLog[];
+  /** How many rows matched the filter, not just this page. */
+  total: number;
+  has_more: boolean;
+};
+

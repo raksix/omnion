@@ -57,6 +57,12 @@ pub enum DeveloperError {
     #[error("a key named {0:?} already exists")]
     KeyNameTaken(String),
 
+    /// A negative or absurd expiry. The panel offers `never`, 30, 90 and 365 days; anything
+    /// else is either a typo or a request trying to mint a key that is dead on arrival — which
+    /// reads on the caller's side as "the key I just made does not work" with no reason given.
+    #[error("expiry must be 30, 90 or 365 days, or omitted for never")]
+    InvalidExpiry(i64),
+
     /// A CIDR entry that is not a network.
     #[error("{0:?} is not a CIDR block")]
     InvalidCidr(String),
@@ -88,3 +94,63 @@ pub enum DeveloperError {
 
 /// The crate's result.
 pub type Result<T, E = DeveloperError> = std::result::Result<T, E>;
+
+impl DeveloperError {
+    /// Whether this is the caller's problem (a `400` with a message they can act on) or the
+    /// platform's (a `500`).
+    ///
+    /// The split is about *who can fix it*, and it is the reason the crate does not carry
+    /// sqlx errors in its client-facing half: a database that is unreachable is not something
+    /// the person filling in a form can act on, and answering `400 invalid request` to a
+    /// database outage sends them to fix a field that was never wrong.
+    #[must_use]
+    pub fn is_client_error(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidName { .. }
+                | Self::NoScopes
+                | Self::EmptyScope
+                | Self::DuplicateScope(_)
+                | Self::UnknownEnvironment(_)
+                | Self::UnknownRateTier(_)
+                | Self::UnknownStatusClass(_)
+                | Self::NegativeDuration
+                | Self::KeyNotFound
+                | Self::KeyNameTaken(_)
+                | Self::InvalidCidr(_)
+                | Self::InvalidExpiry(_)
+                | Self::KeyUnverifiable
+                | Self::InvalidKey
+                | Self::HighTierRefused
+                | Self::KeyNotActive(_)
+        )
+    }
+
+    /// The API error code this variant carries.
+    ///
+    /// Stable strings, because a client switches on them: the panel's `ApiError.code` is what
+    /// decides whether a message goes under a field or into a toast, and a code that changes
+    /// spelling between releases moves the message to the wrong place with nothing failing.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidName { .. } => "invalid_key_name",
+            Self::NoScopes => "no_scopes",
+            Self::EmptyScope => "empty_scope",
+            Self::DuplicateScope(_) => "duplicate_scope",
+            Self::UnknownEnvironment(_) => "unknown_environment",
+            Self::UnknownRateTier(_) => "unknown_rate_tier",
+            Self::UnknownStatusClass(_) => "unknown_status_class",
+            Self::NegativeDuration => "negative_duration",
+            Self::KeyNotFound => "api_key_not_found",
+            Self::KeyNameTaken(_) => "api_key_name_taken",
+            Self::InvalidExpiry(_) => "invalid_expiry",
+            Self::InvalidCidr(_) => "invalid_cidr",
+            Self::KeyUnverifiable => "key_unverifiable",
+            Self::InvalidKey => "invalid_api_key",
+            Self::HighTierRefused => "high_tier_refused",
+            Self::KeyNotActive(_) => "api_key_not_active",
+            Self::Database(_) => "developer_store_unavailable",
+        }
+    }
+}

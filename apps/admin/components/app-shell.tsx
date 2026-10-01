@@ -66,6 +66,14 @@ const NAV: readonly NavItem[] = [
   // rather than under Settings because the two are the same investigation from both ends:
   // the feed says what happened, this says who was told and whether they got it.
   { href: "/webhooks", label: "Webhooks", icon: Webhook },
+  // The developer platform (REQ-033, slice 1). Beside Webhooks rather than under Settings: a
+  // developer asking "what can I call, and what has my integration already called" is asking
+  // about the same platform surface from two ends, and both answers belong on one shelf.
+  // `/developer` is the section root the REQ names; the keys and logs screens ship with it and
+  // the overview arrives with slice 4, so the root is registered once it exists rather than
+  // pointing at a screen that has not been built.
+  { href: "/developer/keys", label: "Developer · API keys", icon: KeyRound },
+  { href: "/developer/logs", label: "Developer · Logs", icon: ScrollText },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/organizations", label: "Organizations", icon: Building2 },
   { href: "/ai", label: "AI Hub", icon: Sparkles, module: "ai-hub" },

@@ -41,7 +41,7 @@ use std::net::IpAddr;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::error::{DeveloperError, Result};
+use crate::error::DeveloperError;
 use crate::model::ApiKey;
 use crate::secret;
 
