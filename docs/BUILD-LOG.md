@@ -9944,3 +9944,36 @@ opened; what changed is that when the reading arrives it *can* be green.
 `paramWrote`, beside `edgeCommitted` and `focusIsCanvas` — then the unticked `narrow-lock`,
 `shortcut-help` and `tab-walk` rows from the same pass. REQ-045 stays blocked: `entities` /
 `entity_fields` still exist in no worktree, so the apply pipeline's first step has no table to write.
+
+## Tick 75 — three silent constants in one row, and the flag that hid them
+
+**What.** `plugin-palette` could not measure its third claim, for three separate reasons stacked
+on top of each other: it read `node.node_type` (the wire sends `type`), it posted to
+`/workflows/{id}/graph/validate` (nothing is mounted there), and both failures were absorbed by a
+`.catch(() => null)` that reported the same reading as a correct product. **And the tick-74 pass
+was never a focused pass at all** — `run.sh` read `${QA_ONLY:-}` and never `$1`, so
+`--only=workflow-builder` walked all 55 routes silently, which is why tick 74 sat on `iam-devices`
+for 36 minutes.
+
+**Proof.**
+- Focused pass `20261001-221017` on the private w3 stack: the banner printed
+  `browser walkthrough (focused: workflow-builder)` and the seven target rows ran in 22 minutes —
+  against 1,007 clicks over 55 routes before. **Zero ENOSPC** (tick 74 recorded one per click
+  once `/mnt/apopic` hit 100%); `QA_OUT_ROOT=/dev/shm/w3-qa` moved ~100MB of screenshots to tmpfs.
+- The row's reading, live: `pluginProbeReachedServer: true` (the fix — no throw), then
+  `validateStatus: 404`. **That is the field order earning its keep**: reachability first, then the
+  sentence, and the 404 was read as a missing route rather than as a product defect.
+- Guard suite `plugin-palette-row.test.ts` **9/9**; full admin suite **355/355** (was 346).
+- `mutate-plugin-palette-row.sh`: **10/10 mutations red**, `walkthrough.cjs` and `run.sh` restored
+  byte-exact (md5 asserted, not assumed).
+- `node --check` clean, `bash -n` clean.
+
+**Not ticked.** Every criterion below still needs a re-read: `keyboard-pass` reads
+`paramSubjectKnown: false` (the subject did not resolve on this graph — honest, but unproven),
+`narrow-lock` is green on all five claims including `tableMode.landedOnTable: true` with
+`editControls: 0` (which is the one that decides the criterion), and `shortcut-help` reads
+`closedByEscape: false`. The pass ended `QA_STACK_GONE=1` under four concurrent passes, so no
+finding count is claimed.
+
+**Next.** Re-run the focused pass against the fixed URL to read `sentinelsStayApart` off a live
+`/validate` answer, then `table-save-survives` and `shortcut-help.closedByEscape`.
