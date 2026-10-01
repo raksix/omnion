@@ -55,6 +55,41 @@ M2 = "0002_content.sql"
 M3 = "0003_media.sql"
 
 
+def _unreversible_in_repo() -> tuple[str, str]:
+    """Two migrations from THIS repository that genuinely ship no down script.
+
+    A plan rooted at REPO has to name files that exist on disk: `destructiveness` reads the
+    real tree and intersects it with the delta by exact filename, so a delta of invented names
+    (`0001_init.sql`, `0002_content.sql`) intersects to nothing and the plan answers
+    `reversible` — while the repository holds 53 migrations with no reversal. That is the
+    exact false promise REQ-129 exists to prevent, and it arrived here through the TEST
+    fixtures rather than through the code under test, which is the harder kind of mistake to
+    notice.
+    """
+    names = release.unreversible_migrations(REPO)
+    assert len(names) >= 2, "the repository is expected to hold reversal-less migrations"
+    return names[0], names[-1]
+
+
+UNREV_A, UNREV_B = _unreversible_in_repo()
+
+
+def _reversible(filename: str) -> str:
+    """A migration file that carries a real reversal, in the shape `down.rs` reads.
+
+    Written once because the reversals matter to three separate tests: a fixture of
+    `-- ordinary migration\n` has no reversal block at all, so under the landed policy it is
+    honestly `destructive`, and the tests that assert `reversible` would be asserting that a
+    missing down script is fine. That is the exact false promise REQ-129 was written against,
+    so the fixture has to carry the thing the assertion is about.
+    """
+    return (
+        "-- the migration\n"
+        "-- Down script (docs/05-VERSIONING.md)\n"
+        "--   drop table %s;\n" % filename[: -len(".sql")]
+    )
+
+
 class VersionRange(unittest.TestCase):
     def test_a_plain_upgrade_builds(self):
         plan = plan_lib.build_plan(
@@ -130,13 +165,63 @@ class Destructiveness(unittest.TestCase):
     """The property that must not degrade: unknown is not safe."""
 
     def test_absent_policy_yields_unknown_not_reversible(self):
-        # This repository has no REQ-129 policy migration, so this is the live answer. If
-        # the verdict were `reversible` the helper would promise a down script nobody has run.
-        self.assertFalse(release._policy_exists(REPO))
-        verdict = plan_lib.destructiveness([M2], manifest_doc("0.5.0", [M1, M2]), REPO)
-        self.assertEqual(verdict["verdict"], plan_lib.VERDICT_UNKNOWN)
-        self.assertEqual(verdict["database_rollback"], "unknown")
-        self.assertIn("REQ-129", verdict["reason"])
+        # The property is the PAIRING, and it is tested in a temp tree rather than against
+        # this repository. It used to assert `assertFalse(_policy_exists(REPO))` — true when
+        # written, false the moment REQ-129 landed, so the test that exists to catch the
+        # helper lying to an operator started failing for a reason that had nothing to do
+        # with the helper. A gate that asserts a snapshot of the repo is a gate that reports
+        # the repo, not the code.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "database", "migrations")
+            os.makedirs(directory)
+            for name in (M1, M2):
+                with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+                    handle.write("-- ordinary migration\n")
+            self.assertFalse(release._policy_exists(tmp))
+            verdict = plan_lib.destructiveness([M2], manifest_doc("0.5.0", [M1, M2]), tmp)
+            self.assertEqual(verdict["verdict"], plan_lib.VERDICT_UNKNOWN)
+            self.assertEqual(verdict["database_rollback"], "unknown")
+            self.assertIn("REQ-129", verdict["reason"])
+
+    def test_the_landed_policy_makes_a_reversal_less_migration_destructive(self):
+        # The other half of the pairing, and the case that was silently unreachable before:
+        # with the policy landed and no `-- omnion:no-down` marker, a migration that has no
+        # reversal must NOT come back `reversible`. It has no down script, so the database
+        # rollback is a restore, and `destructive_migrations` is what establishes it.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "database", "migrations")
+            os.makedirs(directory)
+            for name in (M1, M2):
+                with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+                    handle.write("-- ordinary migration\n")
+            with open(os.path.join(directory, "0207_migration_safety.sql"), "w") as handle:
+                handle.write("-- policy\n")
+            self.assertTrue(release._policy_exists(tmp))
+            verdict = plan_lib.destructiveness([M2], manifest_doc("0.5.0", [M1, M2]), tmp)
+            self.assertEqual(verdict["verdict"], plan_lib.VERDICT_DESTRUCTIVE)
+            self.assertEqual(verdict["database_rollback"], "restore-from-backup")
+
+    def test_a_reversible_migration_is_not_destructive_under_the_landed_policy(self):
+        # …and the case that must stay True, or the rule above degenerates into "always
+        # destructive" and stops being information. A migration WITH an executable reversal
+        # is reversible, and says so.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "database", "migrations")
+            os.makedirs(directory)
+            for name in (M1, M2):
+                with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+                    handle.write(
+                        "-- Down script (docs/05-VERSIONING.md)\n"
+                        "--   drop table %s;\n" % name.replace(".sql", "")
+                    )
+            with open(os.path.join(directory, "0207_migration_safety.sql"), "w") as handle:
+                handle.write(
+                    "-- Down script (docs/05-VERSIONING.md)\n"
+                    "--   drop table migration_safety;\n"
+                )
+            self.assertEqual(release.destructive_migrations(tmp), [])
+            verdict = plan_lib.destructiveness([M2], manifest_doc("0.5.0", [M1, M2]), tmp)
+            self.assertEqual(verdict["verdict"], plan_lib.VERDICT_REVERSIBLE)
 
     def test_a_no_down_marker_in_the_range_makes_it_destructive(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,14 +258,37 @@ class Destructiveness(unittest.TestCase):
         self.assertEqual(verdict["verdict"], plan_lib.VERDICT_DESTRUCTIVE)
         self.assertEqual(verdict["source"], "manifest")
 
-    def test_a_manifest_flag_of_false_does_not_override_an_absent_policy(self):
-        # `migrations_destructive: false` from a publisher means "the publisher's own tree
-        # had no marker". It cannot mean "a verified down script exists" — that is REQ-129's
-        # gate, and until it runs, `false` is the publisher's silence, not a proof.
-        verdict = plan_lib.destructiveness(
-            [M2], manifest_doc("0.5.0", [M1, M2], migrations_destructive=False), REPO
+    def test_a_manifest_flag_of_false_does_not_launder_an_unreversible_migration(self):
+        # `migrations_destructive: false` from a publisher is a claim about the publisher's
+        # tree, and the helper reads the tree itself. So the flag may never turn an
+        # unreversible migration into a `reversible` verdict — that is the invariant, and it is
+        # what the original test meant.
+        #
+        # The assertion was `VERDICT_UNKNOWN` against a `destructiveness()` call rooted at
+        # REPO, which pinned "the gate has not landed". It has: `0207_migration_safety.sql` is
+        # in the tree, so the honest answer for a migration with no down script is
+        # `destructive`, and asserting `unknown` here would have been asserting the
+        # pre-REQ-129 world again. `false` is the publisher's silence; the gate is what turns
+        # silence into an answer, and both of those are consistent with `destructive`.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "database", "migrations")
+            os.makedirs(directory)
+            for name in (M1, M2):
+                with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+                    handle.write("-- ordinary migration\n")
+            with open(os.path.join(directory, "0207_migration_safety.sql"), "w") as handle:
+                handle.write(_reversible("0207_migration_safety.sql"))
+            verdict = plan_lib.destructiveness(
+                [M2],
+                manifest_doc("0.5.0", [M1, M2], migrations_destructive=False),
+                tmp,
+            )
+        self.assertEqual(verdict["verdict"], plan_lib.VERDICT_DESTRUCTIVE)
+        self.assertEqual(
+            verdict["source"],
+            "missing-down-script",
+            "the reason names what was found, not the manifest's flag",
         )
-        self.assertEqual(verdict["verdict"], plan_lib.VERDICT_UNKNOWN)
 
     def test_every_verdict_is_one_of_three(self):
         self.assertEqual(set(plan_lib.VERDICTS), {"reversible", "destructive", "unknown"})
@@ -190,16 +298,22 @@ class RollbackSplit(unittest.TestCase):
     def test_the_plan_splits_application_from_database(self):
         plan = plan_lib.build_plan(
             from_version="0.4.0",
-            to_manifest=manifest_doc("0.5.0", [M1, M2]),
-            from_manifest=manifest_doc("0.4.0", [M1]),
+            to_manifest=manifest_doc("0.5.0", [UNREV_A, UNREV_B]),
+            from_manifest=manifest_doc("0.4.0", [UNREV_A]),
             root=REPO,
         )
         self.assertTrue(plan["rollback"]["application"]["available"])
         self.assertIsNotNone(plan["rollback"]["application"]["command"])
         # Application rollback is ALWAYS available — the previous tag exists. Database
         # rollback is not, and the two must not be rendered as one availability flag.
+        #
+        # The verdict is `destructive`, not the `unknown` this asserted when REQ-129's gate
+        # had not landed: 53 of this tree's migrations ship no down script, so under a landed
+        # gate the honest answer is "restore from backup". `available` stays False either way,
+        # which is the property that matters — the test changed its expected REASON, not its
+        # promise to the operator.
         self.assertFalse(plan["rollback"]["database"]["available"])
-        self.assertEqual(plan["rollback"]["database"]["verdict"], plan_lib.VERDICT_UNKNOWN)
+        self.assertEqual(plan["rollback"]["database"]["verdict"], plan_lib.VERDICT_DESTRUCTIVE)
 
     def test_a_reversible_range_offers_the_down_script(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -207,10 +321,10 @@ class RollbackSplit(unittest.TestCase):
             os.makedirs(directory)
             for name in (M1, M2):
                 with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
-                    handle.write("-- ordinary migration\n")
+                    handle.write(_reversible(name))
             # A policy migration is what makes the absence of a marker mean something.
-            with open(os.path.join(directory, "0030_migration_safety.sql"), "w") as handle:
-                handle.write("-- policy\n")
+            with open(os.path.join(directory, "0207_migration_safety.sql"), "w") as handle:
+                handle.write(_reversible("0207_migration_safety.sql"))
             plan = plan_lib.build_plan(
                 from_version="0.4.0",
                 to_manifest=manifest_doc("0.5.0", [M1, M2]),
@@ -227,15 +341,50 @@ class RollbackSplit(unittest.TestCase):
 
 class PointOfNoReturn(unittest.TestCase):
     def _plan(self, topology="compose"):
+        # Real names, not `M1`/`M2`. `destructiveness` intersects the tree with the delta by
+        # exact filename, so a delta of invented names matches nothing and the plan comes back
+        # `reversible` — which is why this helper's earlier revision produced a plan with no
+        # marker at all and looked like a bug in `point_of_no_return` rather than a fixture
+        # that named files the repository does not contain.
         return plan_lib.build_plan(
             from_version="0.4.0",
-            to_manifest=manifest_doc("0.5.0", [M1, M2]),
-            from_manifest=manifest_doc("0.4.0", [M1]),
+            to_manifest=manifest_doc("0.5.0", [UNREV_A, UNREV_B]),
+            from_manifest=manifest_doc("0.4.0", [UNREV_A]),
             topology=topology,
             root=REPO,
         )
 
-    def test_the_marker_sits_on_the_migration(self):
+    def test_a_reversible_plan_carries_no_marker(self):
+        # A plan whose database rollback is available must NOT carry a point of no return:
+        # marking one there trains operators to ignore the marker that matters. Rooted at a
+        # tree where both migrations ship reversals, which is the only way to get there now
+        # that this repository honestly reports `destructive`.
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "database", "migrations")
+            os.makedirs(directory)
+            for name in (M1, M2):
+                with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+                    handle.write(_reversible(name))
+            with open(os.path.join(directory, "0207_migration_safety.sql"), "w") as handle:
+                handle.write(_reversible("0207_migration_safety.sql"))
+            for topology in plan_lib.TOPOLOGIES:
+                with self.subTest(topology=topology):
+                    plan = plan_lib.build_plan(
+                        from_version="0.4.0",
+                        to_manifest=manifest_doc("0.5.0", [M1, M2]),
+                        from_manifest=manifest_doc("0.4.0", [M1]),
+                        root=tmp,
+                        topology=topology,
+                    )
+                    self.assertEqual(plan["destructive"]["verdict"], plan_lib.VERDICT_REVERSIBLE)
+                    self.assertFalse(any(s["point_of_no_return"] for s in plan["steps"]))
+
+    def test_an_unreversible_plan_marks_exactly_the_migration_step(self):
+        # The other half, and the one that matters to an operator: a release whose database
+        # rollback is a restore DOES have a point of no return, and it sits on the migration.
+        # This was the assertion the old test made against REPO, where it passed for the wrong
+        # reason — REPO was `unknown` then, and `unknown` marks too. Now it is `destructive`
+        # and the marker is there for the right one.
         for topology in plan_lib.TOPOLOGIES:
             with self.subTest(topology=topology):
                 plan = self._plan(topology)
@@ -274,8 +423,8 @@ class ChecklistGate(unittest.TestCase):
     def _plan(self, **over):
         return plan_lib.build_plan(
             from_version="0.4.0",
-            to_manifest=manifest_doc("0.5.0", [M1, M2]),
-            from_manifest=manifest_doc("0.4.0", [M1]),
+            to_manifest=manifest_doc("0.5.0", [UNREV_A, UNREV_B]),
+            from_manifest=manifest_doc("0.4.0", [UNREV_A]),
             root=REPO,
             **over,
         )
@@ -293,7 +442,15 @@ class ChecklistGate(unittest.TestCase):
         # The verdict recorded is the one that was acknowledged. An operator who ticked
         # "destructive" on an unknown plan is a different, more dangerous act than one who
         # ticked it on a known one, and the record has to say which.
-        self.assertEqual(plan["destructive"]["acknowledged_verdict"], plan_lib.VERDICT_UNKNOWN)
+        # The recorded verdict is the one the plan carries. It used to be asserted as
+        # `VERDICT_UNKNOWN` against a REPO-rooted plan, which pinned the pre-REQ-129 answer;
+        # the property is that acknowledgement RECORDS the verdict rather than inventing a
+        # softer one, and that holds for whichever verdict the range earned.
+        self.assertEqual(
+            plan["destructive"]["acknowledged_verdict"],
+            plan["destructive"]["verdict"],
+            "acknowledging must record the verdict, not replace it",
+        )
 
     def test_the_checklist_lists_the_migration_step(self):
         plan = self._plan()
@@ -470,11 +627,28 @@ class Verification(unittest.TestCase):
         verdict = plan_lib.verify_plan(plan, REPO)
         self.assertEqual(verdict["state"], "failed")
 
-    def test_an_unknown_plan_that_names_a_rollback_method_is_caught(self):
-        plan = self._plan()
-        plan["destructive"]["database_rollback"] = "down-script"
-        verdict = plan_lib.verify_plan(plan, REPO)
-        self.assertEqual(verdict["state"], "failed")
+    def test_a_plan_that_names_a_rollback_method_it_has_not_earned_is_caught(self):
+        # The invariant is per-verdict, and the two halves are separate assertions for a
+        # reason: the plan this class builds is `destructive` now (its migrations ship no
+        # down script), so a single assertion written against `unknown` no longer exercises
+        # the branch it was written for — it passed or failed for a reason that had moved.
+        # A gate that only tests one branch of a rule tests that branch.
+        for verdict, borrowed in (
+            (plan_lib.VERDICT_DESTRUCTIVE, "down-script"),
+            (plan_lib.VERDICT_UNKNOWN, "down-script"),
+            (plan_lib.VERDICT_REVERSIBLE, "restore-from-backup"),
+        ):
+            with self.subTest(verdict=verdict):
+                plan = self._plan()
+                plan["destructive"]["verdict"] = verdict
+                plan["destructive"]["database_rollback"] = borrowed
+                result = plan_lib.verify_plan(plan, REPO)
+                self.assertEqual(
+                    result["state"],
+                    "failed",
+                    f"a {verdict} plan may not claim {borrowed}",
+                )
+                self.assertTrue(result["problems"], "a refusal must say what it refused")
 
 
 class Cli(unittest.TestCase):

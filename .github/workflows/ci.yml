@@ -564,5 +564,12 @@ jobs:
       # nothing about the check it removed.
       - name: Upgrade plan gate (with mutations)
         run: bash scripts/qa/release-upgrade.sh
+      # The migration reversal gate (REQ-129). It splits deliberately: the half that proves the
+      # comparison can CATCH a hand-broken down script is pure and needs no services, so it
+      # runs on every commit; the half that proves a reversal actually executes needs a
+      # PostgreSQL and skips itself when there is none. A gate that only ran the second half
+      # would be dark on exactly the configuration where the first one matters.
+      - name: Migration reversal gate
+        run: bash scripts/qa/migration-down-gate.sh
       - name: Chart renders and lints
         run: bash scripts/qa/helm-chart.sh

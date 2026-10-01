@@ -90,11 +90,21 @@ PY
 )
 if [ $? -eq 0 ]; then pass; else fail "the delta is exactly the migrations between the split"; fi
 
-# The verdict on this repository is UNKNOWN, because REQ-129 has not landed. Asserting the
-# exact string, not "not destructive": a helper that answered `reversible` here would be
-# promising a verified down script that nobody has run.
+# The verdict on this repository is DESTRUCTIVE, because REQ-129's gate HAS landed and most
+# of this tree's migrations ship no down script. It used to assert `unknown` "because REQ-129
+# has not landed", which was a snapshot of the repository's age: the moment 0207 landed the
+# gate that guards the upgrade helper's honesty started failing for a reason that had nothing
+# to do with the helper.
+#
+# Asserting the exact string still matters, and in the OTHER direction now: `reversible` here
+# would be promising a verified down script for 53 files that have none, which is the exact
+# false promise REQ-129 exists to prevent.
 verdict=$(python3 -c "import json; print(json.load(open('$WORK/plan.json'))['destructive']['verdict'])" 2>/dev/null)
-if [ "$verdict" = "unknown" ]; then pass; else fail "verdict is unknown while the policy is absent" "got: $verdict"; fi
+if [ "$verdict" = "destructive" ]; then
+  pass
+else
+  fail "a tree of reversal-less migrations reads as destructive" "got: $verdict"
+fi
 
 # ------------------------------------------------------------------------------------------
 section "every step command parses in a shell"
@@ -224,7 +234,14 @@ refuse "an unknown topology" "invalid choice" \
 # The acknowledgement is what completes the checklist, and it has to be the operator's.
 if plan --acknowledge --acknowledge-as ops@example.com > "$WORK/ack.json" 2>&1; then pass; else fail "an acknowledged plan builds"; fi
 ack_state=$(python3 -c "import json; d=json.load(open('$WORK/ack.json')); print(d['checklist']['complete'], d['destructive'].get('acknowledged_verdict'))" 2>/dev/null)
-if [ "$ack_state" = "True unknown" ]; then pass; else fail "acknowledging records the verdict, not just a tick" "got: $ack_state"; fi
+# The property is that acknowledgement RECORDS the verdict rather than inventing a softer
+# one, so it is compared against the plan's own verdict rather than a literal.
+ack_expected=$(python3 -c "import json; print('True ' + json.load(open('$WORK/plan.json'))['destructive']['verdict'])" 2>/dev/null)
+if [ "$ack_state" = "$ack_expected" ]; then
+  pass
+else
+  fail "acknowledging records the verdict, not just a tick" "got: $ack_state (want: $ack_expected)"
+fi
 
 # ------------------------------------------------------------------------------------------
 section "mutations — each check must be able to fail"
@@ -308,7 +325,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 # `SyntaxError` on line 2 of every one of them, which is the same unreadable "everything
 # broke" as a syntax error is everywhere else. The probe's value is the LAST expression, so
 # the body ends in one and `exec` is what makes the rest of the lines possible.
-space = {"upg": upg, "os": os}
+space = {"upg": upg, "os": os, "sys": sys}
 exec(compile(body, sys.argv[1], "exec"), space)
 value = space.get("VALUE")
 if value is None:
@@ -320,7 +337,15 @@ PY
 # The six fixtures, as files. Each is ONE expression: a statement list would need exec(),
 # and an expression is what `compile(..., "eval")` runs without another layer.
 cat > "$WORK/p1.py" <<'PY'
-VALUE = upg.destructiveness(["0002_content.sql"], {"migrations_destructive": None}, os.getcwd())["verdict"]
+# A migration that really exists on disk. The probe used a fictional `0002_content.sql`, and
+# `destructiveness` intersects the tree with the delta by exact filename — so the delta
+# matched nothing and the answer was `reversible`, which is the value the mutation below is
+# supposed to produce. Three mutations reported "not load-bearing" for that reason: they were
+# comparing the real module against itself, on a fixture that both agreed was fine.
+sys.path.insert(0, os.path.dirname(os.environ["OMNION_LIB"]))
+import manifest as _manifest
+_name = _manifest.unreversible_migrations(os.getcwd())[0]
+VALUE = upg.destructiveness([_name], {"migrations_destructive": None}, os.getcwd())["verdict"]
 PY
 cat > "$WORK/p2.py" <<'PY'
 plan = upg.build_plan(
@@ -335,12 +360,15 @@ plan["checklist"].update(complete=True, acknowledged=False)
 VALUE = upg.verify_plan(plan)["state"]
 PY
 cat > "$WORK/p3.py" <<'PY'
+sys.path.insert(0, os.path.dirname(os.environ["OMNION_LIB"]))
+import manifest as _manifest
+_names = _manifest.unreversible_migrations(os.getcwd())
 plan = upg.build_plan(
     from_version="0.4.0",
     to_manifest={"version": "0.5.0", "registry": "ghcr.io",
-                 "migrations": ["0001_init.sql", "0002_content.sql"],
+                 "migrations": _names[:2],
                  "migrations_destructive": None},
-    from_manifest={"version": "0.4.0", "migrations": ["0001_init.sql"]},
+    from_manifest={"version": "0.4.0", "migrations": _names[:1]},
     root=os.getcwd(),
 )
 VALUE = [str(s["kind"]) for s in plan["steps"] if s["point_of_no_return"]]
@@ -361,12 +389,15 @@ for step in plan["steps"]:
 VALUE = upg.verify_plan(plan)["state"]
 PY
 cat > "$WORK/p5.py" <<'PY'
+sys.path.insert(0, os.path.dirname(os.environ["OMNION_LIB"]))
+import manifest as _manifest
+_names = _manifest.unreversible_migrations(os.getcwd())
 plan = upg.build_plan(
     from_version="0.4.0",
     to_manifest={"version": "0.5.0", "registry": "ghcr.io",
-                 "migrations": ["0001_init.sql", "0002_content.sql"],
+                 "migrations": _names[:2],
                  "migrations_destructive": None},
-    from_manifest={"version": "0.4.0", "migrations": ["0001_init.sql"]},
+    from_manifest={"version": "0.4.0", "migrations": _names[:1]},
     root=os.getcwd(),
 )
 VALUE = plan["rollback"]["database"]["available"]
@@ -403,8 +434,20 @@ check() {
 
 # 1. The single most consequential mutation in the file: it turns "nobody has checked" into
 #    "nothing to worry about", which is the one sentence this request must never render.
-check "the unknown verdict" p1.py \
-  "if not release_manifest._policy_exists(root):" "if False:" "'unknown'" "'reversible'"
+# 1. The mutation target MOVED, and the old one became a no-op rather than a failure.
+#
+#    It used to disable the policy check, which is the branch that turns "nobody has checked"
+#    into "unknown". REQ-129 has since landed, so `destructive_migrations` answers FIRST and
+#    the policy branch is only reachable for a range with no unreversible migration in it —
+#    and the mutation reported `real='destructive'` against `mutated='destructive'`, i.e. it
+#    changed nothing at all.
+#
+#    The equivalent claim today is the one that decides the verdict for THIS tree: a reversal
+#    less migration must never come back `reversible` just because the manifest is silent. So
+#    the mutation disables the `unreversible` branch — the code that says "no down script
+#    exists" — and the fixture is a range that really contains such a migration.
+check "the missing-down-script verdict" p1.py \
+  "    if unreversible:" "    if False:" "'destructive'" "'reversible'"
 
 # 2. The request's third refusal. Measured on a plan whose ONLY defect is the unacknowledged
 #    complete checklist, because against a plan that also carries a bad verdict a DIFFERENT

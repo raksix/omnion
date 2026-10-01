@@ -167,9 +167,25 @@ class ManifestShape(unittest.TestCase):
             if artifact["kind"] == "image":
                 self.assertNotIn("//", artifact["name"])
 
-    def test_destructiveness_is_null_until_the_policy_exists(self):
-        # REQ-129 is unbuilt, so `false` would be a claim nobody has verified.
-        self.assertIsNone(self.manifest["migrations_destructive"])
+    def test_destructiveness_reflects_the_tree_rather_than_the_release_date(self):
+        # The tri-state is `True` / `False` / `None`, and `None` means "the gate that would
+        # make the absence of a marker mean something has not landed". This repository is past
+        # that now — `0207_migration_safety.sql` is in the tree — so the flag answers the
+        # question it exists to answer: 53 of 58 migrations ship no down script, therefore
+        # `True`.
+        #
+        # It used to assert `None`, which was right when REQ-129 was unbuilt and became a
+        # snapshot of the repository's age rather than a test of the rule. A release manifest
+        # that said "not destructive" about a tree with 53 unreversible migrations is the
+        # false promise this request was written against, so the assertion is now on the
+        # VALUE, and the pairing with an absent policy is covered in the upgrade suite where
+        # both branches can be built in a temp tree.
+        self.assertIs(
+            self.manifest["migrations_destructive"],
+            True,
+            "a tree with reversal-less migrations must publish migrations_destructive: true",
+        )
+        self.assertTrue(release.destructive_migrations(REPO))
 
     def test_a_version_disagreement_is_refused(self):
         with self.assertRaises(release.ManifestError) as ctx:
