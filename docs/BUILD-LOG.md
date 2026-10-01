@@ -10194,6 +10194,117 @@ run". The reason was never that the pass was slow. It was that consecutive ticks
 competing passes that destroyed each other, and the resulting failure mode is a report full of
 findings measured against a database that was dropped underneath the walk.
 
+## Tick 90 (third pass) — the browser pass finally measured, and it found two real defects
+
+A focused pass (`QA_ONLY='notifications-depth,webhooks-depth,event-retention-depth,security-depth'`)
+walked the whole route inventory and reached the depth passes. It ended in the mobile phase with
+`TypeError: Cannot read properties of undefined (reading 'horizontalOverflow')` at
+`walkthrough.cjs:7724` — a harness bug, recorded below — but everything before it is measurement.
+
+**REQ-021 — the keyboard criterion is now closed.** The box had been open for four ticks with a
+note that no pass had reached the leg. Every leg is now measured:
+
+```text
+keyboardRows 3  cursorMoved true  keyboardSelected true  keyboardOpenedDrawer true
+escapeClosedDrawer true  escapeWithNoRowUnderCursor true
+eToggledRead true  shiftEMarkedVisible true
+drawerDeliveryEmptyState true  drawerDeliveryNamesChannelsInProse true
+readRowsStayVisible true  bulkNoticeIsHonest true  inboxFilterIsHonest true
+```
+
+The settings screen's legs also came back green after the `c48db9d` fix, including the two that
+were false twice: **`quietSaved: true`, `digestPersisted: true`**, plus `serverAgrees`,
+`inAppRefusalIsA400`, `errorState` and `errorOffersRetry`.
+
+### Two defects this pass found, both mine
+
+**1. `slashFocusedFilter: false` — `/` does not focus the filter.** Every other key on the
+criterion is wired (`j`, `k`, `Enter`, `e`, `Shift+E`, `x`, `Esc` all measured true), and `/` is the
+one the criterion names that the handler does not have. A shortcut list in the file header and a
+handler that lacks one of them is the same defect the `Escape` leg was two ticks ago: documented,
+absent, and invisible to every walk that only pressed the keys that work. It is a one-line fix
+once someone reads the criterion as a list rather than as a sample.
+
+**2. `pushEnableExplainsItself: false`, with `pushUnavailableNamesAVariable: true`.** Slice 6a
+made the Web Push readiness row honest — it now says the installation has no usable key pair
+instead of claiming the channel is configured — and 6b added the transport. But the **button**
+next to that message is disabled with no explanation of *why*, so the screen says "this
+installation has no push key pair" in one sentence and offers a dead control in the next. A
+disabled control with no reason is the "dead button" the definition of done forbids, and it is
+the same shape as the webhook `chat`-channel defect from last tick: the state was reported
+honestly while the affordance beside it stayed silent.
+
+**REQ-016 and REQ-010 — the passes ran and the screens are honest, but the flows could not
+complete.** `webhooks` reports a correct empty state (`emptyState`, `emptyOffersTheAction`,
+`emptyNameRefused`, `emptyUrlRefused`, `emptyEventsRefused`, `badUrlRefused`,
+`shortSecretRefused`, `insecureWarns`, `groupSelectsTheWholeArea` — the whole validation set the
+criterion names), then `secretShown: false` / `endpointId: ""` / `testQueued: false`, and
+`endpointIsGone: true` because there was never an endpoint to delete. The same shape on
+`event-retention`: the tab renders and the **bounds come from the API** (`boundsComeFromTheApi`,
+`windowIsTheServers`, `zeroDisablesSave`, `hugeDisablesSave`, `validEnablesSave` all true) but
+`saved: true` with `savedIsAnnounced: false`, `auditCarriesBoth: false`, `sweepAnswers: false` and
+`runLogGrew: false`. In both cases the assertion that depends on a *write* is false while the
+assertions that read the screen are true, which points at the environment rather than at the
+screens: the QA stack runs without a Web Push key pair and without an object store the upload can
+write to, and both passes stop at the first write.
+
+**A harness bug, not a product one.** `walkthrough.cjs:7724` reads `.horizontalOverflow` off an
+undefined value in the mobile phase. It is the same class as the earlier `'horizontalOverflow'`
+note in this ledger: a measurement that cannot be taken is reported as a **thrown TypeError**,
+which kills the pass and takes every later measurement with it, rather than being recorded as an
+absent measurement. The mobile legs for REQ-021 are therefore still unmeasured — and this time the
+cause is in the file that is supposed to be measuring them.
+
+## Tick 91 — the eighth key, the disabled button, and the pass that was erasing its own report
+
+Three defects from tick 90's measurement, all found by reading the measurement rather than
+the code, and all mine.
+
+**1. `/` did focus the filter — something else then took the focus back.**
+`slashFocusedFilter: false` was recorded as "`/` is not wired", and the natural fix would have
+been to add a handler. The handler was already there: `notification-list.tsx` binds `/` on the
+table body and focuses `notification-search`. `components/global-search.tsx` binds the same key
+on `window` and focuses its own input. Both run for one keystroke, and the window listener runs
+second — document listeners fire in registration order — so it answered a key the page had
+already claimed and moved focus straight back out. `50221aeb` guards on
+`event.defaultPrevented`: `preventDefault` is set by whoever claimed the key first, so a page
+with its own `/` keeps it and every page without one still gets the global box.
+
+**2. A disabled push button with its reason in a paragraph above it.**
+`pushEnableExplainsItself: false` sat next to `pushUnavailableNamesAVariable: true`: the notice
+named `OMNION_PUSH_*` correctly while the button beside it was disabled and silent. That is the
+dead control the definition of done forbids, and the same shape as the webhook `chat`-channel
+defect. `36259f96` renders the reason next to the button, names it in `title`, and points
+`aria-describedby` at it so a screen reader hears it *before* the click.
+
+**3. The pass erased its own report when a page threw.** A page whose walk fails is pushed as
+`{ ...route, failed }` with no `diagnostics` key; the roll-up then read `d.horizontalOverflow`
+off `undefined` and threw. The throw landed in the mobile phase — the last thing a pass does —
+so one crashed page took every finding with it, and a pass that reported nothing reads exactly
+like a pass with no findings. That is how tick 90's mobile legs stayed unmeasured. `71375c41`
+records an absent measurement as a high finding naming the screen, continues the roll-up, and
+separates a *live* push button (must produce a sentence when the browser refuses) from a
+*disabled* one (must carry its reason) — the old leg clicked unconditionally, and clicking a
+disabled button measures Playwright's refusal rather than the screen.
+
+Proof this tick: `cargo build -p omnion-api` clean · `cargo test -p omnion-notifications --lib`
+**102 passed, 0 failed** · `pnpm --filter @omnion/admin typecheck` exit 0 · `node --check
+scripts/qa/walkthrough.cjs` clean · focused pass `QA_ONLY='notifications-depth'` running.
+
+Next: read the pass's `slashFocusedFilter`, `pushEnableExplainsItself`,
+`pushDisabledReasonNamesAVariable` and `pushDisabledReasonIsDescribed` legs, and the REQ-021
+mobile legs that tick 90's crash never reached.
+
+**The pass is still walking, and the box is why.** At 07:31 the focused
+`QA_ONLY='notifications-depth'` pass had been walking for 55 minutes with its last screenshot
+at 07:23 and `node scripts/qa/walkthrough.cjs` at **0.0% CPU in state S** — not crashed, not
+finished, waiting on a browser whose renderer gets no time. `uptime` reads **load 97** on a
+six-core box: six sibling worktrees are compiling at once, and `QA_SLOT_WAIT=60` had already
+spent its budget and proceeded without a place because the shared slot belongs to the w5 pass
+(`/tmp/omnion-qa-slot` holder alive, cwd `/mnt/apopic/omnion-w5`). So this tick ends with the
+three fixes committed and every gate green, and the browser leg **still owed** — which is the
+honest state, not the "I ran a pass" reading of the same log.
+
 ## 2026-10-01 · Wave 5 · tick 91 — the overview counters were never driven by a real drain
 
 **What.** Not a new screen: the second leg of REQ-011 slice 4, which says "a test endpoint
