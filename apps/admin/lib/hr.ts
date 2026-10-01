@@ -228,6 +228,243 @@ function query(filters: Record<string, unknown> | undefined): string {
   return parts.length === 0 ? "" : `?${parts.join("&")}`;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The people core (slice 1) — employees, departments, the org chart.
+//
+// Added after slice 2 shipped the client, and deliberately placed **above** the leave section
+// rather than appended to the end: the file used to open with its module description naming leave
+// and attendance only, which described a client that could not see an employee at all. The order
+// here is the order the module reasons in — people, then the leave rows that point at them.
+
+/** The employment types the schema accepts, in the order a form offers them. */
+export const EMPLOYMENT_TYPES = [
+  { value: "full_time", label: "Full time" },
+  { value: "part_time", label: "Part time" },
+  { value: "contract", label: "Contract" },
+  { value: "intern", label: "Intern" },
+] as const;
+
+/** The lifecycle statuses the schema accepts. */
+export const EMPLOYEE_STATUSES = [
+  { value: "active", label: "Active" },
+  { value: "on_leave", label: "On leave" },
+  { value: "terminated", label: "Terminated" },
+] as const;
+
+/**
+ * One employee.
+ *
+ * The four personal fields are **optional and absent** for a caller without
+ * `hr.employees.sensitive.read` — the server drops them from the response rather than sending
+ * them as null, so `undefined` here means "you may not read this", never "this person has none".
+ * A screen that renders `?? "—"` is therefore correct, and one that renders a blank column is
+ * showing a leak that already happened.
+ */
+export type Employee = {
+  id: string;
+  organization_id: string;
+  employee_no: string;
+  user_id: string | null;
+  first_name: string;
+  last_name: string;
+  work_email: string;
+  phone: string | null;
+  position: string;
+  department_id: string;
+  department_name: string;
+  manager_id: string | null;
+  manager_name: string | null;
+  employment_type: string;
+  start_date: string;
+  end_date: string | null;
+  employee_status: string;
+  location: string | null;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+  /** Gated. Present only for a caller holding `hr.employees.sensitive.read`. */
+  personal_email?: string;
+  personal_phone?: string;
+  address?: string;
+  emergency_contact?: string;
+};
+
+/** The fields a filter bar can narrow the directory by. */
+export type EmployeeFilters = {
+  search?: string;
+  department_id?: string;
+  include_subdepartments?: boolean;
+  manager_id?: string;
+  employment_type?: string;
+  status?: string;
+  started_from?: string;
+  started_to?: string;
+  sort?: string;
+  direction?: string;
+  limit?: number;
+  cursor?: string;
+};
+
+/** The body `POST /hr/employees` accepts. */
+export type NewEmployee = {
+  employee_no?: string;
+  user_id?: string;
+  first_name: string;
+  last_name: string;
+  work_email: string;
+  phone?: string;
+  position: string;
+  department_id: string;
+  manager_id?: string;
+  employment_type: string;
+  start_date?: string;
+  end_date?: string;
+  employee_status?: string;
+  location?: string;
+  notes?: string;
+  personal_email?: string;
+  personal_phone?: string;
+  address?: string;
+  emergency_contact?: string;
+};
+
+/** The body `PATCH /hr/employees/{id}` accepts; every field optional. */
+export type EmployeePatch = Partial<Omit<NewEmployee, "user_id">> & {
+  /** Cleared when absent-and-explicit rather than ignored. */
+  clear_end_date?: boolean;
+};
+
+/** One department, with the counts the tree label needs. */
+export type Department = {
+  id: string;
+  organization_id: string;
+  name: string;
+  code: string | null;
+  parent_id: string | null;
+  manager_employee_id: string | null;
+  manager_name: string | null;
+  description: string | null;
+  active: boolean;
+  member_count: number;
+  child_count: number;
+  deletable: boolean;
+  created_at: string;
+};
+
+/** The body `POST /hr/departments` accepts. */
+export type NewDepartment = {
+  name: string;
+  code?: string;
+  parent_id?: string;
+  manager_employee_id?: string;
+  description?: string;
+  active?: boolean;
+};
+
+/** The body `PATCH /hr/departments/{id}` accepts. */
+export type DepartmentPatch = Partial<Omit<NewDepartment, "organization_id">>;
+
+/** One node of the org chart. */
+export type OrgChartNode = {
+  employee: Pick<
+    Employee,
+    "id" | "first_name" | "last_name" | "position" | "work_email" | "employee_no" | "department_id"
+  >;
+  children: OrgChartNode[];
+};
+
+/** The department root rows, empty when the organization has none yet. */
+export type OrgChart = { items: OrgChartNode[] };
+
+/** `GET /hr/employees` — a page of the directory. */
+export function fetchEmployees(filters: EmployeeFilters = {}): Promise<Page<Employee>> {
+  return hrRequest<Page<Employee>>(`/api/v1/hr/employees${query(filters)}`);
+}
+
+/** `GET /hr/employees/{id}` — one employee, with the gated block when the caller may read it. */
+export function fetchEmployee(id: string): Promise<Employee> {
+  return hrRequest<Employee>(`/api/v1/hr/employees/${id}`);
+}
+
+/**
+ * `GET /hr/employees/suggest-number` — the next free employee number.
+ *
+ * A route of its own on purpose: the form needs the suggestion before anything is typed, and a
+ * list endpoint that answered a number when asked would make the directory's response shape
+ * depend on a query parameter.
+ */
+export function suggestEmployeeNumber(): Promise<{ employee_no: string }> {
+  return hrRequest<{ employee_no: string }>("/api/v1/hr/employees/suggest-number");
+}
+
+/** `POST /hr/employees` — add an employee. */
+export function createEmployee(body: NewEmployee): Promise<Employee> {
+  return hrRequest<Employee>("/api/v1/hr/employees", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** `PATCH /hr/employees/{id}` — edit an employee's own fields. */
+export function updateEmployee(id: string, patch: EmployeePatch): Promise<Employee> {
+  return hrRequest<Employee>(`/api/v1/hr/employees/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/** `POST /hr/employees/{id}/terminate` — end an employment: a status and a last day. */
+export function terminateEmployee(
+  id: string,
+  body: { employee_status?: string; end_date?: string },
+): Promise<Employee> {
+  return hrRequest<Employee>(`/api/v1/hr/employees/${id}/terminate`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `GET /hr/departments` — the whole tree, with the counts the labels need. */
+export function fetchDepartments(): Promise<{ items: Department[] }> {
+  return hrRequest<{ items: Department[] }>("/api/v1/hr/departments");
+}
+
+/** `GET /hr/org-chart` — the same rows, nested by manager. */
+export function fetchOrgChart(): Promise<OrgChart> {
+  return hrRequest<OrgChart>("/api/v1/hr/org-chart");
+}
+
+/** `POST /hr/departments` — create a department. */
+export function createDepartment(body: NewDepartment): Promise<Department> {
+  return hrRequest<Department>("/api/v1/hr/departments", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `PATCH /hr/departments/{id}` — rename, re-parent, or set the head. */
+export function updateDepartment(id: string, patch: DepartmentPatch): Promise<Department> {
+  return hrRequest<Department>(`/api/v1/hr/departments/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/**
+ * `DELETE /hr/departments/{id}` — delete one that is empty, or be refused with both counts.
+ *
+ * The refusal carries *how* exposed the department is, so the operator does not have to open two
+ * reports to find out why the delete did not happen.
+ */
+export function deleteDepartment(id: string): Promise<void> {
+  return hrRequest<void>(`/api/v1/hr/departments/${id}`, { method: "DELETE" });
+}
+
+/** `POST /hr/departments/merge` — move a department's members into another and drop it. */
+export function mergeDepartments(body: { source_id: string; target_id: string }): Promise<Department> {
+  return hrRequest<Department>("/api/v1/hr/departments/merge", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 /** `GET /hr/leave/types` — the catalogue. */
 export function fetchLeaveTypes(): Promise<{ items: LeaveType[] }> {
   return hrRequest<{ items: LeaveType[] }>("/api/v1/hr/leave/types");
