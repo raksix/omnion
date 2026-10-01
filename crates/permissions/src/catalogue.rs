@@ -203,6 +203,19 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Register local AI endpoints and manage the models they serve",
     },
+    // REQ-106 slice 2's own key, kept out of the `ai.local.*` family on purpose. Reading the
+    // switch is `ai.local.read`, because the question it answers ("does anything leave this
+    // machine?") is the same one the locality badges answer. FLIPPING it is a different act by
+    // any measure: turning the gap on strands every remote feature at once, and an installation
+    // that lets a support lead see the switch while only an owner moves it is the common and
+    // correct shape. It is also the name an auditor looks up, which is why it exists as its own
+    // key rather than as a flag on `ai.local.manage` — the allow-list editor is on this key too,
+    // because widening what counts as internal decides exactly what the switch permits.
+    PermissionDef {
+        key: "ai.airgap.manage",
+        category: "ai",
+        description: "Turn the air gap on or off, and edit the internal-host allow-list",
+    },
     PermissionDef {
         key: "ai.tools.read",
         category: "ai",
