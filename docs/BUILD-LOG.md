@@ -10502,3 +10502,52 @@ the bottleneck, not the code.
 
 Next: the pass itself if it can take the slot, then REQ-021's keyboard and mobile legs, then
 REQ-016's form-validation and payload-inspector legs.
+
+## Wave 4 · tick 56 — REQ-055 slice 2d, the clock
+
+**What.** Slice 2d: attendance. Migration `0206_hr_attendance.sql` (one row per employee per day,
+the uniqueness being what makes a second punch answerable without a race), the module's
+check-in/check-out/correct plus the month projection, ten routes split in two — `/hr/me/*` with no
+`route_layer` at all because an employee holds no `hr.*` key, `/hr/attendance/*` behind
+`hr.attendance.*` — two screens, the nav fix and the walkthrough routes.
+
+**Two defects, and the first one is the tick.**
+
+1. **The migration was half-guarded, and that is the shape that costs an afternoon.** The table
+   carried `if not exists`; the three indexes below it did not. On a clean database the file
+   applies, so the slice looked installed — and then wedged every database where the schema had
+   come in by another route (here: a hand-applied `psql`) with `42P07 relation
+   "hr_attendance_employee_day_uniq" already exists`. The error aborts the file, so
+   `_sqlx_migrations` never records version 206, so every later `migrate()` walks into it again.
+   **Ten walks, all dying in setup before a single assertion ran** — a suite that reports ten
+   failures and zero signal. Fix: guard the three indexes, which costs nothing on a clean database
+   and makes the file idempotent end to end.
+2. **The nav's "longest href wins" test was dead code.** The inherited condition carried a
+   `&& false` term, so the whole clause could never fire and plain `startsWith` decided everything;
+   a nested route lit the tab a person was not looking at. Rewritten to sort descending and take
+   the first match on a **segment** boundary — `/hr/leave/types` no longer lights `/hr/leave`, and
+   `/hr/leave/whatever` no longer lights `/hr/leave/types`.
+
+**Proof.**
+
+```text
+migration chain on a fresh database                       every migration applied, clean
+0206 applied a SECOND time by hand                        clean, 4 indexes  (the case that wedged)
+cargo test -p omnion-module-hr --quiet                    87 passed; 0 failed
+cd apps/admin && node node_modules/typescript/bin/tsc …    exit 0  (the real binary, its own code)
+```
+
+**Not done this tick, and it is not a code problem.** The ten DB walks are committed but have
+never returned a verdict: the box ran at load **215** (four processes in D-state, both disks at
+95–98 %) with ten writers and three Chrome instances on six cores, and `ss` shows the test process
+sitting on a Postgres socket with `Recv-Q 325` and **zero CPU ticks over 20 s** — the client is
+waiting for a server that has no cycles to answer. The walk is starved, not failing. So:
+
+- **no acceptance box is ticked**, including the criterion slice 2d exists to satisfy;
+- **no browser pass**: the QA slot is held by a live `w6` pass and this is the third tick running;
+- the slice is recorded `in-progress`, not `done`, because a REQ closes on evidence and not on a
+  green unit test.
+
+Next: the walks when the box breathes (they are the only thing between slice 2d and its
+acceptance box), then the browser pass behind the slot, then slice 3 (onboarding, documents,
+reports).
