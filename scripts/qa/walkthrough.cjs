@@ -8663,6 +8663,12 @@ async function runSecurityDepth(page, report) {
 
   // ---- The maintenance window (REQ-024, slice 3) --------------------------------------------
   //
+  // `POLL_WAIT_MS` is the shell banner's own interval plus room for the save round trip. It has
+  // to be derived from the component's `POLL_MS` rather than guessed: a wait shorter than the
+  // interval reports a banner that has not polled yet as one that is stuck, and a wait far
+  // longer makes every pass slower for nothing.
+  const POLL_WAIT_MS = 30_000 + 6_000;
+  //
   // A form that renders is half a screen; the other half is what the server does with it. So
   // this pass does the three things that can be wrong, in the order a human would:
   //
@@ -8717,6 +8723,36 @@ async function runSecurityDepth(page, report) {
     note({ step: "maintenance-state-after-save", state: stateAfterSave });
     await shot(page, "deployment-maintenance-open");
 
+    // The banner is the half of this feature that reaches a session the operator is not
+    // looking at, so it gets its own assertion on a DIFFERENT screen. Reading it on the
+    // maintenance screen itself would prove the screen renders, not that the shell does.
+    await page.goto(`${URL_ADMIN}/deployment/history`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const banner = page.locator("[data-qa-maintenance-banner]").first();
+    const bannerVisible = (await banner.count()) > 0;
+    const bannerText = bannerVisible
+      ? ((await banner.textContent().catch(() => "")) || "").trim()
+      : null;
+    note({ step: "maintenance-banner-visible", visible: bannerVisible, text: bannerText });
+    if (!bannerVisible) {
+      note({
+        step: "maintenance-banner-missing",
+        reason:
+          "a window is open on production but no screen shows the banner; every write is refused and the operator is told by a 503 instead",
+      });
+    }
+    // It must carry the operator's own words, not a restatement of them: the same sentence the
+    // API returns in its 503 body. A paraphrase is a second thing to keep in sync, and this is
+    // the one place the operator is guaranteed to read it.
+    if (bannerText && !bannerText.includes("QA maintenance window")) {
+      note({
+        step: "maintenance-banner-not-operator-message",
+        reason: "the banner does not carry the message the operator wrote",
+        text: bannerText,
+      });
+    }
+    await shot(page, "deployment-maintenance-banner");
+
     // (3) off again, and then the write route must answer. This is the assertion that a stale
     //     window cannot survive a pass: `runDeploymentPreflight` is a POST on an environment
     //     route, so it is exactly the shape the window is supposed to refuse.
@@ -8734,6 +8770,21 @@ async function runSecurityDepth(page, report) {
       });
     }
     await shot(page, "deployment-maintenance-off");
+
+    // The banner must be GONE, and the poll is 30s, so this waits one poll interval plus room.
+    // A banner that outlives its window is the failure in the other direction and it is the one
+    // an operator cannot work around: every write is fine, and the panel keeps saying otherwise
+    // until somebody believes it.
+    await page.waitForTimeout(POLL_WAIT_MS);
+    const bannerAfterOff = (await page.locator("[data-qa-maintenance-banner]").count()) > 0;
+    note({ step: "maintenance-banner-after-off", visible: bannerAfterOff });
+    if (bannerAfterOff) {
+      note({
+        step: "maintenance-banner-stuck",
+        reason:
+          "the banner is still up one poll interval after the window was closed; writes work again but the panel keeps claiming they do not",
+      });
+    }
   } else {
     note({ step: "maintenance-missing", reason: "/deployment/maintenance did not render its cards" });
   }

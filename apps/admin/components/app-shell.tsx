@@ -15,6 +15,7 @@ import { OrganizationSwitcher } from "@/components/organization-switcher";
 import { GlobalSearch } from "@/components/global-search";
 import { NotificationBell } from "@/components/notification-bell";
 import { EnvironmentChip, StagingEnvironmentBanner } from "@/components/environment-chip";
+import { MaintenanceWindowBanner } from "@/components/maintenance-window-banner";
 import { TenantStatusBanner } from "@/components/tenant-status-banner";
 import { useSession } from "@/lib/session";
 import { useTenantStatus } from "@/lib/tenant-status";
@@ -286,6 +287,12 @@ export function AppShell({ title, description, children }: AppShellProps) {
           {/* Staging sits directly under the freeze notice and above the title row, for the same
               reason: a banner that scrolls away is a banner a person reads once and forgets. */}
           <StagingEnvironmentBanner />
+          {/* The maintenance window (REQ-024, slice 3) sits below both, and inside this sticky
+              header for the same reason with a sharper edge: it is the notice that the operator's
+              next Save is about to be refused, so it has to be in front of them at the moment
+              they press it. No dismiss control, for the reason the staging strip has none -- an
+              operator who may hide "your writes are being refused" will hide it. */}
+          <MaintenanceWindowBanner />
           <div className="flex flex-wrap items-center gap-3 px-4 py-3 sm:px-6">
             <button
               type="button"
