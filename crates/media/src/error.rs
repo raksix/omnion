@@ -162,6 +162,19 @@ pub enum MediaError {
         /// What is wrong with it, in a sentence.
         reason: String,
     },
+    /// A custom metadata pair cannot be stored as sent, and names itself.
+    ///
+    /// Same rule as `InvalidScanSetting` and `InvalidRetentionSetting`, for the same reason: the
+    /// pair editor renders the message under the row that caused it, and the field is
+    /// `metadata.<key>` so a message about one pair cannot land under another. A `400`, because
+    /// nothing was written and the caller can fix it and try again.
+    #[error("`{field}`: {reason}")]
+    InvalidMetadata {
+        /// Wire name of the offending pair, or `metadata` for a problem with the set.
+        field: String,
+        /// What is wrong with it, in a sentence.
+        reason: String,
+    },
     /// No retention policy with that id on this site.
     #[error("no such retention policy on this site")]
     RetentionPolicyNotFound,

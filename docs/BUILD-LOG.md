@@ -11018,3 +11018,147 @@ defect, which is the argument for the shared helper rather than for a sixth copy
 `cms_seo` 15/15 (194 s) · `cms_members` 11/11 (124 s) · `cms_featured_media` 7/7 (78 s) ·
 `content_block_media` 10/10 (116 s) · `cms_newsletter` 13/14 (14/14 in isolation) ·
 `omnion-content --lib` 328/0.
+
+## Tick 98 — the media serve path had no validator at all
+
+**What.** `crates/media/src/validators.rs` (new, 20 tests) plus the four media serve paths, so a
+`GET` can say "I already hold these bytes" and be told `304`. The ETag is the row's `checksum`,
+which `append_version` rewrites in the same statement that moves `storage_key`.
+
+**The defect, and why nothing had caught it.** The serve path set `private, max-age=300` at a URL
+that **names the file rather than its contents**, and the tree carried no `ETag` and no
+`If-None-Match` handling anywhere — `grep -rn 'IF_NONE_MATCH\|NOT_MODIFIED\|ETAG' apps/ crates/`
+returned one unrelated SCIM line. Two facts therefore held at once and neither was visible: every
+repeat request pulled the whole object off the store, and a **replace changed the bytes behind an
+address that had promised they had not changed**. A visitor, the panel or a CDN honouring that
+`max-age` saw the previous photograph for five minutes after an operator corrected it. It is the
+uncalled `prune_candidates` defect class again, one module over: a TTL and a URL that together
+describe a promise nothing on the request path keeps.
+
+**Three decisions that are not decoration.**
+
+1. **The validator is the checksum, not a timestamp.** `updated_at` is stamped by a rename, a tag
+   edit and a folder move, so it changes when the bytes did not and fails to describe the one
+   change that did. The checksum is the identity of the pixels, and the walk asserts a validator
+   built from anything else cannot pass.
+2. **A version validates against its own checksum.** `serve_bytes` used the version row; had it
+   borrowed the file's validator it would answer `304` for a historical version the caller has
+   never seen.
+3. **The check happens before the body is read.** Reading first and deciding afterwards costs what
+   an unconditional `200` costs, which defeats the entire point.
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **219 passed**, 0 failed (was 179) |
+| walk | `cargo test -p omnion-api --test media -- --test-threads=1` | **16 passed**, 0 failed |
+| types | `apps/admin` `tsc --noEmit` | **0 errors** |
+
+The crate's 20 new tests, and the full 16-test walk suite green against a fresh database on port
+5433 (`omnion_cond`) — including the three walks this change touches: the range walk, the replace
+walk and the new conditional one. The walk
+`a_conditional_get_is_answered_from_the_bytes_and_a_replace_moves_the_validator` drives the real
+router over live PostgreSQL: upload, read the validator, revalidate to a `304` with an **empty
+body**, `*`, the date fallback, then **replace** — and assert the stale validator is answered
+`200` with the *new* bytes, that the new validator then settles, that version 1 revalidates against
+itself and is **not** answered by the file's current validator, and that an unparseable validator
+gets the representation rather than a `304`.
+
+**Proven to fail twice, because both halves of a self-written suite can no-op.**
+
+* The weak marker removed (`const WEAK = ""`) → the quoting test fails. A validator that stops
+  being weak is one that claims a byte-for-byte uniqueness the platform cannot promise.
+* The date comparison replaced by `true` → **two** tests fail. That is the bug this tick nearly
+  shipped: a shadowed `since` binding in the first draft made `If-Modified-Since` match *anything*,
+  which would have sent a `304` for every client that sent a date. The suite caught it.
+
+One test of mine was **wrong, not the code**: it asserted a client dated *after* the resource gets
+the bytes. A client cannot be right about the future, so `304` is correct and the test was fixed —
+the direction of that comparison is the whole content of the case.
+
+**Note for the next writer.** `cargo fmt -p omnion-media` sweeps the crate's whole module tree —
+it reformatted `duplicates.rs`, `grants.rs`, `retention.rs`, `scanning.rs`, `shares.rs`,
+`storage_settings.rs` and `usage.rs`, none of them mine. Revert them (`git checkout --`) rather
+than committing a sibling's reformat into this tick. Related: `/mnt/apopic` hit **100%** mid-tick
+(482 MB free) and an `open(...).write()` on `apps/api/tests/media.rs` died with `ENOSPC` **after
+truncating the file to 1862 lines**. The file was recovered with `git checkout --` and re-applied
+through `/dev/shm`. On this box, write a file to `/dev/shm` first and copy it into place.
+
+**Browser pass: still owed, and still not startable.** The slot is held live by `w6`
+(`pid 2904616`, `cwd=/mnt/apopic/omnion-w6`, verified with `kill -0` **and** `/proc/<pid>/cwd`),
+45 Chrome processes, load 27. REQ-010's screen-state box and this REQ's five screen boxes turn on it.
+
+**Next:** `bash scripts/qa/run.sh --only=media` on a free slot.
+
+---
+
+## Tick 99 — the custom metadata pairs nobody ever wrote (REQ-010)
+
+The `media.metadata` column has carried a `jsonb` value and a **GIN index** since `0025`, and
+`UpdateFileBody` has had a `metadata` field since the first draft of the file route. A search of
+`apps/` and `crates/` found **no writer and no reader**: every row in every installation was `{}`,
+the index scanned an empty object per row, and the REQ's own scope line — "custom key/value pairs
+(`metadata jsonb` with a GIN index)" and "a metadata filter in the browser" — was satisfied by a
+column. It is the uncalled-column defect class one level up from the uncalled `prune_candidates`
+function, and it survived 98 ticks because **nothing in the tree was broken**: the code compiled,
+every test was green, and the column was there.
+
+Shipped as `crates/media/src/metadata_pairs.rs`, `Filter::MetadataPair` in the browser builder,
+the validation on `PATCH /api/v1/media/files/{id}`, and `features/media/metadata-pairs.tsx` with
+the `Custom pair` field on the browser toolbar.
+
+**Five decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **Values are text, never arbitrary jsonb.** A nested object or a list is a `400` naming the
+   key, not `[object Object]` or `1,2,3`. A flattened structure is searchable and uninterpretable
+   at the same time; a container also has no single meaning for the containment test the GIN index
+   serves, and a numeric value makes a `-> 'k' = 'v'` comparison false for a value that *is* `v`.
+2. **The filter is `metadata ->> $n = $n+1`, not `@>`.** Containment is false for a stored number
+   compared against a string, and a jsonb equality is not the form the 0025 index was built for.
+3. **The set is replaced whole, never merged.** A partial merge lets a caller who does not know
+   the current set drop every pair it did not send — how a licence number disappears during a
+   caption edit. `{}` clears; an omitted field does not.
+4. **A half-typed `key=` is not a filter.** The toolbar field is re-read on every keystroke.
+5. **The editor is a block with its own save button.** The pairs are facts about *this library's
+   copy*, not facts the file carries — listing them beside the dimensions would claim they were
+   extracted — and one `Save metadata` that also rewrote the pairs would let a caption edit empty a
+   licence field.
+
+Caps: 40 pairs, 60-byte keys, 500-byte values, 8 kB total, each refused with the key **named**
+rather than truncated. The total cap is load-bearing — 40 × 500 are individually legal and together
+are a row every listing drags along.
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **243 passed**, 0 failed (was 219) |
+| crate | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walk | `cargo test -p omnion-api --test media -- --test-threads=1` | **18 passed**, 0 failed (was 16) |
+| types | `apps/admin` `tsc --noEmit` | **0 errors** |
+| ui | `/tmp/probe-pairs.cjs` | **22/22** |
+
+**Proven to fail, three times.** Removing the validation from the route fails the walk on the
+stored jsonb's *type*. Swapping `->>` for `->` fails two crate tests. Making a half-typed term
+default to `campaign=` fails one. Plus a fourth, on the UI: removing the row mapping fails the
+probe's check.
+
+**Three of the four failures were my own mistakes, and the first is the one worth keeping.** The
+walk filtered `/api/v1/media` — the **flat core** endpoint that answers `{"media": [...]}` with no
+count — rather than `/media/files`, the browser listing the toolbar actually talks to. The endpoint
+whose name looks like the file manager is not the one the panel uses; that is the same lesson
+`raw_with_preset` taught two ticks ago, and it is now the second time. The other two: the error
+envelope is `{"error": {...}}`, so `body["code"]` reads `null` and looks like a missing field
+rather than a wrong address; and `member_token` holds *no* media permission in this fixture, so an
+assertion that a member can list failed `403` while the fixture's own doc comment says so.
+
+**Note for the next writer.** `cargo fmt -p omnion-media` reports diffs in nine files of which two
+are mine — `duplicates.rs`, `grants.rs`, `retention.rs`, `scanning.rs`, `shares.rs`,
+`storage_settings.rs` and `usage.rs` are pre-existing. Run `rustfmt --edition 2024 <file>` on the
+files you actually touched. And `/mnt/apopic` swung between 95% and 100% during this tick: write to
+`/dev/shm` first, then copy into place.
+
+**Browser pass: queued, not yet run.** `scripts/qa/run.sh --only=media` is waiting on the shared
+slot — `w4` holds it live (`pid 1782910`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0`
+**and** `/proc/<pid>/cwd`, not the placeholder's age). This REQ still rests on it for its screen
+states, and it is not closed on tests alone.
+
+**Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
+hook to REQ-011.
