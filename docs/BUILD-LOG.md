@@ -11294,3 +11294,13 @@ What was verified in this tick stands on its own and is unaffected: `cargo test 
 omnion-module-hr` **132/132**, `pnpm typecheck` clean, the probe **8/8** (and 7 FAIL on `HEAD`).
 The DB-walk gate is **unmeasured, not passing** — `ps` alone cannot tell a slow walk from a blocked
 one, so the next tick re-runs it rather than recording a green it did not observe.
+
+**The gate caught its own author.** `silent-green-report-probe.sh` answered differently on
+unchanged source — 8/8, then 1 FAIL, then 2, then 0, then 1. The cause was its own
+`set -uo pipefail` meeting `awk … | grep -q`: `grep -q` exits at the first match, `awk` takes
+SIGPIPE (141), `pipefail` promotes that to a failed pipeline, so the `if` answered "not present" at
+random. Measured on the file: `pipefail ON: 1000100010`, `pipefail OFF: 1111111111`. Fixed in
+`75ecee54` by slicing to a scratch file and grepping that, and re-verified in **both** directions:
+**20/20 green** on the fix, **10/10 red (7 checks)** against the pre-fix `50978da8`, control check
+passing on both. A gate that changes its mind between runs is not a conservative gate; it is a
+coin flip with a green light on it.
