@@ -7488,13 +7488,20 @@ async function runObservabilityTracesDepth(page, report) {
   await page.waitForTimeout(700);
 
   // (1) the request-id box takes the jump that the screen exists for.
-  await page.locator("[data-trace-request-input]").fill("11111111-2222-3333-4444-555555555555");
+  //
+  // Every other interaction in this pass is `.catch(() => {})` on purpose, and this one was not:
+  // `fill` rejects when the element is not attached, and an unguarded rejection in an async
+  // walkthrough is an UNCAUGHT exception that kills the whole pass — 380 screenshots and every
+  // screen after this one measured for nothing, because one input had not rendered yet. A step
+  // that cannot run is a recorded `false`, not the end of the run.
+  const requestInput = page.locator("[data-trace-request-input]");
+  await requestInput.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+  await requestInput
+    .fill("11111111-2222-3333-4444-555555555555")
+    .catch(() => {});
   await page.waitForTimeout(1200);
-  const requestFilter = await page
-    .locator('[data-trace-request-input]')
-    .inputValue()
-    .catch(() => "");
-  note({ check: "request-id-typed", value: requestFilter });
+  const requestFilter = await requestInput.inputValue().catch(() => "");
+  note({ check: "request-id-typed", value: requestFilter, typed: requestFilter.length === 36 });
 
   // (2) an id with no trace must EXPLAIN the sampling policy, not render a blank table.
   const emptyHint = (await page.locator('[data-view="observability-traces"] p').first().innerText().catch(() => "")) || "";
@@ -9708,10 +9715,17 @@ async function main() {
   // screens it just built instead of walking the whole inventory.
   if (wants("observability-traces")) {
     matchedOnly.add("observability-traces");
-    report.observabilityTraces = await runDepthPass("observability-traces", () =>
-      runObservabilityOverviewDepth(page),
-      runObservabilityTracesDepth(page, report),
-    );
+    // BOTH passes go inside the wrapper as a SEQUENCE. The overview was written as
+    // `runObservabilityOverviewDepth(page),` with its parentheses — which CALLS it immediately and
+    // hands `runDepthPass` an already-running promise. An argument that is a promise is outside the
+    // try/catch the moment it rejects: the traces pass never ran, and the rejection escaped as an
+    // uncaught exception that ended the whole walkthrough with 380 screenshots on disk and no
+    // summary. A wrapper that only guards the call it is given guards nothing when given a promise
+    // instead of a function.
+    report.observabilityTraces = await runDepthPass("observability-traces", async () => {
+      await runObservabilityOverviewDepth(page);
+      await runObservabilityTracesDepth(page, report);
+    });
   }
   if (wants("observability-logs")) {
     matchedOnly.add("observability-logs");
