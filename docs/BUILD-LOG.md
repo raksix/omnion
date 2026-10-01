@@ -10120,3 +10120,54 @@ would have measured the box. Reclaim was limited to this writer's own cold deriv
 **Next.** Re-run the focused pass (`--only=workflow-builder`, private `w3` stack, `QA_OUT_ROOT`
 on tmpfs) to read `shortcut-help.closedByEscape` off a live builder, then `sentinelsStayApart` and
 `table-save-survives`.
+
+
+---
+
+## Tick 77 — the listener said "Captured" before anything was captured
+
+**What.** `captureView()` in `apps/admin/features/workflows/test-listener.ts` decides what one
+listener row may honestly say: `captured` (a payload is present), `waiting` (armed, time left) or
+`expired` (the window closed). `listener-panel.tsx` renders the heading, the mark, the countdown and
+the new `data-listener-capture-kind` attribute from that view; `walkthrough.cjs` reads the kind.
+
+**The defect.** `payloadSource()` returns a *captured* row when one exists and otherwise falls back
+to the **armed** row — correctly, that is the row carrying the countdown. The render then drew
+`<CheckCircle2 /> Captured {event_name}` for whatever it was handed, so pressing *Listen for a real
+event* and waiting produced a green check and the words "Captured page.published" above **no payload**.
+The state the feature exists to make visible was the state it could not show, and criterion 5's claim
+that a real event shows up in the inspector was unmeasurable: the uncaptured state and the captured
+state were the same sentence. A listener is not captured because the matcher filled a row; it is
+captured when a payload came back with it — so the payload is the **first** test, and a row the server
+still labels `captured` with no payload reads as *waiting*.
+
+**The half that was already green.** `test-listener.test.ts` had **29/29** against this panel,
+because the defect was never in the function. A tested rule and a render that ignores it ship
+together as a missing rule, so `listener-capture-row.test.ts` reads the component — comments
+stripped, so its own prose cannot satisfy it — and asserts the wiring: the heading prints
+`view.sentence`, the green tick is unreachable without a `captured` view, the countdown follows
+`waiting`, and the kind is on the DOM because the probe cannot tell the two states by text alone.
+Two of its five cases went **red against a correct file** first: `kind: "expired"` lives in the
+*rule*, not the panel, and the probe's own selector had to be asserted rather than probed with an
+`if` that would pass vacuously. That is the fifth wrong anchor of this class in this REQ, and the
+file says so where the next one will read it.
+
+**Proof.**
+- `apps/admin` full suite **370/370** (359 before; +6 `captureView`, +5 render row).
+- **9 mutations, every one red on a named assertion**: 4 in the rule (status-wins = the shipped
+  render, payload branch dropped, expiry check first, unparseable expiry reading as listening) and 5
+  in the render (revert to the status heading, ignore the view's sentence, drop the kind attribute,
+  green tick keyed on the status, countdown back on `status === "armed"`). Both files restored
+  **byte-exact** (md5 asserted on the passing runs too).
+- `cargo test -p omnion-workflows --lib` **157/157**, unchanged: the defect was in the client, and
+  the every-tick gate is honest about what it did not touch.
+- `tsc --noEmit` clean for `apps/admin` and `apps/web` — run **directly**, because `pnpm typecheck`
+  reported `cache hit` on files this tick had just edited.
+
+**No browser pass, and the numbers again.** 3 concurrent `qa/run.sh` processes, 37 Chrome, load
+23.6, `MemAvailable` 2 GB, `/mnt/apopic` at **98% (1.5 GB free)**. A pass in that state produces
+findings about the machine.
+
+**Next.** Re-run the focused pass (`--only=workflow-builder`, private `w3` stack, `QA_OUT_ROOT` on
+tmpfs) to read `listener.captureKind` and `closedByEscape` off a live builder, then
+`sentinelsStayApart` and `table-save-survives`.
