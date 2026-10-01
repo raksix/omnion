@@ -134,7 +134,7 @@ export function MigrationDetailView() {
   const rehearsable = detail.down_statements.length > 0;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" data-view="deployment-migration-detail">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <Link href="/deployment/migrations" className="inline-flex items-center gap-1 text-sm underline">
           <ArrowLeft className="h-4 w-4" />
@@ -183,7 +183,7 @@ export function MigrationDetailView() {
       )}
 
       <div className="grid gap-4 lg:grid-cols-2">
-        <section aria-labelledby="sql-heading" className="space-y-2">
+        <section aria-labelledby="sql-heading" className="space-y-2" data-up-pane>
           <h3 id="sql-heading" className="flex items-center gap-2 text-sm font-semibold">
             <FileCode2 className="h-4 w-4" />
             Up script
@@ -203,7 +203,7 @@ export function MigrationDetailView() {
           </ol>
         </section>
 
-        <section aria-labelledby="down-heading" className="space-y-2">
+        <section aria-labelledby="down-heading" className="space-y-2" data-down-pane>
           <h3 id="down-heading" className="flex items-center gap-2 text-sm font-semibold">
             <RotateCcw className="h-4 w-4" />
             Down script

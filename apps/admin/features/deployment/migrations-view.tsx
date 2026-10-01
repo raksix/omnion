@@ -230,7 +230,7 @@ export function MigrationsView() {
   if (!ledger) return null;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" data-view="deployment-migrations">
       {/* ---- the lock, the gate and the drift: the three answers an operator opens this screen for */}
       <div className="grid gap-3 sm:grid-cols-3">
         <div className="rounded-lg border border-line p-4">
@@ -379,7 +379,7 @@ export function MigrationsView() {
       </div>
 
       {/* ---- pending: the band above the ledger, with no "applied at" column because there is none */}
-      <section aria-labelledby="pending-heading" className="space-y-2">
+      <section aria-labelledby="pending-heading" className="space-y-2" data-pending-band>
         <h2 id="pending-heading" className="flex items-center gap-2 text-sm font-semibold">
           <CircleDashed className="h-4 w-4" />
           Pending
@@ -414,7 +414,7 @@ export function MigrationsView() {
                 </thead>
                 <tbody>
                   {matches.pending.map((row: PendingMigration) => (
-                    <tr key={row.version} className="border-t border-line">
+                    <tr key={row.version} className="border-t border-line" data-migration-row data-state="pending">
                       <td className="py-2 pr-3 font-mono">
                         <Link className="underline" href={`/deployment/migrations/${row.version}`}>
                           {row.version}
@@ -517,7 +517,7 @@ export function MigrationsView() {
       )}
 
       {/* ---- the ledger itself */}
-      <section aria-labelledby="ledger-heading" className="space-y-2">
+      <section aria-labelledby="ledger-heading" className="space-y-2" data-ledger-band>
         <h2 id="ledger-heading" className="flex items-center gap-2 text-sm font-semibold">
           Ledger
           <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-normal">
@@ -555,7 +555,7 @@ export function MigrationsView() {
                 </thead>
                 <tbody>
                   {matches.applied.map((row: AppliedMigration) => (
-                    <tr key={row.version} className="border-t border-line">
+                    <tr key={row.version} className="border-t border-line" data-migration-row data-state="applied">
                       <td className="py-2 pr-3 font-mono">
                         <Link className="underline" href={`/deployment/migrations/${row.version}`}>
                           {row.version}

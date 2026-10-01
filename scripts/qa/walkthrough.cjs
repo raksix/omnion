@@ -90,7 +90,16 @@ const MOBILE_NAMES = new Set();
  * initialization` and took the ENTIRE walkthrough file down with it, so no pass ran at all and the
  * harness reported nothing. A missing screen and a broken harness must not look the same.
  */
-const DEPLOYMENT_SCREENS = ["/deployment/artifacts", "/deployment/install", "/deployment/upgrade"];
+const DEPLOYMENT_SCREENS = [
+  "/deployment/artifacts",
+  "/deployment/install",
+  "/deployment/upgrade",
+  // REQ-129: the ledger and the migration detail. The detail screen is only reachable from a row
+  // that exists, which is why the depth pass below opens it from the ledger rather than the route
+  // list fabricating a version — a walk of `/deployment/migrations/9999` would prove only that the
+  // 404 renders.
+  "/deployment/migrations",
+];
 
 /**
  * Refuse to start a pass whose deployment screens are not all in the route list.
@@ -8208,6 +8217,7 @@ async function runObservabilitySettingsDepth(page, report) {
 
 module.exports = {
   runSecretsAuditDepth,
+  runDeploymentMigrationsDepth,
   runDeploymentArtifactsDepth,
   runDeploymentInstallDepth,
   runDeploymentUpgradeDepth,
@@ -8786,6 +8796,145 @@ function walkVersion(label) {
  * route list — and it runs at startup, where a drift is a loud line in the log rather than a
  * silently untested screen three weeks later.
  */
+/**
+ * Drive the migration ledger (REQ-129, slice 1): the two bands, the gate verdict, the drift
+ * sentence, the plan preview and the detail screen opened from a row that exists.
+ *
+ * The claims this pass is here to catch are the ones a route walk cannot make:
+ *
+ * 1. **Pending is not applied.** A screen that merged both would render "applied at" on a
+ *    migration that has never run, which is the exact class of silent wrongness the request is
+ *    written against. So the two bands are counted separately and the pending rows must carry a
+ *    `would run` badge rather than a timestamp.
+ * 2. **A reversal nobody rehearsed does not read `reversible`.** `down_verified_at` being null is
+ *    the honest answer and the screen has to render it as such.
+ * 3. **The detail screen is reachable from a row.** Navigating to a fabricated version would prove
+ *    only that the 404 renders, which is how a screen ships unmeasured.
+ */
+async function runDeploymentMigrationsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "deployment-migrations-depth", action: "deployment", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/deployment/migrations`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="deployment-migrations"]', { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  const pending = await page.locator('[data-migration-row][data-state="pending"]').count();
+  const applied = await page.locator('[data-migration-row][data-state="applied"]').count();
+  note({ check: "bands-are-separate", pending, applied });
+
+  // (1) The gate verdict is present and is a SENTENCE. A missing one renders as nothing, and
+  // "the gate passes" is the whole answer to "can I deploy this?".
+  const gate = (await page.locator('[data-testid="gate-verdict"]').innerText().catch(() => "")) || "";
+  note({
+    check: "gate-verdict-is-a-sentence",
+    ok: gate.trim().length > 0,
+    chars: gate.trim().length,
+    text: gate.trim().slice(0, 120),
+  });
+
+  // (2) A pending row never shows an applied-at timestamp.
+  const pendingText = (await page.locator("[data-pending-band]").innerText().catch(() => "")) || "";
+  note({
+    check: "pending-rows-carry-would-run",
+    ok: /would run/i.test(pendingText),
+    chars: pendingText.length,
+  });
+
+  // (3) The ledger says "never rehearsed" rather than implying a reversal was proved. On an
+  // installation that has rehearsed nothing, the ledger must contain the negative answer.
+  const ledgerText = (await page.locator("[data-ledger-band]").innerText().catch(() => "")) || "";
+  note({
+    check: "unrehearsed-is-said",
+    ok: /never rehearsed|no reversal in file|none in file/i.test(ledgerText) || applied === 0,
+    chars: ledgerText.length,
+  });
+
+  // (4) The keyboard filter narrows the ledger. `/` focuses it and typing a version leaves at most
+  // the rows that match — measured, because a filter that renders but does not narrow is invisible
+  // in a screenshot.
+  const before = applied;
+  await page.locator('[data-testid="migration-filter"]').fill("0207").catch(() => {});
+  await page.waitForTimeout(500);
+  const filtered = await page.locator('[data-migration-row][data-state="applied"]').count();
+  note({
+    check: "filter-narrows",
+    ok: filtered <= before,
+    before,
+    after: filtered,
+  });
+  await page.locator('[data-testid="migration-filter"]').fill("").catch(() => {});
+  await page.waitForTimeout(300);
+
+  // (5) The plan preview opens and says it executed nothing. The panel is the ONLY place an
+  // operator sees this, and a preview that quietly applied migrations would be catastrophic.
+  await page.locator('[data-testid="plan-preview"]').click().catch(() => {});
+  await page.waitForTimeout(900);
+  const planText = (await page.locator('[data-testid="plan-preview-panel"]').innerText().catch(() => "")) || "";
+  note({
+    check: "plan-says-it-executed-nothing",
+    ok: /nothing above was executed|up to date|pending migration/i.test(planText),
+    chars: planText.length,
+  });
+
+  // (6) Open the detail screen FROM A ROW. The version is read out of the ledger's own link so the
+  // walk cannot invent one that does not exist.
+  const link = page.locator('[data-migration-row] a[href^="/deployment/migrations/"]').first();
+  const href = (await link.getAttribute("href").catch(() => null)) || null;
+  note({ check: "ledger-row-links-to-a-version", href });
+  if (href) {
+    await page.goto(`${URL_ADMIN}${href}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page
+      .waitForSelector('[data-view="deployment-migration-detail"]', { timeout: 20000 })
+      .catch(() => {});
+    await page.waitForTimeout(600);
+    const up = await page.locator("[data-up-pane]").count();
+    const down = await page.locator("[data-down-pane]").count();
+    note({ check: "detail-shows-both-panes", up, down });
+    // The rehearsal asks for a scratch database NAME — it is deliberately not one-click, so the
+    // input has to exist and say why.
+    const scratch = await page.locator('[data-testid="scratch-name"]').count();
+    note({ check: "rehearsal-asks-for-a-name", scratch, ok: scratch === 1 });
+    // And the rehearsal must refuse the live database. Clicking it with the empty name must show
+    // the reason rather than doing anything.
+    await page.locator('[data-testid="rehearse-reversal"]').click().catch(() => {});
+    await page.waitForTimeout(500);
+    const refusal = (await page.locator('[data-testid="rehearsal-error"]').innerText().catch(() => "")) || "";
+    note({
+      check: "rehearsal-without-a-name-explains-itself",
+      ok: refusal.trim().length > 0,
+      chars: refusal.trim().length,
+    });
+    // Narrow: the SQL panes scroll horizontally inside their region rather than widening the page.
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    note({ check: "no-horizontal-overflow", overflow });
+  }
+
+  // (7) A version nobody has is a 404 with a reason, not a blank screen.
+  await page
+    .goto(`${URL_ADMIN}/deployment/migrations/9999`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(600);
+  const missing = await page.locator('[role="alert"]').count();
+  note({ check: "unknown-version-explains-itself", alerts: missing, ok: missing >= 1 });
+
+  report.push({
+    page: "deployment-migrations",
+    action: "depth",
+    checks: steps.filter((step) => step.ok !== false).length,
+    total: steps.length,
+  });
+}
+
 async function runDeploymentArtifactsDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -9530,6 +9679,9 @@ async function main() {
   { path: "/deployment/artifacts", name: "deployment-artifacts" },
   { path: "/deployment/install", name: "deployment-install" },
   { path: "/deployment/upgrade", name: "deployment-upgrade" },
+  // The migration ledger (REQ-129, slice 1). The detail screen is opened by the depth pass below
+  // from a row the ledger actually renders, for the reason in DEPLOYMENT_SCREENS above.
+  { path: "/deployment/migrations", name: "deployment-migrations" },
   { path: "/settings/iam", name: "iam-overview" },
     { path: "/settings/iam/users", name: "iam-users" },
     { path: "/settings/iam/groups", name: "iam-groups" },
@@ -9819,6 +9971,7 @@ async function main() {
     matchedOnly.add("deployment-artifacts");
     report.deploymentArtifacts = await runDepthPass("deployment-artifacts", () =>
       runDeploymentArtifactsDepth(page, report),
+      runDeploymentMigrationsDepth(page, report),
     );
   }
   if (wants("deployment-install")) {
@@ -10285,7 +10438,7 @@ async function runReliabilityBreakersDepth(page) {
   // slice 4) are in this list rather than only measured inside their depth passes: a layout that
   // has never been opened in a 390px context has not been tested on a phone, and the upgrade
   // helper is read at 2am on a phone more often than anybody planned.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been

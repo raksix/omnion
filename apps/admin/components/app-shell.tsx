@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Bot, Boxes, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Bot, Boxes, ClipboardCheck, Database, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -64,6 +64,10 @@ const NAV = [
   { href: "/deployment/artifacts", label: "Release artifacts", icon: Package },
   { href: "/deployment/install", label: "Install bundle", icon: Boxes },
   { href: "/deployment/upgrade", label: "Upgrade helper", icon: ArrowUpCircle },
+  // The migration ledger (REQ-129, slice 1) belongs beside them, not under Settings: an operator
+  // asking "what changed my database" is mid-deploy, and the answer they need is the pending set
+  // and the rehearsed/unrehearsed column — the same three questions the other two answer.
+  { href: "/deployment/migrations", label: "Migration ledger", icon: Database },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
