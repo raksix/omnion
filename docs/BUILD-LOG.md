@@ -10307,3 +10307,89 @@ passes the same way.
 "queued behind real work", not tick 89's wedge — the distinction lesson 33 asks for, and it took
 a `stat` rather than a story to get right. Not reaped. `/mnt/apopic` is at 98% and `/dev/shm` at
 95%, which is also why `CARGO_TARGET_DIR=/dev/shm/w5-target` stays the standing answer.
+
+## 2026-10-01 · Wave 5 · tick 93 — the fourth time, and the command that makes it the last
+
+**What.** No new screen, and no fix to one. The browser gate on REQ-011 and REQ-017 is still
+owed — w6's walkthrough has been writing `clicks.jsonl` continuously and its holder is alive, so
+this is "queued behind real work", not a wedge — and rather than re-measure the queue I did the
+work the box allows: read the depth passes as source.
+
+The defect is the one tick 92 found, wearing a fourth hat. **`steps.x = …` reaches
+`summary.json` and is read by no code.** A false value differs from a true one in a single
+word of the report and fails nothing. The whole-file measurement is `scripts/qa/audit-depth-claims.mjs`:
+**62 of 358 claims gated across 27 depth passes** before this tick.
+
+**What it found, in the passes this writer owns.**
+
+| Pass | Claims | Gated before | Gated after |
+| --- | --- | --- | --- |
+| `runCdnRulesDepth` | 30 | 13 (43%) | 26 (87%) |
+| `runCdnPurgeDepth` | 29 | 8 (28%) | 27 (93%) |
+| `runEnvironmentsDepth` | 36 | 13 (36%) | 35 (97%) |
+
+The ungated ones were the load-bearing ones, which is the pattern every time. On the rules
+screen: `reorderSwapped`, `prioritiesDense`, `testerIsLive` — a reorder control that moved
+nothing, a renumber that left two rules claiming one priority, and a tester painting "no match"
+for every sample would each have produced a report indistinguishable from a healthy one. On the
+history: `filterNarrows` and `countMatches`, whose `false` reads in a summary as *the product's
+filter does not narrow* — on the tick they were first written, the pass had been counting the
+table and the mobile card list as separate rows. On the environments screen: **every step of the
+create wizard**, including the two the API's `require_areas` guard exists to enforce. The pass
+returns an `ok` that is only printed and stored, so nothing was reading it either.
+
+What is left ungated is deliberate. `rows: 4` is a fact a reader needs in the report, not an
+assertion, and gating it would be the same mistake pointed the other way. `duplicateSlugs` has
+the opposite polarity — zero is the pass — and already carries a dedicated
+`if (Number(duplicates) !== 0)`; a truthy-is-good helper would have filed an inverted finding
+against a clean clone. **An assertion that fails on success is the same defect as one that
+cannot fail.**
+
+**The audit lied twice before it told the truth, and that is the part worth keeping.** Its
+first version credited any identifier in an assignment's text, so the string
+`"/api/v1/webhooks"` contributed the word `webhooks`, which matched the `page: "webhooks"`
+field of every `record(` in that pass — **nineteen phantom gates, 243 reported against a true
+118**. Stripping comments killed a second class. The third was the real one: `const steps = {}`
+makes every claim "reference a local that is read in a guard", because the guard reads `steps`,
+so a pass with **two** `record(` calls in it came back 100% gated. The subject of the sentence
+read as its verb. A tool that reports passes nobody took is worse than no tool, because it is
+believed — so the current numbers were checked against the source: the webhooks pass reads 11%
+and it does have two `record(` calls and no `gate()`.
+
+**A stale spec note, found by grepping instead of re-reading.** REQ-017's slice 3 has listed
+"`promotion.*` reaching a subscribed endpoint — not yet proven" for four ticks. It was proven,
+and the proof is a real HTTP server on an ephemeral port:
+`apps/api/tests/environments.rs:3354`. It asserts the receiver saw exactly
+`["promotion.requested", "promotion.completed"]` and nothing from the environment lifecycle
+that passed through on the way, that the `completed` event carries the affected ids rather than
+re-emitting `page.published` per row, that every HMAC **verifies over the bytes the receiver
+received**, and that a second endpoint subscribed to `environment.*` was **not** called. The
+note was written from the request's wording instead of from the suite. A spec file is not
+evidence of what the code does.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `node --check scripts/qa/walkthrough.cjs` | **ok** |
+| `node scripts/qa/audit-depth-claims.mjs --check` | **exit 1** — 212 claims still collected only, honestly reported |
+| `pnpm typecheck` | **2/2** |
+| `cargo test -p omnion-events --quiet` | **50/50** |
+| the selectors the new gates assert on | present in `apps/admin` source — a gate on a selector that never renders is a permanent false failure |
+| browser pass | **not run** — slot held by w6 (holder alive, `clicks.jsonl` written 04:55:52) |
+| `git status` | clean, `af195152` pushed to `wave5` |
+
+**Next.** The three passes this writer owns read 87/93/97% gated, and the new findings are
+written but **unproven** — `node --check` and `pnpm typecheck` are the only things that have
+touched them, exactly where tick 89's assertions sat. The first CDN- or environments-scoped
+pass to reach the box must treat a red there as a real product defect. REQ-011's and REQ-017's
+last boxes stay open; neither REQ closes this tick. Next no-slot work: the webhooks pass at 11%
+is the largest remaining hole, and it belongs to another writer's wave — so it is reported, not
+taken.
+
+**Slot and disk, measured.** w6's holder is alive and writing, so queued, not wedged. Not
+reaped, and my own five orphaned waiters were TERMed by matching `/proc/<pid>/cwd` — a
+SIGKILLed pass never runs its EXIT trap. `/dev/shm` reached **100% (75 MB free)** during the
+tick with six writers' cargo targets on it, mine among them; nothing live was in mine, but with
+five other directories holding gigabytes each and a running pass that may hold one, reclaiming
+mine buys minutes and risks a sibling's build for nothing. Recorded, not acted on.

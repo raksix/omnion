@@ -321,6 +321,41 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   pass names which button was short rather than only that one was. The box stays open.
 
 - [ ] The CDN screens pass the browser walkthrough with zero high findings.
+  _**Tick 93: the claims that pass would have judged on were not judging anything.** The
+  browser gate is still owed — the slot is held by a sibling's live pass — so this tick read
+  the two CDN depth passes as source instead of as artifacts, which is the same move that found
+  tick 89's `has_credential` and tick 92's retry steps. It found the same defect a third time
+  and then a fourth: **`steps.x = …` reaches `summary.json` and is read by no code.**
+  `runCdnRulesDepth` had 30 claims of which 13 were gated and `runCdnPurgeDepth` 29 of which 8
+  were — and the ungated ones are the load-bearing ones. `reorderSwapped`, `prioritiesDense`
+  and `testerIsLive` on the rules screen: a reorder control that moved nothing, a renumber that
+  left two rules claiming one priority, and a tester painting "no match" for every sample would
+  each have produced a report indistinguishable from a healthy one. `filterNarrows` and
+  `countMatches` on the history: a sentence that reads in a summary as *the product's filter
+  does not narrow*, when on the tick it was first written the pass was counting the table and
+  the mobile card list as separate rows.
+
+  Seventeen and twenty-one claims are now gated. The rules pass reads 87% gated and the history
+  93%, with the remainder being raw tallies — a count a reader needs in the report is a fact,
+  not an assertion, and gating `rows: 4` would be the same mistake in the other direction.
+
+  `scripts/qa/audit-depth-claims.mjs` now measures this for the whole file instead of by hand,
+  so the next writer learns from a one-line command rather than from a fourth incident. It
+  reports 146 of 358 claims gated across 27 depth passes, up from 62.
+
+  **And the audit had to be corrected twice before it could be believed**, which is the part
+  worth keeping. Its first version credited any identifier in an assignment's text, so the
+  string `"/api/v1/webhooks"` contributed the word `webhooks`, which matched the `page:
+  "webhooks"` field of every `record(` in that pass: nineteen phantom gates, 243 reported
+  against a true 118. Stripping comments fixed a second class. The third was the real one —
+  `const steps = {}` makes every claim "reference a local that is read in a guard", because the
+  guard reads `steps`, so a pass with two `record()` calls in it came back 100% gated. An audit
+  that reports passes nobody took is worse than no audit, because it is believed; the numbers
+  now agree with the source.
+
+  The box stays open. `node --check` and `pnpm typecheck` are the only things that have touched
+  these lines, which is exactly where tick 89's assertions sat — the first CDN-scoped pass to
+  reach the box must read a red here as a real product defect until proven otherwise._
   _**Tick 87: the three `click-error`s this box was waiting on were a real defect in the panel
   frame, not the CDN and not the box.** `/cdn/settings` failed on the navigation links
   `Sessions`, `Devices` and `Search settings`. `app-shell.tsx` renders the sidebar as

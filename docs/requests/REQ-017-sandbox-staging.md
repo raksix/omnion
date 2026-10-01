@@ -212,6 +212,15 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
   *(integration walk `archiving_releases_the_host_and_keeps_the_content`; the browser half is
   still owed by the depth pass below)*
 - [ ] The QA walkthrough visits `/environments`, `/environments/new` and `/environments/[id]` with zero high findings.
+  _**Still owed, and the reason is now precisely stated.** The pass is scoped `environments`
+  and its route is in the walkthrough inventory, so it *will* run when the slot frees; what was
+  missing was any way for it to fail. Tick 93 gated the twenty-three ungated claims, so the pass
+  can now return a finding the roll-up counts — before which an empty wizard or a banner in
+  production would have produced a report identical to a healthy one. The gates are written and
+  `node --check` is the only authority that has touched them, which is the same unproven
+  position tick 89's assertions were in. **The first environments-scoped pass to reach the box
+  must read a red here as a real product defect until proven otherwise.** Not proven, so not
+  closed._
   *(`?tab=changes` and `?tab=promotions` are visited and clicked by `runEnvironmentsDepth` as well — the tab strip is a real navigation and an untested tab is an untested screen. **This box stays open because the pass still has not been executed.** Tick 73 established that the five prior ticks' "a sibling held the slot / the disk was at 100%" story was wrong on every count once the harness was actually run: `runEnvironmentsDepth` had never executed a line of its own body. Tick 74 fixed the chip and the banner, extended the pass to measure them, and still could not run it — so the deferral is now the *only* remaining explanation and is recorded as one fact rather than three.)*
   *(**tick 85: the spec names a route the product does not have.** This line has said
   `/environments/new` for twenty-odd ticks and the panel has no such route — the wizard is a
@@ -253,9 +262,41 @@ approved, applied atomically, visible in history, and emitted to a subscribed en
      names its own scope, the dialog leads with a count, requesting writes a `promotions` row, the
      tab is re-read after a navigation) and **none of them has run yet**: a sibling writer held
      the QA slot for the whole tick. A screen nobody has opened is not a screen that works.
-   - `promotion.*` reaching a **subscribed webhook endpoint** end to end. The events are emitted
-     and the row is written; the delivery half is REQ-016's runner, and is not yet proven against a
-     real endpoint from here.
+
+     **Tick 93: those four claims are now gated, which is the step that comes *before* running
+     them.** Auditing the pass as source found **23 claims assigned and read by nothing** —
+     including every step of the create wizard. A `steps.x = false` differs from `true` in one
+     word of `summary.json` and fails nothing, and the `ok` this function returns is only printed
+     and stored. So the pass could not have failed whatever the product did, on precisely the
+     claims that matter: an empty name must not advance the wizard, a URL where a host belongs
+     must be refused on screen, and a clone that copies nothing must not be submittable — the
+     mistake `require_areas` exists to prevent, with the browser as the last line of defence.
+     Twelve are gated now, plus the one in the chip-and-banner block that had no gate at all
+     (`bannerBeforeSelectingStaging`), which is the sharpest of them: a staging banner shown in
+     a production session inverts the one thing it exists to say, and every other measurement in
+     that block still read true. The pass reads **97% gated**; what remains are tallies, which
+     a reader needs in the report and which are facts rather than assertions.
+
+     `scripts/qa/audit-depth-claims.mjs` now measures the whole file (146 of 358 claims gated
+     across 27 depth passes, up from 62) so this is a command rather than a habit. It needed two
+     corrections before it could be believed — the second was `const steps = {}` crediting every
+     claim in a pass because the guard reads `steps`. An audit that reports passes nobody took
+     is worse than none, because it is believed.
+   - `promotion.*` reaching a **subscribed webhook endpoint** end to end. **Closed in tick 93 —
+     and it was already closed, which four ticks of this file did not know.**
+     `apps/api/tests/environments.rs:3354`, `a_promotion_reaches_a_subscribed_endpoint_over_a_signed_delivery`,
+     is exactly this sentence: a real HTTP server on an ephemeral loopback port, an endpoint
+     subscribed to the group `promotion.*` through the store, the promotion requested and approved
+     through the real routes, and the delivery driven by the runner's own `run_due`. It asserts
+     the receiver saw **exactly** `["promotion.requested", "promotion.completed"]` in that order
+     and nothing from the environment lifecycle that passed through on the way; that the
+     `completed` event carries the affected ids (`written: 1`, one item) rather than re-emitting
+     `page.published` per copied row; that every delivery's HMAC **verifies over the bytes the
+     receiver received** against the endpoint's own secret; and that a second endpoint subscribed
+     to `environment.*` was **not** called — so the claim "delivered to the subscriber" cannot be
+     satisfied by a runner that posts to everyone. This note was stale: the writer read the
+     request's wording rather than the suite, and recorded an owed proof that had been running for
+     ticks. A spec file is not evidence of what the code does; grep the test name.
 4. **Hardening.** Clone cancel/retry, `noindex` on staging hosts, large-site batching, conflict refresh, error states and the archive path. *Done line:* a cancelled clone leaves no
    partial environment marked active, and a conflicted promotion is refused with item-level detail.
    **Two of this slice's four items closed in tick 68** — the `noindex` layer (walk above) and
