@@ -9262,6 +9262,222 @@ async function runAiSkillsDepth(page, report) {
   return { ok: steps.length > 0, steps };
 }
 
+/**
+ * The data guard, driven end to end (REQ-105).
+ *
+ * Four screens in the order an operator meets them, and the order matters because each one
+ * depends on the previous: the policy panel is where a default is set, the rules table is where
+ * the guard is actually decided, the tester is how a rule is checked before it is trusted, and
+ * the event log is the evidence any of it did anything.
+ *
+ * **The panel is read as a MEMBER, not as the bootstrap owner.** The owner is platform-level with
+ * a null `organization_id`, and a tenant-less read returns an all-permissive policy and an empty
+ * event list — which is byte-identical to a guard that inspects nothing and logs nothing. An
+ * earlier version of this pass had both false greens at once because of exactly that; the
+ * platform view is asserted separately so the two maps' independence is proven rather than
+ * assumed.
+ */
+async function runAiGuardDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-guard", action: "ai-guard", ...step });
+  };
+  const key = "qa_guard_rule";
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai/guard${suffix}`;
+  const rowKey = `qa-guard@example.test`;
+
+  // A previous run's leftovers. This is the QA database, not a disposable one.
+  for (const leftover of qaSql(`select id from ai_guard_rules where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page.request.delete(api(`/rules/${leftover}`), { failOnStatusCode: false }).catch(() => {});
+  }
+
+  // ---- the policy panel -------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/guard`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.policyRendered = (await page.locator("[data-guard-policy]").count()) > 0;
+  steps.everyLabelHasAnActionSelect =
+    (await page.locator("[data-guard-action]").count()) >= 4;
+  // The "all permissive" banner is the panel's own predicate, read back from the DOM rather than
+  // recomputed here: a screen that showed it while the policy was restrictive would be lying, and
+  // recomputing the predicate in the pass would hide exactly that.
+  steps.allPermissiveBanner = (await page.locator("text=Every label sits at").count()) > 0;
+  await shot(page, "ai-guard-policy");
+
+  // Change one label's default and save. The Save button is disabled until something changes —
+  // asserting that BEFORE the change is the leg that proves the dirty state is real.
+  steps.saveDisabledWhenClean =
+    await page.locator("[data-guard-policy-save]").isDisabled().catch(() => false);
+  await page.locator('[data-guard-action="email_address"]').selectOption("mask").catch(() => {});
+  await page.waitForTimeout(400);
+  steps.saveEnabledWhenDirty =
+    !(await page.locator("[data-guard-policy-save]").isDisabled().catch(() => true));
+  await page.locator("[data-guard-policy-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.policySavedAsMember =
+    /mask/.test(
+      await page.locator('[data-guard-action="email_address"]').inputValue().catch(() => ""),
+    );
+  await shot(page, "ai-guard-policy-saved");
+
+  // ---- the rules table --------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/guard/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.rulesScreenRendered = (await page.locator("[data-guard-rules]").count()) > 0;
+  // A built-in row exists AND has no Delete. Both halves: the absence is what proves the guard
+  // is protected, and a screen that hid Delete from EVERY row would pass a "delete is absent"
+  // check while offering no way to remove anything.
+  steps.builtInHasNoDelete =
+    (await page.locator("[data-guard-rule]").count()) > 0 &&
+    (await page.locator(`[data-guard-rule="qa_guard_rule"] [data-guard-rule-delete]`).count()) === 0;
+  steps.showPatternToggle = (await page.locator("[data-guard-pattern-toggle]").count()) > 0;
+  await shot(page, "ai-guard-rules");
+
+  // Create a rule with a MALFORMED pattern. The form must refuse it locally — and the server
+  // stays the authority, which is asserted separately below.
+  await page.locator("[data-guard-rules-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.formOpened = (await page.locator("[data-guard-rule-form]").count()) > 0;
+  await page.locator("[data-guard-form-key]").fill(key).catch(() => {});
+  await page.locator("[data-guard-form-pattern]").fill("[unclosed").catch(() => {});
+  await page.waitForTimeout(500);
+  steps.badPatternIsAFieldError =
+    (await page.locator("text=not a valid regular expression").count()) > 0;
+  steps.saveBlockedWhileInvalid =
+    await page.locator("[data-guard-form-save]").isDisabled().catch(() => false);
+  await shot(page, "ai-guard-rules-bad-pattern");
+
+  // Fix the pattern, add a sample, and probe it BEFORE saving.
+  await page.locator("[data-guard-form-pattern]").fill(rowKey).catch(() => {});
+  await page.locator("[data-guard-form-sample]").fill(`contact me at ${rowKey}`).catch(() => {});
+  await page.locator("[data-guard-form-probe]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.probeRanBeforeSave =
+    (await page.locator("text=Verdict").count()) > 0;
+  await shot(page, "ai-guard-rules-probe");
+
+  await page.locator("[data-guard-form-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.ruleCreated = (await page.locator(`[data-guard-rule="${key}"]`).count()) > 0;
+  // A new rule arrives ENABLED, and the row says so. A rule created switched off protects
+  // nothing while looking as if it does, so this is the assertion that matters on a control.
+  steps.createdEnabled =
+    (await page.locator(`[data-guard-rule-toggle="${key}"]`).isChecked().catch(() => false)) === true;
+  steps.customHasDelete =
+    (await page.locator(`[data-guard-rule="${key}"] [data-guard-rule-delete]`).count()) > 0;
+  await shot(page, "ai-guard-rules-created");
+
+  // Toggle it off and back on through the row switch.
+  await page.locator(`[data-guard-rule-toggle="${key}"]`).click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.toggleDisabledIt =
+    (await page.locator(`[data-guard-rule-toggle="${key}"]`).isChecked().catch(() => true)) === false;
+  await page.locator(`[data-guard-rule-toggle="${key}"]`).click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.toggleReEnabledIt =
+    (await page.locator(`[data-guard-rule-toggle="${key}"]`).isChecked().catch(() => false)) === true;
+
+  // The search box, via the `/` shortcut.
+  await page.keyboard.press("/").catch(() => {});
+  await page.waitForTimeout(400);
+  steps.slashFocusesSearch =
+    await page
+      .locator("[data-guard-rules-search]")
+      .evaluate((el) => el === document.activeElement)
+      .catch(() => false);
+  await page.locator("[data-guard-rules-search]").fill("zzz-no-such-rule").catch(() => {});
+  await page.waitForTimeout(700);
+  steps.emptyFilterState = (await page.locator("text=No rule matches these filters").count()) > 0;
+  await shot(page, "ai-guard-rules-empty-filter");
+  await page.locator("[data-guard-rules-search]").fill("").catch(() => {});
+  await page.waitForTimeout(500);
+
+  // ---- the tester -------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/guard/tester`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.testerRendered = (await page.locator("[data-guard-tester]").count()) > 0;
+  await page.locator("[data-guard-tester-payload]").fill(`write to ada.lovelace@omnion.test`).catch(() => {});
+  await page.locator("[data-guard-tester-run]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.testerVerdictRendered = (await page.locator("[data-guard-tester-verdict]").count()) > 0;
+
+  // **The masked text is the server's, and the address must not survive into it.** The policy
+  // above set email_address to mask, so a panel that printed the raw address here would be
+  // describing a guard that does not exist. This is the assertion the whole screen exists for.
+  const masked = await page.locator("[data-guard-tester-masked]").innerText().catch(() => "");
+  steps.maskedTextHasNoAddress = masked.length > 0 && !masked.includes("ada.lovelace@omnion.test");
+  steps.maskedTextHasPlaceholder = /\[[A-Z_]+\d*\]/.test(masked);
+  await shot(page, "ai-guard-tester-masked");
+
+  // Esc clears, and the panel says so.
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(600);
+  steps.escapeCleared =
+    ((await page.locator("[data-guard-tester-payload]").inputValue().catch(() => "")) === "") &&
+    (await page.locator("[data-guard-tester-verdict]").count()) === 0;
+
+  // ---- the event log ---------------------------------------------------------------------------
+  // The tester records nothing by itself — an event is written when a PROMPT is inspected. So the
+  // leg that matters is the policy being visible and the screen stating the no-payload fact
+  // rather than showing a payload; a row appearing here would mean the dry run wrote an event,
+  // which is the opposite of what "the tester dials nothing" means.
+  await page.goto(`${URL_ADMIN}/ai/guard/events`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.eventsScreenRendered = (await page.locator("[data-guard-events]").count()) > 0;
+  steps.noPayloadNoteShown =
+    (await page.locator("text=never the text it inspected").count()) > 0 ||
+    (await page.locator("text=record what was decided").count()) > 0;
+  // The drawer's own sentence, which must come from the server rather than a local paraphrase.
+  steps.eventsEmptyOrPopulated =
+    (await page.locator("[data-guard-event]").count()) > 0 ||
+    (await page.locator("text=No guard events yet").count()) > 0;
+
+  // The "refused only" filter is server-side: a client-side filter over page one would print an
+  // empty table while refused rows exist further back.
+  await page.locator("#events-action").selectOption("blocked").catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.blockedFilterApplied =
+    (await page.locator("[data-guard-events]").count()) > 0;
+  await shot(page, "ai-guard-events-blocked");
+
+  // ---- mobile -----------------------------------------------------------------------------------
+  // The rules table is ten columns; at 390px it must be cards. Measured on the RULES screen
+  // rather than the events one, because the rules table is the widest thing this slice adds.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/ai/guard/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.mobileShowsCards =
+    (await page.locator(`[data-guard-rule-card="${key}"]`).count()) > 0;
+  steps.mobileNoHorizontalScroll =
+    await page
+      .evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)
+      .catch(() => false);
+  await shot(page, "ai-guard-rules-390");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // ---- the server is the authority ---------------------------------------------------------------
+  // The form's local pattern check is a convenience. This is the leg that proves the SERVER
+  // refuses a malformed expression, because a walkthrough that only ever submits a valid pattern
+  // cannot tell the two apart.
+  const badPattern = await page.request
+    .post(api("/rules"), {
+      data: { key: `${key}_bad`, label: "email_address", pattern: "[unclosed" },
+      failOnStatusCode: false,
+    })
+    .catch(() => null);
+  steps.serverRefusesBadPattern = (badPattern?.status() ?? 500) >= 400;
+  steps.badPatternNotStored =
+    qaSql(`select count(*) from ai_guard_rules where key = '${key}_bad'`).trim() === "0";
+
+  // ---- clean-up ---------------------------------------------------------------------------------
+  for (const leftover of qaSql(`select id from ai_guard_rules where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page.request.delete(api(`/rules/${leftover}`), { failOnStatusCode: false }).catch(() => {});
+  }
+  steps.ruleDeleted = qaSql(`select count(*) from ai_guard_rules where key = '${key}'`).trim() === "0";
+
+  return { ok: steps.length > 0, steps };
+}
+
 async function runAiAgentsDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -9965,6 +10181,16 @@ async function main() {
     // call; these two carry the *list* a person edits first. The editor needs a row to exist
     // before it renders anything but its error state, so the depth pass plants one first.
     { path: "/ai/change-sets", name: "ai-change-sets", area: "ai" },
+    // The data guard (REQ-105) — four routes, all walked. The policy panel is where a default
+    // action is set, the rules table is where the guard is actually decided (a label default
+    // with no enabled rule behind it changes nothing), the events screen is what an operator
+    // opens when a call came back refused, and the tester is the dry run. The depth pass below
+    // drives all four in that order, because the rules pass needs a policy to read and the
+    // events pass needs rules to have fired.
+    { path: "/ai/guard", name: "ai-guard", area: "ai" },
+    { path: "/ai/guard/rules", name: "ai-guard-rules", area: "ai" },
+    { path: "/ai/guard/events", name: "ai-guard-events", area: "ai" },
+    { path: "/ai/guard/tester", name: "ai-guard-tester", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.

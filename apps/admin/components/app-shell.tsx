@@ -67,6 +67,13 @@ const NAV = [
   // "my agent proposed something" to a screen that can only reject it is a dead end.
   { href: "/ai/change-sets", label: "Change sets", icon: FileStack },
   { href: "/ai/runs", label: "Agent runs", icon: HistoryIcon },
+  // The data guard (REQ-105). Two entries, not one: the policy is a *configuration* an operator
+  // sets once and then forgets, while the event log is the thing they open when a call came back
+  // refused and they need to know why. Routing both into one screen would mean the log — the only
+  // reason an operator goes to the guard in the middle of an incident — sits behind a settings
+  // page. The rules table is reachable from the policy panel's own rows.
+  { href: "/ai/guard", label: "Data guard", icon: ShieldCheck },
+  { href: "/ai/guard/events", label: "Guard events", icon: ScrollText },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

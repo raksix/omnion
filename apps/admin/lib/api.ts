@@ -252,7 +252,16 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/**
+ * The single fetch path every client call goes through.
+ *
+ * **Exported** because `lib/guard-api.ts` (REQ-105) reuses it instead of writing a second one.
+ * The alternative — a local `fetch` in that module — produces a request path that has to
+ * remember CSRF, credentials and the JSON content-type rule on its own, and every one of those
+ * is a `PUT` that the server silently refuses when it is missing. A second transport would
+ * eventually be the copy that drifts.
+ */
+export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
