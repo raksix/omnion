@@ -365,6 +365,23 @@ catalogue! {
     "ai.identity.removed", "ai", Live,
     "An AI identity was removed along with its grants.",
     [("identity_id", Uuid, req), ("key", String, req)];
+    // The air gap (REQ-106 slice 2). Two of these are the switch's PROOF rather than its
+    // effects, which is why both sides are named: `enabled`/`disabled` is the audit entry an
+    // operator reads to answer "who stopped the installation from calling out, and why", and
+    // `call_refused` is the only evidence that the switch is still doing its job. A switch that
+    // emits nothing when it fires is indistinguishable from a switch that is off, so the refusal
+    // carries the provider AND the host — the count of these is the answer to "is anything still
+    // leaving this machine?".
+    "ai.airgap.enabled", "ai", Live,
+    "The air-gap switch was turned on; every non-local AI call is now refused.",
+    [("reason", String, req), ("actor_id", Uuid, opt), ("providers_blocked", Integer, opt)];
+    "ai.airgap.disabled", "ai", Live,
+    "The air-gap switch was turned off, so non-local calls are permitted again.",
+    [("actor_id", Uuid, opt), ("reason", String, opt)];
+    "ai.airgap.call_refused", "ai", Live,
+    "The air gap refused a call before any request left the installation.",
+    [("provider", String, req), ("host", String, opt), ("task", String, opt),
+     ("model_key", String, opt)];
     "media.duplicate_merged", "media", Live,
     "A duplicate item was merged into the one that was kept.",
     [("kept_media_id", Uuid, req), ("merged_media_id", Uuid, req), ("affected", Integer, opt)];
@@ -1332,6 +1349,40 @@ mod tests {
                 .payload_fields
                 .iter()
                 .any(|f| f.name == "changed_by" && !f.required)
+        );
+    }
+
+    /// REQ-106's air-gap names, asserted the way the change-set ones are.
+    ///
+    /// `ai.airgap.call_refused` is the one that matters: a switch that refuses calls silently is
+    /// indistinguishable from a switch that is off, and the count of these events is the only
+    /// answer to "is anything still leaving this machine?". Its `provider` and `host` are required
+    /// for the same reason the refusal message names them — an event saying only "blocked" tells
+    /// an operator to go looking in the wrong place.
+    #[test]
+    fn the_airgap_names_are_live_and_typed() {
+        for (name, required_field, kind) in [
+            ("ai.airgap.enabled", "reason", FieldKind::String),
+            ("ai.airgap.call_refused", "provider", FieldKind::String),
+        ] {
+            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be listed"));
+            assert_eq!(entry.status, Status::Live, "{name} is emitted today");
+            let field = entry
+                .payload_fields
+                .iter()
+                .find(|candidate| candidate.name == required_field)
+                .unwrap_or_else(|| panic!("{name} must declare {required_field}"));
+            assert!(field.required, "{name}.{required_field} is required");
+            assert_eq!(field.kind, kind, "{name}.{required_field} has the wrong kind");
+        }
+
+        // The host is optional on the wire because a base URL the platform cannot parse has no
+        // host — but it is declared, so a consumer reading the schema sees the field exists and
+        // knows the null is meaningful rather than "the emitter forgot".
+        let refused = lookup("ai.airgap.call_refused").expect("listed");
+        assert!(
+            refused.payload_fields.iter().any(|f| f.name == "host"),
+            "call_refused declares host"
         );
     }
 
