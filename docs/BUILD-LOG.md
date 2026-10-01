@@ -10789,3 +10789,89 @@ screen boxes on this REQ still turn on it.
 
 **Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
 REQ-012 can close.
+
+## 2026-10-01 · tick 57 — a rollback that restored the key and left the colours behind
+
+**What.** REQ-062 acceptance 5: "`Restore previous` brings back the previous theme **and its
+published settings revision**, confirmed by comparing the rendered page." `restore_previous`
+restored the key. So a rollback left the displaced theme's live tokens in place and the restored
+theme rendered under another theme's colours — a complete, valid, wrong page, the same class of
+defect as a page drawn under the wrong stylesheet.
+
+`site_themes.previous_settings_revision_id` (`0225_theme_rollback_settings.sql`) records the
+published settings revision that was live when an activation displaced a theme, read **inside the
+activation's own transaction** so two concurrent switches cannot both claim the same revision.
+`restore_previous` republishes it through `theme_settings::restore_revision`, which writes a NEW
+revision rather than moving the published pointer backwards: a restore is itself something the
+site did, so it gets a number, an author and a place in the history. `null` is a real answer for
+a site that published nothing, and the response reports it rather than inventing a revision.
+
+**Three more defects, all in this path, all found by the new walk.**
+
+1. `activate` read the displaced theme from `site_themes` — **the table it itself writes**. A site
+   that had never been activated has no row, so the FIRST activation of a site's life recorded no
+   rollback target at all: the operator's only ever switch was irreversible while the panel showed
+   nothing wrong. It now displaces the site's *resolved* theme (`active_theme_key`, the second
+   read this module already made for exactly this reason).
+2. The gallery's `is_active` compared against `site_themes.theme_key`, so a fresh site's `Active`
+   badge landed on **no card at all** while `activeKey` above it correctly said `minimal` and the
+   renderer correctly drew `minimal`. A screen that names the active theme and then badges nothing.
+3. `GalleryView`, `Theme`, `GalleryEntry` and `ActivationBody` had no
+   `#[serde(rename_all = "camelCase")]`, so the API emitted `active_key` / `theme_key` while the
+   panel's TypeScript read `activeKey` / `themeKey`. The gallery screen read `undefined` for the
+   active theme — and every walk asserting the camelCase name was asserting a field the server
+   does not send.
+
+**The harness is what made all three visible, and it was the worst thing in this tick.**
+
+This suite ran against whatever `OMNION_DATABASE_URL` named — on a writer's box, the **shared QA
+database** every other stack points at. Four consequences, and the last is the one that matters:
+
+- two walks collided on `themes_key_live_idx`, so the failure was a duplicate-key error on a
+  fixed fixture name rather than anything about the behaviour under test;
+- one walk asserted a bundled theme it never mirrored, and passed only because another walk had
+  already put it there;
+- one took no grant of its own and passed only because `seed::ensure` binds Owner to the EARLIEST
+  user in the database — which, shared, is whichever walk inserted first;
+- **a run whose credentials were wrong took the skip branch and reported `13 passed` with every
+  walk having done nothing.** A skipped walk is a passing walk, and cargo captures the `eprintln!`
+  that said so. `grep -c SKIP` on the log returns 0 on a run where twelve walks declined to run.
+
+It now takes a throwaway database per walk (`event_retention`'s pattern, already used by a dozen
+suites here), every walk grants the permission it needs, and `every_walk_that_skipped_said_so`
+turns any skip into a **red** run.
+
+**Proof.**
+- `cargo test -p omnion-api --test cms_themes` → **14 passed, 0 failed** on its own database,
+  122 s (was `13 passed` in 0.04 s with nothing executed).
+- The acceptance walk is **verified to fail** against the old key-only rollback (`Some(_id) => None`
+  in place of the republish): `1 failed`, and the assertion that names it reads
+  *"a rollback that restores the KEY but not the SETTINGS leaves the restored theme rendering
+  under another theme's colours"*.
+- `cargo test -p omnion-content --lib` → **328 passed, 0 failed**.
+- `cargo check -p omnion-api --lib` → exit 0.
+- `node node_modules/typescript/bin/tsc --noEmit` in `apps/admin` → **exit 0** (the direct
+  compiler; `pnpm typecheck` returns a turbo cache hit and checks nothing).
+
+**Two of my own assertions were wrong before the code was.** The acceptance walk first expected
+the rollback to restore the *oldest* settings revision; the criterion says the settings the
+previous theme was **published with**, which is what the activation captured — restoring the
+oldest would restore a state the site had already left. And a fix that cleared the rollback
+target on re-activation was killed by the walk written in the same tick, not by review: the
+target is real and spendable, and clearing it would spend a rollback on a call that changed no
+theme.
+
+**Not ticked on the rendering half.** "Confirmed by comparing the rendered page" is a browser
+claim and no pass ran this tick: the slot is held live by w6 (holder alive in
+`/mnt/apopic/omnion-w6`), and `/mnt/apopic` was at 1.1 GB free at the end.
+
+**Ops.** Reclaimed 1.3 GB (`incremental`, 482 MB of stale integration binaries) from this
+worktree's own target only, after a `cargo check` died on `No space left on device` — which
+`--message-format short` reported as an error about a file rather than about the volume.
+
+**Next.** REQ-062 acceptance 1, 3 and 16, and REQ-063 acceptance 17 / REQ-064 acceptance 18 —
+all browser measurements, all owed a pass against a build newer than the last one that ran.
+The same harness defect is worth sweeping across the other suites that run against a shared
+database; `event_retention` and the health suites already do it correctly and are the model.
+
+---
