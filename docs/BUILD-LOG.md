@@ -9991,3 +9991,48 @@ pass, so the public renderer is asked about a page nothing published; and the tr
 the *first* `/cdn/rules` navigation, which the API log never logged at all and which the admin
 log attributes to nothing since the 22:35 disk-full crash. Then the environments scoped pass,
 which has a wizard URL to drive at 390px since tick 85.
+
+## Tick 89 — wave 5 · REQ-011 (the last two high findings were the measurement, and one was a dead end)
+
+**What.** Two high findings from the tick-86 scoped pass, both open for ticks. Neither was a CDN
+defect, and one of them was a defect in the product that only the wrong finding exposed.
+
+**The 500 on `/cdn/rules` was manufactured by the pass.** The admin log carries `GET /cdn/rules
+200` thirty-six times in that run and zero 5xx; the API log has no `cdn/rules` request at all. The
+depth pass proves the error banner by routing a 500 into the browser, and the roll-up filed that
+failure as a high `request-failed` plus a high `console-error` against the screen it was
+measuring. It was unfixable by registration: the roll-up matched console lines on `/status of
+40[13]/` and requests on `[401, 403]`, so a routed 500 could not be excused however it was
+declared. Refusals and stimuli now share one accounting with a **named status set** — a refusal
+keeps 401/403, a stimulus registers the 500 it injected, and a real 500 from the API in that window
+still lands in the report. All five routed 500s are registered, not just this one.
+
+**The `/qa-sample` 404 was a check whose subject did not exist.** The slug is produced by a form
+filler inside a depth pass a scope can filter out, so `--only=cdn` reached the renderer with
+nothing published. Skipping the check when its subject is absent is the wrong fix: a check that
+quietly skips is indistinguishable from a check that passed. The renderer now publishes the page
+itself through the real route, idempotently, and reports a failed publication as its own finding.
+It reads the site id with `qaSql`, not `qaScalar` — the throwing helper sits in a `try` whose
+`catch` reports `web-unreachable`, so a fixture miss would have been filed against the renderer.
+
+**The product defect underneath it.** REQ-011 asks for "an error banner with a retry that re-runs
+the failing request". `/cdn/rules` was the only one of the five screens that provoke that state
+without one. Under it the table is empty, and empty reads as "this site has no rules" — no way
+forward *and* a wrong conclusion. The banner now carries a retry on the same reload token the
+Refresh control bumps, and the pass asserts `errorOffersRetry` plus `retryReRunsTheRequest`:
+the button is pressed with the route still failing and the request is watched going out, because
+counting a button would have accepted a label.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `pnpm typecheck` | **2/2** |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+| `cargo test -p omnion-cdn --quiet` | **116 passed, 0 failed** |
+| browser re-run to close the box | queued behind two **live** writers' passes (w3 on :3102, main on :3100) |
+
+**Next.** The browser pass on the new assertions. Three orphaned w5 `qa-slot.sh` waiters from
+ticks 86b–e were TERMed by matching `/proc/<pid>/cwd` (mine only; w3's and main's holders are
+live and were left alone). If the pass reports again, the question to ask first is whether the
+**pass's own arithmetic** can produce the number it reported — the answer was yes twice today.

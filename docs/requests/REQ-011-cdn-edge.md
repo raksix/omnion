@@ -343,12 +343,50 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   every link rather than counting them, and `scrollIntoViewIfNeeded` is deliberately not allowed
   to stand in for the click — it would scroll for the probe and report the bug green.
 
-  The box stays open, and the two findings still standing are named rather than waved at: the
-  `/qa-sample` 404 (a scoped pass walks no page-creation pass, so the public renderer is asked
-  about a page nothing published — a harness scoping question, not a CDN one) and the transient
-  `500` on the *first* `/cdn/rules` navigation, which the API log never logged at all and the
-  admin error log has not written since the 22:35 disk-full crash, so neither log has evidence
-  for it yet either way._
+  The box stays open, and the two findings still standing are named rather than waved at. Both
+  were resolved this tick, and neither was what the artifact made them look like._
+
+  _**Tick 89: the 500 on `/cdn/rules` was the pass manufacturing it and then reporting it.** The
+  admin log carries `GET /cdn/rules 200` thirty-six times across that run and **zero** 5xx, and
+  the API log contains no `cdn/rules` request at all — because none reached a server. The depth
+  pass proves the error banner by routing a 500 into the browser
+  (`page.route("**/api/v1/cdn/rules?*").fulfill({ status: 500 })`), and the roll-up then filed that
+  manufactured failure as a high `request-failed` plus a high `console-error` against the screen
+  it was measuring. **No registration could have excused it**: the roll-up matched console lines
+  on a hardcoded `/status of 40[13]/` and request entries on a hardcoded `[401, 403]`, so a routed
+  500 was unreachable by construction — the pass had exactly one way to report its own stimulus.
+  Refusals and stimuli are now the same accounting with a **named status set** (`expectRefusal`
+  keeps 401/403 as its default, `expectStimulus` registers the 500 it injected, and a genuine 500
+  from the API in that window still reaches the report), and all **five** routed 500s in the pass
+  are registered, not just this one._
+
+  _**The `/qa-sample` 404 was a check whose subject did not exist.** `SAMPLE_SLUG` is only produced
+  by a form filler inside a depth pass the scope may filter out, so a `--only=cdn` run reached the
+  public renderer with nothing published and the 404 named the renderer. Gating the check on
+  whether some other pass ran was the tempting fix and it is the wrong one — a check that quietly
+  skips is indistinguishable in the report from a check that passed, the same camouflage a
+  "write-only" assertion gives (see the credential-field note under the purge criterion). The
+  renderer now establishes its own precondition: it publishes the page through the **real**
+  `POST /api/v1/pages` + `publish` route on the signed-in panel, idempotently, and a failed
+  publication is reported as its own finding rather than surfacing later as a 404 pointing at the
+  wrong component. It reads the site id with the non-throwing `qaSql` on purpose: `qaScalar`
+  throws, and this block sits in a `try` whose `catch` reports `web-unreachable`, so a fixture
+  miss would have been filed as "the public renderer could not be reached" — one more finding
+  naming the wrong thing._
+
+  _**The product defect this hunt found.** REQ-011 asks for "an error banner with a retry that
+  re-runs the failing request", and `/cdn/rules` was the only one of the five screens that
+  provoke that state without one — notifications, its preferences, events and webhooks all render
+  a `Retry`. Under it the table is empty, and empty reads as "this site has no rules", so a
+  transient failure left an operator with no way forward **and** a wrong conclusion. The banner
+  now carries a retry wired to the same reload token the Refresh control already bumps. The depth
+  pass asserts both halves: `errorOffersRetry` counts the button, and `retryReRunsTheRequest`
+  presses it with the route still failing and watches the request go out — counting a button would
+  have accepted a label._
+
+  _Gates this tick: `pnpm typecheck` **2/2**, `node --check scripts/qa/walkthrough.cjs` clean,
+  `cargo test -p omnion-cdn --quiet` **116/116**. The browser re-run to close the box is queued
+  behind two live writers' passes (w3 on :3102, main on :3100), which is a queue, not a blocker._
 
 ### QA plan
 
