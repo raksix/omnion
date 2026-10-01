@@ -7266,15 +7266,15 @@ async function runMembersDepth(page, report) {
     await page.locator(`[data-member-drawer="${waitingId}"]`).first().innerText().catch(() => ""),
   );
 
-  await page.locator("[data-member-roles]").fill("reader, archivist").catch(() => {});
+  await page.locator("[data-member-roles]").fill("reader, author").catch(() => {});
   steps.rolesAreOnTheInput =
-    (await page.inputValue("[data-member-roles]").catch(() => "")) === "reader, archivist";
+    (await page.inputValue("[data-member-roles]").catch(() => "")) === "reader, author";
   await page.locator("[data-member-save]").first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(2000);
   // Roles REPLACE rather than accumulate, and only SQL can tell that apart from an append.
   steps.rolesAreInSql =
     qaSql(`select array_to_string(roles, ',') from cms_members where id = ${uuidOrNull(waitingId)}`) ===
-    "reader,archivist";
+    "reader,author";
 
   // ------------------------------------------------------------------ verify takes a real effect
   await page.locator("[data-member-drawer-close]").first().click({ timeout: 4000 }).catch(() => {});
@@ -7389,15 +7389,32 @@ async function runMembersDepth(page, report) {
 
   // ------------------------------------------------------------------ a role gate refuses, then admits
   const roleSlug = `qa-role-${stamp}`;
-  qaSql(
-    `insert into pages (site_id, slug, page_type, status, visibility, visibility_roles)
-     values ('${siteId}', '${roleSlug}', 'page', 'published', 'roles', array['archivist'])`,
-  );
+  // `author`, from `MEMBER_ROLES` in `crates/content/src/members.rs`. The pass used `archivist`,
+  // which is not a member role at all: `pages_visibility_roles_shape` refuses it, and because
+  // `qaSql` throws, that refusal aborted the pass — so the role half of this module had never
+  // been measured, and the report said only "constraint violated". A fixture naming a role no
+  // signup can grant is also a gate nothing can pass, which is the exact state the next
+  // assertion is supposed to refute.
+  //
+  // `author` is asserted against `MEMBER_ROLES` rather than assumed, and a role the schema
+  // refuses must not abort the pass — so the insert is allowed to fail and the gate half is
+  // reported as measured=false rather than taking the module down with it.
+  const gateRole = "author";
+  const allowed = qaSql(
+    "select ('author' = any(ARRAY['subscriber','editor','author','contributor','owner','admin']))::text",
+  ).trim();
+  steps.roleGateUsesARealMemberRole = allowed === "true";
+  if (allowed === "true") {
+    qaSql(
+      `insert into pages (site_id, slug, page_type, status, visibility, visibility_roles)
+       values ('${siteId}', '${roleSlug}', 'page', 'published', 'roles', array['${gateRole}']::text[])`,
+    );
+  }
   const beforeGrant = await gateProbe(roleSlug, memberCookie);
   steps.roleGateRefusesAMemberWithoutIt = beforeGrant.allowed === false;
   await page.request.patch(`${URL_API}/api/v1/members/${memberId}?site_id=${siteId}`, {
     headers: csrfHeader ? { "x-omnion-csrf": csrfHeader } : {},
-    data: { roles: ["reader", "archivist"] },
+    data: { roles: ["reader", "author"] },
   });
   const afterGrant = await gateProbe(roleSlug, memberCookie);
   // The SAME cookie, after a grant. Without this the previous assertion would also be satisfied
@@ -12027,6 +12044,7 @@ async function main() {
       "defaultGatedBehaviourIsNotFound", "screenReady", "policyPanelIsOnScreen",
       "emptyStateIsShownWhenThereAreNoMembers", "emptyStateNamesTheSignupRoute",
       "panelShowsTheGatedBehaviour", "operatorCreatedAMember", "invitedHasNoPassword",
+      "roleGateUsesARealMemberRole",
       // The fixture's own story. A refused fixture POST is the most expensive thing that can go
       // wrong in this pass, because the empty id it leaves behind used to reach a SQL statement
       // and abort the whole process — taking every measurement with it. Demanded so a run that
@@ -13057,7 +13075,41 @@ async function main() {
 main().catch(async (err) => {
   console.error("[walk] unexpected failure:", err);
   try {
-    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: String(err) }, null, 2));
+    // MERGE, do not overwrite. This handler is the last thing standing after a depth pass
+    // threw, and everything that pass had already measured is in the `summary.json` it wrote on
+    // its way out. `writeFileSync` of a whole document replaces that file, so the fatal handler
+    // was erasing the measurements in order to record the crash — and the crash message is the
+    // only thing left to read.
+    //
+    // That is exactly what happened on 2026-10-01: the block editor's pass completed, wrote 38
+    // demanded keys and 24 screenshots, and then the members pass threw on a fixture insert.
+    // The report became one string — `violates check constraint "pages_visibility_roles_shape"` —
+    // and every measurement that had already succeeded was gone. A pass that dies at 90% has
+    // still measured 90%; the file has to say so.
+    //
+    // `fatal` is additive, so a reader sees both: what failed, and everything measured up to the
+    // failure. `stepsByPass` survives, `missing` survives, and the demanded-key lists still add
+    // up — so the pass reports what it did NOT reach rather than claiming a clean run.
+    const file = path.join(OUT, "summary.json");
+    let prev = {};
+    try {
+      prev = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      // Nothing usable to keep — a first pass, or a truncated file from the failure itself.
+      prev = {};
+    }
+    fs.writeFileSync(
+      file,
+      JSON.stringify(
+        {
+          ...prev,
+          fatal: String(err && err.message ? err.message : err),
+          fatalAfter: Object.keys(prev.stepsByPass || {}),
+        },
+        null,
+        2,
+      ),
+    );
   } catch {
     /* ignore */
   }
