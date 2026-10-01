@@ -8587,3 +8587,73 @@ states, and it is not closed on tests alone.
 
 **Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
 hook to REQ-011.
+
+
+## Tick 63 — REQ-130 slice 1: the GraphQL decision layer (69/69, six mutations red)
+
+**Pick.** REQ-126/127/128/129 all carry an unticked close box that needs a browser pass, and the
+single QA slot is held live by w4 (`pid 1782910`, `cwd=/mnt/apopic/omnion-w4`). My own rule from
+tick 59 is not to close a REQ on a contended run, so the pick is the first `pending` request in my
+queue: **REQ-130**, and slice 1 of four.
+
+**Also done before any of it:** `/` was at **98%** (2.4 G free) with my 16 G build target on it —
+invariant 11 says that target belongs in `/dev/shm`, and a box at 98% is how a *sibling's* build
+dies. Measured first (`lsof +D`, `pgrep -a cargo`, `/proc/<pid>/cwd`) and reclaimed **4.32 GB** by
+grouping `debug/deps/*-<16hex>` by (stem, extension) and deleting every entry but the newest —
+957 files. `/` is back to **94%**, no other writer's target touched.
+
+**What shipped.** `crates/graphql`, five modules, no database and no HTTP:
+
+* `document` — a partial GraphQL reader. **Partial by design and fails closed**: anything it
+  cannot fully price is refused rather than assumed cheap, because that assumption *is* the
+  denial-of-service vector the request warns about. Fragments are resolved, not ignored, so depth
+  through a spread is real depth, and a cyclic fragment is refused rather than expanded until the
+  stack dies.
+* `limits` — depth, cost, aliases, fragments, page size, each with its own code, enforced
+  **pre-execution**. Refusals are ordered depth → aliases → page size → cost, so the client is
+  told the thing it can always fix first.
+* `cost` — the catalogue. Every weight carries the sentence justifying it, because a table of
+  naked integers is one nobody can review.
+* `schema` — per-caller composition. The request's rule is *absent, not nulled*, so a type the
+  caller cannot read is missing from the SDL entirely; the cache key is length-prefixed because a
+  `.`-joined key collides `{content, read}` with `{content.read}` — two roles, one cached schema.
+* `settings` — the operator's knobs and the validation the cost meter shares with the endpoint, so
+  a meter that says "allowed" is one the endpoint agrees with. `max_depth` above the parser's own
+  ceiling is refused, with the ceiling named: that is a setting promising a protection it cannot
+  deliver.
+
+**Proof.** `cargo test -p omnion-graphql` **69/69, 0 warnings**. `pnpm typecheck` 2/2.
+
+**Six mutations, because a green suite has not been seen red until it has.** Depth limit made
+unreachable → 1 red. Leaf priced at zero → 1 red. Cache key dropping the permission set → 2 red.
+Withheld type kept in the composed schema → 2 red. Page-size guard narrowed to one name → 1 red
+(after the test was fixed, below). Control green at 69.
+
+**The find of the tick.** That page-size mutation stayed GREEN on the first attempt, and the reason
+matters more than the fix. The test iterated `PAGE_SIZE_ARGUMENTS` — the constant the
+implementation reads — so shrinking the constant to `["first"]` shrank the loop with it. The test
+was green on a guard that had just lost four of its five names. It is the same shape as the
+exported-snapshot gate REQ-129 caught two ticks ago and the `if (false)` branch before it: **an
+assertion that shares its subject with the code cannot fail.** The names are now spelled inside the
+test and a control asserts the implementation's list is a subset of the documented one. Proven
+load-bearing: the same mutation is now red.
+
+**Three defects the gate found, all of which I would have shipped on a code read.** The parser
+refused the `{ … }` shorthand — the single most common document a client sends. `skip_type` opened
+with `[`, so every bare `$id: ID!` desynchronised the parse. `value()` had no comma terminator, so
+`first: 10, order: DESC` parsed as ONE argument and the second silently vanished.
+
+**One data bug that looked like a code bug.** A bulk edit filled `FieldDefinition::returns` by
+field NAME, so `Organization.id` was handed `Some("Article")` — and every caller querying their own
+tenant's name was told `Article` was not in their schema. It is now fixed, and both directions are
+pinned: `every_root_field_declares_the_type_it_returns` (a root field with no return type) and
+`only_root_fields_declare_a_return_type` (an entity field with one). A hand-filled column is a
+column that can be left half-empty.
+
+**Not ticked.** Every acceptance box. Slice 1 has no endpoint, no migration and no screen, so
+there is nothing for a walk to visit yet; the close gate stays where it was, and this slice is the
+layer its proofs will rest on.
+
+**Next.** The migration — numbered above the **union** high-water across all ten worktrees (0229),
+not my own branch's 0221 — then the resolver layer over the same service functions the REST
+handlers call, then the endpoint.

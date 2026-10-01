@@ -1,0 +1,16 @@
+[package]
+name = "omnion-graphql"
+description = "Omnion GraphQL surface: the query decision layer (depth, cost, allowlist), the per-caller schema composition and the API version policy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# The decision layer is pure: it parses, prices and composes a schema from a type catalogue.
+# It reaches for no database, no clock and no HTTP — which is what lets the playground's cost
+# meter predict the endpoint instead of agreeing with it after the fact. Persistence (persisted
+# documents, query logs, deprecations) arrives in slice 2 and lives behind `store.rs`.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
