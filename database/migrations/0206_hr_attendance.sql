@@ -84,13 +84,20 @@ comment on table hr_attendance is
 -- The invariant that makes a second check-in answerable. This is the constraint the whole slice
 -- is built on: the request's "idempotent per employee + day + kind" cannot be delivered by a
 -- service-level check, because the check and the insert would be two statements.
-create unique index hr_attendance_employee_day_uniq
+-- Every object in this file is `if not exists`, and the indexes are not a stylistic addition to
+-- the table's own guard: they are what makes the FILE re-runnable. A migration that is idempotent
+-- at the top and not at the bottom is the worst of the two, because it passes on a clean
+-- database and then wedges every database where the schema was installed by another route -- a
+-- hand-applied psql, a restored dump, a restored backup -- with `relation ... already exists` on
+-- the first index, and the migration ledger never records the version, so the next `migrate()`
+-- walks straight into it again. Half-guarded is the shape that costs a writer an afternoon.
+create unique index if not exists hr_attendance_employee_day_uniq
     on hr_attendance (employee_id, work_date);
 
 -- The monthly grid reads one employee's days newest first, and the roster reads one organization's
 -- day. Both are the two shapes the screens actually ask for.
-create index hr_attendance_employee_date_idx
+create index if not exists hr_attendance_employee_date_idx
     on hr_attendance (employee_id, work_date desc);
 
-create index hr_attendance_org_day_idx
+create index if not exists hr_attendance_org_day_idx
     on hr_attendance (organization_id, work_date desc);
