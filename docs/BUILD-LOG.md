@@ -10453,3 +10453,66 @@ directory`), which is the harness, not the code.
 
 **Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps out
 of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+## 2026-10-01 · REQ-107 slice 4 — the tool-telemetry roll-up, its route and the reconciliation walks
+
+**What.** `0237_ai_tool_stats_daily.sql` (calls / successes / failures / denials / p50 / p95 / p99
+/ aggregated cost / failure histogram, keyed `(day, organization_id, tool)`), `tool_stats.rs` in
+`crates/ai-hub`, `GET /api/v1/ai/telemetry/tools` behind its own `ai.telemetry.read`, and
+`apps/api/tests/tool_stats.rs`. Slice 3's runner work — which the previous tick was cut off
+writing — is finished and committed: `4a1c978a`.
+
+**Proof.**
+- `cargo test -p omnion-api --test tool_stats -- --test-threads=1` **5 passed** (57.9s).
+- `cargo test -p omnion-api --test ai_eval_runner -- --test-threads=1` **13 passed** (34.7s).
+- `cargo test -p omnion-api --test ai_eval_runs -- --test-threads=1` **12 passed** (41.3s).
+- `cargo test -p omnion-ai-hub --lib tool_stats` **2 passed**.
+- `cargo build -p omnion-api` exit 0; `pnpm typecheck` **2/2**.
+- All against a throwaway database on `omnion_qa_w7` (port **5433**).
+
+**Four defects, three of them silent, and all four found by a walk rather than by reading.**
+1. **`jsonb` has no equality operator**, so `jsonb_agg(distinct codes)` silently collapses to
+   `null` — the failure histogram came back empty on a tool with two failures, with no error
+   anywhere. The working reduction is `min(codes::text)::jsonb`.
+2. **The histogram reader used `as_str()` on JSON *numbers*.** `jsonb_object_agg(code, hits)`
+   writes `{"tool_timeout": 2}`, so every count was dropped and every tool read as "no failures".
+   A second silent-empty in the same expression, and it survived a green suite until the
+   assertion named a tool that actually had failures.
+3. **`max(jsonb)` does not exist** (no ordering on jsonb) — the "obvious" reduction for a
+   joined, duplicated column.
+4. **The interrupted runner work graded every run against the installation default.** `build_turn`
+   asked the router with `requested: None`, whose `None` arm is `default_model(pool)`, so a
+   suite's `model` pin was decoration. Its own walk also failed first for a second reason: the
+   `queue_with` helper took a `snapshot` argument and then hardcoded a placeholder, so the walk
+   asserted against `p/walk-model` instead of the model its fixture registered.
+
+**The lesson worth keeping.** Every one of the first three is a query that *runs*. There is no
+error to read, no warning, no non-zero exit — the answer is simply a smaller number than the truth,
+and a telemetry screen renders it as confident. `assert_eq!` on a count the test computed with the
+same expression the code uses would have passed on all of them; the walks compare against a count
+taken from `ai_tool_calls` by a *separate* query, and the percentiles against an interpolation
+computed in Rust. **A roll-up can be perfectly self-consistent and completely wrong — only an
+independent path to the same number catches that.**
+
+**The second lesson.** I guessed at four schema facts in a row before reading one: `Result<T,E>`
+is a 1-parameter alias, `ai_runs.status` has no `succeeded`, `stop_reason` is a closed vocabulary,
+and `ai_tool_calls.id` is a `bigserial`. Each guess cost a compile or a red walk. The first three
+were recoverable; the reading that would have avoided all four is `grep` on the constraint — which
+is what the constraint's own `check` clause is for. **A check constraint in this schema is a
+specification of what a fixture may write, and it is cheaper to read than to discover.**
+
+**Seven of thirteen acceptance rows are now ticked**, each naming the walk that proves it. The six
+left open: `rubric` cost under `eval:judge` on `/ai/costs`, `no_pii` at the run level,
+`gate.blocked` / `regression.detected` event emission, and the workspace-wide green row.
+
+**The browser pass is QUEUED, not run.** w6 held `/tmp/omnion-qa-slot` for the first ~33 minutes of
+this tick; the holder file briefly carried two pids (a known reaper case) and both were dead, so
+the semaphore's own `reap` will clear it. **No box is ticked on a pass that has not executed**, and
+the new route has no screen yet, so nothing about `/ai/telemetry` is claimed here — the screen is
+the next slice, and the walkthrough routes list gains the page with it.
+
+**Next.** The telemetry screen (`/ai/telemetry`): tool table with success %, denial %, the three
+percentiles and the ranked error codes; the step-count histogram and the cost-per-solved scatter;
+the costliest-failing-per-day table under it; a link from each row to `/ai/logs` pre-filtered by
+that tool. Then the event-emission walks for `ai.eval.gate.blocked` and
+`ai.eval.regression.detected`, which are the two rows the slice-3 runner writes but nothing asserts.

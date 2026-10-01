@@ -6,7 +6,12 @@
 > four catalogue keys — `98e18319`; then the screens and the walkthrough pass that drives them —
 > `00755aee`. Slice 2: the routes mounted and the run permission split from the read one —
 > `e154d732`; the run history, the run detail, the mandatory baseline picker and a `Run now` that
-> works — `ed03200f`. The closing browser pass over the two new screens is still owed) ·
+> works — `ed03200f`. Slice 3: the runner that claims, scores and settles — `718a73f9`, then the
+> model-under-test reader that makes a suite's pin mean something — `4a1c978a`. Slice 4 (store and
+> route, **no screen yet**): `0237_ai_tool_stats_daily.sql` and the roll-up — `eae9d344`; the
+> histogram read that was silently returning "no failures" — `9572d7db`; `/ai/telemetry/tools`
+> behind its own `ai.telemetry.read` — `7e7ec6ec`. Seven of thirteen acceptance rows are ticked,
+> each naming its walk. The closing browser pass and the `/ai/telemetry` screen are still owed) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
@@ -148,17 +153,17 @@ cases execute with a bounded concurrency, results are written in batches, and a 
 
 ### Acceptance criteria
 
-- [ ] Creating a suite with `blocking = true` requires a threshold and a judge model when any case carries a `rubric` property; the API refuses the incomplete combination naming the field.
-- [ ] A run executes every enabled case, writes one `ai_eval_case_results` row per case and computes `pass_rate` as the weighted pass share (asserted by a fixture with unequal weights).
+- [x] Creating a suite with `blocking = true` requires a threshold and a judge model when any case carries a `rubric` property; the API refuses the incomplete combination naming the field.  <!-- proved: ai_evals.rs: a_blocking_suite_with_a_rubric_case_needs_a_judge_and_the_rule_lands_on_edit -->
+- [x] A run executes every enabled case, writes one `ai_eval_case_results` row per case and computes `pass_rate` as the weighted pass share (asserted by a fixture with unequal weights).  <!-- proved: ai_eval_runner.rs: a_tick_claims_one_run_scores_every_case_and_weighs_the_verdict -->
 - [ ] A `rubric` case records the judge model, the judge prompt version and the judge's reasoning, and its cost appears under `eval:judge` on `/ai/costs`.
 - [ ] `no_pii` fails a case whose output contains a value REQ-105's detector would mask (stub output), and passes a clean one.
 - [ ] A gate run whose pass rate is below the threshold writes `gate = 'block'`, shows red on the suite and emits `ai.eval.gate.blocked`.
 - [ ] A run that drops more than the tolerance against its baseline marks the regressed cases in the diff view and emits `ai.eval.regression.detected` with their names.
-- [ ] A scheduled suite runs on its schedule without an open browser session (verified by advancing the clock in a test harness), and a second run is not started while one is `running`.
-- [ ] A run stuck beyond the timeout is failed by the runner with a reason and a `status = 'failed'` row, not left `running`.
-- [ ] Cancelling a running suite stops remaining cases and marks the run `cancelled` with the partial results kept.
-- [ ] `/ai/telemetry` tool stats match the underlying run steps for the same range (asserted against SQL for successes and denials).
-- [ ] Organization A cannot read organization B's suites, runs or results (404 on a direct id).
+- [x] A scheduled suite runs on its schedule without an open browser session (verified by advancing the clock in a test harness), and a second run is not started while one is `running`.  <!-- proved: ai_eval_runner.rs: a_schedule_fires_on_its_minute_and_only_once_inside_it + a_suite_with_a_run_in_flight_is_not_queued_again -->
+- [x] A run stuck beyond the timeout is failed by the runner with a reason and a `status = 'failed'` row, not left `running`.  <!-- proved: ai_eval_runner.rs: a_stale_run_is_failed_by_the_reaper_with_a_reason -->
+- [x] Cancelling a running suite stops remaining cases and marks the run `cancelled` with the partial results kept.  <!-- proved: ai_eval_runner.rs: a_cancelled_run_keeps_the_results_it_already_wrote + ai_eval_runs.rs: a_cancel_keeps_the_partial_results_and_a_second_cancel_is_a_conflict -->
+- [x] `/ai/telemetry` tool stats match the underlying run steps for the same range (asserted against SQL for successes and denials).  <!-- proved: tool_stats.rs: the_rollup_reconciles_with_the_calls_it_summarises (counts taken from ai_tool_calls by a separate query) -->
+- [x] Organization A cannot read organization B's suites, runs or results (404 on a direct id).  <!-- proved: ai_evals.rs: another_tenants_suite_is_not_found_and_never_forbidden + ai_eval_runs.rs: another_tenants_settled_run_is_not_found_and_a_cancel_never_confirms_it_exists + tool_stats.rs: a_tenant_reads_only_its_own_tool_numbers -->
 - [ ] A caller without `ai.evals.run` sees Run now disabled with the permission named; the API answers 403 for the same call.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
