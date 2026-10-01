@@ -238,16 +238,21 @@ async fn remind(
         return Ok(false);
     }
 
-    // The recipient must be a real account. `users.organization_id` is nullable, so a person on
-    // another tenant (or on the platform itself) can be *selected* as an escalation target and
-    // the foreign key will happily accept it — which makes the naive "notify whoever the policy
-    // names" a tenant leak wearing a select element. The same assertion the owner roster gate
-    // makes, and for the same reason: the guard has to be proven, not assumed.
-    let known = omnion_notifications::store::existing_users(pool, &[owner])
-        .await
-        .map_err(|error| error.to_string())?;
+    // The recipient must be a real account **of this organization**. `users.organization_id` is
+    // nullable, so a person on another tenant (or on the platform itself) can be the lead's
+    // `owner_user_id` — the assign route binds the id verbatim and the foreign key is happy —
+    // which makes the naive "tell whoever owns the lead" a tenant leak wearing an owner column.
+    // This is the *tenancy* half of the question; the account's `status` is deliberately not part
+    // of it, because a disabled colleague is still somebody who has to be told.
+    let known = omnion_notifications::store::existing_users_in_organization(
+        pool,
+        organization_id,
+        &[owner],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     if !known.contains(&owner) {
-        tracing::warn!(lead_id = %reminder.lead_id, %owner, "a reminder's owner is not a real account");
+        tracing::warn!(lead_id = %reminder.lead_id, %owner, "a reminder's owner is not an account of this organization");
         return Ok(false);
     }
 
@@ -318,15 +323,27 @@ async fn escalate(
         return Ok(Outcome::Skipped);
     }
 
+    // The recipient must be an account **of this organization**, not merely a real one. The
+    // policy's `escalate_to_user_id` is a plain foreign key to `users(id)`, and
+    // `users.organization_id` is nullable, so a policy can name a colleague on another tenant
+    // (or a platform account) and the column accepts it without complaint. Delivering to them
+    // writes a row whose `organization_id` is the *sending* tenant next to a recipient who
+    // belongs to a different one — which is exactly the shape that reads as correct in a query
+    // and is a leak in a product. `status` is deliberately not part of the question: a disabled
+    // account is still somebody who has to be told.
     let target = assignment_store::escalation_target(pool, breach.lead_id)
         .await
         .map_err(|error| error.to_string())?;
     let known = match target {
-        Some(person) => omnion_notifications::store::existing_users(pool, &[person])
-            .await
-            .map_err(|error| error.to_string())?
-            .contains(&person)
-            .then_some(person),
+        Some(person) => omnion_notifications::store::existing_users_in_organization(
+            pool,
+            organization_id,
+            &[person],
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .contains(&person)
+        .then_some(person),
         None => None,
     };
 

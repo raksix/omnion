@@ -559,6 +559,42 @@ pub async fn existing_users(pool: &PgPool, user_ids: &[Uuid]) -> Result<Vec<Uuid
     Ok(known)
 }
 
+/// The subset of `user_ids` that names an account **of that organization**.
+///
+/// [`existing_users`] answers "is this a real account". This answers the other half of the
+/// question — "is this somebody we may tell" — and the two are not the same sentence:
+/// `users.organization_id` is **nullable**, so an account on another tenant, or on the platform
+/// itself, is a perfectly real row. A caller that uses the existence check as a tenancy check
+/// sends a tenant's notification into another tenant's inbox, and the notification table will
+/// carry the *sending* organization next to a recipient who belongs to a different one, which
+/// is the shape that makes the leak look correct in a query.
+///
+/// **The predicate is equality, not `is distinct from`.** An orgless (platform) account is
+/// excluded here on purpose: a platform operator is not a recipient for tenant A's business, and
+/// the platform account is the one population `organization_id is null` was *for*.
+///
+/// **No `status` filter, and that is load-bearing.** `users.status` is the access system, not the
+/// tenancy system: a colleague disabled after a policy was saved is still somebody who has to be
+/// told, and filtering them here would silently drop every escalation for a team on leave. The
+/// two questions are independent and this function answers exactly one of them.
+pub async fn existing_users_in_organization(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_ids: &[Uuid],
+) -> Result<Vec<Uuid>> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known: Vec<Uuid> = sqlx::query_scalar(
+        "select id from users where id = any($1::uuid[]) and organization_id = $2",
+    )
+    .bind(user_ids)
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(known)
+}
+
 /// Check a payload's category and channel names before the store ever sees them.
 ///
 /// The SQL has check constraints and would refuse a bad value — but with a constraint name

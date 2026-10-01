@@ -14938,3 +14938,61 @@ silently red for ticks that distinction is the whole lesson of the second half.
 pattern (`responded`, `status_changed`, `converted`, `received`); the SLA reminder is the only
 once-per-lead one and it has a unique index. Whether the *notification* side of a breach is
 once-only is the same question one layer up, and it has never been asked.
+
+
+## Tick 73 — wave8 (REQ-117, slice 41)
+
+**What.** The SLA worker's recipient guard described a cross-tenant leak and did not implement one.
+`omnion_notifications::store::existing_users` asks `select id from users where id = any($1)` — "is
+this a real account" — and both worker call sites read that as "is this somebody we may tell".
+`users.organization_id` is nullable, so the two questions diverge for exactly the population the
+guard's own comment names: "a person on another tenant (or on the platform itself) can be selected
+as an escalation target and the foreign key will happily accept it — which makes the naive 'notify
+whoever the policy names' a tenant leak wearing a select element." **The comment was the only thing
+asserting the behaviour, and it was a statement about code that did not exist.**
+
+**RED first, and RED was a measurement.** `TickReport { escalated: 1 }` and `{ reminded: 1 }` — both
+doors delivered a real account belonging to a *second* tenant. No privileged actor is needed:
+`crm_sla_policies.escalate_to_user_id → users(id)` constrains existence, not tenancy;
+`POST /crm/assignment/policies` and `PATCH /crm/leads/{id}/assign` both bind the uuid verbatim.
+
+**The fix is a second function, not a changed one.** Both questions are legitimate — the emit
+route's friendly pre-check genuinely wants the weaker one — so `existing_users_in_organization` sits
+beside it with `organization_id = $2`. Equality, not `is distinct from`: the orgless platform
+account is the population the nullable column exists for, and it is not a recipient for a tenant's
+business. **No `status` filter**, and that is load-bearing — the pre-existing
+`a_disabled_target_is_still_a_real_account_and_is_told` stayed green across the change, which is the
+evidence the tenancy guard did not quietly become an access check and start dropping every
+escalation for a team on leave.
+
+**A guard that skips the row would have been the wrong fix, and the test says so.** An out-of-tenant
+target is counted `untargeted` and the breach is still written to the trail with
+`reason: "no escalation target"` — a tenant leak traded for silent data loss is not a repair. The
+absence assertion is `count(*) from notifications where source_id = $1`, over **every** inbox: "the
+stranger's inbox is empty" passes on a two-person fixture even when the leak reached a third row.
+
+**Proof.** `scripts/qa/run-crm-sla.sh` **7/7 (was 5/5), PROVEN TO FAIL at 5/7** — both call sites
+reverted to the pre-fix body, exactly the two new tests red, all five unrelated ones green.
+Regressions: module lib **191/191**, notifications lib **102/102**, `run-crm-assign` **9/9 + 5/5**,
+`run-crm-assignment` **14/14**, `run-crm-verdict-rows` **7/7**, clippy `--all-targets` **0 errors**,
+admin `tsc --noEmit` exit 0.
+
+**A gate that fails on its own configuration, reporting a SQL error instead of the typo.**
+`QA_DB=omnion_qa_w8_verdict-rows` — a hyphen — is a syntax error at the `DROP DATABASE` line, and
+the log said `ERROR: syntax error at or near "-"` with a *database name* nowhere in it. **A gate
+that cannot start has measured its configuration; read the failing statement, not the test count.**
+
+**A near-miss worth recording because the tool reported success.** Appending this entry went through
+a read-one-line / write-back helper, which wrote the *first line of the file* plus the entry over
+14 940 lines of build log and returned `success`. The diff (`14993 +++... 14940 deletions`) was the
+only evidence, and it was one command away. **An append that reports success has to be read back
+with `wc -l`; the helper's own output is not the file's state.**
+
+**Not claimed.** No browser pass: no screen changed (one core helper, two call sites). The QA slot
+holder (pid 1625868) is **dead** — `kill -0` fails, so the slot is reclaimable rather than held, and
+reclaiming it is the next tick's first job rather than this one.
+
+**Next.** The third `existing_users` call site — `POST /notifications/emit` — carries
+`notifications.send` and binds `session.user.organization_id` as the row's organization, so it can
+address any real account on the platform. That is the same defect class one route up, and whether
+it is a leak or an intended cross-tenant feature is a question about the permission, not the query.

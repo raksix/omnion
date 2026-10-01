@@ -386,3 +386,140 @@ async fn a_tick_with_no_live_clocks_is_idle() {
 
     harness.dispose().await;
 }
+
+/// An account that exists but belongs to **another tenant** is not an addressee.
+///
+/// The guard this pins is `existing_users`, and the worker's own comment says what it is for:
+/// *"a person on another tenant (or on the platform itself) can be selected as an escalation
+/// target and the foreign key will happily accept it — which makes the naive 'notify whoever
+/// the policy names' a tenant leak wearing a select element."* **That comment described a check
+/// the function does not perform.** `existing_users` asks `select id from users where id = any($1)`
+/// — a question about the *user table* and nothing else — so it answers "is this a real account"
+/// and the caller reads that as "is this somebody we may tell". `users.organization_id` is
+/// nullable, so the two answers differ for exactly the population the comment is about, and the
+/// platform-side account (organization `null`) is the one the platform is *for*.
+///
+/// Both doors are exercised, because they are two separate call sites that each asked the
+/// weaker question:
+///
+/// * the **escalation target** — a policy naming a colleague on tenant B (a reachable state:
+///   `crm_sla_policies.escalate_to_user_id → users(id)` constrains existence, not tenancy, and
+///   `POST /crm/assignment/policies` binds the id verbatim);
+/// * the **lead's own owner** — the reminder path, which is a different function with a
+///   different call site and its own copy of the reasoning.
+///
+/// The assertion is the absence of the row **and** that the breach is still *recorded*, because
+/// "nobody was told" must not be reachable by breaking the escalation: the trail line is the
+/// fact, the notification is a courtesy, and a guard that quietly stopped counting a breach
+/// would trade a tenant leak for silent data loss.
+#[tokio::test]
+async fn an_escalation_target_on_another_tenant_is_never_told() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let pool = harness.state.db().pool();
+    let (org, colleague) = org_and_user(&harness.state, "sla-home").await;
+    // Tenant B exists only to own a person. Nothing of its own is ever swept.
+    let (_other_org, stranger) = org_and_user(&harness.state, "sla-other").await;
+    let lead = overdue_lead(&harness.state, org, colleague, Some(stranger)).await;
+
+    let report = crm_sla_runner::tick(&harness.state, 10)
+        .await
+        .expect("the tick must not fail over an out-of-tenant target");
+    assert_eq!(
+        report.escalated, 0,
+        "a breach delivered to somebody on another tenant is not an escalation: {report:?}"
+    );
+    assert_eq!(
+        report.untargeted, 1,
+        "it is the same shape as a policy with no target at all — the breach happened, there was \
+         nowhere to send it, and the tick has to say which of the two it was: {report:?}"
+    );
+
+    // Read the whole table for this lead's source rather than one inbox: a leak that reached a
+    // *third* row would satisfy "the stranger's inbox is empty" on a fixture that happens to
+    // have only two people in it. The count is over `source_id`, which is the lead, so it is the
+    // statement "this breach produced no notification anywhere" rather than "not in this one".
+    let anywhere: i64 = sqlx::query_scalar(
+        "select count(*) from notifications where source_id = $1",
+    )
+    .bind(lead.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("the notification table");
+    assert_eq!(
+        anywhere, 0,
+        "a person on another tenant must never see this tenant's lead — and the assertion is \
+         over every inbox, not the one the fixture happens to have built"
+    );
+
+    // The breach is still a fact. The trail line is what stops the lead reading "not breached",
+    // and a tenancy guard that made the worker skip the row entirely would trade a tenant leak
+    // for silent data loss — which is the wrong way round.
+    let reason: Option<String> = sqlx::query_scalar(
+        "select detail->>'reason' from crm_lead_events where lead_id = $1 and kind = 'sla_breached'",
+    )
+    .bind(lead)
+    .fetch_one(pool)
+    .await
+    .expect("the breach is still recorded on the trail");
+    assert_eq!(
+        reason.as_deref(),
+        Some("no escalation target"),
+        "an out-of-tenant target and an absent one are the same state to an operator: nobody \
+         who may see this lead was told"
+    );
+
+    harness.dispose().await;
+}
+
+/// The same rule on the **reminder** door, which is a different function and a different call
+/// site with its own copy of the reasoning.
+///
+/// A test that only pins the escalation path leaves the reminder path asserting the same
+/// promise from its own body, and this branch has shipped exactly that shape more than once —
+/// two guards that read the same rule and disagree, a check that one site got and the other
+/// did not. The lead's `owner_user_id` is bound verbatim by `PATCH /crm/leads/{id}/assign` and
+/// constrained by nothing but the foreign key, so this is the same reachable state seen from
+/// the other door.
+#[tokio::test]
+async fn a_lead_owned_by_somebody_on_another_tenant_is_never_reminded() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let pool = harness.state.db().pool();
+    let (org, colleague) = org_and_user(&harness.state, "sla-owner-home").await;
+    let (_other_org, stranger) = org_and_user(&harness.state, "sla-owner-other").await;
+    // The lead belongs to the stranger; the policy's escalation target is the local colleague,
+    // so a *fix* to the escalation path alone cannot make this test pass.
+    let lead = overdue_lead(&harness.state, org, stranger, Some(colleague)).await;
+    // Inside the reminder window: due in ten minutes with a fifteen-minute reminder.
+    sqlx::query(
+        "update crm_leads set first_response_due_at = now() + interval '10 minutes' where id = $1",
+    )
+    .bind(lead)
+    .execute(pool)
+    .await
+    .expect("the deadline moves into the window");
+
+    let report = crm_sla_runner::tick(&harness.state, 10)
+        .await
+        .expect("the tick must not fail over an out-of-tenant owner");
+    assert_eq!(
+        report.reminded, 0,
+        "a reminder addressed to somebody on another tenant is a leak, not a reminder: {report:?}"
+    );
+    assert!(
+        notifications_for(pool, stranger, &lead.to_string()).await.is_empty(),
+        "the stranger's inbox is this tenant's business only if the tenant shares it"
+    );
+
+    // And the local colleague is not told about it either: the reminder is addressed to the
+    // owner, and a fix that redirected it would be a different (and worse) feature.
+    assert!(
+        notifications_for(pool, colleague, &lead.to_string()).await.is_empty(),
+        "the reminder is addressed to the owner; nobody else is a substitute"
+    );
+
+    harness.dispose().await;
+}
