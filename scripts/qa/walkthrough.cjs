@@ -6163,6 +6163,7 @@ async function runCrmIntakeDepth(page, report) {
       .first()
       .innerText()
       .catch(() => "")) .includes("next pass");
+  
   const stepsAfter = await page.evaluate(() =>
     Array.from(document.querySelectorAll("[data-conversion-stepper] li")).map((li) => [
       li.getAttribute("data-step"),
@@ -6191,6 +6192,128 @@ async function runCrmIntakeDepth(page, report) {
     if (blocked.length === 0) return false; // a pass that never sees a blocked step proves nothing
     return blocked.every((el) => /REQ-\d+|not installed|module/i.test(el.textContent ?? ""));
   });
+
+// 5b. A trail line that EXPLAINS a silence, on a lead that actually has one. Everything above
+  //    asserted against "no autoresponder line exists", which is true and proves nothing: the
+  //    whole autoresponder surface — the reserved/delayed states, the skip sentence and the
+  //    explanation beside it — had never been rendered by a pass, because this fixture's source
+  //    has no autoresponder. So a broken renderer reads exactly like an absent one, which is
+  //    the sentence a gate cannot distinguish. This creates a SECOND source whose autoresponder
+  //    is switched ON with an empty body: the one misconfiguration an operator can fix, and the
+  //    one that produces `invalid_template` + its diagnosis instead of a send.
+  const explained = await page.evaluate(async (tag) => {
+    const source = await fetch("/api/v1/crm/intake/sources", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: `QA autoresponder form ${tag}`,
+        kind: "endpoint",
+        dedupe_policy: "create_anyway",
+        rate_limit_per_hour: 30,
+        mapping: [
+          { target: "email", source: "email", transforms: ["trim", "lowercase"], required: false, fallback: null },
+        ],
+        required_targets: [],
+        // Enabled, with no subject and no body: `prepare` answers InvalidTemplate, which is a
+        // skip carrying a diagnosis. Nothing is mailed, so no SMTP conversation is needed and
+        // the state exists in a QA database — the same trick the abandoned-claim slice used.
+        autoresponder: {
+          enabled: true,
+          template: "qa-broken",
+          subject: "",
+          body: "",
+          delay_minutes: 0,
+        },
+      }),
+    }).then((r) => r.json().catch(() => null));
+
+    if (!source?.endpoint_key) return { created: false, status: source?.status ?? null };
+    const captured = await fetch(`/api/v1/crm/intake/${source.endpoint_key}`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: `broken.${tag}@example.com`, name: "Broken Reply" }),
+    }).then((r) => r.json().catch(() => null));
+    return { created: true, source, captured };
+  }, stamp);
+  steps.explainedSourceCreated = explained.created === true;
+  steps.explainedCaptureState = explained.captured?.state ?? null;
+  steps.explainedLeadId = explained.captured?.reference ?? null;
+
+  if (steps.explainedLeadId) {
+    await page.goto(`${URL_ADMIN}/crm/leads/${steps.explainedLeadId}`, {
+      waitUntil: "domcontentloaded",
+    }).catch(() => {});
+    await page.waitForSelector('[data-testid="crm-lead-detail"]', { timeout: 12000 }).catch(() => {});
+    // The skip line is written from a SPAWNED task (the capture route fires the autoresponder
+    // after it answers 202), so the trail can lag the page by a beat. A single read after a
+    // fixed sleep is a race that reports "no line" on a healthy product — and a walkthrough that
+    // says "absent" for both a broken renderer and a slow worker teaches nobody anything. Poll
+    // for the element instead, and record how long it took: a line that never appears is a
+    // distinct answer from a line that appeared late.
+    const skipStarted = Date.now();
+    await page
+      .waitForSelector("[data-skip-reason]", { timeout: 15000 })
+      .catch(() => {});
+    steps.skipLineWaitMs = Date.now() - skipStarted;
+    steps.skipLineAppeared = (await page.locator("[data-skip-reason]").count()) > 0;
+    await shot(page, "page-crm-lead-autoresponder-skip");
+
+    steps.skipReasonWords = await page
+      .locator("[data-skip-reason]")
+      .first()
+      .innerText()
+      .catch(() => "");
+    steps.skipReasonIsSentence =
+      steps.skipLineAppeared === true && /\s/.test(steps.skipReasonWords.trim());
+    // The reason names WHICH case; the explanation beside it says WHAT TO FIX. They are
+    // separate facts in separate elements, and an operator who has only the machine word
+    // cannot act on it — which is the whole defect this fixture exists to observe.
+    steps.skipExplanation = await page
+      .locator("[data-lead-trail-autoresponder-explanation]")
+      .first()
+      .innerText()
+      .catch(() => "");
+    steps.skipExplanationIsSentence =
+      steps.skipExplanation.trim().length > 0 && /[a-z]/.test(steps.skipExplanation);
+    // The raw machine token must not survive into the panel: a verdict the client has words
+    // for is rendered as the sentence, and only an UNKNOWN word falls through to itself.
+    steps.noMachineTokenInSkip =
+      steps.skipLineAppeared === true && !/^[a-z_]+$/.test(steps.skipReasonWords.trim());
+    steps.skipReasonNotRawWord = steps.skipReasonWords.trim() !== "invalid_template";
+
+    // **The fixture earns its own assertion.** Without it every line above is vacuous: a broken
+    // autoresponder (nothing on the trail at all) and a correct one are the same screen, and the
+    // words would be read from an empty string and pass. The state is created here by a source
+    // whose autoresponder is ON and empty, so the trail MUST carry an explanation — an absent
+    // line is a finding, which is also the only way a silently-dropped `explanation` payload
+    // (the defect slice 49 fixed on the writer side) is caught by a pass at all.
+    const bad = (name, ok, detail) =>
+      record({
+        page: "crm-leads",
+        action: "autoresponder-skip-note",
+        severity: ok ? "low" : "high",
+        detail: `${name}: ${detail}`,
+      });
+    bad(
+      "a lead with a misconfigured autoresponder says why it went quiet",
+      steps.skipLineAppeared === true,
+      steps.skipLineAppeared === true
+        ? `skip line after ${steps.skipLineWaitMs}ms — "${steps.skipReasonWords}"`
+        : `no skip line after ${steps.skipLineWaitMs}ms (the autoresponder is enabled and empty, so one must exist)`,
+    );
+    bad(
+      "the skip note is a sentence, not a machine word",
+      steps.skipReasonIsSentence === true && steps.skipReasonNotRawWord === true,
+      `rendered "${steps.skipReasonWords}"`,
+    );
+    bad(
+      "the skip note carries the diagnosis beside it",
+      steps.skipExplanationIsSentence === true,
+      steps.skipExplanation.trim() === "" ? "explanation absent" : `"${steps.skipExplanation}"`,
+    );
+  }
 
   // 6. The duplicate queue. A second source with the `reject_duplicate` policy files the row
   //    instead of linking it, which is the only way a row reaches this screen.
