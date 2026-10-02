@@ -1161,6 +1161,30 @@ async function interact(page, pageName, report) {
       record({ page: pageName, i, ...meta, action: "skip", outcome: "deferred-signout" });
       continue;
     }
+    // **An auth form is never filled or submitted by the generic pass, and the cost is not
+    // theoretical.** `interact()` reached the sign-in form because an earlier click navigated to
+    // it, then filled it and pressed "Sign in" — correctly, with valid credentials — and the
+    // platform's own limiter answered `429`. That one refusal cost the entire run: every route
+    // after it was measured as a login form and reported as "the session was lost", which is the
+    // 22-screen defect tick 68 fixed, recurring with the same cause one layer down. The limiter
+    // budgets `sign_in` at ten per five minutes per PROCESS, and this browser is one process, so
+    // the generic pass spending the budget means `ensureSignedIn` cannot spend it again.
+    //
+    // The two controls below (`Sign out`, `Sign in`) are excluded for the same reason they are
+    // DEFERRED elsewhere in this file: they are the pass's own bookkeeping, driven deliberately by
+    // the wizard and the re-login step, never incidentally by a round-robin click.
+    if (/\bsign in\b/i.test(meta.label) && /password/i.test(meta.type === "" ? meta.name : "")) {
+      record({ page: pageName, i, ...meta, action: "skip", outcome: "deferred-signin" });
+      continue;
+    }
+    // Filling an `input[type=password]` at all is the tell: the panel has exactly one password
+    // field and it lives on the sign-in form. Matching on the CONTROL rather than the surrounding
+    // form means a screen whose own depth pass fills a password-like field is unaffected, because
+    // depth passes run outside `interact()`.
+    if (meta.type === "password") {
+      record({ page: pageName, i, ...meta, action: "skip", outcome: "deferred-password-field" });
+      continue;
+    }
     if (meta.guard) {
       // The control belongs to the screen's own pass (the analytics settings screen writes and
       // runs the purge and the erasure there): filling it with a sample value would be a
