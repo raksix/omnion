@@ -16,10 +16,18 @@ use omnion_storage::Storage;
 use crate::output;
 
 /// How one check ended.
+///
+/// Three states, not two: the request asks for `warn` to stay visually distinct from a failure
+/// ("each check prints pass/warn/fail with a fix hint … exit code 1 when any check fails, 0 with
+/// warnings present"). A binary pass/fail would force every advisory finding to be either silent
+/// or a failure, and the two failure modes that produces are both bad — an operator learns to
+/// ignore the red, or a pipeline gates on something that was never broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     /// The check passed.
     Ok,
+    /// The check passed with an advisory note; it does not affect the exit code.
+    Warn,
     /// The check failed; a doctor run with one of these exits `1`.
     Fail,
 }
@@ -28,6 +36,7 @@ impl Status {
     fn marker(self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::Warn => "warn",
             Self::Fail => "fail",
         }
     }
@@ -68,6 +77,17 @@ impl Check {
         }
     }
 
+    /// An advisory finding: printed with its own marker, counted as neither a pass nor a
+    /// failure, and reported in the envelope's `warnings` rather than its `error`.
+    fn warn(name: &'static str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            name,
+            status: Status::Warn,
+            detail: detail.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
     fn fail(name: &'static str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             name,
@@ -79,17 +99,22 @@ impl Check {
 }
 
 /// Run every check and report.
-pub async fn run(json: bool) -> ExitCode {
+///
+/// `json` writes the documented envelope to stdout; `quiet` leaves stdout empty. Neither changes
+/// the exit code — that is the property a deployment gate depends on, and the reason the
+/// envelope carries `ok` separately from the check list rather than deriving one from the other.
+pub async fn run(json: bool, quiet: bool) -> ExitCode {
     let checks = collect().await;
     let failures = checks
         .iter()
         .filter(|check| check.status == Status::Fail)
         .count();
 
+    let sink = crate::output::Sink::new(json, quiet);
     if json {
-        print_json(&checks);
+        print_json("doctor", &checks);
     } else {
-        print_table(&checks);
+        print_table(&checks, sink);
     }
 
     if failures == 0 {
@@ -263,12 +288,20 @@ async fn installation_check(db: &Db) -> Check {
 }
 
 /// Render the checks as a table.
-fn print_table(checks: &[Check]) {
-    println!("omnion doctor");
+///
+/// Goes to **stderr** under `--json`, because the envelope owns stdout. Printing the table to
+/// stdout as well — the obvious reading of "a human gets a table, a machine gets JSON" — puts
+/// two documents on one stream, and the parser that fails is the consumer's, whose error message
+/// names the CLI and not the line responsible.
+fn print_table(checks: &[Check], sink: crate::output::Sink) {
+    if !sink.is_visible() {
+        return;
+    }
+    sink.print(format_args!("omnion doctor"));
     for check in checks {
-        output::check(check.status.marker(), check.name, &check.detail);
+        output::check(sink, check.status.marker(), check.name, &check.detail);
         if let Some(hint) = &check.hint {
-            output::hint(hint);
+            output::hint(sink, hint);
         }
     }
 
@@ -276,16 +309,43 @@ fn print_table(checks: &[Check]) {
         .iter()
         .filter(|check| check.status == Status::Fail)
         .count();
-    println!();
+    let warnings = checks
+        .iter()
+        .filter(|check| check.status == Status::Warn)
+        .count();
+    sink.print(format_args!(""));
     if failures == 0 {
-        println!("{} checks, all passed.", checks.len());
+        sink.print(format_args!("{} checks, all passed.", checks.len()));
     } else {
-        println!("{} checks, {failures} failed.", checks.len());
+        sink.print(format_args!("{} checks, {failures} failed.", checks.len()));
+    }
+    // The warning count is on its own line rather than folded into the summary, because "all
+    // passed" and "3 warnings" read as contradictory in one sentence and an operator skimming a
+    // red CI log should not have to work out which one won.
+    if warnings > 0 {
+        sink.print(format_args!(
+            "{warnings} warning(s) — the run still succeeded."
+        ));
     }
 }
 
-/// Render the checks as JSON (for pipelines that prefer a machine-readable answer).
-fn print_json(checks: &[Check]) {
+/// Render the checks as the documented envelope (REQ-131 acceptance 15).
+///
+/// The check list moves under `data.checks` and the counts to the top level, so a consumer reads
+/// `.data.checks[]` rather than re-deriving an array from a bare document.
+///
+/// **A failed check makes the envelope a failure envelope.** The first version wrote
+/// `envelope::success` unconditionally and left the failure count inside `data`, which produced
+/// `ok: true` beside a failing check and an exit code of 1 — the one combination this envelope
+/// exists to prevent: a gate that reads `.ok` and gates on it goes green on an installation
+/// `omnion doctor` just refused. The finding was caught by running the binary and piping its
+/// stdout into a parser, not by reading the code: `envelope::success` looked right, and the
+/// mismatch was only visible in the document the binary actually wrote.
+///
+/// So a failing `doctor` reports `ok: false` with `error.code = "checks_failed"` and the counts
+/// in `data`. The envelope's `ok` and the process exit code now agree by construction, which is
+/// the property the two are for.
+fn print_json(command: &str, checks: &[Check]) {
     let entries: Vec<serde_json::Value> = checks
         .iter()
         .map(|check| {
@@ -301,15 +361,61 @@ fn print_json(checks: &[Check]) {
         .iter()
         .filter(|check| check.status == Status::Fail)
         .count();
-    let document = serde_json::json!({
+    let warnings = collect_warnings(checks);
+
+    let data = serde_json::json!({
         "checks": entries,
         "failures": failures,
+        "total": checks.len(),
+        "warnings_count": warnings.len(),
+        // Kept under `data` as well as in `warnings`, so a consumer can branch on the check
+        // outcome without walking the array and still see the per-check detail.
         "ok": failures == 0,
     });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&document).expect("a JSON document serializes")
-    );
+
+    if failures == 0 {
+        crate::envelope::print(&crate::envelope::success(command, data, &warnings));
+    } else {
+        // The message names the failed checks rather than only counting them: an operator who
+        // ran `--json` on purpose wants to know what to fix, and `data.checks[].hint` is right
+        // there in the same document.
+        let failed: Vec<&str> = checks
+            .iter()
+            .filter(|check| check.status == Status::Fail)
+            .map(|check| check.name)
+            .collect();
+        let failure = crate::envelope::Failure::with_hint(
+            crate::envelope::ErrorCode::DependencyUnavailable,
+            format!(
+                "{} of {} check(s) failed: {}",
+                failures,
+                checks.len(),
+                failed.join(", ")
+            ),
+            "run `omnion doctor` without --json for the per-check hints",
+        );
+        crate::envelope::print(&crate::envelope::failure_with_data(
+            command, &failure, data, &warnings,
+        ));
+    }
+}
+
+/// The failed checks, restated as envelope warnings.
+///
+/// A `warn` status exists in the check vocabulary the request asks for but no check reports one
+/// today, so this list is empty in practice. It is built anyway: when the first advisory check
+/// lands (an unset optional key, a disk above 80%), the consumer already knows the array is there
+/// and nothing has to change shape underneath a script.
+fn collect_warnings(checks: &[Check]) -> Vec<crate::envelope::Warning> {
+    checks
+        .iter()
+        .filter(|check| check.status == Status::Warn)
+        .map(|check| crate::envelope::Warning {
+            code: "doctor_check_warned",
+            message: check.detail.clone(),
+            hint: check.hint.clone(),
+        })
+        .collect()
 }
 
 /// Comma-joined migration versions.

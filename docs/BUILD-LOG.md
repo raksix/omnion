@@ -10521,3 +10521,56 @@ mutation was written against.
 killed the last one (`/tmp/w6-qa/pass.log`: every depth pass after route 8 answered *"Target
 page, context or browser has been closed"*). **Next:** the pass, when a slot frees AND the disk
 has room; then tick the close box.
+
+## Tick 75 — REQ-131 slice 1: the `--json` envelope, and the lie it almost shipped
+
+**What.** The platform-extras tail's queue head was REQ-131 (CLI & generators), whose acceptance 15
+calls the `--json` envelope a **public contract**: a stable document, documented error codes, data on
+stdout and progress on stderr. No command implemented it — `omnion doctor --json` wrote a bare
+`{checks, failures, ok}` with no envelope at all, and the other three commands had no `--json` except
+`doctor`. This slice builds the envelope and routes every command through it.
+
+**Proof.**
+
+| Check | Result |
+|---|---|
+| `cargo test -p omnion-cli` | **38 passed, 0 failed** (was 24) |
+| one document per command (built binary, piped to a parser) | version, help, doctor, migrate status, migrate plan, migrate verify-down — all parse |
+| `ok` agrees with the exit code | 6/6 agree; the usage path answers `code: usage` at exit 2 |
+| no secret in a `--json` document | 1 regex hit, the masked `postgres://omnion:***@…` from `describe_database_url` |
+| eight slot-free QA gates | session-guard, wizard-gate, exports-states, route-adoption 11/11, wave5b-route-coverage 8/8 (6/6 mutations), graphql-surface 30 (9 proven-to-fail), deprecation-surface 43/43, only-filter-gate 19/19 |
+
+**The defect the module's own doc comment predicted, and that reading the code did not catch.** The
+envelope is documented as changing only *how* an outcome is written down, never *what* it is. The
+first implementation had `print_json` call `envelope::success` unconditionally and park the failure
+count inside `data` — so a failing `doctor` wrote `ok: true` next to `data.failures: 1` and exited
+1. **A gate that reads `.ok` and gates on it would have gone green on an installation `doctor` had
+just refused.** Piping the real binary's stdout into a parser is what found it; `envelope::success`
+reads correctly. Fixed by making a failed check produce a *failure* envelope, and
+`envelope::failure_with_data` exists because nulling `data` on failure would throw away the per-check
+detail that is the entire value of the run — `ok: false` with nothing to act on, while the human
+running the same command without `--json` gets all six checks.
+
+**Second defect, found by the same pipe.** `version --json` printed `omnion 0.1.0` **and** the
+document: two documents on one stream, the exact breakage the envelope exists to prevent. The human
+line now goes through `output::Sink`, which also fixed doctor's table — `print_table` reached for
+`println!` directly, so `--json` left the table on stdout beside the document.
+
+**Three smaller ones, each caught by a test rather than by reading.** The parser's `--json` is a
+global extracted *before* the command is looked at, so `--json doctor` and `doctor --json` cannot
+disagree; the extraction stops at `--`, because a pass that ran to the end of the list would strip
+`--json` out of `node build.js --json` handed to a child (`parse_secret` then refused the documented
+`-- <child>` shape as an unknown option). `Doctor{json}` was **deleted** rather than kept: with the
+global lifted first it could only ever read `false`, and the `doctor_json || json` disjunction in
+`main` that hid this worked by accident rather than by design. `command_names()` is a hand-maintained
+list next to a hand-maintained help text, so it is now checked against what the parser accepts in
+both directions. `migrate plan`'s gate refusal classified as `internal` — "could not classify, honest"
+is the wrong answer for the most predictable refusal in the command, and it is now `refused`, pinned
+by a table of the exact sentences this module writes.
+
+**Not ticked.** REQ-131's close gate needs the browser pass. The QA slot is held **live** by **w8**
+(holder pid 2878882, `/proc/2878882/cwd` = `/mnt/apopic/omnion-w8`, 24 processes, 823 chrome on the
+box) and `/mnt/apopic` fell to **99% with 1.1 G free** during this tick's build — a pass needs a
+`.next` rebuild, so starting one now dies on the box rather than on the product. **Next:** `df`
+first, then the pass when a slot frees; then slice 2 (migrate ledger operations, fixture sets, the
+`doctor` check engine with its four induced-failure scenarios).

@@ -56,8 +56,7 @@ struct RedeemResponse {
 }
 
 /// The refusal a non-loopback `--api-url` gets, as a `String` so it can be unit-tested.
-const NON_LOOPBACK: &str =
-    "the helper only talks to the loopback interface; --api-url must be a host:port on 127.0.0.1 \
+const NON_LOOPBACK: &str = "the helper only talks to the loopback interface; --api-url must be a host:port on 127.0.0.1 \
      or ::1, so a mistyped address cannot ship a credential to a remote host";
 
 /// Whether a `host:port` is on the loopback interface.
@@ -126,7 +125,11 @@ const fn libc_o_nofollow() -> i32 {
     // Linux `O_NOFOLLOW` is 0o400000; macOS `O_NOFOLLOW` is 0x100. The helper is built for
     // the server, so the Linux value is the one that matters and the other is named here so
     // the difference is a visible decision rather than a silent wrong constant.
-    if cfg!(target_os = "macos") { 0x100 } else { 0o400_000 }
+    if cfg!(target_os = "macos") {
+        0x100
+    } else {
+        0o400_000
+    }
 }
 
 /// A temporary file that removes itself.
@@ -193,23 +196,37 @@ impl CheckReport {
 
 /// Run `omnion secret …`.
 ///
+/// `json` and `quiet` are the global flags (REQ-131 acceptance 15). The `--check` report is the
+/// only output this command has, and it is safe by construction: it names the secret and its
+/// hint, never its value, so it can be a document without becoming a leak.
+///
 /// # Errors
 ///
 /// A message for the operator, printed by the caller. Every failure here is a configuration or
 /// permission problem, and none of them prints a value.
-pub async fn run(options: SecretOptions, api_url: String) -> Result<ExitCode, String> {
-    let action = options
-        .action
-        .clone()
-        .ok_or_else(|| usage("`omnion secret` needs an action; try `omnion secret redeem --help`"))?;
+pub async fn run(
+    options: SecretOptions,
+    api_url: String,
+    json: bool,
+    quiet: bool,
+) -> Result<ExitCode, String> {
+    let sink = crate::output::Sink::new(json, quiet);
+    let action = options.action.clone().ok_or_else(|| {
+        usage("`omnion secret` needs an action; try `omnion secret redeem --help`")
+    })?;
     match action.as_str() {
-        "redeem" => redeem(options, api_url).await,
+        "redeem" => redeem(options, api_url, json, sink).await,
         other => Err(usage(&format!("unknown secret action {other:?}"))),
     }
 }
 
 /// `omnion secret redeem`.
-async fn redeem(options: SecretOptions, default_api_url: String) -> Result<ExitCode, String> {
+async fn redeem(
+    options: SecretOptions,
+    default_api_url: String,
+    json: bool,
+    sink: crate::output::Sink,
+) -> Result<ExitCode, String> {
     let lease = options
         .lease
         .ok_or_else(|| usage("`omnion secret redeem` needs `--lease <id>`"))?;
@@ -235,17 +252,18 @@ async fn redeem(options: SecretOptions, default_api_url: String) -> Result<ExitC
     let token = match options.token_file.as_deref() {
         Some(path) => std::fs::read_to_string(path)
             .map_err(|error| format!("the lease token could not be read from {path}: {error}"))?,
-        None => std::env::var(TOKEN_ENV)
-            .map_err(|_| {
-                format!(
-                    "no lease token: set {TOKEN_ENV} or pass --token-file <path> (the token is \
+        None => std::env::var(TOKEN_ENV).map_err(|_| {
+            format!(
+                "no lease token: set {TOKEN_ENV} or pass --token-file <path> (the token is \
                      returned once by `POST /secrets/{{id}}/lease`)"
-                )
-            })?,
+            )
+        })?,
     };
     let token = token.trim();
     if token.is_empty() {
-        return Err(format!("the lease token is empty ({TOKEN_ENV} or --token-file)"));
+        return Err(format!(
+            "the lease token is empty ({TOKEN_ENV} or --token-file)"
+        ));
     }
 
     let response = post_redemption(&url, &key, token).await?;
@@ -258,7 +276,22 @@ async fn redeem(options: SecretOptions, default_api_url: String) -> Result<ExitC
             version: response.version,
             hint: response.hint.clone(),
         };
-        println!("omnion: {}", report.sentence());
+        // The document carries the same three fields the sentence does and no more: a machine
+        // asking whether a lease is redeemable needs the name and the hint, and the value has
+        // already been dropped before this line is reached.
+        if json {
+            crate::envelope::print(&crate::envelope::success(
+                "secret",
+                serde_json::json!({
+                    "action": "check",
+                    "name": report.name,
+                    "version": report.version,
+                    "hint": report.hint,
+                }),
+                &[],
+            ));
+        }
+        sink.print(format_args!("omnion: {}", report.sentence()));
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -287,7 +320,9 @@ async fn redeem(options: SecretOptions, default_api_url: String) -> Result<ExitC
         return Ok(ExitCode::SUCCESS);
     }
 
-    let child = std::env::args().skip(1).find(|argument| !argument.starts_with('-'));
+    let child = std::env::args()
+        .skip(1)
+        .find(|argument| !argument.starts_with('-'));
     let Some(child) = child else {
         // The refusal the whole file is built around: a bare redemption must not print.
         return Err(usage(
@@ -409,9 +444,7 @@ fn parse_http_response(raw: &[u8]) -> std::io::Result<HttpResponse> {
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| {
-            std::io::Error::other("the answer carried no HTTP status line")
-        })?;
+        .ok_or_else(|| std::io::Error::other("the answer carried no HTTP status line"))?;
     Ok(HttpResponse {
         status,
         // A chunked body is not decoded: the API answers these two routes with a content
@@ -442,8 +475,8 @@ mod tests {
 
     #[test]
     fn a_non_loopback_url_is_refused_before_a_request_is_built() {
-        let error = redeem_url("10.0.0.5:8080", "lease-id")
-            .expect_err("a remote address is refused");
+        let error =
+            redeem_url("10.0.0.5:8080", "lease-id").expect_err("a remote address is refused");
         assert!(error.contains("loopback"));
     }
 
@@ -451,7 +484,8 @@ mod tests {
     fn the_url_carries_the_lease_and_nothing_else() {
         let url = redeem_url("127.0.0.1:18085", "lease-1").expect("loopback is fine");
         assert_eq!(
-            url, "http://127.0.0.1:18085/api/v1/secret-leases/lease-1/redeem"
+            url,
+            "http://127.0.0.1:18085/api/v1/secret-leases/lease-1/redeem"
         );
         assert!(!url.contains('?'), "no query string carries anything");
     }
@@ -468,7 +502,10 @@ mod tests {
         assert!(!is_env_name(""));
         assert!(!is_env_name("2BAD"), "a leading digit is not a name");
         assert!(!is_env_name("HAS SPACE"), "a space is not a name");
-        assert!(!is_env_name("semi;colon"), "a shell metacharacter is not a name");
+        assert!(
+            !is_env_name("semi;colon"),
+            "a shell metacharacter is not a name"
+        );
     }
 
     #[test]
@@ -482,21 +519,39 @@ mod tests {
         assert!(sentence.contains("smtp.production"));
         assert!(sentence.contains("version 3"));
         assert!(sentence.contains("omnh_1a2b3c4d5e6f"));
-        assert!(!sentence.contains("sk-live"), "no value can appear in this sentence");
+        assert!(
+            !sentence.contains("sk-live"),
+            "no value can appear in this sentence"
+        );
     }
 
     #[test]
     fn a_temp_file_is_private_and_removed_with_its_guard() {
-        let directory = std::env::temp_dir().join(format!("omnion-helper-test-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("omnion-helper-test-{}", std::process::id()));
         let value = "qa-helper-value-do-not-leak-4f81a2";
         let path = write_temp_file(value, &directory).expect("the file must be written");
         {
             let _guard = TempFile(path.clone());
             // Mode is the assertion that matters: 0600 is why the file is safe to exist at all.
-            let mode = std::fs::metadata(&path).expect("the file exists").permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "the temporary file must not be readable by anyone else");
-            let directory_mode = std::fs::metadata(&directory).expect("the directory exists").permissions().mode() & 0o777;
-            assert_eq!(directory_mode, 0o700, "the directory must not be listable by anyone else");
+            let mode = std::fs::metadata(&path)
+                .expect("the file exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "the temporary file must not be readable by anyone else"
+            );
+            let directory_mode = std::fs::metadata(&directory)
+                .expect("the directory exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                directory_mode, 0o700,
+                "the directory must not be listable by anyone else"
+            );
             assert_eq!(std::fs::read_to_string(&path).expect("readable"), value);
         }
         assert!(!path.exists(), "the guard removes the file when it drops");
@@ -505,11 +560,15 @@ mod tests {
 
     #[test]
     fn a_second_write_to_the_same_path_is_refused_rather_than_overwriting() {
-        let directory = std::env::temp_dir().join(format!("omnion-helper-exclusive-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("omnion-helper-exclusive-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         let first = write_temp_file("one", &directory).expect("the first write succeeds");
         let refused = write_temp_file("two", &directory);
-        assert!(refused.is_err(), "a pre-planted name is refused, not followed");
+        assert!(
+            refused.is_err(),
+            "a pre-planted name is refused, not followed"
+        );
         let _ = std::fs::remove_file(first);
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -521,10 +580,7 @@ mod tests {
         // SAFETY: single-threaded test, and the variable is restored by the next line.
         unsafe { std::env::set_var(name, "stale") };
         let environment = child_environment(name, "fresh");
-        let matches: Vec<_> = environment
-            .iter()
-            .filter(|(key, _)| key == name)
-            .collect();
+        let matches: Vec<_> = environment.iter().filter(|(key, _)| key == name).collect();
         assert_eq!(matches.len(), 1, "the name appears exactly once");
         assert_eq!(matches[0].1, std::ffi::OsString::from("fresh"));
         unsafe { std::env::remove_var(name) };
