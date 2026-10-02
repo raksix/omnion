@@ -1,6 +1,6 @@
 # REQ-022 — Developer Portal
 
-> **Status:** in-progress — **slice 1 (keys + logs backend) shipped.** `0240_developer_portal.sql`, `omnion-developer`, `apps/api/src/routes/developer.rs`, the `developer.*` catalogue and `apps/api/tests/developer.rs` (8 walks). A key created through the API authenticates a guarded route and stops the moment it is revoked; a key's scopes may only narrow what its issuer holds; rotation invalidates the previous secret immediately and keeps the old row. Two defects the walks found, both mine and both of the same class — see the BUILD-LOG entry. · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core
+> **Status:** in-progress — **slices 1 and 2 shipped.** Slice 1 (`0240_developer_portal.sql`, `omnion-developer`, the routes, the `developer.*` catalogue, 8 walks) is in the BUILD-LOG for tick 108. **Slice 2 is the request-log middleware plus the four portal screens**, and it closed a defect that had been invisible for a whole slice: `logs_store::record` existed, was walked, and **nothing on the request path ever called it**, so the request log was empty in a platform whose whole purpose here is a debugging surface. Two walks and a static gate this tick; the browser pass is still open and that is why this REQ is not `done`. · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + core
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -110,6 +110,12 @@ Migration: `database/migrations/0012_developer_portal.sql` (next free number at 
 ### Acceptance criteria
 
 - [ ] `/developer` appears in the sidebar with all eight entries and each loads a real screen.
+      — **The nav half of this is closed and walked-free on purpose**: the sidebar asks
+        `GET /developer/scopes` once (`lib/developer-access.tsx`) and hides the group from an
+        account that may not be there, treating a failure as "no". The three entries that exist
+        are the three screens slice 2 ships; the other five are slices 3 and 4, and a nav link to
+        a screen that does not exist is exactly the dead control the definition of done forbids.
+        **Still open:** the browser pass has not visited the group, and the criterion says *eight*.
 - [x] Creating a key shows the secret once; the list shows only a prefix afterwards.
       — The guarantee is a property of the response **types**, not of anybody's memory: `IssuedKey`
         is the only shape in `omnion-developer` with a `token` field, and every other read answers
@@ -117,6 +123,12 @@ Migration: `database/migrations/0012_developer_portal.sql` (next free number at 
         real JSON of the list, the detail and the log screen and greps it for the token, **the stored
         SHA-256 hash**, and any field named `secret` — a check that greps only for the token passes on
         a response that echoes the hash, which is just as fatal.
+      — **The panel half, tick 109:** `scripts/qa/probe-developer-wiring.cjs` reads
+        `lib/developer.ts` and asserts that exactly one exported shape carries a `token: string`
+        and that `DeveloperKey`'s field list has none. The reveal dialog also refuses to close
+        before "I have stored this" is ticked, so a stray `Esc` cannot destroy a secret nobody
+        has written down, and a refused clipboard degrades to showing the value rather than to
+        losing it.
 - [x] A key authenticates on a guarded endpoint and is rejected after revocation.
       — `a_key_authenticates_a_guarded_call_and_dies_the_moment_it_is_revoked`, over the real router
         against a real database. The key answers `200` on `/developer/sandbox/probe` (guarded by
@@ -160,6 +172,14 @@ Migration: `database/migrations/0012_developer_portal.sql` (next free number at 
 - [ ] The explorer renders operations by tag and `Copy as cURL` produces a runnable command.
 - [ ] Sandbox `Send` performs a real request showing status, duration and the environment banner.
 - [ ] Logs filter by key, method, status class and window; detail shows the matched permission.
+      — **The backend and the screen halves are closed; the browser pass is not.** The four
+        filters are wired to the four query parameters the store already honoured, `Reset` clears
+        them together, and the drawer prints the scope the guard resolved — the column that
+        `check_kind_reporting` was split out to provide. What tick 109's new walk
+        `a_request_writes_its_own_log_row_and_nothing_else_does` proves is the half that was
+        missing underneath all of it: a session row, a key row and a **403 row** are written
+        because the platform served the request, and each carries its permission. Before this
+        tick the table was empty.
 - [x] No secret, key value or raw client address appears in any log, event or audit row.
       — Three separate leaks, closed at three different places, and none of them was closed by
         remembering to be careful in a handler:
@@ -181,7 +201,9 @@ Migration: `database/migrations/0012_developer_portal.sql` (next free number at 
         `401`. The walk signs in *without* the developer keys on purpose — the family is deliberately not
         in the base role, so that account is the realistic default user, and a suite that signs in as an
         account holding everything is how this REQ's predecessors shipped a guard that was only ever
-        satisfied. The **nav half** is slice 2's and rides the browser pass.
+        satisfied. The **nav half is now built** (tick 109): `lib/developer-access.tsx` asks
+        `GET /developer/scopes` once and the sidebar hides the group from an account that may not be
+        there, treating any failure as "no". What it still needs is a browser that has *seen* it.
 - [ ] Plugins and Themes screens show real installed items and link into their own screens.
 - [ ] Keyboard and mobile behaviour match the spec, including the one-time secret panel.
 - [ ] `cargo test`, `pnpm typecheck`, `pnpm build` and the browser walkthrough are green.

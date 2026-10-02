@@ -38,6 +38,7 @@ pub mod keys_store;
 pub mod logs;
 pub mod logs_store;
 pub mod model;
+pub mod overview;
 
 pub use error::{DeveloperError, Result};
 pub use keys::{
@@ -48,6 +49,7 @@ pub use keys::{
 };
 pub use logs::MAX_PAGE as MAX_LOG_PAGE;
 pub use model::{IssuedKey, KeyView, UsagePoint};
+pub use overview::{FailureLine, Overview, RECENT_FAILURES, start_of_day};
 pub use keys_store::{
     KeyPage, KeyQuery, authenticate, create, find, list, revoke, rotate, touch_last_used, usage,
 };
