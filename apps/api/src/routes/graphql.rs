@@ -89,7 +89,12 @@ pub struct GraphqlError {
 /// flattening a selection. And every one of these runs before a resolver is called, which is what
 /// makes *"a refused mutation … changes nothing in the store"* structural rather than a matter of
 /// ordering discipline inside the resolvers.
-async fn run_pre_execution(caller: &Caller, request: &GraphqlRequest) -> Result<Prepared, Error> {
+async fn run_pre_execution(
+    caller: &Caller,
+    request: &GraphqlRequest,
+    settings: &omnion_graphql::Settings,
+    registered: bool,
+) -> Result<Prepared, Error> {
     // 1. The document size. Checked on the RAW bytes before parsing, because a parser is the last
     //    thing that should see a 10 MB string.
     if request.query.len() > MAX_DOCUMENT_BYTES {
@@ -106,9 +111,34 @@ async fn run_pre_execution(caller: &Caller, request: &GraphqlRequest) -> Result<
 
     let document = parse(&request.query)?;
 
-    // 2. The caller's limits and cost budget.
-    let settings = omnion_graphql::Settings::default();
-    let limits = omnion_graphql::Limits::from_settings(&settings);
+    // 2. The installation's limits and cost budget — READ, not defaulted.
+    //
+    // This line was `Settings::default()` and that made the whole settings screen decorative: an
+    // operator who turned `persisted_only` on, or lowered `max_depth` to 4, watched the endpoint
+    // keep enforcing the shipped defaults, and the walk proved it — the settings test set
+    // `persisted_only: true`, got `200` and a normal `data` envelope, and the flag had changed
+    // nothing about execution. A settings screen whose values are not read is the "documented but
+    // unreachable" shape this request has produced four times already, and here it was a single
+    // line wearing the costume of a default.
+    let limits = omnion_graphql::Limits::from_settings(settings);
+
+    // 2b. Persisted-only mode, BEFORE a single byte of the document is priced or resolved.
+    //
+    // Checked here rather than after the measurement because a refused ad-hoc document should not
+    // cost the platform a parse, a price walk and a schema composition: the whole point of the
+    // flag is that a leaked read scope cannot run arbitrary queries, and the cheapest query is the
+    // one never looked at.
+    if settings.persisted_only && !registered {
+        // The GET leg executes a REGISTERED document and arrives here with no document reference
+        // attached, so only an ad-hoc POST is refused here. A registered document goes through
+        // `execute_persisted`, which resolves the registry first.
+        return Err(Error::Simple {
+            code: Code::PersistedQueryNotFound,
+            message: "persisted-only mode is on: send a registered document by id or hash instead \
+                      of query text"
+                .into(),
+        });
+    }
     let measurement = match request.operation_name.as_deref() {
         Some(name) => {
             let operation = document.select(Some(name))?;
@@ -137,11 +167,26 @@ struct Prepared {
 
 /// Execute one request and assemble its envelope. **Never returns an error** — everything that
 /// reaches this point is a GraphQL outcome.
-async fn execute_request(state: &AppState, caller: &Caller, request: &GraphqlRequest) -> GraphqlEnvelope {
+async fn execute_request(
+    state: &AppState,
+    caller: &Caller,
+    request: &GraphqlRequest,
+    document_id: Option<Uuid>,
+) -> GraphqlEnvelope {
+    // `document_id` is `Some` exactly when the caller presented a REGISTERED document (the GET
+    // leg resolves the registry before it gets here). Persisted-only mode refuses ad-hoc text, so
+    // the refusal below is applied only when there is no registered document behind the request —
+    // otherwise the GET leg would refuse the very documents the flag exists to allow.
     let request_id = Uuid::new_v4().to_string();
     let started = std::time::Instant::now();
 
-    let outcome = run_pre_execution(caller, request).await;
+    // Read ONCE per request and hand the same value to the refusal path and the measurement, so
+    // a settings save landing between the two cannot produce an envelope priced with one policy
+    // and refused under another.
+    let settings = crate::routes::graphql_settings::load(state.db().pool())
+        .await
+        .unwrap_or_default();
+    let outcome = run_pre_execution(caller, request, &settings, document_id.is_some()).await;
     let (data, errors, measurement) = match outcome {
         Err(error) => {
             // A refusal has no measurement of its own — the document never got that far — so the
@@ -170,7 +215,7 @@ async fn execute_request(state: &AppState, caller: &Caller, request: &GraphqlReq
     let elapsed = started.elapsed().as_millis() as u64;
     let envelope_extensions = extensions(&measurement, elapsed, &request_id);
 
-    record_query(state, caller, request, &measurement, &errors, &request_id).await;
+    record_query(state, caller, request, document_id, &measurement, &errors, &request_id).await;
 
     GraphqlEnvelope {
         data,
@@ -225,6 +270,7 @@ async fn record_query(
     state: &AppState,
     caller: &Caller,
     request: &GraphqlRequest,
+    document_id: Option<Uuid>,
     measurement: &omnion_graphql::Measurement,
     errors: &Option<Vec<GraphqlError>>,
     request_id: &str,
@@ -252,13 +298,14 @@ async fn record_query(
     // has one hole rather than the request being retried by a client that thinks it failed.
     let outcome = sqlx::query(
         "insert into graphql_query_logs \
-         (organization_id, api_key_id, actor_user_id, operation_name, hash, depth, cost, aliases, \
-          duration_ms, status, error_code, ad_hoc, variable_names) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, $12)",
+         (organization_id, api_key_id, actor_user_id, document_id, operation_name, hash, depth, \
+          cost, aliases, duration_ms, status, error_code, ad_hoc, variable_names) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(caller.organization_id)
     .bind(caller.api_key_id)
     .bind(caller.user_id)
+    .bind(document_id)
     .bind(request.operation_name.clone())
     .bind(document_hash(&request.query))
     .bind(i32::try_from(measurement.depth).unwrap_or(i32::MAX))
@@ -301,25 +348,32 @@ pub async fn execute_graphql(
     Json(request): Json<GraphqlRequest>,
 ) -> Result<Json<GraphqlEnvelope>, ApiError> {
     let resolved = resolve_caller(&state, &caller).await?;
-    Ok(Json(execute_request(&state, &resolved, &request).await))
+    Ok(Json(execute_request(&state, &resolved, &request, None).await))
 }
 
-/// `GET /api/v1/graphql?documentId=…` — execute a **registered** document by id.
+/// `GET /api/v1/graphql?documentId=…` — execute a **registered** document by id or hash.
 ///
-/// Slice 2 owns persisted documents, so this leg answers `PERSISTED_QUERY_NOT_FOUND` for every id —
-/// which is the request's own code for "this installation is persisted-only and that document is
-/// not on its allowlist". It is registered now, before the store exists, so that a client built
-/// against the documented GET surface gets a refusal it can branch on rather than a `404` from a
-/// route that does not exist.
+/// The caller is resolved FIRST, so an anonymous GET is a `401` on the transport rather than a
+/// `PERSISTED_QUERY_NOT_FOUND` that reads as "your document is not registered" — which would be a
+/// wrong answer about an unrelated question.
+///
+/// ## What this leg reads
+///
+/// The registry, on **every** call, with no cache between the read and the revocation. That is the
+/// whole of the acceptance line *"A document revoked in the UI stops executing within one cache
+/// cycle"*: the bound is one call, and it holds because there is nothing to expire. The cost is
+/// one indexed read of a table with one row per registered document.
+///
+/// The document's TEXT is read too, and only here — a lookup that answered the query would make
+/// the id meaningless, since the point of a registered document is that the client sends an id
+/// instead of text.
 pub async fn execute_persisted(
     State(state): State<AppState>,
     caller: ApiCaller,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<GraphqlEnvelope>, ApiError> {
-    // The caller is resolved FIRST, so an anonymous GET is a `401` on the transport rather than a
-    // `PERSISTED_QUERY_NOT_FOUND` that reads as "your document is not registered" — which would be
-    // a wrong answer about an unrelated question.
-    let _resolved = resolve_caller(&state, &caller).await?;
+    let resolved = resolve_caller(&state, &caller).await?;
+
     let requested = params
         .get("documentId")
         .or_else(|| params.get("document_id"))
@@ -327,13 +381,106 @@ pub async fn execute_persisted(
         .map(String::as_str)
         .unwrap_or_default();
 
-    let envelope = GraphqlEnvelope {
+    let settings = crate::routes::graphql_settings::load(state.db().pool()).await?;
+
+    // An installation that runs persisted-only refuses a request that names no document at all,
+    // before the registry is consulted — "your document is not registered" is a true statement
+    // about a document the caller did send, and a wrong one about a request that sent none.
+    if settings.persisted_only && requested.is_empty() {
+        return Ok(Json(refusal_envelope(
+            "persisted-only mode is on and this request named no document; send documentId or \
+             hash",
+        )));
+    }
+
+    let Some(organization_id) = resolved.organization_id else {
+        // A global caller has no registry: documents are registered per organization because the
+        // allowlist is a tenant decision, and there is no tenant here to have registered one.
+        return Ok(Json(refusal_envelope(
+            "persisted documents belong to an organization; this caller has none",
+        )));
+    };
+
+    let found =
+        crate::routes::graphql_documents::lookup(state.db().pool(), organization_id, requested)
+            .await?;
+
+    let (document_id, text) = match &found {
+        omnion_graphql::persisted::Lookup::Active(entry) => {
+            let id = Uuid::parse_str(&entry.id).map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    format!("the stored document id `{}` is not a uuid", entry.id),
+                )
+            })?;
+            let text = crate::routes::graphql_documents::text(
+                state.db().pool(),
+                organization_id,
+                id,
+            )
+            .await?
+            .ok_or_else(|| {
+                // The row exists and its text does not. That is a corrupted row, not a missing
+                // document, and answering PERSISTED_QUERY_NOT_FOUND here would tell the client its
+                // document is not registered — which is false and sends the caller to register a
+                // duplicate of a document that exists.
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    format!("document {id} is registered but carries no text"),
+                )
+            })?;
+            (Some(id), text)
+        }
+        other => return Ok(Json(refusal_envelope(&other.message()))),
+    };
+
+    // The variables arrive as query parameters, which is what a persisted-document client sends.
+    // They are parsed rather than ignored: a `variables` parameter that is not JSON is a client
+    // bug, and executing the query with no variables would answer a different question than the
+    // one asked.
+    let variables: serde_json::Value = match params.get("variables") {
+        Some(raw) => serde_json::from_str(raw).map_err(|error| {
+            ApiError::bad_request(
+                "graphql_variables_invalid",
+                format!("`variables` must be a JSON object: {error}"),
+            )
+        })?,
+        None => serde_json::Value::Null,
+    };
+
+    let request = GraphqlRequest {
+        query: text,
+        operation_name: params.get("operationName").cloned(),
+        variables,
+    };
+
+    let envelope = execute_request(&state, &resolved, &request, document_id).await;
+
+    // The hit counter is written AFTER the query has been answered, and a failure to write it is
+    // logged rather than surfaced: the manager's "who hit this document" number must never turn a
+    // successful query into an error.
+    if let Some(id) = document_id {
+        if let Err(error) =
+            crate::routes::graphql_documents::record_use(state.db().pool(), id).await
+        {
+            tracing::debug!(%id, error = %error, "the document hit could not be recorded");
+        }
+    }
+    Ok(Json(envelope))
+}
+
+/// A `200` envelope carrying one refusal.
+///
+/// The request's split again: this reached the endpoint, so it is a GraphQL outcome and not an
+/// HTTP status. `persistedOnly` rides in `extensions` so a client can tell "your document is not
+/// registered" from "your query was too deep" without matching on the message.
+fn refusal_envelope(message: &str) -> GraphqlEnvelope {
+    GraphqlEnvelope {
         data: None,
         errors: Some(vec![GraphqlError {
-            message: format!(
-                "no registered document matches `{requested}`; persisted documents arrive with \
-                 slice 2 of this request"
-            ),
+            message: message.to_owned(),
             extensions: json!({ "code": Code::PersistedQueryNotFound.as_str() }),
         }]),
         extensions: json!({
@@ -341,10 +488,9 @@ pub async fn execute_persisted(
             "cost": 0,
             "durationMs": 0,
             "requestId": Uuid::new_v4().to_string(),
-            "persistedOnly": true,
+            "persisted": true,
         }),
-    };
-    Ok(Json(envelope))
+    }
 }
 
 /// Resolve the caller's permissions once, into the shape the resolvers take.

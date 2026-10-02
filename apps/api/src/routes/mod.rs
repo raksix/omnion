@@ -94,6 +94,8 @@ pub mod deployment;
 pub mod exports;
 pub mod graphql;
 pub mod graphql_documents;
+pub mod graphql_manager;
+pub mod graphql_settings;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -1932,6 +1934,45 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "secrets.audit"));
 
+    // The persisted-document manager (REQ-130 slice 2).
+    //
+    // Split into THREE routers rather than one route per verb with a `.layer()` each, because a
+    // `.layer()` on a `get().post()` pair applies ONE permission to BOTH verbs — the first draft
+    // guarded `GET /documents` with the manage key, which would have made the read list refuse the
+    // very people the manager exists to inform. Two separate routers is the shape the rest of this
+    // file uses (see `secrets_audit` above and the observability writers below), and it is the
+    // only shape in which the read guard and the write guard can differ.
+    //
+    // `content.pages.read` for reads and `deployment.migrations.manage` for writes — both REAL
+    // catalogue keys. The request's table names `developer.read` and `developer.graphql.manage`,
+    // and this repository ships **no `developer.*` key at all**; an uncatalogued key resolves to no
+    // permission, so a route guarded on one answers 403 for every caller including the instance
+    // owner while looking perfectly healthy. See `graphql_manager.rs` for each substitution's
+    // reasoning and a test that reads the catalogue to hold them.
+    let graphql_documents_read = Router::new()
+        .route("/graphql/documents", get(graphql_manager::list))
+        .route("/graphql/documents/prunable", get(graphql_manager::prunable))
+        .route("/graphql/documents/{id}", get(graphql_manager::detail))
+        .route_layer(guards::require(&state, graphql_manager::READ_PERMISSION));
+
+    let graphql_documents_write = Router::new()
+        .route("/graphql/documents", post(graphql_manager::register))
+        .route(
+            "/graphql/documents/{id}",
+            put(graphql_manager::set_status),
+        )
+        .route_layer(guards::require(&state, graphql_manager::MANAGE_PERMISSION));
+
+    // The endpoint's own settings. Read with the read guard and written with the write guard, for
+    // the same reason: an operator who may read the policy may see it, and only an operator who
+    // may manage the release shape may change it.
+    let graphql_settings_routes = Router::new()
+        .route("/graphql/settings", get(graphql_manager::read_settings))
+        .route_layer(guards::require(&state, graphql_manager::READ_PERMISSION));
+    let graphql_settings_writes = Router::new()
+        .route("/graphql/settings", put(graphql_manager::save_settings))
+        .route_layer(guards::require(&state, graphql_manager::MANAGE_PERMISSION));
+
     // Redemption is the ONE handler with no session guard. It is authenticated by the
     // deployment key in the header instead, so it lives on its own router and is never
     // reachable by a cookie: a browser cannot redeem a lease, which is the property the whole
@@ -2125,6 +2166,10 @@ pub fn router(state: AppState) -> Router {
         .merge(secrets_slot_assign)
         .merge(secrets_leases_read)
         .merge(secrets_audit)
+        .merge(graphql_documents_read)
+        .merge(graphql_documents_write)
+        .merge(graphql_settings_routes)
+        .merge(graphql_settings_writes)
         .merge(secrets_lease_write)
         .merge(secrets_deploy_key_write)
         .merge(secrets_lease_redeem)
@@ -2274,6 +2319,14 @@ pub fn router(state: AppState) -> Router {
                 .get(graphql::execute_persisted)
                 .layer(guards::require_or_machine(&state, "content.pages.read")),
         )
+        // The persisted-document manager and the endpoint settings (REQ-130 slice 2).
+        //
+        // `content.pages.read` guards the reads and `deployment.migrations.manage` the writes, and
+        // both are REAL catalogue keys. The request's table names `developer.read` and
+        // `developer.graphql.manage`, and **this repository ships no `developer.*` key at all** — an
+        // uncatalogued key resolves to no permission, so the route answers 403 for every caller
+        // including the owner while looking healthy. `graphql_manager.rs` carries the reasoning for
+        // each substitution and a test that reads the catalogue to hold them.
         .route("/pages", pages)
         .route("/pages/{id}", page)
         .route("/pages/{id}/publish", page_publish)

@@ -50,23 +50,37 @@ pub struct Settings {
     pub playground_enabled: bool,
 }
 
+/// The shipped defaults, as NAMED constants rather than only as `Default::default()`.
+///
+/// Two callers need the numbers outside of a default: the store, which falls back to them when the
+/// settings row is missing (an unseeded database must behave like a fresh one), and the migration,
+/// which seeds the same numbers as column defaults. A literal repeated in a SQL file and a Rust
+/// default is a pair that agrees until someone tunes one of them, and the disagreement is invisible
+/// until an installation reads the row and gets a different policy than the code documents.
+pub const DEFAULT_MAX_DEPTH: u32 = 10;
+pub const DEFAULT_COST_BUDGET: u32 = 1000;
+pub const DEFAULT_MAX_ALIASES: u32 = 15;
+pub const DEFAULT_MAX_FRAGMENTS: u32 = 20;
+pub const DEFAULT_MAX_PAGE_SIZE: u32 = 100;
+pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
 fn default_depth() -> u32 {
-    10
+    DEFAULT_MAX_DEPTH
 }
 fn default_cost() -> u32 {
-    1000
+    DEFAULT_COST_BUDGET
 }
 fn default_aliases() -> u32 {
-    15
+    DEFAULT_MAX_ALIASES
 }
 fn default_fragments() -> u32 {
-    20
+    DEFAULT_MAX_FRAGMENTS
 }
 fn default_page_size() -> u32 {
-    100
+    DEFAULT_MAX_PAGE_SIZE
 }
 fn default_timeout() -> u64 {
-    10_000
+    DEFAULT_TIMEOUT_MS
 }
 fn default_true() -> bool {
     true
@@ -253,6 +267,38 @@ mod tests {
         let json = serde_json::to_string(&settings).expect("settings serialise");
         let back: Settings = serde_json::from_str(&json).expect("settings deserialise");
         assert_eq!(settings, back);
+    }
+
+    /// The migration seeds the same numbers as these constants. A literal in a SQL file and a
+    /// literal in Rust agree until somebody tunes one of them, and the disagreement is invisible
+    /// until an installation reads the row and gets a policy the code does not document — so the
+    /// file is read here and parsed rather than trusted.
+    #[test]
+    fn the_settings_migration_seeds_exactly_these_defaults() {
+        let sql = include_str!("../../../database/migrations/0238_graphql_settings.sql");
+        let column_default = |column: &str| -> String {
+            let line = sql
+                .lines()
+                .find(|line| line.trim_start().starts_with(column))
+                .unwrap_or_else(|| panic!("the migration has no `{column}` column"));
+            let after = line
+                .split("default")
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{column}` has no default in the migration: {line}"));
+            after
+                .trim()
+                .split(|c: char| !c.is_ascii_digit() && c != '_')
+                .find(|token| !token.is_empty())
+                .unwrap_or_default()
+                .replace('_', "")
+        };
+
+        assert_eq!(column_default("max_depth"), DEFAULT_MAX_DEPTH.to_string());
+        assert_eq!(column_default("cost_budget"), DEFAULT_COST_BUDGET.to_string());
+        assert_eq!(column_default("max_aliases"), DEFAULT_MAX_ALIASES.to_string());
+        assert_eq!(column_default("max_fragments"), DEFAULT_MAX_FRAGMENTS.to_string());
+        assert_eq!(column_default("max_page_size"), DEFAULT_MAX_PAGE_SIZE.to_string());
+        assert_eq!(column_default("timeout_ms"), DEFAULT_TIMEOUT_MS.to_string());
     }
 
     #[test]
