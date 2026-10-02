@@ -7508,3 +7508,90 @@ my own tree (1.0 G, `lsof` showed no holder) which took it to 1.8 G, and stopped
 unrelated functions — eight files, ~200 lines of churn that had nothing to do with this tick.
 Reverted with `git checkout --` and the export line re-applied by hand. Format the file you
 touched, not the crate.
+
+---
+
+## Tick 105 — REQ-013 slice 4: an archive that says it is encrypted has to BE encrypted
+
+The `encryption` column was introduced by migration `0157` back in tick 32 and **nothing ever
+read it**. An operator could select `passphrase` mode, the settings screen would save it, the
+audit would record `encryption: "passphrase"`, and every artifact would still be written as
+plain JSON on the destination. The check constraint was the whole feature.
+
+Two commits: `4586277e` (the cipher and its tests) and `abb1e101` (the producer, the verifier
+and the walk).
+
+**The cipher.** `crates/backup/src/crypto.rs` — an artifact is
+`OMN1 ‖ salt(16) ‖ nonce(12) ‖ AES-256-GCM`, keyed by
+`HKDF-SHA256(salt, passphrase, info="omnion-backup/artifact/v1")`. Three choices are the reason
+this is not a base64 blob:
+
+1. **The magic is authenticated as AAD.** A ciphertext cannot be relabelled as plaintext, and a
+   plaintext cannot be relabelled as ciphertext. It is also what lets `open` answer from the
+   bytes alone, so *a dirty key* and *an unencrypted archive* produce different sentences instead
+   of the same checksum mismatch.
+2. **The salt is per artifact and random.** Two archives of the same database share a
+   passphrase and must not share a key, or an observer learns when two runs produced identical
+   plaintext — and can replay a whole archive by copying its header.
+3. **The `info` label namespaces the derivation.** Nothing else in the platform derives a backup
+   key, so an S3 credential that happens to be the same string cannot decrypt an archive.
+
+**The seam.** `resolve_passphrase(reference, reader)` is the only place that touches the secret
+store, and it takes a *reference* plus a closure. The module therefore has no store dependency
+and no way to invent a passphrase — the same shape `media_scan`'s `secret_env` already uses, and
+the reason the migration's own comment ("no column an access key or a passphrase could occupy")
+is still true.
+
+**The defect the walk found, which is the one worth remembering.** The manifest describes the
+**document**; the bytes that land on the destination are `document + framing + GCM tag`. My
+first wiring took the part's `checksum` *and* its `size_bytes` from the sealed bytes while
+`observe` hashed the opened plaintext. Every encrypted archive then reported **"checksum differs
+for 1 part"** on its very first verification — right passphrase, right bytes, and only the number
+describing something else. One rule, two fields, and I applied it to one and not the other. No
+test could have found it before the walk: the unit tests cover the cipher, and this is the
+*producer* disagreeing with the *verifier*.
+
+**A configured-but-unresolvable passphrase now fails the run.** `PUT /backup-settings` refuses
+the mode by name — naming the variable to set — and stores nothing. Without that check the
+settings screen could say "encrypted" over a row that a background worker then reads and
+ignores. The panel's own "archives are stored unencrypted" line is the reporting half; this is
+the enforcement half, and it lives in the API because the mode can also be chosen by anyone
+editing the row.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-backup --lib --quiet` | **174 passed** (was 159), 0 failed |
+| proven to fail | regressing `seal` to the pre-slice-4 identity | **FAILED** — `the artifact on the destination is not sealed: 6542 bytes starting [123, 10, 32, 32, 34, …]` |
+| proven to fail | regressing `salt` to a fixed vector | **FAILED** — `the_nonce_is_fresh_per_artifact_and_is_not_the_salt` |
+| walk | `cargo test -p omnion-api --test backups an_encrypted_archive` | **1 passed** in 19 s, fresh database |
+| build | `cargo build -p omnion-api` | exit 0 |
+| types | `bun x tsc --noEmit` (apps/admin) | exit 0 |
+
+**A test that could not fail, and how it was found.** The first draft of
+`two_seals_of_the_same_plaintext_differ` asserted `assert_ne!(a, b)` and passed — and
+regressing **only** `salt` to a fixed vector left all 172 tests green, because the *nonce* alone
+satisfied it. The salt was untested while the comment directly above it claimed the salt was
+exactly the property that stopped two identical archives from matching. Asserting the *property*
+("same nonce, different salt, different key") rather than the *symptom* ("the bytes differ") is
+what caught it; the regression now fails.
+
+**Two environment facts that cost time, recorded so the next tick does not pay for them:**
+
+* `cargo test -p omnion-api --test backups <name>` **skips** rather than fails when its database
+  is absent, and reports `ok` — `Fixture::new` returns `None` on a connect error. A green
+  `1 passed … 0.00s` with `--nocapture` printing `SKIP: PostgreSQL is not reachable` is
+  evidence for nothing. Always create the database first and read `--nocapture`.
+* A `--only` pass on this box while load was 21 died with `Target crashed` and wrote a
+  `summary.json` containing **only** `{fatal}` — no counters, no findings, no routes. That is
+  the tab-crash class, not a product defect and not a red pass. Re-run when the box is calmer.
+
+**Reclaim that worked:** 490 stale duplicate artifacts under `target/debug/deps` (newest-per-crate
+base name, older copies, none touched in 30 minutes) freed **0.76 GB** with no live cargo in my
+tree. `/mnt/apopic` went 98 % → 91 %.
+
+**Next:** the browser pass on a free slot with `--only=backups` (in flight as this entry is
+written), which closes the `partial`-run criterion and the status-card boxes; then slice 4's
+status-depth half — the destination health card and the security/health cross-links — and the
+unencrypted-mode warning on the settings screen.
