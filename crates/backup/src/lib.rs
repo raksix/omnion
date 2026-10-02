@@ -33,6 +33,7 @@
 
 pub mod apply;
 pub mod cadence;
+pub mod crypto;
 pub mod destination;
 pub mod error;
 pub mod media;
@@ -50,6 +51,12 @@ pub use apply::{
     RestoreRequest, build_plan,
 };
 pub use cadence::Cadence;
+pub use crypto::{
+    CryptoError, MAGIC as ENCRYPTION_MAGIC, Mode as EncryptionMode,
+    NONCE_LEN as ENCRYPTION_NONCE_LEN, OVERHEAD as ENCRYPTION_OVERHEAD,
+    SALT_LEN as ENCRYPTION_SALT_LEN, is_sealed, open as open_archive, resolve_passphrase,
+    seal as seal_archive,
+};
 pub use destination::{
     DestinationReport, PROBE_FILENAME, local_path_for, local_root_for, probe_local, storage_key,
     storage_prefix,
@@ -64,7 +71,8 @@ pub use media::{
 pub use part::{
     MANIFEST_VERSION, MAX_ERROR_LENGTH, MAX_LABEL_LENGTH, Manifest, ObservedPart, PARTS, Part,
     PartStatus, RunStatus, Verification, build_manifest, bytes_checksum, canonical_json,
-    manifest_checksum, normalise_scopes, summarise, truncate_error, validate_label,
+    manifest_checksum, normalise_scopes, summarise, summarise_failure, truncate_error,
+    validate_label,
     verify_manifest,
 };
 pub use purge::{

@@ -337,6 +337,45 @@ pub fn summarise(parts: &[Part]) -> RunStatus {
     RunStatus::Partial
 }
 
+/// The run-level sentence a detail panel and the runs list show for a run that is not green.
+///
+/// [`summarise`] answers *which* state a run is in; this answers *why*, and the two were
+/// separate questions with one implementation's worth of disagreement. The run's `error`
+/// column was written from `find(...)` — the first failed part's message — so a run whose
+/// media copy and whose database export both failed named one of them. That is the wrong
+/// half to keep, and it is the wrong half precisely because a `partial` run *is* the
+/// multi-failure case: `partial` is only reachable when at least one part succeeded and at
+/// least one failed, so the shape the summary drops is the shape the state exists for.
+///
+/// Every message is kept, joined in [`PARTS`] order so two runs with the same failures
+/// produce the same sentence, and clamped with [`truncate_error`] because the column is
+/// `text` and a producer's message is not bounded before it arrives here. `None` when no
+/// part failed — a green run has nothing to explain, and a run whose only failures carry no
+/// message says nothing rather than a bare separator.
+#[must_use]
+pub fn summarise_failure(parts: &[Part]) -> Option<String> {
+    let mut ordered: Vec<&Part> = parts
+        .iter()
+        .filter(|part| part.status == PartStatus::Failed)
+        .collect();
+    ordered.sort_by_key(|part| {
+        PARTS
+            .iter()
+            .position(|candidate| *candidate == part.part)
+            .unwrap_or(usize::MAX)
+    });
+    let messages: Vec<&str> = ordered
+        .iter()
+        .filter_map(|part| part.error.as_deref())
+        .filter(|message| !message.trim().is_empty())
+        .collect();
+    if messages.is_empty() {
+        None
+    } else {
+        Some(truncate_error(&messages.join("; ")))
+    }
+}
+
 /// The manifest a run leaves behind, and the thing `verify` compares against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -656,6 +695,105 @@ mod tests {
     fn no_part_finished_is_running_whatever_the_caller_said() {
         let parts = vec![Part::queued("database"), Part::queued("media")];
         assert_eq!(summarise(&parts), RunStatus::Running);
+    }
+
+    // ---- `summarise_failure`, the "why" behind `summarise`'s "which".
+    //
+    // Each test states the claim its name states, because the defect this function fixes was
+    // invisible to every assertion that already existed: `summarise` reported the state
+    // correctly throughout, and the state is not what was wrong. A test on `summarise` can
+    // never see a sentence that lost a message.
+
+    #[test]
+    fn a_green_run_has_nothing_to_explain() {
+        let parts = vec![
+            Part::done("database", 10, 100, "aa", "d"),
+            Part::done("media", 2, 200, "bb", "m"),
+        ];
+        assert_eq!(summarise_failure(&parts), None);
+    }
+
+    #[test]
+    fn every_failed_part_is_named_not_only_the_first() {
+        // This is the defect. `find` returned the FIRST failed part's message and discarded
+        // the rest, so this run — the exact shape `partial` exists for — reported one of its
+        // two failures. Both words have to be in the sentence.
+        let parts = vec![
+            Part::done("database", 10, 100, "aa", "d"),
+            Part::failed("media", "object store refused"),
+            Part::failed("plugins", "no package installer"),
+        ];
+        assert_eq!(summarise(&parts), RunStatus::Partial);
+        let summary = summarise_failure(&parts).expect("a failed run has a reason");
+        assert!(
+            summary.contains("object store refused"),
+            "the media failure is missing from {summary:?}"
+        );
+        assert!(
+            summary.contains("no package installer"),
+            "the plugins failure is missing from {summary:?}"
+        );
+    }
+
+    #[test]
+    fn the_summary_is_ordered_by_parts_not_by_who_failed_first() {
+        // Given in the reverse of execution order, so an implementation that merely
+        // concatenates whatever it is handed produces a different string. The run's error
+        // has to be the same sentence for the same set of failures whatever order the parts
+        // were walked in, or two identical runs are not comparable.
+        let parts = vec![
+            Part::done("configuration", 5, 5, "cc", "c"),
+            Part::failed("plugins", "no package installer"),
+            Part::failed("media", "object store refused"),
+        ];
+        assert_eq!(
+            summarise_failure(&parts).as_deref(),
+            Some("object store refused; no package installer"),
+            "media is produced before plugins in PARTS order"
+        );
+    }
+
+    #[test]
+    fn a_failed_part_with_no_message_does_not_leave_a_bare_separator() {
+        let parts = vec![
+            Part::done("database", 10, 100, "aa", "d"),
+            Part::failed("media", ""),
+            Part::failed("plugins", "no package installer"),
+        ];
+        assert_eq!(
+            summarise_failure(&parts).as_deref(),
+            Some("no package installer"),
+            "an empty message must not contribute \"; \" to the sentence"
+        );
+    }
+
+    #[test]
+    fn a_run_whose_only_failures_are_silent_says_nothing_rather_than_a_separator() {
+        let parts = vec![
+            Part::done("database", 10, 100, "aa", "d"),
+            Part::failed("media", "   "),
+        ];
+        assert_eq!(summarise_failure(&parts), None);
+    }
+
+    #[test]
+    fn the_summary_is_clamped_on_a_character_boundary_like_every_other_message() {
+        // The column is `text` and a producer's message is unbounded before it arrives, so a
+        // long one is clamped here exactly as a part's is. Multi-byte input is the case that
+        // matters: clamping at a byte index would produce a string that cannot be stored, and
+        // the operator would read an error about the error message.
+        let long = "ş".repeat(MAX_ERROR_LENGTH + 40);
+        let parts = vec![
+            Part::done("database", 1, 1, "aa", "d"),
+            Part::failed("media", &long),
+        ];
+        let summary = summarise_failure(&parts).expect("a failed part has a reason");
+        assert_eq!(
+            summary.chars().count(),
+            MAX_ERROR_LENGTH + 1,
+            "clamped to the cap plus the ellipsis, on a boundary"
+        );
+        assert!(summary.ends_with('…'));
     }
 
     #[test]

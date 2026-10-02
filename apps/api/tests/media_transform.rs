@@ -12,20 +12,35 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+use omnion_api::rate_limit_middleware::RateLimiter;
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
+use omnion_core::config::{Config, CsrfSecret};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
+use omnion_security::RatePolicy;
 use omnion_storage::{Storage, StorageError};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
+
+/// CSRF secret this suite runs with.
+///
+/// Every write in this suite — creating a preset, the POST that asks for a transformed image —
+/// is refused `403 csrf_unavailable` unless the running state carries a secret, and the message
+/// names the *server's* configuration, so the failure reads as a broken middleware rather than a
+/// suite that forgot a line. It has been there since this file was written: with
+/// `OMNION_CSRF_SECRET` unset in a shell, all five walks failed on their first write and none of
+/// them was looking at a preset at all. `media.rs` has carried the same fix since its own suite hit
+/// it; this is that fix, applied here.
+const CSRF_SECRET: &str = "csrf-transform-walk-suite-key-material-not-a-real-secret";
 
 /// The permission keys the editor of this suite holds.
 ///
@@ -49,6 +64,13 @@ const BOUNDARY: &str = "omnion-transform-test-boundary";
 struct TestResponse {
     status: StatusCode,
     set_cookie: Option<String>,
+    /// Every `Set-Cookie` on the response, joined.
+    ///
+    /// `set_cookie` is only the **first**, and sign-in sends two — the session and the CSRF token
+    /// beside it. Reading the first alone gives a caller a session with no token, which is the
+    /// same observable state as a deployment that issued none, so every write answers
+    /// `csrf_failed` and the failure reads as a broken middleware rather than a lost cookie.
+    set_cookies: Vec<String>,
     content_type: Option<String>,
     content_disposition: Option<String>,
     cache_control: Option<String>,
@@ -74,6 +96,13 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
             .map(str::to_owned)
     };
     let set_cookie = header_text(header::SET_COOKIE);
+    // Every `Set-Cookie`, which `header_text` cannot give: it reads the first match only.
+    let all_set_cookies: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_owned))
+        .collect();
     let content_type = header_text(header::CONTENT_TYPE);
     let content_disposition = header_text(header::CONTENT_DISPOSITION);
     let cache_control = header_text(header::CACHE_CONTROL);
@@ -97,6 +126,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     TestResponse {
         status,
         set_cookie,
+        set_cookies: all_set_cookies,
         content_type,
         content_disposition,
         cache_control,
@@ -111,7 +141,19 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(token) => {
+            let mut builder = builder.header(
+                header::COOKIE,
+                format!("omnion_session={}", session_of(token)),
+            );
+            // The token also rides as the **header**, which is the state a page really is in: a
+            // cookie with no header is the stale-tab case the layer reads first. Sending only the
+            // cookie exercises the fallback and nothing else.
+            if let Some(csrf) = csrf_token(token) {
+                builder = builder.header(CSRF_HEADER, csrf);
+            }
+            builder
+        }
         None => builder,
     };
     match body {
@@ -121,6 +163,29 @@ fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) 
             .expect("request must build"),
         None => builder.body(Body::empty()).expect("request must build"),
     }
+}
+
+/// The header the CSRF layer reads the token from.
+const CSRF_HEADER: &str = "x-omnion-csrf";
+
+/// The session id inside a caller's credential.
+fn session_of(token: &str) -> &str {
+    match token.split_once('\u{1f}') {
+        Some((session, _)) => session,
+        // A bare session id, which is what a caller with no token passes.
+        None => token,
+    }
+}
+
+/// The CSRF token inside a caller's credential, when it carries one.
+///
+/// The credential the fixture hands out is `<session>\x1f<token>`: two things that must travel
+/// together on a write, packed into the one `String` the helpers already return. The separator is a
+/// unit separator rather than `;` or `=` because neither can appear in a session id or a derived
+/// token, so a helper that guesses wrong cannot silently read half a value as a whole one.
+fn csrf_token(token: &str) -> Option<String> {
+    let (_, csrf) = token.split_once('\u{1f}')?;
+    (!csrf.is_empty()).then(|| csrf.to_owned())
 }
 
 /// Build a `multipart/form-data` body carrying one `file` part.
@@ -159,7 +224,18 @@ fn upload_request(
         )
         .header(header::CONTENT_LENGTH, body.len().to_string());
     if let Some(token) = token {
-        builder = builder.header(header::COOKIE, format!("omnion_session={token}"));
+        // The session id **and** the CSRF token, as [`request`] does. A multipart upload is a
+        // write, so it needs the same header: sending only the cookie answers `csrf_failed`, and
+        // sending the whole credential as the cookie value is what the first version did — the
+        // `\u{1f}` separator is not a legal cookie byte, so the builder refused the header and the
+        // panic named `request must build` rather than the credential that was wrong.
+        builder = builder.header(
+            header::COOKIE,
+            format!("omnion_session={}", session_of(token)),
+        );
+        if let Some(csrf) = csrf_token(token) {
+            builder = builder.header(CSRF_HEADER, csrf);
+        }
     }
     builder.body(Body::from(body)).expect("request must build")
 }
@@ -167,85 +243,12 @@ fn upload_request(
 /// A real PNG, generated rather than embedded so the bytes are certainly decodable.
 ///
 /// 1200x630 with four coloured quadrants: a crop shows two of the four, a fit shows all of them.
+///
+/// The encoder itself is shared (`support::image_bytes`) rather than copied: the copy that lived
+/// here encoded the same bytes in the same way, and a second copy is a second thing that has to
+/// stay correct.
 fn source_png() -> Vec<u8> {
-    let mut pixels = Vec::with_capacity(1200 * 630 * 3);
-    for y in 0..630u32 {
-        for x in 0..1200u32 {
-            let left = x < 600;
-            let top = y < 315;
-            let colour: [u8; 3] = match (left, top) {
-                (true, true) => [255, 0, 0],
-                (false, true) => [0, 255, 0],
-                (true, false) => [0, 0, 255],
-                (false, false) => [255, 255, 0],
-            };
-            pixels.extend_from_slice(&colour);
-        }
-    }
-    encode_png(1200, 630, &pixels)
-}
-
-/// Write a truecolour PNG with no filter bytes (filter type 0 per scanline).
-fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc = 0xffff_ffffu32;
-        for byte in data {
-            crc ^= u32::from(*byte);
-            for _ in 0..8 {
-                let mask = (crc & 1).wrapping_neg();
-                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-            }
-        }
-        !crc
-    }
-    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        let mut framed = kind.to_vec();
-        framed.extend_from_slice(body);
-        out.extend_from_slice(&framed);
-        out.extend_from_slice(&crc32(&framed).to_be_bytes());
-    }
-
-    let mut raw = Vec::with_capacity((width as usize * 3 + 1) * height as usize);
-    for y in 0..height as usize {
-        raw.push(0); // filter: none
-        raw.extend_from_slice(&rgb[y * width as usize * 3..(y + 1) * width as usize * 3]);
-    }
-
-    // zlib stream with stored (uncompressed) deflate blocks.
-    let mut zlib = vec![0x78, 0x01];
-    let mut offset = 0;
-    while offset < raw.len() {
-        let take = (raw.len() - offset).min(0xffff);
-        let last = offset + take == raw.len();
-        zlib.push(u8::from(last));
-        zlib.extend_from_slice(&(take as u16).to_le_bytes());
-        zlib.extend_from_slice(&(!(take as u16)).to_le_bytes());
-        zlib.extend_from_slice(&raw[offset..offset + take]);
-        offset += take;
-    }
-    let mut adler_a = 1u32;
-    let mut adler_b = 0u32;
-    for byte in &raw {
-        adler_a = (adler_a + u32::from(*byte)) % 65521;
-        adler_b = (adler_b + adler_a) % 65521;
-    }
-    zlib.extend_from_slice(&((adler_b << 16) | adler_a).to_be_bytes());
-
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, truecolour
-
-    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    chunk(&mut png, b"IHDR", &ihdr);
-    chunk(&mut png, b"IDAT", &zlib);
-    chunk(&mut png, b"IEND", &[]);
-
-    // The hash must be stable across the whole build, or the upload's checksum differs per run.
-    let _ = Sha256::digest(&png);
-    png
+    support::image_bytes::quadrant_png(1200, 630)
 }
 
 /// Open the object store the library writes into; `None` means it is not running.
@@ -280,7 +283,11 @@ async fn live_db(config: &Config) -> Option<Db> {
 
 /// A state whose database has all migrations applied and the object store open.
 async fn live_state() -> Option<(AppState, Db, Storage)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    // On the **config**, not through the environment: sign-in only issues a CSRF token when the
+    // running state carries a secret, so a suite that leans on `OMNION_CSRF_SECRET` being in the
+    // shell is a suite that quietly stops testing writes the moment it is not.
+    config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
     let db = live_db(&config).await?;
     db.migrate().await.expect("migrations must apply");
     let storage = live_storage().await?;
@@ -292,7 +299,26 @@ async fn live_state() -> Option<(AppState, Db, Storage)> {
         redis,
         storage.clone(),
     );
+    give_the_suite_its_own_rate_limit(&state);
     Some((state, db, storage))
+}
+
+/// Raise only the sign-in ceiling, leaving every other policy at what a deployment ships.
+///
+/// Without it this suite's own parallel walks share one sign-in bucket and refuse each other,
+/// which surfaces as a `429` in whichever walk lost the race — a number about this suite, not
+/// about the product.
+fn give_the_suite_its_own_rate_limit(state: &AppState) {
+    let policies: Vec<RatePolicy> = RatePolicy::defaults()
+        .into_iter()
+        .map(|mut policy| {
+            if policy.scope == "sign_in" {
+                policy.limit = 10_000;
+            }
+            policy
+        })
+        .collect();
+    omnion_api::rate_limit_middleware::install(RateLimiter::new(state, policies));
 }
 
 /// Everything one walk needs: an organization, a site, an editor and a reader.
@@ -515,17 +541,27 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
-        .set_cookie
-        .clone()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("cookie has a value")
-        .split_once('=')
-        .expect("cookie is name=value")
-        .1
-        .to_owned()
+    // Both cookies, packed into the one `String` the helpers already take: the session id and the
+    // CSRF token issued beside it. `set_cookie` is only the **first** `Set-Cookie`, and sign-in
+    // sends two — reading it alone yields a session with no token, which is exactly the state a
+    // deployment without a secret is in, so the write paths answer `csrf_failed` and the suite
+    // concludes the middleware is broken.
+    let mut pairs: Vec<(String, String)> = response
+        .set_cookies
+        .iter()
+        .flat_map(|header| header.split(';'))
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .collect();
+    let mut take = |name: &str| {
+        pairs
+            .iter()
+            .position(|(key, _)| key == name)
+            .map(|at| pairs.swap_remove(at).1)
+    };
+    let session = take("omnion_session").expect("login must set the session cookie");
+    let csrf = take("omnion_csrf").expect("login must issue a CSRF token beside it");
+    format!("{session}\u{1f}{csrf}")
 }
 
 /// The `id` field of a response body, as text.

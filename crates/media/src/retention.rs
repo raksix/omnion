@@ -922,22 +922,18 @@ pub async fn purge_eligible(
     })
 }
 
-/// Every storage key a set of files owns, current version and superseded history alike.
+/// Every storage key a set of files owns, current version, superseded history and preset cache
+/// alike.
+///
+/// A **delegate**, not a second query. This function and [`crate::browser::owned_object_keys`] are
+/// the same question asked twice, and they had drifted: this one unioned `media` with
+/// `media_versions` only, so the nightly purge sweep — the path that exists to reclaim storage that
+/// nothing else will — left every `media_derivatives` object in the bucket while deleting the rows
+/// that named it. Three implementations of one answer (this, `owned_object_keys`, and
+/// [`crate::preset_store::clear_derivatives`]) is how the interactive purge came to read only
+/// `media.storage_key` in the first place. One function, one answer.
 pub async fn all_keys_of(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<String>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut keys = sqlx::query_scalar::<_, String>(
-        "select storage_key from media where id = any($1) \
-         union \
-         select storage_key from media_versions where media_id = any($1)",
-    )
-    .bind(ids)
-    .fetch_all(pool)
-    .await?;
-    keys.sort();
-    keys.dedup();
-    Ok(keys)
+    crate::browser::owned_object_keys(pool, ids).await
 }
 
 /// How many trashed files of a site are past their restore window, and their bytes.

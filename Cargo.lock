@@ -1511,8 +1511,11 @@ dependencies = [
 name = "omnion-backup"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "hex",
+ "hkdf",
  "omnion-storage",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "sha2",
