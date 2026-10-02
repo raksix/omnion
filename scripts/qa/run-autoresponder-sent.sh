@@ -157,16 +157,36 @@ notes "a doc comment naming a caller that does not exist is a promise to a futur
 LEG=$((LEG + 1))
 # The store's answer must consult the delay, not just the discriminant.
 SENT_BODY="$(printf '%s' "$S_CODE" | sed -n '/pub fn sent(&self) -> bool/,/^    }/p')"
-check "Outcome::sent consults the delay" \
-  "$(printf '%s' "$SENT_BODY" | grep -q 'delayed' && echo true || echo false)" \
-  "sent() answers true for a DELAYED message — a reserved reservation is not a send, and the name says it went to the mailer"
+# **The assertion asks whether the answer is DELEGATED, not whether a literal survived.**
+# The first version of this leg required the text `delayed` to appear inside `sent()`'s body,
+# which is true of a fix that inlines the rule and false of a fix that routes it through
+# `Delivery::is_sendable` — the shape this gate exists to produce. A gate that demands the
+# previous fix's spelling refuses the better one, and the pressure it creates is to inline it
+# again. **Assert the property (one owner of the rule), never the expression that happened to
+# carry it.**
+check "Outcome::sent is answered by the one rule, not its own" \
+  "$(printf '%s' "$SENT_BODY" | grep -qE '(is_sendable|sendable)\(' && echo true || echo false)" \
+  "sent() still matches Delivery::Ready itself, so it answers true for a DELAYED message - a reservation is not a send, and the name says it went to the mailer"
 notes "prepare() claims a delayed message on purpose; the claim is what makes the delay happen later"
 
-# The product's own send path is the working spelling. If it ever stops being one, this goes
-# red for the right reason rather than because someone edited a test.
-check "the route's send arm still excludes a delayed message" \
-  "$(printf '%s' "$R_CODE" | grep -qE 'Delivery::Ready\(message\) if !message\.delayed' && echo true || echo false)" \
-  "the only call site that gets the delay right no longer does — the two copies have swapped places"
+# **The product's own send path must go through the accessor too, and the accessor must
+# actually exclude a delay.** Two assertions rather than one, because either can rot alone: a
+# route that re-inlines `if !message.delayed` passes the first and fails the second, and an
+# accessor that lost the delay passes both and reintroduces the original defect.
+# **The raw file, not the stripped one — and this is the third time on this gate.** The `//`
+# regex runs before the block scan (it must, or a `/*` inside a `//!` doc comment opens a
+# comment that never closes), and the two together happen to cut the *span* between the first
+# `//` and the next newline off every line. That is correct for a line comment and destructive
+# for anything this assertion needs, because the three call sites are formatted across lines
+# and the one that survives stripping is not the one the grep looks for. Assertions about
+# CALLING CONVENTION read the raw file; assertions about a rule's BODY read the stripped one,
+# because only the body can be satisfied by a comment.
+check "the route's send path asks the accessor" \
+  "$(grep -qE '(outcome|delivery)\.sendable\(\)' "$ROUTE" && echo true || echo false)" \
+  "the route re-spells 'may this go to the mailer' with a local match - a copy is what drifts"
+check "the one rule still excludes a delayed message" \
+  "$(printf '%s' "$A_CODE" | sed -n '/pub fn sendable(&self)/,/^    }/p' | grep -q 'delayed' && echo true || echo false)" \
+  "Delivery::sendable hands a DELAYED message back, so every caller of the one rule is wrong at once"
 
 # --------------------------------------------------------------------------------------------
 # leg 3: one spelling of the variant, not three
@@ -203,8 +223,17 @@ LEG=$((LEG + 1))
 check "was_sent asks about the sent key, not about a claim" \
   "$(printf '%s' "$S_CODE" | grep -qE 'detail\.get\("sent"\)' && echo true || echo false)" \
   "reading 'is there a claim' instead of 'was it sent' records a failed send as an answered lead forever"
+# **This assertion reads the RAW file, not the stripped one, and the reason is the stripper.**
+# The SQL is a Rust *string literal*, and the line-comment regex (`//[^\n]*`) is applied before
+# the block-comment scan -- so it cannot eat it, but it also cannot help here: the check needs a
+# `?` and a quoted key, and the earlier draft spelled the pattern with a shell double-quote
+# around `detail ? 'sent'`, which the shell happily mangled into an empty alternation. The
+# assertion then reported FAIL against code that is correct and unchanged since slice 1.
+# **A gate whose pattern went through another quoting layer is testing the quoting.** The raw
+# file is the subject here: the query is data, and no comment-stripping rule should be able to
+# change a data assertion.
 check "the claim read asks for the sent key" \
-  "$(printf '%s' "$S_CODE" | grep -qE "detail \? 'sent'" && echo true || echo false)" \
+  "$(grep -qF "detail ? 'sent'" "$STORE" && echo true || echo false)" \
   "existing_claim returns the newest line of this kind, and record_skip writes the same kind with no sent key"
 
 # --------------------------------------------------------------------------------------------

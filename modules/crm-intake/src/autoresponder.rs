@@ -44,12 +44,59 @@ pub enum Delivery {
 }
 
 impl Delivery {
-    /// `true` when a message is ready to send. The caller treats every other variant as
-    /// "nothing went out", and records the reason — the trail line is the difference between
-    /// "we did not mail them" and "we do not know whether we mailed them".
+    /// The message, if one may be handed to the mailer **now**.
+    ///
+    /// **This is the single spelling of "is it sendable", and the delay is part of it.** A
+    /// `Ready` message with `delayed: true` has been *reserved* — `prepare` takes the claim for
+    /// it precisely so the worker can send it later, which is what makes a send delay a feature
+    /// rather than a message that never goes out — and the thing that mails the lead is
+    /// `due_reservations`. So a `Ready` that is delayed is not sendable *now*, and a caller
+    /// that only tested the discriminant would hand a reservation to the mailer a second time
+    /// or report a send that has not happened.
+    ///
+    /// It was `matches!(self, Self::Ready(_))`, with no callers anywhere in the repository,
+    /// while its doc comment described the caller that treated every other variant as silence.
+    /// Two other copies existed: `Outcome::sent()` in the store (which also ignored the delay,
+    /// under a doc claiming the message "actually went to the mailer") and a hand-written
+    /// `verdict_name()` in the route that re-listed every variant. **The arms of a match are the
+    /// part that goes stale when a variant is added; a named accessor is the part that does
+    /// not**, so the rule lives here once.
+    #[must_use]
+    pub fn sendable(&self) -> Option<&Message> {
+        match self {
+            Self::Ready(message) if !message.delayed => Some(message),
+            _ => None,
+        }
+    }
+
+    /// `true` when a message can go to the mailer immediately.
+    ///
+    /// A thin question over [`Delivery::sendable`], kept because "may I send this" and "give me
+    /// the message" are both asked and spelling either of them with a local `matches!` is how
+    /// the three copies happened.
     #[must_use]
     pub fn is_sendable(&self) -> bool {
-        matches!(self, Self::Ready(_))
+        self.sendable().is_some()
+    }
+
+    /// The verdict's name, in the order the editor wants to explain them.
+    ///
+    /// **One function, not a copy per call site.** The route shipped a local `verdict_name()`
+    /// that re-listed all seven variants in a match, which is the failure mode this crate keeps
+    /// meeting: a hand-written list of an enum's arms does not fail to compile when a variant is
+    /// added, so the new variant renders as `_ => "…"` in some caller and keeps its own name in
+    /// another. The strings are the API's, so they are defined beside the variants.
+    #[must_use]
+    pub fn verdict_name(&self) -> &'static str {
+        match self {
+            Self::Ready(_) => "ready",
+            Self::Disabled => "disabled",
+            Self::NoRecipient(_) => "not_accepted",
+            Self::NoAddress => "no_address",
+            Self::NotYet(_) => "delayed",
+            Self::AlreadySent => "already_sent",
+            Self::InvalidTemplate(_) => "invalid_template",
+        }
     }
 
     /// The trail line's `reason`, one word per variant so the timeline is scannable.
@@ -331,6 +378,123 @@ mod tests {
 
     /// A fixed test instant, so a test never reads the wall clock.
     const MORNING: OffsetDateTime = datetime!(2026-09-29 10:00 UTC);
+
+    // ----------------------------------------------------------------------------------------
+    // "Is it sendable" is one rule, and the DELAY is part of it.
+    //
+    // The whole test module before these asked `matches!(verdict, Delivery::Ready(_))` in
+    // three places, because that was the only way to ask. Now there is a method, and these
+    // tests are about the one thing the method is for: a reserved message is not a sent one.
+    // ----------------------------------------------------------------------------------------
+
+    /// A ready message built by hand, with the delay the caller wants.
+    ///
+    /// **`template_body`, not `body`.** The first draft of this fixture passed `body` and every
+    /// test failed with "the fixture must still be a Ready message" — which is the message
+    /// working: a template that renders to nothing is `InvalidTemplate`, so the fixture was
+    /// not exercising the delay at all, it was exercising the empty-body guard under a name
+    /// that claimed otherwise. **A fixture that fails its own premise assertion has told you
+    /// which of its two inputs was wrong**, and reading the neighbouring test that passes
+    /// (`a_configured_autoresponder_renders_the_submitter_by_name`) is faster than guessing.
+    fn ready(delayed: bool) -> Delivery {
+        let configured = Autoresponder::from_json(&json!({
+            "enabled": true,
+            "template": "acknowledgement",
+            "subject": "We received your message",
+            "template_body": "Hello,\n\nthanks for writing to {{source}}.\n",
+            "delay_minutes": if delayed { 30 } else { 0 },
+        }));
+        let mut verdict = configured.deliver(&accepted(), MORNING, false);
+        // A due instant is what makes the message a *reservation* rather than a plain ready
+        // one, so the field is set the same way `deliver` sets it.
+        if let Delivery::Ready(message) = &mut verdict {
+            message.delayed = delayed;
+            message.due_at = if delayed {
+                Some(MORNING + time::Duration::minutes(30))
+            } else {
+                None
+            };
+        }
+        verdict
+    }
+
+    #[test]
+    fn a_delayed_message_is_reserved_not_sendable() {
+        // The defect this slice closes: `Outcome::sent()` was
+        // `matches!(self.verdict, Delivery::Ready(_))` under a doc comment claiming the
+        // message "actually went to the mailer", and `prepare` claims a DELAYED message on
+        // purpose — that claim is what makes the delay happen later instead of never.
+        let delayed = ready(true);
+        assert!(
+            matches!(delayed, Delivery::Ready(_)),
+            "the fixture must still be a Ready message, or it is not testing the delay",
+        );
+        assert!(
+            !delayed.is_sendable(),
+            "a reserved message has not gone to the mailer",
+        );
+        assert_eq!(delayed.sendable(), None);
+    }
+
+    #[test]
+    fn an_undelayed_message_is_sendable() {
+        // The positive control, and it is here because the negative test above passes against
+        // a `sendable()` that returns `None` for everything — including a message that is
+        // ready and due right now.
+        let now = ready(false);
+        assert!(now.is_sendable());
+        let message = now.sendable().expect("an undelayed Ready is sendable");
+        assert_eq!(message.to, "visitor@example.com");
+    }
+
+    #[test]
+    fn every_non_ready_variant_is_not_sendable() {
+        // The other five arms, spelled out rather than iterated, because the point is that
+        // adding a sixth variant to the enum does not have to touch this test: it is
+        // unreachable through `Ready` and therefore unreachable through `sendable`.
+        for variant in [
+            Delivery::Disabled,
+            Delivery::NoRecipient("spam"),
+            Delivery::NoAddress,
+            Delivery::NotYet(MORNING),
+            Delivery::AlreadySent,
+            Delivery::InvalidTemplate("empty body".into()),
+        ] {
+            assert!(!variant.is_sendable(), "{variant:?} is not a send");
+            assert_eq!(variant.sendable(), None);
+        }
+    }
+
+    #[test]
+    fn verdict_name_names_every_variant() {
+        // The route shipped a local `verdict_name()` re-listing all seven arms, and this is
+        // the test that makes the enum the only place the strings live. **The arms are listed
+        // here as a COUNTED assertion rather than a copy of the list** — a copy would be the
+        // fourth spelling, and the thing that is worth asserting is that no two arms share a
+        // name and that no name is empty, which is what a duplicated string looks like.
+        let names = [
+            Delivery::Ready(Message {
+                to: "a@example.com".into(),
+                subject: "s".into(),
+                body: "b".into(),
+                template: "acknowledgement".into(),
+                delayed: false,
+                due_at: None,
+            })
+            .verdict_name(),
+            Delivery::Disabled.verdict_name(),
+            Delivery::NoRecipient("spam").verdict_name(),
+            Delivery::NoAddress.verdict_name(),
+            Delivery::NotYet(MORNING).verdict_name(),
+            Delivery::AlreadySent.verdict_name(),
+            Delivery::InvalidTemplate("x".into()).verdict_name(),
+        ];
+        let mut unique: Vec<&str> = names.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "two variants share a name");
+        assert!(names.iter().all(|name| !name.is_empty()));
+    }
 
     fn accepted() -> Recipient<'static> {
         Recipient {

@@ -953,26 +953,29 @@ fn spawn_autoresponder(
             }
         };
 
-        let message = match &outcome.verdict {
-            Delivery::Ready(message) if !message.delayed => message,
+        // **The one rule, asked through the accessor that owns it.** This arm used to be
+        // `Delivery::Ready(message) if !message.delayed` — a hand-written copy of the answer,
+        // which is the *third* spelling of "may this go to the mailer now" (the store's
+        // `Outcome::sent()` was the second, and it ignored the delay while its doc claimed the
+        // message had gone out; a local `verdict_name()` was the fourth). A copy is what drifts;
+        // the accessor is what a future variant cannot.
+        let Some(message) = outcome.sendable() else {
             // A delayed message is the worker's to send, and every other verdict is a
             // deliberate silence. Both leave a line so the detail page can say which.
-            other => {
-                if !matches!(other, Delivery::Disabled) {
-                    if let Err(error) = autoresponder_store::record_skip(
-                        &pool,
-                        &lead,
-                        &source,
-                        other.reason(),
-                        serde_json::json!({}),
-                    )
-                    .await
-                    {
-                        tracing::warn!(lead_id = %lead.id, error = %error, "the autoresponder's skip could not be recorded");
-                    }
+            if !matches!(&outcome.verdict, Delivery::Disabled) {
+                if let Err(error) = autoresponder_store::record_skip(
+                    &pool,
+                    &lead,
+                    &source,
+                    outcome.verdict.reason(),
+                    serde_json::json!({}),
+                )
+                .await
+                {
+                    tracing::warn!(lead_id = %lead.id, error = %error, "the autoresponder's skip could not be recorded");
                 }
-                return;
             }
+            return;
         };
 
         let settings = workflow_runner::mail_settings(state.config());
@@ -2358,18 +2361,29 @@ pub async fn preview_autoresponder(
         /* already_sent */ false,
     );
 
-    let (subject, rendered, delayed, due_at) = match &delivery {
-        Delivery::Ready(message) => (
-            Some(message.subject.clone()),
-            Some(message.body.clone()),
-            message.delayed,
-            message.due_at,
-        ),
-        _ => (None, None, false, None),
+    let (subject, rendered, delayed, due_at) = {
+        // **The message comes from the accessor, not from a local match on the variant.** This
+        // block was a fourth copy of the same question in the same file, and a copy of an
+        // enum's arms is exactly what does not fail to compile when a variant is added.
+        match delivery.sendable() {
+            Some(message) => (
+                Some(message.subject.clone()),
+                Some(message.body.clone()),
+                // A DELAYED message is still `Ready`, so the accessor above hands back nothing
+                // and the preview must say so. `delayed` is read from the message rather than
+                // from a second `Ready` arm, because that is the field the rule is about.
+                false,
+                message.due_at,
+            ),
+            None => match &delivery {
+                Delivery::Ready(message) => (None, None, message.delayed, message.due_at),
+                _ => (None, None, false, None),
+            },
+        }
     };
 
     Ok(Json(AutoresponderPreviewResponse {
-        verdict: verdict_name(&delivery),
+        verdict: delivery.verdict_name(),
         reason: delivery.reason(),
         subject,
         body: rendered,
@@ -2377,19 +2391,6 @@ pub async fn preview_autoresponder(
         due_at: due_at.map(omnion_module_crm_intake::autoresponder::date_header),
         unfilled: unfilled_placeholders(&autoresponder),
     }))
-}
-
-/// The verdict’s name, in the order the editor wants to explain them.
-fn verdict_name(delivery: &Delivery) -> &'static str {
-    match delivery {
-        Delivery::Ready(_) => "ready",
-        Delivery::Disabled => "disabled",
-        Delivery::NoRecipient(_) => "not_accepted",
-        Delivery::NoAddress => "no_address",
-        Delivery::NotYet(_) => "delayed",
-        Delivery::AlreadySent => "already_sent",
-        Delivery::InvalidTemplate(_) => "invalid_template",
-    }
 }
 
 /// The placeholders a template asks for that no recipient can ever fill.
@@ -2779,17 +2780,25 @@ mod tests {
             reason: "preview",
         };
         let delivery = autoresponder.deliver(&recipient, time::OffsetDateTime::now_utc(), false);
-        let (subject, body, delayed, due_at) = match &delivery {
-            Delivery::Ready(message) => (
-                Some(message.subject.clone()),
-                Some(message.body.clone()),
-                message.delayed,
-                message.due_at,
-            ),
-            _ => (None, None, false, None),
+        let (subject, body, delayed, due_at) = {
+            // Same accessor as the route above and the same reason: a local match on the
+            // variant is a copy, and a copy of an enum's arms does not fail to compile when
+            // the enum grows.
+            match delivery.sendable() {
+                Some(message) => (
+                    Some(message.subject.clone()),
+                    Some(message.body.clone()),
+                    false,
+                    message.due_at,
+                ),
+                None => match &delivery {
+                    Delivery::Ready(message) => (None, None, message.delayed, message.due_at),
+                    _ => (None, None, false, None),
+                },
+            }
         };
         AutoresponderPreviewResponse {
-            verdict: verdict_name(&delivery),
+            verdict: delivery.verdict_name(),
             reason: delivery.reason(),
             subject,
             body,

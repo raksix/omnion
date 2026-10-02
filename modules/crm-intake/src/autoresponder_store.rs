@@ -54,9 +54,29 @@ pub struct Outcome {
 
 impl Outcome {
     /// `true` when a message actually went to the mailer.
+    ///
+    /// **This asks [`Delivery::is_sendable`], which knows about the delay, and used to ask
+    /// nothing.** It was `matches!(self.verdict, Delivery::Ready(_))` under a doc comment
+    /// claiming the message "went to the mailer" — and `prepare` claims a *delayed* message on
+    /// purpose, so a source with a 30-minute send delay returned `sent() == true` for a
+    /// reservation that no mailer had touched. The name was the guarantee and the body
+    /// contradicted it; the tests that read this method asserted the claim, not the send.
+    ///
+    /// **What this is used for is what makes the direction matter**: a caller asking "was this
+    /// lead answered" must be told no for a message still waiting out its delay, because
+    /// answering yes is how a lead gets marked handled by a send that has not happened.
     #[must_use]
     pub fn sent(&self) -> bool {
-        matches!(self.verdict, Delivery::Ready(_))
+        self.verdict.is_sendable()
+    }
+
+    /// The message, if it can go to the mailer now — the same rule, without the `bool`.
+    ///
+    /// **The store asks this rather than matching `Delivery::Ready` itself.** The arms of a
+    /// match are the part that goes stale when the enum grows; a named accessor is not.
+    #[must_use]
+    pub fn sendable(&self) -> Option<&Message> {
+        self.verdict.sendable()
     }
 }
 
