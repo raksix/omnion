@@ -16091,3 +16091,87 @@ tick, so the pass is reported as not-run rather than reported as green.
 **One harness note worth keeping:** `QA_ONLY=backups` still ran every `media-*` depth pass.
 `wants()` filters *routes and depth passes*, but the route list itself is walked first, so a
 focused pass is narrower than it looks — and on a box this loaded, the width is what killed it.
+
+## 2026-10-02 · Tick 80 · REQ-117 slice 45 — "the autoresponder was sent" was three rules, and the wrong one had the name
+
+**What was wrong.** `Outcome::sent()` answered `matches!(self.verdict, Delivery::Ready(_))`
+under a doc comment saying the message *actually went to the mailer*. `prepare` claims a
+**delayed** message on purpose — that claim is the mechanism that makes a send delay happen
+later instead of never — so every source with a non-zero delay answered `sent() == true` for a
+reservation no mailer had touched. The tests that read the method were asserting the claim, not
+the send.
+
+**The finding was made by a sweep, not by reading a diff.** `open_claims` and
+`Delivery::is_sendable` were the only two `pub` items in the CRM intake module with zero callers
+outside their own definition. A function with no caller is this branch's eighth instance of the
+signature shape, and this time the doc comment was the evidence rather than the symptom:
+`is_sendable`'s doc *describes* the caller that treats every other variant as silence, and no
+such caller exists. So the search did not stop at "unused" — it asked what the documentation
+promised, and found the promise with no implementation behind it. **A doc comment naming a
+caller is a testable claim: grep for the caller.**
+
+**Three spellings, and the one that worked was the dangerous one.** `verdict_name()` in
+`crm_intake.rs` re-listed all seven arms in a local match — a hand-written list of an enum's
+variants is precisely what does *not* fail to compile when a variant is added. And the route's
+real send path, `Delivery::Ready(m) if !m.delayed`, was the only call site that got the delay
+right, which makes it the one a reader checks and concludes the bare `matches!` means the same
+thing. **A working copy is more dangerous than a broken one, because it is what you verify
+against.**
+
+**The fix is a type, not a filter.** `Delivery::sendable() -> Option<&Message>` owns "may this
+go to the mailer *now*"; `is_sendable()` is a question over it, `Outcome::sent()` and
+`Outcome::sendable()` delegate, the route's send arm and both preview sites ask it, and
+`Delivery::verdict_name()` lives beside the variants so a new arm cannot render as `_ => "…"`
+in one caller and keep its name in another. Returning the *message* rather than a `bool` is
+what makes a wrong call site unrepresentable: `let Some(message) = outcome.sendable() else { … }`
+cannot forget the delay, while a `bool` invites the reader to re-match.
+
+**Proof.** `scripts/qa/run-autoresponder-sent.sh` **8 legs / 15 assertions, PASS**, and
+**PROVEN TO FAIL at 3/8** with the delay rule and the store's private copy reinstated: exactly the
+delay assertion, the store-delegation assertion and the accessor's own assertion go red, and the
+ten tenancy-free neighbours stay green — which is what shows the control removed the *delay rule*
+and not the neighbourhood. Module lib **195** (was 191, +4), `omnion-api` lib **327**,
+clippy `--all-targets` **0 errors** on both crates, admin `tsc --noEmit` exit 0.
+Commits `ffb5d716` (the gate) and `c567a2ed` (the fix).
+
+**Three defects in my own gate, all found by running it, and the third is the one worth keeping.**
+
+1. **A backtick inside a double-quoted `check` message is a command substitution.** `` "Message
+   has no `delayed` field" `` printed ``delayed: command not found`` and — worse — the assertion
+   still reported a verdict, because the substitution failed *inside* an argument that was
+   already being built. **A shell gate that logs its own diagnostics is also a program that can
+   execute them.**
+2. **The comment stripper ate its own subject, and the gate printed verdicts anyway.** It scanned
+   for `/*` before `//`, so line 1 of `crm_intake.rs` (`//! ... /api/v1/crm/intake/*`) opened a
+   block comment that ran to end of file. Every assertion then ran against the empty string, and
+   **two of them printed PASS** — "the delayed arm exists" and "a delayed message carries a due
+   instant" are both satisfied by absence. A stripper that cannot read the file must **refuse**
+   (exit 4), not continue; the guard is a balance check, and the fix is the lexer's order: a
+   `//` comment hides a `/*` from the block scanner, exactly as a compiler would see it.
+3. **Three assertions demanded the previous fix's spelling.** Leg 2 required the literal text
+   `delayed` inside `sent()`'s body, and the route assertion required the literal
+   `Delivery::Ready(message) if !message.delayed` — both of which the *better* fix removed by
+   delegating. **A gate that insists on an expression rather than a property creates pressure to
+   inline the rule again.** They now ask whether the answer is *delegated* and whether the single
+   owner *excludes a delay*, which is the property and not the spelling. The same leg split the
+   route check in two, because either half can rot alone: a route that re-inlines the guard passes
+   the first, and an accessor that loses the delay passes both.
+
+**A fixture that fails its own premise assertion has located the wrong input.** The unit test's
+`ready()` passed `body` where `Autoresponder::from_json` reads `template_body`, so it built an
+`InvalidTemplate` — and the assertion that the verdict is still `Ready` failed and said so. The
+neighbouring test that passes was the fastest route to the answer. **A premise assertion that
+names what it expected is worth more than a fixture that silently produces the wrong shape.**
+
+**No browser pass and none claimed.** No screen changed. The QA slot is held by a live **w6**
+pass (holder pid 2099, `/dev/shm/w6-qa-tick69`) and the box is at **load 18.9** with `/` at 99 %
+and `/mnt/apopic` at 93 %; a walkthrough started now would measure a box under pressure rather
+than this change.
+
+**Next.** `Outcome::sent()` is fixed but the question above it is not closed: **the `delay`
+column on `crm_lead_events.detail` is what `due_reservations` sweeps on, and the screen that
+configures the delay does not say what it is waiting for.** The editor renders a template and a
+minute count, and the lead timeline shows `delayed` as a one-word reason — neither names the
+instant the message goes out, which is the sentence an operator needs when a lead that was
+"answered" is not. Slice 46: the due instant on the timeline and in the editor's preview, read
+from the stored row rather than recomputed from the configuration.
