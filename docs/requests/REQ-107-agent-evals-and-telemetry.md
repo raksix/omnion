@@ -11,7 +11,10 @@
 > route, **no screen yet**): `0237_ai_tool_stats_daily.sql` and the roll-up — `eae9d344`; the
 > histogram read that was silently returning "no failures" — `9572d7db`; `/ai/telemetry/tools`
 > behind its own `ai.telemetry.read` — `7e7ec6ec`. Seven of thirteen acceptance rows are ticked,
-> each naming its walk. The closing browser pass and the `/ai/telemetry` screen are still owed) ·
+> each naming its walk. Slice 4's route split: the boot panic from a duplicate `GET
+> `/ai/telemetry/tools` — `cf1c80cb` — and the uniqueness tripwire that catches the class, after
+> its own first version was proven blind — `c525d9d5`. The closing browser pass and the
+> `/ai/telemetry` screen are still owed) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 

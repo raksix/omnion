@@ -10516,3 +10516,48 @@ percentiles and the ranked error codes; the step-count histogram and the cost-pe
 the costliest-failing-per-day table under it; a link from each row to `/ai/logs` pre-filtered by
 that tool. Then the event-emission walks for `ai.eval.gate.blocked` and
 `ai.eval.regression.detected`, which are the two rows the slice-3 runner writes but nothing asserts.
+
+
+## 2026-10-02 · REQ-107 slice 4 · the boot panic, and a tripwire that was itself blind
+
+**The whole API refused to start and no gate in this workspace could see it.** REQ-107 slice 4
+mounted `GET /ai/telemetry/tools`, a path REQ-099's slice 4 had already registered a `GET` of its
+own. `axum` rejects a duplicate method+path when the router is **constructed**, not compiled, so
+`cargo build` stayed green, both handler tests stayed green — neither handler is wrong on its own —
+and the existing mount assertion stayed green because it checked *presence*, never *uniqueness*:
+a path registered twice satisfied it. Only an unrelated suite (`ai_catalog`, which happens to
+construct the router) surfaced it. **Luck is not a gate.**
+
+Both reads are real, so the path was split rather than a handler deleted: `/ai/agents/tool-usage`
+is REQ-099's raw per-tool call counts behind `ai.agents.read`, registered *before* `/ai/agents/<built-in function id>`
+so axum matches the literal segment before the capture; `/ai/telemetry/tools` is REQ-107's
+roll-up behind its own `ai.telemetry.read`. `cf1c80cb`.
+
+**Then the tripwire for it turned out to be a false gate, and the proof run is the only reason
+that is written down.** The new test reads the registration table out of `mod.rs` and asserts no
+two mounts claim the same path *and* method. First version: `mod.rs` puts a ten-line comment in
+front of `let ai_telemetry_tools = …`; a `//` line never closes a statement, so the comment was
+glued onto the front of the binding, `strip_prefix("let ")` stopped matching, the binding dropped
+out of the map, and the route mounting it was skipped as "not a `let` binding`. **The test passed
+with the exact defect injected behind that comment.** A tripwire that reports the router as
+clash-free because it could not see one mount is worse than no tripwire — it buys a false green.
+Comments are now skipped before the buffer grows, and a floor on the parsed binding count keeps a
+silently-shrunk map from quietly shrinking again. `c525d9d5`.
+
+**Proof.** Injected a second independent `GET /ai/telemetry/tools` binding (the realistic shape —
+a *separate* `let`, which is why the move checker never fired and the original compiled clean) →
+the test FAILS naming both bindings. Reverted → `cargo test -p omnion-api --test ai_eval_runs`
+**13 passed, 0 failed** (25.4s); `cargo build -p omnion-api` exit 0; `pnpm typecheck` 2/2. All on
+the private stack's database at `127.0.0.1:5433/omnion_qa_w7`, `CARGO_TARGET_DIR=/dev/shm/w7-target`.
+
+**Next.** The `/ai/telemetry` screen is the whole of what slice 4 still owes: tool table (calls,
+success %, denial %, p50/p95/p99, ranked error codes), the step-count histogram, the cost-per-solved
+scatter, the costliest-failing-per-day table, and a link from each row to `/ai/logs` pre-filtered
+by that tool — plus the page in `scripts/qa/walkthrough.cjs`, since a screen outside the inventory
+is not accepted. Then the two event rows nothing asserts (`ai.eval.gate.blocked`,
+`ai.eval.regression.detected`) and the `eval:judge` rubric cost.
+
+**Box.** 32G RAM at 22G used, `/dev/shm` 72%, `/mnt/apopic` 98% (1.5G free) — build with
+`CARGO_TARGET_DIR=/dev/shm/w7-target CARGO_INCREMENTAL=0` explicitly. The QA slot was checked
+honestly this tick and is held by a **live** w5 pass (holder pid 3155537, cwd empty) — not a
+stale-pid reaper case, so w7 is queued and no box is ticked on a pass that has not executed.
