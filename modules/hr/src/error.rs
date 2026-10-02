@@ -1,0 +1,302 @@
+//! Errors of the HR module.
+//!
+//! The distinction the API layer needs: input the platform refuses is a `400` naming the field,
+//! a record that is not there (or is another organization's, which must be indistinguishable
+//! from not being there) is a `404`, a record that already carries the number or the work e-mail
+//! is a `409`, and a database that will not answer is the retryable dependency failure the rest of
+//! the platform reports.
+//!
+//! The two cycle refusals have their own variants rather than a formatted [`HrError::Invalid`],
+//! because they are the request's named acceptance criteria and a caller (and a test) has to be
+//! able to match on the *kind* — "is this the self-manager case?" is a question about a variant,
+//! and a substring test on a message is a question that breaks when somebody improves the wording.
+
+use thiserror::Error;
+use time::Date as CalendarDay;
+use uuid::Uuid;
+
+/// Everything the HR module can refuse to do.
+#[derive(Debug, Error)]
+pub enum HrError {
+    /// An employee or department description the platform refuses, naming the field that failed.
+    #[error("invalid {entity}.{field}: {message}")]
+    Invalid {
+        /// What was being written (`employee`, `department`, …).
+        entity: &'static str,
+        /// The field to attach the message to in the form.
+        field: &'static str,
+        /// The sentence the person reads.
+        message: String,
+    },
+    /// A list query the platform refuses (an unknown sort column, a cursor that is not a cursor).
+    #[error("invalid list query: {0}")]
+    InvalidQuery(String),
+    /// The record does not exist in this organization.
+    #[error("no such {0} in this organization")]
+    NotFound(&'static str),
+    /// Another employee of the organization already carries this employee number.
+    #[error("employee number {0} is already used in this organization")]
+    EmployeeNoTaken(String),
+    /// Another employee of the organization already carries this work e-mail address.
+    #[error("another employee of this organization already uses this work e-mail address")]
+    WorkEmailTaken,
+    /// Another department of the organization already carries this name.
+    #[error("another department of this organization already carries this name")]
+    DepartmentNameTaken,
+    /// An employee may not be their own manager.
+    #[error("an employee cannot be their own manager")]
+    SelfManager,
+    /// The proposed manager already reports, directly or through a chain, to this employee.
+    ///
+    /// The variant carries the chain because a person asked to fix a cycle needs to know *which*
+    /// line closes it — "set someone as manager who is below you" sends them back to the tree to
+    /// guess. The list is the management chain from the proposed manager up to the employee.
+    ///
+    /// The chain is rendered through a `Display` newtype rather than a `{}` placeholder calling a
+    /// function: `thiserror`'s format strings are `format!`, and a bare `{join(0)}` is a field
+    /// access it cannot resolve, not a function call.
+    #[error("that employee already reports to this one through {0}")]
+    ManagerCycle(ManagementChain),
+    /// A department may not be moved under one of its own descendants.
+    #[error("a department cannot be moved under itself or one of its own children")]
+    DepartmentCycle,
+    /// A department that still has members or child departments cannot be deleted.
+    #[error("this department still has {members} members and {children} child departments; move them first")]
+    DepartmentNotEmpty {
+        /// Members that would be orphaned.
+        members: i64,
+        /// Child departments that would be orphaned.
+        children: i64,
+    },
+    /// A merge whose two records are the same, or a merge of different organizations.
+    #[error("invalid merge: {0}")]
+    InvalidMerge(String),
+    /// The requested range overlaps a `pending` or `approved` request of the same employee.
+    ///
+    /// The variant carries **both** ranges. The acceptance criterion asks for "the conflicting
+    /// dates in the message", and it is the right ask: "conflicts with another request" sends the
+    /// person back to the list to work out which one, which is a different screen and a different
+    /// search. Rejected and cancelled rows are *not* conflicts — they are history, and a person
+    /// who was refused once and then cancelled is not double booked.
+    #[error("these dates overlap request {other_request_id}, which runs from {starts_on} to {ends_on}")]
+    LeaveOverlap {
+        /// The request that already holds those days.
+        other_request_id: Uuid,
+        /// The first day that request holds.
+        starts_on: CalendarDay,
+        /// The last day that request holds.
+        ends_on: CalendarDay,
+    },
+    /// The request asks for more days than the balance has left, on a type that does not allow a
+    /// negative balance.
+    ///
+    /// Carries all five numbers: entitled, used, pending, requested and remaining. A refusal that
+    /// says "not enough balance" makes the person go and read the balance card, and the card is
+    /// the thing they are already on.
+    #[error("this request is {requested} days of {leave_type}, but only {remaining} are left ({entitled} entitled, {used} used, {pending} pending)")]
+    InsufficientBalance {
+        /// The type's name, so the message is about a policy and not an id.
+        leave_type: String,
+        /// What the organization promised.
+        entitled: String,
+        /// What is already spent.
+        used: String,
+        /// What is waiting for a decision.
+        pending: String,
+        /// What this request asks for.
+        requested: String,
+        /// What would be left.
+        remaining: String,
+    },
+    /// A request that is not `pending` was decided.
+    ///
+    /// Its own variant, with the status it already carries, because "cannot decide" and "cannot
+    /// cancel" are different sentences and a second approver clicking at the same moment as the
+    /// first has to be told which one happened.
+    #[error("this request is already {status}, so it cannot be decided again")]
+    LeaveAlreadyDecided {
+        /// The status it holds now.
+        status: String,
+    },
+    /// A request that is not `pending` was cancelled.
+    ///
+    /// An approved request is history: it is ended by the leave actually happening, not by
+    /// pretending it was never agreed.
+    #[error("this request is {status}, so it can no longer be cancelled")]
+    LeaveNotCancellable {
+        /// The status it holds now.
+        status: String,
+    },
+    /// PostgreSQL refused or could not answer.
+    #[error("hr storage error: {0}")]
+    Database(#[from] sqlx::Error),
+    // --- attendance (slice 2d) ---------------------------------------------------------------
+    //
+    // The three clock refusals are their own variants rather than formatted `Invalid` values,
+    // for the reason the two cycle refusals above are: a client has to be able to say "you are
+    // already clocked in" and a test has to ask "is this the second-check-in case?" by kind. A
+    // substring test on a message breaks the day somebody improves the wording.
+
+    /// A check-in was punched on a day that already has one.
+    ///
+    /// Carries the punch it found, because the person standing at the clock needs the time they
+    /// came in — "already clocked in" alone sends them to a log to find out when.
+    ///
+    /// **`at` is a rendered `String`, never an `Option`.** `thiserror` formats through `Display`,
+    /// which `Option` does not implement, so a variant holding the raw option cannot be rendered
+    /// at all — the error is then unprintable rather than wrong, which no type check reports. The
+    /// "the row cannot say" case is an empty string, and the API layer publishes the
+    /// machine-readable value in the body.
+    #[error("this day is already clocked in{at}")]
+    AlreadyCheckedIn {
+        /// The day, as `YYYY-MM-DD`.
+        work_date: String,
+        /// `", at 2026-10-05T09:02:00Z"`, or empty when the row cannot say.
+        at: String,
+    },
+    /// A check-out was punched for a day with no check-in.
+    #[error("this day has no check-in to close")]
+    CheckoutWithoutCheckin {
+        /// The day, as `YYYY-MM-DD`.
+        work_date: String,
+    },
+    /// A check-out was punched on a day that is already closed.
+    #[error("this day is already clocked out")]
+    AlreadyCheckedOut {
+        /// The day, as `YYYY-MM-DD`.
+        work_date: String,
+    },
+    // --- onboarding (slice 4) ---------------------------------------------------------------
+    //
+    // Same rule as the three above: a refusal a client has to *distinguish* is a variant, not a
+    // formatted `Invalid`. "Already applied" is a different sentence from "no such template" and
+    // the double-apply case is the one an operator meets on a page that looks like it did nothing.
+
+    /// A template was applied to an employee who is already working through it.
+    ///
+    /// Carries how many items are already there, because "already applied" on its own sends the
+    /// operator to the employee's page to work out whether it worked at all — and the case that
+    /// matters (a double-clicked button) looks exactly like the case that does not.
+    #[error("this template is already applied to the employee, with {items} item(s) on their checklist")]
+    AlreadyApplied {
+        /// Whose checklist it is.
+        employee_id: Uuid,
+        /// The template that was already applied.
+        template_id: Uuid,
+        /// How many items are already there.
+        items: i64,
+    },
+    /// A template that belongs to this organization does not exist.
+    ///
+    /// A named variant so "the id is wrong" can be told from "you may not apply it" — the second
+    /// is a 403 that arrives before the handler and never reaches this code at all.
+    #[error("no such onboarding template in this organization")]
+    NoSuchTemplate,
+}
+
+impl HrError {
+    /// A refused write: the message the form renders under the field.
+    #[must_use]
+    pub fn invalid(entity: &'static str, field: &'static str, message: impl Into<String>) -> Self {
+        Self::Invalid {
+            entity,
+            field,
+            message: message.into(),
+        }
+    }
+
+    /// A refused write naming a field that the schema would refuse too.
+    #[must_use]
+    pub fn constraint(entity: &'static str, field: &'static str, message: impl Into<String>) -> Self {
+        Self::invalid(entity, field, message)
+    }
+}
+
+/// The management chain a cycle refusal names, rendered as `a → b → c`.
+///
+/// A newtype rather than a bare `Vec<String>` in the error, for two reasons: the message needs the
+/// arrow (so the person can see which way the chain runs) and an empty chain still has to read as
+/// a sentence rather than as nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagementChain(Vec<String>);
+
+impl ManagementChain {
+    /// Wrap the names the store walked, nearest first.
+    #[must_use]
+    pub fn new(names: Vec<String>) -> Self {
+        Self(names)
+    }
+
+    /// The names, for a caller that wants to render them itself.
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ManagementChain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return formatter.write_str("the reporting chain already in place");
+        }
+        formatter.write_str(&self.0.join(" → "))
+    }
+}
+
+/// Result alias of the module.
+pub type Result<T> = std::result::Result<T, HrError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_names_the_entity_the_field_and_the_reason() {
+        let error = HrError::invalid("employee", "work_email", "that is not an e-mail address");
+        let sentence = error.to_string();
+        assert!(sentence.contains("employee"), "{sentence}");
+        assert!(sentence.contains("work_email"), "{sentence}");
+        assert!(sentence.contains("that is not an e-mail address"), "{sentence}");
+    }
+
+    #[test]
+    fn a_missing_record_is_a_404_for_the_api_and_nothing_else() {
+        assert_eq!(
+            HrError::NotFound("employee").to_string(),
+            "no such employee in this organization"
+        );
+    }
+
+    #[test]
+    fn the_cycle_refusals_are_their_own_variants_not_a_formatted_message() {
+        // The acceptance criterion asks for a *cycle* to be refused, and the two cases are
+        // different bugs to fix: one person is a fixed point, the other is a loop in the chain.
+        // Matching on the variant is what makes that distinction testable at all.
+        assert!(matches!(HrError::SelfManager, HrError::SelfManager));
+        let cycle = HrError::ManagerCycle(ManagementChain::new(vec![
+            "Ada".to_owned(),
+            "Grace".to_owned(),
+        ]));
+        assert!(matches!(cycle, HrError::ManagerCycle(_)));
+        assert!(cycle.to_string().contains("Ada → Grace"), "{cycle}");
+    }
+
+    #[test]
+    fn an_empty_chain_still_reads_as_a_sentence() {
+        // Unreachable through the store, and the message must not be a bare empty list if it ever
+        // becomes reachable.
+        let cycle = HrError::ManagerCycle(ManagementChain::new(Vec::new()));
+        assert!(cycle.to_string().contains("the reporting chain already in place"));
+    }
+
+    #[test]
+    fn a_non_empty_department_reports_both_counts() {
+        let error = HrError::DepartmentNotEmpty {
+            members: 4,
+            children: 2,
+        };
+        let sentence = error.to_string();
+        assert!(sentence.contains('4'), "{sentence}");
+        assert!(sentence.contains('2'), "{sentence}");
+    }
+}

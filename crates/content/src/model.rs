@@ -59,9 +59,6 @@ pub struct PageRevision {
     pub body: String,
     /// Short summary, when the author wrote one.
     pub summary: Option<String>,
-    /// The page's block tree as stored JSON (REQ-063). `[]` for revisions written before the
-    /// block system, which is exactly what makes them render from `body` instead.
-    pub blocks: serde_json::Value,
     /// Revision this one was copied from by a restore, when it was.
     pub restored_from_id: Option<Uuid>,
     /// Account that authored the revision, when a person did.
@@ -117,8 +114,6 @@ pub struct PageChanges {
     pub body: Option<String>,
     /// New summary; `Some("")` clears it (appends a revision).
     pub summary: Option<String>,
-    /// New block tree as stored JSON (appends a revision).
-    pub blocks: Option<serde_json::Value>,
 }
 
 impl PageChanges {
@@ -131,10 +126,7 @@ impl PageChanges {
     /// `true` when the change set needs a new revision.
     #[must_use]
     pub fn touches_content(&self) -> bool {
-        self.title.is_some()
-            || self.body.is_some()
-            || self.summary.is_some()
-            || self.blocks.is_some()
+        self.title.is_some() || self.body.is_some() || self.summary.is_some()
     }
 }
 

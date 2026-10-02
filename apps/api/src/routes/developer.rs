@@ -76,6 +76,7 @@ pub struct CreateKeyBody {
     #[serde(default = "default_environment")]
     pub environment: String,
     /// Optional expiry. Refused in the past.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
 }
 

@@ -2,15 +2,11 @@
  * The Minimal theme's page layout.
  *
  * One column, generous spacing, a serif headline — the whole page as semantic markup with
- * `mn-*` hooks the stylesheet owns. A revision that carries a block tree is drawn from it; a
- * revision without one falls back to the plain body, where blank lines separate paragraphs
- * and the stylesheet preserves the rest (`white-space: pre-line`). That fallback is what lets
- * the block system ship without breaking a single page that was published before it.
+ * `mn-*` hooks the stylesheet owns. The body is plain text for now: blank lines separate
+ * paragraphs, everything else is preserved by the stylesheet (`white-space: pre-line`). The
+ * block editor replaces this renderer in a later phase without touching the contract.
  */
 import type { PageLayoutProps } from "@omnion/theme-sdk";
-import type { ContentBlock } from "@omnion/types";
-
-import { BlockTree } from "./block-renderer";
 
 /** Split a plain-text body into paragraphs on blank lines. */
 export function bodyParagraphs(body: string): string[] {
@@ -42,9 +38,6 @@ export function MinimalPageLayout({ content }: PageLayoutProps) {
   const { site, page, revision } = content;
   const paragraphs = bodyParagraphs(revision.body);
   const published = formatPublished(revision.published_at);
-  const blocks = Array.isArray(revision.blocks)
-    ? (revision.blocks as ContentBlock[])
-    : [];
 
   return (
     <div className="mn-shell">
@@ -69,11 +62,9 @@ export function MinimalPageLayout({ content }: PageLayoutProps) {
             ) : null}
           </p>
           <div className="mn-body">
-            {blocks.length > 0 ? (
-              <BlockTree blocks={blocks} />
-            ) : (
-              paragraphs.map((paragraph, index) => <p key={index}>{paragraph}</p>)
-            )}
+            {paragraphs.map((paragraph, index) => (
+              <p key={index}>{paragraph}</p>
+            ))}
           </div>
         </article>
       </main>

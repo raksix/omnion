@@ -21,7 +21,7 @@ use omnion_content::{comments, pages, translations};
 use omnion_events::{NewEvent, bus};
 use omnion_identity::sites::{self, Site};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -52,9 +52,6 @@ pub struct RevisionBody {
     pub body: String,
     /// Short summary, when the author wrote one.
     pub summary: Option<String>,
-    /// The page's block tree as stored JSON (REQ-063). `[]` for a revision that renders from
-    /// its body, which is every revision written before the block system.
-    pub blocks: Value,
     /// Revision this one was restored from, when it was.
     pub restored_from_id: Option<Uuid>,
     /// Creation timestamp, RFC 3339.
@@ -75,7 +72,6 @@ impl From<&PageRevision> for RevisionBody {
             title: revision.title.clone(),
             body: revision.body.clone(),
             summary: revision.summary.clone(),
-            blocks: revision.blocks.clone(),
             restored_from_id: revision.restored_from_id,
             created_at: revision.created_at,
             published_at: revision.published_at,
@@ -112,14 +108,6 @@ pub struct PageBody {
 
 impl PageBody {
     /// Assemble a page with the states the store reports.
-    pub fn from_store(
-        page: &Page,
-        draft: Option<&PageRevision>,
-        published: Option<&PageRevision>,
-    ) -> Self {
-        Self::build(page, draft, published)
-    }
-
     fn build(page: &Page, draft: Option<&PageRevision>, published: Option<&PageRevision>) -> Self {
         Self {
             id: page.id,
@@ -237,9 +225,6 @@ pub struct UpdatePageRequest {
     /// New summary; an empty string clears it (appends a revision).
     #[serde(default)]
     pub summary: Option<String>,
-    /// New block tree as stored JSON (REQ-063, appends a revision after validation).
-    #[serde(default)]
-    pub blocks: Option<Value>,
 }
 
 impl UpdatePageRequest {
@@ -250,7 +235,6 @@ impl UpdatePageRequest {
             title: self.title,
             body: self.body,
             summary: self.summary,
-            blocks: self.blocks,
         }
     }
 }
@@ -402,34 +386,6 @@ pub async fn update_page(
         pages::update_page(state.db().pool(), page.id, &changes, Some(current.user.id)).await?;
     let body = load_page_body(&state, &updated).await?;
 
-    // A block save is a structural change, and the platform's own bus is where downstream
-    // listeners learn about those. The payload carries the count, never the tree: the events
-    // surface is read by integrations that must not be handed a page's whole body.
-    //
-    // The event is gated on the request actually carrying a block tree, not merely on a draft
-    // existing. A rename PATCH appends a draft revision like any other content change, so gating
-    // on the draft made every title edit announce "blocks updated" with a count of zero — and an
-    // integration subscribed to it would rebuild a page's media, re-run a diff and re-publish a
-    // CDN cache for a page whose blocks never moved. The audit entry below still records the
-    // rename, so nothing is lost; it simply stops being reported as a structural change.
-    if changes.blocks.is_some()
-        && let Some(draft) = &body.draft
-    {
-        let block_count = omnion_content::validate(&draft.blocks).block_count;
-        let _report = bus::emit(
-            state.db().pool(),
-            NewEvent::new("content.blocks.updated")
-                .organization(site_of(&state, updated.site_id).await?.organization_id)
-                .site(updated.site_id)
-                .actor(current.user.id)
-                .payload(json!({
-                    "page_id": updated.id,
-                    "revision_no": draft.revision_no,
-                    "block_count": block_count,
-                })),
-        )
-        .await?;
-    }
     // An endpoint subscribed to `page.*` hears edits too. Only an edit that actually appended
     // a revision is a content change; a pure rename is still worth telling, so it is reported
     // with `status` omitted rather than filtered out — a receiver that rebuilds a sitemap needs
@@ -458,7 +414,6 @@ pub async fn update_page(
                 "slug": updated.slug,
                 "revision_no": body.draft.as_ref().map(|draft| draft.revision_no),
                 "content_changed": appends,
-                "blocks_changed": changes.blocks.is_some(),
             }))
             .ip_address(address.as_text())
             .organization(site.organization_id),
@@ -519,23 +474,6 @@ pub async fn publish_page(
     let page = page_in_scope(&state, &current, page_id).await?;
     let site = site_of(&state, page.site_id).await?;
 
-    // A draft whose block tree still has an error is refused here, not rendered: the editor's
-    // Save is deliberately allowed to keep an incomplete tree (an author is mid-sentence), so
-    // publication is the moment the page has to be whole. The message names the first block and
-    // what it needs, which is the sentence the author has to act on.
-    if let Some(draft) = pages::current_draft(state.db().pool(), page.id).await? {
-        let report = omnion_content::validate(&draft.blocks);
-        if let Some(issue) = report.first_error() {
-            return Err(ApiError::bad_request(
-                "blocks_not_publishable",
-                format!(
-                    "this page cannot be published yet: {} (block {}, {})",
-                    issue.message, issue.block_id, issue.path
-                ),
-            ));
-        }
-    }
-
     let (page, published) = pages::publish_page(state.db().pool(), page.id).await?;
 
     // Fan-out (docs/BUILD-BACKLOG.md P12): the platform's own bus records the publication, and
@@ -557,7 +495,6 @@ pub async fn publish_page(
                 "revision_id": published.id,
                 "revision_no": published.revision_no,
                 "title": published.title,
-                "block_count": omnion_content::validate(&published.blocks).block_count,
             })),
     )
     .await?;
@@ -605,239 +542,6 @@ pub async fn list_revisions(
     }))
 }
 
-/// `GET /api/v1/pages/{id}/preview?viewport={mobile|desktop}`.
-///
-/// The renderer-frame payload for the page's *working draft* (REQ-063, slice 2).
-///
-/// The frame is a real render, not a second representation of the page: the tree that leaves
-/// here is the same one `GET /pages/{id}` hands the editor and the same one the public renderer
-/// draws, passed through the *server's* viewport filter. A preview that filtered with CSS would
-/// show the author a phone page with a desktop block still in the DOM, which is exactly the
-/// "preview lies" bug the REQ names.
-///
-/// The payload is scoped to the draft on purpose. Inline editing writes draft revisions, so a
-/// frame that read the published revision would be reviewing the page visitors are not seeing,
-/// and a save in the frame would appear to do nothing to it.
-pub async fn preview_page(
-    State(state): State<AppState>,
-    current: CurrentSession,
-    Path(page_id): Path<Uuid>,
-    Query(query): Query<PreviewQuery>,
-) -> Result<Json<PagePreviewBody>, ApiError> {
-    let page = page_in_scope(&state, &current, page_id).await?;
-    let pool = state.db().pool();
-    let draft = pages::current_draft(pool, page.id).await?;
-    let published = pages::published_revision(pool, page.id).await?;
-
-    // A page with no draft at all is a page that has never been edited since creation, which the
-    // model makes impossible — but the frame says so rather than rendering an empty page, since
-    // "nothing here" and "nothing to preview" are different answers.
-    //
-    // The one page that *does* land here is a page that was published and never touched again,
-    // which is most of them. `publish_page` promotes the draft row to `published` in place, so
-    // after a publish the page has no `draft` row at all and this frame answered `404
-    // no_draft_revision` — the preview of a published, working page was a dead screen, and the
-    // author who opened it after publishing saw a 404 where their page should be. A preview
-    // falls back to the revision visitors are actually seeing, which is the honest answer when
-    // there is no newer work than the published copy.
-    let draft = match draft {
-        Some(revision) => revision,
-        None => published.clone().ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "no_draft_revision",
-                "this page has no working draft to preview",
-            )
-        })?,
-    };
-
-    let viewport = preview_viewport(query.viewport.as_deref());
-    // The filter is the same call the public renderer makes, so "what the phone sees" has one
-    // implementation. A preview that filtered differently from the site would be a third answer
-    // to the same question.
-    let read_on = if viewport == "mobile" {
-        omnion_content::ReadOn::Mobile
-    } else {
-        omnion_content::ReadOn::Desktop
-    };
-    let parsed = omnion_content::parse_blocks(&draft.blocks).unwrap_or_default();
-    let visible = omnion_content::filter_for_viewport(&parsed, read_on);
-    let report = omnion_content::validate(&draft.blocks);
-
-    // Which of the tree's files exist, resolved once and used for both halves of this payload:
-    // the media report the frame shows, and the degradation the frame draws.
-    //
-    // Resolved against the **stored** tree rather than the filtered one, so a desktop-only image
-    // is reported even when this frame is the phone render. The opposite would make the warning
-    // disappear exactly when the author is checking the page they are about to publish on a
-    // different device, and the block's own `visible_on` is what tells the two apart — a warning
-    // that is present but says which viewport it belongs to is information; a warning that is
-    // simply absent is a different story each time the author resizes.
-    let simulated = omnion_content::parse_media_filter(query.media.as_deref())?;
-    let (real_states, media_report) = omnion_content::BlockMediaStore::new(pool.clone())
-        .states(&parsed)
-        .await
-        .unwrap_or_else(|_| {
-            (
-                std::collections::HashMap::new(),
-                omnion_content::TreeMediaReport::default(),
-            )
-        });
-    let states = omnion_content::states_for_render(&real_states, &simulated);
-    let degraded = omnion_content::degrade_tree(&visible, &states);
-    // The simulation is reported as its own count so the frame can say "simulating 1 deleted
-    // file" instead of pretending the page is broken. A frame that claimed a real file was
-    // deleted when nothing was deleted would send an author to fix their own media library.
-    //
-    // The broken count the frame reports is the *drawn* one: a file that is really gone and a
-    // file this frame is pretending is gone are the same thing to somebody reading the page, and
-    // the two are added rather than merged so `simulated_media` can still say how many of them
-    // are the author's own experiment. An id that names no file on this page is counted in
-    // neither — a filter for some other page's image has nothing to say about this one.
-    let on_this_page = omnion_content::media_ids(&parsed);
-    let simulated_broken = simulated.iter().filter(|id| on_this_page.contains(id)).count();
-    let already: std::collections::HashSet<_> = media_report
-        .refs
-        .iter()
-        .filter(|entry| entry.is_broken())
-        .map(|entry| entry.media_id)
-        .collect();
-    let broken_count = media_report.broken_count
-        + simulated
-            .iter()
-            .filter(|id| on_this_page.contains(id) && !already.contains(id))
-            .count();
-
-    Ok(Json(PagePreviewBody {
-        page_id: page.id,
-        slug: page.slug.clone(),
-        title: draft.title.clone(),
-        viewport,
-        // The frame carries the whole stored tree *and* the filtered one, and the two numbers are
-        // not equal whenever the author hid something. Rendering only the filtered tree would
-        // make a "hidden on phones" block indistinguishable from a deleted one.
-        blocks: omnion_content::blocks_to_value(&parsed),
-        visible_blocks: omnion_content::blocks_to_value(&degraded),
-        // Both counts are the RECURSIVE ones, and they have to be: the frame's own arithmetic
-        // is `block_count - visible_count` ("how many did I hide?"), and the editor's status bar
-        // compares this page's number against the whole site's. Both were the length of the
-        // top-level array, so a page with one Columns block holding six cells reported `1 of 1`
-        // while the tree it carried held seven blocks — and the editor's bar, which was handed
-        // the same numbers by the validate route, showed a page of one block being edited.
-        //
-        // The validator already owns the one definition of "how many blocks does this tree
-        // hold" and uses it for the bound, so counting here would be a second one. Counting a
-        // `Vec<Block>` is cheap and exact, and the asymmetry that matters is preserved: the
-        // first number is the STORED tree and the second is what this viewport actually draws.
-        block_count: omnion_content::count_tree(&parsed) as i32,
-        // The count of what THIS viewport draws, after the degradation — so a phone frame whose
-        // gallery lost every file reports zero visible blocks, which is what the author is
-        // looking at. Reporting the pre-degradation number beside a tree that no longer has the
-        // block is the disagreement the previous pass's `previewDrawnBlocks` keys were reading.
-        visible_count: omnion_content::count_tree(&degraded) as i32,
-        body: draft.body.clone(),
-        revision_id: draft.id,
-        revision_no: draft.revision_no,
-        published_revision_no: published.as_ref().map(|entry| entry.revision_no),
-        can_publish: report.can_publish,
-        // The issues travel as the validator's own struct list, serialised here rather than typed
-        // into the response: they are a read-only report, and a struct field would freeze the
-        // validator's shape into the wire format the first time a code appeared on an issue.
-        issues: serde_json::to_value(&report.issues).unwrap_or_else(|_| json!([])),
-        // The media report travels the same way for the same reason: it is a report about the
-        // page, and typing it into this response would make every field of `FileState` a wire
-        // contract the day somebody wanted to add a fourth state.
-        media: serde_json::to_value(&media_report).unwrap_or_else(|_| json!({ "refs": [] })),
-        media_file_count: i32::try_from(media_report.file_count).unwrap_or(i32::MAX),
-        media_broken_count: i32::try_from(broken_count).unwrap_or(i32::MAX),
-        media_warning: media_report.summary(),
-        simulated_media: i32::try_from(simulated_broken).unwrap_or(i32::MAX),
-    }))
-}
-
-/// `?viewport=` — which screen the frame is drawing for.
-#[derive(Debug, Default, Deserialize)]
-pub struct PreviewQuery {
-    /// `mobile` asks for the phone render; anything else (including an unknown value) is the
-    /// wide one, so a typo in a link cannot produce a frame that draws nothing.
-    #[serde(default)]
-    pub viewport: Option<String>,
-    /// Comma-separated media ids the frame should pretend are **deleted** (REQ-063, slice 4).
-    ///
-    /// The frame is how an author finds out what a broken image does to their page, and the
-    /// obvious way to find out is to trash a real file — which changes the page for every
-    /// visitor and cannot be undone from the frame. Naming the ids instead means the
-    /// simulation touches nothing: the store is read exactly as it is for a normal frame and the
-    /// only difference is which map the degradation is given.
-    ///
-    /// Parsed by [`omnion_content::parse_media_filter`], so a word that is not an id and a list
-    /// longer than `MAX_MEDIA_FILTER` are both refused with a message that says which — a
-    /// silently truncated filter would answer "this file was checked" for a gallery it skipped.
-    #[serde(default)]
-    pub media: Option<String>,
-}
-
-fn preview_viewport(value: Option<&str>) -> &'static str {
-    match value.map(str::trim) {
-        Some("mobile") => "mobile",
-        _ => "desktop",
-    }
-}
-
-/// Response body of the preview frame.
-#[derive(Debug, Serialize)]
-pub struct PagePreviewBody {
-    /// Page the frame draws.
-    pub page_id: Uuid,
-    /// Address of the page inside its site.
-    pub slug: String,
-    /// Draft title, as the frame's document title.
-    pub title: String,
-    /// `desktop` or `mobile` — the screen this payload was filtered for.
-    pub viewport: &'static str,
-    /// The stored block tree, unfiltered.
-    pub blocks: Value,
-    /// The tree this viewport actually renders.
-    pub visible_blocks: Value,
-    /// Blocks in the stored tree.
-    pub block_count: i32,
-    /// Blocks this viewport renders.
-    pub visible_count: i32,
-    /// Plain body text, for a page that still renders from its body.
-    pub body: String,
-    /// Draft revision the frame reads.
-    pub revision_id: Uuid,
-    /// Its revision number.
-    pub revision_no: i32,
-    /// The revision visitors see, when the page has one. The frame names it so the author can
-    /// see that their inline edits have not reached the public page.
-    pub published_revision_no: Option<i32>,
-    /// Whether the draft is whole enough to publish.
-    pub can_publish: bool,
-    /// Validation issues of the stored tree, so the frame can show the same badges the editor
-    /// does rather than a second opinion.
-    pub issues: Value,
-    /// The files this page's blocks name, and what can be done with each (REQ-063, slice 4).
-    ///
-    /// The frame shows this so a missing picture is a *named* thing on screen rather than a gap
-    /// the author has to infer — the whole point of the degradation is that the page still
-    /// renders, which also makes it silent unless something says why.
-    pub media: Value,
-    /// Files the tree names that cannot be served.
-    pub media_file_count: i32,
-    /// How many of those cannot be served.
-    pub media_broken_count: i32,
-    /// The one-line summary the frame's status bar prints, or an empty string when nothing is
-    /// broken — the server's wording, so the editor bar and the frame cannot disagree about it.
-    pub media_warning: String,
-    /// Ids this frame is *pretending* are deleted, and how many of them name a file on this page.
-    ///
-    /// Separate from `media_broken_count` because a simulation is the author's own experiment,
-    /// not a fact about their library, and a frame that blended the two would report a working
-    /// page as broken.
-    pub simulated_media: i32,
-}
-
 /// Read one revision of a page.
 pub async fn get_revision(
     State(state): State<AppState>,
@@ -847,140 +551,6 @@ pub async fn get_revision(
     let page = page_in_scope(&state, &current, page_id).await?;
     let revision = revision_of(&state, page.id, revision_id).await?;
     Ok(Json(RevisionBody::from(&revision)))
-}
-
-/// `GET /api/v1/pages/{id}/revisions/{revision_id}/diff?against={revision_id}`.
-///
-/// The block-level compare behind the revisions screen (REQ-063 acceptance 13): "shows
-/// added/removed/changed blocks with prop-level detail, not a raw JSON diff".
-///
-/// `against` is optional and defaults to the previous revision, so opening a revision with no
-/// query string answers the question an author actually has — "what changed in this one" —
-/// rather than refusing for a missing parameter.
-///
-/// The response carries BOTH revisions' `body` text as a plain string compare alongside the
-/// block rows. A page that still renders from its body has no blocks at all, and a compare that
-/// reported "nothing changed" for a page whose paragraphs were rewritten would be a lie; the
-/// block rows answer the same question for a block-built page and this answers it for the rest.
-pub async fn diff_revision(
-    State(state): State<AppState>,
-    current: CurrentSession,
-    Path((page_id, revision_id)): Path<(Uuid, Uuid)>,
-    Query(query): Query<DiffQuery>,
-) -> Result<Json<RevisionDiffBody>, ApiError> {
-    let page = page_in_scope(&state, &current, page_id).await?;
-    let revision = revision_of(&state, page.id, revision_id).await?;
-
-    // The base is the nearest older revision unless the caller named one. Comparing a revision
-    // with itself is refused rather than answered as "no changes": it means the query was built
-    // wrong, and returning an empty diff would hide that.
-    let base = match query.against {
-        Some(other) => revision_of(&state, page.id, other).await?,
-        None => pages::list_revisions(state.db().pool(), page.id)
-            .await?
-            .into_iter()
-            .filter(|candidate| candidate.revision_no < revision.revision_no)
-            .max_by_key(|candidate| candidate.revision_no)
-            .ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "no_earlier_revision",
-                    format!(
-                        "revision {} is the first one on this page, so there is nothing to compare it with",
-                        revision.revision_no
-                    ),
-                )
-            })?,
-    };
-
-    if base.id == revision.id {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "diff_same_revision",
-            "a revision cannot be compared with itself",
-        ));
-    }
-
-    // A payload either side cannot parse is compared as "no blocks" rather than refused: the
-    // page still renders (the renderer's own fallback takes over) and an author asking what
-    // changed should get the body compare even if one side's block tree is corrupt.
-    let blocks_of =
-        |value: &Value| omnion_content::parse_blocks(value).unwrap_or_else(|_| Vec::new());
-    let diff = omnion_content::diff_blocks(&blocks_of(&base.blocks), &blocks_of(&revision.blocks));
-
-    Ok(Json(RevisionDiffBody {
-        page_id: page.id,
-        base: DiffRevisionRef::from(&base),
-        compared: DiffRevisionRef::from(&revision),
-        blocks: serde_json::to_value(&diff).unwrap_or(Value::Null),
-        body: BodyDiff {
-            changed: base.body != revision.body,
-            before: base.body.clone(),
-            after: revision.body.clone(),
-        },
-    }))
-}
-
-/// `?against=` — which revision to compare against.
-#[derive(Debug, Default, Deserialize)]
-pub struct DiffQuery {
-    /// Revision to compare against; the nearest earlier one when omitted.
-    #[serde(default)]
-    pub against: Option<Uuid>,
-}
-
-/// One side of a compare, as a pointer rather than a full revision.
-#[derive(Debug, Serialize)]
-pub struct DiffRevisionRef {
-    /// Revision id.
-    pub id: Uuid,
-    /// Monotonic revision number.
-    pub revision_no: i32,
-    /// `draft`, `published` or `archived`.
-    pub state: String,
-    /// Revision title, for the compare header.
-    pub title: String,
-    /// Creation timestamp, RFC 3339.
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-}
-
-impl From<&PageRevision> for DiffRevisionRef {
-    fn from(revision: &PageRevision) -> Self {
-        Self {
-            id: revision.id,
-            revision_no: revision.revision_no,
-            state: revision.state.clone(),
-            title: revision.title.clone(),
-            created_at: revision.created_at,
-        }
-    }
-}
-
-/// How a revision's plain body text compared.
-#[derive(Debug, Serialize)]
-pub struct BodyDiff {
-    /// `false` when the two bodies are byte-identical.
-    pub changed: bool,
-    /// Body before.
-    pub before: String,
-    /// Body after.
-    pub after: String,
-}
-
-/// The compare two revisions, as the revisions screen reads it.
-#[derive(Debug, Serialize)]
-pub struct RevisionDiffBody {
-    /// Page the compare belongs to.
-    pub page_id: Uuid,
-    /// The revision the change is measured from.
-    pub base: DiffRevisionRef,
-    /// The revision being read.
-    pub compared: DiffRevisionRef,
-    /// The block compare: `entries`, `added`, `removed`, `changed`, `moved`, `has_removals`.
-    pub blocks: Value,
-    /// The body compare, for a page that still renders from plain text.
-    pub body: BodyDiff,
 }
 
 /// One comment on a revision, as the panel reads it.
@@ -1319,7 +889,6 @@ mod tests {
             title: None,
             body: None,
             summary: None,
-            blocks: None,
         }
         .changes();
         assert_eq!(rename.slug.as_deref(), Some(" About "));
@@ -1330,27 +899,9 @@ mod tests {
             title: None,
             body: None,
             summary: None,
-            blocks: None,
         }
         .changes();
         assert!(empty.is_empty(), "an empty patch changes nothing");
-    }
-
-    #[test]
-    fn a_block_only_patch_is_a_content_change() {
-        // REQ-063: blocks live on the revision, so saving a block tree writes a draft revision
-        // exactly like saving the body does. A panel that only sends `blocks` must therefore
-        // never look like a no-op.
-        let blocks_only = UpdatePageRequest {
-            slug: None,
-            title: None,
-            body: None,
-            summary: None,
-            blocks: Some(serde_json::json!([])),
-        }
-        .changes();
-        assert!(blocks_only.touches_content());
-        assert!(!blocks_only.is_empty());
     }
 
     #[test]

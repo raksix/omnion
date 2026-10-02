@@ -91,10 +91,6 @@ function collect() {
 
 async function reviewOne(file) {
   const b64 = fs.readFileSync(file).toString("base64");
-  // The walkthrough may write JPEG bytes under a .png name when the volume is tight
-  // (QA_SHOT_MODE=viewport), so the data URL has to name the format the bytes really are —
-  // a JPEG announced as PNG is a decode failure, not a finding.
-  const jpeg = b64.startsWith("/9j/");
   const body = {
     model: MODEL,
     max_tokens: 2200,
@@ -103,7 +99,7 @@ async function reviewOne(file) {
         role: "user",
         content: [
           { type: "text", text: PROMPT },
-          { type: "image_url", image_url: { url: `data:image/${jpeg ? "jpeg" : "png"};base64,${b64}` } },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } },
         ],
       },
     ],

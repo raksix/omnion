@@ -8,8 +8,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { Boxes, ImageIcon, Pencil, Plus, RefreshCw, Rocket } from "lucide-react";
-import Link from "next/link";
+import { Pencil, Plus, RefreshCw, Rocket } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
@@ -32,20 +31,6 @@ function revisionNote(page: Page): string {
   const live = page.published ? `live v${page.published.revision_no}` : "not published";
   const pending = page.draft ? ` · draft v${page.draft.revision_no}` : "";
   return `${live}${pending}`;
-}
-
-/** Blocks the page's working draft carries, nested ones included (REQ-063). */
-function blockCountOf(page: Page): number {
-  const walk = (nodes: unknown[]): number =>
-    nodes.reduce<number>((sum, node) => {
-      if (typeof node !== "object" || node === null) {
-        return sum;
-      }
-      const children = (node as { children?: unknown[] }).children;
-      return sum + 1 + (Array.isArray(children) ? walk(children) : 0);
-    }, 0);
-  const draft = page.draft ?? page.published;
-  return Array.isArray(draft?.blocks) ? walk(draft.blocks) : 0;
 }
 
 /** The address a title suggests: `About Us!` → `about-us` (the shape the API accepts). */
@@ -265,7 +250,6 @@ export function PagesView() {
 
       {editor ? (
         <form
-          data-page-form
           className="overflow-hidden rounded-xl border border-line bg-surface"
           onSubmit={(event) => {
             event.preventDefault();
@@ -339,7 +323,6 @@ export function PagesView() {
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="submit"
-                data-page-save
                 disabled={saving}
                 className="rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-quiet-soft disabled:text-muted"
               >
@@ -390,7 +373,6 @@ export function PagesView() {
             </button>
             <button
               type="button"
-              data-page-new
               onClick={openCreate}
               className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong"
             >
@@ -447,9 +429,6 @@ export function PagesView() {
                   <th scope="col" className="hidden px-4 py-2.5 sm:table-cell">
                     Type
                   </th>
-                  <th scope="col" className="hidden px-4 py-2.5 lg:table-cell">
-                    Blocks
-                  </th>
                   <th scope="col" className="px-4 py-2.5">
                     State
                   </th>
@@ -475,13 +454,6 @@ export function PagesView() {
                       </span>
                     </td>
                     <td className="hidden px-4 py-3.5 text-muted sm:table-cell">{page.page_type}</td>
-                    {/* The block count of the working draft, so the list says at a glance
-                        whether a page is a text page or a built one (REQ-063). */}
-                    <td className="hidden px-4 py-3.5 whitespace-nowrap text-muted lg:table-cell">
-                      {blockCountOf(page) === 0
-                        ? "text page"
-                        : `${blockCountOf(page)} blocks`}
-                    </td>
                     <td className="px-4 py-3.5 whitespace-nowrap">
                       <StatusBadge status={page.status} />
                     </td>
@@ -501,25 +473,6 @@ export function PagesView() {
                               `sm` up, so the actions column never pushes the table past the card. */}
                           <span className="hidden sm:inline">Edit</span>
                         </button>
-                        <Link
-                          href={`/pages/${page.id}/edit`}
-                          aria-label={`Edit the blocks of ${pageTitle(page)}`}
-                          className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas"
-                        >
-                          <Boxes className="size-3" aria-hidden />
-                          <span className="hidden sm:inline">Blocks</span>
-                        </Link>
-                        {/* The featured image is its own route (REQ-064 slice 4d), so the list
-                            links to it the way it links to the block editor rather than growing a
-                            drawer that would have to own a second unsaved state. */}
-                        <Link
-                          href={`/pages/${page.id}/media`}
-                          aria-label={`Choose the featured image of ${pageTitle(page)}`}
-                          className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas"
-                        >
-                          <ImageIcon className="size-3" aria-hidden />
-                          <span className="hidden sm:inline">Image</span>
-                        </Link>
                         <button
                           type="button"
                           onClick={() => void publish(page)}

@@ -95,6 +95,68 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         hint: "The key/value settings of your organization",
         route: "/settings/search",
     },
+    // The CRM's three registers (docs/requests/REQ-051). Contacts and companies share
+    // `crm.contacts.read` because the module already treats them as one surface — a person is
+    // read on the screen that lists them. Deals carry their own key: the board is the one CRM
+    // screen that exposes an organization's commercial position, so a role that may know who a
+    // customer is does not thereby get to know what they are negotiating.
+    //
+    // A deal's document carries its amount and its stage because those are what somebody searching
+    // for "the renewal" is actually looking for — but **not** the deal's company or contact, which
+    // are separate registers with their own read decision behind them.
+    ProviderSpec {
+        key: "contacts",
+        title: "Contacts",
+        entity_type: "contact",
+        permission: "crm.contacts.read",
+        hint: "The people in your CRM, matched on name, e-mail, company or title",
+        route: "/crm/contacts",
+    },
+    ProviderSpec {
+        key: "companies",
+        title: "Companies",
+        entity_type: "company",
+        permission: "crm.contacts.read",
+        hint: "The companies in your CRM, matched on name, domain or industry",
+        route: "/crm/companies",
+    },
+    ProviderSpec {
+        key: "deals",
+        title: "Deals",
+        entity_type: "deal",
+        permission: "crm.deals.read",
+        hint: "The open and won deals of your pipelines, matched on title, company or stage",
+        route: "/crm/deals",
+    },
+    // The two sales documents (docs/requests/REQ-052). Quotes and orders are **two** providers
+    // rather than one, for the same reason deals carry their own key: they are guarded by
+    // different screens (`sales.quotes.read` opens the quote desk, `sales.orders.read` the order
+    // book), so a person who may price an offer but not see the delivery book gets one section
+    // and not the other. Merging them behind an "any of" guard would give whichever half they
+    // hold a list of rows the other half covers.
+    //
+    // The **number** is the title, not the customer, and that is the deliberate inversion: a
+    // seller reading a printed order types `Q-2026-0007` or `O-2026-0007` and expects one row,
+    // while the customer name is searched for often enough to live at weight D beside the title.
+    // A quote's `notes` and `payment_terms` are deliberately absent — the same rule the CRM
+    // keeps for a contact's notes, because the index cannot answer a per-role question about a
+    // vector and a commercial document's free text is the desk's most private column.
+    ProviderSpec {
+        key: "quotes",
+        title: "Quotes",
+        entity_type: "quote",
+        permission: "sales.quotes.read",
+        hint: "Your quotes by number, title or customer, with status and validity in the row",
+        route: "/sales/quotes",
+    },
+    ProviderSpec {
+        key: "orders",
+        title: "Orders",
+        entity_type: "order",
+        permission: "sales.orders.read",
+        hint: "Your sales orders by number or customer, with the order's state and amount",
+        route: "/sales/orders",
+    },
 ];
 
 /// Look one provider up by its key.
@@ -167,6 +229,73 @@ mod tests {
                 spec.key
             );
             assert!(!spec.title.is_empty() && !spec.hint.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_crm_registers_need_the_keys_their_screens_are_guarded_by() {
+        // The provider's permission is what the palette filters on, and the screen it points at
+        // is guarded by the same key. If the two ever drift, the palette either offers rows
+        // behind a `403` or hides rows a person may read.
+        for (key, route, permission) in [
+            ("contacts", "/crm/contacts", "crm.contacts.read"),
+            ("companies", "/crm/companies", "crm.contacts.read"),
+            ("deals", "/crm/deals", "crm.deals.read"),
+        ] {
+            let spec = provider(key).unwrap_or_else(|| panic!("{key} must be registered"));
+            assert_eq!(spec.route, route, "{key} must point at its own screen");
+            assert_eq!(spec.permission, permission, "{key} must carry its screen's key");
+        }
+        // Deals are the one CRM register with a key of its own: reading the board is a different
+        // decision from reading a contact, and a provider that shared the contact key would
+        // quietly give every contact reader the pipeline.
+        assert_ne!(
+            provider("deals").map(|spec| spec.permission),
+            provider("contacts").map(|spec| spec.permission)
+        );
+    }
+
+    #[test]
+    fn the_sales_documents_need_the_keys_their_screens_are_guarded_by() {
+        for (key, route, permission) in [
+            ("quotes", "/sales/quotes", "sales.quotes.read"),
+            ("orders", "/sales/orders", "sales.orders.read"),
+        ] {
+            let spec = provider(key).unwrap_or_else(|| panic!("{key} must be registered"));
+            assert_eq!(spec.route, route, "{key} must point at its own screen");
+            assert_eq!(
+                spec.permission, permission,
+                "{key} must carry its screen's key"
+            );
+        }
+        // Two providers, not one behind an "any of" guard. The quote desk and the order book are
+        // separate screens with separate keys, so a person who may price an offer without seeing
+        // the delivery book has to get one section and not the other — merging them would hand
+        // whichever half they hold a list of rows the other half covers.
+        assert_ne!(
+            provider("quotes").map(|spec| spec.permission),
+            provider("orders").map(|spec| spec.permission)
+        );
+    }
+
+    #[test]
+    fn every_provider_has_an_upsert_and_a_prune_or_it_is_a_row_that_never_arrives() {
+        // The registry promises "one entry here plus one arm in reindex", and the CRM shipped
+        // three entries that indexed correctly while the panel never showed them, because the
+        // second half of the registration is a TypeScript constant this crate cannot read. What
+        // *is* checkable here is the part that is silent: a provider with no upsert writes zero
+        // rows and reports success, so the bug is invisible from every log the platform prints.
+        for spec in PROVIDERS {
+            let upserted = crate::indexer::upsert_statement(spec.key, None);
+            assert!(
+                upserted.is_some(),
+                "{} has no upsert statement: it would index nothing and look healthy",
+                spec.key
+            );
+            let sql = upserted.expect("checked above");
+            // A statement that forgot its `{filter}` placeholder cannot be filtered down to one
+            // entity, so an incremental reindex would rewrite the whole provider on every save.
+            assert!(!sql.contains("{filter}"), "{} left its filter in", spec.key);
         }
     }
 

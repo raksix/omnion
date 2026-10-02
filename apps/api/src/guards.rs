@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Request};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use omnion_identity::User;
 use omnion_permissions::model::{ResourceContext, Subject};
@@ -60,8 +60,24 @@ pub struct MachinePrincipal {
 pub enum GuardKind {
     /// A signed-in session (the cookie).
     Session,
-    /// A session or a service-account key presented as `Authorization: Bearer`.
+    /// A session or a service-account key presented as `Authorization: ***
     SessionOrMachine,
+    /// A session whose permission may arrive on a **department-scoped** binding.
+    ///
+    /// This kind exists because the default context is organization-wide, and a department
+    /// binding is not a subset of it that the evaluator can find on its own:
+    /// `Scope::Department::applies_to` compares `resource_id` against `context.department`,
+    /// which nothing in the plain request path populates. A role granted `hr.employees.read`
+    /// with a department scope of `team` therefore counted **zero of one** bindings and was
+    /// refused with `403` — from the route guard, before the HR handler that would have honoured
+    /// the level ever ran. The refusal was correct under the rule it was applying and useless as
+    /// a product: the only way to hold an HR visibility level at all was an organization grant,
+    /// which is exactly the level the level exists to stop somebody being given.
+    ///
+    /// The guard tries the organization context first and then each department the caller's
+    /// bindings actually name, so an organization-scoped role keeps working unchanged and a
+    /// department-scoped one opens the route as well.
+    SessionDepartmentScoped,
     /// A session, a service-account key, or a **developer API key** — a delegation with a
     /// scope list rather than a role.
     ///
@@ -81,6 +97,11 @@ pub struct RequirePermission {
     state: AppState,
     permission: &'static str,
     kind: GuardKind,
+    /// A second permission that also opens the route, when the layer is an "any of" one.
+    ///
+    /// A `&'static [&'static str]` rather than a `Vec` because the set is fixed at wiring time:
+    /// there is nothing to allocate and nothing a caller can change after the fact.
+    alternatives: &'static [&'static str],
 }
 
 impl RequirePermission {
@@ -91,6 +112,26 @@ impl RequirePermission {
             state,
             permission,
             kind: GuardKind::Session,
+            alternatives: &[],
+        }
+    }
+
+    /// Build a layer that opens for **any one** of the named permissions.
+    ///
+    /// Its own constructor because "or" cannot be spelled by picking a primary and hoping: the
+    /// check has to try each and refuse only when all of them say no, and a caller passing the
+    /// first name as `permission` with the rest as alternatives would have to know that the
+    /// primary is tried first and why — exactly the kind of knowledge a route author should not
+    /// need. The refusal names **all** of them, so somebody who got a 403 sees the whole set
+    /// they were measured against rather than the first name that happened to be tried.
+    #[must_use]
+    pub fn new_any(state: AppState, permissions: &'static [&'static str]) -> Self {
+        let (first, rest) = permissions.split_first().expect("a guard needs one permission");
+        Self {
+            state,
+            permission: first,
+            kind: GuardKind::Session,
+            alternatives: rest,
         }
     }
 
@@ -101,6 +142,7 @@ impl RequirePermission {
             state,
             permission,
             kind: GuardKind::SessionOrMachine,
+            alternatives: &[],
         }
     }
 }
@@ -128,7 +170,79 @@ pub fn require_or_developer_key(state: &AppState, permission: &'static str) -> R
         state: state.clone(),
         permission,
         kind: GuardKind::SessionOrDeveloperKey,
+        alternatives: &[],
     }
+}
+
+/// Guard a route with **any one** of `permissions`.
+///
+/// The only route in the platform that uses it is the sales desk's global search
+/// (docs/requests/REQ-052, slice 4b), and the reason it could not simply be two routes is worth
+/// recording: the ⌘K palette is on every screen, so a person whose job is deliveries and not
+/// quoting must still find their order by typing a customer's name. Requiring both keys would make
+/// the search silently absent for half the sales desk — a feature that vanishes with no message,
+/// which is worse than a feature that is not there.
+#[must_use]
+pub fn require_any(state: &AppState, permissions: &'static [&'static str]) -> RequirePermission {
+    RequirePermission::new_any(state.clone(), permissions)
+}
+
+/// Guard a route whose permission may be held on a **department-scoped** binding.
+///
+/// The HR directory is the reason this exists, and the shape of the gap is worth naming because
+/// it is invisible from the route table: `require()` authorizes against an organization-wide
+/// context, so a role whose grant is scoped to a department is consulted with
+/// `context.department = None`, matched by nothing, and refused. The HR module reads the very
+/// same bindings afterwards to decide *how much* of the directory the caller sees, so the level
+/// was fully implemented and unreachable — a request that should have answered "your team" was
+/// stopped one layer earlier with a permission error naming a key the caller demonstrably holds.
+///
+/// The department names are read from the caller's own bindings rather than taken as an argument:
+/// the guard is wired at startup and a route layer cannot know who will call it, and a hard-coded
+/// department would silently refuse everybody else. The organization context is still tried
+/// first, so every organization-scoped role behaves exactly as it did before.
+#[must_use]
+pub fn require_department_scoped(
+    state: &AppState,
+    permission: &'static str,
+) -> RequirePermission {
+    RequirePermission {
+        state: state.clone(),
+        permission,
+        kind: GuardKind::SessionDepartmentScoped,
+        alternatives: &[],
+    }
+}
+
+/// The department names a caller's allow-bindings actually name, for one permission.
+///
+/// Read from `role_bindings` joined to `role_permissions` rather than from any list the caller
+/// supplies, so a level can only be one the tenant granted. `own`/`team`/`all` are the HR
+/// visibility levels stored in the same column as a real department name, and both are returned
+/// here: the guard only asks "does this binding open the route", and the HR handler is what
+/// decides what an opened route may show.
+async fn granted_departments(
+    state: &AppState,
+    user_id: Uuid,
+    organization_id: Uuid,
+    permission: &str,
+) -> Vec<String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "select distinct rb.resource_id \
+         from role_bindings rb \
+         join role_permissions rp on rp.role_id = rb.role_id \
+         where rb.user_id = $1 and rb.organization_id = $2 \
+           and rb.scope_type = 'department' and rb.resource_id is not null \
+           and rb.revoked_at is null and (rb.expires_at is null or rb.expires_at > now()) \
+           and rp.effect = 'allow' and rp.permission_key = $3",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .bind(permission)
+    .fetch_all(state.db().pool())
+    .await
+    .unwrap_or_default();
+    rows.into_iter().map(|(name,)| name).collect()
 }
 
 impl<S> Layer<S> for RequirePermission {
@@ -140,6 +254,7 @@ impl<S> Layer<S> for RequirePermission {
             state: self.state.clone(),
             permission: self.permission,
             kind: self.kind,
+            alternatives: self.alternatives,
         }
     }
 }
@@ -151,6 +266,7 @@ pub struct RequirePermissionService<S> {
     state: AppState,
     permission: &'static str,
     kind: GuardKind,
+    alternatives: &'static [&'static str],
 }
 
 impl<S> Service<Request<Body>> for RequirePermissionService<S>
@@ -173,6 +289,7 @@ where
         let state = self.state.clone();
         let permission = self.permission;
         let kind = self.kind;
+        let alternatives = self.alternatives;
         // `Request<Body>` is not `Sync`, so the guard works on a copy of the headers and hands
         // the whole request to the handler afterwards.
         let headers = request.headers().clone();
@@ -181,40 +298,77 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
+// An "any of" layer tries **every** name — the primary first, then the
+            // alternatives — and keeps the first caller it gets.
+            //
+            // Both halves of that sentence are load-bearing, and the first version of this
+            // got the first half wrong in the quietest possible way: it looped over
+            // `alternatives` alone, and `alternatives` holds the *second* name onwards because
+            // `new_any` peeled the first one off to be `permission`. So the layer that existed
+            // precisely so a quotes-only reader could search was the one case it refused: the
+            // quotes-only account holds the primary, the primary was never tried, and the walk
+            // caught it as a 403 naming both keys. The refusal held back until the last name has
+            // been tried too, or a signed-in holder of the second key would be told they are not
+            // signed in.
+            //
+            // The loop asks the **reporting** variant, not `check_kind`, so a refusal keeps the
+            // caller that produced it: an "any of" guard that denies every name still knows who
+            // was refused, and the request log can write that row with its organization rather
+            // than with `organization_id = null` — which is a row no log screen filters to.
+            if !alternatives.is_empty() {
+                let mut last: Option<ApiError> = None;
+                let mut principal = crate::request_log_middleware::ResolvedPrincipal {
+                    permission: Some(permission.to_owned()),
+                    ..Default::default()
+                };
+                for name in std::iter::once(permission).chain(alternatives.iter().copied()) {
+                    let decision = check_kind_reporting(&state, &headers, name, kind).await;
+                    // Each attempt is logged under the name it was tried with, so the log says
+                    // which scope was being measured rather than only which set it belongs to.
+                    principal.permission = Some(name.to_owned());
+                    match decision {
+                        Ok(caller) => {
+                            merge_principal(&mut principal, &principal_of_caller(&caller, name));
+                            insert_caller(&mut request, caller);
+                            return finish(inner, request, principal).await;
+                        }
+                        Err((error, partial)) => {
+                            if let Some(partial) = partial {
+                                merge_principal(&mut principal, &partial);
+                            }
+                            last = Some(error);
+                        }
+                    }
+                }
+                let Some(error) = last else {
+                    return finish(inner, request, principal).await;
+                };
+                // The refusal names the whole set, not the name that happened to be tried last.
+                let response = explain_any_denial(error, permission, alternatives).into_response();
+                return Ok(attach_principal(response, principal));
+            }
+
             // The reporting variant, so a **refusal** also carries a caller. This is the whole
             // point of the split: a 403 that says "add the `content.pages.read` scope" and is
             // stored with no organization is a row no log screen can ever show, because every
             // screen filters on organization. The walk below caught exactly that.
             let decision = check_kind_reporting(&state, &headers, permission, kind).await;
             let principal = match &decision {
-                Ok(Caller::Session(session)) => crate::request_log_middleware::ResolvedPrincipal {
-                    user_id: Some(session.user.id),
-                    user_name: display_name_of(session),
-                    organization_id: session.user.organization_id,
-                    permission: Some(permission.to_owned()),
-                    ..Default::default()
-                },
-                Ok(Caller::Machine(machine)) => machine_principal_of(machine, permission),
+                Ok(caller) => principal_of_caller(caller, permission),
                 // The refusal's own answer. `None` only when a presented key was not found at
                 // all, which genuinely has no caller to name.
-                Err((_, Some(partial))) => partial.clone(),
-                Err((_, None)) => crate::request_log_middleware::ResolvedPrincipal {
-                    permission: Some(permission.to_owned()),
-                    ..Default::default()
-                },
+                Err((_, partial)) => partial.clone().unwrap_or_default(),
             };
 
-            let response = match decision {
+            match decision {
                 Ok(Caller::Session(session)) => {
                     request.extensions_mut().insert(*session);
-                    inner.call(request).await
                 }
                 Ok(Caller::Machine(machine)) => {
                     request.extensions_mut().insert(machine);
-                    inner.call(request).await
                 }
-                Err((error, _)) => Ok(error.into_response()),
-            };
+                Err((error, _)) => return Ok(attach_principal(error.into_response(), principal)),
+            }
 
             // **On the response, not the request, and not in a task-local.** The request log's
             // layer sits *outside* this guard, so by the time it regains control the request has
@@ -232,14 +386,42 @@ where
             // `S::Error = Infallible`, so the error arm is matched rather than unwrapped: the
             // bound says an observing guard can never be handed a failed service, and writing
             // that as a `match` makes it a *checkable* statement rather than a comment.
-            let mut response = match response {
-                Ok(response) => response,
-                Err(unreachable) => match unreachable {},
-            };
-            response.extensions_mut().insert(principal);
-            Ok(response)
+            finish(inner, request, principal).await
         })
     }
+}
+
+/// Put a resolved caller into the request's extensions, whichever kind it is.
+fn insert_caller(request: &mut Request<Body>, caller: Caller) {
+    match caller {
+        Caller::Session(session) => {
+            request.extensions_mut().insert(*session);
+        }
+        Caller::Machine(machine) => {
+            request.extensions_mut().insert(machine);
+        }
+    }
+}
+
+/// A refusal from an "any of" guard, naming every permission that was tried.
+///
+/// The single-permission refusal explains one key; this one has to explain the set, because a
+/// person who ran the simulator against their own role and still got a 403 needs to see the whole
+/// list they were measured against. A `401` passes through untouched — there is no permission set
+/// to explain to somebody who is not signed in at all.
+fn explain_any_denial(
+    error: ApiError,
+    first: &'static str,
+    rest: &'static [&'static str],
+) -> ApiError {
+    if error.status() != StatusCode::FORBIDDEN {
+        return error;
+    }
+    let names: Vec<&str> = std::iter::once(first).chain(rest.iter().copied()).collect();
+    ApiError::forbidden(
+        "permission_denied",
+        format!("this needs one of: {}", names.join(", ")),
+    )
 }
 
 /// The name a log row shows for a signed-in account.
@@ -279,6 +461,83 @@ fn machine_principal_of(
         api_key_prefix: machine.key_prefix.clone(),
         organization_id: Some(machine.organization_id),
         permission: Some(permission.to_owned()),
+    }
+}
+
+/// The log's view of a resolved caller, whichever kind it is.
+///
+/// One function for both paths so the "any of" loop and the single-permission guard cannot
+/// disagree about what a caller looks like in the log. They did, for one tick: the loop built a
+/// principal with a permission name and nothing else, so an "any of" refusal was the one row the
+/// request log stored with no user and no organization.
+fn principal_of_caller(
+    caller: &Caller,
+    permission: &'static str,
+) -> crate::request_log_middleware::ResolvedPrincipal {
+    match caller {
+        Caller::Session(session) => crate::request_log_middleware::ResolvedPrincipal {
+            user_id: Some(session.user.id),
+            user_name: display_name_of(session),
+            organization_id: session.user.organization_id,
+            permission: Some(permission.to_owned()),
+            ..Default::default()
+        },
+        Caller::Machine(machine) => machine_principal_of(machine, permission),
+    }
+}
+
+/// Fold a partial answer into the running one, keeping whichever half is populated.
+///
+/// The "any of" loop tries several names and keeps the last partial it saw, because each attempt
+/// names a different `permission` while user/organization stay the same. A field that is `None`
+/// in the newer answer must not erase one that was resolved: `None` here means "this attempt
+/// could not say", not "there is no user".
+fn merge_principal(
+    into: &mut crate::request_log_middleware::ResolvedPrincipal,
+    from: &crate::request_log_middleware::ResolvedPrincipal,
+) {
+    if into.user_id.is_none() {
+        into.user_id = from.user_id;
+    }
+    if into.user_name.is_empty() {
+        into.user_name = from.user_name.clone();
+    }
+    if into.api_key_id.is_none() {
+        into.api_key_id = from.api_key_id;
+    }
+    if into.api_key_prefix.is_none() {
+        into.api_key_prefix = from.api_key_prefix.clone();
+    }
+    if into.organization_id.is_none() {
+        into.organization_id = from.organization_id;
+    }
+}
+
+/// Put the principal on the response, which is the only carrier that outlives the handler.
+fn attach_principal(
+    mut response: Response<Body>,
+    principal: crate::request_log_middleware::ResolvedPrincipal,
+) -> Response<Body> {
+    response.extensions_mut().insert(principal);
+    response
+}
+
+/// Call the handler and return its response carrying `principal`.
+async fn finish<S>(
+    inner: S,
+    request: Request<Body>,
+    principal: crate::request_log_middleware::ResolvedPrincipal,
+) -> Result<Response<Body>, Infallible>
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = Infallible>,
+{
+    let mut inner = inner;
+    // `S::Error = Infallible`, so the error arm is matched rather than unwrapped: the bound says
+    // an observing guard can never be handed a failed service, and writing that as a `match`
+    // makes it a *checkable* statement rather than a comment.
+    match inner.call(request).await {
+        Ok(response) => Ok(attach_principal(response, principal)),
+        Err(unreachable) => match unreachable {},
     }
 }
 
@@ -363,6 +622,39 @@ pub async fn check_kind_reporting(
         };
         let scope = scope_of(&session.user);
         let context = ResourceContext::from_scope(scope.clone());
+// A department-scoped guard is the organization context **plus** one context per
+        // department the caller actually holds the permission on. The first decision that allows
+        // the request wins, and the denial that is finally reported is the organization one, so
+        // the explanation an operator reads is still the one about the whole tenant.
+        if kind == GuardKind::SessionDepartmentScoped {
+            if let Some(organization_id) = session.user.organization_id {
+                let departments = granted_departments(
+                    state,
+                    session.user.id,
+                    organization_id,
+                    permission,
+                )
+                .await;
+                for department in departments {
+                    let scoped = ResourceContext {
+                        organization_id: Some(organization_id),
+                        department: Some(department),
+                        ..ResourceContext::default()
+                    };
+                    if let Decision::Allowed(_) = authorize_subject(
+                        state.db().pool(),
+                        Subject::User(session.user.id),
+                        &scoped,
+                        permission,
+                    )
+                    .await
+                    .map_err(|error| (ApiError::from(error), None))?
+                {
+                        return Ok(Caller::Session(Box::new(session)));
+                    }
+                }
+            }
+        }
         // A store failure here is not a refusal and has no principal worth reporting, so it is
         // the one `?` in this function that carries `None`.
         let decision = authorize(state.db().pool(), session.user.id, scope, permission)

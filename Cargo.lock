@@ -1447,7 +1447,12 @@ dependencies = [
  "omnion-health",
  "omnion-identity",
  "omnion-media",
+ "omnion-module-accounting",
  "omnion-module-analytics",
+ "omnion-module-crm",
+ "omnion-module-hr",
+ "omnion-module-inventory",
+ "omnion-module-sales",
  "omnion-notifications",
  "omnion-onboarding",
  "omnion-permissions",
@@ -1459,7 +1464,6 @@ dependencies = [
  "p256",
  "percent-encoding",
  "rand 0.8.8",
- "redis",
  "reqwest",
  "rsa",
  "serde",
@@ -1530,7 +1534,6 @@ dependencies = [
 name = "omnion-cli"
 version = "0.1.0"
 dependencies = [
- "omnion-content",
  "omnion-core",
  "omnion-identity",
  "omnion-onboarding",
@@ -1544,16 +1547,9 @@ dependencies = [
 name = "omnion-content"
 version = "0.1.0"
 dependencies = [
- "omnion-identity",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "sha2",
  "sqlx",
  "thiserror 2.0.21",
  "time",
- "time-tz",
- "tokio",
  "uuid",
 ]
 
@@ -1673,11 +1669,78 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-module-accounting"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-module-analytics"
 version = "0.1.0"
 dependencies = [
  "hex",
  "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-module-crm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-module-hr"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-module-inventory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-module-sales"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "sha2",

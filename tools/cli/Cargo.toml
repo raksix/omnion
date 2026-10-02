@@ -18,10 +18,3 @@ omnion-core = { path = "../../crates/core" }
 omnion-identity = { path = "../../crates/identity" }
 omnion-onboarding = { path = "../../crates/onboarding" }
 omnion-storage = { path = "../../crates/storage" }
-
-[dev-dependencies]
-# The scaffolder writes a manifest, and a scaffolder that emits a manifest the platform's
-# own validator refuses is a scaffolder that reports success and produces a theme that cannot
-# be activated. The unit test runs the REAL `manifest_shape` over the generated JSON, so the
-# contract is checked by the code the loader uses rather than by a copy of its rules.
-omnion-content = { path = "../../crates/content" }

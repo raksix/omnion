@@ -230,6 +230,136 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &["ai", "models"],
         contexts: &[],
     },
+    // The sales desk's four screens and the two commands that create documents (REQ-052). Each
+    // names the key the screen it opens is guarded by, for the reason the CRM's providers do: a
+    // palette row that offers a 403 is worse than a row that is not there, and `visible` is the
+    // filter — the panel cannot render a command the API would refuse.
+    //
+    // The route of a create command is its screen with `?new=1`, the same contract as
+    // `nav.create-page`: running the command opens the list with the form ready, rather than
+    // navigating to a route that does not exist yet and hoping the screen reads the parameter.
+    CommandSpec {
+        id: "nav.sales-quotes",
+        title: "Open quotes",
+        group: "Sales",
+        hint: "Your quotes with their status, validity and grand total",
+        icon: "file-signature",
+        kind: CommandKind::Navigate,
+        permission: Some("sales.quotes.read"),
+        route: "/sales/quotes",
+        confirm: false,
+        keywords: &["quotes", "quotations", "offers", "proposals", "pricing"],
+        aliases: &["quotes", "quotations"],
+        contexts: &["/sales/orders", "/crm/deals"],
+    },
+    CommandSpec {
+        id: "nav.create-quote",
+        title: "Create a quote",
+        group: "Sales",
+        hint: "Opens the quote desk with a new quote ready to price",
+        icon: "file-plus",
+        kind: CommandKind::Navigate,
+        permission: Some("sales.quotes.create"),
+        route: "/sales/quotes/new",
+        confirm: false,
+        keywords: &["new quote", "add quote", "price", "offer", "proposal"],
+        aliases: &["new quote", "add quote"],
+        contexts: &["/sales/quotes", "/sales/orders", "/crm/deals"],
+    },
+    CommandSpec {
+        id: "nav.sales-orders",
+        title: "Open orders",
+        group: "Sales",
+        hint: "Confirmed and draft orders, with their reservation and invoice state",
+        icon: "package-check",
+        kind: CommandKind::Navigate,
+        permission: Some("sales.orders.read"),
+        route: "/sales/orders",
+        confirm: false,
+        keywords: &["orders", "deliveries", "fulfilment", "fulfillment", "book"],
+        aliases: &["orders"],
+        contexts: &["/sales/quotes"],
+    },
+    CommandSpec {
+        id: "nav.sales-catalog",
+        title: "Open the product catalog",
+        group: "Sales",
+        hint: "Sellable products, their units and their default price",
+        icon: "package",
+        kind: CommandKind::Navigate,
+        permission: Some("sales.products.read"),
+        route: "/sales/catalog",
+        confirm: false,
+        keywords: &["catalog", "products", "prices", "sku", "items"],
+        aliases: &["catalog", "products"],
+        contexts: &["/sales/quotes", "/sales/pricelists"],
+    },
+    // The accounting desk's three slice-1 screens and the one command that creates a document
+    // (REQ-054, slice 1). Same rule as the sales rows above: each names the key the screen it
+    // opens is guarded by, so the palette can never offer a row the API would answer 403.
+    //
+    // The "post an entry" command is the one worth reading twice. It runs **with the drawer
+    // open**, not a route that does not exist yet: the posting form is a grid whose running
+    // balance is the operator's reference while they type, and navigating away from the list to
+    // compose would take that reference out of view. So its route is the journal with
+    // `?compose=1`, which is the same contract as `nav.create-quote` — a parameter the screen
+    // already reads — rather than a screen that does not exist until slice 2.
+    CommandSpec {
+        id: "nav.accounting-journal",
+        title: "Open the journal",
+        group: "Accounting",
+        hint: "Posted entries with their debit and credit totals and a balanced badge",
+        icon: "scroll-text",
+        kind: CommandKind::Navigate,
+        permission: Some("accounting.journal.read"),
+        route: "/accounting/journal",
+        confirm: false,
+        keywords: &["journal", "ledger", "entries", "debit", "credit", "balance", "gl"],
+        aliases: &["journal", "ledger"],
+        contexts: &["nav.accounting-accounts", "nav.accounting-tax-rates"],
+    },
+    CommandSpec {
+        id: "act.post-journal-entry",
+        title: "Post a journal entry",
+        group: "Accounting",
+        hint: "Opens the journal with a balanced entry ready to fill in",
+        icon: "file-plus",
+        kind: CommandKind::Navigate,
+        permission: Some("accounting.journal.manage"),
+        route: "/accounting/journal?compose=1",
+        confirm: false,
+        keywords: &["post entry", "journal entry", "debit", "credit", "book", "accrue"],
+        aliases: &["post entry", "new journal entry"],
+        contexts: &["nav.accounting-journal", "nav.accounting-accounts"],
+    },
+    CommandSpec {
+        id: "nav.accounting-accounts",
+        title: "Open the chart of accounts",
+        group: "Accounting",
+        hint: "The account tree by kind, with how many journal lines each one carries",
+        icon: "book-open",
+        kind: CommandKind::Navigate,
+        permission: Some("accounting.accounts.read"),
+        route: "/accounting/accounts",
+        confirm: false,
+        keywords: &["accounts", "chart of accounts", "coa", "ledger accounts", "code"],
+        aliases: &["accounts", "chart of accounts"],
+        contexts: &["nav.accounting-journal"],
+    },
+    CommandSpec {
+        id: "nav.accounting-tax-rates",
+        title: "Open the tax rates",
+        group: "Accounting",
+        hint: "Sales and purchase rates, with the one default per side",
+        icon: "percent",
+        kind: CommandKind::Navigate,
+        permission: Some("accounting.accounts.read"),
+        route: "/accounting/tax-rates",
+        confirm: false,
+        keywords: &["tax", "vat", "rates", "percent", "duty"],
+        aliases: &["tax rates", "vat"],
+        contexts: &["nav.accounting-journal", "nav.accounting-accounts"],
+    },
     CommandSpec {
         id: "act.reindex-search",
         title: "Rebuild the search index",
@@ -376,6 +506,54 @@ mod tests {
                 .all(|spec| spec.is_action()),
             "only an action may carry no route: it never opens a screen"
         );
+    }
+
+    #[test]
+    fn the_sales_commands_are_gated_by_the_keys_their_screens_are_guarded_by() {
+        // The palette's promise is that it never offers a command the API would refuse. A create
+        // command whose key drifted from its screen's guard produces a row that 403s on click,
+        // which is the one failure this registry cannot have: the command looks real and the
+        // click is a dead end.
+        for (id, route, permission) in [
+            ("nav.sales-quotes", "/sales/quotes", "sales.quotes.read"),
+            ("nav.create-quote", "/sales/quotes/new", "sales.quotes.create"),
+            ("nav.sales-orders", "/sales/orders", "sales.orders.read"),
+            ("nav.sales-catalog", "/sales/catalog", "sales.products.read"),
+        ] {
+            let spec = command(id).unwrap_or_else(|| panic!("{id} must be registered"));
+            assert_eq!(spec.route, route, "{id} must open its own screen");
+            assert_eq!(
+                spec.permission,
+                Some(permission),
+                "{id} must carry the key its screen is guarded by"
+            );
+            assert_eq!(spec.kind, CommandKind::Navigate, "{id} opens a screen");
+            assert!(!spec.confirm, "opening a screen asks nothing");
+        }
+    }
+
+    #[test]
+    fn creating_a_quote_needs_the_create_key_and_not_merely_the_read_key() {
+        // The acceptance criterion names this gate explicitly, so it is proved by its negative:
+        // a seller who may *read* quotes must not be offered the command that writes one. The
+        // permission half alone would pass while the create half was absent, and a read-only
+        // account is exactly the one that would discover it.
+        fn ids(allows: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
+            visible(allows).into_iter().map(|spec| spec.id).collect()
+        }
+
+        let read_only = ids(&allows(&["sales.quotes.read", "sales.orders.read"]));
+        assert!(
+            read_only.contains(&"nav.sales-quotes"),
+            "a reader may open the desk"
+        );
+        assert!(
+            !read_only.contains(&"nav.create-quote"),
+            "a reader must not be offered Create a quote"
+        );
+
+        let seller = ids(&allows(&["sales.quotes.read", "sales.quotes.create"]));
+        assert!(seller.contains(&"nav.create-quote"));
     }
 
     #[test]

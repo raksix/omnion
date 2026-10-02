@@ -13,7 +13,7 @@ publish = false
 # feature.
 reqwest = { workspace = true, features = ["json"] }
 
-axum = { workspace = true, features = ["multipart", "matched-path"] }
+axum = { workspace = true, features = ["multipart"] }
 tokio.workspace = true
 tower.workspace = true
 serde.workspace = true
@@ -23,10 +23,6 @@ serde_json.workspace = true
 # every category and priority filter.
 percent-encoding.workspace = true
 sqlx.workspace = true
-# The content usage meter increments its counters with a Lua script, and the typed `Script`
-# wrapper lives behind a feature this workspace does not enable — so the meter speaks raw `EVAL`
-# (the same choice `crates/security/src/limiter_redis.rs` documents for the same reason).
-redis.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -49,7 +45,12 @@ omnion-media = { path = "../../crates/media" }
 omnion-notifications = { path = "../../crates/notifications" }
 omnion-security = { path = "../../crates/security" }
 omnion-module-analytics = { path = "../../modules/analytics" }
+omnion-module-crm = { path = "../../modules/crm" }
+omnion-module-accounting = { path = "../../modules/accounting" }
+omnion-module-sales = { path = "../../modules/sales" }
 omnion-onboarding = { path = "../../crates/onboarding" }
+omnion-module-inventory = { path = "../../modules/inventory" }
+omnion-module-hr = { path = "../../modules/hr" }
 omnion-developer = { path = "../../crates/developer" }
 omnion-permissions = { path = "../../crates/permissions" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }
@@ -63,17 +64,13 @@ omnion-workflows = { path = "../../crates/workflows" }
 url.workspace = true
 base64.workspace = true
 
-# The form builder hashes a sender's address and user agent before they reach the inbox
-# (`routes/forms.rs`): the rate limiter only asks whether the same sender came back, and a
-# raw address in a form inbox turns the owner's database into a log of every visitor who used
-# the contact form.
-sha2.workspace = true
 [dev-dependencies]
 http-body-util = "0.1"
 # The passkey integration walk (tests/webauthn.rs) holds the private half of a credential and
 # signs the ceremony's own message, so the verification runs exactly as it does in production.
 p256.workspace = true
 base64.workspace = true
+sha2 = "0.10"
 rand = "0.8"
 # The enterprise sign-in walk (tests/sso_live.rs) runs a *real* identity provider — a loopback
 # OIDC/SAML server it starts itself — so the round trip is proven over a socket with real RSA

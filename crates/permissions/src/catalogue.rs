@@ -58,187 +58,6 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Restore an earlier revision",
     },
-    // The block system (REQ-063). Reading the block registry and validating a block tree touch
-    // nothing, so they ride the read key a content editor already holds; the pattern library is
-    // its own surface because a pattern is a reusable asset other pages depend on.
-    PermissionDef {
-        key: "content.blocks.read",
-        category: "content",
-        description: "Read the block registry and validate block trees",
-    },
-    PermissionDef {
-        key: "content.patterns.manage",
-        category: "content",
-        description: "Create, edit and remove content patterns",
-    },
-    PermissionDef {
-        key: "content.templates.manage",
-        category: "content",
-        description: "Create and edit page templates",
-    },
-    // The headless content API (REQ-019). Reading tokens is separated from managing them on
-    // purpose: a person who may read the list may also read the per-token usage breakdown (both
-    // are "who is calling us"), while minting, rotating and revoking are what grant a stranger
-    // read access to published content and belong to a different person.
-    PermissionDef {
-        key: "content.api.read",
-        category: "content",
-        description: "View content API tokens and usage",
-    },
-    PermissionDef {
-        key: "content.api.manage",
-        category: "content",
-        description: "Create, rotate and revoke content API tokens",
-    },
-    // The CMS depth pack (REQ-064, slice 1). Menus and scheduled publishing are two separate
-    // powers: an account that may publish a page does not thereby gain the right to rewrite the
-    // site's header, and an account that may edit the header may not schedule a post. The
-    // publishing key is `content.pages.schedule`, which already existed — the queue is that
-    // permission's queue, and inventing a second one would have made "who may schedule a post"
-    // and "who may look at the schedule" different questions about the same rows.
-    PermissionDef {
-        key: "menus.read",
-        category: "content",
-        description: "Read site menus and their items",
-    },
-    PermissionDef {
-        key: "menus.manage",
-        category: "content",
-        description: "Create, edit and remove site menus",
-    },
-    // Forms (REQ-064, slice 2) are THREE powers, and the third is the point. `forms.read`
-    // draws the builder, `forms.manage` writes the definition — and `forms.submissions.read`
-    // reads what visitors sent. Somebody who may design a contact form has no business reading
-    // its answers: every owner of a site with a contact form is somebody who can edit it, and
-    // folding the inbox into `forms.read` would hand that person the inbox as a side effect of a
-    // permission whose name says "forms", not "answers".
-    PermissionDef {
-        key: "forms.read",
-        category: "content",
-        description: "Read form definitions and the builder vocabulary",
-    },
-    PermissionDef {
-        key: "forms.manage",
-        category: "content",
-        description: "Create, edit, publish and remove forms",
-    },
-    PermissionDef {
-        key: "forms.submissions.read",
-        category: "content",
-        description: "Read and moderate form submissions",
-    },
-    // SEO toolkit (REQ-064, slice 3). Same split as everything else in the CMS: reading a
-    // site's search setup is not the power to change it, and the public sitemap/robots/redirect
-    // routes need no key at all — a crawler has no account.
-    PermissionDef {
-        key: "seo.read",
-        category: "content",
-        description: "Read page SEO, redirect rules, sitemap and broken links",
-    },
-    PermissionDef {
-        key: "seo.manage",
-        category: "content",
-        description: "Edit page SEO, redirects, sitemap settings and robots.txt",
-    },
-    // Comments (REQ-064, slice 4a). Two powers, and the split is the same one the forms
-    // inbox drew for the same reason: reading the queue is not the power to approve what is in
-    // it. A site that hands the inbox to a community manager should be able to keep the policy
-    // — the blocked words, the link limit, whether comments are on at all — with somebody else,
-    // and a deployment that folds both into one key cannot offer that.
-    PermissionDef {
-        key: "comments.read",
-        category: "content",
-        description: "Read the comment inbox and the moderation policy",
-    },
-    PermissionDef {
-        key: "comments.manage",
-        category: "content",
-        description: "Approve, spam, trash, reply, ban and change the comment policy",
-    },
-    // Newsletter (REQ-064, slice 4b). The same split as the comment inbox, for the same
-    // reason, and the argument is sharper here: reading a subscriber table already shows every
-    // address on it, so "somebody may look at the list" must not imply "somebody may re-add the
-    // people who left". An operator who can import a CSV can undo an unsubscribe in one action,
-    // and that is a moderation power, not a reporting one.
-    // Themes (REQ-062). Three keys because the surface has three different powers: seeing the
-    // gallery, reading one manifest (what the renderer's preview frame does), and changing
-    // which theme a site renders with. The last one is deliberately not implied by the first:
-    // a theme switch changes every page a signed-out visitor sees, and an account that may
-    // only LOOK at the gallery is a very common setup.
-    PermissionDef {
-        key: "themes.read",
-        category: "content",
-        description: "Read the theme gallery and a theme manifest",
-    },
-    PermissionDef {
-        key: "themes.activate",
-        category: "content",
-        description: "Activate or roll back the theme of a site",
-    },
-    // Customizing a theme is a THIRD power, not a second spelling of activation, and the split
-    // is about who can change what a visitor sees rather than *which* theme. An account that
-    // may publish the settings is rewriting every page's typography, colour and header on a
-    // live site — that is a design power — while activation only chooses between designs that
-    // already ship. Splitting them lets a brand owner switch between a prepared pair of themes
-    // without being able to recolour the primary brand, which is the setup most teams actually
-    // want.
-    PermissionDef {
-        key: "themes.customize",
-        category: "content",
-        description: "Edit, publish and restore a site's theme settings",
-    },
-    // Packages (REQ-062 slice 3). Two more powers, and neither is implied by the three above —
-    // the argument is the one the whole surface is built on, applied to a resource that
-    // crosses sites.
-    //
-    // `themes.export` is separate from `themes.read` on purpose even though it looks like a
-    // read: an export carries every published token and every customised slot *off* the
-    // platform, and "may look at the gallery" is not a grant to take the site's look with you.
-    //
-    // `themes.install` is the strongest of the five: it writes a row every site in the
-    // installation can see, and an uploaded theme is the only one that can carry markup and
-    // tokens an operator did not write. It is deliberately NOT implied by `themes.activate`,
-    // because activating something you cannot install is harmless while installing something
-    // you cannot activate is how a package nobody vetted reaches the gallery.
-    PermissionDef {
-        key: "themes.export",
-        category: "content",
-        description: "Export a site's theme as a package",
-    },
-    PermissionDef {
-        key: "themes.install",
-        category: "content",
-        description: "Validate, install and remove uploaded theme packages",
-    },
-    PermissionDef {
-        key: "newsletter.read",
-        category: "content",
-        description: "Read newsletter lists, subscribers and the issue archive",
-    },
-    PermissionDef {
-        key: "newsletter.manage",
-        category: "content",
-        description: "Create lists, import and export subscribers, change states, send issues",
-    },
-    // Memberships (REQ-064, slice 4c). The split is the same one the comment and newsletter
-    // inboxes draw, and the argument is sharpest here: reading a member table already shows
-    // every address on the site AND every place they last signed in from. An account that may
-    // only look must not be able to unblock the one member it dislikes, mint a password reset
-    // for them, or delete them — those are powers over a person, not over a record.
-    //
-    // `memberships.manage` is also what changes the SITE's policy (signup on or off, whether
-    // verification is required, what a gated page answers). Gating decides who can read which
-    // published page, so whoever holds it can quietly make a page readable again.
-    PermissionDef {
-        key: "memberships.read",
-        category: "content",
-        description: "Read visitor accounts, their sign-in history and the membership policy",
-    },
-    PermissionDef {
-        key: "memberships.manage",
-        category: "content",
-        description: "Create, verify, block and delete members, send resets, change the site policy",
-    },
     // Media.
     PermissionDef {
         key: "media.read",
@@ -801,6 +620,592 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "analytics",
         description: "Change tracking, privacy and retention settings",
     },
+    // CRM (docs/requests/REQ-051). A business separates the four powers the relationship layer
+    // actually has: seeing the people and the companies, changing them, removing them for good
+    // (archiving is a different act from editing), and the two narrower ones — merging two
+    // records is irreversible from the user's side, and the flagged fields (a contract note, a
+    // margin) are a role's decision rather than the record's.
+    PermissionDef {
+        key: "crm.contacts.read",
+        category: "crm",
+        description: "Read CRM contacts, companies and their timelines",
+    },
+    PermissionDef {
+        key: "crm.contacts.create",
+        category: "crm",
+        description: "Create CRM contacts and companies",
+    },
+    PermissionDef {
+        key: "crm.contacts.update",
+        category: "crm",
+        description: "Edit CRM contacts and companies",
+    },
+    PermissionDef {
+        key: "crm.contacts.delete",
+        category: "crm",
+        description: "Archive CRM contacts and companies",
+    },
+    PermissionDef {
+        key: "crm.contacts.merge",
+        category: "crm",
+        description: "Merge two CRM records into one",
+    },
+    PermissionDef {
+        key: "crm.fields.sensitive.read",
+        category: "crm",
+        description: "Read the CRM fields a role otherwise cannot see",
+    },
+    // Slice 2's two keys. Both exist because both acts are a way to **copy** the records rather
+    // than work with them: a saved view hands the whole filtered set to whoever opens it next, and
+    // an import writes a whole file of contacts in one request. Separating them from `.read` and
+    // `.create` is what lets a role look at the CRM without being able to exfiltrate or bulk-load
+    // it — a distinction an audit can answer.
+    PermissionDef {
+        key: "crm.views.manage",
+        category: "crm",
+        description: "Create and delete saved CRM views (a view is shared with its organization)",
+    },
+    PermissionDef {
+        key: "crm.contacts.import",
+        category: "crm",
+        description: "Import contacts and companies from a CSV",
+    },
+    // Slice 3's three keys. Deals are separated from contacts for the same reason the others
+    // are: a pipeline exposes an organization's commercial position — its total open value and
+    // its win rate are the two numbers a competitor most wants — so reading the board is its
+    // own decision rather than a side effect of being able to read a contact. Moving a card
+    // between columns is separate from editing it, and reshaping the pipeline itself (the
+    // stage editor) is the one change that retroactively rewrites everyone's history, so it
+    // gets a key of its own.
+    PermissionDef {
+        key: "crm.deals.read",
+        category: "crm",
+        description: "Read CRM deals, the pipeline board and the forecast",
+    },
+    PermissionDef {
+        key: "crm.deals.create",
+        category: "crm",
+        description: "Create CRM deals",
+    },
+    PermissionDef {
+        key: "crm.deals.update",
+        category: "crm",
+        description: "Edit CRM deals and move them between stages",
+    },
+    PermissionDef {
+        key: "crm.deals.delete",
+        category: "crm",
+        description: "Archive CRM deals",
+    },
+    PermissionDef {
+        key: "crm.pipelines.manage",
+        category: "crm",
+        description: "Create and reshape pipelines and their stages",
+    },
+    // Slice 4's keys. An activity is a note a person wrote about a person, so reading the feed
+    // and reading one record's timeline are the *same* exposure and share a key — a separate
+    // "timeline" key would let someone read a contact's history through the deal screen while
+    // being refused on the contact. Writing one is its own decision because the activity feed is
+    // the only place a CRM record's history can be *added* to.
+    PermissionDef {
+        key: "crm.activities.read",
+        category: "crm",
+        description: "Read the CRM activity feed and a record's merged timeline",
+    },
+    PermissionDef {
+        key: "crm.activities.create",
+        category: "crm",
+        description: "Log CRM activities (calls, meetings, notes and tasks)",
+    },
+    // The copilot reads a record and proposes a sentence; it never writes one. The key exists
+    // because a model that can read the whole CRM is a data-exfiltration surface even when it
+    // only ever returns text, and the audit of the call is the record of what it saw.
+    PermissionDef {
+        key: "crm.copilot.use",
+        category: "crm",
+        description: "Ask the CRM copilot to summarize a deal or draft a follow-up",
+    },
+    // The form → lead ingress. Reading the log of submissions that arrived and deciding what a
+    // submission becomes are separate decisions with separate consequences, so they are separate
+    // keys: a role that watches the pipeline fill up should not be able to silence it, and the
+    // person who configures routing is rarely the person who reads it.
+    PermissionDef {
+        key: "crm.leads.read",
+        category: "crm",
+        description: "Read the CRM lead inbox: form submissions and what became of them",
+    },
+    PermissionDef {
+        key: "crm.leads.manage",
+        category: "crm",
+        description: "Configure form → lead routing and run the ingress drain",
+    },
+    // HR (docs/requests/REQ-055). People are read, written and **exported** under separate keys,
+    // and the sensitive block is a power of its own — the request's leading risk note is that a
+    // role which can see the directory must not automatically be able to read a colleague's home
+    // address or emergency contact.
+    //
+    // The two keys that are *not* a stricter version of editing:
+    //
+    // * **`hr.employees.sensitive.read`** opens the personal block. It decides what a response
+    //   carries rather than whether the request is allowed, so the routes resolve it inside the
+    //   handler — the same split `crm.fields.sensitive.read` has.
+    // * **`hr.employees.terminate`** is separated from `.delete` because termination is not a
+    //   delete at all: the record stays, the status becomes `terminated` and the end date is
+    //   recorded. A role that may end an employment is making a statement about a person, which
+    //   is a different decision from editing their job title.
+    PermissionDef {
+        key: "hr.employees.read",
+        category: "hr",
+        description: "Read the employee directory, its departments and the org chart",
+    },
+    PermissionDef {
+        key: "hr.employees.create",
+        category: "hr",
+        description: "Add an employee record",
+    },
+    PermissionDef {
+        key: "hr.employees.update",
+        category: "hr",
+        description: "Edit an employee's own fields",
+    },
+    PermissionDef {
+        key: "hr.employees.terminate",
+        category: "hr",
+        description: "Terminate an employment: a status and an end date, never a delete",
+    },
+    PermissionDef {
+        key: "hr.employees.export",
+        category: "hr",
+        description: "Download the employee list as a file",
+    },
+    PermissionDef {
+        key: "hr.employees.sensitive.read",
+        category: "hr",
+        description: "Read the personal contact block: home address, personal phone, emergency contact",
+    },
+    PermissionDef {
+        key: "hr.departments.read",
+        category: "hr",
+        description: "Read the department tree",
+    },
+    PermissionDef {
+        key: "hr.departments.manage",
+        category: "hr",
+        description: "Create, move, merge and delete departments",
+    },
+    PermissionDef {
+        key: "hr.documents.read",
+        category: "hr",
+        description: "Read employee documents",
+    },
+    PermissionDef {
+        key: "hr.documents.manage",
+        category: "hr",
+        description: "Attach and remove employee documents",
+    },
+    // Leave (REQ-055 slice 2). The three keys split the same way the other families do, and the
+    // middle one is the interesting one:
+    //
+    // * **`hr.leave.approve` is a different act from `hr.leave.request`.** Asking for leave and
+    //   agreeing to somebody else's are separate decisions by separate people: an employee's own
+    //   request must not carry the power to approve it, or the approval chain is a formality and
+    //   the audit trail records a person approving themselves.
+    // * **`hr.leave.manage` is the catalogue, not the requests.** It writes leave *types* — the
+    //   entitlement, whether approval is needed, whether a negative balance is allowed — which is
+    //   an organization's policy decision. A role that can request leave must not be able to raise
+    //   the entitlement it is measured against.
+    PermissionDef {
+        key: "hr.leave.read",
+        category: "hr",
+        description: "Read leave requests, balances and the absence calendar",
+    },
+    PermissionDef {
+        key: "hr.leave.request",
+        category: "hr",
+        description: "Raise and cancel one's own leave request",
+    },
+    PermissionDef {
+        key: "hr.leave.approve",
+        category: "hr",
+        description: "Approve or reject a leave request somebody else raised",
+    },
+    PermissionDef {
+        key: "hr.leave.manage",
+        category: "hr",
+        description: "Create and edit leave types: entitlement, approval and negative-balance policy",
+    },
+    // Attendance (REQ-055 slice 2d). Three keys, and the split that matters is the third one:
+    //
+    // * **`hr.attendance.record` is a power, not a form.** It is what a service account holds so a
+    //   device or an import can punch somebody else's day, and it is deliberately separate from
+    //   `.manage` — a person who can correct their own forgotten punch must not thereby gain the
+    //   power to rewrite somebody else's, which is the one edit in this module that changes what
+    //   an organization's payroll thinks it owes.
+    // * **Reading is split from recording.** An employee reads their own month with no key at all
+    //   (the self-service surface), so `hr.attendance.read` is about reading *other* people's
+    //   months and the roster.
+    PermissionDef {
+        key: "hr.attendance.read",
+        category: "hr",
+        description: "Read any employee's attendance month, the daily roster and the summary",
+    },
+    PermissionDef {
+        key: "hr.attendance.record",
+        category: "hr",
+        description: "Punch the clock for another employee, as a service account or an import does",
+    },
+    PermissionDef {
+        key: "hr.attendance.manage",
+        category: "hr",
+        description: "Correct a recorded day, with a reason, for any employee",
+    },
+    // Onboarding (docs/requests/REQ-055, slice 4). Two keys rather than one, because the read and
+    // the write are different facts about an organization:
+    //
+    // * **`hr.onboarding.read`** is the board and the templates. A manager reading who is still
+    //   in progress is exactly the case the board exists for.
+    // * **`hr.onboarding.manage`** owns the templates AND the ticking. The request says an item
+    //   "can be completed by the assigned role or HR" — and the *assigned role* half is the
+    //   employee, who holds no `hr.*` key at all and ticks through `/hr/me/onboarding`. So this
+    //   key is HR applying a template to somebody, and the self-service tick is deliberately not
+    //   behind it: a guard that 403s the employee ticking their own checklist is a checklist that
+    //   HR has to do for them.
+    PermissionDef {
+        key: "hr.onboarding.read",
+        category: "hr",
+        description: "Read the onboarding board and the template catalogue",
+    },
+    PermissionDef {
+        key: "hr.onboarding.manage",
+        category: "hr",
+        description: "Create and edit onboarding templates, apply them, and tick any checklist",
+    },
+    // REQ-055 slice 4b. The reports split the way the request's own risk note does: reading a
+    // headcount is ordinary, and **exporting** it is the act that moves personal data out of the
+    // tenant into a file somebody mails around. A role that can read the table therefore does not
+    // automatically get the download — which is why this is a separate key and not a stricter
+    // version of reading.
+    PermissionDef {
+        key: "hr.reports.read",
+        category: "hr",
+        description: "Read the HR reports (headcount, turnover, absence, attendance)",
+    },
+    PermissionDef {
+        key: "hr.reports.export",
+        category: "hr",
+        description: "Export an HR report as CSV, audited",
+    },
+    // The expiry sweep is its own key rather than part of `hr.documents.manage`, because it is
+    // the one write in this module that touches **every** employee's documents rather than the
+    // one somebody is looking at, and it is the write that emits to the event bus — an automation
+    // waiting on `hr.document.expiring` is driven by whoever holds this.
+    PermissionDef {
+        key: "hr.documents.sweep",
+        category: "hr",
+        description: "Run the document expiry sweep, which announces expiring documents",
+    },
+    // Sales (docs/requests/REQ-052). The selling side splits the way the relationship layer
+    // does — read, create, edit, archive — and adds the two powers that are genuinely different
+    // acts rather than a stricter version of editing:
+    //
+    // * **`sales.quotes.send`** exists because sending is the moment a document stops being the
+    //   organization's and becomes the customer's. From that point the lines are frozen, the
+    //   number is immutable and a public link exists that anyone holding it can open. A role
+    //   that may write a quote but not send it can prepare work a manager reviews, which is the
+    //   normal shape of a sales desk.
+    // * **`sales.orders.confirm`** is the stock decision. Confirming reserves inventory, so it
+    //   moves physical goods; cancelling releases them. It is separated from `.update` because
+    //   the damage of a wrong confirmation is not a wrong label on a row.
+    PermissionDef {
+        key: "sales.products.read",
+        category: "sales",
+        description: "Read the sales product catalog and its price lists",
+    },
+    PermissionDef {
+        key: "sales.products.manage",
+        category: "sales",
+        description: "Create and edit products and their price lists",
+    },
+    PermissionDef {
+        key: "sales.pricelists.read",
+        category: "sales",
+        description: "Read price lists and the prices they assign",
+    },
+    PermissionDef {
+        key: "sales.pricelists.manage",
+        category: "sales",
+        description: "Create price lists and replace their price rows",
+    },
+    PermissionDef {
+        key: "sales.quotes.read",
+        category: "sales",
+        description: "Read quotes, their versions and the public link state",
+    },
+    PermissionDef {
+        key: "sales.quotes.create",
+        category: "sales",
+        description: "Create quotes and duplicate an existing one",
+    },
+    PermissionDef {
+        key: "sales.quotes.update",
+        category: "sales",
+        description: "Edit a draft quote and cancel it",
+    },
+    PermissionDef {
+        key: "sales.quotes.send",
+        category: "sales",
+        description: "Send a quote to the customer, mint its public link and request approval",
+    },
+    PermissionDef {
+        key: "sales.orders.read",
+        category: "sales",
+        description: "Read sales orders and their stock reservation state",
+    },
+    PermissionDef {
+        key: "sales.orders.create",
+        category: "sales",
+        description: "Create sales orders from an accepted quote or by hand",
+    },
+    PermissionDef {
+        key: "sales.orders.confirm",
+        category: "sales",
+        description: "Confirm an order (reserving stock), cancel it and create its invoice draft",
+    },
+    PermissionDef {
+        key: "sales.reports.read",
+        category: "sales",
+        description: "Read the sales reports and export them as CSV",
+    },
+
+    // Inventory (docs/requests/REQ-053). The family is split by **what a mistake costs**, not by
+    // screen, and three of the five exist for a reason a reader would otherwise have to infer:
+    //
+    // * `inventory.movements.record` is not implied by `inventory.items.manage`. Fixing a
+    //   threshold and altering a balance are different acts, and the second one is the one the
+    //   ledger is there to record.
+    // * `inventory.negative.manage` **guards no route at all.** The schema cannot ask who is
+    //   calling, so the rule is a service check inside the write: it is the only permission on
+    //   this platform whose entire meaning is "the refusal this module would otherwise make is
+    //   permitted for you", and giving it a route would be giving it a second meaning.
+    // * `inventory.locations.manage` is separate from the movement key because closing a location
+    //   makes stock unreachable, which is a structural change rather than a day's work.
+    // * `inventory.adjustment.approve` is separate from `inventory.movements.record` because
+    //   approving somebody else's recount is a **second pair of eyes**, not a bigger pen: a
+    //   manager who may approve is not thereby authorised to move stock, and an operator who may
+    //   move stock is not thereby authorised to wave their own through. The module refuses a
+    //   self-approval in the service, so the key alone is not the whole rule — it is the first
+    //   half.
+    PermissionDef {
+        key: "inventory.items.read",
+        category: "inventory",
+        description: "Read items, stock levels, the movement ledger and the warehouse tree",
+    },
+    PermissionDef {
+        key: "inventory.items.manage",
+        category: "inventory",
+        description: "Create, edit and archive inventory items",
+    },
+    PermissionDef {
+        key: "inventory.movements.record",
+        category: "inventory",
+        description: "Record stock movements (receipts, issues, adjustments, transfers)",
+    },
+    PermissionDef {
+        key: "inventory.locations.manage",
+        category: "inventory",
+        description: "Create, rename and deactivate warehouses, locations and the thresholds",
+    },
+    PermissionDef {
+        key: "inventory.negative.manage",
+        category: "inventory",
+        description: "Allow a correction to take stock below zero (needed with reason `correction`)",
+    },
+    PermissionDef {
+        key: "inventory.adjustment.approve",
+        category: "inventory",
+        description: "Decide another operator's over-threshold stock adjustment (approve or reject)",
+    },
+    // Slice 3 split the movement key in two rather than adding a fifth. The reason is the same
+    // one that separated `inventory.adjustment.approve` from `inventory.movements.record`, and
+    // it is about **what a mistake costs**:
+    //
+    // * `inventory.movements.record` moves a number at one place. A mistake is a correction.
+    // * `inventory.transfers.manage` moves a number at **two** places and asserts the goods
+    //   physically moved between them, which is a claim about the world rather than about a
+    //   balance. A dispatch books goods as in-transit on a truck that may never arrive, and the
+    //   role that may do that is not the role that may note a shelf went down by two.
+    //
+    // There is deliberately **no `inventory.alerts.*` key**: raising and clearing an alert is the
+    // sweep's judgement about a balance, and a permission to *see* the inbox is
+    // `inventory.items.read`. A key that guards nothing is a comment, and a key that guards
+    // reading is a second name for a key that already exists.
+    PermissionDef {
+        key: "inventory.transfers.manage",
+        category: "inventory",
+        description: "Create, dispatch, receive and cancel stock transfers between locations",
+    },
+    // Slice 4 is a third split rather than an entry that reuses an existing key, and the same
+    // question decides it: **what does a mistake here cost, and who else would pay it?**
+    //
+    // * `inventory.movements.record` moves a number at one place, and a mistake there is a
+    //   correction somebody can see on the ledger.
+    // * `inventory.stocktake.manage` overwrites the balance of **every** location in a scope
+    //   from a count, in one act, on the word of one person. A count that is wrong is not wrong
+    //   in one row: it is wrong in all of them at once, and the rows it writes look like real
+    //   movements unless somebody finds the document behind them.
+    //
+    // So it does not inherit the movement key, and opening a sheet is not enough: the count is
+    // the part anybody may do, and the close is the only part that writes.
+    PermissionDef {
+        key: "inventory.stocktake.manage",
+        category: "inventory",
+        description: "Count a location and post the variances a count finds",
+    },
+    // Accounting (docs/requests/REQ-054, slice 1). The family splits the way the other three do —
+    // read, write, release — with one key whose reason is worth reading twice, because it is the
+    // one that could plausibly have been folded into a neighbour and should not have been:
+    //
+    // * `accounting.accounts.read` / `.manage` cover the chart and the rates together. They are
+    //   the same decision: an account code is what a journal line picks, and a rate is what a
+    //   line defaults to. Splitting them would let a role maintain the tree it is judged against
+    //   without being able to change what a document defaults to — or the reverse, which is
+    //   worse, because the rate is the one that changes numbers somebody already issued.
+    // * **`accounting.journal.manage` is a permission of its own because posting is a claim, not
+    //   an edit.** A bookkeeper who may prepare a journal is a normal role; the person who may
+    //   post is the one whose name is on the entry, and the balance invariant means every posted
+    //   entry is a promise that the books add up. That is the same argument that separated
+    //   `inventory.movements.record` from `inventory.stocktake.manage` one wave earlier.
+    PermissionDef {
+        key: "accounting.accounts.read",
+        category: "accounting",
+        description: "Read the chart of accounts and the organization's tax rates",
+    },
+    PermissionDef {
+        key: "accounting.accounts.manage",
+        category: "accounting",
+        description: "Add and edit accounts and tax rates; deactivate an account",
+    },
+    PermissionDef {
+        key: "accounting.journal.read",
+        category: "accounting",
+        description: "Read journal entries, their lines and both totals",
+    },
+    PermissionDef {
+        key: "accounting.journal.manage",
+        category: "accounting",
+        description: "Post a manual journal entry (a balanced, attributed, permanent record)",
+    },
+    // Invoices (docs/requests/REQ-054, slice 2). Three keys, and the middle one is the
+    // interesting split:
+    //
+    // * `accounting.invoices.read` / `.create` / `.send`. A draft is a document nobody has seen, so
+    //   creating one is cheap. **`send` is not**: it gives a number to a customer, fires
+    //   `accounting.invoice.issued` to every webhook subscriber, and makes the document immutable
+    //   from that moment — the flow becomes void-and-duplicate. A role that may draft but not
+    //   issue is an ordinary role (a sales assistant preparing invoices for review), so the
+    //   boundary is a real one and not a formality.
+    // * Void shares `send`'s layer rather than getting a key of its own, and the reason is that
+    //   both are statements **about money owed** rather than edits of a private document. Splitting
+    //   them would produce a role that can tell a customer an invoice is cancelled while not being
+    //   able to issue it, which is a strictly worse configuration than either.
+    PermissionDef {
+        key: "accounting.invoices.read",
+        category: "accounting",
+        description: "Read invoices, their lines and their outstanding balances",
+    },
+    PermissionDef {
+        key: "accounting.invoices.create",
+        category: "accounting",
+        description: "Write a draft invoice, manual or converted from a sales order",
+    },
+    PermissionDef {
+        key: "accounting.invoices.send",
+        category: "accounting",
+        description:
+            "Issue, void and overdue-sweep an invoice (a permanent statement about money owed)",
+    },
+    // Payments (docs/requests/REQ-054, slice 3). Three keys, and the third is the one worth
+    // arguing for:
+    //
+    // * `accounting.payments.read` / `.record` is the ordinary split — seeing what came in is
+    //   not the same act as writing it down.
+    // * `.record` is split from reversal rather than sharing it. Recording money that arrived is
+    //   the routine act of a bookkeeper; **undoing** a recorded payment rewrites an invoice's
+    //   status and posts a counter entry against the ledger, so it is the statement that the
+    //   books were wrong, and the same argument that separated `accounting.journal.manage` from
+    //   reading the journal applies a second time here.
+    // * **`accounting.payments.overpay` is a permission of its own and the narrowest in the
+    //   family.** Every other key in this module gates an action that is legitimate. This one
+    //   gates the action that is *arithmetically wrong*: allocating more to an invoice than it
+    //   has outstanding. It is refused with a 422 by default, and holding the key is how a
+    //   person says "I know, it is a goodwill write-off". Folding it into `.record` would hand
+    //   every bookkeeper the ability to overstate what was collected — which no permission
+    //   review anywhere in the platform would call intended.
+    PermissionDef {
+        key: "accounting.payments.read",
+        category: "accounting",
+        description: "Read payments, their allocations and what each one settled",
+    },
+    PermissionDef {
+        key: "accounting.payments.record",
+        category: "accounting",
+        description:
+            "Record a payment and apply it to invoices (each allocation within its outstanding)",
+    },
+    PermissionDef {
+        key: "accounting.payments.reverse",
+        category: "accounting",
+        description: "Reverse a payment: release its allocations and post the counter entry",
+    },
+    PermissionDef {
+        key: "accounting.payments.overpay",
+        category: "accounting",
+        description:
+            "Allocate more to an invoice than it has outstanding (refused with 422 without this)",
+    },
+    // Expenses (docs/requests/REQ-054, slice 4). Four keys, and `.approve` is separated from
+    // `.update` for the same reason `.payments.reverse` is separated from `.payments.record`:
+    // writing the expense down is the routine act, and **deciding whether the business pays for
+    // it** is the statement. A role that can file its own expenses and also sign them off is a
+    // role nobody would grant on purpose.
+    PermissionDef {
+        key: "accounting.expenses.read",
+        category: "accounting",
+        description: "Read expenses, their receipts and who decided each one",
+    },
+    PermissionDef {
+        key: "accounting.expenses.create",
+        category: "accounting",
+        description: "File an expense and submit it for approval",
+    },
+    PermissionDef {
+        key: "accounting.expenses.update",
+        category: "accounting",
+        description: "Edit a draft expense (a submitted or decided one is a record, not a form)",
+    },
+    PermissionDef {
+        key: "accounting.expenses.approve",
+        category: "accounting",
+        description:
+            "Approve or reject an expense (approving posts the journal entry) and mark it paid",
+    },
+    // Reports. Read-only, and a key of its own rather than a synonym for `.journal.read`: the
+    // journal is rows, a report is an **interpretation** of them across a period, and the person
+    // who may see what was posted is not automatically the person who may see the ageing of
+    // everything that has not been paid yet.
+    PermissionDef {
+        key: "accounting.reports.read",
+        category: "accounting",
+        description: "Read and export the income/expense, ageing and cashflow reports",
+    },
+    // The tax summary is a **separate key**, and the separation is the point: a tax summary is
+    // the input to a filing, while the other three reports are internal reading. Handing every
+    // bookkeeper the tax position is a different decision from handing them the ageing.
+    PermissionDef {
+        key: "accounting.reports.tax",
+        category: "accounting",
+        description: "Read and export the tax summary (what has been collected, per rate)",
+    },
 ];
 
 /// Look a permission up by key.
@@ -1039,24 +1444,289 @@ mod tests {
     }
 
     #[test]
-    fn the_block_system_family_is_catalogued() {
-        // REQ-063: the registry and its dry-run validator change nothing, so they read with the
-        // rest of the content surface; the pattern and template libraries are their own powers
-        // because a saved asset is depended on by pages other than the one that made it.
+    fn the_crm_family_is_catalogued() {
+        // REQ-051: the relationship layer separates reading, creating, editing, archiving and
+        // merging, and the flagged fields are a separate power — a role that may read a contact
+        // is not automatically a role that may read its contract note.
         for key in [
-            "content.blocks.read",
-            "content.patterns.manage",
-            "content.templates.manage",
-            // A manager can see which integrations are calling the site; minting a new one is
-            // not in the same hand, because a token outlives the session that made it.
-            "content.api.read",
+            "crm.contacts.read",
+            "crm.contacts.create",
+            "crm.contacts.update",
+            "crm.contacts.delete",
+            "crm.contacts.merge",
+            "crm.fields.sensitive.read",
+            "crm.views.manage",
+            "crm.contacts.import",
+            "crm.deals.read",
+            "crm.deals.create",
+            "crm.deals.update",
+            "crm.deals.delete",
+            "crm.pipelines.manage",
+            "crm.activities.read",
+            "crm.activities.create",
+            "crm.copilot.use",
+            "crm.leads.read",
+            "crm.leads.manage",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
-                Some("content"),
-                "{key} belongs to the content category"
+                Some("crm"),
+                "{key} belongs to the crm category"
             );
         }
+    }
+
+    #[test]
+    fn the_hr_family_is_catalogued() {
+        // REQ-055. **Twenty-two** keys: the directory's read/create/update/terminate/export, the
+        // sensitive block, the department pair, the document trio, the leave quartet, the
+        // attendance trio, the onboarding pair and the report pair.
+        //
+        // The reason this test is worth writing by hand rather than trusting the entries above:
+        // a `guards::require()` with a key that is **not** in the catalogue does not fall open —
+        // it 403s *everyone*, including the instance owner. So a typo in a route is a module that
+        // looks installed and answers 403 on every screen, and the tripwire is the catalogue, not
+        // the route.
+        //
+        // **The list is the argument that it stays current.** Slice 4 added two keys and this
+        // array was still asserting fourteen — and it was still *passing*, because a list that
+        // names fewer keys than exist is a test that checks the keys it happens to remember. A
+        // catalogue test that only ever grows by hand is a test that lags the feature silently.
+        // Every `guards::require(&state, "hr.…")` in `routes/mod.rs` must appear here.
+        for key in [
+            "hr.employees.read",
+            "hr.employees.create",
+            "hr.employees.update",
+            "hr.employees.terminate",
+            "hr.employees.export",
+            "hr.employees.sensitive.read",
+            "hr.departments.read",
+            "hr.departments.manage",
+            "hr.documents.read",
+            "hr.documents.manage",
+            "hr.leave.read",
+            "hr.leave.request",
+            "hr.leave.approve",
+            "hr.leave.manage",
+            "hr.attendance.read",
+            "hr.attendance.record",
+            "hr.attendance.manage",
+            "hr.onboarding.read",
+            "hr.onboarding.manage",
+            "hr.reports.read",
+            "hr.reports.export",
+            "hr.documents.sweep",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("hr"),
+                "{key} belongs to the hr category"
+            );
+        }
+
+        // The separation that matters: reading the directory is not reading the personal block.
+        assert_ne!(
+            get("hr.employees.read").map(|entry| entry.key),
+            get("hr.employees.sensitive.read").map(|entry| entry.key)
+        );
+
+        // **The half of the tripwire that can actually notice a new key.** The loop above cannot:
+        // it asserts the keys it *names*, so it fails when a key is removed and stays green when a
+        // slice adds one — which is how it was five keys behind for four waves while passing. This
+        // arm closes the direction that matters by asserting the list against the catalogue
+        // itself: twenty-two named, twenty-two catalogued, and a slice that adds a third route key
+        // without adding it here fails on the **same run** that adds it.
+        //
+        // It is deliberately not a `contains_all`: that direction is the loop above, and keeping
+        // both means neither list can drift alone.
+        let catalogued = CATALOGUE
+            .iter()
+            .filter(|entry| entry.category == "hr")
+            .count();
+        assert_eq!(
+            catalogued,
+            22,
+            "the catalogue holds {catalogued} hr keys; the list above names 22. \
+             Add the new key to BOTH — the loop above will not notice its absence."
+        );
+    }
+
+    #[test]
+    fn an_hr_key_nobody_routes_is_still_reachable_through_a_role() {
+        // The inverse error, and the one the count above cannot see: a key in the catalogue that
+        // no route uses is a permission an administrator can grant which changes nothing. The
+        // reports and the sweep are the deliberate case — they are *scheduled* callers, not screen
+        // ones — so the three are named here as the known set rather than left to fail silently.
+        //
+        // The value of this test is the moment somebody adds a fourth "called by a cron" key: it
+        // has to be written down here, which is the moment they find out it is also unreachable
+        // from the UI.
+        let schedulable = [
+            "hr.reports.read",     // the /hr/reports screen
+            "hr.reports.export",    // its export button
+            "hr.documents.sweep",   // the expiry automation
+        ];
+        for key in schedulable {
+            assert!(get(key).is_some(), "{key} must be catalogued");
+        }
+    }
+
+    #[test]
+    fn the_inventory_family_is_catalogued_and_one_key_guards_no_route() {
+        // REQ-053. Five keys guard routes and one does not — `inventory.negative.manage`
+        // is a service rule the schema cannot check, so it exists only to unlock one refusal.
+        // A catalogue entry for it is what lets a role **hold** it; nothing in `routes/inventory.rs`
+        // may `require()` it, and this test cannot see that, so the comment in the route file is
+        // the second half of the guarantee and the assertion here is the first.
+        for key in [
+            "inventory.items.read",
+            "inventory.items.manage",
+            "inventory.movements.record",
+            "inventory.locations.manage",
+            "inventory.negative.manage",
+            "inventory.adjustment.approve",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("inventory"),
+                "{key} belongs to the inventory category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sales_family_is_catalogued() {
+        // REQ-052: the catalog, the price lists and the documents are read, written and
+        // *released* separately, because sending a quote and confirming an order are the two
+        // acts a role must be able to withhold from a seller who may otherwise prepare anything.
+        for key in [
+            "sales.products.read",
+            "sales.products.manage",
+            "sales.pricelists.read",
+            "sales.pricelists.manage",
+            "sales.quotes.read",
+            "sales.quotes.create",
+            "sales.quotes.update",
+            "sales.quotes.send",
+            "sales.orders.read",
+            "sales.orders.create",
+            "sales.orders.confirm",
+            "sales.reports.read",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("sales"),
+                "{key} belongs to the sales category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_accounting_family_is_catalogued_and_posting_is_its_own_key() {
+        // REQ-054, slice 1. Four keys for the chart, the rates and the journal: the chart and the
+        // rates read/manage as one pair (they are the same decision — what a line picks and what
+        // it defaults to), and the journal split read/post because posting is a claim with the
+        // poster's name on it, not an edit.
+        for key in [
+            "accounting.accounts.read",
+            "accounting.accounts.manage",
+            "accounting.journal.read",
+            "accounting.journal.manage",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("accounting"),
+                "{key} belongs to the accounting category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_invoice_family_is_catalogued_and_issuing_is_its_own_key() {
+        // REQ-054, slice 2. Slice 1's test asserted these three keys were ABSENT — the routes did
+        // not exist yet and a key with no route is a promise the permission screen makes that the
+        // product does not keep. This test is the same assertion run in the other direction: the
+        // keys exist because the routes do, and `send` is separate from `create` because issuing
+        // a number to a customer is not drafting one.
+        for key in [
+            "accounting.invoices.read",
+            "accounting.invoices.create",
+            "accounting.invoices.send",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("accounting"),
+                "{key} belongs to the accounting category"
+            );
+        }
+        // **This list is now EMPTY, and that is the assertion.** It existed to hold back the
+        // keys the REQ's API table names before their routes did -- a key with no route is a
+        // promise the permission screen makes that the product does not keep. It emptied in
+        // slice 4b: `accounting.reports.tax` was the last one, and slice 4b's tax-summary route
+        // is what discharged it.
+        //
+        // It is kept as an empty loop with a comment rather than deleted, because the NEXT
+        // request that adds a key before its route will look here first, and "there is nothing
+        // left to hold back" is the fact that stops them.
+        for later in [] as [&str; 0] {
+            assert!(
+                get(later).is_none(),
+                "{later} is still owed and must not appear before its route does"
+            );
+        }
+
+        for key in [
+            "accounting.expenses.read",
+            "accounting.expenses.create",
+            "accounting.expenses.update",
+            "accounting.expenses.approve",
+            "accounting.reports.read",
+            "accounting.reports.tax",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("accounting"),
+                "{key} belongs to the accounting category"
+            );
+            assert!(
+                !get(key).expect(key).description.is_empty(),
+                "{key} needs a description the permission screen can show"
+            );
+        }
+    }
+
+    #[test]
+    fn the_payment_family_is_catalogued_and_overpaying_is_its_own_key() {
+        // REQ-054, slice 3. Four keys, and the assertion that is worth the test is the last one:
+        // `overpay` must be a key **of its own**, not a synonym for `record`. Every other key in
+        // this catalogue gates an action that is legitimate; this one gates the action that is
+        // arithmetically wrong, and folding it into `record` would hand every bookkeeper the
+        // ability to allocate more to an invoice than it has outstanding.
+        for key in [
+            "accounting.payments.read",
+            "accounting.payments.record",
+            "accounting.payments.reverse",
+            "accounting.payments.overpay",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("accounting"),
+                "{key} belongs to the accounting category"
+            );
+        }
+
+        // `reverse` is separate from `record`: recording money that arrived is a bookkeeper's
+        // routine act, and undoing one rewrites an invoice and posts a counter entry.
+        assert_ne!(
+            get("accounting.payments.reverse").map(|entry| entry.description),
+            get("accounting.payments.record").map(|entry| entry.description),
+            "reversing and recording are different acts and must not share a description"
+        );
+        assert_ne!(
+            get("accounting.payments.overpay").map(|entry| entry.description),
+            get("accounting.payments.record").map(|entry| entry.description),
+            "the overpay override must not be described as recording"
+        );
     }
 
     #[test]

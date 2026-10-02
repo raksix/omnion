@@ -61,6 +61,17 @@
 //! separate `search.manage`. The indexer that keeps the documents fresh from the event bus is
 //! `crate::search_runner`. See `crate::routes::search`.
 //!
+//! The CRM surface (`/crm/*`, docs/requests/REQ-051) is the relationship layer: companies,
+//! contacts and their rollups. Reading them is `crm.contacts.read`, creating is
+//! `crm.contacts.create`, editing and archiving are `.update` / `.delete` (archiving is a
+//! different act from editing — it removes a record from the work while keeping the history),
+//! and merging two records — the one act a user cannot undo from the screen — is
+//! `crm.contacts.merge`. The **visibility level** (`own` / `team` / `all`) is read from the
+//! caller's `department` bindings and enforced in SQL inside the module, so a list, a detail
+//! screen and an export all narrow identically; a record outside the caller's scope answers
+//! `404`, never `403`. Every mutation writes an audit row and emits the documented `crm.*`
+//! events for the automation engine and webhook subscribers. See `crate::routes::crm`.
+//!
 //! The analytics surface (`/analytics/*`, docs/requests/REQ-007) is the platform's own
 //! measurement engine: the panel side (`/analytics/settings`, `/analytics/snippet`) is read
 //! with `analytics.read` and written with `analytics.settings.manage` in the caller's own
@@ -69,30 +80,35 @@
 //! cap, a per-site rate limit and a collector that decides before it writes. The worker that
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
-pub mod theme_layouts;
-pub mod theme_settings;
-pub mod theme_assets;
-pub mod themes;
+pub mod accounting;
+pub mod accounting_expenses;
+pub mod accounting_reports;
+pub mod accounting_invoices;
+pub mod accounting_payments;
 pub mod ai;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
 pub mod backups;
-pub mod blocks;
 pub mod commands;
-pub mod comments;
 pub mod content;
-pub mod content_api;
-pub mod content_usage;
-pub mod content_explorer;
-pub mod content_openapi;
-pub mod content_read;
-pub mod featured_media;
-pub mod forms;
+pub mod crm;
+pub mod crm_activities;
+pub mod crm_copilot;
+pub mod crm_deals;
+pub mod crm_leads;
+pub mod crm_views;
+pub mod hr;
+pub mod hr_attendance;
+pub mod hr_leave;
+pub mod hr_me;
+pub mod hr_documents;
+pub mod hr_onboarding;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
 pub mod iam;
+pub mod inventory;
 pub mod iam_approvals;
 pub mod iam_policy;
 pub mod iam_providers;
@@ -112,17 +128,19 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
-pub mod menus;
-pub mod members;
-pub mod newsletter;
 pub mod notifications;
 pub mod notifications_admin;
 pub mod notifications_test;
 pub mod onboarding;
-pub mod patterns;
 pub mod public;
 pub mod readyz;
 pub mod restore_jobs;
+pub mod sales;
+pub mod sales_approvals;
+pub mod sales_documents;
+pub mod sales_orders;
+pub mod sales_reports;
+pub mod sales_quotes;
 pub mod scim;
 pub mod search;
 pub mod security;
@@ -131,7 +149,6 @@ pub mod security_headers;
 pub mod security_ip;
 pub mod security_limiter;
 pub mod security_secrets;
-pub mod seo;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
@@ -424,50 +441,6 @@ pub fn router(state: AppState) -> Router {
 
     // Content: pages and their revision history (docs/05-VERSIONING.md §4–§7). Reading the
     // history needs the read key; every mutation carries its own.
-    // The block registry (REQ-063, slice 1): the registry document and the dry-run validator
-    // both change nothing, so they read with `content.blocks.read` — the power an editor needs
-    // to author against the registry at all. Writing a block tree is `content.pages.update` on
-    // the page it belongs to, so the two halves of the editor carry the two keys that mean
-    // something: "may I see what I can build" and "may I change this page".
-    let blocks_registry =
-        get(blocks::list_blocks).layer(guards::require(&state, "content.blocks.read"));
-    let blocks_validate =
-        post(blocks::validate_blocks).layer(guards::require(&state, "content.blocks.read"));
-
-    // Patterns and page templates (REQ-063, slice 3). Both libraries read with the block read
-    // key — what an author may build is not a privilege — but writing is a separate key from
-    // editing a page, because a pattern outlives the page it was cut from and is reused across
-    // every site of the organization. Building from a template is the other direction: it needs
-    // `content.pages.create` (it creates a page) and no curation power at all.
-    let patterns_list =
-        get(patterns::list_patterns).layer(guards::require(&state, "content.blocks.read"));
-    let patterns_save =
-        post(patterns::save_pattern).layer(guards::require(&state, "content.patterns.manage"));
-    let templates_list =
-        get(patterns::list_templates).layer(guards::require(&state, "content.blocks.read"));
-    let templates_save =
-        post(patterns::save_template).layer(guards::require(&state, "content.templates.manage"));
-    let page_from_template = post(patterns::create_page_from_template)
-        .layer(guards::require(&state, "content.pages.create"));
-
-    let pattern = get(patterns::get_pattern)
-        .layer(guards::require(&state, "content.blocks.read"))
-        .merge(
-            put(patterns::update_pattern).layer(guards::require(&state, "content.patterns.manage")),
-        )
-        .merge(
-            delete(patterns::delete_pattern)
-                .layer(guards::require(&state, "content.patterns.manage")),
-        );
-
-    // The insert path reads a pattern's blocks with ids already fresh for the page they are
-    // going into, so it carries the read key — inserting is authoring, not curation.
-    let pattern_blocks =
-        get(patterns::get_pattern_blocks).layer(guards::require(&state, "content.blocks.read"));
-
-    let template = delete(patterns::delete_template)
-        .layer(guards::require(&state, "content.templates.manage"));
-
     let pages = get(content::list_pages)
         .layer(guards::require(&state, "content.pages.read"))
         .merge(post(content::create_page).layer(guards::require(&state, "content.pages.create")));
@@ -480,13 +453,6 @@ pub fn router(state: AppState) -> Router {
     let page_publish =
         post(content::publish_page).layer(guards::require(&state, "content.pages.publish"));
 
-    // REQ-063 slice 2: the preview frame reads the *draft* of a page and hands the panel a tree
-    // the server has already filtered for the chosen viewport. It changes nothing, so it carries
-    // the same read key as opening the page — a frame that needed a second permission would only
-    // teach authors to skip the one screen that shows the phone render.
-    let page_preview =
-        get(content::preview_page).layer(guards::require(&state, "content.pages.read"));
-
     let page_restore =
         post(content::restore_revision).layer(guards::require(&state, "content.pages.restore"));
 
@@ -495,12 +461,6 @@ pub fn router(state: AppState) -> Router {
 
     let page_revision =
         get(content::get_revision).layer(guards::require(&state, "content.pages.read"));
-
-    // REQ-063: the block-level compare two revisions, on the same read key as reading either
-    // of them — looking at a history is `content.pages.read`, and needing a second permission to
-    // ask what changed inside it would only teach authors to restore instead of compare.
-    let page_revision_diff =
-        get(content::diff_revision).layer(guards::require(&state, "content.pages.read"));
 
     let page_revision_comments =
         get(content::list_revision_comments).layer(guards::require(&state, "content.pages.read"));
@@ -1099,381 +1059,6 @@ pub fn router(state: AppState) -> Router {
         .route("/notifications/route", post(notifications_admin::run_route))
         .route_layer(guards::require(&state, "notifications.admin"));
 
-    // Menus (REQ-064, slice 1). Reading a menu is `menus.read` — an editor needs to see the
-    // navigation before deciding anything about it — and every write is `menus.manage`, which
-    // is a genuinely separate power: an account that may publish a page should not thereby
-    // rewrite the site's header. The public payload carries no guard at all, because a theme
-    // that needs a session to draw its navigation cannot be rendered by anything.
-    let menus_list = get(menus::list_menus).layer(guards::require(&state, "menus.read"));
-    let menus_create = post(menus::create_menu).layer(guards::require(&state, "menus.manage"));
-    let menu_read = get(menus::get_menu).layer(guards::require(&state, "menus.read"));
-    let menu_write = put(menus::update_menu)
-        .layer(guards::require(&state, "menus.manage"))
-        .merge(delete(menus::delete_menu).layer(guards::require(&state, "menus.manage")));
-    let menu_items_write =
-        put(menus::save_menu_items).layer(guards::require(&state, "menus.manage"));
-    let menu_items_from_pages =
-        post(menus::add_pages_to_menu).layer(guards::require(&state, "menus.manage"));
-    // The rendered menu a theme draws. Unauthenticated by nature, and audience-filtered by
-    // query — see `menus::public_menu`.
-    let public_menu = get(menus::public_menu);
-
-    // Content API tokens (REQ-019, slice 1). Reading the list and its vocabulary is one power
-    // (`content.api.read`) and minting, rotating and revoking is another (`content.api.manage`),
-    // because a token outlives the session that made it: whoever can create one can hand read
-    // access to published content to somebody outside the organization, and that is not the same
-    // privilege as watching who is already calling. The list answers prefix-only, so the route
-    // cannot leak a secret even by accident.
-    let content_api_tokens_list = get(content_api::list_tokens)
-        .layer(guards::require(&state, "content.api.read"));
-    let content_api_vocabulary = get(content_api::token_vocabulary)
-        .layer(guards::require(&state, "content.api.read"));
-    let content_api_token_create = post(content_api::create_token)
-        .layer(guards::require(&state, "content.api.manage"));
-    let content_api_token_update = patch(content_api::update_token)
-        .layer(guards::require(&state, "content.api.manage"));
-    let content_api_token_rotate = post(content_api::rotate_token)
-        .layer(guards::require(&state, "content.api.manage"));
-    let content_api_token_revoke = delete(content_api::revoke_token)
-        .layer(guards::require(&state, "content.api.manage"));
-    // The Docs tab's own read. A reader who may see the tokens may see the contract they are for —
-    // and the panel cannot reach the token-authenticated copy, so this is not a convenience
-    // duplicate but the only way the screen can render at all.
-    let content_api_openapi = get(content_api::openapi_document)
-        .layer(guards::require(&state, "content.api.read"));
-    // Reading what the tokens have done is the same power as reading them: a viewer of this
-    // section can already see a token's name, prefix and rate tier, and has lost nothing by also
-    // seeing how much it has been used. There is deliberately no separate "usage" permission — a
-    // permission nobody needs to *act* on only ever surprises an operator by being absent from
-    // someone's role.
-    let content_api_usage = get(content_usage::usage)
-        .layer(guards::require(&state, "content.api.read"));
-
-    // The Explorer's dispatcher (REQ-019, slice 3). `content.api.read`, not `manage`: making a
-    // call spends the *token's* budget and reads what that token may read, and a reader of this
-    // section can already mint such a token — so a `manage` requirement here would refuse an
-    // operator who may legitimately try out a token without letting them break one they do not
-    // own. The escalation argument is the scope list: `media:read` is what a call needs, and the
-    // route answers `403 insufficient_scope` naming it, which is the surface's own behaviour.
-    let content_api_explorer = post(content_explorer::explorer_call)
-        .layer(guards::require(&state, "content.api.read"));
-
-    // The token surface itself. Declared as its own router so the six routes read as one unit
-    // next to their permission layer, and merged into the v1 tree below.
-    let content_api = Router::new()
-        .route("/content-api/usage", content_api_usage)
-        .route("/content-api/explorer", content_api_explorer)
-        .route("/content-api/tokens", content_api_tokens_list)
-        .route("/content-api/tokens", content_api_token_create)
-        .route("/content-api/tokens/vocabulary", content_api_vocabulary)
-        .route("/content-api/tokens/{id}", content_api_token_update)
-        .route("/content-api/tokens/{id}", content_api_token_revoke)
-        .route("/content-api/tokens/{id}/rotate", content_api_token_rotate)
-        // Reading what the tokens have done is the same power as reading them: `content.api.read`
-        // is a viewer of this section, and a role that can see a token's name, prefix and rate
-        // tier has lost nothing by also seeing how much it has been used. There is no separate
-        // "usage" permission to add later — a permission nobody needs to *act* on is a permission
-        // that only ever surprises an operator by being missing.
-        // A literal path next to the `{id}` siblings: registering it after them would make
-        // matchit read `openapi` as a token id.
-        .route("/content-api/openapi.json", content_api_openapi);
-
-    // The headless content read surface (REQ-019, slice 2). No panel permission layer: these
-    // routes authenticate a *content token* through the `ContentToken` extractor instead, and
-    // they are the only routes in the v1 tree that do — a panel session must not be able to read
-    // them, because a session is a human inside the organization while this surface exists to
-    // hand published content to something outside it. Adding a session fallback here would make
-    // every integrator's token optional, which is the opposite of what the token is for.
-    let content_read = Router::new()
-        .route("/content/pages", get(content_read::list_pages))
-        .route("/content/pages/{slug}", get(content_read::get_page))
-        .route("/content/posts", get(content_read::list_posts))
-        .route("/content/posts/{slug}", get(content_read::get_post))
-        .route("/content/media", get(content_read::list_media))
-        .route("/content/sites", get(content_read::list_sites))
-        .route("/content/openapi.json", get(content_read::openapi_document));
-
-    // Scheduled publishing (REQ-064, slice 1). One key for the whole queue: reading it, moving
-    // an entry and cancelling one are the same power a publisher already has
-    // (`content.pages.schedule`), and a second key would only answer "who may look at the
-    // queue" separately from "who may change it" without making either safer.
-    let publishing_queue =
-        get(menus::list_queue).layer(guards::require(&state, "content.pages.schedule"));
-    let publishing_entry =
-        put(menus::reschedule_entry).layer(guards::require(&state, "content.pages.schedule"));
-    let publishing_entry_cancel =
-        post(menus::cancel_entry).layer(guards::require(&state, "content.pages.schedule"));
-    let publishing_entry_now =
-        post(menus::publish_now).layer(guards::require(&state, "content.pages.schedule"));
-    let publishing_entry_retry =
-        post(menus::retry_entry).layer(guards::require(&state, "content.pages.schedule"));
-    let page_schedule =
-        post(menus::schedule_page).layer(guards::require(&state, "content.pages.schedule"));
-
-    // Forms (REQ-064, slice 2). Three powers, not two: `forms.read` draws the builder and the
-    // list, `forms.manage` writes the definition, and `forms.submissions.read` reads what
-    // visitors sent. The third key is the one that matters — a person who may design the form
-    // has no business reading the answers, and every owner of a contact form has been that
-    // person at some point. The public submit route carries no guard at all: it is the endpoint
-    // a stranger's browser posts to.
-    let forms_list = get(forms::list_forms).layer(guards::require(&state, "forms.read"));
-    let forms_create = post(forms::create_form).layer(guards::require(&state, "forms.manage"));
-    let form_read = get(forms::get_form).layer(guards::require(&state, "forms.read"));
-    let form_write = put(forms::update_form)
-        .layer(guards::require(&state, "forms.manage"))
-        .merge(delete(forms::delete_form).layer(guards::require(&state, "forms.manage")));
-    let form_fields = put(forms::save_form_fields).layer(guards::require(&state, "forms.manage"));
-    let form_publish = post(forms::set_form_status).layer(guards::require(&state, "forms.manage"));
-    // The inbox: reading it AND changing a row's state take the same key, because an inbox you
-    // may read but not act on is a screen with buttons that answer 403.
-    let submissions_list =
-        get(forms::list_submissions).layer(guards::require(&state, "forms.submissions.read"));
-    let submissions_bulk = patch(forms::bulk_submission_status)
-        .layer(guards::require(&state, "forms.submissions.read"));
-    let submissions_export =
-        get(forms::export_submissions).layer(guards::require(&state, "forms.submissions.read"));
-    let submission_read =
-        get(forms::get_submission).layer(guards::require(&state, "forms.submissions.read"));
-    let submission_write = patch(forms::set_submission_status)
-        .layer(guards::require(&state, "forms.submissions.read"))
-        .merge(
-            delete(forms::delete_submission)
-                .layer(guards::require(&state, "forms.submissions.read")),
-        );
-    // Unauthenticated, like the rendered menu: a form on a live page is posted to by browsers
-    // that have no account on this installation.
-    let public_form_submit = post(forms::public_submit);
-
-    // SEO toolkit (REQ-064, slice 3). TWO powers, and the split is the same one the CMS has
-    // drawn everywhere: `seo.read` looks at a site's search setup, `seo.manage` changes it.
-    // The public routes below carry no guard at all — a sitemap, a robots.txt and a redirect are
-    // what a crawler asks for before it has any account anywhere.
-    let seo_overview = get(seo::get_seo_overview).layer(guards::require(&state, "seo.read"));
-    let page_seo_read = get(seo::get_page_seo).layer(guards::require(&state, "seo.read"));
-    let page_seo_write = put(seo::put_page_seo).layer(guards::require(&state, "seo.manage"));
-
-    // A page's featured image (REQ-064, slice 4d). **Three guards across two routes, and the
-    // first version had two and got it wrong.** The mistake was guarding the page's own read with
-    // `media.read` "because the body mentions a file" — which locked a page editor who can edit
-    // the page's title, body and crop out of reading the alt they are required to write. The three
-    // questions are genuinely different and each gets its own key:
-    //
-    //   * reading THIS page's image      → `content.pages.read`   — it is the page's own field
-    //   * writing it                     → `content.pages.update` — the same power as its body
-    //   * listing what it could point at  → `media.read`           — that is a question about the
-    //     LIBRARY, and it is the one that can enumerate files rather than name one
-    //
-    // The picker is a separate route for the third reason alone: one endpoint serving both would
-    // need one guard for both, and the weaker one wins — either an editor with an empty picker or
-    // a page editor holding the whole library.
-    let featured_read =
-        get(featured_media::get_featured_media).layer(guards::require(&state, "content.pages.read"));
-    let featured_write = put(featured_media::put_featured_media)
-        .layer(guards::require(&state, "content.pages.update"));
-    let featured_candidates =
-        get(featured_media::list_candidates).layer(guards::require(&state, "media.read"));
-    // The theme gallery (REQ-062 slice 1). Two read permissions and one write, and the
-    // split follows the question each one answers rather than the verb: the gallery is a
-    // listing (`themes.read`), the single theme is the renderer's own lookup, and activation
-    // is the only thing on this surface that changes what a signed-out visitor sees — so it
-    // carries its own key and cannot be reached by a `themes.read` account.
-    let themes_gallery =
-        get(themes::list_gallery).layer(guards::require(&state, "themes.read"));
-    let theme_read = get(themes::get_theme).layer(guards::require(&state, "themes.read"));
-    // A theme's own preview image (REQ-062 slice 4, acceptance 3). `themes.read`, because it
-    // is the gallery card's own read and the gallery is already that permission — a preview
-    // image is presentation data about a theme, and gating it harder than the theme's own
-    // manifest would make the gallery's card fail for a reason the card cannot explain.
-    let theme_asset =
-        get(theme_assets::theme_asset).layer(guards::require(&state, "themes.read"));
-    let theme_activate =
-        post(themes::activate_theme).layer(guards::require(&state, "themes.activate"));
-    let theme_rollback =
-        post(themes::rollback_theme).layer(guards::require(&state, "themes.activate"));
-    // Theme settings (REQ-062 slice 2). Read is `themes.read` because the history screen is a
-    // reading; every write is `themes.customize`, which is deliberately NOT implied by
-    // `themes.activate`. The save and the publish are different powers too — a designer who
-    // may stage a palette but not put it in front of visitors is a real setup, so the split
-    // is by *what the write does*, not by which table it touches.
-    let theme_settings_read =
-        get(theme_settings::read_settings).layer(guards::require(&state, "themes.read"));
-    let theme_settings_save = put(theme_settings::save_settings)
-        .layer(guards::require(&state, "themes.customize"));
-    // The dry run is gated on `themes.read`, not on `themes.customize`: it writes nothing, so
-    // the power it needs is the power to READ the draft it measures. Gating a measurement on
-    // the edit permission would answer "your palette is fine" with a 403 to a viewer, which
-    // reads as "your palette is broken".
-    let theme_settings_contrast_check = post(theme_settings::check_contrast)
-        .layer(guards::require(&state, "themes.read"));
-    let theme_settings_publish = post(theme_settings::publish_settings)
-        .layer(guards::require(&state, "themes.customize"));
-    let theme_settings_revisions = get(theme_settings::list_revisions)
-        .layer(guards::require(&state, "themes.read"));
-    let theme_settings_revision = get(theme_settings::read_revision)
-        .layer(guards::require(&state, "themes.read"));
-    let theme_settings_restore = post(theme_settings::restore_revision)
-        .layer(guards::require(&state, "themes.customize"));
-    // Theme layouts and packages (REQ-062 slice 3). The builder reads with `themes.read` and
-    // writes with `themes.customize`, exactly as the settings surface does — a slot and a
-    // colour token are the same power over the same site.
-    //
-    // The package routes are `themes.install`/`themes.export` and NOT `themes.customize`,
-    // because they are not about one site: a package crosses sites, and an account that may
-    // restyle the site it is on has no business writing a row every site in the installation
-    // can see. The validate route carries `themes.install` too — a dry run that an editor
-    // cannot perform is a dry run they guess at instead.
-    let theme_layouts_read =
-        get(theme_layouts::read_layouts).layer(guards::require(&state, "themes.read"));
-    let theme_layout_slot_read =
-        get(theme_layouts::read_slot).layer(guards::require(&state, "themes.read"));
-    let theme_layout_slot_save = put(theme_layouts::save_slot)
-        .layer(guards::require(&state, "themes.customize"));
-    let theme_layout_slot_reset = post(theme_layouts::reset_slot)
-        .layer(guards::require(&state, "themes.customize"));
-    let theme_package_export =
-        get(theme_layouts::export_package).layer(guards::require(&state, "themes.export"));
-    let theme_package_validate =
-        post(theme_layouts::validate_package).layer(guards::require(&state, "themes.install"));
-    let theme_package_install =
-        post(theme_layouts::install_package).layer(guards::require(&state, "themes.install"));
-    let theme_remove = delete(theme_layouts::remove_theme)
-        .layer(guards::require(&state, "themes.install"));
-    let seo_redirect_create =
-        post(seo::create_redirect).layer(guards::require(&state, "seo.manage"));
-    let seo_redirect_write = put(seo::update_redirect)
-        .layer(guards::require(&state, "seo.manage"))
-        .merge(delete(seo::delete_redirect).layer(guards::require(&state, "seo.manage")));
-    let seo_redirect_test = post(seo::test_redirect).layer(guards::require(&state, "seo.read"));
-    // The import writes rules, so it carries `seo.manage` like every other write on this surface
-    // — a *read* guard would have let any account that may look at the rules paste a file into
-    // the table. The export is the read it is: a caller who may see the rules may take them away.
-    let seo_redirect_import =
-        post(seo::import_redirects).layer(guards::require(&state, "seo.manage"));
-    let seo_redirect_export = get(seo::export_redirects).layer(guards::require(&state, "seo.read"));
-    let seo_settings_write = put(seo::put_settings).layer(guards::require(&state, "seo.manage"));
-    let seo_sitemap_regenerate =
-        post(seo::regenerate_sitemap).layer(guards::require(&state, "seo.manage"));
-    let seo_broken_read = get(seo::list_broken_links).layer(guards::require(&state, "seo.read"));
-    let seo_broken_scan = post(seo::scan_broken_links).layer(guards::require(&state, "seo.manage"));
-    let seo_broken_write =
-        patch(seo::set_broken_link_ignored).layer(guards::require(&state, "seo.manage"));
-    // Unauthenticated by nature — see the note above.
-    let public_sitemap = get(seo::public_sitemap);
-    let public_robots = get(seo::public_robots);
-    let public_redirect = get(seo::public_redirect);
-
-    // Newsletter (REQ-064, slice 4b). Two powers, and the public surface underneath them: the
-    // signup, the confirmation click and the unsubscribe click are the only unauthenticated
-    // routes in this module, and each of them writes to somebody else's inbox — so the confirm
-    // and unsubscribe tokens are the whole security surface, hashed and single-use.
-    let newsletter_lists_read =
-        get(newsletter::list_lists).layer(guards::require(&state, "newsletter.read"));
-    let newsletter_lists_write = post(newsletter::create_list)
-        .layer(guards::require(&state, "newsletter.manage"));
-    let newsletter_list_read =
-        get(newsletter::get_list).layer(guards::require(&state, "newsletter.read"));
-    let newsletter_list_write = put(newsletter::patch_list)
-        .layer(guards::require(&state, "newsletter.manage"))
-        .merge(delete(newsletter::delete_list).layer(guards::require(&state, "newsletter.manage")));
-    let newsletter_subscribers_read =
-        get(newsletter::list_subscribers).layer(guards::require(&state, "newsletter.read"));
-    // TWO separate POST method routers on purpose: they serve DIFFERENT paths
-    // (`/newsletter/lists/{id}/subscribers` and `/newsletter/lists/{id}/import`), and merging
-    // two POST routers panics at router construction with "Overlapping method route" — which
-    // takes down the whole application, not just this screen. A method router is a per-PATH
-    // thing; the paths are what decide.
-    let newsletter_list_subscribers_write =
-        post(newsletter::add_subscriber).layer(guards::require(&state, "newsletter.manage"));
-    let newsletter_list_import = post(newsletter::import_subscribers)
-        .layer(guards::require(&state, "newsletter.manage"));
-    let newsletter_subscriber_read =
-        get(newsletter::get_subscriber).layer(guards::require(&state, "newsletter.read"));
-    let newsletter_subscriber_write = patch(newsletter::set_subscriber_status)
-        .layer(guards::require(&state, "newsletter.manage"))
-        .merge(
-            delete(newsletter::delete_subscriber)
-                .layer(guards::require(&state, "newsletter.manage")),
-        );
-    let newsletter_export =
-        get(newsletter::export_subscribers).layer(guards::require(&state, "newsletter.read"));
-    let newsletter_issues_read =
-        get(newsletter::list_issues).layer(guards::require(&state, "newsletter.read"));
-    let newsletter_issues_write =
-        post(newsletter::send_issue).layer(guards::require(&state, "newsletter.manage"));
-
-    let public_newsletter_subscribe = post(newsletter::public_subscribe);
-    let public_newsletter_confirm = get(newsletter::public_confirm);
-    let public_newsletter_unsubscribe = get(newsletter::public_unsubscribe);
-    let public_newsletter_issue = get(newsletter::public_issue);
-    let public_newsletter_lists = get(newsletter::public_lists);
-
-    // Memberships (REQ-064, slice 4c). Two powers, and the split is the point: a member table
-    // shows every address on the site, so "somebody may look at it" must not also mean
-    // "somebody may block the one member they dislike, mint them a password reset, or delete
-    // them". `memberships.manage` additionally owns the SITE's policy, because gating decides
-    // who can read which published page.
-    //
-    // The public half carries no guard and no member session of the platform's own kind: these
-    // are the routes a browser with no account on this installation posts to. The literal
-    // segments are declared before the parameterised ones so axum ranks `/members/verify`
-    // ahead of a hypothetical `/members/{id}`.
-    let members_read = get(members::list_members).layer(guards::require(&state, "memberships.read"));
-    let members_create =
-        post(members::create_member).layer(guards::require(&state, "memberships.manage"));
-    let member_read = get(members::get_member).layer(guards::require(&state, "memberships.read"));
-    let member_write = patch(members::patch_member)
-        .layer(guards::require(&state, "memberships.manage"))
-        .merge(
-            delete(members::delete_member).layer(guards::require(&state, "memberships.manage")),
-        );
-    let member_block =
-        post(members::block_member).layer(guards::require(&state, "memberships.manage"));
-    let member_verify =
-        post(members::verify_member).layer(guards::require(&state, "memberships.manage"));
-    let member_send_verification = post(members::send_verification)
-        .layer(guards::require(&state, "memberships.manage"));
-    let member_send_reset =
-        post(members::send_reset).layer(guards::require(&state, "memberships.manage"));
-    let member_signout_everywhere = post(members::signout_everywhere)
-        .layer(guards::require(&state, "memberships.manage"));
-    let member_settings_read =
-        get(members::get_settings).layer(guards::require(&state, "memberships.read"));
-    let member_settings_write =
-        put(members::put_settings).layer(guards::require(&state, "memberships.manage"));
-    let public_member_signup = post(members::public_signup);
-    let public_member_signin = post(members::public_signin);
-    let public_member_signout = post(members::public_signout);
-    let public_member_me = get(members::public_me).merge(put(members::public_update_me));
-    let public_member_verify = get(members::public_verify);
-    let public_member_reset = post(members::public_password_reset);
-    let public_member_gate = get(members::public_gate);
-
-    // Comments (REQ-064, slice 4a). Two powers and one public surface. `comments.read` opens
-    // the inbox, `comments.manage` changes a row and edits the policy — and the two are
-    // deliberately separate, because the value of the split is exactly the case where a site
-    // hands the inbox to somebody who should not be able to approve a defamatory comment and
-    // hand the policy to somebody who should not be able to turn moderation off.
-    let comments_inbox = get(comments::list_comments).layer(guards::require(&state, "comments.read"));
-    let comments_bulk = post(comments::bulk_moderate).layer(guards::require(&state, "comments.manage"));
-    let comment_read = get(comments::get_comment).layer(guards::require(&state, "comments.read"));
-    let comment_write = patch(comments::moderate_comment)
-        .layer(guards::require(&state, "comments.manage"))
-        .merge(delete(comments::delete_comment).layer(guards::require(&state, "comments.manage")));
-    let comment_reply =
-        post(comments::reply).layer(guards::require(&state, "comments.manage"));
-    let comment_settings_read =
-        get(comments::get_settings).layer(guards::require(&state, "comments.read"));
-    let comment_settings_write =
-        put(comments::put_settings).layer(guards::require(&state, "comments.manage"));
-    let comment_ban_create =
-        post(comments::add_ban).layer(guards::require(&state, "comments.manage"));
-    let comment_ban_write =
-        delete(comments::remove_ban).layer(guards::require(&state, "comments.manage"));
-    // The two public routes carry no guard at all: a comment thread and the form that posts it
-    // are read and written by browsers that have no account on this installation.
-    let public_comment_thread = get(comments::public_thread);
-    let public_comment_submit = post(comments::public_submit);
-
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
     // resolve the site through the caller's own organization. The collection endpoint is the
@@ -1890,6 +1475,1144 @@ pub fn router(state: AppState) -> Router {
             omnion_module_analytics::collect::MAX_BODY_BYTES,
         ));
 
+    // The CRM surface (docs/requests/REQ-051, slice 1): reading companies and contacts is
+    // `crm.contacts.read`, creating is `.create`, editing and archiving are separate keys
+    // (archiving removes a record from the work while keeping its history) and merging — the
+    // one act a user cannot undo from the screen — is `.merge`. The `crm.fields.sensitive.read`
+    // key is resolved *inside* the handlers, because it decides which values the response
+    // carries rather than whether the request is allowed at all.
+    let crm_read = Router::new()
+        .route("/crm/contacts", get(crm::list_contacts))
+        .route("/crm/contacts/{id}", get(crm::get_contact))
+        .route("/crm/companies", get(crm::list_companies))
+        .route("/crm/companies/{id}", get(crm::get_company))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.read",
+        ));
+
+    let crm_create = Router::new()
+        .route("/crm/contacts", post(crm::create_contact))
+        .route("/crm/companies", post(crm::create_company))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.create",
+        ));
+
+    let crm_update = Router::new()
+        .route("/crm/contacts/{id}", patch(crm::update_contact))
+        .route("/crm/companies/{id}", patch(crm::update_company))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.update",
+        ));
+
+    let crm_archive = Router::new()
+        .route("/crm/contacts/{id}", delete(crm::archive_contact))
+        .route("/crm/companies/{id}", delete(crm::archive_company))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.delete",
+        ));
+
+    let crm_merge = Router::new()
+        .route("/crm/contacts/merge", post(crm::merge_contacts))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.merge",
+        ));
+
+    // Slice 2 adds what a *list* needs to be more than a table: saved views, the import and the
+    // export. Reading a view and running a dry run are reads (`crm.contacts.read`); saving a view,
+    // committing an import and downloading a file write, so they carry their own keys — a file
+    // the caller can download is a copy of the records, and a role that may not create contacts
+    // must not be able to create them one file at a time.
+    let crm_views_read = Router::new()
+        .route("/crm/views", get(crm_views::list_views))
+        .route("/crm/views/columns", get(crm_views::view_columns))
+        .route("/crm/contacts/export", get(crm_views::export_contacts))
+        .route("/crm/companies/export", get(crm_views::export_companies))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.read",
+        ));
+
+    let crm_views_manage = Router::new()
+        .route("/crm/views", post(crm_views::create_view))
+        .route("/crm/views/{id}", delete(crm_views::delete_view))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.views.manage",
+        ));
+
+    let crm_import = Router::new()
+        .route(
+            "/crm/contacts/import",
+            post(crm_views::import_contacts),
+        )
+        .layer(DefaultBodyLimit::max(
+            omnion_module_crm::csv::MAX_IMPORT_BYTES,
+        ))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.contacts.import",
+        ));
+
+    // Slice 3: the board. Deals carry keys of their own rather than reusing the contact family,
+    // because a pipeline is a *different* disclosure — its open value and win rate describe the
+    // business, not the people. Reading the board and its stages is `crm.deals.read`; creating,
+    // editing, moving and archiving are the three separate writes; and reshaping the pipeline
+    // itself is `crm.pipelines.manage`, because the stage editor retroactively changes what
+    // every past deal's stage meant.
+    let crm_deals_read = Router::new()
+        .route("/crm/deals", get(crm_deals::list_deals))
+        .route("/crm/deals/{id}", get(crm_deals::get_deal))
+        .route("/crm/pipelines", get(crm_deals::list_pipelines))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.deals.read",
+        ));
+
+    let crm_deals_create = Router::new()
+        .route("/crm/deals", post(crm_deals::create_deal))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.deals.create",
+        ));
+
+    let crm_deals_update = Router::new()
+        .route("/crm/deals/{id}", patch(crm_deals::update_deal))
+        // The stage move is the drag and the keyboard's `ctrl + ←/→`: one route, one write, one
+        // event, so a card cannot be moved by the mouse and by the keyboard down different paths.
+        .route("/crm/deals/{id}/stage", post(crm_deals::move_deal_stage))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.deals.update",
+        ));
+
+    let crm_deals_archive = Router::new()
+        .route("/crm/deals/{id}", delete(crm_deals::archive_deal))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.deals.delete",
+        ));
+
+    let crm_pipelines_manage = Router::new()
+        .route(
+            "/crm/pipelines/{id}/stages",
+            put(crm_deals::save_pipeline_stages),
+        )
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.pipelines.manage",
+        ));
+
+    // The HR surface (docs/requests/REQ-055, slice 1): the people core — employees, the
+    // department tree and the org chart. The family splits the way CRM's does, with two keys that
+    // are a **different act** rather than a stricter version of editing:
+    //
+    // * `hr.employees.terminate` is not `.delete`. Termination keeps the record and writes a
+    //   status plus an end date, and there is no delete route at all: leave, attendance and
+    //   onboarding all reference an employee, so a hard delete would take a person's history
+    //   with it. Giving it a key of its own also says what it is — a statement about an
+    //   employment, not an edit to a job title.
+    // * `hr.employees.sensitive.read` is deliberately **not** a `require()` here. It decides what
+    //   a response *carries* (four personal fields), not whether the request is allowed, so the
+    //   handlers resolve it with the authorizer. A guard would 403 the whole employee screen for
+    //   exactly the roles the request says should still see the directory.
+    let hr_employees_read = Router::new()
+        .route("/hr/employees", get(hr::list_employees))
+        .route("/hr/employees/suggest-number", get(hr::suggest_employee_number))
+        .route("/hr/employees/{id}", get(hr::get_employee))
+        // The chart is the directory drawn as a tree, so it reads with the directory rather than
+        // with the department tree below: a role that may see the org chart must see it whole.
+        .route("/hr/org-chart", get(hr::org_chart))
+        //   The **department-scoped** guard, not `require()`. An HR visibility level (`own`,
+        //   `team`, `all`) is granted as a department-scoped binding — it is the only place a
+        //   level can live — and `require()` authorizes against an organization-wide context,
+        //   which matches no department binding at all. A manager holding `team` was refused
+        //   with a permission error naming a key they demonstrably hold, one layer before the
+        //   handler that implements the level ever ran. The narrowing itself is unchanged and is
+        //   still read from the same rows by `hr::scope_of`; this only lets such a caller reach it.
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "hr.employees.read",
+        ));
+
+    // Attendance (slice 2d). Three routers, three keys, and the split is the point:
+    //
+    // * Reading somebody else's month, the roster and the summary is `hr.attendance.read`. The
+    //   caller's OWN month is not in this router at all — it is on `/hr/me/attendance` with no
+    //   key, because the person who needs their own hours is the one person without the key.
+    // * **Punching for somebody else** is `hr.attendance.record`, and it is a layer on the clock
+    //   routes rather than a check inside them: a service account and a person pressing the
+    //   button send the same request, and the guard is the only place that can tell them apart
+    //   before the handler has resolved a subject. The handler still resolves the caller's own
+    //   employee when the body names nobody, so the *same* route serves both — there is no
+    //   separate "admin punch" endpoint that could drift from it.
+    // * **Correcting a recorded day** is `hr.attendance.manage`, the one write in this module that
+    //   changes what a payroll run will pay.
+    let hr_attendance_read = Router::new()
+        .route("/hr/attendance", get(hr_attendance::get_attendance))
+        .route("/hr/attendance/roster", get(hr_attendance::get_roster))
+        .route("/hr/attendance/summary", get(hr_attendance::get_summary))
+        .route("/hr/attendance/export", get(hr_attendance::export_csv))
+        .route_layer(guards::require(&state, "hr.attendance.read"));
+
+    let hr_attendance_record = Router::new()
+        .route(
+            "/hr/attendance/check-in",
+            post(hr_attendance::check_in),
+        )
+        .route(
+            "/hr/attendance/check-out",
+            post(hr_attendance::check_out),
+        )
+        // The clock needs a session AND the recording key, because it is a write that moves a
+        // number somebody is measured on. The self-service twin above is the same handler
+        // without the key, which is the whole difference between an employee and a service
+        // account.
+        .route_layer(guards::require(&state, "hr.attendance.record"));
+
+    let hr_attendance_manage = Router::new()
+        .route(
+            "/hr/attendance/corrections",
+            post(hr_attendance::correct_day),
+        )
+        .route_layer(guards::require(&state, "hr.attendance.manage"));
+
+    // Onboarding (slice 4). Two routers, and the split is the request's own rule rather than a
+    // finer-grained one: the board and the template catalogue are readable by anybody who manages
+    // people, while applying a template and ticking somebody else's checklist is HR's.
+    //
+    // **The employee's own tick is NOT in either router.** `/hr/me/onboarding` answers it with no
+    // `route_layer` at all, because the request says an item "can be completed by the assigned
+    // role or HR" and the assigned role is frequently the employee themselves — who holds no
+    // `hr.*` key. Putting that route behind `hr.onboarding.manage` would make the one item the
+    // employee owns the one item they cannot tick.
+    let hr_onboarding_read = Router::new()
+        .route("/hr/onboarding", get(hr_onboarding::board))
+        .route("/hr/onboarding/templates", get(hr_onboarding::list_templates))
+        .route(
+            "/hr/onboarding/employees/{id}",
+            get(hr_onboarding::checklist),
+        )
+        .route_layer(guards::require(&state, "hr.onboarding.read"));
+
+    let hr_onboarding_manage = Router::new()
+        .route(
+            "/hr/onboarding/templates",
+            post(hr_onboarding::create_template),
+        )
+        .route(
+            "/hr/onboarding/templates/{id}",
+            patch(hr_onboarding::update_template),
+        )
+        .route(
+            "/hr/employees/{id}/onboarding",
+            post(hr_onboarding::apply_template),
+        )
+        .route(
+            "/hr/onboarding/items/{id}",
+            patch(hr_onboarding::tick_item),
+        )
+        .route_layer(guards::require(&state, "hr.onboarding.manage"));
+
+    // Documents and reports (slice 4b). Three routers, and the splits are the point:
+    //
+    // * `hr.documents.read` is the cross-employee list — the screen opened when somebody asks
+    //   "whose contract expires next week", which is not the same question as one employee's
+    //   documents, and it is why this is a separate key from `hr.employees.read` rather than a
+    //   query on the employee screen.
+    // * `hr.documents.manage` attaches and removes. Removing deletes the **reference only**: the
+    //   bytes stay in the media pipeline, because another module may be pointing at them.
+    // * `hr.documents.sweep` is its own key rather than part of the pair. It is the one write here
+    //   that touches every employee's documents rather than the one somebody is looking at, and the
+    //   one that emits to the bus — an automation waiting on `hr.document.expiring` is driven by
+    //   whoever holds it.
+    //
+    // **The export is a fourth key, not a stricter read.** `hr.reports.export` exists because
+    // reading a headcount is ordinary and moving it into a file somebody mails around is a
+    // different act; a role that can read the table does not automatically get the download.
+    let hr_documents_read = Router::new()
+        .route("/hr/documents", get(hr_documents::list_documents))
+        .route("/hr/documents/{id}", get(hr_documents::get_document))
+        .route_layer(guards::require(&state, "hr.documents.read"));
+
+    let hr_documents_manage = Router::new()
+        .route(
+            "/hr/employees/{id}/documents",
+            post(hr_documents::attach_document),
+        )
+        .route(
+            "/hr/documents/{id}",
+            delete(hr_documents::delete_document),
+        )
+        .route_layer(guards::require(&state, "hr.documents.manage"));
+
+    // The sweep is a POST and stays one. A reminder a `GET` can trigger is a reminder a prefetcher,
+    // a crawler or a link preview burns out of a month.
+    let hr_documents_sweep = Router::new()
+        .route("/hr/documents/sweep", post(hr_documents::sweep_documents))
+        .route_layer(guards::require(&state, "hr.documents.sweep"));
+
+    let hr_reports_read = Router::new()
+        .route("/hr/reports", get(hr_documents::report_names))
+        .route_layer(guards::require(&state, "hr.reports.read"));
+
+    // `hr.reports.read` guards the router; the export is narrowed *inside* the handler by the
+    // effective-permission check, because the same handler serves both and a second route with a
+    // different path would mean `?format=csv` and `/hr/reports/{name}/export` could disagree about
+    // which one the screen's button is allowed to call.
+    let hr_reports_export = Router::new()
+        .route("/hr/reports/{report}", get(hr_documents::get_report))
+        .route_layer(guards::require(&state, "hr.reports.read"));
+
+    let hr_employees_create = Router::new()
+        .route("/hr/employees", post(hr::create_employee))
+        .route_layer(guards::require(&state, "hr.employees.create"));
+
+    let hr_employees_update = Router::new()
+        .route("/hr/employees/{id}", patch(hr::update_employee))
+        .route_layer(guards::require(&state, "hr.employees.update"));
+
+    let hr_employees_terminate = Router::new()
+        .route(
+            "/hr/employees/{id}/terminate",
+            post(hr::terminate_employee),
+        )
+        .route_layer(guards::require(&state, "hr.employees.terminate"));
+
+    // The department tree and the org chart are the same rows, so the tree gets its own read key
+    // rather than borrowing the directory's: an organization may well let a manager see the shape
+    // of the company without opening the directory.
+    let hr_departments_read = Router::new()
+        .route("/hr/departments", get(hr::list_departments))
+        .route_layer(guards::require(&state, "hr.departments.read"));
+
+    let hr_departments_manage = Router::new()
+        .route("/hr/departments", post(hr::create_department))
+        .route("/hr/departments/{id}", patch(hr::update_department))
+        .route("/hr/departments/{id}", delete(hr::delete_department))
+        .route("/hr/departments/merge", post(hr::merge_departments))
+        .route_layer(guards::require(&state, "hr.departments.manage"));
+
+    // Leave (REQ-055 slice 2). Four keys for four different acts, and the split is the point:
+    //
+    // * `hr.leave.approve` is separate from `hr.leave.request` because asking for leave and
+    //   agreeing to somebody else's are different decisions by different people. A key that did
+    //   both would let an employee approve their own holiday, and the audit trail would record it
+    //   as an ordinary approval.
+    // * `hr.leave.manage` writes the CATALOGUE, not the requests: entitlement, whether approval
+    //   is needed, whether a negative balance is allowed. A person who can request leave must not
+    //   be able to raise the entitlement they are measured against.
+    // * The **preview** is a route rather than arithmetic in the browser. The acceptance criterion
+    //   asks that the number shown before submit equals the stored value, and a second
+    //   implementation in TypeScript is a second answer.
+    let hr_leave_read = Router::new()
+        .route("/hr/leave/types", get(hr_leave::list_leave_types))
+        .route("/hr/leave/balances", get(hr_leave::list_balances))
+        .route("/hr/leave/requests", get(hr_leave::list_requests))
+        .route("/hr/leave/requests/preview", get(hr_leave::preview_days))
+        .route("/hr/leave/requests/{id}", get(hr_leave::get_request))
+        .route("/hr/leave/calendar", get(hr_leave::absence_calendar))
+        .route_layer(guards::require(&state, "hr.leave.read"));
+
+    let hr_leave_request = Router::new()
+        .route("/hr/leave/requests", post(hr_leave::create_request))
+        .route(
+            "/hr/leave/requests/{id}/cancel",
+            post(hr_leave::cancel_request),
+        )
+        .route_layer(guards::require(&state, "hr.leave.request"));
+
+    let hr_leave_approve = Router::new()
+        .route(
+            "/hr/leave/requests/{id}/decision",
+            post(hr_leave::decide_request),
+        )
+        .route_layer(guards::require(&state, "hr.leave.approve"));
+
+    let hr_leave_manage = Router::new()
+        .route("/hr/leave/types", post(hr_leave::create_leave_type))
+        .route("/hr/leave/types/{id}", patch(hr_leave::update_leave_type))
+        .route_layer(guards::require(&state, "hr.leave.manage"));
+
+    // The self-service surface (REQ-055 slice 2c), and the **only** router in this file with no
+    // `route_layer` at all. That is the point of it rather than a gap in the guards: an employee
+    // with no HR role must still be able to read their own record, ask for leave, withdraw it and
+    // open their contract. Every `/hr/*` route above is behind an `hr.*` key, which is exactly
+    // what makes them unusable for the person they exist for.
+    //
+    // What replaces the permission check is not "nothing":
+    //
+    // * `CurrentSession` is the extractor, so an anonymous caller is refused `401` by the platform
+    //   rather than reaching a handler that would answer an empty page.
+    // * `organization_of` resolves the caller's own tenant, so no request may name another one.
+    // * The **subject** is resolved from `user_id` through the module on every request. There is
+    //   no `employee_id` path or query parameter in `hr_me`, and that absence is the security
+    //   property: a self-service route that accepted one would be a directory read for anyone who
+    //   can edit a URL.
+    //
+    // An account with no employee row answers `404` naming the *employee*, not `403` — an account
+    // created before HR, or one belonging to a service integration, is a real state of a real
+    // platform and not a permission problem.
+    let hr_me = Router::new()
+        .route("/hr/me", get(hr_me::get_me))
+        .route("/hr/me/leave", get(hr_me::my_leave))
+        .route("/hr/me/leave/types", get(hr_me::my_leave_types))
+        .route(
+            "/hr/me/leave/requests",
+            post(hr_me::create_my_leave_request),
+        )
+        .route(
+            "/hr/me/leave/requests/{id}",
+            get(hr_me::my_leave_request),
+        )
+        .route(
+            "/hr/me/leave/requests/{id}/cancel",
+            post(hr_me::cancel_my_leave_request),
+        )
+        .route("/hr/me/leave/preview", get(hr_me::my_leave_preview))
+        .route("/hr/me/documents", get(hr_me::my_documents))
+        // Attendance (slice 2d). The caller's OWN clock lives here, with no `hr.*` key, for the
+        // reason the rest of this router carries none: the person pressing the button is an
+        // employee, and an employee is exactly who holds no `hr.attendance.*` permission. The
+        // month grid and the CSV sit beside it so `/hr/me/attendance` is one screen, not a tab
+        // that fetches its own totals and can disagree with them.
+        .route("/hr/me/attendance", get(hr_attendance::get_attendance))
+        .route("/hr/me/attendance/export", get(hr_attendance::export_csv))
+        .route(
+            "/hr/me/attendance/check-in",
+            post(hr_attendance::check_in),
+        )
+        .route(
+            "/hr/me/attendance/check-out",
+            post(hr_attendance::check_out),
+        );
+
+    // Activities and the merged timeline. Reading the feed and reading one record's history are
+    // the same exposure, so they share `crm.activities.read` — a separate "timeline" key would
+    // let a caller read a contact's history through a deal screen while being refused on the
+    // contact itself. Writing is its own decision: the feed is the only place a CRM record's
+    // history can be *added* to.
+    let crm_activities_read = Router::new()
+        .route("/crm/activities", get(crm_activities::list_activities))
+        // Three explicit paths rather than `/crm/{record}/{id}/timeline`: the wildcard form
+        // would sit in the same segment tree as `/crm/deals/{id}/stage`, and a param-at-param
+        // match in that position is a route table that only one of the two can win.
+        .route(
+            "/crm/contacts/{id}/timeline",
+            get(crm_activities::contact_timeline),
+        )
+        .route(
+            "/crm/companies/{id}/timeline",
+            get(crm_activities::company_timeline),
+        )
+        .route("/crm/deals/{id}/timeline", get(crm_activities::deal_timeline))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.activities.read",
+        ));
+
+    let crm_activities_create = Router::new()
+        .route("/crm/activities", post(crm_activities::create_activity))
+        .route(
+            "/crm/activities/{id}/done",
+            post(crm_activities::complete_activity),
+        )
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.activities.create",
+        ));
+
+    // The copilot. `crm.copilot.use` is a key of its own and not a sub-permission of the read or
+    // the update, for the reason the catalogue gives: a model that can read the whole CRM is a
+    // data-exfiltration surface even when it only ever returns text. The route answers a draft
+    // and writes nothing to the record, so there is deliberately no `POST` that applies one.
+    let crm_copilot = Router::new()
+        .route(
+            "/crm/copilot/summarize/{deal_id}",
+            post(crm_copilot::summarize),
+        )
+        .route(
+            "/crm/copilot/follow-up/{deal_id}",
+            post(crm_copilot::follow_up),
+        )
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.copilot.use",
+        ));
+
+    // The form → lead ingress (slice 4 part seven). Two keys and not one: **reading** the log of
+    // submissions that arrived and **deciding what a submission becomes** are separate decisions
+    // with separate consequences, and a role that can silence the pipeline should not be the
+    // same role that merely watches it fill up. The settings route is a `GET` *and* a `PUT` on
+    // one path, split by method into two layers so the read does not need the manage key.
+    let crm_leads_read = Router::new()
+        .route("/crm/leads", get(crm_leads::list_leads))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.leads.read",
+        ));
+
+    let crm_leads_manage = Router::new()
+        .route(
+            "/crm/leads/settings",
+            get(crm_leads::get_lead_settings).put(crm_leads::update_lead_settings),
+        )
+        .route("/crm/leads/drain", post(crm_leads::drain_now))
+        .route_layer(guards::require_department_scoped(
+            &state,
+            "crm.leads.manage",
+        ));
+
+    let crm = crm_read
+        .merge(crm_leads_read)
+        .merge(crm_leads_manage)
+        .merge(crm_activities_read)
+        .merge(crm_activities_create)
+        .merge(crm_copilot)
+        .merge(hr_employees_read)
+        .merge(hr_employees_create)
+        .merge(hr_employees_update)
+        .merge(hr_employees_terminate)
+        .merge(hr_departments_read)
+        .merge(hr_departments_manage)
+        .merge(hr_leave_read)
+        .merge(hr_leave_request)
+        .merge(hr_leave_approve)
+        .merge(hr_leave_manage)
+        .merge(hr_me)
+        .merge(hr_attendance_read)
+        .merge(hr_attendance_record)
+        .merge(hr_attendance_manage)
+        .merge(hr_onboarding_read)
+        .merge(hr_onboarding_manage)
+        .merge(hr_documents_read)
+        .merge(hr_documents_manage)
+        .merge(hr_documents_sweep)
+        .merge(hr_reports_read)
+        .merge(hr_reports_export)
+        .merge(crm_create)
+        .merge(crm_update)
+        .merge(crm_archive)
+        .merge(crm_merge)
+        .merge(crm_views_read)
+        .merge(crm_views_manage)
+        .merge(crm_import)
+        .merge(crm_deals_read)
+        .merge(crm_deals_create)
+        .merge(crm_deals_update)
+        .merge(crm_deals_archive)
+        .merge(crm_pipelines_manage);
+
+    // The sales surface (docs/requests/REQ-052, slice 1): the sellable catalog and the price
+    // lists. Four keys rather than two, and the split is the point: **a price list is a separate
+    // decision from a product**, because a price list is shared with everyone who quotes from it
+    // and a product is one item in a catalog. A role that may add a widget must not thereby be
+    // able to rewrite what the whole sales desk charges for everything.
+    //
+    // The price-resolution route sits on the *read* key deliberately: asking "what would this
+    // product cost at 100 units on this list" discloses nothing the catalog does not already
+    // show, and putting it behind a write key would mean the quote builder cannot prefill a
+    // price for a seller who is not allowed to change it — which is most of them.
+    let sales_products_read = Router::new()
+        .route("/sales/products", get(sales::list_products))
+        .route("/sales/products/vocabulary", get(sales::catalog_vocabulary))
+        .route("/sales/products/{id}", get(sales::get_product))
+        .route("/sales/products/{id}/price", get(sales::resolve_product_price))
+        .route_layer(guards::require(&state, "sales.products.read"));
+
+    let sales_products_manage = Router::new()
+        .route("/sales/products", post(sales::create_product))
+        .route("/sales/products/{id}", patch(sales::update_product))
+        .route("/sales/products/{id}", delete(sales::archive_product))
+        .route_layer(guards::require(&state, "sales.products.manage"));
+
+    let sales_pricelists_read = Router::new()
+        .route("/sales/pricelists", get(sales::list_price_lists))
+        .route("/sales/pricelists/{id}", get(sales::get_price_list))
+        .route_layer(guards::require(&state, "sales.pricelists.read"));
+
+    let sales_pricelists_manage = Router::new()
+        .route("/sales/pricelists", post(sales::create_price_list))
+        .route("/sales/pricelists/{id}", patch(sales::update_price_list))
+        .route("/sales/pricelists/{id}", delete(sales::archive_price_list))
+        .route(
+            "/sales/pricelists/{id}/items",
+            put(sales::replace_price_list_items),
+        )
+        .route_layer(guards::require(&state, "sales.pricelists.manage"));
+
+    // The settings row is read on the quote builder (every new quote's currency and validity come
+    // from it) and written on the settings screen. One path, two keys, split by method — the same
+    // treatment the CRM lead settings get, for the same reason: a screen that cannot read the
+    // defaults cannot build a quote, and a seller who can build quotes need not be able to change
+    // the approval threshold they are measured against.
+    let sales_settings_read = Router::new()
+        .route("/sales/settings", get(sales::get_settings))
+        .route_layer(guards::require(&state, "sales.quotes.create"));
+
+    let sales_settings_write = Router::new()
+        .route("/sales/settings", put(sales::update_settings))
+        .route_layer(guards::require(&state, "sales.quotes.send"));
+
+    // The quote surface (docs/requests/REQ-052, slice 2). `send` is the one that both freezes
+    // the document and issues the customer's link, so it is a permission of its own rather than
+    // part of `sales.quotes.update`: being able to rewrite a draft is not the same power as being
+    // able to put a company's name on a document.
+    let sales_quotes_read = Router::new()
+        .route("/sales/quotes", get(sales_quotes::list_quotes))
+        .route("/sales/quotes/vocabulary", get(sales_quotes::quote_vocabulary))
+        .route("/sales/quotes/{id}", get(sales_quotes::get_quote))
+        // The PDF is on the **read** key, not on `send` or `update`: downloading a document
+        // changes nothing, and putting it behind a key that also freezes a document would make a
+        // read-only analyst unable to print a quote they are looking at. It is a separate route
+        // rather than `?format=pdf` for the reason the report export is — a file and a JSON body
+        // have different failure modes, and one route answering either has whichever error
+        // handling ran last.
+        .route(
+            "/sales/quotes/{id}/pdf",
+            get(sales_documents::quote_pdf),
+        )
+        .route_layer(guards::require(&state, "sales.quotes.read"));
+    let sales_quotes_create = Router::new()
+        .route("/sales/quotes", post(sales_quotes::create_quote))
+        .route_layer(guards::require(&state, "sales.quotes.create"));
+    let sales_quotes_update = Router::new()
+        .route("/sales/quotes/{id}", patch(sales_quotes::update_quote))
+        .route("/sales/quotes/{id}/cancel", post(sales_quotes::cancel_quote))
+        .route("/sales/quotes/{id}/duplicate", post(sales_quotes::duplicate_quote))
+        .route("/sales/quotes/{id}/lines", put(sales_quotes::replace_lines))
+        .route_layer(guards::require(&state, "sales.quotes.update"));
+    let sales_quotes_send = Router::new()
+        .route("/sales/quotes/{id}/send", post(sales_quotes::send_quote))
+        .route("/sales/quotes/{id}/link", post(sales_quotes::issue_link))
+        .route_layer(guards::require(&state, "sales.quotes.send"));
+    // The discount gate (docs/requests/REQ-052, slice 3). Reading the inbox is `sales.quotes.read`
+    // and **deciding is `sales.quotes.send`**, which is the deliberate choice: approving a
+    // discount is the last step before the organization's name goes on a document, so a role that
+    // may not send may not clear the gate that lets it be sent. Raising a request is on the send
+    // key too, because asking for a discount and granting one are the same conversation and a
+    // seller with `.update` but not `.send` is exactly the person who needs this.
+    // The order chain (docs/requests/REQ-052, slice 4). Reading a delivery is `sales.orders.read`
+    // and writing a hand-made draft is `sales.orders.create`; **confirming, cancelling and
+    // raising an invoice draft are all `sales.orders.confirm`**, because each of them commits the
+    // organization: stock is held, stock is given back, or a document goes to accounting. A role
+    // that may look at the deliveries may not promise one.
+    let sales_orders_read = Router::new()
+        .route("/sales/orders", get(sales_orders::list_orders))
+        .route("/sales/orders/{id}", get(sales_orders::get_order))
+        // As with the quote: the PDF is a read. A role that may see the deliveries may print them.
+        .route(
+            "/sales/orders/{id}/pdf",
+            get(sales_documents::order_pdf),
+        )
+        .route_layer(guards::require(&state, "sales.orders.read"));
+    let sales_orders_create = Router::new()
+        .route("/sales/orders", post(sales_orders::create_order))
+        .route_layer(guards::require(&state, "sales.orders.create"));
+    let sales_orders_confirm = Router::new()
+        .route("/sales/orders/{id}/confirm", post(sales_orders::confirm_order))
+        .route("/sales/orders/{id}/cancel", post(sales_orders::cancel_order))
+        .route(
+            "/sales/orders/{id}/invoice-draft",
+            post(sales_orders::raise_invoice_draft),
+        )
+        .route_layer(guards::require(&state, "sales.orders.confirm"));
+
+    // The report and the search (docs/requests/REQ-052, slice 4b). Both are **reads**, and both
+    // are on keys that only read: a report is a picture of what already happened, and asking for
+    // one commits nobody to anything.
+    //
+    // The export is deliberately on the *same* key as the summary rather than a key of its own. An
+    // export readable by somebody who cannot see the table is not a smaller copy of it — it is a
+    // way around the permission, landing in a downloads folder with no screen on it to explain
+    // what it is.
+    let sales_reports_read = Router::new()
+        .route("/sales/reports/summary", get(sales_reports::report_summary))
+        .route("/sales/reports/export", get(sales_reports::report_export))
+        .route_layer(guards::require(&state, "sales.reports.read"));
+    // **Any one of** the two read keys, and the one place the platform needs an "or" guard. The
+    // palette is on every screen, so a person whose job is deliveries and not quoting must still
+    // find their order by typing a customer's name. Requiring both keys would make the search
+    // silently absent for half the sales desk — a feature that vanishes with no message, which is
+    // worse than a feature that is not there.
+    let sales_search = Router::new()
+        .route("/sales/search", get(sales_reports::search))
+        .route_layer(guards::require_any(
+            &state,
+            &["sales.quotes.read", "sales.orders.read"],
+        ));
+
+    let sales_approvals_read = Router::new()
+        .route("/sales/approvals", get(sales_approvals::list_approvals))
+        .route("/sales/approvals/{id}", get(sales_approvals::get_approval))
+        .route(
+            "/sales/quotes/{id}/approvals",
+            get(sales_approvals::list_quote_approvals),
+        )
+        .route(
+            "/sales/quotes/{id}/approval-requirement",
+            get(sales_approvals::approval_requirement),
+        )
+        .route_layer(guards::require(&state, "sales.quotes.read"));
+    let sales_approvals_send = Router::new()
+        .route(
+            "/sales/approvals/{id}/decision",
+            post(sales_approvals::decide_approval),
+        )
+        .route(
+            "/sales/approvals/{id}/cancel",
+            post(sales_approvals::cancel_approval),
+        )
+        .route_layer(guards::require(&state, "sales.quotes.send"));
+    // **Raising** a request is on the *update* key, not the send key, and this is not a detail:
+    // the request is what the seller asks for when they may not send, so a route behind
+    // `sales.quotes.send` would leave the drafter role — the one the acceptance criteria are
+    // about — with an amber banner and no button. Deciding stays on `send`; that is the power.
+    let sales_approvals_ask = Router::new()
+        .route(
+            "/sales/quotes/{id}/approval-requests",
+            post(sales_approvals::request_approval),
+        )
+        .route_layer(guards::require(&state, "sales.quotes.update"));
+
+    // The accounting surface (docs/requests/REQ-054, slice 1): the chart of accounts, the tax
+    // rates and the journal.
+    //
+    // Two keys guard reads and two guard writes, and the split is the same argument the other
+    // three families make — **what a mistake costs, not which screen**. The chart and the rates
+    // share a pair because an account code is what a journal line picks and a rate is what a line
+    // defaults to: they are one decision about what a document will say. The journal's write key
+    // is separate because posting is a claim with the poster's name on it, not an edit: a
+    // prepared entry and a posted entry are different acts, and the balance invariant means
+    // everything posted is a promise that the books add up.
+    //
+    // The deactivate route is a `POST` and not a `DELETE` on purpose. **Nothing in this module
+    // deletes.** A journal line references an account with `on delete restrict`, so a delete is a
+    // database error naming a constraint; deactivating is the operation that answers "we do not
+    // use this any more" while leaving every historical reference readable. A `DELETE` route that
+    // quietly deactivated would be a lie in the method name.
+    let accounting_accounts_read = Router::new()
+        .route("/accounting/accounts", get(accounting::list_accounts))
+        .route("/accounting/tax-rates", get(accounting::list_tax_rates))
+        .route_layer(guards::require(&state, "accounting.accounts.read"));
+
+    let accounting_accounts_manage = Router::new()
+        .route("/accounting/accounts", post(accounting::create_account))
+        .route(
+            "/accounting/accounts/{id}",
+            patch(accounting::update_account),
+        )
+        .route(
+            "/accounting/accounts/{id}/deactivate",
+            post(accounting::deactivate_account),
+        )
+        .route("/accounting/tax-rates", post(accounting::create_tax_rate))
+        .route(
+            "/accounting/tax-rates/{id}",
+            patch(accounting::update_tax_rate),
+        )
+        .route_layer(guards::require(&state, "accounting.accounts.manage"));
+
+    let accounting_journal_read = Router::new()
+        .route("/accounting/journal", get(accounting::list_journal))
+        .route(
+            "/accounting/journal/{id}",
+            get(accounting::get_journal_entry),
+        )
+        .route_layer(guards::require(&state, "accounting.journal.read"));
+
+    let accounting_journal_manage = Router::new()
+        .route("/accounting/journal", post(accounting::post_journal_entry))
+        .route_layer(guards::require(&state, "accounting.journal.manage"));
+
+    // The invoice surface (docs/requests/REQ-054, slice 2).
+    //
+    // Three keys, and the split is **what a mistake costs**. Reading a list of receivables costs
+    // nothing worse than an inconvenience. Creating a draft is a document nobody has seen. Sending
+    // is different again: it issues a number to a customer, it is the event a finance automation
+    // subscribes to, and after it the document is immutable. Void is separate from send for the
+    // same reason — a withdrawal is a statement about money owed, and a person who may issue an
+    // invoice is not automatically a person who may cancel one.
+    let accounting_invoices_read = Router::new()
+        .route("/accounting/invoices", get(accounting_invoices::list_invoices))
+        .route(
+            "/accounting/invoices/{id}",
+            get(accounting_invoices::get_invoice),
+        )
+        .route_layer(guards::require(&state, "accounting.invoices.read"));
+
+    let accounting_invoices_create = Router::new()
+        .route("/accounting/invoices", post(accounting_invoices::create_invoice))
+        .route_layer(guards::require(&state, "accounting.invoices.create"));
+
+    // Send, void and the sweep are one layer on purpose: each is the point where a document stops
+    // being the organization's own draft and becomes a statement about money owed. The sweep
+    // lives here rather than behind a background job because the platform's automation family
+    // (wave 3) is what *triggers* it — the trigger is a schedule, the statement is a route, and
+    // putting the statement in three places is how "which invoices are late" gets three answers.
+    let accounting_invoices_issue = Router::new()
+        .route(
+            "/accounting/invoices/{id}/send",
+            post(accounting_invoices::send_invoice),
+        )
+        .route(
+            "/accounting/invoices/{id}/void",
+            post(accounting_invoices::void_invoice),
+        )
+        .route(
+            "/accounting/invoices/sweep-overdue",
+            post(accounting_invoices::sweep_overdue_invoices),
+        )
+        .route_layer(guards::require(&state, "accounting.invoices.send"));
+
+    // Payments (docs/requests/REQ-054, slice 3). Three layers rather than two, and the split is
+    // the argument the catalogue spells out: recording what arrived is a bookkeeper's routine
+    // act, reversing it rewrites an invoice and posts against the ledger, and the overpay
+    // override gates the one action here that is arithmetically wrong rather than merely
+    // consequential. **`.overpay` is checked inside the route, not as a layer** — it is a field
+    // on a body that is otherwise legal, and a layer would forbid the whole payment rather than
+    // the flag that was not entitled to it.
+    let accounting_payments_read = Router::new()
+        .route("/accounting/payments", get(accounting_payments::list_payments))
+        .route(
+            "/accounting/payments/{id}",
+            get(accounting_payments::get_payment),
+        )
+        .route_layer(guards::require(&state, "accounting.payments.read"));
+
+    let accounting_payments_record = Router::new()
+        .route("/accounting/payments", post(accounting_payments::record_payment))
+        .route_layer(guards::require(&state, "accounting.payments.record"));
+
+    // **No `.reverse` route layer, and the absence is deliberate.** Every other payment route is
+    // guarded by a layer, which reads as the safe default — and it is, for the routes whose
+    // refusal says nothing about a specific row. This one is different: the path carries an id, and
+    // a layer answers `403 permission_denied` *before* the handler can ask whether that id is in
+    // the caller's organization. A 403 on a named id confirms the row exists somewhere, which is
+    // the one thing a tenant boundary must never leak — the walk
+    // `another_organizations_payment_is_404_and_never_403` exists for exactly this. The handler
+    // therefore does it in the right order: read the row (404 for another tenant), *then* check
+    // the key. A 403 that survives is always about a payment the caller can already see.
+    //
+    // The layer's other job — refusing an anonymous caller — is unchanged: `CurrentSession` in the
+    // handler extractor still answers 401 before any of this runs, and
+    // `every_payment_route_refuses_an_anonymous_caller` proves it.
+    let accounting_payments_reverse = Router::new().route(
+        "/accounting/payments/{id}/reverse",
+        post(accounting_payments::reverse_payment),
+    );
+
+    // Expenses (docs/requests/REQ-054, slice 4). The read layer is fine here — a list and a detail
+    // refusal say nothing about a row the caller cannot see. The **transition routes carry no
+    // layer at all**, for the reason slice 3 removed one from the payment reversal: the path holds
+    // an id, and a layer answers 403 before the handler can ask whose expense that is, which
+    // confirms it exists somewhere. The handler reads (404) and then asks for the key.
+    // The four reports and their export. `reports/{report}` names a REPORT, not a row, so a
+    // permission layer's 403 says nothing about a document the caller cannot see -- the reason
+    // the expense transitions omit a layer does not apply here. `/export` is registered after
+    // the read because it is a different path, not a parameter: axum matches in registration
+    // order and both are distinct segments.
+    let accounting_reports = Router::new()
+        .route(
+            "/accounting/reports/{report}",
+            get(accounting_reports::get_report),
+        )
+        .route(
+            "/accounting/reports/{report}/export",
+            get(accounting_reports::export_report),
+        )
+        .route_layer(guards::require(&state, "accounting.reports.read"));
+
+    let accounting_expenses_read = Router::new()
+        // `categories` is registered **before** `{id}`: axum matches in registration order, so a
+        // literal declared after a path parameter is read as a uuid and the route answers 400 for
+        // a word.
+        .route(
+            "/accounting/expenses/categories",
+            get(accounting_expenses::list_expense_categories),
+        )
+        .route(
+            "/accounting/expenses",
+            get(accounting_expenses::list_expenses),
+        )
+        .route(
+            "/accounting/expenses/{id}",
+            get(accounting_expenses::get_expense),
+        )
+        .route_layer(guards::require(&state, "accounting.expenses.read"));
+
+    let accounting_expenses_create = Router::new()
+        .route(
+            "/accounting/expenses",
+            post(accounting_expenses::create_expense),
+        )
+        .route_layer(guards::require(&state, "accounting.expenses.create"));
+
+    // Edit is its own key: a draft is a form, and letting anyone who may file one rewrite a
+    // colleague's draft is how two people overwrite each other's half-typed receipt.
+    let accounting_expenses_update = Router::new()
+        .route(
+            "/accounting/expenses/{id}",
+            patch(accounting_expenses::update_expense),
+        )
+        .route_layer(guards::require(&state, "accounting.expenses.update"));
+
+    // **No layer, and the absence is the feature** — see above. `CurrentSession` still answers 401
+    // for an anonymous caller before any of this runs, so the layer's other job is unchanged.
+    let accounting_expenses_decide = Router::new()
+        .route(
+            "/accounting/expenses/{id}/submit",
+            post(accounting_expenses::submit_expense),
+        )
+        .route(
+            "/accounting/expenses/{id}/decision",
+            post(accounting_expenses::decide_expense),
+        )
+        .route(
+            "/accounting/expenses/{id}/reimburse",
+            post(accounting_expenses::reimburse_expense),
+        );
+
+    // The customer's copy: no session, no permission, the token is the credential. `post` is the
+    // same method as a mutation because accepting a quote **is** a mutation — a GET that changed
+    // a document would be prefetched by a crawler and accepted on the customer's behalf.
+    let sales_quotes_public = Router::new()
+        .route("/sales/public/quotes/{token}", get(sales_quotes::public_quote))
+        .route("/sales/public/quotes/{token}/accept", post(sales_quotes::accept_quote))
+        .route("/sales/public/quotes/{token}/decline", post(sales_quotes::decline_quote));
+
+    let sales = sales_products_read
+        .merge(sales_approvals_read)
+        .merge(sales_orders_read)
+        .merge(sales_orders_create)
+        .merge(sales_orders_confirm)
+        .merge(sales_reports_read)
+        .merge(sales_search)
+        .merge(sales_approvals_ask)
+        .merge(sales_approvals_send)
+        .merge(sales_products_manage)
+        .merge(sales_pricelists_read)
+        .merge(sales_pricelists_manage)
+        .merge(sales_settings_read)
+        .merge(sales_settings_write)
+        .merge(sales_quotes_read)
+        .merge(sales_quotes_create)
+        .merge(sales_quotes_update)
+        .merge(sales_quotes_send)
+        .merge(sales_quotes_public)
+        .merge(accounting_accounts_read)
+        .merge(accounting_accounts_manage)
+        .merge(accounting_journal_read)
+        .merge(accounting_journal_manage)
+        .merge(accounting_invoices_read)
+        .merge(accounting_invoices_create)
+        .merge(accounting_invoices_issue)
+        .merge(accounting_payments_read)
+        .merge(accounting_payments_record)
+        .merge(accounting_payments_reverse)
+        .merge(accounting_expenses_read)
+        .merge(accounting_expenses_create)
+        .merge(accounting_expenses_update)
+        .merge(accounting_expenses_decide)
+        // **This merge is the route.** Without it the router is built, compiles, and every
+        // request answers 404 -- a walk that only checked "the handler exists" would call that
+        // done. It is the one line that made a green build a usable endpoint.
+        .merge(accounting_reports);
+
+    // The inventory surface (docs/requests/REQ-053, slice 1): items, warehouses, locations, the
+    // stock rollup and the append-only ledger.
+    //
+    // The keys are **not** one per screen. They follow what a mistake costs, and three of them
+    // exist for reasons a reader would otherwise have to infer:
+    //
+    // * `inventory.movements.record` is separate from `inventory.items.manage` because **reading
+    //   a balance and moving stock are different powers**: a picking clerk needs the first for
+    //   every order of the day and the second once.
+    // * `inventory.negative.manage` is a key of its own and **is not on any route**. The schema
+    //   cannot ask who is calling, so the rule is checked inside the write (see
+    //   `inventory::record_movement`); a role that holds it can do nothing else with it, which is
+    //   exactly what a "you may take the stock below zero" permission should look like.
+    // * `inventory.locations.manage` is separate from `inventory.movements.record` because
+    //   closing a location is a structural change — it makes stock unreachable — and a person who
+    //   ships goods all day is not automatically the person who may close a bin.
+    let inventory_items_read = Router::new()
+        .route("/inventory", get(inventory::overview))
+        .route("/inventory/vocabulary", get(inventory::vocabulary))
+        .route("/inventory/items", get(inventory::list_items))
+        .route("/inventory/items/lookup", get(inventory::lookup_item))
+        .route("/inventory/items/{id}", get(inventory::get_item))
+        .route("/inventory/stock", get(inventory::list_stock))
+        .route("/inventory/reconciliation", get(inventory::reconciliation))
+        .route("/inventory/warehouses", get(inventory::list_warehouses))
+        .route("/inventory/locations", get(inventory::list_locations))
+        .route("/inventory/movements", get(inventory::list_movements))
+        .route("/inventory/movements/{id}", get(inventory::get_movement))
+        // The preview and the settings row are reads that sit on a read key: the drawer asks
+        // "what would this do?" on every keystroke, and putting that behind a write key would make
+        // the drawer broken for every role that may not yet be trusted with the write.
+        .route("/inventory/movements/preview", post(inventory::preview_movement))
+        .route("/inventory/settings", get(inventory::get_settings))
+        // The transfer and alert **reads** sit here, under `inventory.items.read`, for the
+        // reason in the comment on `inventory_transfers` above.
+        .route("/inventory/transfers", get(inventory::list_transfers))
+        .route("/inventory/transfers/{id}", get(inventory::get_transfer))
+        .route("/inventory/alerts", get(inventory::list_alerts))
+        .route(
+            "/inventory/alerts/open-count",
+            get(inventory::open_alert_count),
+        )
+        // The stocktake (slice 4). The reads sit here on `inventory.items.read` for the same
+        // reason the transfer reads do: **a stocktake is a document about stock**, so anybody
+        // who may read the ledger may read the counts that explain it, and a second key would
+        // mean a role could see a variance hit the shelf with no way to find the count that
+        // caused it. The report is a read for the same reason and for a further one — it is
+        // the document an auditor opens, and an auditor holds the read key.
+        .route("/inventory/stocktake", get(inventory::list_stocktakes))
+        .route("/inventory/stocktake/{id}", get(inventory::get_stocktake))
+        .route(
+            "/inventory/stocktake/{id}/report",
+            get(inventory::stocktake_report),
+        )
+        // The adjustment inbox and its export. The inbox is a **read** key and not the approve
+        // key on purpose: a manager's job is to see what is waiting, and an approver who cannot
+        // see the queue has to ask for a link to it. The decision is the guarded write below.
+        .route("/inventory/approvals", get(inventory::list_approvals))
+        .route(
+            "/inventory/approvals/pending-count",
+            get(inventory::pending_approval_count),
+        )
+        .route("/inventory/approvals/export", get(inventory::export_approvals))
+        .route("/inventory/stock/export", get(inventory::export_stock))
+        // The reports screen and the global search (slice 4b). Both are **reads**, so
+        // they sit here on `inventory.items.read` with the stock list rather than
+        // growing a key: a report is a question about stock this organization owns,
+        // and a permission called `inventory.reports.read` would let a role hold it
+        // and still see nothing, which is the confusingest permission there is.
+        .route("/inventory/reports", get(inventory::reports))
+        .route("/inventory/reports/export", get(inventory::export_report))
+        .route("/inventory/search", get(inventory::global_search))
+        .route(
+            "/inventory/movements/export",
+            get(inventory::export_movements),
+        )
+        .route_layer(guards::require(&state, "inventory.items.read"));
+
+    let inventory_items_manage = Router::new()
+        .route("/inventory/items", post(inventory::create_item))
+        .route("/inventory/items/{id}", patch(inventory::update_item))
+        .route("/inventory/items/{id}", delete(inventory::archive_item))
+        .route_layer(guards::require(&state, "inventory.items.manage"));
+
+    let inventory_locations_manage = Router::new()
+        .route("/inventory/warehouses", post(inventory::create_warehouse))
+        .route("/inventory/warehouses/{id}", patch(inventory::update_warehouse))
+        .route("/inventory/locations", post(inventory::create_location))
+        .route("/inventory/locations/{id}", patch(inventory::update_location))
+        .route("/inventory/settings", put(inventory::update_settings))
+        .route_layer(guards::require(&state, "inventory.locations.manage"));
+
+    // The ledger's write. **`inventory.movements.record` is the key that moves numbers**, and it
+    // is deliberately not implied by `inventory.items.manage`: being able to fix a threshold is
+    // not being able to alter the balance.
+    let inventory_movements_record = Router::new()
+        .route("/inventory/movements", post(inventory::record_movement))
+        .route_layer(guards::require(&state, "inventory.movements.record"));
+
+    // Transfers and the alert inbox (REQ-053 slice 3).
+    //
+    // **Reading a transfer needs only `inventory.items.read`**, and that is a deliberate choice
+    // rather than a missing guard: a transfer is a movement of stock, so anybody who may read the
+    // ledger may read the documents that produced it, and a second key would mean a role could
+    // see stock go out with no explanation of where it went.
+    let inventory_transfers = Router::new()
+        .route("/inventory/transfers", post(inventory::create_transfer))
+        .route(
+            "/inventory/transfers/{id}/dispatch",
+            post(inventory::dispatch_transfer),
+        )
+        .route("/inventory/transfers/{id}/receive", post(inventory::receive_transfer))
+        .route("/inventory/transfers/{id}/cancel", post(inventory::cancel_transfer))
+        .route_layer(guards::require(&state, "inventory.transfers.manage"));
+
+    // The stocktake's writes (REQ-053 slice 4).
+    //
+    // **Opening a sheet and closing one sit behind the same key on purpose.** A sheet is a
+    // document other people read, and a counter who may not be trusted to close one may still
+    // be trusted to fill it in — but the *close* posts a signed adjustment to every location in
+    // the scope, so it cannot be split into "may count" and "may post" without inventing a key
+    // whose only real holder is the person who already has this one. If the separation is ever
+    // wanted, the honest split is at `close`, and it should be asked for rather than assumed.
+    let inventory_stocktake = Router::new()
+        .route("/inventory/stocktake", post(inventory::create_stocktake))
+        .route(
+            "/inventory/stocktake/{id}/count",
+            post(inventory::count_stocktake),
+        )
+        .route(
+            "/inventory/stocktake/{id}/close",
+            post(inventory::close_stocktake),
+        )
+        .route(
+            "/inventory/stocktake/{id}/cancel",
+            post(inventory::cancel_stocktake),
+        )
+        .route_layer(guards::require(&state, "inventory.stocktake.manage"));
+
+    // The sweep creates rows the inbox then shows, so it is a write — but it is the sweep's
+    // **judgement about a balance**, which is the same judgement the crossing already made, so it
+    // sits under the movement key rather than the transfer one. `inventory.transfers.manage`
+    // guards a claim that goods physically moved; the sweep makes no such claim.
+    let inventory_alerts_sweep = Router::new()
+        .route("/inventory/alerts/sweep", post(inventory::sweep_alerts))
+        .route_layer(guards::require(&state, "inventory.movements.record"));
+
+    // **There is no `PATCH` or `DELETE` on `/inventory/movements/{id}` and there is never going to
+    // be one.** The criterion asks for a 405 and axum answers that for a path it does not
+    // implement, which is the only answer that cannot be undone by a later handler that decides to
+    // be helpful. The way to fix a mistake is another movement.
+    // The approval route itself. Raising a request needs only the **movement record** key,
+    // because a request is not a movement: an operator who may adjust stock may ask for a large
+    // adjustment to be approved, and the decision belongs to whoever holds the key below. The
+    // `raise` path is also reachable from the save route above, which is why this router exists
+    // separately — a client that wants to ask explicitly, without attempting the write, can.
+    let inventory_approvals = Router::new()
+        .route("/inventory/approvals", post(inventory::raise_approval))
+        .route_layer(guards::require(&state, "inventory.movements.record"));
+
+    // **`inventory.adjustment.approve` guards the decision and nothing else.** A holder approves
+    // somebody else's recount; that is the whole meaning of the key, and it is why it is
+    // separate from `inventory.movements.record` (a manager who may approve is not thereby
+    // authorised to move stock) and separate from `inventory.negative.manage` (which is not on
+    // any route at all).
+    let inventory_approvals_manage = Router::new()
+        .route(
+            "/inventory/approvals/{id}",
+            get(inventory::get_approval),
+        )
+        .route_layer(guards::require(&state, "inventory.items.read"));
+    let inventory_approval_decisions = Router::new()
+        .route(
+            "/inventory/approvals/{id}/decision",
+            post(inventory::decide_approval),
+        )
+        .route("/inventory/approvals/{id}/cancel", post(inventory::cancel_approval))
+        .route_layer(guards::require(&state, "inventory.adjustment.approve"));
+
+    let inventory = inventory_items_read
+        .merge(inventory_items_manage)
+        .merge(inventory_locations_manage)
+        .merge(inventory_movements_record)
+        .merge(inventory_approvals)
+        .merge(inventory_transfers)
+        .merge(inventory_stocktake)
+        .merge(inventory_alerts_sweep)
+        .merge(inventory_approvals_manage)
+        .merge(inventory_approval_decisions);
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -1969,6 +2692,9 @@ pub fn router(state: AppState) -> Router {
         .merge(analytics_goals_write)
         .merge(analytics_privacy)
         .merge(analytics_collect)
+        .merge(crm)
+        .merge(sales)
+        .merge(inventory)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),
@@ -2048,72 +2774,12 @@ pub fn router(state: AppState) -> Router {
         .route("/sites/{id}/domains", domains)
         .route("/sites/{id}/domains/{domain_id}", domain)
         .route("/sites/{id}/domains/{domain_id}/primary", domain_primary)
-        .route("/blocks", blocks_registry)
-        .route("/blocks/validate", blocks_validate)
-        .route("/patterns", patterns_list)
-        .route("/patterns", patterns_save)
-        .route("/patterns/{id}", pattern)
-        .route("/patterns/{id}/blocks", pattern_blocks)
-        .route("/page-templates", templates_list)
-        .route("/page-templates", templates_save)
-        .route("/page-templates/{id}", template)
-        .route("/pages/from-template", page_from_template)
         .route("/pages", pages)
         .route("/pages/{id}", page)
         .route("/pages/{id}/publish", page_publish)
-        // Menus and the publishing queue (REQ-064, slice 1). The static segments are declared
-        // before the parameter ones so axum ranks them ahead of `{id}`.
-        .route("/menus", menus_list)
-        .route("/menus", menus_create)
-
-        // The panel-side token manager for the headless surface. Merged rather than nested
-        // under a prefix, because the guard layers already carry the permissions and a second
-        // nesting level would only add a place for a route to be declared and forgotten.
-        .merge(content_api)
-        .merge(content_read)
-
-        .route("/menus/{id}", menu_read.merge(menu_write))
-        .route("/menus/{id}/items", menu_items_write)
-        .route("/menus/{id}/items/from-pages", menu_items_from_pages)
-        .route("/publishing/queue", publishing_queue)
-        .route("/publishing/queue/{id}", publishing_entry)
-        .route("/publishing/queue/{id}/cancel", publishing_entry_cancel)
-        .route("/publishing/queue/{id}/publish-now", publishing_entry_now)
-        .route("/publishing/queue/{id}/retry", publishing_entry_retry)
-        .route("/pages/{id}/schedule", page_schedule)
-        .route("/public/menus/{location}", public_menu)
-        // The three public SEO surfaces. The host is a path parameter rather than a header so
-        // they can be cached and proxied like any other file, and so a crawler following a
-        // canonical URL lands on the right site without a `Host` header being trusted through a
-        // CDN that rewrites it.
-        .route("/public/{host}/sitemap.xml", public_sitemap)
-        .route("/public/{host}/robots.txt", public_robots)
-        .route("/public/{host}/redirect", public_redirect)
-        // Forms and their inbox (REQ-064, slice 2). The static segments are declared before the
-        // parameter ones so axum ranks them ahead of `{id}` — `/forms/{id}/submissions/export`
-        // is a literal, and a route registered after `/forms/{id}/submissions/{sid}` would never
-        // be reached.
-        .route("/forms", forms_list)
-        .route("/forms", forms_create)
-        .route("/forms/{id}", form_read.merge(form_write))
-        .route("/forms/{id}/fields", form_fields)
-        .route("/forms/{id}/publish", form_publish)
-        .route("/forms/{id}/submissions", submissions_list)
-        .route("/forms/{id}/submissions", submissions_bulk)
-        .route("/forms/{id}/submissions/export", submissions_export)
-        .route(
-            "/forms/{id}/submissions/{sid}",
-            submission_read.merge(submission_write),
-        )
-        .route("/public/forms/{key}/submit", public_form_submit)
-        .route("/pages/{id}/preview", page_preview)
         .route("/pages/{id}/restore", page_restore)
         .route("/pages/{id}/revisions", page_revisions)
         .route("/pages/{id}/revisions/{revision_id}", page_revision)
-        .route(
-            "/pages/{id}/revisions/{revision_id}/diff",
-            page_revision_diff,
-        )
         .route(
             "/pages/{id}/revisions/{revision_id}/translations",
             page_translations,
@@ -2122,106 +2788,6 @@ pub fn router(state: AppState) -> Router {
             "/pages/{id}/revisions/{revision_id}/translations/{language}",
             page_translation,
         )
-        // SEO toolkit (REQ-064, slice 3). The page tab hangs off `/pages/{id}/seo` beside the
-        // other per-page sub-resources, and the site-wide surface lives under `/seo` with the
-        // settings under `/sites/{id}/seo` — three prefixes for one feature, because each names
-        // a different scope and a single one would have made a page's SEO a site-level route
-        // with a page id in the query.
-        .route("/pages/{id}/seo", page_seo_read.merge(page_seo_write))
-        .route(
-            "/pages/{id}/featured-media",
-            featured_read.merge(featured_write),
-        )
-        .route(
-            "/sites/{site_id}/featured-media/candidates",
-            featured_candidates,
-        )
-        .route("/seo/settings", seo_overview)
-        .route("/seo/redirects", seo_redirect_create)
-        // Before `/seo/redirects/{id}`: axum's matchit would otherwise read "import" as a
-        // redirect id and hand the CSV to a handler that expects a UUID, which fails as a 400
-        // with a message about the path instead of about the file.
-        .route("/seo/redirects/import", seo_redirect_import)
-        .route("/seo/redirects/export", seo_redirect_export)
-        .route("/seo/redirects/{id}", seo_redirect_write)
-        .route("/seo/redirects/{id}/test", seo_redirect_test)
-        .route("/sites/{site_id}/seo/settings", seo_settings_write)
-        .route(
-            "/sites/{site_id}/seo/sitemap/regenerate",
-            seo_sitemap_regenerate,
-        )
-        .route("/seo/broken-links", seo_broken_read.merge(seo_broken_scan))
-        .route("/seo/broken-links/{id}", seo_broken_write)
-        // Newsletter (REQ-064, slice 4b). The panel is three tables and one archive; the
-        // `/public` half is the signup, the two link clicks and the archive page, and none of
-        // them carry a session. The literal segments are declared before the parameter ones so
-        // axum ranks `/newsletter/subscribers/export` ahead of `/newsletter/subscribers/{id}` —
-        // a route registered after a parameterised sibling is unreachable, and the export is
-        // the one button an owner reaches for under pressure.
-        .route("/newsletter/lists", newsletter_lists_read)
-        .route("/newsletter/lists", newsletter_lists_write)
-        .route("/newsletter/lists/{id}", newsletter_list_read.merge(newsletter_list_write))
-        .route(
-            "/newsletter/lists/{id}/subscribers",
-            newsletter_list_subscribers_write,
-        )
-        .route("/newsletter/lists/{id}/import", newsletter_list_import)
-        .route("/newsletter/subscribers", newsletter_subscribers_read)
-        .route("/newsletter/subscribers/export", newsletter_export)
-        .route(
-            "/newsletter/subscribers/{id}",
-            newsletter_subscriber_read.merge(newsletter_subscriber_write),
-        )
-        .route("/newsletter/issues", newsletter_issues_read)
-        .route("/newsletter/issues", newsletter_issues_write)
-        .route("/public/newsletter/lists", public_newsletter_lists)
-        .route("/public/newsletter/confirm", public_newsletter_confirm)
-        .route("/public/newsletter/unsubscribe", public_newsletter_unsubscribe)
-        .route("/public/newsletter/issues/{slug}", public_newsletter_issue)
-        .route(
-            "/public/newsletter/{key}/subscribe",
-            public_newsletter_subscribe,
-        )
-        // Memberships (REQ-064, slice 4c). The panel is the table, the drawer and the policy;
-        // the `/public` half is the visitor's own signup, sign-in, profile, the two link clicks
-        // and the gate probe a theme asks before it draws a page. The per-site policy hangs off
-        // `/sites/{id}`, beside the other per-site surfaces.
-        //
-        // The literal segments are declared BEFORE `/members/{id}` so axum ranks
-        // `/members/settings`-style paths ahead of it — a route registered after a
-        // parameterised sibling is unreachable, and the visitor's sign-in is the one link a
-        // member area cannot afford to lose.
-        .route("/members", members_read)
-        .route("/members", members_create)
-        .route("/members/{id}", member_read.merge(member_write))
-        .route("/members/{id}/block", member_block)
-        .route("/members/{id}/verify", member_verify)
-        .route("/members/{id}/send-verification", member_send_verification)
-        .route("/members/{id}/send-reset", member_send_reset)
-        .route("/members/{id}/sign-out-everywhere", member_signout_everywhere)
-        .route("/sites/{site_id}/members/settings", member_settings_read)
-        .route("/sites/{site_id}/members/settings", member_settings_write)
-        .route("/public/members/signup", public_member_signup)
-        .route("/public/members/signin", public_member_signin)
-        .route("/public/members/signout", public_member_signout)
-        .route("/public/members/me", public_member_me)
-        .route("/public/members/verify", public_member_verify)
-        .route("/public/members/password-reset", public_member_reset)
-        .route("/public/members/gate", public_member_gate)
-        // Comments (REQ-064, slice 4a). The inbox is `/comments`, the policy hangs off the site
-        // it belongs to (`/sites/{id}/comment-settings`, beside the other per-site surfaces) and
-        // the visitor's two routes live under `/public` where every unauthenticated surface on
-        // this platform already lives.
-        .route("/comments", comments_inbox)
-        .route("/comments/bulk", comments_bulk)
-        .route("/comments/{id}", comment_read.merge(comment_write))
-        .route("/comments/{id}/reply", comment_reply)
-        .route("/sites/{site_id}/comment-settings", comment_settings_read)
-        .route("/sites/{site_id}/comment-settings", comment_settings_write)
-        .route("/sites/{site_id}/comment-bans", comment_ban_create)
-        .route("/sites/{site_id}/comment-bans/{id}", comment_ban_write)
-        .route("/public/comments/{page}", public_comment_thread)
-        .route("/public/comments/{page}", public_comment_submit)
         .route("/media", media)
         .merge(media_upload)
         .route("/media/{id}", media_entry)
@@ -2336,59 +2902,6 @@ pub fn router(state: AppState) -> Router {
             media_version_download,
         )
         .route("/public/pages/{slug}", public_pages)
-        .route("/themes", themes_gallery)
-        .route("/themes/{key}", theme_read)
-        .route("/themes/{key}/assets/{file}", theme_asset)
-        .route("/sites/{site_id}/theme", theme_activate)
-        .route("/sites/{site_id}/theme/rollback", theme_rollback)
-        .route("/sites/{site_id}/theme-settings", theme_settings_read)
-        .route("/sites/{site_id}/theme-settings", theme_settings_save)
-        .route(
-            "/sites/{site_id}/theme-settings/contrast-check",
-            theme_settings_contrast_check,
-        )
-        .route(
-            "/sites/{site_id}/theme-settings/publish",
-            theme_settings_publish,
-        )
-        .route(
-            "/sites/{site_id}/theme-settings/revisions",
-            theme_settings_revisions,
-        )
-        .route(
-            "/sites/{site_id}/theme-settings/revisions/{revision_no}",
-            theme_settings_revision,
-        )
-        .route(
-            "/sites/{site_id}/theme-settings/revisions/{revision_no}/restore",
-            theme_settings_restore,
-        )
-        // Theme layouts and packages (REQ-062 slice 3). `/themes/{key}` above is a GET, and a
-        // `DELETE` on the same path is a different method — axum merges those, so the two
-        // coexist. `validate` and `install` are registered BEFORE `/themes/{key}` for the
-        // reason `/backups/sweep` is: a `POST /themes/validate` would otherwise be a perfect
-        // `key` and no conflict at all, so this is a readability choice rather than a
-        // correctness one — but it keeps the static names next to each other.
-        .route("/themes/validate", theme_package_validate)
-        .route("/themes/install", theme_package_install)
-        .route("/sites/{site_id}/theme-layouts", theme_layouts_read)
-        .route(
-            "/sites/{site_id}/theme-layouts/{slot}",
-            theme_layout_slot_read,
-        )
-        .route(
-            "/sites/{site_id}/theme-layouts/{slot}",
-            theme_layout_slot_save,
-        )
-        .route(
-            "/sites/{site_id}/theme-layouts/{slot}/reset",
-            theme_layout_slot_reset,
-        )
-        .route(
-            "/sites/{site_id}/theme-package/export",
-            theme_package_export,
-        )
-        .route("/themes/{key}", theme_remove)
         .route("/public/media/{id}", public_media)
         // The share token route: unauthenticated by nature, because the token is the
         // credential. It is a *static* `shared` segment, so it never collides with the
@@ -2499,7 +3012,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
         .nest("/api/v1", v1)
-        // The limiter is the OUTERMOST layer, ahead of CSRF and ahead of every permission guard,
+// The limiter is the OUTERMOST layer, ahead of CSRF and ahead of every permission guard,
         // and the order is the design rather than an accident of where the line falls in the chain:
         //
         // * A limiter behind the guards would cap only callers who already hold a permission, which
@@ -2511,9 +3024,15 @@ pub fn router(state: AppState) -> Router {
         // `/healthz` and `/readyz` are inside it too, which is deliberate and cheap: they are two
         // `GET`s a probe makes every few seconds, counted against a budget of 600 a minute, and a
         // probe that trips the limiter is a probe that reports the platform down.
-        .layer(crate::rate_limit_middleware::rate_limit(
-            limiter_layer.clone(),
-        ))
+        .layer(crate::rate_limit_middleware::rate_limit(limiter_layer.clone()))
+        // The request id (REQ-051's error state) sits directly under the limiter and **outside** the
+        // nest, so `/healthz` and `/readyz` are stamped too: a liveness probe that answers 503 is
+        // exactly the case where an operator needs the id, and a request id that stopped at the
+        // `/api/v1` boundary would leave the two most-queried endpoints as the only uncorrelatable
+        // ones. Under the limiter rather than above it because a request the limiter refuses never
+        // reaches a handler, so the stamp has to be applied for that answer too — and the limiter
+        // being outermost is the whole reason its refusals are the ones an anonymous caller sees.
+        .layer(axum::middleware::from_fn(crate::request_id::request_id))
         // The IP access list runs ahead of the limiter and ahead of every guard, for the same
         // reason the limiter does: an address rule exists to stop a caller who has no account,
         // so anything behind `guards::require` would never see one. Ahead of the limiter because

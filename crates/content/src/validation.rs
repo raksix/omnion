@@ -156,69 +156,6 @@ pub fn validate_translation_value(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-// ---------------------------------------------------------------------------------------------
-// Names, keys and optional text (REQ-063 slice 3: patterns and page templates)
-// ---------------------------------------------------------------------------------------------
-
-/// Validate a key and normalize it to lowercase.
-///
-/// Keys are what an author remembers a pattern or template by, and they end up in a URL, an
-/// event payload and the seed that ships the platform's own templates — so the shape is the
-/// strict one: lowercase letters, digits and dashes, never leading or trailing in a way that
-/// would make two spellings of the same key. `field` names the thing in the error, because
-/// "invalid key" on a pattern's *category* is a worse message than naming the category.
-pub fn validate_key(key: &str, field: &str) -> Result<String> {
-    let key = key.trim().to_lowercase();
-    let shaped = !key.is_empty()
-        && key.len() <= 63
-        && key.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && key.ends_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && key
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if shaped {
-        return Ok(key);
-    }
-    Err(ContentError::InvalidKey(format!(
-        "{field} {key:?} must be lowercase letters, digits and dashes, 1-63 characters"
-    )))
-}
-
-/// Validate a human-facing name: trimmed, non-empty, bounded.
-pub fn validate_text(value: &str, max: usize, field: &str) -> Result<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(ContentError::InvalidName(format!(
-            "the {field} must not be empty"
-        )));
-    }
-    if value.chars().count() > max {
-        return Err(ContentError::InvalidName(format!(
-            "the {field} must stay under {max} characters"
-        )));
-    }
-    Ok(value.to_owned())
-}
-
-/// Validate an optional free-text field; blank clears it to `None`.
-pub fn validate_optional_text(value: Option<&str>, max: usize) -> Result<Option<String>> {
-    match value {
-        Some(value) => {
-            let value = value.trim();
-            if value.is_empty() {
-                Ok(None)
-            } else if value.chars().count() > max {
-                Err(ContentError::InvalidText(format!(
-                    "the text must stay under {max} characters"
-                )))
-            } else {
-                Ok(Some(value.to_owned()))
-            }
-        }
-        None => Ok(None),
-    }
-}
-
 fn is_lower_alnum(part: &str) -> bool {
     part.chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())

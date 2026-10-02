@@ -11,8 +11,6 @@ pub mod automation_runner;
 pub mod backup_schedule_runner;
 pub mod backup_sweep_runner;
 pub mod client_ip;
-pub mod content_meter;
-pub mod content_usage_runner;
 pub mod cookies;
 pub mod dto;
 pub mod error;
@@ -23,13 +21,10 @@ pub mod headers_middleware;
 pub mod health_events;
 pub mod health_runner;
 pub mod intent_resolver;
-// BOTH sides of this merge declare a module and the list is alphabetical, so the resolution is
-// "keep both" — dropping either would leave a file that nothing references (or a module with no
-// file). A merge that silently drops one side's `pub mod` compiles cleanly and fails at runtime
-// with a route that is not registered.
+pub mod lead_runner;
 pub mod notification_runner;
-pub mod publishing_runner;
 pub mod rate_limit_middleware;
+pub mod request_id;
 pub mod request_log_middleware;
 pub mod restore_job_runner;
 pub mod retention_runner;

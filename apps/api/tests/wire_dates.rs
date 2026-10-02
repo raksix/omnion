@@ -148,6 +148,10 @@ fn the_backup_bodies_answer_timestamps_as_strings() {
             reason: String::new(),
             message: String::new(),
             encryption: "none".to_owned(),
+            // Every field is `null`-able on purpose, so a destination the kernel would not
+            // measure answers `unknown` rather than inventing a number — this fixture is the
+            // "could not measure" case, not the "plenty of room" one.
+            //
             // `aebe9a34` split room out of writability and this fixture never grew the field, so
             // the gate below stopped compiling and — because a test target that does not build
             // never runs — **the whole wire-date gate has been absent since**. That is the failure

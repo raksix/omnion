@@ -6,45 +6,10 @@
  */
 import { useState, type ReactNode } from "react";
 
-import {
-  Activity,
-  BarChart3,
-  Bell,
-  Bot,
-  Boxes,
-  CalendarClock,
-  ClipboardCheck,
-  Code2,
-  FileStack,
-  FileText,
-  Fingerprint,
-  Globe,
-  HardDriveDownload,
-  HeartPulse,
-  Images,
-  Import,
-  KeyRound,
-  LayoutDashboard,
-  LayoutGrid,
-  ListTree,
-  LockKeyhole,
-  LogOut,
-  Mail,
-  Menu,
-  MessageSquare,
-  Palette,
-  Scale,
-  ScrollText,
-  ShieldCheck,
-  SlidersHorizontal,
-  Sparkles,
-  Timer,
-  UserCog,
-  UserRoundCheck,
-  UsersRound,
-  Webhook,
-  X,
-} from "lucide-react";
+// Both sides added icons in the same import: wave4 brought Package/Users/Warehouse/Palmtree for
+// the business modules' nav entries, main brought Code2/HeartPulse for the developer portal and
+// the health centre. They are additive, so the union keeps every entry the two features render.
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Code2, FileText, Fingerprint, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Palmtree, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, Users, UsersRound, Warehouse, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -57,42 +22,6 @@ import { useSession } from "@/lib/session";
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/pages", label: "Pages", icon: FileText },
-  { href: "/blocks", label: "Blocks", icon: Boxes },
-  { href: "/patterns", label: "Patterns", icon: LayoutGrid },
-  { href: "/page-templates", label: "Page templates", icon: FileStack },
-  // The navigation editor and the queue of scheduled publishes (REQ-064, slice 1). Both are
-  // content surfaces rather than settings, so they sit next to Pages rather than under it.
-  { href: "/menus", label: "Menus", icon: ListTree },
-  { href: "/publishing/queue", label: "Publishing queue", icon: CalendarClock },
-  // The SEO toolkit (REQ-064, slice 3). It sits beside Publishing queue because both answer
-  // "what does the outside world see about this site" — one about when, one about how.
-  { href: "/seo", label: "SEO", icon: Globe },
-  // The comment queue (REQ-064, slice 4a). It sits beside SEO rather than under Pages because
-  // it is the one content surface that is *inbound*: everything else in this shelf is
-  // something an editor wrote, and the queue is the only place an owner finds out what
-  // readers said about it.
-  { href: "/comments", label: "Comments", icon: MessageSquare },
-  // The mailing lists (REQ-064, slice 4b). It sits directly after Comments because both answer
-  // the same inbound question — what visitors sent us — and both are the places an owner has to
-  // decide about a stranger's address. Everything before them in this shelf is an outbound or
-  // authored surface.
-  { href: "/newsletter", label: "Newsletter", icon: Mail },
-  // Visitor accounts (REQ-064, slice 4c). It sits directly after Newsletter because both hold
-  // a stranger's address and both ask an operator to decide about one — and the icon differs on
-  // purpose: `UserCog` already means a PANEL user two rows down, and an operator who confuses
-  // the two is about to grant a visitor a set of platform permissions.
-  { href: "/members", label: "Members", icon: UserRoundCheck },
-  // The headless content API (REQ-019, slice 1). It sits AFTER Members rather than beside
-  // Settings because the thing it manages is a credential that leaves the building: an operator
-  // asking "who outside our org is reading our site" is the same question as "who is a member",
-  // asked about a stranger rather than an account. `KeyRound` rather than a settings key, because
-  // it is a credential and not a preference.
-  { href: "/content-api", label: "Content API", icon: KeyRound },
-  // The theme gallery (REQ-062). It sits directly BEFORE Media on purpose: the gallery decides
-  // what a visitor sees, and every row below it in this shelf — media, menus, pages — is content
-  // a theme then presents. `Palette` rather than `LayoutTemplate`, which the block editor
-  // already owns one screen over.
-  { href: "/themes", label: "Themes", icon: Palette },
   { href: "/media", label: "Media", icon: Images },
   // Backups sit beside Media rather than under Settings: an operator asking "where are my
   // files and can I get them back" is one question, and burying half of it under a
@@ -105,6 +34,23 @@ const NAV = [
   // to the person who opened the admin panel to find out that it is not.
   { href: "/health", label: "System Health", icon: HeartPulse },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
+  { href: "/crm/contacts", label: "CRM", icon: Users },
+  { href: "/sales/catalog", label: "Sales", icon: Package },
+  // Inventory (REQ-053). It sits beside Sales rather than under it because the two answer
+  // different questions about the same goods: Sales says what was agreed, Inventory says what is
+  // on the shelf. A stock list nested under a catalog is a list of products, which is the one
+  // thing an inventory screen must not be.
+  { href: "/inventory/stock", label: "Inventory", icon: Warehouse },
+  // People (REQ-055). It sits beside Inventory rather than under Settings because "who is away
+  // today" and "what is in the warehouse" are both questions an operator asks at the same moment
+  // in the morning — and burying leave under Identity would make a holiday request look like an
+  // account problem, which is exactly what it is not.
+  { href: "/hr/leave", label: "People", icon: Palmtree },
+  // My workspace (REQ-055 slice 2c). A separate entry rather than a tab inside People, and the
+  // reason is the permission split: "People" is the administrator's shelf and every route under
+  // it answers behind an `hr.*` key, while these three carry no key at all. Hiding the
+  // self-service screens inside the admin shelf would make them look like they 403.
+  { href: "/hr/me", label: "My workspace", icon: UsersRound },
   { href: "/notifications", label: "Notifications", icon: Bell },
   // The event console (REQ-016, slice 1). It sits beside Notifications rather than under
   // Settings because both answer the same question from the bus's side — "what does the

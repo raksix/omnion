@@ -77,13 +77,6 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.publish",
             "content.pages.schedule",
             "content.pages.restore",
-            "content.blocks.read",
-            "content.patterns.manage",
-            "content.templates.manage",
-            // Navigation belongs to whoever runs the content: a manager can reshape the
-            // header, and reading the menus is part of doing that.
-            "menus.read",
-            "menus.manage",
             "media.read",
             "media.upload",
             "media.update",
@@ -118,6 +111,59 @@ const BASE_ROLES: &[BaseRole] = &[
             "analytics.export",
             "analytics.goals.manage",
             "analytics.settings.manage",
+            "crm.contacts.read",
+            "crm.contacts.create",
+            "crm.contacts.update",
+            "crm.contacts.delete",
+            "crm.contacts.merge",
+            "crm.fields.sensitive.read",
+            "crm.views.manage",
+            "crm.contacts.import",
+            "crm.deals.read",
+            "crm.deals.create",
+            "crm.deals.update",
+            "crm.deals.delete",
+            "crm.pipelines.manage",
+            "crm.activities.read",
+            "crm.activities.create",
+            "crm.copilot.use",
+            "crm.leads.read",
+            "crm.leads.manage",
+            // HR (REQ-055), the whole people core, and the two keys that are a **different act**
+            // rather than a stricter version of editing are in here for the same reason
+            // `sales.quotes.send` is discussed below rather than left out: an administrator is
+            // exactly the person who hires somebody and who reads the file an HR officer keeps.
+            //
+            // The sensitive block IS included, because the base `admin` role is the
+            // installation's own operator and an operator who cannot read an employee's emergency
+            // contact cannot do the job. Organizations that want a narrower split hand the key
+            // out themselves; the point of a separate key is that they can, not that nobody holds
+            // it.
+            "hr.employees.read",
+            "hr.employees.create",
+            "hr.employees.update",
+            "hr.employees.terminate",
+            "hr.employees.export",
+            "hr.employees.sensitive.read",
+            "hr.departments.read",
+            "hr.departments.manage",
+            "hr.documents.read",
+            "hr.documents.manage",
+            // Sales (REQ-052), the full seller loop except the two releases. A manager
+            // prepares and reviews; who may *send* a quote to a customer and *confirm* an
+            // order that reserves stock is granted separately in the installation's own roles,
+            // because in most organizations the person who may discount is not the person who
+            // may commit the stock.
+            "sales.products.read",
+            "sales.products.manage",
+            "sales.pricelists.read",
+            "sales.pricelists.manage",
+            "sales.quotes.read",
+            "sales.quotes.create",
+            "sales.quotes.update",
+            "sales.orders.read",
+            "sales.orders.create",
+            "sales.reports.read",
             // Your own inbox is not a privilege: every account has one, and the reads are
             // owner-scoped in the store, so this key grants nothing about anybody else. It is
             // listed explicitly rather than folded into a family because the panel shows the
@@ -145,10 +191,6 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.publish",
             "content.pages.schedule",
             "content.pages.restore",
-            "content.blocks.read",
-            // Read-only: a moderator checks that the navigation points at live pages, but the
-            // header itself is the manager's to change.
-            "menus.read",
             "media.read",
             "media.update",
             "ai.chat",
@@ -159,6 +201,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            "crm.contacts.read",
             // The bell is on every route, so every role that can open the panel needs to read
             // its own inbox. `notifications.manage` is deliberately NOT here: it is the
             // channel-configuration power slice 2 introduces, and a role that may read an
@@ -177,7 +220,6 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.update",
             "content.pages.publish",
             "content.pages.schedule",
-            "content.blocks.read",
             "media.read",
             "media.upload",
             "media.update",
@@ -186,6 +228,7 @@ const BASE_ROLES: &[BaseRole] = &[
             "sites.read",
             "search.read",
             "analytics.read",
+            "crm.contacts.read",
             // The bell is on every route. See the note in the manager role.
             "notifications.read",
         ]),
@@ -549,10 +592,6 @@ mod tests {
             !keys.contains(&"search.manage"),
             "running the index is not a member's power"
         );
-        assert!(
-            !keys.contains(&"content.blocks.read"),
-            "the block registry is not a member's power"
-        );
         // The member reads its own inbox — the bell is in the header of every screen, so a
         // member without the key is a member with a badge they cannot open — and that is the
         // whole of it. Reading an inbox is not deciding how it is delivered, so neither
@@ -585,14 +624,6 @@ mod tests {
         assert!(
             !keys.contains(&"users.read"),
             "editors do not read accounts"
-        );
-        assert!(
-            keys.contains(&"content.blocks.read"),
-            "editors read the block registry they author against"
-        );
-        assert!(
-            !keys.contains(&"content.patterns.manage"),
-            "a saved pattern is a library asset, not an editor's call"
         );
     }
 }

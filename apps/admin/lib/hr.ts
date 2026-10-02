@@ -1,0 +1,1283 @@
+/**
+ * The HR client: the eleven leave routes slice 2a shipped (REQ-055).
+ *
+ * It follows the inventory client's rule rather than inventing a fourth one: the panel owns the
+ * transport, and what lives here is the module's own vocabulary — the `hr.leave.*` keys, the
+ * day count **as a string**, and the two things a leave screen must never recompute for itself.
+ *
+ * ## Four things about this client that are deliberate
+ *
+ * * **A day count is a string, never a number.** The module trims `numeric(6,2)` once at the
+ *   reader (`trim_scale`) so a row reads `3` and `0.5`, the way a person reads a leave balance.
+ *   Parsing it into a JS number here would be a second place the value can be reshaped, and
+ *   `0.1 + 0.2` is the reason the module ships text. `Days` is branded so a plain `number`
+ *   cannot be passed where one is expected without a cast nobody will notice.
+ * * **The preview is a route, and the form calls it.** "The number shown before submit equals the
+ *   stored value" is an acceptance criterion; computing it in TypeScript would make it a second
+ *   implementation and the criterion untestable. The working-day rule lives in Rust, once.
+ * * **The calendar's `today` comes from the response.** The grid has to mark the same day the
+ *   server considered current — a client computing its own would disagree with the window by
+ *   however far the two clocks are apart — and the window bounds are the server's too, so the
+ *   grid draws the month it was given rather than the month it assumes.
+ * * **`can_decide` decides the decision panel, not the status.** A decided request offering an
+ *   approve button is how a request ends up approved twice; the server tells the screen whether
+ *   the panel belongs on the page at all.
+ */
+import { ApiError, type ErrorBody } from "./api";
+
+/** A charged day count as the module sends it: `"3"`, `"0.5"`. */
+export type Days = string & { readonly __days: unique symbol };
+
+/** The four statuses a request can hold. */
+export type LeaveStatus = "pending" | "approved" | "rejected" | "cancelled";
+
+/** One page of leave requests. */
+export type Page<T> = {
+  items: T[];
+  next_cursor: string | null;
+  total_estimate: number;
+};
+
+/** A leave type from the catalogue. */
+export type LeaveType = {
+  id: string;
+  organization_id: string;
+  name: string;
+  code: string;
+  paid: boolean;
+  /** The yearly entitlement, as the column's own text (`14.00`). */
+  annual_days: string;
+  requires_approval: boolean;
+  allow_negative: boolean;
+  active: boolean;
+  created_at: string;
+};
+
+/** A leave type as the balance card flattens it in. */
+export type BalanceCard = LeaveType & {
+  employee_id: string;
+  balance_year: number;
+  entitled_days: Days;
+  used_days: Days;
+  pending_days: Days;
+  remaining_days: Days;
+  /** Whether the balance row existed. `false` = the type has never been taken. */
+  seeded: boolean;
+};
+
+/** A request as the list reads it. */
+export type LeaveRequest = {
+  id: string;
+  organization_id: string;
+  employee_id: string;
+  employee_name: string;
+  leave_type_id: string;
+  leave_type_name: string;
+  starts_on: string;
+  ends_on: string;
+  days: Days;
+  half_day: boolean;
+  reason: string;
+  leave_status: LeaveStatus;
+  decided_by: string | null;
+  decided_by_name: string | null;
+  decided_at: string | null;
+  decision_comment: string | null;
+  cancelled_at: string | null;
+  created_at: string;
+};
+
+/** One step of a request's history. */
+export type TimelineStep = {
+  kind: string;
+  at: string;
+  actor_id: string | null;
+  comment: string | null;
+};
+
+/** A request with its balance, its timeline and whether it can still be decided. */
+export type RequestDetail = LeaveRequest & {
+  balance: BalanceCard;
+  timeline: TimelineStep[];
+  can_decide: boolean;
+};
+
+/** One absence bar on the calendar. */
+export type AbsenceBar = {
+  request_id: string;
+  employee_id: string;
+  employee_name: string;
+  leave_type_id: string;
+  leave_type_name: string;
+  starts_on: string;
+  ends_on: string;
+  days: Days;
+  /** The range runs past the window's last day. */
+  continues_after: boolean;
+  /** The range began before the window's first day. */
+  continues_before: boolean;
+};
+
+/** One employee line of the calendar. */
+export type AbsenceRow = {
+  employee_id: string;
+  employee_name: string;
+  request_count: number;
+};
+
+/** The month grid: bounds, today, bars and rows — every bound the server owns. */
+export type AbsenceCalendar = {
+  from: string;
+  to: string;
+  today: string;
+  bars: AbsenceBar[];
+  employees: AbsenceRow[];
+};
+
+/** The working days a range would charge. */
+export type DaysPreview = {
+  days: Days;
+  working_days: number;
+};
+
+/** The list's filters. Every one is optional; the server validates them. */
+export type LeaveFilters = {
+  status?: string;
+  leave_type_id?: string;
+  employee_id?: string;
+  search?: string;
+  from?: string;
+  to?: string;
+  pending_only?: boolean;
+  limit?: number;
+  cursor?: string;
+  visibility?: string;
+};
+
+/** The body's fields of a new request. Omitted `employee_id` means the caller's own. */
+export type NewLeaveRequest = {
+  leave_type_id: string;
+  starts_on: string;
+  ends_on: string;
+  half_day?: boolean;
+  reason?: string;
+  attachment_media_id?: string;
+  employee_id?: string;
+};
+
+/** What a decision writes. */
+export type Decision = {
+  decision: "approved" | "rejected";
+  comment?: string;
+};
+
+/** A `Response` that is not `ok`, turned into the platform's own error. */
+async function readFailure(response: Response): Promise<ApiError> {
+  const text = await response.text();
+  let code = "unknown_error";
+  let message = `The API answered with status ${response.status}.`;
+  let details: Record<string, unknown> | null = null;
+  let requestId: string | null = response.headers.get("x-request-id");
+  try {
+    const body = JSON.parse(text) as ErrorBody;
+    code = body.error?.code ?? code;
+    message = body.error?.message ?? message;
+    details = body.error?.details ?? null;
+    requestId = body.error?.request_id ?? requestId;
+  } catch {
+    // A non-JSON body is still an error; the status stays in the message.
+  }
+  return new ApiError(response.status, code, message, details, requestId);
+}
+
+/** One JSON call, with the same session, accept header and error shape the panel uses. */
+async function hrRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      credentials: "same-origin",
+      headers: {
+        accept: "application/json",
+        ...(typeof init.body === "string" ? { "content-type": "application/json" } : {}),
+        ...init.headers,
+      },
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+  if (!response.ok) {
+    throw await readFailure(response);
+  }
+  const text = await response.text();
+  if (!text) {
+    return null as T;
+  }
+  return JSON.parse(text) as T;
+}
+
+/** Build a query string, dropping the empties so a cleared filter is not sent as `?search=`. */
+function query(filters: Record<string, unknown> | undefined): string {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(filters ?? {})) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  }
+  return parts.length === 0 ? "" : `?${parts.join("&")}`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The people core (slice 1) — employees, departments, the org chart.
+//
+// Added after slice 2 shipped the client, and deliberately placed **above** the leave section
+// rather than appended to the end: the file used to open with its module description naming leave
+// and attendance only, which described a client that could not see an employee at all. The order
+// here is the order the module reasons in — people, then the leave rows that point at them.
+
+/** The employment types the schema accepts, in the order a form offers them. */
+export const EMPLOYMENT_TYPES = [
+  { value: "full_time", label: "Full time" },
+  { value: "part_time", label: "Part time" },
+  { value: "contract", label: "Contract" },
+  { value: "intern", label: "Intern" },
+] as const;
+
+/** The lifecycle statuses the schema accepts. */
+export const EMPLOYEE_STATUSES = [
+  { value: "active", label: "Active" },
+  { value: "on_leave", label: "On leave" },
+  { value: "terminated", label: "Terminated" },
+] as const;
+
+/**
+ * One employee.
+ *
+ * The four personal fields are **optional and absent** for a caller without
+ * `hr.employees.sensitive.read` — the server drops them from the response rather than sending
+ * them as null, so `undefined` here means "you may not read this", never "this person has none".
+ * A screen that renders `?? "—"` is therefore correct, and one that renders a blank column is
+ * showing a leak that already happened.
+ */
+export type Employee = {
+  id: string;
+  organization_id: string;
+  employee_no: string;
+  user_id: string | null;
+  first_name: string;
+  last_name: string;
+  work_email: string;
+  phone: string | null;
+  position: string;
+  department_id: string;
+  department_name: string;
+  manager_id: string | null;
+  manager_name: string | null;
+  employment_type: string;
+  start_date: string;
+  end_date: string | null;
+  employee_status: string;
+  location: string | null;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+  /** Gated. Present only for a caller holding `hr.employees.sensitive.read`. */
+  personal_email?: string;
+  personal_phone?: string;
+  address?: string;
+  emergency_contact?: string;
+};
+
+/** The fields a filter bar can narrow the directory by. */
+export type EmployeeFilters = {
+  search?: string;
+  department_id?: string;
+  include_subdepartments?: boolean;
+  manager_id?: string;
+  employment_type?: string;
+  status?: string;
+  started_from?: string;
+  started_to?: string;
+  sort?: string;
+  direction?: string;
+  limit?: number;
+  cursor?: string;
+};
+
+/** The body `POST /hr/employees` accepts. */
+export type NewEmployee = {
+  employee_no?: string;
+  user_id?: string;
+  first_name: string;
+  last_name: string;
+  work_email: string;
+  phone?: string;
+  position: string;
+  department_id: string;
+  manager_id?: string;
+  employment_type: string;
+  start_date?: string;
+  end_date?: string;
+  employee_status?: string;
+  location?: string;
+  notes?: string;
+  personal_email?: string;
+  personal_phone?: string;
+  address?: string;
+  emergency_contact?: string;
+};
+
+/** The body `PATCH /hr/employees/{id}` accepts; every field optional. */
+export type EmployeePatch = Partial<Omit<NewEmployee, "user_id">> & {
+  /** Cleared when absent-and-explicit rather than ignored. */
+  clear_end_date?: boolean;
+};
+
+/** One department, with the counts the tree label needs. */
+export type Department = {
+  id: string;
+  organization_id: string;
+  name: string;
+  code: string | null;
+  parent_id: string | null;
+  manager_employee_id: string | null;
+  manager_name: string | null;
+  description: string | null;
+  active: boolean;
+  member_count: number;
+  child_count: number;
+  deletable: boolean;
+  created_at: string;
+};
+
+/** The body `POST /hr/departments` accepts. */
+export type NewDepartment = {
+  name: string;
+  code?: string;
+  parent_id?: string;
+  manager_employee_id?: string;
+  description?: string;
+  active?: boolean;
+};
+
+/** The body `PATCH /hr/departments/{id}` accepts. */
+export type DepartmentPatch = Partial<Omit<NewDepartment, "organization_id">>;
+
+/** One node of the org chart. */
+export type OrgChartNode = {
+  employee: Pick<
+    Employee,
+    "id" | "first_name" | "last_name" | "position" | "work_email" | "employee_no" | "department_id"
+  >;
+  children: OrgChartNode[];
+};
+
+/** The department root rows, empty when the organization has none yet. */
+export type OrgChart = { items: OrgChartNode[] };
+
+/** `GET /hr/employees` — a page of the directory. */
+export function fetchEmployees(filters: EmployeeFilters = {}): Promise<Page<Employee>> {
+  return hrRequest<Page<Employee>>(`/api/v1/hr/employees${query(filters)}`);
+}
+
+/** `GET /hr/employees/{id}` — one employee, with the gated block when the caller may read it. */
+export function fetchEmployee(id: string): Promise<Employee> {
+  return hrRequest<Employee>(`/api/v1/hr/employees/${id}`);
+}
+
+/**
+ * `GET /hr/employees/suggest-number` — the next free employee number.
+ *
+ * A route of its own on purpose: the form needs the suggestion before anything is typed, and a
+ * list endpoint that answered a number when asked would make the directory's response shape
+ * depend on a query parameter.
+ */
+export function suggestEmployeeNumber(): Promise<{ employee_no: string }> {
+  return hrRequest<{ employee_no: string }>("/api/v1/hr/employees/suggest-number");
+}
+
+/** `POST /hr/employees` — add an employee. */
+export function createEmployee(body: NewEmployee): Promise<Employee> {
+  return hrRequest<Employee>("/api/v1/hr/employees", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** `PATCH /hr/employees/{id}` — edit an employee's own fields. */
+export function updateEmployee(id: string, patch: EmployeePatch): Promise<Employee> {
+  return hrRequest<Employee>(`/api/v1/hr/employees/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/** `POST /hr/employees/{id}/terminate` — end an employment: a status and a last day. */
+export function terminateEmployee(
+  id: string,
+  body: { employee_status?: string; end_date?: string },
+): Promise<Employee> {
+  return hrRequest<Employee>(`/api/v1/hr/employees/${id}/terminate`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `GET /hr/departments` — the whole tree, with the counts the labels need. */
+export function fetchDepartments(): Promise<{ items: Department[] }> {
+  return hrRequest<{ items: Department[] }>("/api/v1/hr/departments");
+}
+
+/** `GET /hr/org-chart` — the same rows, nested by manager. */
+export function fetchOrgChart(): Promise<OrgChart> {
+  return hrRequest<OrgChart>("/api/v1/hr/org-chart");
+}
+
+/** `POST /hr/departments` — create a department. */
+export function createDepartment(body: NewDepartment): Promise<Department> {
+  return hrRequest<Department>("/api/v1/hr/departments", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `PATCH /hr/departments/{id}` — rename, re-parent, or set the head. */
+export function updateDepartment(id: string, patch: DepartmentPatch): Promise<Department> {
+  return hrRequest<Department>(`/api/v1/hr/departments/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/**
+ * `DELETE /hr/departments/{id}` — delete one that is empty, or be refused with both counts.
+ *
+ * The refusal carries *how* exposed the department is, so the operator does not have to open two
+ * reports to find out why the delete did not happen.
+ */
+export function deleteDepartment(id: string): Promise<void> {
+  return hrRequest<void>(`/api/v1/hr/departments/${id}`, { method: "DELETE" });
+}
+
+/** `POST /hr/departments/merge` — move a department's members into another and drop it. */
+export function mergeDepartments(body: { source_id: string; target_id: string }): Promise<Department> {
+  return hrRequest<Department>("/api/v1/hr/departments/merge", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `GET /hr/leave/types` — the catalogue. */
+export function fetchLeaveTypes(): Promise<{ items: LeaveType[] }> {
+  return hrRequest<{ items: LeaveType[] }>("/api/v1/hr/leave/types");
+}
+
+/** `POST /hr/leave/types` — add a type. Needs `hr.leave.manage`. */
+export function createLeaveType(
+  type: Pick<LeaveType, "name" | "code"> &
+    Partial<Pick<LeaveType, "paid" | "annual_days" | "requires_approval" | "allow_negative" | "active">>,
+): Promise<LeaveType> {
+  return hrRequest<LeaveType>("/api/v1/hr/leave/types", {
+    method: "POST",
+    body: JSON.stringify(type),
+  });
+}
+
+/** `PATCH /hr/leave/types/{id}` — edit a type. Needs `hr.leave.manage`. */
+export function updateLeaveType(
+  id: string,
+  changes: Partial<
+    Pick<
+      LeaveType,
+      "name" | "code" | "paid" | "annual_days" | "requires_approval" | "allow_negative" | "active"
+    >
+  >,
+): Promise<LeaveType> {
+  return hrRequest<LeaveType>(`/api/v1/hr/leave/types/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+}
+
+/** `GET /hr/leave/balances` — every type's card for one employee in one year. */
+export function fetchBalances(employeeId?: string, year?: number): Promise<{ items: BalanceCard[] }> {
+  return hrRequest<{ items: BalanceCard[] }>(
+    `/api/v1/hr/leave/balances${query({ employee_id: employeeId, year })}`,
+  );
+}
+
+/** `GET /hr/leave/requests` — a page of requests. */
+export function fetchRequests(filters: LeaveFilters = {}): Promise<Page<LeaveRequest>> {
+  return hrRequest<Page<LeaveRequest>>(
+    `/api/v1/hr/leave/requests${query(filters as Record<string, unknown>)}`,
+  );
+}
+
+/** `GET /hr/leave/requests/preview` — the days a range would charge. The form's day counter. */
+export function previewDays(
+  starts_on: string,
+  ends_on: string,
+  half_day?: boolean,
+): Promise<DaysPreview> {
+  return hrRequest<DaysPreview>(
+    `/api/v1/hr/leave/requests/preview${query({ starts_on, ends_on, half_day })}`,
+  );
+}
+
+/** `GET /hr/leave/requests/{id}` — detail with balance, timeline and `can_decide`. */
+export function fetchRequest(id: string): Promise<RequestDetail> {
+  return hrRequest<RequestDetail>(`/api/v1/hr/leave/requests/${id}`);
+}
+
+/** `POST /hr/leave/requests` — raise one. Omitted `employee_id` means the caller's own. */
+export function createRequest(body: NewLeaveRequest): Promise<LeaveRequest> {
+  return hrRequest<LeaveRequest>("/api/v1/hr/leave/requests", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/leave/requests/{id}/decision` — approve or reject. Needs `hr.leave.approve`. */
+export function decideRequest(id: string, decision: Decision): Promise<LeaveRequest> {
+  return hrRequest<LeaveRequest>(`/api/v1/hr/leave/requests/${id}/decision`, {
+    method: "POST",
+    body: JSON.stringify(decision),
+  });
+}
+
+/** `POST /hr/leave/requests/{id}/cancel` — withdraw a pending request. */
+export function cancelRequest(id: string): Promise<LeaveRequest> {
+  return hrRequest<LeaveRequest>(`/api/v1/hr/leave/requests/${id}/cancel`, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
+/** `GET /hr/leave/calendar` — the month grid. The bounds and `today` are the server's. */
+export function fetchCalendar(params: { from?: string; to?: string } = {}): Promise<AbsenceCalendar> {
+  return hrRequest<AbsenceCalendar>(`/api/v1/hr/leave/calendar${query(params)}`);
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * The self-service surface (REQ-055 slice 2c)
+ *
+ * A separate block from the HR screen's client on purpose, and the split is the same one the
+ * server makes: these calls carry **no employee id**, so there is nothing here a caller could
+ * change to read somebody else's record. Writing them next to the HR functions would invite the
+ * obvious-looking `fetchBalances(employeeId)` refactor, and that refactor is the vulnerability.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The caller's own employee record, with the personal fields the request keeps private. */
+export type MyProfile = {
+  employee_id: string;
+  employee_no: string;
+  first_name: string;
+  last_name: string;
+  work_email: string;
+  phone: string | null;
+  position: string;
+  department: string | null;
+  manager_name: string | null;
+  employment_type: string;
+  start_date: string;
+  end_date: string | null;
+  employee_status: string;
+  location: string | null;
+  personal_email: string | null;
+  personal_phone: string | null;
+  address: string | null;
+  emergency_contact: string | null;
+};
+
+/** The caller's own leave: the cards and the requests that produced them, in one answer. */
+export type MyLeave = {
+  employee_id: string;
+  year: number;
+  balances: BalanceCard[];
+  requests: LeaveRequest[];
+  total: number;
+};
+
+/** One of the caller's own documents. */
+export type MyDocument = {
+  id: string;
+  kind: string;
+  title: string;
+  media_id: string;
+  expires_on: string | null;
+  acknowledged: boolean;
+  expiring_soon: boolean;
+};
+
+/** `GET /hr/me` — the caller's own profile. */
+export function fetchMyProfile(): Promise<MyProfile> {
+  return hrRequest<MyProfile>("/api/v1/hr/me");
+}
+
+/** `GET /hr/me/leave` — own balances and own requests for a year. */
+export function fetchMyLeave(year?: number): Promise<MyLeave> {
+  return hrRequest<MyLeave>(`/api/v1/hr/me/leave${query({ year })}`);
+}
+
+/** `GET /hr/me/leave/types` — the catalogue the self-service form offers. */
+export function fetchMyLeaveTypes(): Promise<{ items: LeaveType[] }> {
+  return hrRequest<{ items: LeaveType[] }>("/api/v1/hr/me/leave/types");
+}
+
+/** `GET /hr/me/documents` — own documents, newest first. */
+export function fetchMyDocuments(): Promise<{ items: MyDocument[] }> {
+  return hrRequest<{ items: MyDocument[] }>("/api/v1/hr/me/documents");
+}
+
+/** The body of a self-service request: no `employee_id`, and there will never be one. */
+export type MyNewLeaveRequest = {
+  leave_type_id: string;
+  starts_on: string;
+  ends_on: string;
+  half_day?: boolean;
+  reason?: string;
+};
+
+/** `GET /hr/me/leave/preview` — the days a self-service request would charge. */
+export function previewMyLeaveDays(
+  starts_on: string,
+  ends_on: string,
+  half_day?: boolean,
+): Promise<DaysPreview> {
+  return hrRequest<DaysPreview>(
+    `/api/v1/hr/me/leave/preview${query({ starts_on, ends_on, half_day })}`,
+  );
+}
+
+/** `POST /hr/me/leave/requests` — ask for leave, for oneself. */
+export function createMyLeaveRequest(body: MyNewLeaveRequest): Promise<LeaveRequest> {
+  return hrRequest<LeaveRequest>("/api/v1/hr/me/leave/requests", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/me/leave/requests/{id}/cancel` — withdraw one of one's own pending requests. */
+export function cancelMyLeaveRequest(id: string): Promise<LeaveRequest> {
+  return hrRequest<LeaveRequest>(`/api/v1/hr/me/leave/requests/${id}/cancel`, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Attendance (REQ-055 slice 2d)
+// ---------------------------------------------------------------------------------------------
+
+/** The exception types the summary counts. */
+export type AttendanceException = "missing_checkout" | "overtime" | "under_hours";
+
+/**
+ * One day of one employee, as the month grid, the roster and the correction drawer read it.
+ *
+ * `minutes_worked` is `null` while the day is open. It is **never** recomputed here: the module
+ * derives it in SQL on every read, and a second derivation in TypeScript is a second answer to a
+ * number a payroll run reads.
+ */
+export type AttendanceDay = {
+  id: string;
+  organization_id: string;
+  employee_id: string;
+  /** `YYYY-MM-DD`, in the organization's time zone. */
+  work_date: string;
+  /** RFC 3339, or `null` while the day is open. */
+  check_in: string | null;
+  check_out: string | null;
+  minutes_worked: number | null;
+  /** `manual`, `api` or `import`. A correction never rewrites it. */
+  source: string;
+  note: string;
+  corrected_by: string | null;
+  corrected: boolean;
+  /**
+   * The server's flag, or `null` for a plain day.
+   *
+   * It is a **reading against the server's clock** — `missing_checkout` applies only to a day in
+   * the past — so it is never recomputed here. The grid, the summary and the CSV are three
+   * readers of one answer, and a fourth reader in the browser disagrees with all three by
+   * however far the two clocks are apart.
+   */
+  exception: AttendanceException | null;
+};
+
+/** One employee's month, as the summary and the grid footer read it. */
+export type AttendanceSummary = {
+  employee_id: string;
+  /** `YYYY-MM`. */
+  month: string;
+  days_present: number;
+  minutes_worked: number;
+  overtime_days: number;
+  under_hours_days: number;
+  missing_checkout_days: number;
+  /** Days still open — a working day, not a mistake. */
+  open_days: number;
+};
+
+/** The month grid: the days and their totals, shipped together so the two cannot disagree. */
+export type AttendanceMonth = {
+  month: string;
+  employee_id: string;
+  days: AttendanceDay[];
+  summary: AttendanceSummary;
+};
+
+/** One line of the daily roster. */
+export type RosterEntry = {
+  employee_id: string;
+  employee_name: string;
+  work_date: string;
+  check_in: string | null;
+  check_out: string | null;
+  minutes_worked: number | null;
+  on_leave: boolean;
+  exception: AttendanceException | null;
+};
+
+/** One organization's day: who is in, who is out, who is away. */
+export type Roster = {
+  work_date: string;
+  /** The server's own answer to "is this today" — a client clock is not a second source. */
+  today: boolean;
+  days: RosterEntry[];
+};
+
+/** What a punch asks for. Omitted `work_date` means *today, on the server*. */
+export type ClockPunch = {
+  employee_id?: string;
+  work_date?: string;
+  /** An explicit instant, for a correction drawer or an import. A person pressing the button
+   *  does not send this, and the server's clock is the honest default. */
+  at?: string;
+  organization_id?: string;
+};
+
+/** A correction: which day, the two punches and the reason the schema requires. */
+export type AttendanceCorrection = {
+  employee_id: string;
+  work_date: string;
+  /** Omit to keep the stored punch — which leaves the day open, and is the usual reason. */
+  check_in?: string | null;
+  check_out?: string | null;
+  reason: string;
+  organization_id?: string;
+};
+
+/** `GET /hr/me/attendance` — the caller's own month. No `hr.*` key required. */
+export function fetchMyAttendance(month?: string): Promise<AttendanceMonth> {
+  return hrRequest<AttendanceMonth>(`/api/v1/hr/me/attendance${query({ month })}`);
+}
+
+/** `GET /hr/attendance` — one employee's month. Needs `hr.attendance.read` for anybody else. */
+export function fetchAttendance(
+  params: { employee_id?: string; month?: string } = {},
+): Promise<AttendanceMonth> {
+  return hrRequest<AttendanceMonth>(`/api/v1/hr/attendance${query(params)}`);
+}
+
+/** `GET /hr/attendance/roster` — one organization's day. Needs `hr.attendance.read`. */
+export function fetchRoster(workDate?: string): Promise<Roster> {
+  return hrRequest<Roster>(`/api/v1/hr/attendance/roster${query({ work_date: workDate })}`);
+}
+
+/** `POST /hr/me/attendance/check-in` — open the caller's own day. */
+export function checkInSelf(body: ClockPunch = {}): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/me/attendance/check-in", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/me/attendance/check-out` — close the caller's own day. */
+export function checkOutSelf(body: ClockPunch = {}): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/me/attendance/check-out", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/attendance/check-in` — punch somebody else's day. Needs `hr.attendance.record`. */
+export function checkInFor(body: ClockPunch): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/attendance/check-in", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/attendance/check-out` — close somebody else's day. Needs `hr.attendance.record`. */
+export function checkOutFor(body: ClockPunch): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/attendance/check-out", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `POST /hr/attendance/corrections` — change a day, with a reason. Needs `hr.attendance.manage`. */
+export function correctAttendance(body: AttendanceCorrection): Promise<AttendanceDay> {
+  return hrRequest<AttendanceDay>("/api/v1/hr/attendance/corrections", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** The hours a minute count reads as, e.g. `510` → `"8h 30m"`.
+ *
+ *  Presentational only. The number a payroll import reads is the CSV, not this string, and the
+ *  grid's cell shows the same two numbers this derives so a person can check it by eye.
+ */
+export function formatMinutes(minutes: number | null): string {
+  if (minutes === null) {
+    return "—";
+  }
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours === 0) {
+    return `${rest}m`;
+  }
+  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+}
+
+/** The clock time of a punch, in the browser's own zone — `09:02`, or `—` for an open day. */
+export function formatPunch(instant: string | null): string {
+  if (!instant) {
+    return "—";
+  }
+  const parsed = new Date(instant);
+  if (Number.isNaN(parsed.getTime())) {
+    return "—";
+  }
+  return `${String(parsed.getHours()).padStart(2, "0")}:${String(parsed.getMinutes()).padStart(2, "0")}`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Documents and reports (REQ-055, slice 4b)
+// ---------------------------------------------------------------------------------------------
+
+/** The four document kinds. The list filter and the attach form both read this, never their own copy. */
+export const DOCUMENT_KINDS = ["contract", "id", "certificate", "other"] as const;
+
+/** One of the four kinds. */
+export type DocumentKind = (typeof DOCUMENT_KINDS)[number];
+
+/** `expired`, `expiring` or `valid` — text from the server, never derived here. */
+export type DocumentStatus = "expired" | "expiring" | "valid";
+
+/** One document, as the cross-employee list shows it and the detail renders it. */
+export type HrDocument = {
+  id: string;
+  employee_id: string;
+  employee_name: string;
+  department_name: string | null;
+  kind: string;
+  title: string;
+  media_id: string;
+  /** Wire form `YYYY-MM-DD`, or `null` for a document that never expires. */
+  expires_on: string | null;
+  acknowledged: boolean;
+  acknowledged_at: string | null;
+  uploaded_by: string | null;
+  created_at: string;
+  /** Negative when it has already expired, `null` when it never will. */
+  days_until_expiry: number | null;
+  status: DocumentStatus;
+};
+
+/** The counts the header shows, over the **filtered** rows. */
+export type DocumentTotals = {
+  total: number;
+  expired: number;
+  expiring: number;
+  permanent: number;
+};
+
+/** One page of documents with the header's numbers. */
+export type DocumentPage = Page<HrDocument> & { totals: DocumentTotals };
+
+/** The list's filters. Every field is optional; absent means "all". */
+export type DocumentFilters = {
+  search?: string;
+  kind?: string;
+  employee_id?: string;
+  department_id?: string;
+  expiring?: boolean;
+  per_page?: number;
+  cursor?: string;
+};
+
+/** An attach's payload. `media_id` is the media pipeline's id — the bytes' address, not the bytes. */
+export type NewHrDocument = {
+  kind: string;
+  title?: string;
+  media_id: string;
+  expires_on?: string;
+};
+
+/** What the expiry sweep considered and what it announced. */
+export type SweepResult = {
+  considered: number;
+  notified: number;
+  documents: HrDocument[];
+};
+
+/** `GET /hr/documents` — the cross-employee list, with the header's counts. Needs `hr.documents.read`. */
+export function fetchDocuments(filters: DocumentFilters = {}): Promise<DocumentPage> {
+  return hrRequest<DocumentPage>(`/api/v1/hr/documents${query(filters)}`);
+}
+
+/** `GET /hr/documents/{id}` — one document. */
+export function fetchDocument(id: string): Promise<HrDocument> {
+  return hrRequest<HrDocument>(`/api/v1/hr/documents/${id}`);
+}
+
+/**
+ * `POST /hr/employees/{id}/documents` — attach. Needs `hr.documents.manage`.
+ *
+ * A POST and not a PUT: the same employee takes several documents, and there is no url that names
+ * one before it exists.
+ */
+export function attachDocument(
+  employeeId: string,
+  body: NewHrDocument,
+): Promise<HrDocument> {
+  return hrRequest<HrDocument>(`/api/v1/hr/employees/${employeeId}/documents`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * `DELETE /hr/documents/{id}` — drop the **reference**. The bytes stay in the media pipeline.
+ *
+ * That is what the route does and the client does not pretend otherwise: a delete button labelled
+ * "delete the file" would be a lie about where the bytes went.
+ */
+export function deleteDocument(id: string): Promise<void> {
+  return hrRequest<void>(`/api/v1/hr/documents/${id}`, { method: "DELETE" });
+}
+
+/**
+ * `POST /hr/documents/sweep` — announce every document inside the window, once.
+ *
+ * Its own key (`hr.documents.sweep`) because it is the one write here that touches every employee's
+ * documents rather than the one somebody is looking at. The window defaults to the module's own
+ * thirty days; the client never invents one.
+ */
+export function sweepDocuments(windowDays?: number): Promise<SweepResult> {
+  return hrRequest<SweepResult>("/api/v1/hr/documents/sweep", {
+    method: "POST",
+    body: JSON.stringify({ window_days: windowDays }),
+  });
+}
+
+/** The report names the **route** serves, plus the export formats it offers. */
+export type ReportNames = { items: string[]; exports: string[] };
+
+/** A resolved period. Both ends are wire form — never an ordinal array (tick 58's `[2026,61]`). */
+export type Period = { from: string; to: string };
+
+/** One headcount row: a department and its people by employment type. */
+export type HeadcountRow = {
+  department_id: string;
+  department_name: string;
+  full_time: number;
+  part_time: number;
+  contract: number;
+  intern: number;
+  total: number;
+};
+
+/** The headcount report. */
+export type HeadcountReport = {
+  period: Period;
+  rows: HeadcountRow[];
+  total: number;
+  on_leave: number;
+};
+
+/** One movement: somebody who joined or left inside the period. */
+export type TurnoverRow = {
+  employee_id: string;
+  employee_name: string;
+  day: string;
+  movement: "joined" | "left";
+  employment_type: string;
+  tenure_days: number | null;
+};
+
+/** The turnover report. */
+export type TurnoverReport = {
+  period: Period;
+  rows: TurnoverRow[];
+  joined: number;
+  left: number;
+  average_headcount: number;
+  /** A **ratio**, not a percentage: the screen multiplies by 100 and the CSV does not. */
+  turnover_rate: number;
+};
+
+/**
+ * One leave type's absence over the period.
+ *
+ * Named `AbsenceReportRow` rather than `AbsenceRow` because the **absence calendar** already owns
+ * an `AbsenceRow` — the one employee line of the month grid — and the two are unrelated shapes
+ * about unrelated subjects. Reusing the name would have made the second definition silently win.
+ */
+export type AbsenceReportRow = {
+  leave_type_id: string;
+  leave_type_name: string;
+  requests: number;
+  approved: number;
+  pending: number;
+  days: number;
+};
+
+/** The absence report. */
+export type AbsenceReport = {
+  period: Period;
+  rows: AbsenceReportRow[];
+  total_requests: number;
+  total_days: number;
+};
+
+/** One employee's worked time over the period. */
+export type AttendanceReportRow = {
+  employee_id: string;
+  employee_name: string;
+  department_name: string | null;
+  days_present: number;
+  minutes_worked: number;
+  overtime_days: number;
+  under_hours_days: number;
+  missing_checkout_days: number;
+};
+
+/** The attendance report. */
+export type AttendanceReport = {
+  period: Period;
+  rows: AttendanceReportRow[];
+  employees: number;
+  minutes_worked: number;
+  missing_checkout_days: number;
+};
+
+/**
+ * Every report the screen can render, as one union.
+ *
+ * The picker is served by the route (`report_names`) rather than hardcoded here for the reason the
+ * route's own doc comment gives: four entries in four places is four chances to add a report and
+ * forget a column. The union is here so the renderer is exhaustive — a fifth report that arrives
+ * without a case here is a **typecheck failure**, not a blank table.
+ */
+export type HrReport =
+  | ({ report: "headcount" } & HeadcountReport)
+  | ({ report: "turnover" } & TurnoverReport)
+  | ({ report: "absence" } & AbsenceReport)
+  | ({ report: "attendance" } & AttendanceReport);
+
+/** The CSV answer: the file's text, plus the period it covers. */
+export type ReportCsv = { report: string; format: "csv"; csv: string; period: Period };
+
+/** The report's query. `from`/`to` are wire form; absent means the current year / today. */
+export type ReportFilters = {
+  from?: string;
+  to?: string;
+  department_id?: string;
+};
+
+/** `GET /hr/reports` — the picker. Needs `hr.reports.read`. */
+export function fetchReportNames(): Promise<ReportNames> {
+  return hrRequest<ReportNames>("/api/v1/hr/reports");
+}
+
+/**
+ * `GET /hr/reports/{report}` — one report as JSON, or its CSV with `format: "csv"`.
+ *
+ * `hr.reports.read` opens the screen; `hr.reports.export` buys the file. They are separate because
+ * reading a report and taking it out of the tenant are different acts, and the screen shows the
+ * export button on the strength of the export key alone — so the 403 lands where the user is
+ * looking instead of on a click that looked available.
+ */
+export function fetchReport<T extends HrReport = HrReport>(
+  report: string,
+  filters: ReportFilters = {},
+): Promise<T> {
+  return hrRequest<T>(`/api/v1/hr/reports/${report}${query(filters)}`);
+}
+
+/** The same report as CSV. Needs `hr.reports.export`; the JSON above needs only `hr.reports.read`. */
+export function fetchReportCsv(
+  report: string,
+  filters: ReportFilters = {},
+): Promise<ReportCsv> {
+  return hrRequest<ReportCsv>(
+    `/api/v1/hr/reports/${report}${query({ ...filters, format: "csv" })}`,
+  );
+}
+
+/** The filename a download gets, from the report and the period it covers. */
+export function reportFilename(report: string, period: Period): string {
+  return `hr-${report}-${period.from}-to-${period.to}.csv`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Onboarding (REQ-055, slice 4b)
+// ---------------------------------------------------------------------------------------------
+
+/** One step of a template, as the template editor writes it. */
+export type TemplateItem = {
+  title: string;
+  /** Free text, not an enum: the roles are the organization's, not the platform's. */
+  owner_role: string | null;
+  /** Days after the start date. `null` means "no deadline" — a real answer, and different from 0. */
+  due_offset_days: number | null;
+  requires_file: boolean;
+};
+
+/** A checklist template, as the picker lists it. */
+export type OnboardingTemplate = {
+  id: string;
+  organization_id: string;
+  name: string;
+  items: TemplateItem[];
+  active: boolean;
+  /** How many employees are working through it right now. */
+  in_progress: number;
+};
+
+/** One materialised step on somebody's checklist. */
+export type ChecklistItem = {
+  id: string;
+  employee_id: string;
+  template_id: string | null;
+  /** Zero-based and contiguous per employee — the order it is worked in. */
+  position: number;
+  title: string;
+  owner_role: string | null;
+  /** Wire form `YYYY-MM-DD`, or `null` for a step with no deadline. */
+  due_on: string | null;
+  /** Kept beside the derived date, so "why is this due on the 9th?" needs no reconstruction. */
+  due_offset_days: number | null;
+  requires_file: boolean;
+  /** RFC-3339, or `null` while the step is open. */
+  done_at: string | null;
+  done_by: string | null;
+  note: string;
+};
+
+/** Somebody's whole checklist, with the numbers the progress bar reads. */
+export type Checklist = {
+  employee_id: string;
+  employee_name: string;
+  department_name: string | null;
+  template_id: string | null;
+  template_name: string | null;
+  items: ChecklistItem[];
+  /** Ticked. */
+  done: number;
+  /** How many there are — the bar's denominator, and **not** the template's length. */
+  total: number;
+};
+
+/** The board's own totals, computed server-side over the whole board. */
+export type OnboardingTotals = {
+  people: number;
+  in_progress: number;
+  finished: number;
+  items_total: number;
+  items_done: number;
+};
+
+/** The board: everybody's checklist, with the totals above a filtered list. */
+export type OnboardingBoard = { items: Checklist[]; totals: OnboardingTotals };
+
+/** `GET /hr/onboarding` — the board. Needs `hr.onboarding.read`. */
+export function fetchOnboardingBoard(): Promise<OnboardingBoard> {
+  return hrRequest<OnboardingBoard>("/api/v1/hr/onboarding");
+}
+
+/** `GET /hr/onboarding/templates` — the picker. */
+export function fetchOnboardingTemplates(): Promise<{ items: OnboardingTemplate[]; total: number }> {
+  return hrRequest<{ items: OnboardingTemplate[]; total: number }>("/api/v1/hr/onboarding/templates");
+}
+
+/** `GET /hr/onboarding/employees/{id}` — one person's checklist. */
+export function fetchChecklist(employeeId: string): Promise<Checklist> {
+  return hrRequest<Checklist>(`/api/v1/hr/onboarding/employees/${employeeId}`);
+}
+
+/** A new template. `organization_id` is the server's business for a tenant session. */
+export type NewOnboardingTemplate = {
+  name: string;
+  items: TemplateItem[];
+};
+
+/** `POST /hr/onboarding/templates` — create one. Needs `hr.onboarding.manage`. */
+export function createOnboardingTemplate(
+  body: NewOnboardingTemplate,
+): Promise<OnboardingTemplate> {
+  return hrRequest<OnboardingTemplate>("/api/v1/hr/onboarding/templates", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `PATCH /hr/onboarding/templates/{id}` — rename it, restep it, or retire it. */
+export function updateOnboardingTemplate(
+  id: string,
+  patch: Partial<NewOnboardingTemplate> & { active?: boolean },
+): Promise<OnboardingTemplate> {
+  return hrRequest<OnboardingTemplate>(`/api/v1/hr/onboarding/templates/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/**
+ * `POST /hr/employees/{id}/onboarding` — materialise a template onto somebody's checklist.
+ *
+ * Refused with a **409 carrying the item count** when the employee already has one: applying twice
+ * would silently duplicate every step, and an onboarding checklist with "sign the contract" twice
+ * is a checklist nobody can finish honestly.
+ */
+export function applyOnboardingTemplate(
+  employeeId: string,
+  templateId: string,
+): Promise<Checklist> {
+  return hrRequest<Checklist>(`/api/v1/hr/employees/${employeeId}/onboarding`, {
+    method: "POST",
+    body: JSON.stringify({ template_id: templateId }),
+  });
+}
+
+/**
+ * `PATCH /hr/onboarding/items/{id}` — tick or untick one step.
+ *
+ * The answer carries `completed`, which flips only on the **transition** to all-ticked: ticking an
+ * already-ticked item and unticking the last one are both writes and neither is somebody finishing
+ * their onboarding.
+ */
+export function tickChecklistItem(
+  id: string,
+  body: { done: boolean; note?: string },
+): Promise<{ checklist: Checklist; completed: boolean }> {
+  return hrRequest<{ checklist: Checklist; completed: boolean }>(
+    `/api/v1/hr/onboarding/items/${id}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
+}
+
+/**
+ * The bar, as a fraction.
+ *
+ * **Never computed here.** The module answers `progress()` and the server sends `done`/`total`; a
+ * browser that divides its own copy is a second definition of "how far along is this person", and
+ * the two disagree the moment an item is added to a template after the checklist was applied.
+ * An empty checklist is 0.0 — a person nobody gave anything to do has done nothing, which is not
+ * the same as being finished.
+ */
+export function checklistProgress(checklist: Pick<Checklist, "done" | "total">): number {
+  return checklist.total === 0 ? 0 : checklist.done / checklist.total;
+}

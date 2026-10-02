@@ -12,8 +12,8 @@ use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
     analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
-    event_retention_runner, event_runner, notification_runner, publishing_runner,
-    restore_job_runner, search_runner, workflow_runner,
+    event_retention_runner, event_runner, lead_runner, notification_runner, restore_job_runner,
+    search_runner, workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -137,6 +137,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the automation matcher is disabled (OMNION_AUTOMATION_RUNNER=false)");
     }
 
+    // The CRM lead drain reads the bus in this process too (REQ-051 slice 4, REQ-117): each
+    // tick turns the `form.submitted` events above its cursor into a contact and a deal. The
+    // producer is the forms module (REQ-064); the contract is the event name, not a table, so
+    // the CRM does not need the form builder to exist to be correct about what it receives.
+    if state.config().crm.lead_runner_enabled {
+        let _leads = lead_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the CRM lead drain is disabled (OMNION_LEAD_RUNNER=false)");
+    }
+
     // The search indexer applies the bus to the search index in this process (REQ-002): each
     // tick reads the events above its cursor and updates the documents they touch, so a page
     // published here answers a search a moment later.
@@ -158,12 +168,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         tracing::info!("the retention worker is disabled (OMNION_RETENTION_RUNNER=false)");
     }
-
-    // The scheduled publishing worker runs due entries from the CMS queue (REQ-064, slice 1).
-    // It ticks every thirty seconds so a scheduled publish lands within the minute the
-    // acceptance criterion names, and it claims its rows before touching a page, so a second
-    // worker cannot publish the same revision twice.
-    let _publishing = publishing_runner::spawn(state.clone());
 
     // The health runner publishes this process's heartbeat and runs the scheduled probes
     // (REQ-014, slice 4). Both halves of it were missing before: `worker_heartbeats` had a
@@ -197,12 +201,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
              and their artifacts stay on the destination"
         );
     }
-
-    // The content usage flush (REQ-019, slice 3). Spawned unconditionally: unlike the analytics
-    // rollup it is cheap when nobody is calling the content surface — one SCAN over a namespace
-    // with no keys — and a feature that silently stops metering when an operator forgets an env
-    // var is a feature whose usage tab is wrong with no indication that anything is off.
-    let _content_usage = omnion_api::content_usage_runner::spawn(state.clone());
 
     if state.config().analytics.runner_enabled {
         let _rollups = analytics_runner::spawn(state.clone());

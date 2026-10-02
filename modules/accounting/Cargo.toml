@@ -1,0 +1,16 @@
+[package]
+name = "omnion-module-accounting"
+description = "Omnion Accounting: the chart of accounts, tax rates and the journal whose balance is the module's spine (docs/requests/REQ-054)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+tracing.workspace = true

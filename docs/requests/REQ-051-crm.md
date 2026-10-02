@@ -1,6 +1,14 @@
 # REQ-051 — CRM
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
+> **Status:** in-progress (tick 79 — the contradiction the last browser report left open is resolved **in the code**, and it was a product defect rather than a harness one. The board held **two** cursors: the frame's `selectedIndex`, which `j`/`k` move, and the board's own `focusedCard`, the id the card draws its ring on. A one-way sync joined them, but it depended on `frame` — and `CrmShell` builds its context value as a bare `const value: CrmListState = {…}` literal with **no `useMemo`**, so that dependency is a new object on every render, the effect body re-ran after every render, and it rewrote `focusedCard` from a number that **only `j`/`k` ever moved**. Clicking a card called `setFocusedCard` alone, so the ring drew on the clicked card for one frame and the next render of anything on the page — a hover, a notice clearing, a refetch — put it back on the first card, with `Enter` opening whichever deal the *index* named rather than the one that was clicked. That is precisely the tension the report could not settle: `theCursorIsVisible: true` and `theListHasRows: true` with `jMovesTheVisibleCursor`, `kMovesBack` and `exactlyOneCursor` all `false`. Fixed in `5feec809`: the sync now depends on `frameIndex`, a **primitive**, so its body runs when the index genuinely changed and never otherwise, and a card's click moves **both** cursors so clicking and `j` leave the same state behind. The gate `scripts/qa/probe-crm-cursor-sync.cjs` (6/6, exit 0) also asserts the provider is *still* an unmemoized literal, so that when someone memoizes it the rule reports itself stale instead of passing on a premise that has moved. **Proven to fail on the real pre-fix file: 2/6, exit 1**, naming the object dependency, the ring-only click and the join; its first draft named a *false* reason for the join on that same file and was corrected to distinguish "never joined" from "joined through the object". Gates: `cargo test -p omnion-module-crm --lib` **172 passed** under `CARGO_TARGET_DIR=/dev/shm/w4-target`, `apps/admin` `tsc --noEmit` exit 0, `probe-crm-screen-states` 28/28, `probe-crm-sweep-selectors` 11/11. **No box ticked:** this is exactly what the keyboard box's browser pass would have caught, but a static gate is not a pixel — the slot is still held live by main (`pid 315364`, `cwd=/mnt/apopic/omnion`) and the box itself refuses one (**933** Chrome processes, 1.2 GB available of 32, **24 GB** swap in use, `/mnt/apopic` at 97%), so a pass launched now is an OOM kill whose output reads as a defect list.)
+
+  *Re-run against a database this branch's migration set has seen.* The suite pointed at the shared
+  dev database answered 56 × `Migration(VersionMissing(19))`: 19 is a **shared-number collision**
+  (w2 `cms blocks`, w5 `organization memberships`, w6 `secret hierarchy`, w7 `ai provider runtime`
+  each have their own `19_*.sql` on their own branch; the shared database has w2's, and this
+  worktree has no 19 at all — 18, 21, 22). Against `omnion_w4_fresh` the suite is **56 passed; 0
+  failed** in 422s. A wave's suite has to run against a database that wave's migration set built,
+  or it is asserting another branch's history.. · **Captured:** 2026-09-26 · **Layer:** module (`modules/crm`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -134,24 +142,257 @@ Payloads carry ids and the changed field list only — never a rendered document
 
 ### Acceptance criteria
 
-- [ ] Migration `0011_crm.sql` applies on a populated database without touching existing rows; `cargo test -p omnion-module-crm` is green.
-- [ ] Every `/api/v1/crm/*` route answers 401 unauthenticated, 403 with the permission missing, and 200 with it granted; a contact from another organization is invisible (404).
-- [ ] Creating, updating, archiving and merging a contact/company/deal writes an audit entry with actor, before/after diff and request id.
-- [ ] `crm.contact.created`, `crm.deal.stage_changed` and `crm.deal.won` appear in the event feed with the documented payload and reach a subscribed webhook endpoint.
-- [ ] Contact list: search, owner, status, tag and date filters combine; sort persists in a saved view; column chooser survives reload.
-- [ ] Inline edit of owner/status/tags saves optimistically and rolls back with a visible error when the API rejects it.
-- [ ] Contact form rejects a malformed e-mail and a duplicate e-mail (case-insensitive) with a field-level message; the first invalid field receives focus.
-- [ ] CSV import runs a dry run that shows row count, mapped columns and per-row errors before commit; commit writes only the valid rows.
-- [ ] Pipeline board drag moves a deal, persists the new stage, updates per-stage count/sum/weighted sum, and is reversible with `ctrl + ←/→`.
-- [ ] Moving a deal to `lost` requires a reason; moving to `won` records/confirms the close date and emits `crm.deal.won`.
-- [ ] Visibility scoping works: a member with `own` sees only their records, a team lead sees the team's, an `all` binding sees everything.
-- [ ] A role without `crm.fields.sensitive.read` sees the flagged field hidden in list, detail, export and import preview.
-- [ ] Record timeline merges activities, stage changes and audit-worthy notes in one ordered stream with correct relative times.
-- [ ] CRM copilot returns a summary and a suggested next action; nothing is written to a record without an explicit user action, and the call is audited.
-- [ ] Global search (REQ-002) finds contacts, companies and deals by name/e-mail and deep-links to the record; ⌘K offers "New contact" and "New deal" gated by permission.
+- [x] Migration `0022_crm.sql` applies on a populated database without touching existing rows; `cargo test -p omnion-module-crm` is green (84 unit tests). (Renumbered from `0021`, which `0021_iam_sso.sql` on main took while this file was in flight; a migration number is global across branches.)
+- [x] Every `/api/v1/crm/*` route answers 401 unauthenticated, 403 with the permission missing, and 200 with it granted; a contact from another organization is invisible (404) — proved by `every_crm_route_is_permission_guarded` and `a_record_of_another_organization_is_invisible`.
+- [x] Creating, updating, archiving and merging a contact/company/deal writes an audit entry with actor, before/after diff and request id. (Contacts and companies proved in slice 2; the deal's `crm.deal.created` / `crm.deal.updated` / `crm.deal.archived` / `crm.deal.stage_changed` rows are asserted by the slice-3 walks, which now run: **29/29 passed** against a fresh database in `b49aa3d`.)
+- [x] `crm.contact.created`, `crm.deal.stage_changed` and `crm.deal.won` appear in the event feed with the documented payload and reach a subscribed webhook endpoint. (`the_won_and_lost_flows_demand_their_own_input_and_emit_their_own_event` and `a_stage_move_persists_reloads_and_emits_the_documented_event`, both in the 29/29 run. The walk also asserts the payload carries **no** deal title, and `b49aa3d` fixed `crm.deal.won`'s `close_on`, which `json!` was writing as a `[2026, 273]` tuple.)
+- [x] Contact list: search, owner, status, tag and date filters combine; sort persists in a saved view; column chooser survives reload — `the_contact_list_filters_sorts_and_totals` and `a_saved_view_is_the_query_it_stands_for`, with the screen in the walkthrough route list.
+- [x] Inline edit of owner/status/tags saves optimistically and rolls back with a visible error when the API rejects it — the screen sends the patch, restores the previous value and shows the refusal under the field.
+- [x] The API rejects a malformed e-mail and a duplicate e-mail (case-insensitive) with a field-level message in `error.details.field` — `the_contact_and_company_forms_refuse_what_they_name`.
+- [x] CSV import runs a dry run that shows row count, mapped columns and per-row errors before commit; commit writes only the valid rows — `an_import_previews_before_it_writes_and_then_writes_what_it_accepted`, and `an_export_is_the_lists_own_answer_and_imports_back` proves the export applies the same field hiding as the list and re-imports.
+- [x] Pipeline board drag moves a deal, persists the new stage, updates per-stage count/sum/weighted sum, and is reversible with `ctrl + ←/→`. The one statement that computes the count, the sum and the weighted sum is the board's own header query, and the keyboard path sends the **same** request the drag sends. *Proved by `a_new_deal_lands_on_the_first_open_stage_and_the_board_adds_up` and `moving_a_deal_to_the_stage_it_is_already_in_is_a_no_op` in the 29/29 run. The browser walk (`runCrmDealsDepth`) is registered in the route list.*
+- [x] Moving a deal to `lost` requires a reason; moving to `won` records/confirms the close date and emits `crm.deal.won`. The rule is in the module (`resolve_move`) and in the schema's trigger, the dialog is required before the write, and leaving the lost column forgets the old reason. *Proved by `the_won_and_lost_flows_demand_their_own_input_and_emit_their_own_event` in the 29/29 run. `b49aa3d` is what made this reachable at all: the close date was a 422 for every caller.*
+- [x] Visibility scoping works: a member with `own` sees only their records (enforced in SQL, a hidden record is a `404`), a team lead sees the group's, an unnarrowed account sees the organization's — `the_own_visibility_level_hides_a_colleagues_record`.
+  *The box was ticked on a claim two of its three levels had never been checked for. Reading it
+  this tick, "a team lead sees the group's" was proved by a walk named `..._own_visibility_...`,
+  and nothing in the suite had ever created a **group** — so `Visibility::Team` had a SQL
+  branch, two unit tests over a `QueryBuilder` string, and no evidence. Two defects, both of the
+  shape tick 64 found in HR, and both found by the audit rather than by a failing test.*
+
+  ***A level granted on any key but two was silently ignored, and the answer was `all`.***
+  `visibility_of` matched exactly `crm.contacts.read` / `crm.contacts.update`. Those are the
+  **contact** screens' keys. A tenant that expressed "own deals" as `crm.deals.read` on a
+  department binding was asked how much of the organization the role reads, the query did not
+  find the binding, and the answer was `all` — the promise withheld, in the direction that
+  matters, on the one screen whose contents are the business' own open pipeline value. The
+  other fifteen `crm.*` keys were invisible to the one query that decides the level; it now
+  matches the **family** (`crm.%`), which fails closed: a key this module cannot reason about
+  narrows rather than widens.
+
+  ***The guard refused the very grant a level lives in*** — tick 64's HR defect, unfixed here.
+  `require()` authorizes against an organization-wide `ResourceContext`; a **department** binding
+  — which is what a level *is* — matches no such context. So a role holding `crm.deals.read` at
+  the `own` level was refused `403` by the route layer, one step **before** the handler that
+  implements the level ever ran, naming a key the caller demonstrably held. The only way to hold
+  a level at all was an organization grant: precisely the level the level exists to prevent.
+  All twenty CRM guards are now `require_department_scoped`, which tries the organization
+  context first (so every organization-scoped role is unchanged) and then each department the
+  caller's own bindings name.
+
+  *Proved by `a_visibility_level_holds_on_any_key_of_the_family`, which grants the level on
+  `crm.deals.read` and asserts against **deals**, so a pass cannot be explained by the key that
+  used to be named. `team` reads the group member and stops at a stranger; `own`, added after
+  `team`, is tighter and wins; a deal outside the level is a `404` on a direct URL; a member
+  holding **no** level still reads the organization, so a level never leaks onto a colleague;
+  and a final account whose *only* grant is the department binding reads the board at all.
+
+  *Both fixes are proven to fail by reverting each alone, the same walk going red each time:
+  the guard revert answers `403` with `"1 binding(s) looked at, 0 counted"` and
+  `"department": null`; the family revert answers `all` and the `team` assertion sees the
+  stranger's deal. The first version of this walk proved **neither** — every account in it also
+  held an organization grant, which opens the route on its own, so reverting the guard left it
+  green. That is tick 64's own mistake repeated inside the tick that was fixing it, and the
+  account with no organization grant exists because of it: a level's binding is the **only** way
+  to open a route at the `own` level, so the walk has to hold nothing else to prove the guard
+  reads it.*
+- [x] A role without `crm.fields.sensitive.read` sees the flagged field hidden, at every depth of the custom object, in both the list and the detail — `the_flagged_fields_are_hidden_from_a_role_without_the_key`. (Export and import preview arrive with slice 2's CSV.)
+- [x] Record timeline merges activities, stage changes and audit-worthy notes in one ordered stream with correct relative times. (`record_timeline` in `modules/crm/src/activities.rs` merges three arms under **one** `order by` — an activity, a deal's stage change and a deal's archive marker — rather than three queries merged in Rust, which can disagree with themselves the moment a row moves between them. The stage arm reads the deal rows rather than the event log, so a record imported before the event bus existed still has a correct history and a replayed event cannot duplicate an entry. `a_logged_activity_appears_in_the_feed_and_on_the_records_timeline` asserts the activity *and* the stage change are both on a contact's stream and that a contact's call is **not** on its company's; `the_relative_label_reads_as_a_person_would_say_it` pins the label, which is presentation only — ordering always uses `occurred_at`.)
+- [x] CRM copilot returns a summary and a suggested next action; nothing is written to a record without an explicit user action, and the call is audited. (Route in `d2b9f74`: `POST /api/v1/crm/copilot/summarize/{deal_id}` and `/follow-up/{deal_id}` behind `crm.copilot.use`, sharing one handler. The **scoped read runs before the model is resolved**, so a foreign deal is a `404` and never reaches a provider. Every call is audited — `crm.copilot.summarized` / `crm.copilot.follow_up_drafted`, and `crm.copilot.failed` on the failure path — carrying the deal, the action, the model and the size but **neither the draft nor the deal's title**. Proved by `the_copilot_is_guarded_scoped_and_audited` in the 36/36 run: 401, 403 for a manager holding the whole contact/deal family but not the copilot key, 404 across the tenant boundary **in both directions**, the audit row, and the deal unchanged afterwards. No provider is faked — this installation connects none, so the call fails and the audit is asserted *because* a failure is still a call; the sanitiser's text rules are unit-tested in `modules/crm/src/copilot.rs`. **The screen shipped in `2eb8638`** — the endpoints had been reachable only from curl, which is the same as a feature that does not exist: a **Copilot** button on every board card (on the card rather than in a row menu, because on the board the card *is* the record), a side panel that answers both actions, takes focus when it opens and closes on Escape, and `?focus=<id>&copilot=1` to land on the answer from a link. A **refusal renders as a sentence** rather than a silently missing panel, and `is_draft` drives a visible marker that turns amber and reads "written to the record" if a response ever contradicts it. The answer renders in a **text node** — the server's sanitiser already reduced it to plain text. Proved in the browser by `runCrmCopilotDepth`.)
+- [x] Global search (REQ-002) finds contacts, companies and deals by name/e-mail and deep-links to the record. (**Shipped** in `5bedddb`/`241cf91`: three providers in `crates/search/src/providers.rs` — `contacts` and `companies` behind `crm.contacts.read`, `deals` behind `crm.deals.read`, each pointing at its own screen — with the three upserts, the three prune arms and the `crm.*` event plans in `crates/search/src/indexer.rs`, plus `database/migrations/0031_crm_search_providers.sql` to enable the keys. A contact's **notes** are excluded: the module flags them `crm.fields.sensitive.read` and a vector cannot answer a per-role question. The deep link is `?focus=<id>`: the two lists open that row's editor, the board marks that card. Proved by three walks in the **39/39** run — the hit carries the right `url`, `type:contacts` narrows to contact rows only, a reader holding only the contact key finds the contact and gets **no** deal rows (the same split `/api/v1/crm/deals` enforces), and archiving a company takes its document out of the index. **⌘K "New contact" / "New deal" is not done** — the command centre (REQ-032) is wave 1 and owns the palette's own rows.)
+- [x] An automation rule triggered by `crm.deal.stage_changed` runs **once**. (Proved by driving the **real** matcher — `crates/automation/src/matcher.rs` — over the **real** bus in this suite's own database, so the event the rule reads is the one the board's stage endpoint emitted rather than a hand-written row. Three walks: `a_rule_on_a_deal_stage_change_runs_exactly_once`, `a_rule_whose_condition_does_not_hold_starts_nothing` and `defining_the_rule_needs_the_workflow_key_and_a_tenant_rule_stays_home`, all in the **42/42** run. They assert: a move to the stage a deal is **already in** starts nothing (the board's `ctrl + ←/→` posts on every key press); one move starts **one** run whose step carries *this* move's resolved values — the subject reads "A deal entered open" and the body the deal's id, amount and currency, so a retry would repeat the first attempt rather than re-reading a bus that has moved on; a second drain over the same bus is **idle**, which is what "once" means rather than a count; the match is audited as `automation.rule.matched` against the execution; a second deal starts a second run, because exactly-once is per *event* and collapsing two customers into one run would lose one; and a condition that does not hold is `skipped`, not `matched`. The rule's key is `workflows.manage`, so a CRM manager who may move deals all day still cannot define the rule that watches them, and a rule for another organization is refused.)
 - [ ] Empty, loading and error states exist on all six screens; no dead buttons and no placeholder rows.
+  *The tick-66 pass produced the first report behind this box in two days, and it is **void**: the
+  run exited 4 because `/` hit 100% mid-pass and six screenshots could not be written. A void run
+  ticks nothing, whatever its CRM numbers say, so this box stays open — but its report is real
+  evidence and it reads differently than the last one did.*
+
+  *`crmStates` now grades six screens and two of them are still unaccounted for.* `activities`,
+  `leads` and `stages` answer all five questions (state, sentence, request id, retry, no false
+  empty claim). `contacts`, `companies` and `deals` answer **every** one with `false` — including
+  `doesNotClaimToBeEmpty`, which was the single question the previous report used to clear them.
+  Three screens cannot all lose five unrelated behaviours in one release, and the screenshots that
+  would explain it are precisely the six the full filesystem refused to write. The next pass runs
+  with the disk reclaimed and answers this properly; nothing is concluded from it now.*
+
+  *The six `503`s this sweep injects on purpose are filed as `netFailures` again* — thirty CRM
+  reads at `503` with `organization_id` on the URL — which is the sweep working, and the same
+  finding `ee3387de` removed once. Worth re-reading the roll-up's filter before the next box is
+  judged on it.
+
+  *Two thirds are in, and both halves were defects rather than omissions.*
+
+  *Tick 50 read this box for the first time with a report behind it, and the answer was
+  "the sweep was grading its own ruler": three of the six screens came back clean
+  (activities, leads, stages) while contacts, companies and deals came back empty — which
+  the screenshots then explained. Contacts and companies were fine and the stub simply
+  never fired on them; deals was the crash above. All six 503s the sweep injects on
+  purpose were being filed as high findings, which is how a pass that *proved* the screens
+  survive a lost dependency was also the module's worst offender (`ee3387de`).
+
+  *The state sweep was itself the defect (`fa6181c`).* It reported the contacts and companies
+  screens as having **no** error state. They have one — the list's own read renders it. What had
+  happened is that both screens fire four reads at once (column catalogue, saved views, company
+  picker, list) and the pass stubbed "the first CRM list read it sees", so the refusal landed on
+  whichever the network delivered first: the company picker, whose failure is *meant* to be
+  absorbed because the list still works. A pass that fails an arbitrary one of four concurrent
+  reads is measuring a race, and it reported the race. The read under test is now named per screen
+  (`LIST_READ`), and the retry step re-arms it — the variable still held the *last* screen's path
+  after the loop, so that assertion had been running against a healthy screen.
+
+  *What the race was pointing at was real.* The company picker read its list and, on failure, set
+  it to empty and moved on: a `select` whose only option was "No company". That is a control that
+  looks like a choice, refuses every real one, and cannot be told apart from "this contact has no
+  company" — a dead control, which is what the box forbids. The picker now carries its own state
+  where the choice was: the sentence, the request id **only when the server named one**, and a
+  retry on its own token (so re-reading the companies does not re-read the list the person is
+  looking at). The list behind it is untouched — losing a dependency the screen survives losing
+  must not take the screen down. Four new steps assert it: the picker's sentence, its id, its
+  retry, and the list still being there.
+
+
+  *The **tenant resolution** (`b899f7f`): a platform account that has no organization is now a
+  state with a sentence and an action rather than a 400 with a code nobody can draw from.*
+
+  *The **error state** (`63512c5`, `c0e51fe`). The box asks for "error state with retry button and
+  request id" and the request id did not exist: the refusal body carried a code, a message and
+  sometimes a details object, and nothing that named the exchange. So the id was built —
+  `apps/api/src/request_id.rs` stamps `x-request-id` on every response (so an id captured from a
+  successful call can correlate the next failure of the same operation) and `error.request_id` in
+  the body (so a refusal pasted into a ticket still carries it). Installed outside the `/api/v1`
+  nest, so the liveness probes are stamped too. An inbound id is honoured only when it is safe to
+  reflect, and a hostile value is **replaced**, not sanitised.
+  Then the six screens: each had hand-rolled its own block, they had drifted into three shapes,
+  and the settings editor and the lead inbox had lost the retry. `components/error-state.tsx` is
+  the one shape — sentence, code, the id **when the server named one**, and a retry. A network
+  failure never reached the server, so no id is invented for it: a fabricated correlation number
+  would look more useful than it is and send an operator to a log line that does not exist.
+  `lib/crm.ts` was also dropping `error.details`, which is why every field-level refusal was a
+  generic banner with nothing under the input it was about.
+  Proved by `runCrmStateSweep`: a real 503 with a real body at the network layer, five screens
+  checked for a sentence / a retry / the id, the retry **pressed** and the recovery watched, and
+  the no-id case asserted to invent nothing. 10/10 unit tests, typecheck 2/2.*
+
+  *What is left is the **empty state** on the two screens that still fall back to a bare paragraph
+  rather than `EmptyState`: the board's per-column body and the activities filter bar. Both exist;
+  both need the sentence-and-action shape the other four have.*
+
+  *Both were already done, and the box was pointing at stale text.* The board's per-column body
+  carries a stage-specific sentence, an action on the first column and a drop target on the rest;
+  the activities feed and the record timeline both draw `EmptyState`. The instruction above named
+  two places that an earlier tick had already fixed, so the remaining work was found by auditing
+  the six screens rather than by re-reading the note.
+
+  *What the audit found was a worse defect than the one being hunted (`fed62b5`).* The deals
+  screen — **the** screen of this request — had the only body in the module that did **not** gate
+  on its read. A refused board read set `error`, and the body went on rendering the
+  `board === null` branch: a four-column skeleton, permanently, printed directly beneath a refusal.
+  Two incompatible claims on one screen, neither of them true, and the one the reader was looking
+  at was a loading state for a load that had already given up. The list mode had the same gate
+  missing, so both views of the same record were affected.
+
+  The fix had a trap in it that the obvious patch would have sprung. `error` was **shared** with
+  action failures — a refused drag, a refused archive — and those deliberately keep the board on
+  screen with a strip above it, because the card has already moved back and the board is the
+  answer. Gating the body on the shared state would have blanked the entire pipeline every time
+  someone moved a card the server would not accept. So the state is split: `error` stays the
+  action refusal (a strip above a good board), `loadError` is the screen's own read (the body
+  itself), and each of the six screens now has exactly the one shape its failure warrants. A
+  refused board also offers the list, because the two are views of one record and losing one
+  must not take the other away.
+
+  The walkthrough grew four steps that the strip could not have passed — the state, the request
+  id, **no `[aria-busy]` element left anywhere on the page**, and the other view still on offer.
+  The third is the assertion that matters: the defect was a screen claiming to load, so the proof
+  is that nothing claims to load any more.
 - [ ] Mobile 390×844: lists are usable, the board scrolls horizontally with sticky stage headers, and forms are single-column.
+  *The tick-66 pass answers most of this box correctly and **still does not tick it**, because the
+  run is void (exit 4). Recording the numbers so the next pass is a comparison rather than a first
+  reading.* Green on the phone: `thePhoneDefaultsToTheList`, `theBoardIsStillOffered`,
+  `theBoardScrollsOnAPhone` (its own `overflow-x` box, `scrollWidth > clientWidth`),
+  `thePageDoesNotScrollSideways`, `theStageHeaderSticks` (read from the element, not the class),
+  `theStagesKeepTheirTotals`. Three of four forms measure one column at 390px — contacts 9 fields,
+  deals 7, companies 6, all `widestRow: 1` — and `everyMeasuredFormIsSingleColumn` is `true`
+  **because** the fourth is excluded: `theFormsOnAPhone.activities` is `fields: 0`. The activity
+  form measured nothing, which is a pass that could not see the screen, not a form that passed;
+  `theFormIsSingleColumn` is `false` for exactly that reason and the box waits on it.
+  `5e27a2b5` (the shortcut sheet) does not touch this box, and the activity form's own `sm:grid-cols-2`
+  pair is still there to be measured.
+
+  *Proved by `runCrmKeyboardAndMobile` (REQ-051, `927ddb6`) against the live stack: the phone
+  defaults to the **list** and offers the board rather than taking it away, the board's own box
+  reads `overflow-x: auto|scroll` with `scrollWidth > clientWidth` (it scrolls *inside* its own
+  box), the page itself does not scroll sideways, the stage header is read from the element and is
+  `position: sticky`, and the contact form's fields are measured rather than assumed — the set of
+  distinct `left` offsets is the assertion, because "single column" is a claim about geometry and
+  a class name cannot make it.*
+  *Still unticked, and for the first time the reason is knowable. The pass that would tick it
+  reported `high 160` and exited 0 while producing no evidence at all (tick 46), so the
+  instrument was answering questions about a box it had never actually looked at. `e8d26476`
+  makes that state impossible to report as a result — a pass that lost its captures, or ran
+  without a serving stack, exits **4** and says which — so the next run either ticks this box or
+  names the leg that broke. A number that cannot be wrong about its own evidence is the
+  precondition for a box like this one ever closing.*
+  *The one defect this box was measuring, found by the first pass that had a screenshot to
+  look at (`47d822b7`, tick 50). The board is the screen's whole body, so it reads the
+  keyboard cursor out of `CrmShell` — and it called the **throwing** form of the hook from
+  *above* the shell it is a child of. `/crm/deals` therefore threw on every load and the
+  board never drew: `boardColumns: 0`, `boardRendered: false`, `cardHasAButton: false`, and
+  the same crash is why the state sweep read no error state on the deals screen. The comment
+  two lines above the call already claimed a `null` contract; `useOptionalCrmList` is it.
+  Re-proved in the browser by the pass this entry queues.*
+
 - [ ] Keyboard: `/` focuses search, `j`/`k` move rows, `enter` opens, `e` edits, `?` shows the shortcut sheet.
+  *The hook made the bindings reachable; it did not make them **visible**. `5e27a2b5`.*
+  The tick-66 pass drove this box for the first time with a live report behind it and found that
+  `/crm/activities` destructures `showShortcuts` out of `useCrmKeyboard` and **never renders it** —
+  the hook worked, `?` flipped the flag, the state moved, and no sheet appeared. The pass read it
+  as `"activities": {"sheet": false, "slashFocusedSearch": false}` while `/crm/leads`, which draws
+  `{showShortcuts ? <CrmShortcutSheet /> : null}`, answered `true`. The fix renders the sheet the
+  same way leads does; the sheet is drawn inside the screen's own root, after the nav.
+
+  *The same report is still not a verdict: the run is void (exit 4, six screenshots lost to a
+  full `/`), so the box stays unticked.* What the pass does say, and what the next one must
+  re-answer: `slashFocusesSearch` is `true` on the shell screens, every advertised `g`-prefixed
+  destination navigates, `n` creates, and `e` opens an editor on all four shell screens
+  (`eIsNeverADeadBinding: true`). Against that, `jMovesTheVisibleCursor`, `kMovesBack` and
+  `exactlyOneCursor` all read `false` while `theListHasRows` is `true` and `theCursorIsVisible` is
+  `true` — a cursor that exists, is drawn, and does not move under `j`. Either the two disagree
+  about which row is marked, or `j` moves a selection the DOM never reflects. The same pass also
+  reports `theFormsOnAPhone.activities.fields = 0` — the activity form measured **no fields at
+  390px** — so `theFormIsSingleColumn` is `false` on a screen whose form the pass could not even
+  see. None of that is concluded here; all of it is what the next pass starts from.
+
+  *Half of the module never listened for any of it, and the sheet is shared. `/crm/activities` and
+  `/crm/leads` draw their own rows instead of rendering `CrmShell`, so the bindings — which were
+  written out **inside** the shell — were unreachable from both, while `crm-parts.tsx` kept
+  printing `/`, `j`, `k`, `Enter`, `e` and `?` for the section. The sheet is a claim about the
+  module, so two of its six screens were advertising controls they could not deliver.*
+
+  *Fixed by making the contract a hook rather than a body (`a38ff972`), so the shell and a
+  screen with its own frame call the same code and cannot drift: `useCrmKeyboard` owns the
+  bindings, `CrmShortcutSheet` the sheet, and `j`/`k` plus the toolbar's "move by N" share one
+  wrapping helper — two callers re-deriving the wrap rule is how a list and its own keyboard
+  disagree about where the cursor ends up.*
+
+  *Both screens now draw the cursor on their `<li>` rows with `crmListItemCursor` (`656aa8e2`),
+  and a click moves it to the same place `j` would: clicking and pressing `j` are the same act,
+  and a click that leaves the cursor elsewhere makes the two disagree about which row `Enter`
+  opens. `Enter` and `e` open the record the row is about — the activity's contact, company or
+  deal; the submission's contact, deal or company. Where there is no record, the screen says so in
+  a sentence rather than navigating somewhere unrelated, because a free-standing note and a
+  submission that became **nothing** are precisely the rows this inbox exists to explain.*
+
+  *The leads inbox loses its local `/` binding, which is now the module's, and keeps Escape, which
+  the hook deliberately does not own — two owners of one key is how a shortcut sometimes works.*
+
+  *Proved in code, not yet in a browser. The pass has a new per-screen leg (`19ae394b`) that reads
+  no source: the sheet opens, `/` reaches that screen's own field, `j` moves a cursor the page
+  renders, and `Enter` moves the URL. Each stays **unset** rather than false with no rows, because
+  an empty database is not a broken keyboard. **It has not run** — the box sits at load 86-93 with
+  `/mnt/apopic` at 100% (92 MB free), which is what ended the queued accounting pass; reclaiming my
+  own cold build cache recovered 2.0 GB (97%), and the slot is still held by a sibling writer's pass.
+  Gates this tick: `cargo test -p omnion-module-crm --lib` **172/172**, `turbo run typecheck`
+  **2/2**, `node --check scripts/qa/walkthrough.cjs` OK.*
 
 ### QA plan
 
@@ -161,10 +402,57 @@ What the visual check should see: a board with four stage columns, per-column co
 
 ### Slices
 
-1. **Data + API core.** Migration, companies/contacts CRUD with filters and paging, permission keys registered, audit + events wired, integration tests. Done when `cargo test -p omnion-module-crm` is green and a signed-in curl round-trip creates a contact that produces an audit row and a `crm.contact.created` event.
-2. **Contact & company screens.** List, filters, saved views, column chooser, inline edit, create/edit form with validation, archive/merge, CSV import (dry run + commit) and export. Done when the walkthrough clicks both screens end to end and the QA pass reports zero high findings.
-3. **Deals + pipeline board.** Stages editor, board with drag + keyboard move, per-stage totals and weighted forecast, won/lost flows, list mode. Done when QA drags a card, reloads, and the stage plus `crm.deal.stage_changed` persist.
-4. **Activities, timeline, copilot, search & automations.** Activity capture, merged timeline, copilot read-only actions, global-search registration, workflow triggers and the `form.submitted` consumer. Done when a logged activity appears in the record timeline and in search, and an automation rule triggered by `crm.deal.stage_changed` runs once.
+1. **Data + API core.** Migration, companies/contacts CRUD with filters and paging, permission keys registered, audit + events wired, integration tests. Done when `cargo test -p omnion-module-crm` is green and a signed-in curl round-trip creates a contact that produces an audit row and a `crm.contact.created` event. **Shipped** as `database/migrations/0021_crm.sql` (the spec's `0011` was taken by IAM before this work started; a migration number is global, so the next free one was taken and the file is still additive), `modules/crm` (`omnion-module-crm`) and `apps/api/src/routes/crm.rs`.
+2. **Contact & company screens.** List, filters, saved views, column chooser, inline edit, create/edit form with validation, archive/merge, CSV import (dry run + commit) and export. Done when the walkthrough clicks both screens end to end and the QA pass reports zero high findings. **Shipped** in `apps/admin/features/crm/`, `apps/admin/lib/crm.ts`, `modules/crm/src/{csv,views}.rs` and `apps/api/src/routes/crm_views.rs`.
+3. **Deals + pipeline board.** Stages editor, board with drag + keyboard move, per-stage totals and weighted forecast, won/lost flows, list mode. Done when QA drags a card, reloads, and the stage plus `crm.deal.stage_changed` persist. **Shipped** in `9909af9` as `modules/crm/src/deals.rs`, `apps/api/src/routes/crm_deals.rs`, the five `crm.deals.*` / `crm.pipelines.manage` keys, `apps/admin/features/crm/deals-view.tsx` and the walkthrough's deals depth pass. Shipped and green: 29/29 of its walks ran in `b49aa3d` and again in `d132936` (35/35 with slice 4).
+4. **Activities, timeline, copilot, search & automations.** Activity capture, merged timeline, copilot read-only actions, global-search registration, workflow triggers and the `form.submitted` consumer. Done when a logged activity appears in the record timeline and in search, and an automation rule triggered by `crm.deal.stage_changed` runs once. **All seven parts are in** (2026-09-28, the seventh in `2a4a0f0`): activity capture, the feed, the log form and the merged timeline; the copilot's module, its two endpoints, their audit and **its screen**; the global-search registration; the **workflow-trigger proof**; and the **`form.submitted` consumer**. The ⌘K rows the command centre owns (REQ-032) stay with that request.
+   - **The seventh part, in its own words.** A submitted form becomes a contact and a deal. The
+     producer is REQ-064's public submit endpoint, which is **not in this build** — so the
+     consumer is written against the *event contract* (`form.submitted`) rather than against a
+     form table, and the day the form builder lands it only has to emit the documented name.
+     The design in one line each: `crm_form_leads.event_id` is the bus identity and the primary
+     key, so a retried drain and a second API process both leave **one** contact; the claim is
+     taken **before** the writes and there is deliberately no transaction, because
+     `create_contact`/`create_deal` take a `&PgPool` and a rolled-back batch would show nobody
+     anything; routing is a **row** (`crm_lead_settings`), not a constant, because a support
+     address and a "quote me" address are the same event with different meanings; and a repeat is
+     the **same person**, matched on the normalized address and parked in the operator's repeat
+     stage rather than opening a second deal for one interest.
+   - **A submission is never silently dropped.** Five outcomes, all of them listed: `created`,
+     `merged`, `rejected` (nothing usable, *with the sentence*), `orphaned` (no organization) and
+     `disabled` (the policy says no). A form builder that quietly loses a submission is the most
+     expensive failure this feature has, and the inbox is where somebody finds out.
+
+### The walks that were written but never run (2026-09-28, `d132936`)
+
+Slice 4 part one shipped with six integration walks that had never executed. They were never
+executed because the suite is pointed at the shared development database by default, and that
+database's `_sqlx_migrations` ledger carries versions 19 and 21 from a run against files no branch
+carries — so the fixture panicked before any test body and the "29 passed" that was being reported
+was 29 of the *slice-1-3* walks running against a database that happened to work. The six slice-4
+walks were silently not in that number.
+
+Pointed at a throwaway database, they ran and found **four product defects**, each of which made a
+documented feature unusable rather than slightly wrong:
+
+1. **The activity feed 500'd for every caller at the `team` visibility level.** The clause was
+   built as `any(` followed by a `separated(", ")` of individual binds, which is `any($1, $2)`; the
+   array operator needs one array parameter. `open_tasks` repeated the clause by hand, and
+   `set_activity_done` used `$3` for both the `done_at` timestamp and the id list, so closing any
+   task was a 500 too. All three now share `push_activity_visibility`.
+2. **Every timestamp in an activity response was `time`'s tuple** (`[2026, 263, …]`), because
+   `Activity` and `TimelineEntry` carried no serde attribute on those fields.
+3. **Logging a task with a due date was a 422 for every caller**, because `ActivityChanges`' three
+   timestamps were bare `Option<OffsetDateTime>` and `time`'s serde support is opt-in per field —
+   a bare one accepts no JSON string at all. `dates::instant` is the round trip that fixes it.
+4. The three walks themselves passed an e-mail where a session token belonged, a deal's id where a
+   route takes an activity's, `rp.permission` where the column is `permission_key`, and read
+   `actor_user_id` from a helper that names the key `actor`.
+
+**For the next writer.** A suite's green number is only about the tests in it. If a feature's walks
+are added and the run is a re-run of a database the fixture has always used, check *which* tests the
+count is made of before believing the feature is proved — and run the suite against a database
+created for the purpose at least once per feature.
 
 ### Risks / notes
 
@@ -175,3 +463,44 @@ What the visual check should see: a board with four stage columns, per-column co
 - Weighted forecast is `amount × probability/100`; keep it one SQL expression so board headers and the overview cannot drift apart.
 - Merge must be transactional and must move activities/deals, then archive the loser — never delete a record other rows point at.
 - Copilot output is untrusted text: render as plain text, never as HTML, and always show it as a draft.
+
+### The migration "blocker" was a misdiagnosis (2026-09-27, corrected in `b49aa3d`)
+
+An earlier tick recorded that `cargo test -p omnion-api --test crm` could not run because this
+branch's migration set had a gap at 0019/0020, and it proposed a platform-wide renumber as the
+remedy. **That diagnosis was wrong, and acting on it would have touched five other writers' branches
+to fix nothing.** It is kept here because a confidently wrong blocker costs the next tick more
+than the bug it described.
+
+What the evidence actually was, and what it was read as:
+
+* The suite reported 29 FAILED in 0.99 s. That was read as "a fixture that never set up".
+* The fixture's panic was `Migration(VersionMissing(19))`, read as "this branch's set is not
+  contiguous".
+* The fix attempted was a merge of `main`, on the theory that it would supply 0021.
+
+What is true. The migration *directory* is non-contiguous, and that is real. But
+`Migration(VersionMissing(N))` is raised when a version is **applied in the database and absent
+from the source**, which is a different condition from "the source is missing a file". The shared
+development database `omnion` — the default target of `OMNION_DATABASE_URL` — has 19 and 21 in
+its `_sqlx_migrations` ledger, applied by a run against files no branch carries today. Pointing
+the suite at a database created a moment earlier makes all 29 walks run, and 5 of them fail on
+real defects.
+
+So the migration numbering is a shared-environment wart, not this branch's blocker, and the
+correct response was to name the database the suite was talking to, not to renumber five branches.
+
+**What the runs then found** (all fixed in `b49aa3d`, walks now 29/29):
+
+1. `create_deal`/`patch_deal` bound a money `String` into a `numeric` column. Postgres will not
+   coerce it, so every create was a 500 and the board, won and lost flows all sat on top of it.
+2. `expected_close_on` was a bare `time::Date`, which `serde` reads as a tuple — so the
+   `"2026-12-01"` a browser's date input sends was a 422, and the won/lost flow was unreachable
+   from the panel. `modules/crm/src/dates.rs` is the `YYYY-MM-DD` round trip that fixes it, on the
+   request side and in the two hand-built `json!` payloads that bypass `serde` entirely.
+
+**For the next writer who hits `VersionMissing`.** Create a throwaway database, point
+`OMNION_DATABASE_URL` at it, and run the suite there before believing anything about the
+migration ledger. The distinction that mattered: a *source* that is missing a file is a gap you
+can see with `ls database/migrations`; an *applied-but-absent* version is invisible in the source
+and only shows up as a panic. Two conditions, one error message.
