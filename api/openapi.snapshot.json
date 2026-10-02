@@ -3467,6 +3467,263 @@
         "x-omnion-sunset": null
       }
     },
+    "/developer/api-keys": {
+      "get": {
+        "deprecated": false,
+        "description": null,
+        "operationId": "get_developer_api-keys",
+        "responses": {
+          "403": {
+            "description": "The caller's permissions do not cover this route."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Standard error envelope."
+          }
+        },
+        "summary": "GET keys",
+        "tags": [
+          "developer"
+        ],
+        "x-omnion-permission": "developer.keys.read",
+        "x-omnion-replacement": null,
+        "x-omnion-sunset": null
+      },
+      "post": {
+        "deprecated": false,
+        "description": null,
+        "operationId": "post_developer_api-keys",
+        "responses": {
+          "403": {
+            "description": "The caller's permissions do not cover this route."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Standard error envelope."
+          }
+        },
+        "summary": "POST key",
+        "tags": [
+          "developer"
+        ],
+        "x-omnion-permission": "developer.keys.manage",
+        "x-omnion-replacement": null,
+        "x-omnion-sunset": null
+      }
+    },
+    "/developer/api-keys/{id}": {
+      "delete": {
+        "deprecated": false,
+        "description": null,
+        "operationId": "delete_developer_api-keys_by_id",
+        "responses": {
+          "403": {
+            "description": "The caller's permissions do not cover this route."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Standard error envelope."
+          }
+        },
+        "summary": "DELETE key",
+        "tags": [
+          "developer"
+        ],
+        "x-omnion-permission": "developer.keys.manage",
+        "x-omnion-replacement": null,
+        "x-omnion-sunset": null
+      },
+      "get": {
+        "deprecated": false,
+        "description": null,
+        "operationId": "get_developer_api-keys_by_id",
+        "responses": {
+          "403": {
+            "description": "The caller's permissions do not cover this route."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Standard error envelope."
+          }
+        },
+        "summary": "GET key",
+        "tags": [
+          "developer"
+        ],
+        "x-omnion-permission": "developer.keys.read",
+        "x-omnion-replacement": null,
+        "x-omnion-sunset": null
+      }
+    },
+    "/developer/api-keys/{id}/rotate": {
+      "post": {
+        "deprecated": false,
+        "description": null,
+        "operationId": "post_developer_api-keys_by_id_rotate",
+        "responses": {
+          "403": {
+            "description": "The caller's permissions do not cover this route."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Standard error envelope."
+          }
+        },
+        "summary": "POST rotate",
+        "tags": [
+          "developer"
+        ],
+        "x-omnion-permission": "developer.keys.manage",
+        "x-omnion-replacement": null,
+        "x-omnion-sunset": null
+      }
+    },
+    "/developer/logs": {
+      "get": {
+        "deprecated": false,
+        "description": null,
+        "operationId": "get_developer_logs",
+        "responses": {
+          "403": {
+            "description": "The caller's permissions do not cover this route."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Standard error envelope."
+          }
+        },
+        "summary": "GET logs",
+        "tags": [
+          "developer"
+        ],
+        "x-omnion-permission": "developer.logs.read",
+        "x-omnion-replacement": null,
+        "x-omnion-sunset": null
+      }
+    },
+    "/developer/logs/{id}": {
+      "get": {
+        "deprecated": false,
+        "description": null,
+        "operationId": "get_developer_logs_by_id",
+        "responses": {
+          "403": {
+            "description": "The caller's permissions do not cover this route."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Standard error envelope."
+          }
+        },
+        "summary": "GET log",
+        "tags": [
+          "developer"
+        ],
+        "x-omnion-permission": "developer.logs.read",
+        "x-omnion-replacement": null,
+        "x-omnion-sunset": null
+      }
+    },
+    "/developer/sandbox/probe": {
+      "get": {
+        "deprecated": false,
+        "description": null,
+        "operationId": "get_developer_sandbox_probe",
+        "responses": {
+          "403": {
+            "description": "The caller's permissions do not cover this route."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Standard error envelope."
+          }
+        },
+        "summary": "GET sandbox probe",
+        "tags": [
+          "developer"
+        ],
+        "x-omnion-permission": "content.pages.read",
+        "x-omnion-replacement": null,
+        "x-omnion-sunset": null
+      }
+    },
+    "/developer/scopes": {
+      "get": {
+        "deprecated": false,
+        "description": null,
+        "operationId": "get_developer_scopes",
+        "responses": {
+          "403": {
+            "description": "The caller's permissions do not cover this route."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Standard error envelope."
+          }
+        },
+        "summary": "GET scopes",
+        "tags": [
+          "developer"
+        ],
+        "x-omnion-permission": "developer.read",
+        "x-omnion-replacement": null,
+        "x-omnion-sunset": null
+      }
+    },
     "/events": {
       "get": {
         "deprecated": false,

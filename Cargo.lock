@@ -1445,6 +1445,7 @@ dependencies = [
  "omnion-content",
  "omnion-core",
  "omnion-deployment",
+ "omnion-developer",
  "omnion-events",
  "omnion-graphql",
  "omnion-graphql-resolvers",
@@ -1587,6 +1588,23 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-developer"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "thiserror 2.0.21",
+ "time",
  "uuid",
 ]
 

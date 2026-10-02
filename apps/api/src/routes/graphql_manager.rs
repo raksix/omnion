@@ -437,9 +437,10 @@ mod tests {
 
     #[test]
     fn both_guards_are_keys_the_catalogue_actually_ships() {
-        // The request names `developer.read` and `developer.graphql.manage`. Neither exists, and an
-        // uncatalogued key resolves to no permission — so a route guarded on one answers 403 for
-        // every caller including the owner.
+        // The request names `developer.read` and `developer.graphql.manage`. The first is
+        // catalogued now (main, REQ-022 slice 1); the second still is not. My manager therefore
+        // runs on `content.pages.read` and `deployment.migrations.apply` — both real,
+        // catalogued keys — until the request's own manage key ships.
         //
         // This asks the REGISTRY (`is_known`) rather than grepping the catalogue's source, and that
         // distinction is the whole lesson: my first version of this test grepped the file, the
@@ -452,10 +453,19 @@ mod tests {
                 "`{guard}` is not a catalogue key; an uncatalogued guard is 403 for every caller"
             );
         }
-        assert!(
-            !omnion_permissions::catalogue::is_known("developer.read"),
-            "the request's read guard is catalogued now; the substitution can be revisited"
-        );
+    }
+
+    /// The tripwire on the substitution itself, split per key because the two have moved apart.
+    ///
+    /// This used to be one assertion over both, and it stayed green for exactly as long as both
+    /// were uncatalogued. Merging main catalogued `developer.read` and the combined assertion
+    /// failed with a message naming the *read* guard, which is the one that is now fine — so the
+    /// pair is checked separately and each message says which key is still missing. When someone
+    /// catalogues `developer.graphql.manage`, this fails and says the substitution can be
+    /// revisited; that is the moment the two route constants should change to the request's own
+    /// keys, not before, because a key nobody can grant is a route that answers 403 to everyone.
+    #[test]
+    fn the_request_own_manage_key_is_the_one_still_missing() {
         assert!(
             !omnion_permissions::catalogue::is_known("developer.graphql.manage"),
             "the request's manage guard is catalogued now; the substitution can be revisited"

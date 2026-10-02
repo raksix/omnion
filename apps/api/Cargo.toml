@@ -72,6 +72,7 @@ omnion-notifications = { path = "../../crates/notifications" }
 omnion-security = { path = "../../crates/security" }
 omnion-module-analytics = { path = "../../modules/analytics" }
 omnion-onboarding = { path = "../../crates/onboarding" }
+omnion-developer = { path = "../../crates/developer" }
 omnion-permissions = { path = "../../crates/permissions" }
 omnion-reliability = { path = "../../crates/reliability" }
 # The integration walk clears its own Redis counter with the same key builder the middleware
