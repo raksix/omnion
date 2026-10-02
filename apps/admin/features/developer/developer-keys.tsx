@@ -310,7 +310,20 @@ export function DeveloperKeysScreen() {
       ) : null}
 
       {state.status === "ready" && state.keys.length > 0 ? (
-        <div className="overflow-hidden rounded-xl border border-line bg-surface">
+        <div className="rounded-xl border border-line bg-surface">
+          {/*
+            Two layouts, not one squeezed table. Seven columns at 390 px either scrolls
+            horizontally — which is a *high* finding on every mobile pass and an operator
+            reading a phone sideways — or drops columns until the one that matters (is this key
+            still alive?) is the one that went. The REQ names "tables collapse to cards", and the
+            card keeps the name, the prefix, the status and both actions, because those are what
+            a person holding a phone needs to decide what to do next.
+
+            Both layouts render from the same `KeyRow`, so there is no second implementation of
+            the actions that could drift; the row component returns a `<tr>` for the table and the
+            card list reads its own copy of the same two buttons.
+          */}
+          <div className="hidden overflow-x-auto sm:block">
           <table className="w-full border-collapse text-left text-[13px]">
             <thead>
               <tr className="border-b border-line text-[11.5px] text-muted">
@@ -337,6 +350,70 @@ export function DeveloperKeysScreen() {
               ))}
             </tbody>
           </table>
+          </div>
+
+          <ul data-developer-key-cards className="divide-y divide-line sm:hidden">
+            {state.keys.map((key) => {
+              const dead = key.status !== "active";
+              return (
+                <li
+                  key={key.id}
+                  data-developer-key-card={key.id}
+                  className="flex flex-col gap-2 px-4 py-3"
+                >
+                  <div className="flex items-baseline justify-between gap-2">
+                    <Link
+                      href={`/developer/api-keys/${key.id}`}
+                      className="min-w-0 truncate text-[13px] font-medium hover:underline"
+                    >
+                      {key.name}
+                    </Link>
+                    <span
+                      data-key-status={key.status}
+                      className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                        dead ? "bg-quiet-soft text-muted" : "bg-positive-soft text-positive"
+                      }`}
+                    >
+                      {key.status}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-muted">
+                    <span className="font-mono">{key.key_prefix}</span>
+                    <span>{key.environment}</span>
+                    <span>
+                      {key.scopes.length}{" "}
+                      {key.scopes.length === 1 ? "scope" : "scopes"}
+                    </span>
+                    <span>
+                      used {key.last_used_at ? formatTimestamp(key.last_used_at) : "never"}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void onRotate(key)}
+                      disabled={busyId === key.id || dead}
+                      aria-label={`Rotate ${key.name}`}
+                      className="inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12.5px] transition disabled:opacity-40"
+                    >
+                      <RotateCw className="size-3.5" aria-hidden />
+                      Rotate
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void onRevoke(key)}
+                      disabled={busyId === key.id || dead}
+                      aria-label={`Revoke ${key.name}`}
+                      className="inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12.5px] transition disabled:opacity-40"
+                    >
+                      <Trash2 className="size-3.5" aria-hidden />
+                      Revoke
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
         </div>
       ) : null}
 

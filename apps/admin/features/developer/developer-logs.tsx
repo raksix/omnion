@@ -333,7 +333,14 @@ export function DeveloperLogsScreen() {
       ) : null}
 
       {state.status === "ready" && state.rows.length > 0 ? (
-        <div className="overflow-hidden rounded-xl border border-line bg-surface">
+        <div className="rounded-xl border border-line bg-surface">
+          {/*
+            Same reasoning as the key list: seven columns do not fit a phone, and the two columns
+            that must survive the squeeze are the call itself and the status. The card keeps both
+            plus the caller, and the detail button keeps its 44 px hit target — a debugging table
+            you cannot read on the device you are holding is half a table.
+          */}
+          <div className="hidden overflow-x-auto sm:block">
           <table className="w-full border-collapse text-left text-[13px]">
             <thead>
               <tr className="border-b border-line text-[11.5px] text-muted">
@@ -401,6 +408,50 @@ export function DeveloperLogsScreen() {
               ))}
             </tbody>
           </table>
+          </div>
+
+          <ul data-developer-log-cards className="divide-y divide-line sm:hidden">
+            {state.rows.map((row) => (
+              <li
+                key={row.id}
+                data-developer-log-card={row.id}
+                data-developer-log-card-status={row.status}
+                className="flex flex-col gap-1.5 px-4 py-3"
+              >
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="min-w-0 truncate font-mono text-[12px]">
+                    {row.method} {row.path}
+                  </span>
+                  <span
+                    className={`inline-flex w-11 shrink-0 justify-center rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                      row.status >= 400 ? "bg-caution-soft text-caution" : "bg-positive-soft text-positive"
+                    }`}
+                  >
+                    {row.status}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-muted">
+                  <span>{formatTimestamp(row.created_at)}</span>
+                  <span className="tabular-nums">{row.duration_ms} ms</span>
+                  <span className="truncate">
+                    {row.api_key_prefix ?? (row.actor_name || "—")}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFocus(String(row.id));
+                    void fetchDeveloperLog(row.id).then(setOpen).catch(() => undefined);
+                  }}
+                  aria-label={`Open request ${row.id}`}
+                  className="inline-flex min-h-11 w-fit items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12.5px] transition"
+                >
+                  <PanelRightOpen className="size-3.5" aria-hidden />
+                  Open the detail
+                </button>
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
 
