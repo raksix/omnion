@@ -166,6 +166,24 @@ impl Registry {
         Ok(())
     }
 
+    /// Annotate a route without the duplicate check.
+    ///
+    /// For a registry assembled **from** a route inventory — one pass over records that already
+    /// contains no duplicate `METHOD path`, because the recorder refused them. This exists so
+    /// that path can clone an `Annotation` rather than rebuild one; a public API shape that is
+    /// wrong for everyone else is a bug waiting for a caller who does not know the guarantee, so
+    /// it is documented as belonging to exactly this case.
+    pub fn annotate_unchecked(
+        &mut self,
+        method: &str,
+        path: &str,
+        annotation: Annotation,
+    ) -> &mut Self {
+        self.entries
+            .insert(key_of(&RouteEntry::new(method, path)), annotation);
+        self
+    }
+
     /// Annotate a route, panicking on a duplicate.
     ///
     /// For the static `build()` tables in the API crate, where a duplicate is a compile-time-ish
