@@ -44,7 +44,7 @@ use omnion_core::Db;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use omnion_api::ai_eval_runner::{self, CaseTurn, TickReport};
+use omnion_api::ai_eval_runner::{self, CaseTurn};
 
 /// A turn the walk scripts: a canned answer per case, and a judge that always has an opinion.
 struct ScriptedTurn {
@@ -252,6 +252,51 @@ impl Runner {
         .fetch_one(&self.pool)
         .await
         .expect("the model must be registered")
+    }
+
+    /// A model row served by a real socket, under the OpenAI-compatible protocol.
+    ///
+    /// Separate from `model_keyed` because the base URL is the whole point here: `model_keyed`
+    /// registers `https://models.invalid/v1`, which is deliberately undialable so a walk cannot
+    /// accidentally reach a vendor. This one points at a stub the walk itself started.
+    async fn model_at(&self, base_url: String, key: &str) -> Uuid {
+        let provider = Uuid::new_v4();
+        sqlx::query(
+            "insert into ai_providers (id, name, kind, base_url, enabled, protocol) \
+             values ($1, $2, 'cloud', $3, true, 'openai_compatible')",
+        )
+        .bind(provider)
+        .bind(format!("evalrun3-provider-{provider}"))
+        .bind(base_url)
+        .execute(&self.pool)
+        .await
+        .expect("the provider must be created");
+        let model = Uuid::new_v4();
+        sqlx::query(
+            "insert into ai_models (id, provider_id, model_key, display_name) \
+             values ($1, $2, $3, $3)",
+        )
+        .bind(model)
+        .bind(provider)
+        .bind(key)
+        .execute(&self.pool)
+        .await
+        .expect("the model must be created");
+        model
+    }
+
+    /// The provider serving a model — the scope a usage row is read by.
+    ///
+    /// `ai_provider_usage` carries no organization column, so a walk cannot scope its reads by
+    /// tenant the way every other assertion in this file does. It scopes by provider instead, and
+    /// this is the read that makes that sound: the fixture's provider names carry a fresh uuid,
+    /// so the scope is this walk's rows and no one else's.
+    async fn provider_of(&self, model: Uuid) -> Uuid {
+        sqlx::query_scalar("select provider_id from ai_models where id = $1")
+            .bind(model)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the model must be registered")
     }
 
     async fn model_keyed(&self, key: &str) -> Uuid {
@@ -1375,6 +1420,302 @@ async fn a_tick_with_no_free_slot_claims_nothing() {
     // The run is still queued — a full process leaves the work for a free one.
     assert_eq!(eval_run::queued_runs(&fx.pool).await.expect("the count must read"), 1);
 
+    fx.dispose().await;
+}
+
+
+// -------------------------------------------------------------------------------------------
+// The live seam: a provider that answers on a real socket
+// -------------------------------------------------------------------------------------------
+
+/// A provider on `127.0.0.1` that answers every chat completion with `reply`.
+///
+/// The walks above script their turn, which is right for testing the *runner* and exactly wrong
+/// for testing anything the runner does on the way to a provider: usage rows, prices, cost
+/// attribution. `ScriptedTurn` writes none of that, so the `eval:judge` billing path was
+/// implemented, reached by `spawn`, and provable only here.
+///
+/// The body is OpenAI's non-streaming answer shape because `adapter_for`'s default arm is
+/// `openai_compatible` — which is also why `model_at` registers the provider with that protocol
+/// rather than leaving it to the fallback: a test that relies on an unknown protocol resolving to
+/// the default is testing the fallback, not the protocol it names.
+async fn stub_provider(reply: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::routing::post as route_post;
+    use axum::{Json, Router};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the stub must bind a port");
+    let address = listener.local_addr().expect("the stub has an address");
+    let app = Router::new().route(
+        "/chat/completions",
+        route_post(move || {
+            let reply = reply.to_owned();
+            async move {
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": { "role": "assistant", "content": reply },
+                        "finish_reason": "stop"
+                    }],
+                    // Real token counts, not zeros: the cost row is derived from them, so a stub
+                    // reporting zero tokens would produce a priced row of zero and the walk would
+                    // pass while measuring nothing.
+                    "usage": { "prompt_tokens": 1200, "completion_tokens": 300, "total_tokens": 1500 }
+                }))
+            }
+        }),
+    );
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), task)
+}
+
+
+/// **A rubric run records its judge, grades under it, and bills the grading to `eval:judge`.**
+///
+/// This is the one acceptance row no scripted walk could ever close. Every other walk in this file
+/// drives `ScriptedTurn`, which writes **no** `ai_usage` rows by design — the seam exists to test
+/// the runner, not the provider. The only writer of `eval:judge` is `LiveTurn::judge`: private,
+/// built by `build_turn`, reached in production only through `spawn`'s tick loop. So the row was
+/// fully implemented and completely unproven, and a walk on the scripted seam would have asserted
+/// against a seam that writes nothing and passed for the wrong reason.
+///
+/// The walk therefore goes through the **live** seam against two stub providers on `127.0.0.1`: one
+/// for the model under test, one for the judge. The judge stub answers `VERDICT: fail`, so the run
+/// visibly settles on what the grading decided.
+///
+/// Six claims, each of which has a distinct wrong answer that a looser row would accept:
+/// - the case result carries the judge's own sentence verbatim;
+/// - the run's snapshot names the judge's model **and** the prompt version it was judged with, so
+///   the run detail's reproduction claim is about the judge that actually ran;
+/// - exactly one usage row carries `task = 'eval'` and exactly one carries `'eval:judge'`;
+/// - the judge's row names the **judge's** provider and model key — grading billed to the graded
+///   model is the mistake this whole split exists to prevent, and it is invisible in the row
+///   count;
+/// - the judge's row carries a **priced** total, and the answer's row carries a different one,
+///   because the two are billed at two different models' prices;
+/// - a run whose snapshot names no judge records **no** `eval:judge` row at all, which is what
+///   keeps the number meaningful: a judge-less suite contributing judge spend would mean the cost
+///   screen is counting something that never happened.
+#[tokio::test]
+async fn a_rubric_runs_judge_and_bill_the_grading_to_eval_judge() {
+    let fx = runner!();
+    let org = fx.organization().await;
+
+    let (model_base, model_stub) = stub_provider("the model under test answers 'a vague answer'")
+        .await;
+    let (judge_base, judge_stub) = stub_provider("VERDICT: fail\nIt does not meet the rubric.")
+        .await;
+
+    // The stub servers must live until every call has been made, and the walk reads their
+    // counters after `execute` returns, so both handles are kept to the end of the scope.
+    let model = fx.model_at(model_base, "graded-model").await;
+    let judge = fx.model_at(judge_base, "judge-model").await;
+
+    // Prices, so the billing is arithmetic rather than a row of zeroes. A `cost_total_micros` of
+    // 0 and a `cost_total_micros` of null are different claims, and this walk needs the numbers to
+    // be able to tell them apart.
+    sqlx::query(
+        "update ai_models set input_cost_micros_per_mtok = 1000, \
+         output_cost_micros_per_mtok = 2000 where id = any($1)",
+    )
+    .bind(vec![model, judge])
+    .execute(&fx.pool)
+    .await
+    .expect("the prices must be settable");
+
+    let model_key = fx.key_of(model).await;
+    let judge_key = fx.key_of(judge).await;
+    let suite = fx
+        .suite_with(
+            org,
+            "judged-live",
+            model,
+            &[("rubric-case", serde_json::json!({ "rubric": "is clear and complete" }), 1.0)],
+            90,
+            5.0,
+            Some(judge),
+        )
+        .await;
+    fx.queue_with(
+        org,
+        suite,
+        model,
+        serde_json::json!({
+            "model": model_key,
+            "temperature": 0.0,
+            "prompt": "",
+            "judge_model": judge_key,
+            "judge_prompt": "grade strictly",
+            "judge_prompt_version": 3,
+        }),
+    )
+    .await;
+
+    // The production seam, built by the runner's own factory rather than assembled by the walk.
+    let queued = eval_run::claim_next_run(&fx.pool)
+        .await
+        .expect("the queue must read")
+        .expect("the run must be claimable");
+    // `live_turn_for` is the runner's own factory, so this line is the claim that the pinned
+    // model **reaches the resolve**. It is where the pin bug was caught: `build_turn` had the
+    // pin in `DecisionContext.requested` but passed `None` for the argument `decide` reads, so
+    // the runner resolved the installation default and this returned `None`. No scripted walk
+    // could have seen it, because the scripted seam never resolves anything.
+    let turn = ai_eval_runner::live_turn_for(&fx.pool, &queued)
+        .await
+        .expect("the run's pinned model and judge must both resolve to dialable targets");
+    let verdict = ai_eval_runner::execute(&fx.pool, &queued, &turn)
+        .await
+        .expect("the live run must not fail");
+    let results = eval_run::list_case_results(&fx.pool, org, queued.id)
+        .await
+        .expect("the results must be readable");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        verdict.failed, 1,
+        "the judge failed the case, so the run failed it (status {:?}, error {:?}, checks {:?})",
+        results[0].status, results[0].error, results[0].checks
+    );
+    // The `error` is in the message because a case that could not be called also settles with
+    // no failures, and "0 failed" alone sends the reader looking for a scoring bug instead of at
+    // the reason the row carries.
+    assert_eq!(
+        results[0].status, "fail",
+        "the judge said fail, so the case fails (error: {:?})",
+        results[0].error
+    );
+    assert!(
+        results[0]
+            .judge_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("VERDICT: fail")),
+        "the judge's own sentence is stored verbatim, got {:?}",
+        results[0].judge_reason
+    );
+
+    // The snapshot is what a reproduction reads, so it must name the judge that ran and the
+    // prompt version it judged with.
+    let settled = eval_run::find_run(&fx.pool, org, queued.id)
+        .await
+        .expect("the read must succeed")
+        .expect("the run must still be there");
+    assert_eq!(settled.snapshot["judge_model"], serde_json::json!(judge_key));
+    assert_eq!(settled.snapshot["judge_prompt_version"], serde_json::json!(3));
+
+    // The billing. Read the rows, do not trust the return value: `record_usage` is best-effort
+    // (a failed write is a `tracing::warn!`, never a run failure), so the row count is the only
+    // evidence the row landed.
+    // Scoped by the two fixture providers rather than by tenant: `ai_provider_usage` has no
+    // organization column (it links to `ai_route_decisions` by `decision_id`), and the fixture's
+    // provider names carry a fresh uuid, so this scope cannot pick up another test's rows. The
+    // alternative — filtering on nothing — would be a walk that passes or fails with whatever
+    // else is in the table.
+    let usage = sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(
+        "select task, model_key, cost_total_micros from ai_provider_usage \
+         where provider_id = any($1) order by task",
+    )
+    .bind(vec![fx.provider_of(model).await, fx.provider_of(judge).await])
+    .fetch_all(&fx.pool)
+    .await
+    .expect("the usage rows must be readable");
+
+    assert_eq!(
+        usage.len(),
+        2,
+        "one answer call and one judge call, got {usage:?}"
+    );
+    let tasks: Vec<&str> = usage.iter().map(|(task, _, _)| task.as_str()).collect();
+    assert!(
+        tasks.contains(&"eval") && tasks.contains(&"eval:judge"),
+        "the grading must be billed separately from the answer, got {tasks:?}"
+    );
+
+    let judge_row = usage
+        .iter()
+        .find(|(task, _, _)| task == "eval:judge")
+        .expect("a judge row must exist");
+    assert_eq!(
+        judge_row.1.as_deref(),
+        Some(judge_key.as_str()),
+        "grading is billed to the judge that did the grading, not to the model being graded"
+    );
+    assert!(
+        judge_row.2.is_some_and(|micros| micros > 0),
+        "the judge row must carry a priced total, got {:?} - a null here is the `cost: None` \
+         defect this walk was written to catch",
+        judge_row.2
+    );
+
+    // The two rows are priced at two different models' prices, so equal totals would mean the
+    // price was taken from one model and applied to both.
+    let answer_row = usage
+        .iter()
+        .find(|(task, _, _)| task == "eval")
+        .expect("an answer row must exist");
+    assert_eq!(answer_row.1.as_deref(), Some(model_key.as_str()));
+    assert!(answer_row.2.is_some_and(|micros| micros > 0));
+
+    model_stub.abort();
+    judge_stub.abort();
+    fx.dispose().await;
+}
+
+/// **A run with no judge records no judge spend.** The control for the row above, and the reason
+/// its count is worth asserting: if a judge-less suite produced an `eval:judge` row, then the
+/// number on `/ai/costs` would be counting calls that never happened.
+#[tokio::test]
+async fn a_run_with_no_judge_records_no_judge_spend() {
+    let fx = runner!();
+    let org = fx.organization().await;
+    let (model_base, model_stub) = stub_provider("a plain answer").await;
+    let model = fx.model_at(model_base, "solo-model").await;
+    sqlx::query(
+        "update ai_models set input_cost_micros_per_mtok = 1000, \
+         output_cost_micros_per_mtok = 2000 where id = $1",
+    )
+    .bind(model)
+    .execute(&fx.pool)
+    .await
+    .expect("the prices must be settable");
+
+    let suite = fx
+        .suite_with(org, "no-judge", model, &[("only", exact("a plain answer"), 1.0)], 90, 5.0, None)
+        .await;
+    fx.queue_with(
+        org,
+        suite,
+        model,
+        serde_json::json!({ "model": fx.key_of(model).await, "temperature": 0.0, "prompt": "" }),
+    )
+    .await;
+
+    let queued = eval_run::claim_next_run(&fx.pool)
+        .await
+        .expect("the queue must read")
+        .expect("the run must be claimable");
+    let turn = ai_eval_runner::live_turn_for(&fx.pool, &queued)
+        .await
+        .expect("the run's model must resolve");
+    ai_eval_runner::execute(&fx.pool, &queued, &turn)
+        .await
+        .expect("the live run must not fail");
+
+    let tasks: Vec<String> = sqlx::query_scalar(
+        "select task from ai_provider_usage where provider_id = $1 order by task",
+    )
+    .bind(fx.provider_of(model).await)
+    .fetch_all(&fx.pool)
+    .await
+    .expect("the usage rows must be readable");
+    assert_eq!(
+        tasks,
+        vec!["eval".to_string()],
+        "a suite with no judge spends exactly one row, and it is the answer's"
+    );
+
+    model_stub.abort();
     fx.dispose().await;
 }
 

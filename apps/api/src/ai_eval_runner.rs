@@ -146,7 +146,12 @@ pub trait CaseTurn: Send + Sync {
 /// The two calls go through the **same router** the chat endpoint uses, and are recorded with
 /// `feature = 'eval'` / `'eval:judge'`, so eval spend is visible in REQ-104's cost screen instead
 /// of hiding inside another feature's total.
-struct LiveTurn {
+///
+/// Public, and only because `live_turn_for` hands one back. The fields stay private — a walk
+/// needs to *drive* the live turn, and a walk that could rebuild one out of its own inputs would
+/// be testing itself. The alternative was a `Box<dyn CaseTurn>`, which hides the type but loses
+/// the name at the one place the name is worth reading: the seam under test.
+pub struct LiveTurn {
     pool: PgPool,
     organization_id: Uuid,
     model_key: String,
@@ -172,18 +177,27 @@ impl CaseTurn for LiveTurn {
                 .await
                 .map_err(|error| error.to_string())?;
             let (prompt_tokens, completion_tokens) = tokens_of(&outcome);
-            let billed = cost::call_cost(
-                cost::price_for(&self.prices, &self.model_key),
+            let priced = cost::call_cost(
+                // `self.model_key` is the router's **`provider/model`** identifier; the price
+                // table is keyed on the model's own `model_key`, which is the half after the
+                // slash. Asking with the full identifier missed on every call and returned
+                // `ModelPrice::unpriced`, so **every eval call was recorded with a null cost**
+                // while the run row and the case rows carried a real number — the costs screen
+                // and the run detail disagreed about the same run, and neither was wrong on its
+                // own terms. `routes::ai.rs` looks the price up with the bare key, which is why
+                // chat was priced and eval was not.
+                cost::price_for(&self.prices, bare_key(&self.model_key)),
                 prompt_tokens,
                 completion_tokens,
-            )
-            .map_or(0, |cost| cost.total_micros);
+            );
+            let billed = priced.map_or(0, |cost| cost.total_micros);
             self.record_usage(
                 self.provider.id,
                 &self.model_key,
                 "eval",
                 prompt_tokens,
                 completion_tokens,
+                priced,
             )
             .await;
             Ok(Turn {
@@ -215,16 +229,32 @@ impl CaseTurn for LiveTurn {
                     )),
                 ],
             );
-            let outcome = omnion_ai_hub::client::chat(provider, &request).await.ok()?;
+            // The call's failure used to be a bare `.ok()?`, so a judge that could not be reached
+            // and a judge that was never configured both arrived at the scorer as `None` — and
+            // the scorer cannot tell them apart either. The walk for the `eval:judge` billing row
+            // failed on exactly this and the row carried no reason. `None` is the right answer
+            // (an unreachable judge must never read as a pass), but it must say why.
+            let outcome = match omnion_ai_hub::client::chat(provider, &request).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(
+                        organization_id = %self.organization_id,
+                        judge = %key,
+                        %error,
+                        "the judge could not be called"
+                    );
+                    return None;
+                }
+            };
             let (prompt_tokens, completion_tokens) = tokens_of(&outcome);
-            let billed = cost::call_cost(
-                cost::price_for(&self.prices, key),
+            let priced = cost::call_cost(
+                // The judge's identifier has the same `provider/` prefix; see the answer call.
+                cost::price_for(&self.prices, bare_key(key)),
                 prompt_tokens,
                 completion_tokens,
-            )
-            .map_or(0, |cost| cost.total_micros);
+            );
             self.judge_cost_micros
-                .fetch_add(billed, std::sync::atomic::Ordering::SeqCst);
+                .fetch_add(priced.map_or(0, |cost| cost.total_micros), std::sync::atomic::Ordering::SeqCst);
             // The judge's own provider, under `eval:judge` — not the model under test's row,
             // and not `eval`. A cost screen that attributes grading to the graded model cannot
             // answer "what did this suite cost to run".
@@ -234,6 +264,7 @@ impl CaseTurn for LiveTurn {
                 "eval:judge",
                 prompt_tokens,
                 completion_tokens,
+                priced,
             )
             .await;
             Some(parse_verdict(&outcome.content))
@@ -243,6 +274,19 @@ impl CaseTurn for LiveTurn {
     fn judge_cost_micros(&self) -> i64 {
         self.judge_cost_micros.load(std::sync::atomic::Ordering::SeqCst)
     }
+}
+
+/// The model's own key out of a router identifier — `provider/model` becomes `model`.
+///
+/// **Split on the FIRST `/` and commit to it, exactly as the store's own readers do.** A model
+/// key may itself contain a slash (a llama.cpp endpoint publishes `models/<file>.gguf`), so
+/// taking the last segment would silently mis-key the price of every local model. A string with
+/// no slash is returned unchanged, because that is the shape the table is keyed by and there is
+/// nothing to strip.
+fn bare_key(identifier: &str) -> &str {
+    identifier
+        .split_once('/')
+        .map_or(identifier, |(_, model)| model)
 }
 
 /// The judge's own instructions, pinned on the suite as `judge_prompt` when it has one.
@@ -303,6 +347,7 @@ impl LiveTurn {
         task: &str,
         prompt_tokens: Option<i32>,
         completion_tokens: Option<i32>,
+        cost: Option<cost::CallCost>,
     ) {
         let usage = omnion_ai_hub::health_store::NewUsage {
             provider_id,
@@ -315,7 +360,15 @@ impl LiveTurn {
             latency_ms: 0,
             substituted_from: None,
             first_byte_at: None,
-            cost: None,
+            // **The price, not `None`.** `NewUsage::cost` documents `None` as "the cost is NOT
+            // knowable — an unpriced model, or an endpoint that reported no token counts" and
+            // requires it to be stored as `null`, never as `0`. This caller had already computed
+            // the cost one line above and then dropped it on the floor, so **every eval call —
+            // answers and judges alike — landed on the costs screen as unpriced**: the row said
+            // "we tried to price this and could not" for a model whose price was sitting in the
+            // table. That is the failure the field's doc comment exists to prevent, reached by
+            // passing `None` at the one call site that had the answer.
+            cost,
         };
         if let Err(error) = omnion_ai_hub::health_store::record_usage(&self.pool, usage).await {
             tracing::warn!(%error, task, "an eval usage row could not be written");
@@ -341,11 +394,21 @@ fn case_messages(case: &CaseRow, system: &str) -> Vec<ChatMessage> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let mut messages = vec![ChatMessage::system(if system.is_empty() {
-        DEFAULT_SYSTEM_PROMPT
-    } else {
-        system
-    })];
+    // **The system message is omitted when there is none.** `DEFAULT_SYSTEM_PROMPT` is empty on
+    // purpose — a suite's own configuration is the reproduction data, and a prompt baked into
+    // the runner would be a variable the snapshot does not record. But the message itself cannot
+    // be *present and empty*: `client::validate_request` refuses any message whose content is
+    // blank ("chat messages may not be empty"), so a suite that pins no system prompt — the
+    // default, and what the panel's form writes when the box is left alone — produced a request
+    // the platform rejected before it was sent. Every such run settled as `error` with "the model
+    // could not be called", which reads like a provider outage and is not one. **This meant the
+    // live runner had never made a successful call on a default suite**, and no walk could see
+    // it: `ScriptedTurn` never builds a `ChatRequest`, so the seam that validates one is only
+    // reachable through `LiveTurn`.
+    let mut messages = Vec::new();
+    if !system.is_empty() {
+        messages.push(ChatMessage::system(system));
+    }
     if !context.is_empty() {
         messages.push(ChatMessage::user(context));
     }
@@ -895,6 +958,21 @@ pub async fn sweep_schedules(pool: &PgPool) -> Result<usize, String> {
     Ok(queued)
 }
 
+/// Build the **live** turn for a run — the seam that dials providers and writes `ai_usage`.
+///
+/// Exists for the walks, and the reason is worth recording: every other walk in
+/// `ai_eval_runner.rs` drives `ScriptedTurn`, which writes no usage rows by design. So the judge
+/// billing path — `LiveTurn::judge` recording `task = 'eval:judge'` under the judge's own model
+/// — was fully implemented, reached in production by `spawn`, and provable only by a test that
+/// went through it. Without this the acceptance row would have been ticked by a walk asserting
+/// against a seam that never writes anything.
+///
+/// It is a named function rather than `pub fn build_turn` because the private one takes `pool` and
+/// a run and returns a private type; renaming it `live_turn_for` is the whole of the change.
+pub async fn live_turn_for(pool: &PgPool, run: &RunRow) -> Option<LiveTurn> {
+    build_turn(pool, run).await
+}
+
 /// Start the runner; the returned handle is kept by the binary (and ends with the process).
 #[must_use]
 pub fn spawn(state: AppState) -> JoinHandle<()> {
@@ -1052,19 +1130,50 @@ async fn build_turn(pool: &PgPool, run: &RunRow) -> Option<LiveTurn> {
             run_id: None,
             task: Some("eval"),
             feature: Some("eval"),
-            // **The pin, not `None`.** `lookup`'s `None` arm is `default_model(pool)`, so a
-            // runner that asked the router without naming the suite's model graded every run
-            // with whichever model the installation had marked default — the model under test
-            // was never the model asked. See `resolve_model_under_test`.
+            // The pin, for the record. It is **not** what makes the decision — see the
+            // argument after the scope.
             requested: Some(&model_key),
             requirements: &[],
         },
         Scope::Organization(run.organization_id),
-        None,
+        // **The pin again, and this is the one that decides.**
+        //
+        // `resolve_and_record` has two places a model can arrive: `DecisionContext.requested`,
+        // which is stored on the row, and this parameter, which is what builds the resolve
+        // request's `explicit` — the field `decide` checks first, before any map. This call
+        // passed `None` here and set the pin only in the context, so `explicit` was `None`,
+        // `decide` fell through to the feature pin, then to the task map (no `eval` task
+        // exists — the routing tasks are cheap/translation/coding/vision/long_context/
+        // embedding/critical), and finally to the installation default. So **every eval run in
+        // production graded whichever model the installation had marked default**, while the
+        // run's snapshot and its `requested` column both recorded the suite's own pin: the
+        // decision log agreed with the snapshot, and both were wrong about the call.
+        //
+        // The comment above this call said "the pin, not `None`" and was true of the line it
+        // sat on. It was written about the argument the function reads least, which is why the
+        // scripting seam hid it: `ScriptedTurn` never resolves anything, so every walk in this
+        // file was green against a runner that resolved the wrong model.
+        Some(&model_key),
     )
     .await
+    .map_err(|error| {
+        tracing::warn!(run = %run.id, %error, "the eval run's model could not be resolved");
+        error
+    })
     .ok()?;
-    let model = resolved.model?;
+    // `resolved.model` is `None` when the decision came back unresolved. It used to be a bare
+    // `?`, so a run whose model was switched off and a database that was unreachable both
+    // produced the same silence: the runner's caller settles the run as `error` with "this run's
+    // model could not be resolved", which is true of one of those and a lie about the other.
+    let Some(model) = resolved.model else {
+        tracing::warn!(
+            run = %run.id,
+            requested = %model_key,
+            rule = %resolved.rule,
+            "the eval run's model resolved to nothing"
+        );
+        return None;
+    };
 
     let prices = Arc::new(load_model_prices(pool).await);
 
@@ -1102,16 +1211,25 @@ async fn build_turn(pool: &PgPool, run: &RunRow) -> Option<LiveTurn> {
 /// which makes a rubric case `error` with a reason rather than a silent pass.
 async fn resolve_judge_target(pool: &PgPool, key: &str) -> Option<ProviderTarget> {
     let (provider_name, _) = key.split_once('/')?;
-    let provider: Option<omnion_ai_hub::Provider> = sqlx::query_as(
-        "select id, name, protocol, base_url, api_key, timeout_ms::bigint as timeout_ms \
-         from ai_providers where name = $1 and enabled limit 1",
-    )
-    .bind(provider_name)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    provider.as_ref().map(ProviderTarget::from_provider)
+    // **Through the store's own reader, not a hand-written six-column select.** This used to be
+    // `select id, name, protocol, base_url, api_key, timeout_ms ... from ai_providers`, bound
+    // straight into `omnion_ai_hub::Provider` — a struct with **sixteen** fields. `query_as` needs
+    // every one of them, so the read failed on a missing column, and the two steps after it
+    // (`.ok().flatten()`) turned that failure into a plain `None`. The caller's reading of `None`
+    // is documented right above: "a rubric case is `error` with a reason rather than a silent
+    // pass". So **every judge in production was unreachable**, whatever the registry said: a
+    // rubric case could never be graded, and the only symptom was a case whose `rubric` check
+    // said the run layer supplied no judge — which reads as a suite configured without one.
+    //
+    // `store::find_provider_by_name` is the same read `router::resolve` does for the model under
+    // test, so the judge and the graded model can no longer be answered by two different
+    // queries — which is exactly how the two came to disagree.
+    let provider = omnion_ai_hub::store::find_provider_by_name(pool, provider_name)
+        .await
+        .ok()
+        .flatten()
+        .filter(|provider| provider.enabled)?;
+    Some(ProviderTarget::from_provider(&provider))
 }
 
 /// The price table, read from the same two columns `routes::ai` reads.
