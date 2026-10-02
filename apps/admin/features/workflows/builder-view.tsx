@@ -2037,6 +2037,92 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   lateActions.current.validate = () => void validateNow();
   lateActions.current.run = () => void runOnce();
 
+  // ONE way to close the shortcut list, for all three of its exits — the chord, the dialog's
+  // own Escape and the backdrop click — because the focus restore is part of closing it, not a
+  // nicety attached to one of the three.
+  //
+  // The restore runs in an effect rather than inline, and that ordering is the whole fix:
+  // React removes the dialog on this render, so calling `.focus()` in the same tick lands on a
+  // node the browser is about to detach, and the focus silently ends up on `body` anyway — the
+  // exact state this exists to prevent. The element is also re-checked for connectedness,
+  // because the thing focus returns to may itself have been unmounted while the list was open
+  // (a rule deleted from another tab re-renders the builder underneath), and focusing a
+  // detached node is a no-op that reads as a successful restore.
+  //
+  // **These three hooks sit ABOVE the `loading` / `loadError` early returns on purpose.** They
+  // used to live just under them, added by `92fba4af`, and React reported a change in hook order
+  // the moment the builder rendered `loading` — which is its first render, every time. The
+  // symptom was not a crash: React logs it to the console and the Next dev overlay paints a
+  // full-screen error card **over a builder that was about to be fine**, so the walkthrough read
+  // four panes absent, zero palette nodes and zero canvas nodes while the server held two nodes.
+  // A hook after a conditional return is invisible to every unit test of the code around it and
+  // costs the whole screen; `scripts/qa/probe-hook-order.cjs` is what now says so.
+  const closeHelp = useCallback(() => {
+    setHelpOpen(false);
+  }, []);
+
+  // Published on every render, so `helpState.current` is always the current answer to "is the
+  // list open?" and "how is it closed?" — written in the body rather than in an effect on
+  // purpose, because an effect would publish one render LATE, and the keydown that opens the
+  // list would still see `open: false` when it ran. This is the same hand-off `lateActions`
+  // does above, for the same ordering reason.
+  helpState.current.open = helpOpen;
+  helpState.current.close = closeHelp;
+
+  useEffect(() => {
+    if (helpOpen) {
+      return;
+    }
+    const back = helpReturnFocus.current;
+    if (!back) {
+      return;
+    }
+    helpReturnFocus.current = null;
+    const target = back.isConnected ? back : canvasRef.current;
+    target?.focus();
+  }, [helpOpen]);
+
+  // ---- render -----------------------------------------------------------------------------
+
+  if (loading) {
+    return (
+      <div className="flex min-h-[60vh] items-center justify-center" data-builder-state="loading">
+        <div className="flex items-center gap-2 text-[13px] text-muted">
+          <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+          Loading the builder…
+        </div>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div
+        className="flex min-h-[60vh] flex-col items-center justify-center gap-3"
+        data-builder-state="error"
+      >
+        <p className="max-w-md text-center text-[13px] text-muted">{loadError}</p>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void load()}
+            className="inline-flex items-center gap-1.5 rounded-md bg-ink px-3 py-1.5 text-[12.5px] text-canvas"
+            data-builder-retry
+          >
+            <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+            Try again
+          </button>
+          <Link
+            href={`/automations/${workflowId}`}
+            className="rounded-md border border-line px-3 py-1.5 text-[12.5px]"
+          >
+            Back to the rule
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
   // ---- render -----------------------------------------------------------------------------
 
   if (loading) {
@@ -2081,42 +2167,6 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const errorCount = findings.filter((finding) => finding.severity === "error").length;
   const selectedNode = nodes.find((node) => node.id === selected) ?? null;
   const style = canvasStyle(viewport);
-
-  // ONE way to close the shortcut list, for all three of its exits — the chord, the dialog's
-  // own Escape and the backdrop click — because the focus restore is part of closing it, not a
-  // nicety attached to one of the three.
-  //
-  // The restore runs in an effect rather than inline, and that ordering is the whole fix:
-  // React removes the dialog on this render, so calling `.focus()` in the same tick lands on a
-  // node the browser is about to detach, and the focus silently ends up on `body` anyway — the
-  // exact state this exists to prevent. The element is also re-checked for connectedness,
-  // because the thing focus returns to may itself have been unmounted while the list was open
-  // (a rule deleted from another tab re-renders the builder underneath), and focusing a
-  // detached node is a no-op that reads as a successful restore.
-  const closeHelp = useCallback(() => {
-    setHelpOpen(false);
-  }, []);
-
-  // Published on every render, so `helpState.current` is always the current answer to "is the
-  // list open?" and "how is it closed?" — written in the body rather than in an effect on
-  // purpose, because an effect would publish one render LATE, and the keydown that opens the
-  // list would still see `open: false` when it ran. This is the same hand-off `lateActions`
-  // does below, for the same ordering reason.
-  helpState.current.open = helpOpen;
-  helpState.current.close = closeHelp;
-
-  useEffect(() => {
-    if (helpOpen) {
-      return;
-    }
-    const back = helpReturnFocus.current;
-    if (!back) {
-      return;
-    }
-    helpReturnFocus.current = null;
-    const target = back.isConnected ? back : canvasRef.current;
-    target?.focus();
-  }, [helpOpen]);
 
   return (
     <div
