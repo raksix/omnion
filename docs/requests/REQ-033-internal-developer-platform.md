@@ -1,6 +1,6 @@
 # REQ-033 — Internal Developer Platform
 
-> **Status:** in-progress (`a1840487`, `416a58bf`, `dd00be30`, `0469249e`, `d497b8f9`, `bfd699dd`, `de3b6620`, `ba95b808`, `4867981f`, `6fa5d647`, `2595999e`, `a560b0b7`, `a7e373d2`, `f26b96d8`, `6e994015`, `318321cd`, `8a7695c7`, `27679d38`, `3a330665`, `95b2d07e`, `5e2db6df`; tick 112 — **slice 4 is code-complete: the archive is a real downloadable file, the four-tool screen is on its own route, and the deep link the CLI hands out is no longer a dead button.** `8a7695c7` closes the `object_key` nothing filled in; `27679d38` ships `/developer/sdks`; `3a330665` fixes the `?tab=cli` deep link; `95b2d07e` fixes a red test; `5e2db6df` ships the pass and the two probes.)
+> **Status:** in-progress (`a1840487`, `416a58bf`, `dd00be30`, `0469249e`, `d497b8f9`, `bfd699dd`, `de3b6620`, `ba95b808`, `4867981f`, `6fa5d647`, `2595999e`, `a560b0b7`, `a7e373d2`, `f26b96d8`, `6e994015`, `318321cd`, `8a7695c7`, `27679d38`, `3a330665`, `95b2d07e`, `5e2db6df`, `792d610f`, `c5dd43fb`; tick 112 — **slice 4 is code-complete: the archive is a real downloadable file, the four-tool screen is on its own route, and the deep link the CLI hands out is no longer a dead button.** `8a7695c7` closes the `object_key` nothing filled in; `27679d38` ships `/developer/sdks`; `3a330665` fixes the `?tab=cli` deep link; `95b2d07e` fixes a red test; `5e2db6df` ships the pass and the two probes.)
 >
 > **The same dead-button class a third time, and the shape of it is now worth writing down.** `DeviceStart.verification_uri` is `/developer/sdks?tab=cli`; the CLI prints it and the person opens it. The tab strip was **React state only**, so that link landed on the plugin generator — a working page, so no route walk, no build and no `tsc` noticed. Two details matter more than the fix. First, the tab is now read in the **`useState` initialiser**, not only in the effect that resynchronises state with the URL: a view that corrects itself one frame later has already painted the wrong screen to the person following a terminal's own instructions. Second, the reading is a **named pure function** (`initialTab`) rather than an inline expression, because the first version of the probe asked "does the view read `?tab=`?" — which is true of the dead version too, since the resync effect reads it. A claim too general to fail is the tick-98 gate wearing a different hat.
 >
@@ -12,9 +12,46 @@
 >
 > **A red test in the tick that committed it, and the shape of my mistake.** `cargo test` failed `a_regenerated_archive_is_byte_identical_...`: it looked up `plugin-determinism/omnion.manifest.json`, and the archive stores entries under the template's own paths with no enclosing folder. The archive was fine. "Look it up and see if it comes back" cannot tell a missing entry from a wrong guess, so a hardcoded path in a round-trip test is a **second, invisible claim about the format**; the path now comes from the scaffold being archived. The format statement lives in one test, in both directions — no path starts with the slug, *and* a slug-prefixed guess does not resolve.
 >
-> Gates: `omnion-api --lib` **414** (was 412), `developer_scaffolds` **6/6**, `probe-dev-sdk-screen.cjs` **41/41** (proven to fail 5/41), `probe-dev-sdk-tab-fallback.cjs` **11/11** (proven to fail 5 and 6 ways), `probe-dev-event-screen.cjs` **22/22** (unchanged, so the sibling screen was not broken), `pnpm typecheck` **2/2**, `pnpm --filter @omnion/admin build` compiles with `/developer/sdks` present in `routes-manifest.json`, `node --check` clean.
+> Gates: `omnion-api --lib` **414** (was 412), `omnion-developer --features store --lib` **196** (was 193), `developer_scaffolds` **6/6**, `store_cli` **3/3** (proven to fail 1/3 on each of two mutations), `probe-dev-sdk-screen.cjs` **41/41** (proven to fail 5/41), `probe-dev-sdk-tab-fallback.cjs` **11/11** (proven to fail 5 and 6 ways), `probe-dev-event-screen.cjs` **22/22** (unchanged, so the sibling screen was not broken), `pnpm typecheck` **2/2**, `pnpm --filter @omnion/admin build` compiles with `/developer/sdks` present in `routes-manifest.json`, `node --check` clean.
 >
 > **Slice 4's remaining item is the browser pass**, and it is queued: `scripts/qa/run.sh` on `QA_STACK=w5` was launched this tick with the slot free (the `w4-target` reclaim below freed 1.3G of a tmpfs that was at 95%). **Open on that pass alone**, like slices 2 and 3.
+
+> **The browser pass ran, and it found a live defect that nothing else could.** The focused
+> `QA_STACK=w5` pass (`QA_ONLY=dev-sdks,…`) reported **4 claims that did not hold**, and three of
+> them were one bug: `start` minted `SPW5-SXDH`, the screen printed it, the pass typed it back, and
+> the API answered `invalid device code`. `draw_user_code` returns the **grouped display form** and
+> the insert bound it verbatim, while every reader — `find_for_approval`, `approve`, the poll —
+> normalises its input first. The row the failing pass left in `omnion_qa_w5` reads
+> `SPW5-SXDH | len=9 | canonical=false` and the reader's lookup finds `0`; rewritten the way the
+> fixed insert writes it, `1`. `stored_user_code_form()` is now the single place the canonical form
+> is chosen (`792d610f`).
+>
+> **Why 196 unit tests and a green SQL probe missed it.** `probe-cli-store.sql`'s four fixtures were
+> hand-written as `'BCDF-1111'`, `'GHJK-2222'`, `'LMNP-3333'`, `'QRST-4444'` — the grouped form, which
+> the store never wrote. A hand-written fixture is a second implementation; it agreed with the wrong
+> half. The unit tests exercised `normalize_user_code` rather than the `.bind(...)` that chose what to
+> store. Both corrected, and **two of the three new tests had to be rewritten before they could see
+> the bug**: one asserted a *function's* output instead of the statement that uses it, and one read
+> its own source with `include_str!` and sliced from the insert to end-of-file — a region that
+> includes the test module containing the literal it greps for, so it passed against the very defect
+> it exists to catch. **A check that reads itself always agrees with itself.** The check now reads
+> the file at runtime via `CARGO_MANIFEST_DIR` and cuts at `#[cfg(test)]`. Both mutations now fail 1/3
+> each.
+>
+> **The fourth claim was mine, and the code was right.**
+> `thePreviewHidesTheDotfilesItAdmitsToHiding` asserted that `.env.example` and `.gitignore` were both
+> kept out of the preview. `ScaffoldFile::shown_in_preview` hides **only** `.gitignore`, on purpose:
+> a preview full of dotfiles is noise, while `.env.example` is the file the generated README warns
+> about, so hiding it would hide the warning's target. The claim was rewritten from the rule's own
+> doc and is now stronger than the original (`c5dd43fb`). The screen's **note** was wrong too and
+> now says which file is where. The general lesson: read the code that owns the rule before writing a
+> claim about the rule — it was written down, in that field's own doc comment, and I wrote the claim
+> from the *shape* of the thing rather than from the sentence.
+>
+> **Still open: one focused re-run.** The fix and the corrected claims are committed and pushed; what
+> is owed is the same focused pass again to see all 4 claims green. The QA slot was taken by a live
+> `w3` run (holder pid 2724189, cwd `/mnt/apopic/omnion-w3`) when the re-run was due, so per this
+> branch's rule it is queued rather than reported as a pass that never ran.
 >
 > Tick 111's note stands for the record: slice 3's code is complete — the panel screen tick 110 said was open (`6fa5d647`, corrected at `f26b96d8` with the pass's 33 `data-oauth-app-*` hooks cross-checked against the view's 33), and the event catalogue that was the slice's last item (`6e994015`, `318321cd`).
 >

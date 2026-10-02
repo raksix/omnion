@@ -87,6 +87,55 @@ parse** — `Unexpected identifier 'as'` — which would report "the function is
 the real claim, that the guard is gone. A probe that can only fail by not compiling is reporting
 the wrong failure.
 
+### What the browser pass found that no gate had
+
+The first focused run of the new pass **failed**, naming four claims. Two of them were mine and
+one was a live, end-to-end defect in the device-code flow:
+
+- `thePreviewHidesTheDotfilesItAdmitsToHiding` — **my assertion was wrong, not the screen.**
+  `shown_in_preview` hides only `.gitignore`, on purpose, because `.env.example` is the file the
+  generated README warns about. The claim was rewritten from the rule's own doc, and it is now
+  stronger than the original: a preview that leaked `.gitignore` fails, and one that dropped the
+  `.env.example` fails too. The **screen's own note** was wrong as well ("the hidden files
+  (.env.example, .gitignore) are in the archive") and now says which file is where.
+- `theLookupShowsWhoIsAsking`, `theScopesAreSpokenNotSpelled`, `approvalIsConfirmed` — one defect
+  behind all three. `start` minted `SPW5-SXDH`, the screen printed it, the pass typed it back, and
+  the API answered `invalid device code`.
+
+**The defect, as data.** The row that failing pass created was still in `omnion_qa_w5`:
+
+```text
+SPW5-SXDH | len=9 | canonical=false
+reader_normalised_lookup_found=0
+```
+
+Rewritten the way the fixed insert writes it, and asked again:
+
+```text
+UPDATE 1
+SPW5SXDH | len=8 | canonical=true
+found_after_fix=1
+```
+
+**Why nothing caught it.** `probe-cli-store.sql`'s four fixtures were hand-written as `'BCDF-1111'`,
+`'GHJK-2222'`, `'LMNP-3333'`, `'QRST-4444'` — the **grouped display form**, which the store never
+wrote. A hand-written fixture is a second implementation, and it agreed with the wrong half of the
+real one. Every unit test exercised `normalize_user_code` rather than the `.bind(...)` that chose
+what to store. Both are fixed: the fixtures are canonical, the form is asserted in SQL, and
+`stored_user_code_form()` is the one place the decision is made.
+
+**Two tests that could not see the bug, both rewritten:**
+
+1. A test that asserted the *format* of a normalised code passed with the bug in the tree — it
+   proved a function behaves, not that the store uses it.
+2. A source check using `include_str!` and slicing from the insert to end-of-file passed against
+   the same bug, because the slice includes the test module containing the literal it greps for.
+   **A check that reads itself always agrees with itself.** It now reads the file at runtime via
+   `CARGO_MANIFEST_DIR` and cuts at `#[cfg(test)]`.
+
+Both mutations (grouped value bound again; helper bypassed with an inline normalise — identical
+behaviour, duplicated decision) now fail 1/3 each. Reverted, file verified byte-identical.
+
 ### Host note
 
 `/dev/shm` was at 95% with four writers building. `/dev/shm/w4-target` (1.3G) had **no holder** —
