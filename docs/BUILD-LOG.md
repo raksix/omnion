@@ -13307,3 +13307,86 @@ the log table and its detail drawer, the nav entry, all three states per screen,
 mobile behaviour the REQ names. The request-log **middleware** that writes rows on every API call also
 belongs to it: `omnion-developer::logs_store::record` exists and is walked, but nothing calls it on the
 request path yet, which is the same "described but inert" shape this REQ's predecessors shipped.
+
+
+## Tick 75 — the browser pass ran, and the gates it was measured by could not fail
+
+**What.** `origin/main` merged (5 commits, the developer portal: migration `0240`, six catalogue
+keys, `apps/api/src/routes/developer.rs`, `apps/api/tests/developer.rs`). Three conflicts, all
+additive, all resolved by keeping both sides: `apps/api/Cargo.toml` (`omnion-module-inventory` +
+`omnion-module-hr` + `omnion-developer`), `apps/api/src/guards.rs` (two new `GuardKind` variants
+— this branch's `SessionDepartmentScoped` and main's `SessionOrDeveloperKey` — and four
+constructors), and `docs/BUILD-LOG.md` via `merge-build-log.py`, which reported
+`all 0 entry check passed; every '## ' entry of both sides is present`. `cargo check -p omnion-api`
+exits 0.
+
+Then the CRM browser pass, which had been owed for three ticks, ran to completion:
+
+```
+QA_FINDINGS=72 QA_HIGH=72 QA_CLICKS=220 QA_SHOTS=259 QA_SHOT_FAILURES=0
+QA_VERDICT=pass
+```
+
+**Two gates were wrong, and each one had been hiding a real red behind a green.**
+
+**1. The walk gate wrote to the shared container and kept every database (`2cc8528b`).**
+`scripts/qa/run-walks.sh` created its per-walk database on a hard-coded `-p 5433` and never
+dropped it. 5433 is the *shared* compose container — the main writer's. A private stack's own
+`QA_PG_PORT` (5444 for w4) was silently bypassed, and 26 of this gate's databases were alive in
+that container:
+
+```
+select count(*) from pg_database where datname like 'omnion_w4_x_%'   →  26   (port 5433)
+```
+
+The cost is not tidiness. An `organizations` row written into the stack's own `omnion_qa_w4`
+leaves `organization_of` with several tenants for one account, and the API answers
+`organization_ambiguous`. That refusal is the product being **correct** — *"a guess would hand one
+tenant's records to another"* — and it read as a CRM defect because the pass was red on it. The
+query that settles it, from the contaminated database:
+
+```
+select id, slug from organizations                                  →  qa-org, inventory-fix-a-…, inventory-fix-b-…
+select email, organization_id is null from users                     →  qa-owner@… true, five inventory-* accounts
+select email, r.name, rb.scope_type from role_bindings rb join …    →  qa-owner@… | Owner | global
+```
+
+The fix reads the port from `QA_PG_PORT` and drops each walk's database **as its own walk
+finishes**. Cleanup on `EXIT` alone — which is what the first version of the fix did, and which
+looks sufficient — keeps one database per walk until the end and keeps *all* of them when a run
+dies halfway. The probe caught that before it shipped.
+
+**2. A pass that found defects reported `pass` (`a5d0d3ef`).** `walkthrough.cjs` exited `0`
+whenever the run merely produced evidence, so `QA_VERDICT=pass` meant *the pass ran* rather than
+*the screens are sound*. Seventy-two high findings sat underneath that string: six screens whose
+state refusal never arrived, `boardColumns: 0`, `dealCreated: false`, `export: 400
+organization_ambiguous`, `cardHasAButton: false`. The finding count now travels in the exit
+status, which is the channel every reader already uses: `4` keeps meaning "this run is not a
+verdict", `5` is new and means "this run is a real verdict and it is red". `run.sh` reports the
+two differently — collapsing them under one *"not a verdict"* line is precisely what let a
+72-high pass read as a broken run while a clean pass read as a pass.
+
+**Proof**
+
+| gate | command | result |
+|---|---|---|
+| isolation probe | `QA_PG_PORT=5444 bash scripts/qa/probe-walk-gate-isolation.sh` | **6 passed · 0 failed** |
+| verdict probe | `node scripts/qa/probe-verdict-gate.cjs` | **9 passed · 0 failed** |
+| isolation control | the same probe against the pre-fix script | the reverted script **leaks** — the assertion can fail |
+| verdict control | `process.exit(5)` reverted to `process.exit(0)` | control comes back green without the fix |
+| cleanup | `select count(*) … like 'omnion_w4_x_%'` on 5433 | 26 → **0** |
+| compile | `cargo check -p omnion-api` | exit 0 |
+| merge | `merge-build-log.py docs/BUILD-LOG.md` | 0 entries lost |
+
+**What is *not* claimed.** The six `diagnostics.json` pages are clean — overflow: no, broken
+images: 0, unlabeled inputs: 0, duplicate ids: 0, h1: 1 on all six — so the screens render and
+their behaviour is what was red, under a contaminated database. **No acceptance box ticked**:
+all three remaining boxes (empty/loading/error states, mobile 390×844, keyboard) are browser-only
+and the browser has still not produced one trustworthy reading. `export: 400
+organization_ambiguous` is *presumed* to be the contamination rather than asserted to be, and the
+gate re-run below is what turns it into a reading.
+
+**Next.** Re-run the inventory walks against a clean per-walk database on 5444 with the fixed
+gate, then the CRM pass on the same stack — a focused run needs `QA_HIGH_FAIL_ON` set to a named
+budget, because exit 5 now fails the command and a writer must choose that deliberately rather
+than inherit a green. Then REQ-051's three boxes, or name the leg that broke.
