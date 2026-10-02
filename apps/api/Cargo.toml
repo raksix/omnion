@@ -51,6 +51,7 @@ omnion-module-sales = { path = "../../modules/sales" }
 omnion-onboarding = { path = "../../crates/onboarding" }
 omnion-module-inventory = { path = "../../modules/inventory" }
 omnion-module-hr = { path = "../../modules/hr" }
+omnion-developer = { path = "../../crates/developer" }
 omnion-permissions = { path = "../../crates/permissions" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }

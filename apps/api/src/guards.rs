@@ -71,6 +71,17 @@ pub enum GuardKind {
     /// bindings actually name, so an organization-scoped role keeps working unchanged and a
     /// department-scoped one opens the route as well.
     SessionDepartmentScoped,
+    /// A session, a service-account key, or a **developer API key** — a delegation with a
+    /// scope list rather than a role.
+    ///
+    /// This is a third case and not a flavour of the second, because the two authenticate
+    /// against different tables and are resolved by *different* rules: a service-account key
+    /// is a subject roles bind to, so it is authorised through the binding table; a developer
+    /// key has no role at all, so its scopes are the authorization. Folding the second into the
+    /// first would mean either a developer key is looked up in a service-account table it was
+    /// never written to, or a service-account key is authorized by a scope column that does not
+    /// exist. Both are the "two mechanisms that look alike and behave nothing alike" trap.
+    SessionOrDeveloperKey,
 }
 
 /// Layer rejecting requests whose caller does not carry `permission`.
@@ -139,6 +150,21 @@ pub fn require(state: &AppState, permission: &'static str) -> RequirePermission 
 #[must_use]
 pub fn require_or_machine(state: &AppState, permission: &'static str) -> RequirePermission {
     RequirePermission::new_with_machine(state.clone(), permission)
+}
+
+/// Guard a route with `permission`, accepting a developer API key as a `Bearer` token too.
+///
+/// The key's scopes are the authorization, checked in [`check_kind`] before the permission
+/// decision is made — so a key carrying only `content.pages.read` is refused `403` on a route
+/// guarded for `content.pages.manage`, with the missing scope named.
+#[must_use]
+pub fn require_or_developer_key(state: &AppState, permission: &'static str) -> RequirePermission {
+    RequirePermission {
+        state: state.clone(),
+        permission,
+        kind: GuardKind::SessionOrDeveloperKey,
+        alternatives: &[],
+    }
 }
 
 /// Guard a route with **any one** of `permissions`.
@@ -432,8 +458,59 @@ pub async fn check_kind(
         };
     }
 
+    // No cookie. A developer key first, because it is the narrower mechanism: a token that
+    // authenticates against `api_keys` must never fall through to the service-account branch
+    // and be reported as an unknown machine key, which names the wrong table in the error an
+    // integrator reads at 2am.
+    if kind == GuardKind::SessionOrDeveloperKey {
+        if let Some(bearer) = bearer_token(headers) {
+            let now = time::OffsetDateTime::now_utc();
+            if let Some(key) =
+                omnion_developer::keys_store::authenticate(state.db().pool(), &bearer, now)
+                    .await
+                    .map_err(crate::routes::developer::map_store)?
+            {
+                // **The scope check is the authorization.** A key holds no role, so a
+                // permission the route asks for that the key does not carry is a plain refusal
+                // — and the refusal names the missing scope, so the integrator is told which
+                // scope to add rather than which route they hit.
+                if !key.scopes.iter().any(|scope| scope == permission) {
+                    tracing::debug!(
+                        permission,
+                        api_key = %key.id,
+                        scopes = ?key.scopes,
+                        "developer key does not carry the scope this route requires"
+                    );
+                    return Err(ApiError::forbidden(
+                        "scope_missing",
+                        format!(
+                            "this key does not carry the \"{permission}\" scope — rotate it with \
+                             that scope added"
+                        ),
+                    ));
+                }
+
+                return Ok(Caller::Machine(MachinePrincipal {
+                    // A key has no subject of its own: it is a delegation *by* somebody, so the
+                    // issuer is the closest honest subject. It is never resolved against (a
+                    // developer key is authorized by its scopes above, and a revoked issuer must
+                    // not revoke the integration they delegated — that is what the portal's own
+                    // revoke button is for).
+                    account: omnion_permissions::model::Subject::User(
+                        key.created_by.unwrap_or_else(Uuid::nil),
+                    ),
+                    organization_id: key.organization_id,
+                    key_id: key.id,
+                }));
+            }
+
+            // Not a developer key. Fall through to the service-account check, so one header can
+            // mean either — which is what the API's own documentation promises.
+        }
+    }
+
     // No cookie: a machine key may authenticate, when the route accepts one.
-    if kind == GuardKind::SessionOrMachine {
+    if matches!(kind, GuardKind::SessionOrMachine) {
         if let Some(bearer) = bearer_token(headers) {
             let Some(machine) =
                 omnion_permissions::service_accounts::authenticate(state.db().pool(), &bearer)
