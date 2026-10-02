@@ -11749,3 +11749,65 @@ pushed.
 **Next:** `QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202 … --only=workflow-table,workflow-builder`
 the moment the slot frees, for `table-save-survives`, `edge-delete.removed` / `edge-delete-undo.restored`,
 and the first reading of `narrow-lock.tableMode.editControls` that can be anything but 0.
+
+## Tick 87 (wave3) — two more constants, found by widening the sweep from two passes to the whole walkthrough
+
+**Merge first.** `origin/main` had moved 3 commits (`d1706e81` developer wire-date gate, plus its
+REQ/docs ticks); `docs/BUILD-LOG.md` merged with `merge-build-log.py` against the true merge-base
+`6e8bd678` (base=8069 ours=11666 theirs=8154 → merged=11751, **exact multiset OK**), 0 conflict
+markers left in any file. Post-merge gates: tsc 2/2, `omnion-api --lib` 325/325,
+`omnion-developer`+`omnion-notifications` 102/102, apps/admin **381/381**, all eight source gates
+green. Pushed as `2999e58b` before any editing.
+
+**What the tick found.** Tick 86 generalised one class of *constant reading* and swept it — but
+only across the two builder passes. Widening the same sweep to **every literal selector in the
+whole walkthrough** (1056 of them) found two more rows that could never be true:
+
+- `analytics steps.empty` queried `[data-analytics-overview-empty]`. The empty panel renders its
+  marker as an **attribute VALUE** — `EmptyPanel` writes `data-analytics-state="analytics-overview-empty"`
+  (the `dataAttribute` prop reaches `parts.tsx:94`) — so the attribute *name* queried had never
+  existed. `empty` was false on every run, including the runs where the overview was empty and the
+  pass was supposed to say so.
+- `notifications` read two fields off `[data-push-enable-reason]`: whether a disabled button
+  explains itself, and whether that reason names the variable an operator must set. The product
+  renders it as `<span id="push-enable-reason">` — which is also what the button's `aria-describedby`
+  points at. Both fields were false on every run **of the disabled case, the only case they exist
+  to describe**.
+
+Both fixed; `probe-selector-sweep.cjs` now sweeps the whole walkthrough so the class cannot recur.
+
+**The gate was six wrong versions before it was right, and each one reported a clean bill of health
+while wrong** — the same failure mode tick 86 recorded for its own sweep, which is precisely why
+the control is mandatory:
+
+1. requiring `=` missed JSX shorthand (`data-foo` alone on a line) → **522 false unresolved**, and
+   three spot-checked markers all rendered bare. Three spot checks is what caught it; the number did not.
+2. the haystack included `*.test.ts`, so a gate's own assertion resolved a marker the product never
+   renders — the control caught this immediately (`data-table-edit` "resolved").
+3. a capture forbidding all three quote characters truncated every single-quoted selector containing
+   double quotes — 947 selectors collected where there are 1056.
+4. comma groups treated as AND; a union is live when **one** alternative matches.
+5. `input[inputmode=…]` reached the tag branch before the attribute branch, and the alias rule
+   converted hyphens only, never `inputmode` → `inputMode`.
+6. `.animate-pulse` is a stylesheet class and `[data-qa-idx]` is a probe-written instrument — neither
+   is a product surface, and both are now checked explicitly rather than exempted.
+
+**Proof.** 0 unresolved **with a control that bites** (the two markers tick 86 removed are handed
+back and reported). Both defects re-introduced into the real source are each red naming the marker;
+each of mutations 1–4 above is red naming a selector. Every file restored byte-exact. Gates:
+sweep 0 unresolved, `probe-probe-markers` ALL RESOLVE, `probe-pass-scope` 10/10,
+`probe-only-filter` 33/33, `probe-edge-delete-claim` 15/15, `probe-hook-order` 2/2,
+`probe-expected-refusals` 38/38, `probe-developer-harness` all checks passed. apps/admin **381/381**,
+`omnion-api --lib` 325/325, tsc 2/2.
+
+**Slot.** Checked first: `kill -0` + `/proc/1495859/cwd` = `/mnt/apopic/omnion-w2`, **live**. The box
+has recovered though (Chrome 1032 → 1, load 34 → 11.5, free RAM 0 → 2.6 GB), so the wait is now on a
+sibling's pass, not on a saturated machine. The pass was queued, not forced.
+
+**Commits:** `2999e58b` (merge), `e84ebfdd` (the two constants + the sweep), pushed.
+
+**Next:** the moment the slot frees, `--only=workflow-table,workflow-builder` for
+`table-save-survives`, `edge-delete.removed` / `edge-delete-undo.restored`, and the first reading of
+`narrow-lock.tableMode.editControls` that can be anything but 0. The two constants fixed this tick
+change what `analytics.empty` and the push-disabled readings mean, so their next live values are
+evidence rather than a repeat of the previous run's.
