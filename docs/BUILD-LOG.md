@@ -17723,3 +17723,80 @@ runs — and this is the fourth tick that has said so, which is why the *reason*
 rather than "the pass was slow".
 
 **Next:** the pass, then the state boxes and `done`.
+
+### 2026-10-02 · omnion-w8 tick 89 · REQ-117 slice 51 · the inbox row's six bulk words
+
+**What.** REQ-117's screens table has read *"Bulk: assign, reassign, mark responded, mark spam,
+reject with reason, export CSV"* since the request was written. `bulk_assign_owner` existed and
+nothing else did — `mark responded`, `mark spam` and `reject` had **no batch form at all**, so a
+morning of triage was twenty single-lead presses and the operator who skips the sixth has
+answered five leads and left one breaching. This is the third consecutive instance of the tick-87
+signature (read the REQ's own screen and API tables against the routes **in order**); two slices
+reading the same row and finding consecutive missing words is what proves the row was never read
+as a list, so **the words on one table row are a checklist** is now a ledger rule.
+
+**Shipped.** `bulk::run_action` (three row verbs over the hand-over's *own* report type — a bar
+that rendered two report shapes would have two empty states) · `POST /crm/leads/bulk-action`
+(`crm.leads.manage`, the key the three single-lead routes already carry) ·
+`GET /crm/leads/export` (`crm.leads.read`) · four panel controls · four walkthrough observations.
+
+**Three decisions the obvious version gets wrong.**
+
+1. **The action is a newtype, not a serde enum.** `#[serde(rename_all)]` on a fieldless enum
+   turns `action: "delate"` — one keystroke from `delete`, a verb this bar does not have — into
+   serde's own `unknown variant` wording inside a `422` the panel renders as a body error. The
+   newtype answers `400` naming the three real verbs, and its unknown arm is a **refusal, not a
+   fallback**: a default of `Respond` would stop twenty SLA clocks for an operator who asked to
+   delete twenty leads.
+2. **The export is the FILTER, not the page — and the inbox's existing `?limit` is the trap.**
+   The parameter is right there, the panel sends it on every read, and honouring it produces a
+   document that reads as a complete list and is not one. Ignored on purpose; `MAX_EXPORT_ROWS`
+   is a **refusal rather than a truncation**, and the cursor loop checks it against the rows
+   already read so a tenant with a million leads is refused in bounded time.
+3. **The formula guard found its own cost in its first test run.** The OWASP prefix rule turns the
+   NUMBER `-3` into `\t-3`, so a signed column would export as a string that will not sum and
+   will not chart. The rule is now the prefix rule **minus a plain number**, spelled out as a
+   grammar rather than a `f64` parse — the question is not what a parser accepts but what a
+   *spreadsheet* reads as a figure, and those are not the same set. `-.5` is a figure to Excel and
+   a string to a CSV reader, so it keeps the guard: **every ambiguity resolves toward guarding**,
+   because a false positive costs a tab character and a false negative costs an executed formula.
+
+**One defect was mine and was found before it shipped.** The export's first draft reused
+`bulk::run_action` "because it already knows which of the twenty ids are mine" — and the only
+read-shaped verb on that pipeline is `Respond`, **which writes**. A twenty-row export would have
+stopped twenty SLA clocks. `find_lead` is right there: one indexed lookup per id, the same tenancy
+answer, and it cannot change a row. **A read that borrows a write's plumbing is a write nobody
+has noticed.**
+
+| Gate | Command | Result |
+|---|---|---|
+| store | `bash scripts/qa/run-crm-bulk-actions.sh` | **8 passed**, and **proven to fail twice** |
+| crate | `cargo test -p omnion-module-crm-intake --lib --quiet` | **233 passed** (was 227) |
+| build | `cargo build -p omnion-api` | exit 0 |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| harness | `node --check scripts/qa/walkthrough.cjs` | parses |
+
+**Proven to fail, once per half — not once, at the end, as a habit.** The reason requirement
+neutralised → **7/8**: the rejection test alone goes red and the seven that never reject stay
+green. The `organization_id` argument dropped → **5/8**: the three respond tests go red and the
+five that never touch tenancy stay green. Two independent neutralisations, each naming its own
+assertion set, is the difference between measuring the defect and measuring its neighbourhood.
+
+**The panel's own copy of the reason rule, and who owns the sentence.** `bulkActionNeedsReason`
+duplicates the server's `BulkAction::requires_reason`, and the duplication is deliberate: if the
+two ever disagree the server refuses with a message naming the reason and the panel renders *that*
+message, so the operator sees the server's rule rather than the browser's guess at it.
+
+**The box, first and honestly.** Postgres on 5433 entered crash recovery at 09:58 and answered
+`FATAL: the database system is in recovery mode` to every `psql` **including `pg_isready`** for
+about fifteen minutes; siblings w4 and w7 were already waiting on it in their own loops. It
+recovered and every DB-backed gate above ran afterwards. The lesson is about ordering, not about
+Postgres: **a loop that opens with a DB gate spends its first minutes watching a container it does
+not own**, and the module's 233 lib tests needed no database at all.
+
+**Commits:** `4609b93e` (the store), `25e5704f` (the API and the gate), `3b0cc13b` (the panel and
+the walkthrough).
+
+**Next:** the browser pass on the private stack, then the unticked 390 px criterion, then the
+remaining `~`-boxed screens criteria — of which "All seven screens have empty, loading and error
+states" is the one no amount of store work can close.
