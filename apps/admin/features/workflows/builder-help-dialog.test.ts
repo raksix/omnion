@@ -216,10 +216,23 @@ test("the dialog takes focus when it opens", () => {
   // thing a mouse author clicks must be the same control — an author who tabs in and then presses
   // Enter should leave, not activate a node behind the dialog. Asserted within the button's own
   // tag, which is short and therefore safe to match across.
+  //
+  // **Tick 78: the closing half of this assertion moved, and the claim did not.** This test was
+  // reading `onClick={() => setHelpOpen(false)}` — the inline form the button used to carry —
+  // and went red the moment the button was switched to the shared `closeHelp`. The red is not a
+  // regression: both statements it made are still true, and the second one is *stronger* now.
+  // The button is still the focused control and still the pointer exit, and it now closes
+  // through the one function that also restores focus — so an author who presses Enter on it and
+  // an author who presses Escape both land back on the canvas.
+  //
+  // The assertion deliberately accepts EITHER spelling rather than being rewritten to the new
+  // one. Pinning it to `onClick={closeHelp}` would have replaced "this control closes the dialog"
+  // with "this control contains this identifier", which is a *syntactic* claim the next refactor
+  // breaks while the behaviour is unchanged — the failure mode this file already documents once.
   const buttonTag = header.slice(buttonAt, header.indexOf(">", focusAt) + 1);
   assert.match(
     buttonTag,
-    /onClick=\{\(\) => setHelpOpen\(false\)\}/,
+    /onClick=\{\(\) => setHelpOpen\(false\)\}|onClick=\{closeHelp\}/,
     "the focused control must be the same one that closes the dialog on click",
   );
 });
@@ -337,5 +350,126 @@ test("the source comment claims Escape closes it, and the claim must stay true",
     CODE,
     /Escape closes it/,
     "the contract sentence must live in a comment, so stripping comments removes it from CODE",
+  );
+});
+
+/**
+ * Tick 78 — the SECOND half of the same contract, found by the first pass that was allowed to
+ * read it (`togglesOnTheSameKey: false`).
+ *
+ * The file above made Escape work from inside the dialog. What it did not make true is that the
+ * list **toggles**, and the reason is one line of markup that reads like a convenience: the close
+ * button carries `autoFocus`. That is correct — a dialog which does not take focus is the defect
+ * the rest of this file is about — but it means focus leaves the canvas the moment the list
+ * opens, and on unmount the browser drops focus to `body`. `⌘/` is bound to the *canvas*
+ * (`onCanvasKeyDown` is `onKeyDown` on the canvas div; the overlay is a sibling). So after one
+ * open/close cycle the chord that documents itself cannot be heard again for the rest of the
+ * session: the toggle state and the handler were both correct and the handler was unreachable.
+ *
+ * **Why a source guard and not a unit test.** Focus is a property of a live DOM; there is no
+ * `document` here, and the sibling guards in this file are already source guards *by that
+ * necessity*, not by preference. What the guard can establish is the wiring, and the wiring is
+ * what the defect was: something must capture the opener, something must restore it, and the
+ * restore must run after the node is detached rather than in the same tick.
+ */
+test("closing the list returns focus, so the chord that opened it can be pressed again", () => {
+  // The opener is captured — and captured *conditionally*, so a close never overwrites the
+  // remembered element with the dialog's own button (which is about to be removed).
+  assert.match(
+    CODE,
+    /helpReturnFocus\.current\s*=\s*[\s\S]{0,120}document\.activeElement/,
+    "opening the list must remember where focus came from",
+  );
+  assert.match(
+    CODE,
+    /if \(!helpState\.current\.open\) \{[\s\S]{0,200}helpReturnFocus\.current\s*=/,
+    "the opener must be captured only on the way OPEN — capturing on close would save the button",
+  );
+
+  // The restore re-checks connectedness, which is what makes it honest: the remembered element
+  // can itself be gone by the time the list closes.
+  assert.match(
+    CODE,
+    /isConnected \? back : canvasRef\.current/,
+    "the restore must fall back to the canvas when the remembered element is gone",
+  );
+
+  // And it runs from an effect keyed on the dialog closing, never inline in the close handler.
+  // React removes the dialog on the same render that the close handler schedules, so an inline
+  // `.focus()` targets a node the browser is about to detach and the focus lands on `body` —
+  // the exact state this exists to prevent, written in a form that reads correct.
+  // The window is generous on purpose and the reason is not sloppiness: the guard has to reach
+  // the dependency array at the END of the effect, and every intermediate statement is a line a
+  // future edit may insert. A tight bound here fails on a *harmless* reordering and teaches the
+  // next reader that the assertion is about proximity rather than about the effect's shape.
+  const effect = /useEffect\(\(\) => \{[\s\S]{0,900}?helpReturnFocus\.current[\s\S]{0,400}?\}, \[helpOpen\]\);/.exec(
+    CODE,
+  );
+  assert.ok(effect, "the focus restore must run inside a useEffect keyed on helpOpen");
+  assert.match(
+    effect[0],
+    /if \(helpOpen\) \{\s*return;/,
+    "the restore must be gated on the list being CLOSED, or it steals focus while the list is open",
+  );
+  assert.match(
+    effect[0],
+    /\.focus\(\);/,
+    "the effect must actually restore focus, not merely consult the remembered element",
+  );
+
+  // The one place that must NOT restore inline: the close handler itself. Asserted as a negative
+  // because the inline version is what shipped and what a reader would write.
+  const closeHelp = /const closeHelp = useCallback\(\(\) => \{[\s\S]{0,300}?\}, \[\]\);/.exec(CODE);
+  assert.ok(closeHelp, "the overlay must keep one close function");
+  assert.doesNotMatch(
+    closeHelp[0],
+    /focus\(\)/,
+    "the close handler must not focus inline — the dialog is still mounted at that point",
+  );
+
+  // All three exits go through it. A fourth exit added later that calls `setHelpOpen(false)`
+  // directly would drop the restore, so the count is asserted, not the intent.
+  const exits = CODE.match(/closeHelp\(\)|onClick=\{closeHelp\}/g) ?? [];
+  assert.equal(
+    exits.length,
+    3,
+    "the chord, the dialog's Escape and the backdrop/button all close through closeHelp()",
+  );
+});
+
+/**
+ * The handler cannot simply *name* `closeHelp`, and this is why.
+ *
+ * `onCanvasKeyDown` is defined ~540 lines above `closeHelp`, so listing it in that dependency
+ * array is a temporal-dead-zone read at render time. The file already has the honest answer for
+ * exactly this shape (`lateActions`, written for `validateNow`/`runOnce`), and the half nobody
+ * notices is that `helpOpen` was being read inside the handler **without being a dependency** —
+ * a stale closure that answered "is the list open?" with whatever the value was when the
+ * callback was last rebuilt.
+ */
+test("the canvas handler reaches the overlay through a ref, not a later binding", () => {
+  assert.match(
+    CODE,
+    /const helpState = useRef</,
+    "the overlay hand-off must be a ref: closeHelp is declared after onCanvasKeyDown",
+  );
+  // Published in the render BODY, not in an effect: an effect publishes one render late, so the
+  // very keydown that opens the list would still read `open: false`.
+  assert.match(
+    CODE,
+    /helpState\.current\.open = helpOpen;/,
+    "the ref must carry the current open state",
+  );
+  assert.match(
+    CODE,
+    /helpState\.current\.close = closeHelp;/,
+    "the ref must carry the current close function",
+  );
+  // The canvas handler reads the ref, and reads it at the guard as well as the action — a guard
+  // reading stale `helpOpen` is how Escape closes the list while it is still open.
+  assert.match(
+    CODE,
+    /if \(helpState\.current\.open\) \{[\s\S]{0,120}?helpState\.current\.close\(\);/,
+    "the canvas Escape path must read the current state from the ref and close through it",
   );
 });

@@ -258,11 +258,35 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [paletteQuery, setPaletteQuery] = useState("");
   const [problemsOpen, setProblemsOpen] = useState(true);
-  // The ⌘/ shortcut list. Kept out of the problems panel on purpose: that panel is the rule's
+  // ⌘/ — the shortcut list. Kept out of the problems panel on purpose: that panel is the rule's
   // own state and is open by default, so a help overlay parked there would be the first thing
   // an author sees and the last thing they could dismiss. It is a `dialog` and it traps
   // nothing — Escape closes it, and the canvas keeps its own state behind it.
   const [helpOpen, setHelpOpen] = useState(false);
+  // Where focus was when the shortcut list opened, so closing it puts the author back where
+  // they were. The chord that opens the list is bound to the CANVAS (`onCanvasKeyDown` is
+  // React's `onKeyDown` on the canvas div, and the overlay is a sibling of that div), so it
+  // only fires while the canvas holds focus — and the dialog's close button takes `autoFocus`,
+  // which moves focus INTO the overlay. On unmount the browser drops focus to `body`, from
+  // which the chord can never be heard again: ⌘/ opens, Escape closes, and the same chord is
+  // then dead for the rest of the session. That is the one gesture the help list itself
+  // teaches, so "toggles on the same key" read false on a live pass (tick 78) while the toggle
+  // state and the handler were both correct — the handler was simply unreachable.
+  const helpReturnFocus = useRef<HTMLElement | null>(null);
+  // The overlay's own state, handed to the canvas handler through a ref.
+  //
+  // `onCanvasKeyDown` is built at line 1540, long before `closeHelp` exists (2082), so naming
+  // it in that dependency array is a temporal-dead-zone read at render time — the trap
+  // `lateActions` below was introduced for, with the same reasoning written out next to it.
+  // And `helpOpen` was already being read inside that handler *without* being a dependency,
+  // which is a second, quieter version of the same bug: the handler closed over whichever
+  // `helpOpen` was current when the callback was last rebuilt, so "is the list open?" was
+  // answered by a stale value. This ref is rewritten on every render, so both reads are the
+  // current ones and neither is a render-time read of a later binding.
+  const helpState = useRef<{ open: boolean; close: () => void }>({
+    open: false,
+    close: () => undefined,
+  });
   const [running, setRunning] = useState(false);
   const [runMessage, setRunMessage] = useState<string | null>(null);
   // The most recent run's steps, keyed by the node each came from — this is what paints
@@ -1608,6 +1632,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       // `/` — hence the chord rather than the bare key.
       if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key === "/") {
         event.preventDefault();
+        // Capture the opener BEFORE the state flips: on the way open the author is on the
+        // canvas (that is the only place the chord is heard), and on the way shut the list
+        // would be closing and the canvas is not where they are.
+        if (!helpState.current.open) {
+          helpReturnFocus.current =
+            (document.activeElement as HTMLElement | null) ?? canvasRef.current;
+        }
         setHelpOpen((open) => !open);
         return;
       }
@@ -1743,9 +1774,9 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         // would be satisfied on a screen with a dialog no keyboard can dismiss. It sits above
         // the ladder deliberately: Escape in a dialog belongs to the dialog, which is the same
         // rule the pointer handler follows when a refusal needs dismissing.
-        if (helpOpen) {
+        if (helpState.current.open) {
           event.preventDefault();
-          setHelpOpen(false);
+          helpState.current.close();
           return;
         }
         // One rule for the whole key, and it answers in priority order: a connection in
@@ -2051,6 +2082,42 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const selectedNode = nodes.find((node) => node.id === selected) ?? null;
   const style = canvasStyle(viewport);
 
+  // ONE way to close the shortcut list, for all three of its exits — the chord, the dialog's
+  // own Escape and the backdrop click — because the focus restore is part of closing it, not a
+  // nicety attached to one of the three.
+  //
+  // The restore runs in an effect rather than inline, and that ordering is the whole fix:
+  // React removes the dialog on this render, so calling `.focus()` in the same tick lands on a
+  // node the browser is about to detach, and the focus silently ends up on `body` anyway — the
+  // exact state this exists to prevent. The element is also re-checked for connectedness,
+  // because the thing focus returns to may itself have been unmounted while the list was open
+  // (a rule deleted from another tab re-renders the builder underneath), and focusing a
+  // detached node is a no-op that reads as a successful restore.
+  const closeHelp = useCallback(() => {
+    setHelpOpen(false);
+  }, []);
+
+  // Published on every render, so `helpState.current` is always the current answer to "is the
+  // list open?" and "how is it closed?" — written in the body rather than in an effect on
+  // purpose, because an effect would publish one render LATE, and the keydown that opens the
+  // list would still see `open: false` when it ran. This is the same hand-off `lateActions`
+  // does below, for the same ordering reason.
+  helpState.current.open = helpOpen;
+  helpState.current.close = closeHelp;
+
+  useEffect(() => {
+    if (helpOpen) {
+      return;
+    }
+    const back = helpReturnFocus.current;
+    if (!back) {
+      return;
+    }
+    helpReturnFocus.current = null;
+    const target = back.isConnected ? back : canvasRef.current;
+    target?.focus();
+  }, [helpOpen]);
+
   return (
     <div
       // `relative` is load-bearing for the ⌘/ overlay: it positions `absolute inset-0` against
@@ -2265,7 +2332,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       {helpOpen ? (
         <div
           className="absolute inset-0 z-40 flex items-start justify-center bg-black/40 p-6"
-          onClick={() => setHelpOpen(false)}
+          onClick={closeHelp}
           data-builder-help-backdrop
         >
           <div
@@ -2301,7 +2368,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               }
               event.stopPropagation();
               event.preventDefault();
-              setHelpOpen(false);
+              closeHelp();
             }}
             data-builder-help
           >
@@ -2309,7 +2376,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               <h2 className="text-[13px] font-semibold">Keyboard shortcuts</h2>
               <button
                 type="button"
-                onClick={() => setHelpOpen(false)}
+                onClick={closeHelp}
                 autoFocus
                 className="rounded-md border border-line px-2 py-1 text-[12px] hover:bg-quiet-soft"
                 data-builder-help-close
