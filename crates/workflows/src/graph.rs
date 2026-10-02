@@ -1194,13 +1194,32 @@ struct ParamCheck<'a> {
     options: Vec<&'a str>,
 }
 
-/// The shared body: a required field must be present and non-empty, and a `select` must hold
-/// one of its declared values.
+/// The shared body: a required field must be present and non-empty, a `select` must hold one
+/// of its declared values, and a field the schema does not declare at all is reported.
+///
+/// **The last clause is the one that was missing, and it is the one the two projections
+/// disagree on.** The builder's inspector maps over the *schema* (`nodeType.params`), so a param
+/// the node type never declared has no input to render into; Table mode maps over the *data*
+/// (`Object.keys(row.params)`), so it renders whatever the node happens to carry — as an
+/// editable field. A rule written by the API, by the table, or by an older build therefore
+/// presents an author with a field one screen lets them edit and the other silently drops on
+/// the next save, and the round trip loses the value. "Consistent after a save in either mode"
+/// is exactly that, and until this check existed a node could carry a key the inspector could
+/// never show: `validate` only ever asked whether the *declared* fields were satisfied, so the
+/// defect it should have named was invisible to all of the tests.
+///
+/// Reported as an **error**, not a warning, and deliberately not a refusal: `replace_graph`
+/// validates to *tell* the author rather than to reject the save (a rule is built by being
+/// incomplete), so the finding reaches the problems panel and the author decides.
 fn validate_declared_params<'a>(
     node: &Node,
     fields: impl Iterator<Item = ParamCheck<'a>>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
+    // Collected first because the undeclared-key sweep below has to ask "did the schema mention
+    // this one?" — a second pass over a consumed iterator would report every param as extra.
+    let fields: Vec<ParamCheck<'a>> = fields.collect();
+    let declared: BTreeSet<&str> = fields.iter().map(|field| field.key).collect();
     for field in fields {
         if field.required {
             let present = node
@@ -1231,6 +1250,24 @@ fn validate_declared_params<'a>(
                 }
             }
         }
+    }
+    // The undeclared-key sweep. BTreeMap is ordered, so the findings come out in a stable
+    // order and two saves of the same graph report the same list.
+    for key in node.params.as_object().map(|map| map.keys()).into_iter().flatten() {
+        if declared.contains(key.as_str()) {
+            continue;
+        }
+        findings.push(Finding::error(
+            "unknown_parameter",
+            format!(
+                "{:?} carries {:?}, which {} does not declare — the canvas has no field for it \
+                 and the next save from there would drop it",
+                node.label,
+                key,
+                node.node_type,
+            ),
+            Some(&node.id),
+        ));
     }
     // The rest of the core checks read the *node type's* identity — a `condition` bounds its
     // field path, a `wait` bounds its seconds — and a plugin node has neither identity, so
@@ -2019,6 +2056,120 @@ mod tests {
         assert!(
             !schedule.nodes[0].params.as_object().is_some_and(|map| map.contains_key("event")),
             "a schedule trigger declares `cron`, not `event`",
+        );
+    }
+
+    /// The half of the same defect that the starter fix could not reach: `validate()` used to ask
+    /// only whether the *declared* fields were satisfied, so a key the node type never declared
+    /// was invisible to all of the suite. Anything that writes a graph can seed one — the API,
+    /// the table, an older build — and the inspector renders the SCHEMA, so the field has no
+    /// input there while Table mode renders the DATA and offers it as editable. The round trip
+    /// then loses whatever the author typed.
+    #[test]
+    fn a_parameter_the_node_type_does_not_declare_is_reported() {
+        let mut trigger = node("t1", "trigger.manual");
+        // The exact shape the QA pass produced: `event` on a trigger whose form declares none.
+        trigger.params = json!({ "event": "qa.table.edited" });
+        let graph = Graph {
+            nodes: vec![trigger, node("e1", "end")],
+            edges: vec![Edge {
+                id: "e0".into(),
+                source: "t1".into(),
+                source_port: "out".into(),
+                target: "e1".into(),
+            }],
+        };
+        let found = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "unknown_parameter")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a trigger carrying `event`, which trigger.manual does not declare, must be \
+                     reported: the canvas inspector renders the schema and has no field for it"
+                )
+            });
+        // The sentence has to name the node AND the key, because "something on this node is
+        // wrong" is what an author already gets from three other findings.
+        assert!(
+            found.message.contains("event") && found.message.contains("trigger.manual"),
+            "the finding names the key and the node type: {}",
+            found.message
+        );
+        assert_eq!(found.node_id.as_deref(), Some("t1"));
+        // Severity is part of the claim, not decoration: `replace_graph` counts errors and hands
+        // that count to the client, and a warning is exactly how "this field will disappear the
+        // next time you save from the canvas" turns into a note nobody reads.
+        assert_eq!(
+            found.severity,
+            Severity::Error,
+            "a parameter the inspector has no field for is an error, not a warning"
+        );
+    }
+
+    /// The two directions, or the sweep is a filter that deletes everything.
+    #[test]
+    fn a_declared_parameter_is_never_reported_as_undeclared() {
+        // Sweeping on the node TYPE instead of on the field list would flag a rule the author
+        // just filled in correctly, and an error that fires on valid rules is a finding nobody
+        // reads — the fastest way to make the problems panel noise.
+        for node_type in ["trigger.event", "trigger.schedule", "wait", "condition"] {
+            let declared = find_node_type(node_type).expect("a core node type");
+            let mut probe = node("n1", node_type);
+            probe.params = Value::Object(
+                declared
+                    .params
+                    .iter()
+                    .map(|field| (field.key.to_owned(), json!("qa.probe")))
+                    .collect(),
+            );
+            let graph = Graph {
+                nodes: vec![probe, node("e1", "end")],
+                edges: vec![Edge {
+                    id: "e0".into(),
+                    source: "n1".into(),
+                    source_port: "out".into(),
+                    target: "e1".into(),
+                }],
+            };
+            let findings = validate(&graph);
+            let codes: Vec<&str> = findings.iter().map(|finding| finding.code.as_str()).collect();
+            assert!(
+                !codes.contains(&"unknown_parameter"),
+                "{node_type} filled in exactly as its form declares must raise no unknown_parameter: \
+                 {codes:?}"
+            );
+        }
+    }
+
+    /// Every finding the sweep emits has to be nameable, or it is a symptom nobody can act on.
+    #[test]
+    fn the_undeclared_sweep_reports_one_finding_per_stray_key_in_a_stable_order() {
+        let mut trigger = node("t1", "trigger.manual");
+        // Deliberately not alphabetical in construction order; BTreeMap is the order in the JSON,
+        // so the report is stable regardless of how the keys were typed.
+        trigger.params = json!({ "zeta": "1", "alpha": "2" });
+        let graph = Graph {
+            nodes: vec![trigger, node("e1", "end")],
+            edges: vec![Edge {
+                id: "e0".into(),
+                source: "t1".into(),
+                source_port: "out".into(),
+                target: "e1".into(),
+            }],
+        };
+        let messages: Vec<String> = validate(&graph)
+            .into_iter()
+            .filter(|finding| finding.code == "unknown_parameter")
+            .map(|finding| finding.message)
+            .collect();
+        assert_eq!(
+            messages.len(),
+            2,
+            "one finding per stray key, not one per node: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("alpha") && messages[1].contains("zeta"),
+            "the keys come out in a stable order so two saves report the same list: {messages:?}"
         );
     }
 
