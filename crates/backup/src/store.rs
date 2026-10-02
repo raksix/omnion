@@ -539,6 +539,49 @@ pub async fn last_succeeded_at(
     .map_err(BackupError::from)
 }
 
+/// The largest backup this tenant holds on the destination, in bytes.
+///
+/// The destination card needs a **yardstick**, not a prediction: "is there room" cannot be
+/// answered without knowing how big a run has been, and the honest source of that number is
+/// this tenant's own history rather than a formula. A card that predicted the next size from a
+/// part-count table would tell an operator with a 400 MB library that they need 12 GB, and the
+/// second time it did that they would stop reading the card.
+///
+/// Any state counts, and that is deliberate rather than an oversight. A `partial` run's row
+/// size is the size of the parts that *did* land, so on its own it would understate the next
+/// full run — but understating the yardstick makes the card *optimistic*, which is the
+/// direction this card must never lean. A `failed` run's row is larger than what it managed to
+/// write, which errs the other way, and of the two, over-estimating the requirement is the one
+/// that sends somebody to enlarge a disk that did not need it rather than the one that lets a
+/// backup die silently at 02:00.
+///
+/// `succeeded` alone would be the tidier answer and the wrong one: the day a tenant's
+/// destination starts running out of room is usually the day runs start coming back `partial`,
+/// and filtering to `succeeded` would empty the yardstick at exactly the moment it is needed.
+///
+/// The `is not distinct from` comparison is the same one `totals` and `last_succeeded_at` use,
+/// so the platform row counts as a tenant — on a single-tenant installation that row *is* the
+/// tenant, and excluding it would leave the only installation that matters answering "unknown"
+/// on the one card about room.
+pub async fn largest_backup_bytes(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<Option<u64>> {
+    // `max(size_bytes)` over a `bigint` column is `numeric`-typed to sqlx, so the cast is
+    // `::bigint` for the same reason `totals` carries one — and `::text` is deliberately not
+    // used: a size that fits in `i64` is every size that fits on a filesystem, and a `u64` here
+    // is chosen so a caller comparing against a 2× margin cannot overflow at the multiply.
+    let bytes: Option<i64> = sqlx::query_scalar(
+        "select max(size_bytes)::bigint from backups \
+         where organization_id is not distinct from $1 and size_bytes > 0",
+    )
+    .bind(organization_id)
+    .fetch_one(pool)
+    .await
+    .map_err(BackupError::from)?;
+    Ok(bytes.and_then(|value| u64::try_from(value).ok()))
+}
+
 /// How many protected backups exist — the number the prune screen shows as "never removed".
 pub async fn protected_backup_count(pool: &PgPool, organization_id: Option<Uuid>) -> Result<i64> {
     sqlx::query_scalar(
