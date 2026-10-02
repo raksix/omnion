@@ -15241,13 +15241,131 @@ note({
     // The banner's own escape route has to *work*, and a lock that locked Table mode too
     // would satisfy "read-only" and fail the criterion in the same breath. So the link is
     // followed and a value is changed there.
+    //
+    // **THE EDITABILITY READ NAMED TWO ATTRIBUTES THE PRODUCT HAS NEVER RENDERED**
+    // (`editControls`, tick 86). The row asked for `[data-workflow-table-edit]` and
+    // `[data-table-edit]`; `grep -rn 'data-table-edit' apps/ scripts/ crates/` returns this line
+    // and nothing else, so `editControls` was structurally **0** — a lock that had extended to
+    // Table mode entirely, and a Table mode that had never rendered, reported the same number.
+    // The comment above it claims "a value is changed there" and nothing ever typed one.
+    //
+    // This is the same class as the four rows above it, and the tell is identical: the row
+    // reported a count, so a constant was indistinguishable from a reading. The real table
+    // ships `data-table-label` / `data-table-param` inputs and a `data-table-save` button, and
+    // "stays editable" is a claim about those controls being *writable*, so it is measured by
+    // writing: type into a control that is not disabled and not readOnly, and read the save
+    // button's own disabled state back. A control that rendered but was inert reports 0 here.
+    //
+    // The selector's *resolution* is reported alongside, because a 0 must say which of the two
+    // it is (tick 74's lesson, one field): `tableMounted` separates "the page never rendered"
+    // from "the page rendered and its controls are all inert".
     let tableSaves = null;
     if (bannerLinksTable > 0) {
       await page.locator("[data-builder-lock-table-mode]").first().click({ timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(2000);
       const onTable = page.url().includes("/table");
-      const editableOnTable = await page.locator("[data-workflow-table-edit], [data-table-edit]").count();
-      tableSaves = { landedOnTable: onTable, editControls: editableOnTable };
+      // Wait for the table to mount rather than for a duration to elapse: a fixed delay is
+      // green against a page that has not drawn, and wrong only on a slow machine.
+      const tableMounted =
+        (await page
+          .waitForSelector("[data-table-mode]", { timeout: 15000 })
+          .then(() => true)
+          .catch(() => false)) || false;
+
+      // The editable surface, read from the attributes the component actually ships. Both
+      // halves are counted separately because "no control rendered" and "every control is
+      // inert" are different defects with the same zero.
+      const editSurface = await page
+        .evaluate(() => {
+          const inputs = Array.from(
+            document.querySelectorAll("[data-table-label], [data-table-param]"),
+          );
+          const save = document.querySelector("[data-table-save]");
+          return {
+            rendered: inputs.length,
+            editable: inputs.filter(
+              (input) => !input.disabled && input.readOnly !== true && input.getAttribute("aria-disabled") !== "true",
+            ).length,
+            kinds: {
+              label: document.querySelectorAll("[data-table-label]").length,
+              param: document.querySelectorAll("[data-table-param]").length,
+            },
+            savePresent: save !== null,
+            saveDisabled: save ? save.disabled === true : null,
+          };
+        })
+        .catch(() => null);
+
+      // And then the write itself, because "renders a control" is not "accepts an edit". The
+      // value is restored immediately afterwards: this row is about the lock, and a probe that
+      // left a draft dirty on a real rule would make every later row's version reading a
+      // statement about the probe.
+      let typedAccepted = null;
+      let saveEnabledAfterTyping = null;
+      if (editSurface && editSurface.editable > 0) {
+        const typed = await page.evaluate(() => {
+          const input = document.querySelector("[data-table-label], [data-table-param]");
+          if (!input) return null;
+          const original = input.value;
+          const next = original.length > 0 ? `${original} qa` : "qa.lock.probe";
+          const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype,
+            "value",
+          )?.set;
+          if (setter) setter.call(input, next);
+          else input.value = next;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("blur", { bubbles: true }));
+          return { original, next, kind: input.hasAttribute("data-table-param") ? "param" : "label" };
+        });
+        if (typed) {
+          await page.waitForTimeout(400);
+          const saveEnabled = await page
+            .locator("[data-table-save]")
+            .first()
+            .isDisabled()
+            .then((disabled) => !disabled)
+            .catch(() => null);
+          // A dirty draft is the observable proof the keystroke was accepted; an enabled Save
+          // is the observable proof the product agreed the draft is committable.
+          const saveState = await page
+            .locator("[data-table-save-state]")
+            .first()
+            .innerText()
+            .then((text) => text.replace(/\s+/g, " ").trim())
+            .catch(() => null);
+          typedAccepted = saveState !== null && /unsaved/i.test(saveState);
+          saveEnabledAfterTyping = saveEnabled;
+          // Put the author's own value back.
+          await page.evaluate((original) => {
+            const input = document.querySelector("[data-table-label], [data-table-param]");
+            if (!input) return;
+            const setter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype,
+              "value",
+            )?.set;
+            if (setter) setter.call(input, original);
+            else input.value = original;
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("blur", { bubbles: true }));
+          }, typed.original);
+          await page.waitForTimeout(300);
+        }
+      }
+
+      tableSaves = {
+        landedOnTable: onTable,
+        tableMounted,
+        // Kept under its own name too, because the old field is what earlier notes cited and a
+        // silent rename would make two numbers in two reports look like one measurement.
+        editControls: editSurface?.editable ?? null,
+        editControlsRendered: editSurface?.rendered ?? null,
+        editControlKinds: editSurface?.kinds ?? null,
+        savePresent: editSurface?.savePresent ?? null,
+        saveDisabled: editSurface?.saveDisabled ?? null,
+        typedAccepted,
+        saveEnabledAfterTyping,
+      };
       await shot(page, "page-workflow-builder-locked-table");
 
       // **Come back.** This row navigates the pass to `/table` and the next two rows read the
