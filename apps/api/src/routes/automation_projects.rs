@@ -22,9 +22,11 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use omnion_audit::NewAuditEntry;
 use omnion_permissions::{Decision, Scope, authorize};
 use omnion_workflows::limits;
+use omnion_workflows::project_export;
 use omnion_workflows::projects::{
     self, NewProject, Project, ProjectCaller, ProjectMember, ProjectRole, ProjectStatus,
     ProjectSummary,
@@ -934,6 +936,88 @@ pub async fn delete_project(
         removed_members: dependencies.members,
         retained_audit_rows: dependencies.audit_rows,
     }))
+}
+
+/// Query for `GET /api/v1/projects/{id}/export`.
+///
+/// `organization_id` is here for the same reason it is on every other project read: a platform
+/// account has no organization of its own and states which one it is acting in.
+#[derive(Debug, Deserialize)]
+pub struct ExportProjectQuery {
+    /// Organization; required for a platform account.
+    pub organization_id: Option<Uuid>,
+}
+
+/// `GET /api/v1/projects/{id}/export` — a portable snapshot of the project.
+///
+/// **This is a download and not a JSON API response, and the distinction is three headers.** The
+/// browser decides whether a response is a file or a page from `Content-Disposition` and
+/// `Content-Type`, so an endpoint that answers `Json<ProjectExport>` — the obvious way to write it,
+/// and the way every other handler on this file is written — makes the panel fetch a blob it has to
+/// turn into a file by hand. `attachment` also states the *intent*: an export is not a document a
+/// browser may render, and a response served inline could reflect a project key into a page.
+///
+/// **The permission is `projects.read` and not `projects.manage`**, which is the one decision here
+/// that could have gone the other way. Exporting is a read: it takes no lock, writes nothing, and
+/// changes nothing. A viewer who may read every workflow in the project may read them in a file as
+/// well, and a second permission on the same data would mean "read it here but not there" — the
+/// split this surface has already been bitten by once (`visible_project_ids` vs `find_visible`).
+///
+/// **Visibility is resolved before the first row is read**, through the same `find_visible` every
+/// other read on this surface uses, so a foreign project answers `404` and its name never appears
+/// in the body. The audit trail on this module exists for the same reason.
+pub async fn export_project(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(project_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<ExportProjectQuery>,
+) -> Result<Response, ApiError> {
+    let organization_id = resolve_organization(&current, query.organization_id)?;
+
+    // The same resolution `get_project` uses, and `caller_for` rather than a struct literal
+    // written out again: that helper exists precisely because four call sites each re-implementing
+    // `projects.admin` is how one permission comes to mean two things on a branch. A struct
+    // literal here would have been the fifth, and it would have been the one that mattered —
+    // this route is the only place `projects.admin` is consulted on a *read* of project contents.
+    let caller = caller_for(&state, &current, organization_id).await;
+    projects::find_visible(state.db().pool(), organization_id, project_id, caller)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(not_found)?;
+
+    let export = project_export::build_export(state.db().pool(), project_id)
+        .await
+        .map_err(ApiError::from)?;
+    let body = project_export::render(&export).map_err(ApiError::from)?;
+
+    let format = project_export::ExportFormat::Json;
+    let filename = project_export::filename(format, &export);
+    // RFC 6266 quoting: the stem is `[a-z0-9-]` by the key constraint, so nothing here needs
+    // escaping — and the assertion that it does not is `filename_is_the_lower_key` in the crate
+    // tests, rather than this comment.
+    let disposition = format!("attachment; filename=\"{filename}\"");
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, project_export::content_type(format))
+        .header(axum::http::header::CONTENT_DISPOSITION, disposition)
+        // A snapshot is a point in time. Caching one would mean a user clicking "export" twice
+        // gets yesterday's file, which for an archive taken before a deletion is the one failure
+        // the feature exists to prevent.
+        .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(body))
+        // `Response::builder()` fails on an invalid header value, which for this handler means a
+        // filename the key constraint should have made impossible — so it is reported rather than
+        // unwrapped. Note the type: this is an `axum::http::Error`, NOT a `sqlx::Error`, so the
+        // file's `sql` helper is the wrong mapping and using it here was a compile error, which is
+        // the cheapest possible way to find out.
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "project_export_header_failed",
+                format!("the export could not be prepared as a download: {error}"),
+            )
+        })?)
 }
 
 /// `POST /api/v1/projects/{id}/members` — add a member or change a role.

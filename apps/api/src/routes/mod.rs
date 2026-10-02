@@ -188,6 +188,20 @@ fn automation_projects_surface(state: &AppState) -> Router<AppState> {
             post(automation_projects::restore_project)
                 .layer(guards::require(state, "projects.manage")),
         )
+        // The export the settings row has named since slice 1 and the REQ's Risks section names
+        // again as the "export-first hint" that makes deleting a project with dependencies safe.
+        //
+        // `projects.read`, not `projects.manage`, and that is the load-bearing choice: the handler
+        // writes nothing and locks nothing, so requiring management would mean a viewer may read
+        // every workflow on screen and may not read them in a file — "read it here but not there"
+        // is the split (`visible_project_ids` vs `find_visible`) this surface has already paid for
+        // once. Project visibility itself is resolved in the handler through `find_visible`, so a
+        // foreign project is a `404` whose body never names it.
+        .route(
+            "/projects/{id}/export",
+            get(automation_projects::export_project)
+                .layer(guards::require(state, "projects.read")),
+        )
         // `/workflows/{id}/move` lives under workflows, not projects: the path names what is
         // being moved and the project is the destination. Declared here beside the other project
         // routes so the one permission that guards it is visible with the rest of the surface.
