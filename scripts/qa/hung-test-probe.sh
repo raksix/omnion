@@ -55,13 +55,32 @@ find_pid() {
 
 PID="$(find_pid)" || { echo "no process matches '$BINARY' — it may have finished; check the log first" >&2; exit 1; }
 
+# CPU of the WHOLE process, summed over every thread — not of `/proc/<pid>/stat`, which is the
+# main thread only.
+#
+# This is the second defect this script has had in the two ticks it has existed, and it is the one
+# that matters most: libtest runs each test on its own thread, so while a walk is working the
+# main thread sits in `futex_do_wait` at zero CPU and the CPU actually being burned is on the
+# test thread (`/proc/<pid>/task/<tid>/comm` is the test's name, so the running test is readable
+# by name). A probe that reports the main thread answers "this process is idle" about a suite
+# that is halfway through a walk, and "moving" about one that is frozen — which is worse than
+# printing nothing, because the reader believes it.
 cpu_of() {
-  local stat rest
-  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || { echo "gone"; return; }
-  rest="${stat#*) }"
-  # after the comm field: state ppid pgrp session tty_nr tpgid flags minflt cminflt
-  # majflt cmajflt utime stime
-  echo "$(echo "$rest" | awk '{print $12" "$13}')"
+  local total=0 tid
+  for tid in /proc/"$1"/task/*; do
+    # `stat` field 2 is the comm *in parentheses* and contains spaces, so awk's split shifts
+    # every field after it; cut at the final `)` first, then utime/stime are $12 and $13.
+    local ticks
+    ticks="$(sed 's/.*) //' "$tid/stat" 2>/dev/null | awk '{print $12 + $13}')"
+    case "$ticks" in
+      '' | *[!0-9]*) continue ;;
+      *) total=$((total + ticks)) ;;
+    esac
+  done
+  # `total` is clock ticks summed over all threads. A single tick is 10 ms; printing it raw is
+  # fine because the finding is the DELTA, and a delta of 0 is what "not working" looks like.
+  [ "$total" -gt 0 ] || { echo "gone"; return; }
+  echo "$total 0"
 }
 
 # `/proc/<pid>/task` is the whole picture; `Threads:` in `status` is one line of it, and
@@ -94,9 +113,8 @@ if [ "$A" = "gone" ] || [ "$B" = "gone" ]; then
 elif [ -z "$B" ]; then
   echo "  CPU delta: (unreadable)"
 else
-  DELTA="$(awk -v a="$A" -v b="$B" '{print (b1-a1), (b2-a2)}' </dev/null 2>/dev/null; \
-          echo "$A $B" | awk '{print ($3-$1), ($4-$2)}')"
-  echo "  CPU delta (utime stime): $DELTA"
+  DELTA="$(echo "$A $B" | awk '{print ($3-$1), ($4-$2)}')"
+  echo "  CPU delta (utime stime, all threads): $DELTA"
   echo "$DELTA" | grep -q '^0 0' \
     && echo "  -> ZERO: not working. Waiting on a future or a lock. Not slow I/O." \
     || echo "  -> moving: genuinely slow or genuinely working; check load before blaming it."
