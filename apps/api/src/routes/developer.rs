@@ -224,6 +224,8 @@ pub async fn create_key(
 ) -> Result<(StatusCode, Json<MintedResponse>), ApiError> {
     let organization_id = organization_of(&current)?;
     let environment = Environment::parse(&input.environment).map_err(ApiError::from)?;
+    refuse_undelegable_scopes(state.db().pool(), current.user.id, organization_id, &input.scopes)
+        .await?;
     let rate_tier = match input.rate_tier.as_deref() {
         None | Some("") | Some("standard") => RateTier::Standard,
         Some("high") => {
@@ -453,6 +455,61 @@ pub(crate) fn organization_of(current: &CurrentSession) -> Result<Uuid, ApiError
             "an API key belongs to an organization; a platform account has no key to manage",
         )
     })
+}
+
+/// Refuse a key that carries a scope its issuer does not hold.
+///
+/// **This gate was missing entirely, and the walk that exists to catch it had never run.** It was
+/// written three ticks ago and every run reported `8 passed in 0.08 s` — eight SKIPs, because a
+/// refused database connection and a passing walk print the same line. The first run that reached a
+/// live database answered `201` to a request for a key carrying `iam.users.manage` from an account
+/// holding only `developer.keys.manage`, and the store wrote it. That is a privilege escalation
+/// through the API-key surface: `developer.keys.manage` was supposed to mean "manage the keys you
+/// are allowed to delegate", and it meant "mint a key with any scope in the catalogue".
+///
+/// The check is the caller's **effective** permissions for the same organization scope, which is
+/// what [`list_scopes`] already derives its `grantable` flag from — so the picker and the create
+/// route now answer from one source and cannot disagree. Reading the catalogue instead would be
+/// wrong: a catalogue entry says the permission *exists*, not that this account holds it.
+///
+/// The refusal names the offending scope and points at the field. Naming it matters more than the
+/// status code: an operator who typed `iam.users.manage` by mistake needs to be told *that* is the
+/// problem, not that the request was invalid.
+async fn refuse_undelegable_scopes(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    organization_id: Uuid,
+    scopes: &[String],
+) -> Result<(), ApiError> {
+    if scopes.is_empty() {
+        // The store already refuses an empty scope list; returning early here keeps this gate
+        // about delegation rather than about validation, so the two errors stay distinguishable.
+        return Ok(());
+    }
+    let effective = omnion_permissions::effective_permissions(
+        pool,
+        user_id,
+        omnion_permissions::Scope::Organization { organization_id },
+    )
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("could not resolve the caller's permissions: {error}"),
+        )
+    })?;
+
+    if let Some(refused) = scopes.iter().find(|scope| !effective.allows(scope)) {
+        return Err(ApiError::bad_request(
+            "scope_not_delegable",
+            format!(
+                "{refused:?} is not a permission you hold, so a key you create cannot carry it"
+            ),
+        )
+        .with_details(json!({ "scope": refused, "field": "scopes" })));
+    }
+    Ok(())
 }
 
 /// Whether this account may mint a key on the `high` tier.

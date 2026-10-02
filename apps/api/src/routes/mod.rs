@@ -1728,12 +1728,26 @@ pub fn router(state: AppState) -> Router {
     // permission chosen is `content.pages.read` because it is a real, catalogued read that a
     // publisher's integration genuinely needs, so the walk exercises the production shape
     // rather than a purpose-made one.
+    //
+    // It is guarded by **`developer_auth::require_or_key`, not `guards::require_or_developer_key`**,
+    // and the difference is not stylistic. Both accept a key in place of a session and both check
+    // its scopes, but only the `developer_auth` layer records the use afterwards — the request-log
+    // row and the `last_used_at` bump. The `guards` twin authenticates and then returns, so
+    // `last_used_at` stayed null for every request made through this route and the panel's
+    // "Last used" column read "never" for a key that had just called in. The walk
+    // `a_key_authenticates_a_guarded_call_and_dies_the_moment_it_is_revoked` caught it the first
+    // time it reached a database: the request returned 200 and the row said the key was unused.
+    //
+    // `guards::require_or_developer_key` is therefore unused. It is kept out of the router rather
+    // than deleted here — `guards.rs` is shared with every other writer's routes, so removing it
+    // belongs to whoever owns that file. What belongs to this REQ is that **no route this branch
+    // adds is guarded by the twin**: one guard that authenticates and one that authenticates
+    // *and accounts* is exactly the pair that lets a column silently stop being true.
     let developer_guarded = Router::new().route(
         "/developer/sandbox/probe",
-        get(developer_portal_extras::sandbox_probe).layer(guards::require_or_developer_key(
-            &state,
-            "content.pages.read",
-        )),
+        get(developer_portal_extras::sandbox_probe).layer(
+            crate::developer_auth::require_or_key(&state, "content.pages.read"),
+        ),
     );
 
     let security_reports = Router::new()

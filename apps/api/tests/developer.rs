@@ -320,6 +320,19 @@ async fn create_organization_row(db: &Db) -> Uuid {
 }
 
 /// Create a key through the API and return its id and its **one and only** plaintext.
+///
+/// Both halves of this helper are the contract, and each was wrong once, in the same direction:
+/// the body omitted `environment` and the response was read as a nested `key`/`token`. Every walk
+/// therefore died at `422 missing field 'environment'` and none of them had ever been observed
+/// green — the suite *compiled* for three ticks while measuring nothing, because an unwalked walk
+/// and a passing one print the same `test result` line. Two ways in kept it honest:
+///
+/// * the body below is built by [`create_key_body`], which every walk uses, so "what the create
+///   route requires" is written down once rather than repeated into a shape that can rot;
+/// * the read below goes through [`minted_fields`], which asserts the **flattened** shape
+///   (`id` beside `secret`, not `key.id`/`token`) in one place. `MintedResponse` flattens
+///   `ApiKey` deliberately, so `secret` is a sibling of `id` — reading `body["key"]["id"]` finds
+///   `null` and `expect` panics with "the id must be there", which is how this was found.
 async fn create_key(
     harness: &Harness,
     credential: &str,
@@ -329,7 +342,7 @@ async fn create_key(
     let response = harness
         .call(post(
             "/api/v1/developer/api-keys",
-            json!({ "name": name, "scopes": scopes }),
+            create_key_body(name, scopes, "live"),
             Some(credential),
         ))
         .await;
@@ -339,13 +352,35 @@ async fn create_key(
         "the key must be created: {}",
         response.text
     );
-    let id = Uuid::parse_str(response.body["key"]["id"].as_str().expect("the id must be there"))
-        .expect("the id must be a uuid");
-    let token = response.body["token"]
+    minted_fields(&response.body)
+}
+
+/// The body `POST /api/v1/developer/api-keys` requires.
+///
+/// `name`, `scopes` and `environment` have no `#[serde(default)]`, so omitting any one of them is
+/// a `422` **before the handler runs** — which is why a walk that forgets one cannot be
+/// distinguished from a walk testing the wrong thing until you read the status. Every walk builds
+/// its body here so that omission is a one-place defect.
+fn create_key_body(name: &str, scopes: &[&str], environment: &str) -> Value {
+    json!({ "name": name, "scopes": scopes, "environment": environment })
+}
+
+/// Read `(id, secret)` out of a create/rotate response, asserting the flattened shape.
+///
+/// `MintedResponse` is `{ #[serde(flatten)] key: ApiKey, secret: String }`, so the key's own
+/// fields sit beside `secret`. The assertions name the two halves separately so a future
+/// response change reports *which* field moved instead of a bare "the id must be there".
+fn minted_fields(body: &Value) -> (Uuid, String) {
+    let id = body["id"]
         .as_str()
-        .expect("the create response carries the token once")
-        .to_owned();
-    (id, token)
+        .unwrap_or_else(|| panic!("the create response must carry a top-level `id`: {body}"));
+    let secret = body["secret"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the create response must carry `secret` once: {body}"));
+    (
+        Uuid::parse_str(id).expect("the id must be a uuid"),
+        secret.to_owned(),
+    )
 }
 
 // --------------------------------------------------------------------------------------------
@@ -477,13 +512,23 @@ async fn rotation_kills_the_previous_secret_immediately_and_keeps_the_old_row() 
         ))
         .await;
     assert_eq!(rotated.status, StatusCode::OK, "rotate: {}", rotated.text);
-    let new_token = rotated.body["token"]
-        .as_str()
-        .expect("rotate carries the new token once")
-        .to_owned();
-    let new_id = Uuid::parse_str(rotated.body["key"]["id"].as_str().expect("the successor id"))
-        .expect("the successor id must parse");
-    assert_ne!(new_id, old_id, "rotation must be a NEW row, or the history is gone");
+    // Same flattened shape as the create response — rotate returns `MintedResponse` too, so the
+    // read goes through the same helper rather than re-typing the path.
+    let (new_id, new_token) = minted_fields(&rotated.body);
+
+    // Rotation is **in place**: one row, a new secret, `rotated_at` stamped. This walk used to
+    // assert the opposite — a new row plus a `rotated_from` chain — because it was written
+    // against main's `0240`, whose `api_keys` had a `rotated_from uuid`. The `0240` merge kept
+    // this branch's `0223` instead (its own header tabulates the disagreement), and `0223` records
+    // a rotation as `rotated_at timestamptz` on the same row. The claim followed a schema that was
+    // deliberately discarded, so it was measuring a design that does not exist here — and a walk
+    // that cannot pass is a walk that teaches nothing. Restated against what the schema says:
+    // the row keeps its identity, its history stays addressable, and it records that it rotated.
+    assert_eq!(
+        new_id, old_id,
+        "rotation is in place on this branch: one row keeps its id so its log history stays \
+         addressable, and `rotated_at` records that it happened"
+    );
 
     // The old secret, byte for byte the one that just worked.
     assert_eq!(
@@ -503,32 +548,28 @@ async fn rotation_kills_the_previous_secret_immediately_and_keeps_the_old_row() 
         "the new secret must authenticate"
     );
 
-    // The predecessor keeps its row — that is what keeps its usage history addressable.
-    let predecessor: (Option<time::OffsetDateTime>, Option<Uuid>) =
-        sqlx::query_as("select revoked_at, rotated_from from api_keys where id = $1")
+    // The row survives with its identity intact — that is what keeps its usage history
+    // addressable, which the alternative (a new row) would have thrown away.
+    let rotated_at: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("select rotated_at from api_keys where id = $1")
             .bind(old_id)
             .fetch_one(harness.db.pool())
             .await
-            .expect("the predecessor row must survive");
+            .expect("the key row must survive rotation");
     assert!(
-        predecessor.0.is_some(),
-        "the predecessor is revoked, not deleted: its log rows still name it"
-    );
-    assert_eq!(
-        predecessor.1, None,
-        "the predecessor is the root of the chain, so it points at nothing"
+        rotated_at.is_some(),
+        "rotation must record when it happened, or the panel's 'rotated' column is a guess"
     );
 
-    let successor: Option<Uuid> =
-        sqlx::query_scalar("select rotated_from from api_keys where id = $1")
-            .bind(new_id)
-            .fetch_one(harness.db.pool())
-            .await
-            .expect("the successor row must exist");
+    // And it is still a usable key: rotation replaces the secret, it does not withdraw the key.
+    let status: (String,) = sqlx::query_as("select status from api_keys where id = $1")
+        .bind(old_id)
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the key row must still be readable");
     assert_eq!(
-        successor,
-        Some(old_id),
-        "the successor must name its predecessor, or the chain cannot be drawn"
+        status.0, "active",
+        "rotation replaces the secret; it does not revoke the key"
     );
 
     harness.dispose().await;
@@ -562,7 +603,7 @@ async fn a_key_cannot_be_minted_with_a_scope_its_issuer_does_not_hold() {
     let refused = harness
         .call(post(
             "/api/v1/developer/api-keys",
-            json!({ "name": "Escalation", "scopes": [PROBE_SCOPE, UNDELEGATABLE] }),
+            create_key_body("Escalation", &[PROBE_SCOPE, UNDELEGATABLE], "live"),
             Some(&credential),
         ))
         .await;
@@ -901,7 +942,7 @@ async fn the_offered_environments_are_the_ones_the_server_accepts() {
         let created = harness
             .call(post(
                 "/api/v1/developer/api-keys",
-                json!({ "name": name, "scopes": [PROBE_SCOPE], "environment": environment }),
+                create_key_body(&name, &[PROBE_SCOPE], environment),
                 Some(&credential),
             ))
             .await;
@@ -912,8 +953,7 @@ async fn the_offered_environments_are_the_ones_the_server_accepts() {
              that submits and is then rejected: {}",
             created.text
         );
-        let id = Uuid::parse_str(created.body["key"]["id"].as_str().expect("the id must be there"))
-            .expect("the id must be a uuid");
+        let (id, _secret) = minted_fields(&created.body);
         let stored: (String,) = sqlx::query_as("select environment from api_keys where id = $1")
             .bind(id)
             .fetch_one(harness.db.pool())
@@ -1070,10 +1110,16 @@ async fn the_migration_applies_to_a_populated_database() {
         .execute(harness.db.pool()).await.expect("drop the rollup table");
     sqlx::query("drop table if exists api_request_logs cascade")
         .execute(harness.db.pool()).await.expect("drop the log table");
+    // `oauth_apps` is created by **0231**, not by `0240`, and `0240` hangs a foreign key off it
+    // (`oauth_authorizations.app_id references oauth_apps(id)`). Dropping it while leaving the
+    // ledger at 231 leaves the migration ledger claiming a table exists that does not, and the
+    // re-apply dies at `relation "oauth_apps" does not exist` — which is what this walk reported
+    // the first time it ran. The drop list has to be the set of tables `0240` *and its declared
+    // prerequisites* own, and that set is read off the migration's own foreign keys rather than
+    // guessed. `0231`'s tables are left in place, matching the ledger, which is what an upgrade
+    // from a database that already has them looks like.
     sqlx::query("drop table if exists oauth_authorizations cascade")
         .execute(harness.db.pool()).await.expect("drop the authorizations table");
-    sqlx::query("drop table if exists oauth_apps cascade")
-        .execute(harness.db.pool()).await.expect("drop the apps table");
     // `api_keys` is dropped, and the row in it goes with it — which is why the duplicate-name
     // half of this walk re-creates one *after* the re-apply rather than expecting the original
     // to still be there.
@@ -1104,7 +1150,7 @@ async fn the_migration_applies_to_a_populated_database() {
     let response = harness
         .call(post(
             "/api/v1/developer/api-keys",
-            json!({ "name": "Pre-existing", "scopes": [PROBE_SCOPE] }),
+            create_key_body("Pre-existing", &[PROBE_SCOPE], "live"),
             Some(&credential),
         ))
         .await;
