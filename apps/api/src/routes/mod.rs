@@ -1865,6 +1865,29 @@ pub fn router(state: AppState) -> Router {
             "/crm/leads/bulk-assign",
             post(crm_intake::bulk_assign).layer(guards::require(&state, "crm.leads.assign")),
         )
+        // The bulk bar's other three verbs, in ONE endpoint rather than three.
+        //
+        // `crm.leads.manage` — the same key `/{id}/respond`, `/{id}/spam` and `/{id}/reject`
+        // already carry, one row at a time. A batch needing a *different* key would mean the
+        // power was cheap per row and expensive in bulk, which is a privilege nobody was
+        // granted and no operator expects. The verb is a closed enum in the body, so a typo is
+        // a `400` naming the three real names rather than an `else` arm that "responded" twenty
+        // leads.
+        .route(
+            "/crm/leads/bulk-action",
+            post(crm_intake::bulk_action).layer(guards::require(&state, "crm.leads.manage")),
+        )
+        // The export. `crm.leads.read`: it writes one audit row and downloads a document of
+        // what the caller may already read, which is the same contract as every other export
+        // on this platform (the security findings CSV is exactly this shape).
+        //
+        // Declared here, before `/crm/leads/{id}`, and so is `bulk-assign` — axum ranks a
+        // static segment ahead of a parameter, so both would match anyway; the ordering puts
+        // the intent in the file rather than leaving it to a matcher.
+        .route(
+            "/crm/leads/export",
+            get(crm_intake::export_leads).layer(guards::require(&state, "crm.leads.read")),
+        )
         .route(
             "/crm/leads/retention/sweep",
             post(crm_intake::retention_sweep).layer(guards::require(&state, "crm.leads.manage")),

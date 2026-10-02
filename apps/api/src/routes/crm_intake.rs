@@ -34,6 +34,7 @@
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -48,6 +49,7 @@ use omnion_module_crm_intake::model::{IntakeSource, Lead, LeadEvent, LeadOwner};
 use omnion_module_crm_intake::store::{self, LeadQuery, SourcePatch};
 use omnion_module_crm_intake::timestamp;
 use omnion_module_crm_intake::{CrmIntakeError, LeadMetrics, MappingEntry, NewIntakeSource};
+use omnion_module_crm_intake::{bulk, export};
 
 use crate::auth::CurrentSession;
 use crate::client_ip::ClientAddress;
@@ -85,6 +87,15 @@ pub struct LeadsQuery {
     pub before: Option<String>,
     /// Page size.
     pub limit: Option<i64>,
+    /// A selection: the exact rows, ignoring every filter above.
+    ///
+    /// **Only the export reads it, and it is deliberately outside `LeadQuery`.** The inbox's
+    /// `list_leads` takes a `LeadQuery` — which has no notion of "these ids" — so adding the
+    /// field to the shared query struct would give every filter a clause that never matches
+    /// and is silently ignored by the one read that does not implement it. A selection is a
+    /// different question ("these twenty"), not a filter, and the export answers it by reading
+    /// each row through `find_lead`, which is where the tenant check already lives.
+    pub ids: Option<Vec<Uuid>>,
 }
 
 /// A source create's body.
@@ -1870,6 +1881,265 @@ pub struct BulkAssignBodyOut {
     pub summary: String,
     /// Per lead, in the order they were named.
     pub results: Vec<BulkAssignRow>,
+}
+
+/// `POST /api/v1/crm/leads/bulk-action` — one of the bar's other verbs, over a selection.
+///
+/// ## Why this is one endpoint and not three
+///
+/// `bulk-assign` answers `owner_user_id` and `reason`; the three verbs here answer `action` and
+/// `reason`. **Three separate endpoints would be three guards, three audits and three report
+/// shapes** for what is one press with one result per row — and the panel already renders the
+/// report. The verb is a closed enum in the body (`bulk::BulkActionWire`), never a bare string,
+/// so a typo is a `400` that names the three real names rather than an `else` arm that
+/// "responded" twenty leads.
+///
+/// ## The permission is `crm.leads.manage`, and it is the same key the single-lead routes use
+///
+/// Marking a lead responded, filing it as spam and rejecting it are each already `crm.leads.manage`
+/// one row at a time (`/{id}/respond`, `/{id}/spam`, `/{id}/reject`). A batch that needed a
+/// *different* key would mean the same power was cheap per-row and expensive in bulk, which is
+/// a privilege nobody was granted and no operator expects: the person who may answer five leads
+/// may answer twenty, and the person who may reject one may reject twenty.
+///
+/// ## The report, not a count
+///
+/// Each lead is its own transaction, for the hand-over's reason: one spam row in twenty must not
+/// roll back nineteen responses, and "failed" about work that already happened invites the
+/// operator to press again — which, for `respond`, is harmless (it is idempotent on the instant)
+/// and for the verdicts writes a second trail line per row. The report says which landed and
+/// what the rest said.
+pub async fn bulk_action(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Json(body): Json<BulkActionBody>,
+) -> Result<Json<BulkAssignBodyOut>, ApiError> {
+    let Some(action) = body.action.get() else {
+        return Err(ApiError::bad_request(
+            "unknown_bulk_action",
+            format!(
+                "\"action\" must be one of {}",
+                bulk::BulkAction::ALL
+                    .iter()
+                    .map(|verb| verb.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    };
+    let organization_id = organization_of(&session)?;
+    let report = bulk::run_action(
+        state.db().pool(),
+        organization_id,
+        &body.ids,
+        action,
+        &body.reason,
+        Some(session.user.id),
+    )
+    .await
+    .map_err(map_store)?;
+
+    audit(
+        state.db().pool(),
+        session.user.id,
+        organization_id,
+        "crm.lead.bulk_action",
+        body.ids.first().copied().unwrap_or(uuid::Uuid::nil()),
+        json!({
+            "action": action.as_str(),
+            "reason": body.reason.trim(),
+            "bulk": body.ids.len(),
+            "applied": report.applied(),
+        }),
+    )
+    .await;
+
+    Ok(Json(bulk_report_out(report, action)))
+}
+
+/// One report → the wire shape, shared by the hand-over and this verb.
+///
+/// **Two functions, one shape.** The hand-over's own body was left where it was — it is already
+/// gated by `run-crm-assign.sh` — but the conversion is shared so a third bulk verb cannot grow
+/// a third report type with its own `applied` and its own `summary` that means something else.
+fn bulk_report_out(report: bulk::BulkReport, action: bulk::BulkAction) -> BulkAssignBodyOut {
+    let _ = action;
+    BulkAssignBodyOut {
+        applied: report.applied(),
+        refused: report.refused(),
+        summary: report.summary(),
+        results: report
+            .results
+            .into_iter()
+            .map(|row| BulkAssignRow {
+                id: row.id,
+                done: row.done,
+                reason: row.reason,
+            })
+            .collect(),
+    }
+}
+
+/// The body of `POST /crm/leads/bulk-action`.
+#[derive(Debug, Default, Deserialize)]
+pub struct BulkActionBody {
+    /// The leads, in the order the panel listed them.
+    pub ids: Vec<Uuid>,
+    /// Which verb, as one of the three the bar carries.
+    ///
+    /// **A newtype rather than `String`, and the difference is the error the operator sees.**
+    /// `#[serde(rename_all = "snake_case")]` on a fieldless enum turns `action: "delate"` into
+    /// serde's own wording — `unknown variant \`delate\`, expected one of …` — wrapped in a
+    /// `422` the panel renders as a body error. The newtype deserializes it to `None` and this
+    /// handler answers `400` naming the three real verbs, which is a sentence an operator can
+    /// act on.
+    #[serde(default)]
+    pub action: bulk::BulkActionWire,
+    /// The reason, required for a rejection and carried on the trail line for the other two.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// `GET /api/v1/crm/leads/export` — the selection, or the whole filter, as a CSV download.
+///
+/// ## The export is the filter, not the page
+///
+/// This is the one read in the file that is **not** a page. `list_leads` is capped at
+/// [`omnion_module_crm_intake::MAX_PAGE`] and returns a cursor, because an inbox that loads
+/// every lead is an inbox that never opens; an export has no such problem — it is a document the
+/// operator asked for, and an operator who filtered to "breached" and got the visible fifty of
+/// three hundred has produced a file that reads as a complete list and is not one. So this
+/// handler climbs the cursor until the filter is exhausted, bounded by
+/// [`omnion_module_crm_intake::MAX_EXPORT_ROWS`] and **refusing** rather than truncating: a
+/// truncated file is indistinguishable from a complete one at exactly the point where it does
+/// damage.
+///
+/// ## A selection is a selection
+///
+/// `ids` names rows directly and bypasses the filter entirely, so "export what I ticked" and
+/// "export what I am looking at" cannot be confused for one another — which is the defect the
+/// first version of this handler would have shipped, since a filter with a selection applied to
+/// it answers something neither the operator nor the panel intended.
+///
+/// ## Served as a download, not as a JSON body
+///
+/// `attachment` + `text/csv` + `no-store`, and the panel's button is a real anchor, because a
+/// CSV opened inline from the API's own origin is one click from being executed by whatever
+/// MIME sniffer the browser has.
+pub async fn export_leads(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Query(params): Query<LeadsQuery>,
+) -> Result<Response, ApiError> {
+    let organization_id = organization_of(&session)?;
+    let pool = state.db().pool();
+
+    let rows = match params.ids.as_deref() {
+        // A selection is read **row by row through `find_lead`**, which is the tenant filter.
+        //
+        // The first version of this branch reused `bulk::run_action` "because it already knows
+        // which of the twenty are mine" — and that would have made an EXPORT stop twenty SLA
+        // clocks, because the only read-shaped verb on the action pipeline is `Respond`, which
+        // writes. **A read that borrows a write's plumbing is a write nobody has noticed**, and
+        // `find_lead` was right there: one indexed lookup per id, the same tenancy answer, and
+        // it cannot change a row.
+        Some(ids) => {
+            let mut rows = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(lead) = store::find_lead(pool, organization_id, *id)
+                    .await
+                    .map_err(map_store)?
+                {
+                    rows.push(lead);
+                }
+            }
+            rows
+        }
+        None => export_filter(pool, organization_id, &params, session.user.id).await?,
+    };
+
+    let document = export::render(&rows).map_err(map_store)?;
+    let stamp = timestamp::rfc3339(OffsetDateTime::now_utc())
+        .replace([':', '-'], "")
+        .replace('T', "-");
+    let filename = format!("leads-{stamp}.csv");
+
+    audit(
+        pool,
+        session.user.id,
+        organization_id,
+        "crm.lead.exported",
+        rows.first().map(|lead| lead.id).unwrap_or(uuid::Uuid::nil()),
+        json!({
+            "rows": rows.len(),
+            "filter": params.q.clone(),
+            "selection": params.ids.is_some(),
+        }),
+    )
+    .await;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    // `attachment`, never `inline`: a CSV served from the API's own origin, next to the panel,
+    // is one click away from a browser's MIME sniffer.
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+        "attachment; filename=\"{filename}\""
+    )) {
+        headers.insert(axum::http::header::CONTENT_DISPOSITION, value);
+    }
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok((StatusCode::OK, headers, document).into_response())
+}
+
+/// Read the whole filter, page by page, up to the export ceiling.
+///
+/// **The loop stops on the ceiling rather than reading everything and refusing afterwards**, so a
+/// tenant with a million leads gets a refusal in bounded time and memory instead of a
+/// synchronous response that builds a gigabyte of rows first. The refusal is the store's own
+/// sentence (`bulk::TooManyRows`), so there is exactly one place that knows what the number is.
+async fn export_filter(
+    pool: &sqlx::PgPool,
+    organization_id: Uuid,
+    params: &LeadsQuery,
+    acting_user_id: Uuid,
+) -> Result<Vec<Lead>, ApiError> {
+    let mut rows: Vec<Lead> = Vec::new();
+    let mut query = build_lead_query(params, acting_user_id)?;
+    // The panel's `limit` is a *page* size and is deliberately ignored: "export what I am
+    // looking at" means the filter, not the fifty rows currently on screen. A caller that sends
+    // `limit=200` to fetch more is answered with the whole filter, which is what the button
+    // promised and the only reading that does not silently under-export.
+    query.limit = omnion_module_crm_intake::MAX_PAGE;
+    query.before = None;
+    loop {
+        let page = store::list_leads(pool, organization_id, &query)
+            .await
+            .map_err(map_store)?;
+        rows.extend(page.leads);
+        let Some(cursor) = page.next_before else {
+            break;
+        };
+        // **The ceiling is checked against the rows already read**, so a tenant with a million
+        // leads is refused in bounded time and memory rather than after a synchronous response
+        // has built every row first. `next_before` is the `received_at` of the last row on the
+        // page just read, so the next iteration starts strictly before it and cannot repeat
+        // it — which is why the cursor is taken from the page rather than recomputed, and why
+        // a re-run of the loop cannot duplicate a row.
+        if rows.len() > omnion_module_crm_intake::MAX_EXPORT_ROWS {
+            return Err(ApiError::bad_request(
+                "export_too_large",
+                bulk::TooManyRows(rows.len()).to_string(),
+            ));
+        }
+        query.before = Some(cursor);
+    }
+    Ok(rows)
 }
 
 /// `GET /api/v1/crm/leads/owners` — who a lead can be handed to, and what they already hold.
