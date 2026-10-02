@@ -68,6 +68,18 @@ reap
 
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  # Reap INSIDE the loop, not once before it. A place whose holder dies while we are
+  # queued for it is the common case, not the rare one: the pass that owns the place is a
+  # browser pass that can be killed by the box (OOM, a tab crash that takes the process
+  # with it, the loop's own timeout) and its EXIT trap never runs. Reaping once at startup
+  # only cleans up places that were already dead when *this* script started, so a holder
+  # that dies mid-queue is invisible forever — every later pass then prints "waiting for a
+  # QA slot", blocks for the full QA_SLOT_WAIT, and proceeds with a report that never had
+  # a walkthrough in it. Observed on 2026-10-02 (tick 76): a place whose holder died at
+  # 07:53 wedged a pass that had been queued since 07:13 — 49 minutes of the queue for a
+  # holder that was already gone. `count_places` counts files, so an unreclaimed place
+  # reads as full capacity and the queue never drains.
+  reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"

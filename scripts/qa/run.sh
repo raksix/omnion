@@ -200,9 +200,21 @@ step "API on :$API_PORT (database omnion_qa)"
 # from a pass that ran before the fix keeps panicking on a route that has since been corrected.
 # That is why the process is deleted and started rather than restarted.
 API_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/omnion-api"
+# **Source counts as stale, not just migrations.** The original test compared the binary
+# against `database/migrations/*.sql` only, which catches a new migration and nothing else:
+# a pure code fix leaves the newest migration older than the binary, the check passes, the
+# build is skipped and pm2 starts the previous binary. The pass then measures code that is
+# no longer in the tree and reports defects against it — observed on 2026-10-02 (tick 76):
+# commit 936eae4e (07:36, `fix(ai-eval): decode the run's model key as one column, not a
+# tuple`, which made every model-targeted eval run 500) landed four minutes AFTER the binary
+# was built (07:32), no migration was involved, so the check declared the binary fresh and
+# the pass would have re-measured the exact 500 the commit had just removed. `cargo build`
+# is itself incremental, so including sources costs a mtime walk when nothing changed and
+# a near-no-op compile when something did.
 if [ ! -x "$API_BIN" ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ]; then
-  step "building the API (first pass, or a migration changed since the last build)"
+   || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ] \
+   || [ -n "$(find crates apps/api -name '*.rs' -newer "$API_BIN" -print -quit 2>/dev/null)" ]; then
+  step "building the API (first pass, or the tree changed since the last build)"
   # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
   # compiling at once instead of every pass grabbing all six threads for itself.
   "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
