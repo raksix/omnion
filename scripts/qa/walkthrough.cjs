@@ -12727,9 +12727,13 @@ async function main() {
   // column back, the run sheet's 409 offered as a link, and the trace's arguments behind a tap.
   if (inScope("ai")) {
     report.aiAgents = await runDepthPass("ai-agents", () => runAiAgentsDepth(page, report));
-  // The skills registry's pass (REQ-099, slice 3): a custom skill with a bad tool key, the
-  // validation error that NAMES it, the fix, the attach, and a reorder checked against the
-  // server's own order rather than the table's.
+  }
+  log(`ai agents: ${JSON.stringify(report.aiAgents)}`);
+  // The AI tool registry's pass (REQ-099, slice 2). It used to sit INSIDE the agents block
+  // above — that `if` opened and then closed four passes later, so tools, skills and identities
+  // only ran when the agents predicate was true. Same predicate, so nothing was skipped in
+  // practice, but a pass four levels deep in someone else's scope is one edit away from three
+  // screens quietly going unwalked.
   if (inScope("ai")) {
     report.aiTools = await runDepthPass("ai-tools", () => runAiToolsDepth(page, report));
   }
@@ -12747,7 +12751,6 @@ async function main() {
     );
   }
   log(`ai identities: ${JSON.stringify(report.aiIdentities)}`);
-  }
   // The approval gate (REQ-101, slice 1). Its own pass, after the identities one, because it
   // reads the policy table the same way — against the database, not the screen — and because the
   // review route is a detail screen that needs a planted row to be worth walking at all.
@@ -12773,7 +12776,6 @@ async function main() {
     );
   }
   log(`ai change sets: ${JSON.stringify(report.aiChangeSets)}`);
-  log(`ai agents: ${JSON.stringify(report.aiAgents)}`);
 
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
   // two files are selected so the bulk bar appears, one is trashed, and the trash brings it back.
