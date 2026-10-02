@@ -1685,7 +1685,6 @@ pub fn is_check_violation(error: &sqlx::Error) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
-    use sqlx::Execute as _;
     use time::Date;
 
     fn changes() -> ContactChanges {
