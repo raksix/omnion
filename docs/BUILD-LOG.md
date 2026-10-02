@@ -11804,3 +11804,66 @@ my own tree, which `lsof` showed held by nothing.
 **Next:** the browser pass on a free slot (`--only=media`, reading `mediaFileDetail` and the four
 filter steps out of `summary.json`), which closes REQ-010's screen-states box. The remaining half
 of the purge hook — `crates/cdn` itself — is REQ-011's slice 2.
+
+### tick 104 — the two halves of "the message", and why one test could never have seen either
+
+REQ-013's `partial`-run criterion asks for the failing part's message to be *visible in the
+UI*. Reading it as two claims rather than one produced two defects, and they are not the same
+defect.
+
+**The store kept one failure out of several.** `finish_run` wrote the run's `error` column from
+`find(...)` over the failed parts. `find` returns the first match, so a run whose media copy
+and whose database export both failed recorded one of them. The sharp part is *which* shape
+gets truncated: `partial` is only reachable when at least one part succeeded and at least one
+failed (`summarise`: `done == 0` → `Failed`, `failed == 0` → `Succeeded`). **The discarded
+shape is the shape the state exists for.** An operator with two broken parts was handed one
+reason, fixed it, watched the run stay red, and had no sentence left for the second.
+`summarise_failure` now sits beside `summarise` — the state and the reason, two pure functions
+side by side — keeps every message, joins in `PARTS` order so two runs with the same failures
+produce the same sentence, and clamps through the existing `truncate_error` because the column
+is `text` and a producer's message is unbounded before it arrives here.
+
+**The list had never drawn the reason at all.** `run.error` has been on every row of
+`GET /api/v1/backups` since slice 1 and `backups-view.tsx` never referenced it. The detail
+panel draws it, which is exactly why this survived: the defect reads as "the reason is one
+click away" on a screen whose whole job is to tell an operator which run to click. A red run
+was a coloured pill and nothing else.
+
+**Why every existing assertion was green.** `summarise` reports the *state*, and the state was
+right at every commit in this module's history. A test on the state cannot see a sentence that
+lost a message, and a screenshot of a healthy stack cannot either — the drawer's create button
+always asks for all five parts, so nothing on this screen ever failed. The six new tests assert
+the sentence itself, and the old state assertions are untouched and still green.
+
+The walkthrough grows the step that could have caught it. It does not rewrite `backups.status`:
+it points a live `media` row at a key nobody wrote, so the copy loop misses it through the real
+`Storage` exactly as it would in production, then requires the list to show a reason naming the
+failing part *and* the detail panel to show the per-part message, and puts the key back
+afterwards so the stack is not left poisoned.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-backup --lib --quiet` | **159 passed** (was 150), 0 failed |
+| proven to fail | regressing `summarise_failure` to `.take(1)` | **FAILED** — `the plugins failure is missing from "object store refused"` |
+| restored | same command after `cp` back | 159 passed |
+| build | `cargo build -p omnion-api` | exit 0 (13 pre-existing warnings) |
+| types | `bun x tsc --noEmit` (apps/admin) | exit 0 |
+| harness | `node --check scripts/qa/walkthrough.cjs` | clean |
+
+**Browser pass: not run.** The single QA place is held live by `w3` (`pid 2724189`,
+`cwd=/mnt/apopic/omnion-w3`), verified with `kill -0` and `/proc/<pid>/cwd` — a genuinely live
+pass, not a stale holder, so it was left alone. `/mnt/apopic` was at **98 % (1.4 G free)**;
+`run.sh` deletes `apps/{admin,web}/.next` and Turbopack needs ~1.5 G to rebuild, so a pass
+would have died on the disk rather than reported. I reclaimed `target/debug/incremental` from
+my own tree (1.0 G, `lsof` showed no holder) which took it to 1.8 G, and stopped there.
+
+**Next:** the browser pass on a free slot with `--only=backups`, reading `partial-run` and
+`partial-detail` out of `summary.json` — that is what closes this criterion. Slice 4
+(encryption at rest) is the last code slice this REQ owns.
+
+**A note on `rustfmt`:** running it on a crate reorders every `pub use` block and reflows
+unrelated functions — eight files, ~200 lines of churn that had nothing to do with this tick.
+Reverted with `git checkout --` and the export line re-applied by hand. Format the file you
+touched, not the crate.
