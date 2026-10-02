@@ -12636,3 +12636,61 @@ re-run green after the merge.
 fix is one `OnceLock` around the `(AppState, Db)` that `live_state()` builds, with the per-walk
 `seed::ensure` and pipeline seeding kept inside the fixture — that turns 57 setups into 1 without
 weakening a single assertion. Then a full 57-test run, which this suite still has never produced.
+
+## 2026-10-02 — tick 72 · REQ-051 · the fixture's boot bill, paid once (and a fix that was wrong)
+
+**What.** `apps/api/tests/crm.rs` rebuilt the process-global half of its fixture in every one of
+57 walks: the validated config, the connection pool, `db.migrate()` and the full IAM `seed::ensure`.
+That work is global and idempotent — the applied-migration table and the permission catalogue are
+rows in the database, not memory — so it now runs behind an `AtomicBool` and a double-checked
+`tokio::Mutex`, while each walk keeps its own `AppState` and `Db`.
+
+**Measured, not assumed.** `CRM_FIXTURE_TRACE=1` is new and prints every stage:
+
+| stage | cost |
+|---|---|
+| `iam seed` | **11850.3 ms** |
+| `six accounts` | 752.2 ms |
+| `connect+migrate` | 8.3 ms |
+| `grants+pipelines` | 2.6 ms |
+
+The seed was ~94 % of a ~12.6 s fixture. Tick 71 named the six Argon2id hashes; the hash was right
+and the ratio was not — 752 ms against 11 850 ms.
+
+**The first fix was wrong, and the run said so.** Caching the `(AppState, Db)` pair in a
+`tokio::sync::OnceCell` compiles, passes the first walk and breaks every later one: **each
+`#[tokio::test]` builds and tears down its own runtime, and a `PgPool` is bound to the runtime that
+opened it.** The two-walk reproduction is the whole argument —
+
+```
+test a_contact_event_carries_its_organization ... [fixture] pool size=3 idle=2 ... ok
+test a_contact_round_trip_writes_its_audit_row_and_event ... panicked:
+    the test organization must be created: PoolTimedOut
+test result: FAILED. 1 passed; 1 failed; finished in 18.48s
+```
+
+The old per-walk pool was accidentally immune to that bug. Cache the work, not the resource.
+
+**Proof.**
+* `a_contact_round_trip_writes_its_audit_row_and_event` **alone**: `1 passed; finished in 24.55 s`.
+* **First complete run this suite has ever produced** — `--test-threads=1` reached `test result:`
+  for **all 57**: `19 passed; 38 failed … finished in 212.13s (3m32s)`. Every previous tick's best
+  was 4/4. All 38 failures were the same pre-fix `PoolTimedOut`.
+* `hung-test-probe` on the stalled binary: CPU 0 across the window, `tokio-rt-worker` in
+  `futex_do_wait`, PostgreSQL 4–9 backends with 1 active and `locks not granted = 0`, Redis
+  `blocked=0` — the wait is inside the process, exactly as the probe's closing line says.
+
+**Not claimed green.** The corrected build sat in the cargo queue behind eight other writers on a
+box at load 89–222 for the rest of the tick; the post-fix 57-walk run is the next tick's first
+job. Gates `omnion-module-crm --lib` 172/172 and `pnpm typecheck` 2/2 were green on tick 71 and are
+untouched by a test-file change. No acceptance box ticked: the three open ones are browser-only and
+the QA slot was held all tick by the main writer (holder pid alive, cwd `/mnt/apopic/omnion`).
+
+**Also worth recording.** A `cargo test` with no `OMNION_DATABASE_URL` silently connects to the
+**shared** `omnion` database on 5433, where a sibling applied migration 19 as `cms blocks`; all 57
+tests then fail in **0.81 s** with an error that names a migration instead of the missing
+environment variable. Same command, same commit, opposite diagnosis from the 3m32s run — **read
+the elapsed time before the error text.**
+
+**Next:** run the full 57 against `omnion_qa_w4` with `OMNION_DATABASE_URL` exported, then the three
+browser-only boxes when the QA slot frees.
