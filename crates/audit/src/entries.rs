@@ -218,6 +218,53 @@ async fn write(
     Ok(stored)
 }
 
+/// Append an entry **inside a caller's open transaction**, for a mutation that must be auditable
+/// atomically (REQ-133's project deletion).
+///
+/// **Why this exists and why it is a separate function rather than a pool one.** Deleting a
+/// project takes a row lock on the project (`for update`), checks its dependencies and then
+/// deletes it. The audit row has to be written by that same transaction for two reasons, and
+/// neither is about tidiness:
+///
+/// 1. **`audit_log.project_id` is `on delete set null`.** A trail row written by a *pool* write
+///    after the delete commits is a row with a null project — and the project audit screen it was
+///    written for no longer exists to be read from. The instance-wide stream would show
+///    "somebody deleted a project" with no project to point at, which is exactly the row the
+///    operator is looking for after the fact.
+/// 2. **A delete with no trail is the worst possible gap in a trail.** Every other writer on this
+///    module records after its write through the pool, which is fine for a row that still exists;
+///    for the one action that removes the thing, the write and the record have to commit or roll
+///    back together.
+///
+/// The entry is otherwise built exactly as [`record_for_project`] builds it — same columns, same
+/// `project_id` — so the row is indistinguishable from every other project-scoped entry, which is
+/// what keeps `run-project-audit.sh` measuring the same stream.
+pub async fn record_for_project_in(
+    connection: &mut sqlx::PgConnection,
+    entry: NewAuditEntry,
+    project_id: Uuid,
+) -> Result<AuditEntry> {
+    let sql = format!(
+        "insert into audit_log ({AUDIT_INSERT_COLUMNS}) \
+         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet), $9) returning {AUDIT_COLUMNS}"
+    );
+
+    let stored: AuditEntry = sqlx::query_as(&sql)
+        .bind(entry.organization_id)
+        .bind(entry.actor_user_id)
+        .bind(entry.actor_type.as_str())
+        .bind(entry.action)
+        .bind(entry.target_type)
+        .bind(entry.target_id.as_deref())
+        .bind(entry.metadata)
+        .bind(entry.ip_address.as_deref())
+        .bind(project_id)
+        .fetch_one(&mut *connection)
+        .await?;
+
+    Ok(stored)
+}
+
 /// Most recent entries, newest first. `organization_id` filters when given.
 pub async fn recent(
     pool: &PgPool,
