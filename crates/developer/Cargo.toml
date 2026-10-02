@@ -20,5 +20,10 @@ sqlx.workspace = true
 # digest is a timing oracle, because the token's public prefix is printed on the key list.
 subtle = "2"
 thiserror.workspace = true
-time.workspace = true
+# `macros` for `time::macros::datetime!` in the tests. The workspace default is
+# `serde-well-known` only, so `time.workspace = true` alone gives a crate that cannot write a
+# timestamp in a test — and the failure reads as `invalid component: day was 02T00`, which looks
+# like a malformed literal rather than a missing feature. A boundary function is exactly the
+# kind of thing that needs a test with real instants in it.
+time = { workspace = true, features = ["macros"] }
 uuid.workspace = true

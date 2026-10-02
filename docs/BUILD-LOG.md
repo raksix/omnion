@@ -10279,3 +10279,194 @@ cache or process was removed.** The two `api-deprecations` lines in the log are 
 
 **Next.** Re-run the focused pass against `d1bebd5c` on a box with RAM to spare, then close
 acceptance 11–12's browser half and the request.
+
+---
+
+---
+
+## Tick 109 — REQ-022 slice 2: the request log, on the request path, and the portal's four screens
+
+**What.** `crates/developer/src/overview.rs` (the card row, one snapshot), the
+`/developer/overview` route, `apps/api/src/request_log_middleware.rs`, the guard's
+`check_kind_reporting` split, `apps/admin/lib/developer.ts`, four screens, and
+`scripts/qa/probe-developer-wiring.cjs`.
+
+### The defect slice 1 could not see
+
+`omnion_developer::logs_store::record` existed, had unit tests, and was walked by a test that
+**called it directly**. The walk proved the store works; it could not prove the store is *called*,
+because it was the thing calling it. So the platform shipped a complete, tested, **empty** request
+log — and a request log is the one surface whose whole job is to explain what the platform did.
+The REQ's own data model had already promised the fix in one line: *"Usage rollup and request log
+are written by middleware in `apps/api`, so a new route is covered without extra code."* Nothing
+had been written there.
+
+### Four ways the log could be quietly wrong, and what each cost
+
+Every one of these compiled, passed the unit tests, and produced a log that *looked* fine.
+
+1. **The layer was installed on the first statement of the `v1` chain.** `Router::layer` applies
+   to the routes registered *so far*, so it wrapped an empty router and every route added after it
+   was simply unwrapped. The layer compiled, installed, and never ran. Moved to the end of the
+   chain, and the position is now commented with the reason.
+2. **`should_log_path` filtered on the `/api/v1` prefix.** The layer sits inside
+   `Router::nest("/api/v1", v1)`, and `nest` wraps the inner router in `StripPrefix` — so the
+   path arriving at the layer is `/developer/api-keys`, and the prefix never matched. Every
+   request was filtered out and **no error was raised**. This is the quietest failure in the
+   whole class: a log layer that filters itself out.
+3. **The caller was read from the *request* extensions after the handler ran.** The request is
+   gone; the handler consumed it. Every row was anonymous.
+4. **A task-local around the inner call.** That looks equivalent and is not: the scope closes
+   when the inner call returns, which is *before* the outer layer resumes. Every row was still
+   anonymous. The response's own extension map is the one carrier that outlives the handler.
+
+A temporary diagnostic inside the walk is what separated 2 from 3 and 4: it printed
+`rows=5`, then five rows each with `permission=None`. Five rows proved the layer ran; five nulls
+proved the *identity* half did not. A walk that only asserts "no row" leaves the next reader
+guessing between those two states.
+
+### The fourth defect, and the one that mattered
+
+On a **refusal** the guard had no principal to publish, so the `403` that names the missing scope
+was written with `organization_id = null` — and every log screen filters on organization. The
+platform was storing exactly the rows nobody could find: the one row an integrator opens the log
+for. `check_kind_reporting` now returns the partial answer beside the error, taking the caller from
+the credential that was already presented rather than resolving it a second time.
+
+Both remaining defects are **proven to fail with their own symptoms**, not with an unrelated
+error: the refusal principal loses its `organization_id` → `RowNotFound` on "a refusal must be
+logged too"; `should_log_path` filters on the prefix again → `RowNotFound` on "a request the
+platform served must have logged itself".
+
+### A CSS defect the typecheck could not see
+
+The four screens were written with `text-danger` and `bg-danger-soft`. `--color-danger` is **not
+declared** in `app/globals.css`. Tailwind v4 drops a utility for an undeclared token silently —
+no warning, a green build — so every error message would have rendered in default ink: an error
+that does not look like one. The shipped `features/backups/backups-view.tsx` carries the same
+classes, so this predates the slice.
+
+`cargo` cannot see the panel and `tsc` cannot see the CSS, so the gap needed its own gate.
+`probe-developer-wiring.cjs` reads the classes used and the tokens declared and compares them.
+**Its first version was wrong in the same direction, and that is recorded in it**: `\bbg-danger\b`
+matches *inside* `bg-danger-soft` (the `-` is a word boundary), so reintroducing the exact defect
+left the gate green. It now tests the colour *segment* against every variant. Proven to fail: one
+injected `border-danger/30` turns it red with the token named.
+
+### Gates, all run this tick
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-developer --lib --quiet` | **30 passed** (was 25) |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **292 passed** |
+| walks | `OMNION_DATABASE_URL=… omnion cargo test -p omnion-api --test developer -- --test-threads=1` | **10 passed**, 56 s (was 8) |
+| catalogue | `cargo test -p omnion-permissions --lib --quiet` | **64 passed** (unchanged) |
+| build | `cargo build -p omnion-api` | exit 0, no warnings from the new files |
+| types | `pnpm --filter @omnion/admin typecheck` | exit 0 |
+| web build | `next build` | exit 0, all four `/developer` routes emitted |
+| built CSS | `grep` over `.next/static/chunks/*.css` | `text-caution` / `bg-caution-soft` / `text-positive` present, **`text-danger` 0 occurrences** |
+| wiring gate | `node scripts/qa/probe-developer-wiring.cjs` | green, **proven to fail** |
+
+**A note on the walk numbers, because it is the same trap twice.** The suite creates and drops its
+own per-walk databases, so `OMNION_DATABASE_URL` only decides whether it can reach a server at
+all. A run pointed at a database that did not exist reported **10 passed in 0.02 s** — a full skip
+wearing a pass, announced only by its duration. The 56 s run above is the real one.
+
+**Not run: the browser pass.** The shared QA slot is held live by `w3` (`pid 1207109`,
+`cwd=/mnt/apopic/omnion-w3`, verified with `kill -0` and `/proc/<pid>/cwd`) and `/mnt/apopic` is
+at 92% with 5.1 G free, which is where a pass that rebuilds `.next` (~1.5 G) dies. So the four
+screens are **built, typechecked, built by `next build` and statically gated, but not yet seen by a
+browser** — and the definition of done forbids closing on that basis. The three screen-state boxes
+and the keyboard/mobile box stay open for that reason and no other.
+
+**Commits:** `b1ef486c` (overview), `239d1cf9` (middleware + guard), `0b331fd9` (walks),
+`1acb5abf` (typed client), `8754cb80` (screens + gate), pushed.
+
+**Next:** the walkthrough needs its developer routes added to `scripts/qa/walkthrough.cjs` — no
+untested screen is accepted, and a route list that omits `/developer` means a pass that is green
+because it never looked. Then the pass itself, then the state boxes, and only then `done`.
+
+## Tick 109 — a gate that had not run for four commits
+
+`git status` at the start of this tick was **dirty**, which the loop contract forbids. It was not
+leftover scratch: a coherent block — the wire-date fix, the expiry walk, the gate widening — sitting
+uncommitted from the previous tick, alongside three commits that never reached the BUILD-LOG.
+
+### The finding that outranks all of it
+
+Running the block's own test target first was meant to be a formality. It was not:
+
+```
+error[E0063]: missing field `headroom` in initializer of `DestinationBody`
+  --> apps/api/tests/wire_dates.rs:142:22
+```
+
+`aebe9a34` (the backups headroom card, three commits back) added `headroom` to `DestinationBody`.
+The wire-date gate constructs that struct. **The test target stopped compiling**, and a test target
+that does not build never runs — so the gate protecting every date in every API response had been
+absent for three commits.
+
+**Nothing reported it**, because "the test did not run" and "the test was green" are
+indistinguishable in any summary that prints counts. And the defect this gate exists to catch had
+already shipped twice underneath it: `KeyView::expires_at` reached a shipped screen as a nine-element
+array last tick, and `UsagePoint::day` as a three-element one before that. Both were found by walks,
+not by the gate. A gate that is absent is worse than no gate, because it is counted.
+
+### Widening it: two real defects, and two wrong versions of the gate
+
+The first widening — "scan every crate that derives `Serialize`" — reported about **30** types. Nearly
+all false. `IpRule`, `PushSubscription`, `ServiceReport` and `ApiKey` are storage types that a route
+**converts** into `RuleBody`, `DeviceBody`, `ServiceBody`, `KeyView`, precisely so the wire shape is
+decided in one place. A gate demanding annotations on those gets muted, and the way it gets muted is
+somebody deleting the field.
+
+The fix is to test **reachability from a wire boundary** — the type name on a `Json<…>` or a `pub`
+field of a route body — not serialisability. `impl From<IpRule>` and `fn f(x: &IpRule)` are not
+boundaries, which is right: those lines are where the shape is still being decided.
+
+The second wrong version came from `CreateKeyBody`: it derives only `Deserialize`, and `time`'s
+*deserialiser* reads a string regardless of the feature set, so flagging it reported a field the
+platform never emits. Serialisation **is** the defect, so a struct must derive `Serialize` on
+either half.
+
+Three findings, one real and two real:
+
+| Type | Screen | Was |
+|---|---|---|
+| `SecretBody::rotated_at` | Secrets → rotation age | nine-element array, renders `—` |
+| `RouteRule::created_at` | Notification router list (`Json<Vec<RouteRule>>`, published verbatim) | three-element array |
+
+Both fixed. `RouteRule` is in a **crate**, which the old `*Body`/`*Query`/`*Response` name filter
+could not reach at all — the widened scan is the only reason it was ever going to be found.
+
+### Proven to fail
+
+Removing the attribute from `RouteRule` turns the gate red naming
+`crates/notifications/src/router.rs:207`. The name filter that missed it is the same filter that
+would have missed the reintroduction, which is why the proof matters more than the count.
+
+### Gates
+
+| Gate | Command | Result |
+|---|---|---|
+| wire dates | `cargo test -p omnion-api --test wire_dates` | **4/4** (was not compiling) |
+| notifications | `cargo test -p omnion-notifications --lib --quiet` | **102 passed** |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **292 passed** |
+| developer walks | `cargo test -p omnion-api --test developer -- --test-threads=1` | **11 passed** in 210 s |
+| types | `pnpm --filter @omnion/admin typecheck` | exit 0 |
+| web build | `next build` | exit 0, all four `/developer` routes emitted |
+| built CSS | `grep` over `.next/static/chunks/*.css` | `text-danger` **0**, `text-caution` 3, `bg-caution-soft` 2, `text-positive` 2 |
+| wiring gate | `node scripts/qa/probe-developer-wiring.cjs` | green |
+| harness gate | `node scripts/qa/probe-developer-harness.cjs` | green (6 claims) |
+
+The walks at **210 s** are the real ones. This suite builds and drops a database per walk, so a run
+that reports 11 passed in 0.02 s is 11 skips — the fourth time this repo has shown that.
+
+**Commits:** `d1706e81` (the gate and the two wire fixes), `82d5e897` (the ticked criterion), pushed.
+
+**Not yet: the browser pass.** Queued behind `w6` (`pid 212963`, `cwd=/mnt/apopic/omnion-w6`,
+verified live), disk 87%. The three screen-state boxes and the keyboard/mobile box stay open until it
+runs — and this is the fourth tick that has said so, which is why the *reason* is now a named gate
+rather than "the pass was slow".
+
+**Next:** the pass, then the state boxes and `done`.
