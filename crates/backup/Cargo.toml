@@ -22,6 +22,22 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+# Archive encryption (slice 4). `aes-gcm` is already the platform's AEAD — Web Push seals
+# every notification body with it (crates/core/src/push_crypto.rs) — so a backup archive is
+# not the first thing in the product that depends on it. `hkdf` derives the per-artifact key
+# from the passphrase; `rand` draws the salt and the nonce from the OS.
+aes-gcm.workspace = true
+hkdf.workspace = true
+rand.workspace = true
+
+# The destination's free space. NOT `libc`: every crate but `omnion-health` is
+# `#![forbid(unsafe_code)]`, and `omnion-health` holds the single sanctioned `statvfs` block in
+# the whole workspace with a written argument for why the syscall beats shelling out to `df`.
+# Reaching past it to call the kernel directly would mean a second `unsafe` in a crate that
+# promises it has none; the dependency is the price of that promise, and it is a path
+# dependency inside one workspace.
+omnion-health = { path = "../health" }
+
 # The media part copies objects rather than counting them, so it has to open the deployment's
 # own object store. It depends on the *abstraction* (omnion-storage), never on a vendor SDK:
 # a backup that only works against the S3 driver would be a backup that silently stops being a
