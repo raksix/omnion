@@ -13716,3 +13716,66 @@ runs — and this is the fourth tick that has said so, which is why the *reason*
 rather than "the pass was slow".
 
 **Next:** the pass, then the state boxes and `done`.
+
+## Tick 77 — the three CRM boxes that only a browser can close, and a gate that needs neither
+
+**What.** `scripts/qa/probe-crm-screen-states.cjs`, a slot-free static gate for REQ-051's three
+open boxes (screen states, keyboard contract, per-screen keyboard reachability).
+
+**Why this tick did not run the browser pass.** The QA slot is a single global place held live by
+`w8` (`pid 2878882`, `cwd=/mnt/apopic/omnion-w8`, verified with `kill -0` and `/proc/<pid>/cwd`),
+`/mnt/apopic` is at 97% and `free -g` reports **0 available of 32**. A 25-minute browser pass on a
+box with no RAM is not a slow measurement, it is an OOM kill dressed as a defect list. That is the
+fourth consecutive tick to end on "the pass is queued" with nothing ticked, so the plan itself is
+the thing that changed: a box whose only proof is a pass that cannot run is a box nobody can close.
+
+**What the gate measures.** Not the pixels — the *implementation*, which is what makes a screen lie
+about its own state. Three properties, each a defect this module has actually produced:
+
+1. **Loading is distinguishable from empty** on all six screens — a `null` sentinel or a loading
+   flag plus a visible loading branch. An `EmptyState` component existing in a file is not a state
+   machine; the stages screen shipped exactly that bug once, answering "this pipeline has no stages"
+   (and an *add* button) on the first paint, before a byte of the answer had arrived.
+2. **The sheet and the hook agree** — every key the sheet prints is dispatched by a real
+   `event.key` comparison, and every `g then X` destination is a key of `CRM_NAV`/`GO_DESTINATIONS`.
+   `c` and `o` sat in the sheet for several ticks with no listener anywhere in the module.
+3. **The keyboard reaches every screen** — a screen drawing rows wires the hook or sits in
+   `CrmShell`, and is handed real `rowIds`. Activities and leads draw their own rows and call the
+   hook directly; the contract used to be inlined in the frame, which left them silently un-keyboardable
+   while the sheet still promised them keys.
+
+**Proven to fail, on the real file.** `event.key === "e"` in `crm-parts.tsx` replaced with a
+constant: **exit 1**, `every printed binding is dispatched by the hook — dead sheet rows: e`. Restored,
+the same gate is **exit 0, 28/28**. The control is also asserted as its own check (`control: the
+mutation actually changed what the check reads`), because the first version of it measured the
+*original* file and reported green whatever the mutation did — the very defect class this gate
+exists to catch, reproduced inside itself.
+
+**Three gate bugs found and fixed before it was allowed to be a gate** — all three were the gate's
+own model of the source, not the product's:
+
+| What the gate got wrong | How it showed | Fix |
+|---|---|---|
+| `row.split("/")` cuts the `/` row into two empty halves | reported the module's most real shortcut as "a binding nobody listens for" | split on a **spaced** ` / ` |
+| `g then d` read as one opaque binding name | all four `g then …` rows marked dead | two row *shapes* parsed explicitly: `bindings` vs `prefix`; only a prefix has destinations, and `k` in `j / k` is a binding, not a destination |
+| dispatch looked for the bare literal `"e"` | the `false &&` control mutation left the literal in place, so the control measured green | match the **comparison** `event.key === "e"`, which is what makes the control possible |
+
+**Gates.**
+
+| Gate | Command | Result |
+|---|---|---|
+| screen states | `node scripts/qa/probe-crm-screen-states.cjs` | **28/28**, exit 0 |
+| proven to fail | same, with `event.key === "e"` mutated | **26/28**, exit 1, naming `e` |
+| crm crate | `cargo test -p omnion-module-crm --quiet` | **172 passed**, 0 failed |
+| types | `npx tsc --noEmit` (apps/admin) | exit 0 |
+
+**NOT CLAIMED.** No acceptance box ticked. The three boxes stay open until `runCrmStateSweep` and
+`runCrmKeyboardAndMobile` run against a real browser; this gate narrows what can hide behind the
+queue, it does not close anything. The mobile 390×844 box is also the one property this gate
+deliberately does *not* approximate — sticky stage headers and single-column forms are layout facts,
+and a regex asserting `"sticky"` in the source would be the same green-lying failure this module has
+already produced three times.
+
+**Next.** The browser pass when the slot frees (RAM first: 0 available is the real blocker, and a
+browser pass across three writers at 32 GB is what took the box down in September), then the three
+state boxes, the keyboard box and `done`.
