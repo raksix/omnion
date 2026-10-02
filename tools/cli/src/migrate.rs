@@ -49,13 +49,55 @@ pub async fn run(options: &MigrateOptions, json: bool, quiet: bool) -> ExitCode 
             }
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            let failure = crate::envelope::Failure::new(classify(&message), message.clone());
+        Err(outcome) => {
+            // The code arrives with the refusal. `classify` is no longer consulted here: it is
+            // called at the boundary where a migration-runner sentence becomes a code, which is
+            // the only place that still needs it, so there is one classifier and one place it
+            // runs. `migrate new` goes further and never produces a sentence at all.
             if json {
-                crate::envelope::print_failure("migrate", &failure, &[]);
+                crate::envelope::print_failure("migrate", outcome.failure(), &[]);
             }
-            eprintln!("omnion migrate: {message}");
+            eprintln!("omnion migrate: {}", outcome.failure().message);
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Why an action failed, carrying the documented code with it.
+///
+/// The four older actions produce sentences — they come from the migration runner across a crate
+/// boundary that has no opinion about the CLI's vocabulary, so `classify` is the adapter that
+/// turns one of those sentences into a code. `migrate new` produces a typed
+/// [`crate::new_migration::Refusal`] instead, and its own `code()` is the answer: a developer who
+/// typed a capital letter is told `usage` by the value itself, not by a string that happens to
+/// contain a recognisable phrase.
+///
+/// This is what keeps the two from disagreeing. Before this type, the only exit was a `String`,
+/// so the typed code was consulted nowhere in production and existed to satisfy a test — and a
+/// reworded sentence would have silently moved a refusal to `internal`.
+enum Outcome {
+    /// A sentence from the runner, classified at the boundary.
+    Classified(crate::envelope::Failure),
+    /// A refusal that already knows its code.
+    Typed(crate::envelope::Failure),
+}
+
+/// A refusal that already knows its own code.
+///
+/// This is the one call site of `Refusal::code()` in the whole binary. It exists so the typed
+/// answer is what a script gets, and so the string classifier has nothing left to disagree with.
+fn typed(refusal: crate::new_migration::Refusal) -> Outcome {
+    Outcome::Typed(crate::envelope::Failure::new(
+        refusal.code(),
+        refusal.message(),
+    ))
+}
+
+impl Outcome {
+    /// The failure to report, whichever shape it arrived in.
+    fn failure(&self) -> &crate::envelope::Failure {
+        match self {
+            Self::Classified(failure) | Self::Typed(failure) => failure,
         }
     }
 }
@@ -80,6 +122,17 @@ fn classify(message: &str) -> crate::envelope::ErrorCode {
     // script branching on the code needs this one to be stable and named.
     if lowered.contains("gate") {
         ErrorCode::Refused
+    } else if lowered.contains("migrations directory")
+        || lowered.contains("cannot be written to")
+        || lowered.contains("could not write the migration file")
+    {
+        // Check BEFORE the database arms, and the order is the whole point: this sentence names
+        // `database/migrations`, so the `database` arm catches it and a `new` refused for a
+        // missing checkout is reported to a script as a database outage. The two tests at the
+        // bottom of this module exist because of exactly that — the first version of this
+        // function put these arms after `database` and every assertion was green against a
+        // table nobody re-read, because the table was written from the same function.
+        ErrorCode::ConfigUnreadable
     } else if lowered.contains("checksum")
         || lowered.contains("drift")
         || lowered.contains("ledger")
@@ -94,6 +147,20 @@ fn classify(message: &str) -> crate::envelope::ErrorCode {
         ErrorCode::ConfirmationRequired
     } else if lowered.contains("lock") {
         ErrorCode::Refused
+    } else if lowered.contains("already exists")
+        || lowered.contains("lower_snake_case")
+        || lowered.contains("needs a name")
+    {
+        // `migrate new` refusals about the NAME, and only those: the same three fragments
+        // `new_migration::Refusal::code()` maps to `Usage`. Routing them through the generic arms
+        // would report a developer who typed a capital letter as a database outage.
+        //
+        // Every fragment here is a piece of a message that arm of `Refusal::code()` also
+        // recognises, and `the_two_classifications_agree` below asserts the two agree for all
+        // six refusals. They are two views of one decision, and without that assertion a
+        // reworded message would silently turn a usage error into `internal` — which tells a
+        // script the CLI could not classify, and tells the operator nothing at all.
+        ErrorCode::Usage
     } else if lowered.contains("unknown") || lowered.contains("takes") || lowered.contains("--") {
         ErrorCode::Usage
     } else {
@@ -108,6 +175,7 @@ enum Action {
     Status,
     Plan,
     VerifyDown,
+    New,
 }
 
 impl Action {
@@ -122,8 +190,9 @@ impl Action {
             Some("status" | "ledger") => Ok(Self::Status),
             Some("plan" | "dry-run") => Ok(Self::Plan),
             Some("verify-down" | "verify_down") => Ok(Self::VerifyDown),
+            Some("new" | "create") => Ok(Self::New),
             Some(other) => Err(format!(
-                "unknown sub-action {other:?}: expected up, status, plan or verify-down"
+                "unknown sub-action {other:?}: expected up, status, plan, new or verify-down"
             )),
         }
     }
@@ -132,20 +201,160 @@ impl Action {
 async fn execute(
     options: &MigrateOptions,
     sink: crate::output::Sink,
-) -> Result<serde_json::Value, String> {
-    let action = Action::parse(options.action.as_deref())?;
-    let config = Config::from_env().map_err(|err| err.to_string())?;
-    let db = Db::connect(&config.database)
-        .await
-        .map_err(|err| format!("could not connect to the database: {err}"))?;
+) -> Result<serde_json::Value, Outcome> {
+    let action = Action::parse(options.action.as_deref()).map_err(|message| {
+        Outcome::Classified(crate::envelope::Failure::new(
+            crate::envelope::ErrorCode::Usage,
+            message,
+        ))
+    })?;
+
+    // `new` runs BEFORE the connection, deliberately. The other four actions are about a
+    // database, but this one writes a file into a working tree, and an author who needs a
+    // running PostgreSQL to create a migration cannot create one on a laptop, in CI, or during
+    // the first five minutes of a new checkout — which is exactly when they do it.
+    //
+    // It is dispatched here, above the `Config`/`Db` lines, rather than inside the `match` below,
+    // so the connection it never needs is never opened. `create_migration` still reads the
+    // ledger on a best-effort basis, because a number the installation has already run is
+    // exactly the half a tree scan cannot see — but that read failing is a warning, never a
+    // refusal, so the command works with no database at all.
+    if action == Action::New {
+        return create_migration(options, sink).await;
+    }
+
+    let config = Config::from_env().map_err(|err| {
+        Outcome::Classified(crate::envelope::Failure::new(
+            crate::envelope::ErrorCode::ConfigUnreadable,
+            err.to_string(),
+        ))
+    })?;
+    let db = Db::connect(&config.database).await.map_err(|err| {
+        Outcome::Classified(crate::envelope::Failure::new(
+            crate::envelope::ErrorCode::DatabaseUnreachable,
+            format!("could not connect to the database: {err}"),
+        ))
+    })?;
     let pool = db.pool();
 
-    match action {
+    // The one adapter: every runner sentence becomes a code here, and nowhere else. The four
+    // bodies keep returning `String` because their errors genuinely are sentences — the runner
+    // has no vocabulary of its own to give up.
+    let result = match action {
         Action::Up => apply(pool, options, sink).await,
         Action::Status => status(pool, sink).await,
         Action::Plan => plan(pool, sink).await,
         Action::VerifyDown => verify_down(pool, options, &config.database, sink).await,
+        // Dispatched above, before the connection is made.
+        Action::New => unreachable!("`new` returns before the database is connected"),
+    };
+    result.map_err(|message| {
+        Outcome::Classified(crate::envelope::Failure::new(classify(&message), message))
+    })
+}
+
+/// Allocate the next migration number and write the file.
+async fn create_migration(
+    options: &MigrateOptions,
+    sink: crate::output::Sink,
+) -> Result<serde_json::Value, Outcome> {
+    let explicit = options
+        .directory
+        .clone()
+        .or_else(crate::new_migration::directory_from_env);
+    let directory = crate::new_migration::resolve_directory(explicit.as_deref())
+        .map_err(typed)?;
+
+    // Best-effort ledger read, for the numbers no tree can show. A failure here is a warning in
+    // the output, never a refusal: refusing here would make the one moment a migration is
+    // created — a fresh checkout, a laptop, a CI container — the one moment it cannot be.
+    let mut applied = std::collections::BTreeSet::new();
+    let mut ledger_seen = false;
+    let mut ledger_error: Option<String> = None;
+    match Config::from_env() {
+        Ok(config) => match Db::connect(&config.database).await {
+            Ok(db) => {
+                applied = crate::new_migration::ledger_versions(db.pool()).await;
+                ledger_seen = true;
+            }
+            Err(err) => ledger_error = Some(err.to_string()),
+        },
+        Err(err) => ledger_error = Some(err.to_string()),
     }
+
+    let name = options.name.as_deref().unwrap_or_default();
+    let created = crate::new_migration::create(&directory, name, &applied).map_err(typed)?;
+
+    // Read back what the RUNNER will see, and report it, rather than only what the template
+    // intended. The two are different questions and the gap between them is a class of surprise:
+    // a file whose prose reversal block parses as a statement, or whose forward half already
+    // contains a statement nobody wrote. `migrate plan` would catch that later, on another
+    // machine, at another moment — the point of answering it here is that this is the file the
+    // author is about to open.
+    let (forward_statements, has_reversal, declared_irreversible) =
+        crate::new_migration::inspect(&created.path).map_err(typed)?;
+
+    sink.print(format_args!(
+        "created   {}",
+        created
+            .path
+            .strip_prefix(&created.directory)
+            .unwrap_or(&created.path)
+            .display()
+    ));
+    sink.print(format_args!(
+        "in        {}",
+        created.directory.display()
+    ));
+
+    // The two states a freshly created file is in, stated as lines rather than warnings. Both are
+    // the EXPECTED state of a skeleton nobody has filled in, so an envelope warning would make
+    // every generated migration look alarming — the warnings array is for things worth noticing,
+    // and "you have not written the migration yet" is not one.
+    if forward_statements == 0 {
+        sink.print(format_args!(
+            "status    the forward half is still the placeholder"
+        ));
+    }
+    if !has_reversal && !declared_irreversible {
+        sink.print(format_args!(
+            "status    no reversal yet — the policy reports {} as not reversible until you \
+             write one",
+            created.version
+        ));
+    } else if declared_irreversible {
+        sink.print(format_args!(
+            "status    declared irreversible (omnion:no-down); the deployment plan will ask for \
+             a backup"
+        ));
+    }
+
+    let mut data = serde_json::json!({
+        "action": "new",
+        "version": created.version,
+        "name": created.name,
+        "path": created.path.display().to_string(),
+        "directory": created.directory.display().to_string(),
+        // The two sources, reported so an operator can see what the number was derived from
+        // rather than having to trust it.
+        "ledger_versions": applied.len(),
+        "ledger_consulted": ledger_seen,
+        // What the runner will read in the file that was just written — the same three numbers
+        // `inspect` derived, so a script can assert on them without re-parsing the file.
+        "forward_statements": forward_statements,
+        "has_reversal": has_reversal,
+        "declared_irreversible": declared_irreversible,
+    });
+
+    if let Some(err) = &ledger_error {
+        sink.print(format_args!(
+            "warning:  the migration ledger could not be read ({err}); the number came from the \
+             tree only"
+        ));
+        data["ledger_error"] = serde_json::Value::String(err.clone());
+    }
+
+    Ok(data)
 }
 
 /// The actor the journal records, defaulting to the OS user.
@@ -562,13 +771,41 @@ mod tests {
                 ErrorCode::Refused,
             ),
             (
-                "unknown sub-action \"staus\": expected up, status, plan or verify-down",
+                "unknown sub-action \"staus\": expected up, status, plan, new or verify-down",
                 ErrorCode::Usage,
             ),
             (
                 "`--version` selects one migration for `verify-down`; an apply is always the \
                  whole set",
                 ErrorCode::Usage,
+            ),
+            // `migrate new` — acceptance 4. The codes here are asserted against
+            // `Refusal::code()` in `the_two_classifications_agree`, so a reworded message shows up
+            // as a disagreement rather than as a script reading a code nobody chose.
+            (
+                "migrate new needs a name: `omnion migrate new add_invoices`",
+                ErrorCode::Usage,
+            ),
+            (
+                "a migration name must be lower_snake_case: \"Add Invoices\" is not \
+                 lower_snake_case: use a, z, 0-9 and underscores only",
+                ErrorCode::Usage,
+            ),
+            (
+                "a migration named \"add_invoices\" already exists (0004_add_invoices.sql); pick \
+                 another name",
+                ErrorCode::Usage,
+            ),
+            (
+                "could not find the migrations directory: no database/migrations next to a \
+                 Cargo.toml above the working directory. Run this from inside the checkout, or \
+                 set OMNION_MIGRATIONS_DIR.",
+                ErrorCode::ConfigUnreadable,
+            ),
+            ("/tmp/migrations cannot be written to (Permission denied)", ErrorCode::ConfigUnreadable),
+            (
+                "could not write the migration file: disk full",
+                ErrorCode::ConfigUnreadable,
             ),
             ("something nobody has written yet", ErrorCode::Internal),
         ];
@@ -595,10 +832,20 @@ mod tests {
             "could not connect to the scratch database: refused",
             "`verify-down` needs --version: rehearsing \"a migration\" is not an action",
             "`verify-down` needs --scratch. It is required and has no default on purpose",
-            "unknown sub-action \"x\": expected up, status, plan or verify-down",
+            "unknown sub-action \"x\": expected up, status, plan, new or verify-down",
             "`--version` selects one migration for `verify-down`; an apply is always the whole set",
             "the reversal did not restore the structure: 1 table(s) left behind (t), 0 \
              table(s) created (). The ledger records this migration as NOT rehearsed.",
+            "migrate new needs a name: `omnion migrate new add_invoices`",
+            "a migration name must be lower_snake_case: \"Add Invoices\" is not lower_snake_case: \
+             use a, z, 0-9 and underscores only",
+            "a migration named \"add_invoices\" already exists (0004_add_invoices.sql); pick \
+             another name",
+            "could not find the migrations directory: no database/migrations next to a Cargo.toml \
+             above the working directory. Run this from inside the checkout, or set \
+             OMNION_MIGRATIONS_DIR.",
+            "/tmp/migrations cannot be written to (Permission denied)",
+            "could not write the migration file: disk full",
         ];
 
         for message in written {
@@ -606,6 +853,47 @@ mod tests {
                 classify(message),
                 ErrorCode::Internal,
                 "{message:?} is a message this command writes and must be classified"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_classifications_agree() {
+        // `migrate new` produces its refusals as a typed `Refusal`, whose `code()` the module
+        // below calls directly — but `execute` funnels every error through a `String`, so the
+        // message is re-classified on the way out. Two authorities for one decision is the shape
+        // that drifts: the day somebody rewords "already exists", the direct path still answers
+        // `usage` while the string path answers `internal`, and the script only sees whichever
+        // one it happened to be triggered by.
+        //
+        // So the two are compared here over every refusal the new action can produce. Both read
+        // the same sentences, so a reword that breaks one breaks this test rather than a
+        // pipeline.
+        use crate::new_migration::Refusal;
+        let refusals = [
+            Refusal::MissingName,
+            Refusal::InvalidName("\"Add Invoices\" is not lower_snake_case".to_owned()),
+            Refusal::DuplicateName {
+                name: "add_invoices".to_owned(),
+                existing: "0004_add_invoices.sql".to_owned(),
+            },
+            Refusal::NoDirectory,
+            Refusal::NotWritable {
+                directory: std::path::PathBuf::from("/tmp/migrations"),
+                reason: "Permission denied".to_owned(),
+            },
+            Refusal::NotWritten("disk full".to_owned()),
+        ];
+
+        for refusal in refusals {
+            let direct = refusal.code();
+            let through_the_string = classify(&refusal.message());
+            assert_eq!(
+                through_the_string, direct,
+                "{refusal:?}: the typed path says {} and the string path says {}. The message is \
+                 what `execute` actually returns, so the string path is the one a script sees.",
+                direct.as_str(),
+                through_the_string.as_str()
             );
         }
     }

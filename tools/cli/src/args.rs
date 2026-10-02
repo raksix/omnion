@@ -23,7 +23,7 @@ pub enum Command {
     /// the flag), and the `doctor_json || json` disjunction in `main` that hides this would keep
     /// working by accident rather than by design.
     Doctor,
-    /// `omnion migrate [up|status|plan|verify-down]`.
+    /// `omnion migrate [up|status|plan|verify-down|new]`.
     Migrate(Box<MigrateOptions>),
     /// `omnion setup …`.
     Setup(Box<SetupOptions>),
@@ -89,6 +89,13 @@ pub struct MigrateOptions {
     /// the runner cannot derive it, and a rehearsal on the live database is the accident the
     /// request spends a whole risk note on.
     pub scratch: Option<String>,
+    /// The migration name (`omnion migrate new <name>`), and the only reason this struct accepts
+    /// a second bare word: the other four actions take none, so a stray word in any of them is a
+    /// typo rather than an argument.
+    pub name: Option<String>,
+    /// The migrations directory (`--dir`); the environment and the working directory are the
+    /// other two sources, in that order after the flag.
+    pub directory: Option<String>,
 }
 
 /// Everything `omnion setup` accepts on the command line.
@@ -302,7 +309,7 @@ fn parse_migrate(cursor: &mut Cursor<'_>) -> Result<MigrateOptions, String> {
             if flag.contains('=') {
                 return Err(format!(
                     "unknown option {flag:?} for `omnion migrate`: a sub-action is a bare word \
-                     (up, status, plan, verify-down)"
+                     (up, status, plan, new, verify-down)"
                 ));
             }
             if options.action.is_none() {
@@ -310,8 +317,19 @@ fn parse_migrate(cursor: &mut Cursor<'_>) -> Result<MigrateOptions, String> {
                 no_value(flag, inline)?;
                 continue;
             }
+            // A second bare word is the migration name — and ONLY for `new`. The four other
+            // actions take no positional argument, so accepting one there would let
+            // `omnion migrate up production` look like a valid invocation and apply every
+            // pending migration to whatever the operator meant. `new` is the one action whose
+            // subject is a word rather than the installation, so it is the one that takes it.
+            if options.action.as_deref() == Some("new") && options.name.is_none() {
+                options.name = Some(flag.to_owned());
+                no_value(flag, inline)?;
+                continue;
+            }
             return Err(format!(
-                "`omnion migrate` takes one sub-action; {flag:?} is a second one"
+                "`omnion migrate {}` takes no name; {flag:?} is not one of its arguments",
+                options.action.as_deref().unwrap_or("up")
             ));
         }
         match flag {
@@ -319,6 +337,7 @@ fn parse_migrate(cursor: &mut Cursor<'_>) -> Result<MigrateOptions, String> {
             "--source" => options.source = Some(cursor.value(flag, inline)?),
             "--version" | "-V" => options.version = Some(cursor.value(flag, inline)?),
             "--scratch" => options.scratch = Some(cursor.value(flag, inline)?),
+            "--dir" => options.directory = Some(cursor.value(flag, inline)?),
             other => return Err(format!("unknown option {other:?} for `omnion migrate`")),
         }
     }
@@ -431,6 +450,12 @@ MIGRATE ACTIONS
       --source <kind>    cli, deploy, ci or boot (default: cli).
     status              The ledger: applied, pending, checksum drift, lock holder.
     plan                What a run would do. Executes nothing, takes no lock.
+    new <name>          Create a migration file with the next free version.
+      --dir <path>       The migrations directory. Defaults to the database/migrations
+                         directory of the checkout the working directory is in, or
+                         $OMNION_MIGRATIONS_DIR when set. It is never guessed: a `new`
+                         that wrote into a directory no build reads produces a migration
+                         nobody applies.
     verify-down         Rehearse a migration's reversal on a SCRATCH database.
       --version <NNNN>   The migration to rehearse.
       --scratch <url>    The scratch database. Required: this runner cannot
@@ -598,6 +623,8 @@ mod tests {
                 source: None,
                 version: None,
                 scratch: None,
+                name: None,
+                directory: None,
             }))
         );
         let parsed = Command::parse(&argv(
@@ -622,9 +649,42 @@ mod tests {
         assert!(Command::parse(&argv("migrate --force")).is_err());
         let err = Command::parse(&argv("migrate up=yes")).unwrap_err();
         assert!(
-            err.contains("up, status, plan, verify-down"),
+            err.contains("up, status, plan, new, verify-down"),
             "the refusal lists the actions: {err}"
         );
+    }
+
+    #[test]
+    fn only_new_takes_a_name_and_the_others_refuse_a_stray_word() {
+        // The dangerous shape this closes: `omnion migrate up production` used to be refused as
+        // "a second sub-action" by accident of the position, and a parser that generalised the
+        // name to every action would run it — applying every pending migration while an
+        // operator believes they named a target.
+        let parsed = Command::parse(&argv("migrate new add_invoices")).expect("parses");
+        let Command::Migrate(options) = parsed else {
+            panic!("expected migrate options");
+        };
+        assert_eq!(options.action.as_deref(), Some("new"));
+        assert_eq!(options.name.as_deref(), Some("add_invoices"));
+
+        let parsed =
+            Command::parse(&argv("migrate new add_invoices --dir /tmp/m")).expect("parses");
+        let Command::Migrate(options) = parsed else {
+            panic!("expected migrate options");
+        };
+        assert_eq!(options.directory.as_deref(), Some("/tmp/m"));
+
+        for line in [
+            "migrate up production",
+            "migrate status everything",
+            "migrate plan nightly",
+            "migrate new one two",
+        ] {
+            assert!(
+                Command::parse(&argv(line)).is_err(),
+                "{line} must not parse: only `new` takes a name"
+            );
+        }
     }
 
     #[test]

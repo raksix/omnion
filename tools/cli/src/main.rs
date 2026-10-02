@@ -23,6 +23,7 @@ mod args;
 mod doctor;
 mod envelope;
 mod migrate;
+mod new_migration;
 mod output;
 mod prompt;
 mod secret;
