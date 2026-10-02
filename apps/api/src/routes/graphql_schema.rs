@@ -153,12 +153,31 @@ pub async fn read(
 /// The diff's query.
 #[derive(Debug, Default, Deserialize)]
 pub struct DiffQuery {
-    /// The role to compare against. Named `roleId` because that is what the screen sends.
-    #[serde(default)]
+    /// The role to compare against, under the wire name the screen sends.
+    ///
+    /// **The `rename` is load-bearing and its absence was a `400` on the one screen that calls
+    /// this.** The doc comment above this field said "Named `roleId` because that is what the
+    /// screen sends" while the field had no `rename` at all — so serde looked for `role_id`,
+    /// found `None`, and the route's own "`roleId` is required" guard answered `400` to a request
+    /// that had sent `roleId` exactly as documented. The walk found it as a `request-failed`
+    /// beside the diff's verdict, and the honest reading is that **a comment describing a rename
+    /// is not a rename**: the walk could see the 400 and nothing in the source could.
+    #[serde(default, rename = "roleId")]
     pub role_id: Option<String>,
-    /// The id spelling the screen also tolerates, so a hand-written URL works.
-    #[serde(default, rename = "role")]
-    pub role: Option<String>,
+    /// The id spelling a hand-written URL is likely to use. Accepted for the same reason a
+    /// route accepts two query spellings anywhere else in this API — and it is `Option`, so a
+    /// request that sends neither falls to the guard's own message rather than a serde error.
+    ///
+    /// **This field needs its rename too, and the test above is what said so.** `role_id_snake`
+    /// deserialises from `role_id_snake` by default, so the spelling it exists to accept —
+    /// `role_id` — never reached it, and the assertion for that spelling failed on the first run
+    /// of the test written to fix a missing rename. Two renames in one struct, one of them added
+    /// by the same hand that forgot the other.
+    #[serde(default, rename = "role_id")]
+    pub role_id_snake: Option<String>,
+    /// A role's `key`, because an operator comparing schemas reads names, not uuids.
+    #[serde(default, rename = "roleKey")]
+    pub role_key: Option<String>,
 }
 
 /// One line of the diff.
@@ -196,7 +215,8 @@ pub async fn diff(
     let requested = params
         .role_id
         .as_deref()
-        .or(params.role.as_deref())
+        .or(params.role_id_snake.as_deref())
+        .or(params.role_key.as_deref())
         .unwrap_or_default();
     if requested.is_empty() {
         return Err(ApiError::bad_request(
@@ -371,6 +391,38 @@ mod tests {
             compose(&catalogue, &reader),
             compose(&catalogue, &reader_and_writer),
         )
+    }
+
+    #[test]
+    fn the_diff_query_reads_the_spelling_the_screen_actually_sends() {
+        // **This test exists because the walk found a `400` on the diff and no test could.**
+        //
+        // The field's doc comment read "Named `roleId` because that is what the screen sends" with
+        // NO `rename` on it, so serde looked for `role_id`, found `None`, and the route answered
+        // its own "`roleId` is required" refusal to a request that had sent `roleId` exactly as
+        // documented. Every unit test in this file passed, because none of them deserialised a
+        // query string — and a doc comment asserting a rename is not a rename.
+        let from_screen: DiffQuery =
+            serde_json::from_str(r#"{"roleId":"abc-123"}"#).expect("the screen's spelling parses");
+        assert_eq!(
+            from_screen.role_id.as_deref(),
+            Some("abc-123"),
+            "`roleId` must reach the field; the screen sends exactly this"
+        );
+
+        // The other two spellings a hand-written URL is likely to use, so a request that sends
+        // neither falls to the guard's own message instead of a serde error.
+        let snake: DiffQuery =
+            serde_json::from_str(r#"{"role_id":"def-456"}"#).expect("the snake spelling parses");
+        assert_eq!(snake.role_id_snake.as_deref(), Some("def-456"));
+        let by_key: DiffQuery =
+            serde_json::from_str(r#"{"roleKey":"editor"}"#).expect("the key spelling parses");
+        assert_eq!(by_key.role_key.as_deref(), Some("editor"));
+
+        // And a query that names none of them must leave every field `None`, so the route's guard
+        // is what answers — with the sentence it wrote, rather than serde's.
+        let none: DiffQuery = serde_json::from_str("{}").expect("an empty query parses");
+        assert!(none.role_id.is_none() && none.role_id_snake.is_none() && none.role_key.is_none());
     }
 
     #[test]
