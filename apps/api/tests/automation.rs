@@ -460,9 +460,16 @@ async fn drive_until_settled(
     execution_id: Uuid,
 ) -> ExecutionStatus {
     for _ in 0..SETTLE_BUDGET {
-        engine::tick_with(harness.db.pool(), &runner_config(), actions)
-            .await
-            .expect("the engine tick must run");
+        // `NoRunGuard`: these walks drive the engine's own steps, so the endless-loop guard
+        // under test elsewhere has nothing to say about them and is left out on purpose.
+        engine::tick_with(
+            harness.db.pool(),
+            &runner_config(),
+            actions,
+            &omnion_workflows::guard::NoRunGuard,
+        )
+        .await
+        .expect("the engine tick must run");
 
         let execution = store::find_execution(harness.db.pool(), execution_id)
             .await
@@ -558,7 +565,19 @@ async fn an_automation_runs_end_to_end_on_a_page_published_trigger() {
         .call(get("/api/v1/automations/catalogue", Some(&owner_token)))
         .await;
     assert_eq!(catalogue.status, StatusCode::OK, "{:?}", catalogue.body);
-    assert_eq!(catalogue.body["events"][0], "page.published");
+    // An event is an *object*, not a name: the editor's picker shows its description, its
+    // group and the payload fields the condition/binding pickers offer, so an assertion on
+    // the bare string was asserting a shape this endpoint stopped returning in slice 1.
+    assert_eq!(catalogue.body["events"][0]["name"], "page.published");
+    assert!(
+        catalogue.body["events"][0]["fields"]
+            .as_array()
+            .expect("the event carries the fields a condition can read")
+            .iter()
+            .any(|field| field["key"] == "slug"),
+        "the fields are the ones the condition picker offers: {:?}",
+        catalogue.body["events"][0]
+    );
     assert!(
         catalogue.body["actions"]
             .as_array()
@@ -595,7 +614,9 @@ async fn an_automation_runs_end_to_end_on_a_page_published_trigger() {
         .expect("automation id")
         .to_owned();
     assert_eq!(created.body["event"], "page.published");
-    assert_eq!(created.body["conditions"].as_array().map(Vec::len), Some(2));
+    // `condition_count` rather than the length of `conditions`: the tree is a group object now
+    // (slice 1), and the number the editor shows is the count the panel actually reads.
+    assert_eq!(created.body["condition_count"], 2);
     assert_eq!(created.body["actions"].as_array().map(Vec::len), Some(2));
     assert_eq!(created.body["trigger_count"], 0);
     println!(
@@ -1139,7 +1160,11 @@ async fn the_automation_surface_is_permission_gated_and_tenant_scoped() {
         .await;
     assert_eq!(updated.status, StatusCode::OK, "{:?}", updated.body);
     assert_eq!(updated.body["enabled"], false);
-    assert_eq!(updated.body["conditions"].as_array().map(Vec::len), Some(0));
+    // A rule with no conditions is stored as an empty `all` group rather than a bare `[]`
+    // (slice 1's deliberate choice: one stored shape, and the v0 array still reads back as
+    // the same thing). The assertion below therefore checks the *count*, which is what the
+    // panel shows, rather than a shape the store normalised on the way in.
+    assert_eq!(updated.body["condition_count"], 0);
     assert_eq!(updated.body["actions"].as_array().map(Vec::len), Some(1));
     assert_eq!(
         audit_rows(&harness, "automation.updated", &rule_id).await,

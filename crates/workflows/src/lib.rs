@@ -19,19 +19,43 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod approval;
+pub mod branch;
 pub mod cron;
 pub mod definition;
 pub mod engine;
 pub mod error;
+pub mod graph;
+pub mod graph_store;
+pub mod guard;
 pub mod handler;
 pub mod model;
-pub mod store;
+pub mod plugin_nodes;
 
+#[cfg(test)]
+#[path = "plugin_nodes_tests.rs"]
+mod plugin_nodes_tests;
+pub mod run_from;
+pub mod retry_node;
+pub mod store;
+pub mod test_listener;
+
+pub use approval::{APPROVAL_PERMISSION, ApprovalParams, Decision as ApprovalDecision};
 pub use definition::{StepDefinition, Trigger, WorkflowDefinition};
 pub use engine::{RunnerConfig, SweepReport, TickReport};
 pub use error::{Result, WorkflowError};
+pub use graph::{
+    Edge, Finding, Graph, Node, NodeType, Port, Severity, find_cycle, find_node_type, project,
+    reachable_from, validate,
+};
+pub use graph_store::{GraphDefinition, GraphUpdate, find_graph, replace_graph};
+pub use guard::{GuardStep, GuardVerdict, NoRunGuard, RunGuard};
 pub use handler::{ActionContext, ActionFuture, ActionHandler, NoActionHandler};
+pub use test_listener::{
+    LISTENER_TTL, ListenerStatus, MAX_PAYLOAD_BYTES, TestListener, hash_token, listener_is_live,
+    mint_token, status_of,
+};
 pub use model::{
-    ExecutionStatus, NewWorkflow, StepKind, StepStatus, TriggerKind, Workflow, WorkflowExecution,
-    WorkflowStep,
+    DEFAULT_STEP_TIMEOUT_MS, ExecutionStatus, MAX_STEP_TIMEOUT_MS, NewWorkflow, OnError, StepKind,
+    StepStatus, TriggerKind, Workflow, WorkflowExecution, WorkflowStep,
 };

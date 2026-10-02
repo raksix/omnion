@@ -13,7 +13,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 TS="$(date -u +%Y%m%d-%H%M%S)"
-OUT="$ROOT/qa-artifacts/$TS"
+# **`QA_OUT_ROOT` overrides where the artifacts land, because a full disk must not decide whether
+# a screen was measured.** The walkthrough screenshots on every click and every navigation; at
+# 1,007 clicks that is ~100MB of PNGs, and tick 74's pass recorded `ENOSPC` on every screenshot
+# after `/mnt/apopic` hit 100% — so the run *appeared* to have measured the panel while writing
+# nothing a reader could look at. Pointing this at tmpfs (`/dev/shm/…`) is the ledger's answer
+# for a busy box and needs no change to the harness.
+OUT="${QA_OUT_ROOT:-$ROOT/qa-artifacts}/$TS"
+mkdir -p "$OUT"
 
 API_PORT="${QA_API_PORT:-18080}"
 ADMIN_PORT="${QA_ADMIN_PORT:-3100}"
@@ -42,6 +49,26 @@ export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
 
+# A dangling `target` symlink kills the pass before it walks a single screen.
+#
+# A worktree can point `target` at a tmpfs directory (`target -> /dev/shm/w3-target`) to keep a
+# multi-gigabyte build off a nearly full disk. That is a symlink, so it SURVIVES whatever emptied
+# /dev/shm — and the next `cargo build` then fails with
+#
+#     error: failed to create directory `/mnt/apopic/omnion-w3/target`
+#     Caused by: Not a directory (os error 20)
+#
+# which is not a disk-full and not a permission problem, and reads like neither. Ten ticks of
+# deferred passes came after the first one; this one queued for the slot, took it, and died on
+# this line. Recreating the link's destination is a second, so the pass repairs what a foreign
+# cleanup emptied and says so, instead of exiting where the next reader sees only an errno.
+# A real directory, or a symlink to a live directory, is left exactly as it is.
+if [ -L target ] && [ ! -d target ]; then
+  target_dest="$(readlink -f target 2>/dev/null || readlink target)"
+  step "target is a dangling symlink to ${target_dest} — recreating it"
+  mkdir -p "$target_dest"
+fi
+
 wait_http() { # url, seconds
   local url="$1" deadline=$(( $(date +%s) + ${2:-120} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -57,99 +84,23 @@ wait_http() { # url, seconds
 # side by side. Take a slot first so the passes queue instead of all landing on the
 # machine at once; the wait is bounded and then the pass proceeds regardless.
 # One pass at a time on this box: it is the difference between load 20 and load 6.
-#
-# A pass that never reached the walkthrough has to be able to say so. The artifact
-# directory used to be created on the first line of the script, BEFORE this wait and
-# before any trap was installed, so a pass that was killed while queued left an empty
-# `qa-artifacts/<ts>/` behind. An empty directory reads exactly like a pass that started
-# and died: `ls -1t qa-artifacts` shows the newest entry either way, and the next tick
-# spends itself deciding which of the two it is looking at. On 2026-09-30 five of nine
-# worktrees had empty artifact directories, two of them mine, and two ticks were lost to
-# directories that were never passes.
-#
-# So the directory is created BEFORE the wait, stamped as a queued record, and converted
-# into a real pass only once this script has a QA slot and is about to do real work. A pass
-# killed while queued therefore leaves a summary that declares itself void instead of an
-# empty directory that claims a walkthrough happened.
-mkdir -p "$OUT"
-write_queued_record() {
-  # The stack name is expanded on purpose. Escaping the `$` (which a heredoc does not need for
-  # anything else on these lines) leaves the literal text `${QA_STACK:-main}` in the record, so
-  # every artifact says it belongs to a stack called `${QA_STACK:-main}` and none of them name
-  # the stack they actually wrote to — which is the one field that makes a void record useful.
-  local stack_label="${QA_STACK:-main}"
-  cat > "$OUT/QUEUED.md" <<EOF
-# QA pass queued, not run
-
-- When: $TS · stack: $stack_label
-- This pass was created and never reached the browser walkthrough.
-
-The artifact directory is created before the QA slot is taken, so a pass killed while
-queued would otherwise leave an empty directory that reads like a pass that ran. This file
-is the record of the queue; \`summary.json\` marks the pass void until the walkthrough runs.
-EOF
-  python3 - "$OUT/summary.json" <<'PY'
-import json, sys
-json.dump(
-    {
-        "void": True,
-        "reason": "queued-and-never-ran",
-        "detail": "the pass did not reach the browser walkthrough; it was killed or timed out while waiting for a QA slot",
-        "counts": {"clicks": 0, "screenshots": 0, "shotFailures": 0},
-        "findings": [],
-    },
-    open(sys.argv[1], "w"),
-    indent=2,
-)
-PY
-}
-write_queued_record
-# Stamped as soon as this pass owns a place and is about to do real work. `release` below
-# is the only trap once a place is held; this one exists for the window before that.
-QA_PASS_STARTED=0
-queued_exit() {
-  [ "${QA_PASS_STARTED:-0}" = "1" ] && return 0
-  printf '[qa] queued pass never reached the walkthrough; void record kept in %s\n' "$OUT" >&2
-}
-trap queued_exit EXIT INT TERM
-
 QA_SLOT_PID=""
-# A typo in the focused-pass filter costs a WHOLE TICK if it is discovered at the end.
-#
-# `--only` takes route and depth-pass NAMES (`observability-traces`), not paths and not the plural
-# group (`observability`), so the obvious spelling of "all the observability screens" matches
-# nothing. `walkthrough.cjs` does report that — as `empty-pass` / `unknown-pass-name` findings —
-# but from its report roll-up, which runs LAST. By then this pass has queued for the box's single
-# QA slot (up to 25 min), reset a QA database and booted three servers, and has walked no route at
-# all: a green-looking artifact directory that proves nothing, with the slot held the whole time.
-# On a box where seven writers queue for one pass, that is the most expensive possible place to
-# discover a typo. This check runs against the same source file, one second, no slot.
-if [ -n "${QA_ONLY:-}" ]; then
-  step "validating the focused-pass filter (--only=$QA_ONLY)"
-  if ! node "$(dirname "${BASH_SOURCE[0]}")/check-only-filter.cjs" "$QA_ONLY"; then
-    echo "[qa] refusing to start: the focused-pass filter matches no route and no depth pass." >&2
-    echo "[qa] route and depth-pass names are hyphenated; run:" >&2
-    echo "[qa]   grep -oE 'name: \"[a-z0-9-]+\"' scripts/qa/walkthrough.cjs | sort -u" >&2
-    exit 2
-  fi
-fi
-
-# Free the place whenever this pass ends, however it ends.
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
-  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+  # `QA_SLOT_OWNER_PID=$$` is THIS shell, not the qa-slot.sh child, and that distinction is the
+  # fix: a pass killed with SIGKILL — the OOM killer, a terminal timeout — cannot run its EXIT
+  # trap, so the holder it left behind is reparented to init and holds the one place for the
+  # life of the box. The holder watches the pid it is given, so it exits on its own when the
+  # pass dies the way no trap can catch. (Main's qa-slot.sh reads the variable; only the call
+  # site here is mine.)
+  QA_SLOT_PID="$(QA_SLOT_OWNER_PID="$$" QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" \
+    bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
-
+# Free the place whenever this pass ends, however it ends.
 if [ -n "$QA_SLOT_PID" ]; then
   trap 'kill "$QA_SLOT_PID" 2>/dev/null || true' EXIT INT TERM
 fi
-
-# The pass has a place and is about to do real work, so the queued record is retired: the
-# walkthrough owns `summary.json` from here, and a stale void summary next to a real one is
-# the same ambiguity this change exists to remove.
-QA_PASS_STARTED=1
-rm -f "$OUT/QUEUED.md"
 
 # The QA servers are disposable: a pass starts them, walks, and the next pass can
 # start them again. Leaving seven stacks of three servers running between passes cost
@@ -232,7 +183,7 @@ printf '%s\n' "$BASHPID" >&9
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
-step "API on :$API_PORT (database $QA_DB)"
+step "API on :$API_PORT (database omnion_qa)"
 # A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
@@ -268,51 +219,6 @@ fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
 
-# The precondition every org-scoped screen in this report depends on, checked BEFORE the walk
-# rather than inferred from it afterwards. A pass that runs with no organization answers every
-# `/sites`, `/notifications`, `/organizations` and `/reliability/*` read with 403, and still
-# produces a complete report: per-page diagnostics, a vision review, a high-finding count. The
-# screens render their shell, their title and their `h1` regardless, so each page looks healthy
-# while every number under it was refused — which is how a pass can measure three new screens and
-# report "clean" about a tenant that does not exist.
-#
-# It is one query, and it is the difference between failing in the first thirty seconds and
-# spending an hour measuring an installation that has no tenant.
-qa_scalar() {
-  docker exec "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB" -t -A -c "$1" 2>/dev/null || echo ""
-}
-# The guard below is correct — and it had no way to be satisfied. The only thing that created the
-# organization was the browser's first-run wizard, and the wizard is the exact thing this branch's
-# own `wizard-gate.test.cjs` exists because it does not always reach its submit on a cold dev
-# server. So the pass reset the database, required a tenant, and could not make one: every pass
-# aborted at the guard before measuring a single screen. A precondition with no way to be met is a
-# harness that can only fail.
-#
-# The seed runs BEFORE the guard, over the API and through the same endpoints the wizard calls —
-# never by inserting rows. A SQL-inserted organization would satisfy the count while leaving
-# `onboarding_state`, the membership row and the site row unwritten, and each of those is what an
-# org-scoped read joins against: the pass would measure screens answering 403 and report it as the
-# product's answer, which is the precise failure the guard was added to catch.
-if [ "$(qa_scalar 'select count(*) from organizations')" = "0" ]; then
-  step "seeding the QA tenant (the wizard creates it in a browser; this does it over the API)"
-  node scripts/qa/ensure-organization.mjs || {
-    echo "[qa] FATAL: the QA tenant could not be seeded, so the walk below would measure 403s."
-    echo "[qa] Check the API log for the reason; the seeder prints the status and body it got."
-    exit 1
-  }
-fi
-
-QA_ORGS="$(qa_scalar 'select count(*) from organizations')"
-QA_USERS="$(qa_scalar 'select count(*) from users')"
-if [ "$QA_ORGS" = "0" ] || [ -z "$QA_ORGS" ]; then
-  echo "[qa] FATAL: ${QA_DB} has ${QA_USERS:-0} user(s) and ${QA_ORGS:-no} organization(s)."
-  echo "[qa] The browser creates the organization through the first-run wizard; if it did not run,"
-  echo "[qa] every org-scoped screen below is answered 403 and the report describes nothing."
-  echo "[qa] Check the wizard's POST /api/v1/onboarding/organization in the API log."
-  exit 1
-fi
-step "precondition ok: ${QA_USERS} user(s), ${QA_ORGS} organization(s) in ${QA_DB}"
-
 step "admin panel on :$ADMIN_PORT"
 NEXT_ADMIN="$ROOT/apps/admin/node_modules/next/dist/bin/next"
 if pm2 describe "$ADMIN_NAME" >/dev/null 2>&1; then
@@ -331,28 +237,121 @@ else
   OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
 fi
-wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
+# **The renderer is gated by what the pass MEASURES, not by existing.**
+#
+# `wait_http` here used to be a hard gate: if the public renderer did not answer, the pass exited
+# 1 before the walkthrough ran at all. That is right for a full acceptance run and wrong for a
+# focused one, and the cost was measured twice: a `QA_ONLY=workflow-builder` pass on a box with no
+# room for Turbopack's cache died on `public renderer did not answer`, and the two minutes after
+# that went into reading a *web* defect in a branch whose *web* app was merely out of disk. The
+# walkthrough itself does not treat the renderer as required — it wraps its public-renderer
+# section in a try/catch and records `report.web.error` (`walkthrough.cjs`, the `webBase` block).
+# **So the gate was stricter than the thing it guards**, and the pass measured less than its own
+# harness would have let it: every admin-side row in that run is unmeasured because of a component
+# none of those rows touch.
+#
+# The two options are now named rather than implied. `QA_REQUIRE_WEB=1` keeps the old behaviour
+# for a full acceptance run, where "the public site renders" is itself a criterion. The default
+# starts the renderer and RECORDS whether it answered; a focused admin pass that did not need it
+# runs to completion and says `public renderer: DOWN` in the log, and a full pass opts back into
+# refusing to start.
+#
+# A failed renderer is never silent: `WEB_ANSWERED=0` is exported so a caller can act on it, and
+# the line is printed either way. "The pass ran" and "the renderer booted" stay two claims.
+if ! wait_http "http://127.0.0.1:$WEB_PORT/" 150; then
+  if [ "${QA_REQUIRE_WEB:-0}" = "1" ]; then
+    echo "[qa] public renderer did not answer (QA_REQUIRE_WEB=1 — refusing to run a pass that measures it)"
+    pm2 logs "$WEB_NAME" --lines 20 --nostream || true
+    exit 1
+  fi
+  echo "[qa] public renderer did not answer; continuing — this pass does not measure it (QA_REQUIRE_WEB=1 to make it fatal)"
+  export WEB_ANSWERED=0
+  pm2 logs "$WEB_NAME" --lines 20 --nostream || true
+else
+  echo "[qa] public renderer answered on :$WEB_PORT"
+  export WEB_ANSWERED=1
+fi
 
 # `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
 # them, which is the right thing for a full acceptance run and the wrong thing for a loop that
 # has just built two screens and needs them proven before the tick ends. It is a filter on the
 # walk, never on the harness around it: the stack, the reset, the vision review and the report
 # all run exactly as they do for a full pass.
+#
+# **`--only` is ALSO accepted on the command line, because a filter that can only be spelled one
+# way is a filter that gets missed.** Tick 74 ran `bash scripts/qa/run.sh --only=workflow-builder`
+# and got a full pass over all 55 routes instead -- the walkthrough received no `--only` at all and
+# walked the entire panel, which is why that pass had reached `iam-devices` after 36 minutes and
+# had not come near the builder. The script read `${QA_ONLY:-}` and never `$1`, so the argument
+# was not an error, not a warning and not in the log: **the one thing the flag exists to do was
+# the one thing it did not do, silently.** A narrow pass that silently runs wide costs more than
+# no pass at all, because the tick reports "no builder rows" and reads it as a product defect.
 QA_ONLY_ARGS=()
-[ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
+QA_ONLY_FILTER="${QA_ONLY:-}"
+# A manual cursor rather than `shift` inside a `for arg in "$@"`: the loop iterates over a
+# snapshot of the argument list, so shifting inside it does not move what the loop sees and the
+# value after a bare `--only` would be read as an unknown option.
+_prev=""
+for arg in "$@"; do
+  case "$arg" in
+    --only=*) QA_ONLY_FILTER="${arg#--only=}" ;;
+    --only)   QA_ONLY_FILTER="" ;; # the value arrives as the next argument, seen on the next turn
+    *)
+      # `--only VALUE` is the one spelling that cannot be handled inside the loop, so it is
+      # repaired here: a bare `--only` is only ever followed by its own value.
+      if [ "$_prev" = "--only" ]; then QA_ONLY_FILTER="$arg"; fi
+      ;;
+  esac
+  _prev="$arg"
+done
+[ -n "$QA_ONLY_FILTER" ] && QA_ONLY_ARGS=(--only="$QA_ONLY_FILTER")
 
-step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
+# The tenant has to exist before the walkthrough runs, and this step is what puts it there.
+#
+# A freshly reset QA database holds a platform account with `organization_id IS NULL` and an EMPTY
+# organizations table -- the first-run wizard creates the owner and stops. Every rule belongs to a
+# tenant, so the editor refuses its own save with "Choose an organization before saving a rule",
+# the lists render empty, and each depth note downstream reads as a broken screen. The tenant
+# picker is gated on `organizations.length > 1`, so a probe does not even have a control to click.
+#
+# The script existed and nothing called it. The symptom that finally named it was the AI console's
+# fixture: `insert into ai_workflow_drafts (organization_id, …) values ('' …)` — a uuid column fed
+# an empty string — which read as a broken console on a database that had no tenant in it at all.
+step "ensure the QA organization exists"
+node scripts/qa/ensure-organization.mjs --url "http://127.0.0.1:$API_PORT" --admin "http://127.0.0.1:$ADMIN_PORT" \
+  || echo "[qa] the organization could not be created; the rule screens will report an empty tenant"
+
+# The two static sweeps run BEFORE the browser, and they are cheap. Both answer a question the
+# walkthrough's own notes keep re-deriving by hand: is every path the rows fetch a path the router
+# mounts (`probe-api-routes.mjs`), and is every field they read a field the handler actually sends
+# (`probe-api-fields.mjs`). Tick 89's defect — `/api/v1/workflows/{id}/runs`, `body.runs`,
+# `trigger_kind` — is the second sweep's whole reason to exist, and both were run by hand for two
+# ticks before anyone noticed they were not in this file, which is exactly how a gate stops being run.
+#
+# They are wired HERE rather than left in the tick's prose because a gate nobody invokes is a
+# paragraph. Neither starts a server, neither needs the database, and together they take about a
+# second — so there is no honest reason for a pass to reach the browser with a defect in it.
+step "static sweeps — every walkthrough path and field the server actually has"
+node scripts/qa/probe-api-routes.mjs
+node scripts/qa/probe-api-fields.mjs
+
+# The banner reads `QA_ONLY_FILTER`, not `QA_ONLY`. With the flag arriving on the command line
+# the env var is empty, so the old line announced a full pass over every route while a narrow
+# one ran -- a report that misstates its own scope is worse than no report, because it is the
+# line a reader trusts to know what was covered.
+step "browser walkthrough${QA_ONLY_FILTER:+ (focused: $QA_ONLY_FILTER)}"
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
 
 step "vision review"
 node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
 
 step "summary"
-node -e '
+WEB_ANSWERED="${WEB_ANSWERED:-unknown}" node -e '
 const fs = require("fs");
 const path = require("path");
 const out = process.argv[1];
 const label = process.argv[2] || "main";
+const webAnswered = process.env.WEB_ANSWERED || "unknown";
 const summary = JSON.parse(fs.readFileSync(path.join(out, "summary.json"), "utf8"));
 const visionPath = path.join(out, "findings", "vision.json");
 const vision = fs.existsSync(visionPath) ? JSON.parse(fs.readFileSync(visionPath, "utf8")) : { skipped: "not run" };
@@ -360,6 +359,7 @@ const doc = [
   `# Omnion QA — latest pass (${label})`,
   "",
   `- When: ${summary.startedAt || "?"} · artifacts: \`${path.relative(process.cwd(), out)}\``,
+  `- Public renderer: ${webAnswered === "1" ? "answered" : webAnswered === "0" ? "**DID NOT ANSWER** — the public-renderer rows below are UNMEASURED, not green" : "unknown"}`,
   `- Interactions: ${summary.counts?.clicks ?? 0} clicks · ${summary.counts?.filled ?? 0} field fills · ${summary.counts?.forms ?? 0} form submissions · ${summary.counts?.screenshots ?? 0} screenshots`,
   `- Console errors: ${summary.counts?.consoleErrors ?? 0} · failed requests: ${summary.counts?.failedRequests ?? 0} · dialogs: ${summary.counts?.dialogs ?? 0}`,
   `- Programmatic findings: ${summary.findings?.length ?? 0} (high ${summary.bySeverity?.high ?? 0} · medium ${summary.bySeverity?.medium ?? 0} · low ${summary.bySeverity?.low ?? 0})`,

@@ -64,33 +64,6 @@ pub struct RatePolicy {
 }
 
 impl RatePolicy {
-    /// The document a walk installs: every scope present and enforced, with ceilings a test
-    /// binary can actually spend.
-    ///
-    /// **The limiter is a process-wide `OnceLock`, and a test binary is a process.** Every walk in
-    /// one `--test` target shares a single budget, and the sign-in scope's shipped ceiling is
-    /// 10 requests per 300 seconds — a number chosen to stop credential stuffing, which is
-    /// exactly right for a deployment and exactly wrong for eleven walks that each sign in
-    /// three or four times. The symptom is a walk failing on `429 rate_limited` in a test that
-    /// never mentions rate limiting, which reads as a product defect and is not one.
-    ///
-    /// So the walks keep the layer ON and raise the ceilings instead of switching it off:
-    /// removing the middleware would make every suite that depends on a `429` assertion vacuous,
-    /// and a limiter that silently disappears in test is a limiter nobody notices breaking. The
-    /// ceilings here are high enough that a whole binary cannot exhaust them and low enough that
-    /// the behaviour is still real.
-    #[must_use]
-    pub fn for_tests() -> Vec<Self> {
-        Self::defaults()
-            .into_iter()
-            .map(|policy| Self {
-                limit: policy.limit.max(100_000),
-                burst: 0,
-                ..policy
-            })
-            .collect()
-    }
-
     /// The document a platform starts from: every scope present, sign-in the strictest.
     ///
     /// The defaults are the four a reader would write by hand, and they are deliberately

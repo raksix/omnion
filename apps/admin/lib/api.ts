@@ -132,7 +132,20 @@ import type {
   NotificationSummary,
   Site,
   User,
+  AppBuilderArtifact,
+  AppBuilderBlocker,
+  AppBuilderBulkDelete,
+  AppBuilderCounts,
+  AppBuilderDecision,
+  AppBuilderExample,
+  AppBuilderFinding,
+  AppBuilderPlan,
+  AppBuilderPlanDecision,
+  AppBuilderPlanDetail,
+  AppBuilderPlanList,
+  AppBuilderVocabulary,
 } from "./types";
+
 // The portal's own shapes live in their own module rather than in `types.ts`, because they come
 // with a *rule* attached (only `IssuedDeveloperKey` may hold a token) that is worth reading
 // next to the type itself rather than one of two hundred lines of a shared list.
@@ -274,17 +287,7 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-/**
- * The panel's one fetch: same-origin, JSON in and out, the session cookie always sent, the CSRF
- * header added on a write, and a thrown {@link ApiError} carrying the API's own code and message.
- *
- * Exported because a surface with its own module (the deployment centre's release client in
- * `deployment-api.ts`) must speak through THIS function rather than re-implementing it — a second
- * fetch that forgets the CSRF header would make every write on that surface fail with a 403 that
- * reads like a permissions problem, and one that forgets `credentials` would sign an operator out
- * on the first read.
- */
-export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
@@ -3813,6 +3816,689 @@ export function fetchIamProvisioningLog(input: {
   return request(`/api/v1/iam/provisioning/log${query ? `?${query}` : ""}`);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Automations (docs/requests/REQ-003) — trigger → condition → action
+// ---------------------------------------------------------------------------------------------
+
+/** One payload field of a documented event, as the condition picker offers it. */
+export type AutomationEventField = {
+  /** The field as it appears in the payload, dotted for nesting. */
+  key: string;
+  /** `string`, `number`, `boolean`, `array` or `object`. */
+  kind: string;
+  /** What the field holds, in product language. */
+  label: string;
+};
+
+/** One event of the library. */
+export type AutomationEvent = {
+  /** Event name as the bus records it. */
+  name: string;
+  /** What happened, in product language. */
+  description: string;
+  /** The group the picker files it under. */
+  group: string;
+  /** The payload fields a condition or binding may read. */
+  fields: AutomationEventField[];
+  /** `true` when the event belongs to a site. */
+  site_scoped: boolean;
+};
+
+/** One operator of the closed comparison set. */
+export type AutomationOperator = {
+  /** Stable operator key. */
+  key: string;
+  /** `false` for the two existence operators, which take no value. */
+  needs_value: boolean;
+};
+
+/** One action of the closed action set. */
+export type AutomationAction = {
+  /** Stable action key. */
+  key: string;
+  /** What it does, in product language. */
+  description: string;
+  /** `true` when the action touches the world rather than the run only. */
+  host: boolean;
+};
+
+/** The closed vocabulary a rule is written in. */
+export type AutomationCatalogue = {
+  /** The event library, with the payload fields each event carries. */
+  events: AutomationEvent[];
+  /** The closed comparison set. */
+  condition_operators: AutomationOperator[];
+  /** The closed action set. */
+  actions: AutomationAction[];
+  /** How the rule starts. */
+  trigger_kinds: string[];
+  /** The condition group modes the editor offers. */
+  group_modes: string[];
+  /** How deep groups may nest. */
+  max_group_depth: number;
+  /** How many conditions and groups a rule may carry in total. */
+  max_conditions: number;
+  /** The event a webhook trigger listens for. */
+  hook_event: string;
+  /** The hook path with the token left out. */
+  hook_path_template: string;
+  /** How a payload field is named inside a condition or a binding. */
+  binding_syntax: string;
+  /** An example of the payload an inbound call produces. */
+  hook_sample: Record<string, unknown>;
+  /** The operators a `branch` step offers — the same nine the conditions use. */
+  branch_operators: AutomationOperator[];
+  /** The step kinds a definition may carry. */
+  step_kinds: string[];
+  /** The permission that may decide a parked `approval` step. */
+  approval_permission: string;
+  /** The default and the ceiling of a gate's lifetime, in hours. */
+  approval_ttl_hours: number;
+  max_approval_ttl_hours: number;
+  /** What a step's own failure may do; `inherit` takes the rule's policy. */
+  on_error_policies: AutomationStepOnError[];
+  /** The longest a step may block, in milliseconds, and the default. */
+  max_step_timeout_ms: number;
+  default_step_timeout_ms: number;
+  /** The methods an outbound call may use. */
+  outbound_methods: string[];
+  /** How many rules deep a `run_workflow` chain may go. */
+  max_chain_depth: number;
+};
+
+/** One run of a rule, as the run detail reads it. */
+export type AutomationExecution = {
+  /** Run id. */
+  id: string;
+  /** Rule the run belongs to. */
+  workflow_id: string;
+  /** `running`, `completed`, `failed` or `cancelled`. */
+  status: string;
+  /**
+   * How the run started.
+   *
+   * The list endpoint names this `trigger` and the detail `trigger_kind`; both are mapped
+   * onto this one field by the fetcher below, so the panel never has to know which endpoint
+   * answered.
+   */
+  trigger_kind: string;
+  /** The list endpoint's spelling of {@link trigger_kind}, normalised onto it. */
+  trigger?: string;
+  /** When it started. */
+  started_at: string;
+  /** When it finished, if it has. */
+  finished_at: string | null;
+  /** The failing step's message, when the run failed. */
+  error: string | null;
+};
+
+/** One step of a run's trace. */
+export type AutomationRunStep = {
+  /** 1-based position. */
+  step_no: number;
+  /** Step name. */
+  name: string;
+  /** `task`, `wait`, `branch`, `stop` or `approval`. */
+  kind: string;
+  /** Action key of a task step. */
+  action: string | null;
+  /** `pending`, `running`, `waiting`, `succeeded`, `failed` or `cancelled`. */
+  status: string;
+  /** Attempts made so far. */
+  attempts: number;
+  /** Attempts allowed in total. */
+  max_attempts: number;
+  /** What this step's own failure does. */
+  on_error: string;
+  /** How long this step may block, in milliseconds. */
+  timeout_ms: number;
+  /** `true` when the run deliberately outlived this step's failure. */
+  ignored: boolean;
+  /** The step's output, when it succeeded. */
+  output: Record<string, unknown> | null;
+  /** The last failure's message. */
+  error: string | null;
+  /**
+   * When the current attempt started, and when the step reached a terminal state.
+   *
+   * Both are what makes the trace's duration column honest: without them every step reads
+   * as having taken no time, which is indistinguishable from having run instantly.
+   */
+  started_at?: string | null;
+  finished_at?: string | null;
+};
+
+/** The run detail: the run, its steps and the payload it started from. */
+export type AutomationRunDetail = AutomationExecution & {
+  /** Steps, in order. */
+  steps: AutomationRunStep[];
+  /** The event payload the run started from. */
+  event_payload?: Record<string, unknown>;
+  /** `true` when this run offers Retry. */
+  can_retry: boolean;
+  /** `true` when this run is still going. */
+  can_cancel: boolean;
+};
+
+/** What "Run now" started. */
+export type AutomationRunStarted = {
+  /** The run that started. */
+  execution_id: string;
+  /** The rule it belongs to. */
+  workflow_id: string;
+  /** How many steps it carries. */
+  steps: number;
+};
+
+/** What a retry or a resume re-queued. */
+export type AutomationRetryResult = {
+  /** The run that was re-opened. */
+  execution_id: string;
+  /** The step the operator pointed at. */
+  step_no: number;
+  /** How many steps went back on the queue. */
+  requeued: number;
+};
+
+/** One comparison inside a condition group. */
+export type AutomationCondition = {
+  /** Field path into the event payload. */
+  field: string;
+  /** How the field is compared. */
+  operator: string;
+  /** Value to compare with; absent for the two existence operators. */
+  value?: unknown;
+};
+
+/** One member of a condition group: a comparison or a nested group. */
+export type AutomationNode = AutomationCondition | AutomationGroup;
+
+/** A group of condition nodes. */
+export type AutomationGroup = {
+  /** `all` (every member holds) or `any` (one member holds). */
+  mode?: "all" | "any";
+  all?: AutomationNode[];
+  any?: AutomationNode[];
+  /** Members of a nested group, when the panel holds the flat editing shape. */
+  nodes?: AutomationNode[];
+};
+
+/** The hook surface of a webhook-triggered rule. */
+export type AutomationHook = {
+  /** `true` once a token has been minted. */
+  configured: boolean;
+  /** How many calls the current window has spent. */
+  window_used: number;
+  /** The window's ceiling. */
+  window_limit: number;
+  /** When the window rolls over. */
+  window_resets_at: string;
+  /** The path template, with the token left out. */
+  path_template: string;
+};
+
+/** One automation rule. */
+export type Automation = {
+  /** Rule id. */
+  id: string;
+  /** Organization that owns the rule. */
+  organization_id: string;
+  /** Site the rule is bound to, when it is. */
+  site_id: string | null;
+  /** Display name. */
+  name: string;
+  /** Free-form description. */
+  description: string;
+  /** Whether the rule fires. */
+  enabled: boolean;
+  /** Event the rule listens for. */
+  event: string;
+  /** How the rule starts: `event` or `inbound_webhook`. */
+  trigger: string;
+  /** The condition tree as stored. */
+  conditions: AutomationGroup | AutomationCondition[];
+  /** How many comparisons the tree carries. */
+  condition_count: number;
+  /** Actions to run, in order. */
+  actions: AutomationNode[];
+  /** The rule's own error policy; a step that inherits takes this. */
+  on_error: AutomationOnError;
+  /** Whose authority the rule's host actions run with; `null` means the author. */
+  run_as_user_id: string | null;
+  /** Which of the two it is, in a sentence the editor shows beside the picker. */
+  run_as_description: string;
+  /** What each host action needs, so the panel can say what a run-as account is asked for. */
+  action_permissions: [string, string][];
+  /** How many runs the trigger has started. */
+  trigger_count: number;
+  /**
+   * The version a graph write must quote.
+   *
+   * Present on the list for the same reason it is on the row: a rule opened from a list row
+   * and then saved has no other way to learn it, and a client that guessed `0` would be
+   * refused with a conflict about a version the author was never shown.
+   */
+  graph_version: number;
+  /** When the rule last fired. */
+  last_triggered_at: string | null;
+  /** Creation time. */
+  created_at: string;
+  /** Last change. */
+  updated_at: string;
+  /** The hook surface, for a webhook-triggered rule. */
+  hook?: AutomationHook;
+};
+
+/** What a step's own failure does; `inherit` takes the rule's policy. */
+export type AutomationStepOnError = "inherit" | "stop" | "continue";
+
+/** The rule's own error policy. A rule may not choose `inherit` — that is a step's. */
+export type AutomationOnError = "stop" | "continue";
+
+/** One step of a rule's action list. */
+export type AutomationStep = {
+  /** Display name; unique within the rule. */
+  name: string;
+  /** `task`, `wait`, `branch`, `stop` or `approval`. */
+  kind: string;
+  /** Action key of a task step. */
+  action?: string | null;
+  /** Action parameters. */
+  params: Record<string, unknown>;
+  /** What this step's own failure does. */
+  on_error?: AutomationStepOnError;
+  /** How long this step may block, in milliseconds. */
+  timeout_ms?: number;
+  /** Attempts allowed in total. */
+  max_attempts: number;
+};
+
+/** The condition report of a dry run: one row, answered. */
+export type AutomationConditionReport = {
+  /** The comparison as the author wrote it. */
+  condition: AutomationCondition;
+  /** `true` when the payload satisfied it. */
+  holds: boolean;
+  /** The payload's value for the field, when it had one. */
+  found?: unknown;
+};
+
+/** One group of a dry-run report. */
+export type AutomationGroupReport = {
+  /** `all` or `any`. */
+  mode: string;
+  /** What the group answered. */
+  holds: boolean;
+  /** The members, in order. */
+  nodes: Array<AutomationConditionReport | AutomationGroupReport>;
+};
+
+/** What one action of a dry run would have done. */
+export type AutomationActionReport = {
+  /** Step name, so the report lines up with the editor. */
+  name: string;
+  /** The action key. */
+  action: string;
+  /** `true` when the action touches the world. */
+  host: boolean;
+  /** `would_send`, `would_call`… — what the step would do. */
+  outcome: string;
+  /** The parameters after the payload was resolved into them. */
+  params: Record<string, unknown>;
+  /** A readable one-line summary, when the action has one. */
+  summary?: string;
+};
+
+/** The whole dry-run report. */
+export type AutomationDryRun = {
+  /** `true` when the conditions held and the actions would have run. */
+  would_run: boolean;
+  /** Why the rule would not run, when it would not. */
+  reason: string | null;
+  /** The condition tree, answered row by row. */
+  conditions: AutomationGroupReport;
+  /** The actions, in order. */
+  actions: AutomationActionReport[];
+  /** Nothing in this report was sent, published or called. */
+  simulated: boolean;
+};
+
+/** One stored test report or captured payload. */
+export type AutomationTestEvent = {
+  /** Row id. */
+  id: string;
+  /** `test` or `listen`. */
+  kind: string;
+  /** The payload the row carries. */
+  payload: Record<string, unknown> | null;
+  /** Event id, when a listener captured one. */
+  event_id: number | null;
+  /** Event name, when a listener captured one. */
+  event_name: string | null;
+  /** `true` while a listener waits for its next event. */
+  armed: boolean;
+  /** When the row was written. */
+  created_at: string;
+  /** When a listener filled in. */
+  captured_at: string | null;
+};
+
+/** The answer of a dry run. */
+export type AutomationTestResult = {
+  /** The report, row by row. */
+  report: AutomationDryRun;
+  /** The stored report. */
+  recorded: AutomationTestEvent;
+};
+
+/**
+ * One gate a parked automation run is waiting on (REQ-003 slice 3).
+ *
+ * There is deliberately **no token** on this type. The panel decides through the decider's
+ * own session and the gate's own id, so reading the queue can never hand out the credential
+ * that opens it — the token is minted by the engine when the run parks and travels to the
+ * decider out of band, exactly as the inbound hook token does.
+ */
+export type AutomationApproval = {
+  /** Approval id — what the decision endpoint is addressed by. */
+  id: string;
+  /** The run that is parked. */
+  execution_id: string;
+  /** The step inside that run. */
+  step_no: number;
+  /** The step's name. */
+  step_name: string;
+  /** The rule that asked, when the rule still exists. */
+  rule_id: string | null;
+  /** Its name. */
+  rule_name: string | null;
+  /** Organization the gate belongs to. */
+  organization_id: string;
+  /** When the run parked. */
+  requested_at: string;
+  /** When the gate stops accepting decisions. */
+  expires_at: string;
+  /** The permission a decider must hold. */
+  permission: string;
+  /** The message the author wrote for the decider. */
+  message: string;
+  /** `true` when the deadline has passed; the panel then offers only Reject. */
+  expired: boolean;
+};
+
+/** The answer of a decision: what happened to the run. */
+export type AutomationDecisionResult = {
+  /** The gate that was decided. */
+  approval_id: string;
+  /** What it was decided as. */
+  decision: "approved" | "rejected";
+  /** The run that was let go (approved) or ended (rejected). */
+  execution_id: string;
+  /** `running` after an approval, `cancelled` after a rejection. */
+  execution_status: string;
+};
+
+/** `GET /api/v1/approvals` — the gates waiting in one organization. */
+export function fetchApprovals(
+  options: { organizationId?: string | null; status?: "pending" | "decided" } = {},
+): Promise<{ approvals: AutomationApproval[]; total: number }> {
+  const query = new URLSearchParams();
+  if (options.organizationId) {
+    query.set("organization_id", options.organizationId);
+  }
+  query.set("status", options.status ?? "pending");
+  return request<{ approvals: AutomationApproval[]; total: number }>(
+    `/api/v1/approvals?${query.toString()}`,
+  );
+}
+
+/**
+ * `POST /api/v1/approvals/{id}/decide` — let a parked run go on, or end it.
+ *
+ * The token is sent in the body, never in the path: a token in a URL is written to every
+ * access log on the way in, and an approval is a credential that can let a message leave
+ * the process. A repeat press is answered `200` with the decision the gate already has,
+ * so a double click cannot apply twice.
+ *
+ * **No token is sent from the panel**, and that is the point of the split: the *authority*
+ * to decide is the session's `workflows.approve`, which this screen's route guard already
+ * checked, while the token is the second factor a notification carries. A decider who
+ * followed a link brings one and it is checked; a decider who opened the panel brings their
+ * session, which is the same power by a different route.
+ */
+export function decideApproval(
+  approvalId: string,
+  decision: "approved" | "rejected",
+  note?: string,
+): Promise<AutomationDecisionResult> {
+  return request<AutomationDecisionResult>(
+    `/api/v1/approvals/${encodeURIComponent(approvalId)}/decide`,
+    { method: "POST", body: JSON.stringify({ decision, note: note ?? null }) },
+  );
+}
+
+/** A newly minted hook token — the only response that carries one. */
+export type AutomationHookToken = {
+  /** The URL to give the caller, token included. */
+  url: string;
+  /** The token on its own. */
+  token: string;
+  /** The rule the URL belongs to. */
+  automation_id: string;
+};
+
+/** The rule list. */
+export function fetchAutomations(organizationId?: string): Promise<{ automations: Automation[] }> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<{ automations: Automation[] }>(`/api/v1/automations${query}`);
+}
+
+/** The closed vocabulary a rule is written in. */
+export function fetchAutomationCatalogue(): Promise<AutomationCatalogue> {
+  return request<AutomationCatalogue>("/api/v1/automations/catalogue");
+}
+
+/** One rule. */
+export function fetchAutomation(automationId: string): Promise<Automation> {
+  return request<Automation>(`/api/v1/automations/${automationId}`);
+}
+
+/**
+ * A rule to write.
+ *
+ * One shape for both `createAutomation` and `updateAutomation`, so a field added here
+ * cannot reach one and miss the other — which is how a rule's error policy ends up
+ * quietly resetting to the default every time somebody toggles a rule.
+ */
+export type AutomationInput = {
+  organization_id?: string | null;
+  site_id?: string | null;
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  event: string;
+  conditions?: unknown;
+  hook_triggered?: boolean;
+  /** The rule's own failure policy; a step that inherits takes this. */
+  on_error?: AutomationOnError;
+  /**
+   * Whose authority the rule's host actions run with; `null` follows the author.
+   *
+   * The API resolves it at *run* time, so handing a rule to a service account changes what
+   * happens from the next run — which is what a settings field is expected to do.
+   */
+  run_as_user_id?: string | null;
+  actions: AutomationStep[];
+};
+
+/** Write a rule. */
+export function createAutomation(input: AutomationInput): Promise<Automation> {
+  return request<Automation>("/api/v1/automations", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Replace a rule. */
+export function updateAutomation(
+  automationId: string,
+  input: AutomationInput,
+): Promise<Automation> {
+  return request<Automation>(`/api/v1/automations/${automationId}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Remove a rule and its run history. */
+export function deleteAutomation(automationId: string): Promise<null> {
+  return request<null>(`/api/v1/automations/${automationId}`, { method: "DELETE" });
+}
+
+/** Evaluate a hand-written payload against a rule without touching anything. */
+export function testAutomation(automationId: string, payload: unknown): Promise<AutomationTestResult> {
+  return request<AutomationTestResult>(`/api/v1/automations/${automationId}/test`, {
+    method: "POST",
+    body: JSON.stringify({ payload }),
+  });
+}
+
+/** Arm a one-shot listener for a rule's next real event. */
+export function listenAutomation(automationId: string): Promise<AutomationTestEvent> {
+  return request<AutomationTestEvent>(`/api/v1/automations/${automationId}/listen`, {
+    method: "POST",
+  });
+}
+
+/** A rule's test reports and captured payloads, newest first. */
+export function fetchAutomationTests(automationId: string): Promise<{ tests: AutomationTestEvent[] }> {
+  return request<{ tests: AutomationTestEvent[] }>(`/api/v1/automations/${automationId}/tests`);
+}
+
+/** Mint a fresh inbound-webhook token; the response is the only place one appears. */
+export function rotateAutomationHook(automationId: string): Promise<AutomationHookToken> {
+  return request<AutomationHookToken>(`/api/v1/automations/${automationId}/rotate-hook`, {
+    method: "POST",
+  });
+}
+
+/**
+ * Start one run now, in the real world.
+ *
+ * This is the one automations control that sends, publishes and calls for real — the
+ * dry run beside it is the simulation, and this is not. The response is the run, so the
+ * panel can link straight to its trace.
+ */
+export function runAutomation(automationId: string): Promise<AutomationRunStarted> {
+  return request<AutomationRunStarted>(`/api/v1/automations/${automationId}/run`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+/** One run with its step trace. */
+export function fetchAutomationRun(executionId: string): Promise<AutomationRunDetail> {
+  return request<AutomationRunDetail>(`/api/v1/workflow-executions/${executionId}`);
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * *Listen for a real event* (REQ-004 slice 3, criterion 5)
+ *
+ * Arming and reading are **two calls and not one that does both**, and the reason is the
+ * one that only shows up in production: a panel that polls by POSTing re-arms its own
+ * listener on every tick, so the row the matcher fills is a row the previous tick deleted —
+ * the capture appears for one frame and the author watches a spinner and nothing else. The
+ * `readWorkflowListeners` call is the only one the panel repeats.
+ */
+
+/** One armed (or spent) listener, as the builder's inspector reads it. */
+export interface WorkflowListener {
+  id: string;
+  node_id: string;
+  event_name: string;
+  /** `armed` | `captured` | `expired` — derived by the server, never stored. */
+  status: "armed" | "captured" | "expired";
+  armed_at: string;
+  expires_at: string;
+  /** Seconds left, clamped at zero by the server so a bar can be drawn from it. */
+  expires_in_seconds: number;
+  captured_at?: string;
+  event_id?: number;
+  payload: Record<string, unknown> | null;
+  payload_text?: string;
+}
+
+/** What arming answers. The token is here and nowhere else. */
+export interface WorkflowListenerArmed {
+  listener: WorkflowListener;
+  token: string;
+  expires_in_seconds: number;
+}
+
+/** What the read answers. */
+export interface WorkflowListenerList {
+  listeners: WorkflowListener[];
+  armed: number;
+  captured?: WorkflowListener;
+}
+
+/** Arm a one-shot listener for one node. This is the only call that mints a token. */
+export function armWorkflowListener(
+  workflowId: string,
+  nodeId: string,
+): Promise<WorkflowListenerArmed> {
+  return request<WorkflowListenerArmed>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/listen`,
+    { method: "POST", body: JSON.stringify({ node_id: nodeId }) },
+  );
+}
+
+/** The rule's listeners and whatever they captured. Safe to repeat; arms nothing. */
+export function readWorkflowListeners(workflowId: string): Promise<WorkflowListenerList> {
+  return request<WorkflowListenerList>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/listeners`,
+  );
+}
+
+/** Read one listener back by its token — the handle a caller scripts against. */
+export function readWorkflowListener(
+  workflowId: string,
+  token: string,
+): Promise<WorkflowListener> {
+  return request<WorkflowListener>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/listeners/${encodeURIComponent(token)}`,
+  );
+}
+
+/**
+ * Try a failed run again from one step.
+ *
+ * The chosen step **and everything after it** go back on the queue: re-running only the
+ * failed step would let a run whose middle failed march on to completion, which is not
+ * what "try that again" means to anybody reading a trace. The steps that already
+ * succeeded are left exactly as they are.
+ */
+export function retryAutomationStep(
+  executionId: string,
+  stepNo: number,
+): Promise<AutomationRetryResult> {
+  return request<AutomationRetryResult>(
+    `/api/v1/workflow-executions/${executionId}/retry-step`,
+    { method: "POST", body: JSON.stringify({ step_no: stepNo }) },
+  );
+}
+
+/** The same write as {@link retryAutomationStep}, named for what the button says. */
+export function resumeAutomationFrom(
+  executionId: string,
+  stepNo: number,
+): Promise<AutomationRetryResult> {
+  return request<AutomationRetryResult>(
+    `/api/v1/workflow-executions/${executionId}/resume-from`,
+    { method: "POST", body: JSON.stringify({ step_no: stepNo }) },
+  );
+}
+
 /* ---------------------------------------------------------------------------------------------
  * Enterprise sign-in providers (REQ-006, slice 4b-2; docs/07-IAM.md §11)
  *
@@ -3962,6 +4648,267 @@ export function fetchSsoProviders(): Promise<{
   return request("/api/v1/auth/sso/providers");
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * The automation operations surfaces (REQ-003 slice 4)
+ *
+ * Three reads an operator reaches for when a rule is not doing what its author expected —
+ * "what did this look like on Tuesday", "who changed it", "what would a starter look like" —
+ * and one write among them, the restore. The restore is a **definition write**, so the API
+ * guards it with `workflows.manage` and audits it exactly like a save; the reads carry
+ * `workflows.read`, the same power that reads the rule.
+ * ------------------------------------------------------------------------------------------- */
+
+/** One stored version of a rule, as the Versions tab lists it. */
+export type AutomationVersion = {
+  /** Version row id — what *Restore* is addressed by. */
+  id: string;
+  /** The rule it belongs to. */
+  automation_id: string;
+  /** The number it was written as. */
+  version: number;
+  /** `created`, `updated` or `restored`. */
+  change: string;
+  /**
+   * What changed, in words.
+   *
+   * `{ changed: [{ field, from, to }], count }`, and `{ first: true }` for the version a
+   * rule was born as — which has nothing to be different from and says so rather than
+   * reporting an empty change set that reads like "you changed nothing".
+   */
+  summary: AutomationVersionSummary;
+  /** The whole definition as it was written. */
+  definition: Record<string, unknown>;
+  /** Who wrote it; `null` when the account has since been deleted. */
+  created_by: string | null;
+  /** When, RFC 3339. */
+  created_at: string;
+  /** The version whose content was restored, when this row is a restore. */
+  restored_from: string | null;
+  /** `true` when the rule as it stands is this row. */
+  current: boolean;
+};
+
+/** One line of a version's diff: the field, and the two values it moved between. */
+export type AutomationVersionChange = {
+  /** Which field of the definition moved. */
+  field: string;
+  /** What it was. */
+  from: unknown;
+  /** What it became. */
+  to: unknown;
+};
+
+/**
+ * What one write changed.
+ *
+ * A fixed list of fields rather than a structural diff: a structural walk reports every key
+ * a later slice added as a change on every edit, and needs rewriting the first time the
+ * definition's shape changes — which is the thing that happens most often here.
+ */
+export type AutomationVersionSummary = {
+  /** The fields that moved, in the order the panel lists them. */
+  changed?: AutomationVersionChange[];
+  /** How many, derived from the list so the number cannot disagree with the rows. */
+  count?: number;
+  /** `true` for the version a rule was created as. */
+  first?: boolean;
+};
+
+/** The Versions tab payload. */
+export type AutomationVersionList = {
+  /** The rule the history belongs to. */
+  automation_id: string;
+  /** The number the rule is on now. */
+  current_version: number;
+  /** History, newest first. */
+  versions: AutomationVersion[];
+  /**
+   * `true` when the rule has no history row at all.
+   *
+   * A rule written before this feature shipped is *untracked*, not *unchanged*, and the tab
+   * says which one it is looking at.
+   */
+  untracked: boolean;
+};
+
+/** One version with its diff, as `GET …/versions/{id}` answers it. */
+export type AutomationVersionComparison = {
+  /** The version being looked at. */
+  version: AutomationVersion;
+  /** The number it was compared against, or `null` for the first version. */
+  compared_to: number | null;
+  /** What changed, in words. */
+  summary: AutomationVersionSummary;
+};
+
+/** A rule's definition history, newest first. */
+export function fetchAutomationVersions(
+  automationId: string,
+): Promise<AutomationVersionList> {
+  return request<AutomationVersionList>(
+    `/api/v1/automations/${encodeURIComponent(automationId)}/versions`,
+  );
+}
+
+/** One version, with what it changed against the one before it. */
+export function fetchAutomationVersion(
+  automationId: string,
+  versionId: string,
+): Promise<AutomationVersionComparison> {
+  return request<AutomationVersionComparison>(
+    `/api/v1/automations/${encodeURIComponent(automationId)}/versions/${encodeURIComponent(
+      versionId,
+    )}`,
+  );
+}
+
+/**
+ * Put a stored definition back.
+ *
+ * **Appends** rather than rewinds: the old content becomes the next version and
+ * `restored_from` says where it came from, so the history stays a line and "v3 → v1 → v3"
+ * never looks like a bug. The rule keeps its id, its run history and its webhook token.
+ *
+ * The body is empty by design — a caller that could send its own definition here would be
+ * able to write a rule the panel never validated.
+ */
+export function restoreAutomationVersion(
+  automationId: string,
+  versionId: string,
+): Promise<AutomationVersion> {
+  return request<AutomationVersion>(
+    `/api/v1/automations/${encodeURIComponent(automationId)}/versions/${encodeURIComponent(
+      versionId,
+    )}/restore`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
+/** One audit row, as the Audit tab lists it. */
+export type AutomationAuditEntry = {
+  /** Row id. */
+  id: number;
+  /** Stable action name, e.g. `automation.updated`. */
+  action: string;
+  /** Who did it, when a person did. */
+  actor_user_id: string | null;
+  /** `user`, `agent`, `service` or `system`. */
+  actor_type: string;
+  /** What was acted on. */
+  target_type: string | null;
+  /** Its id, as text. */
+  target_id: string | null;
+  /** Structured detail; never carries secrets. */
+  metadata: Record<string, unknown>;
+  /** When, RFC 3339. */
+  created_at: string;
+};
+
+/** Who changed this rule, and when. */
+export function fetchAutomationAudit(
+  automationId: string,
+  input: { limit?: number } = {},
+): Promise<{ automation_id: string; entries: AutomationAuditEntry[] }> {
+  const query = input.limit ? `?limit=${input.limit}` : "";
+  return request(`/api/v1/automations/${encodeURIComponent(automationId)}/audit${query}`);
+}
+
+/** One starter rule in the gallery. */
+export type AutomationTemplate = {
+  /** Stable key; the gallery's row identity. */
+  key: string;
+  /** Display name. */
+  name: string;
+  /** One line about what it does. */
+  description: string;
+  /** The category the gallery groups by. */
+  category: string;
+  /** The event the rule listens for. */
+  event: string;
+  /** How many conditions it starts with. */
+  condition_count: number;
+  /** How many actions it starts with. */
+  action_count: number;
+  /**
+   * What has to be filled in before it can run.
+   *
+   * Named rather than guessed: a template that says "needs a destination" is honest, and the
+   * request's criterion is that a starter is savable "without edits beyond its missing
+   * credentials".
+   */
+  requires: string[];
+  /** `false` when an action's host is not on the allow-list yet. */
+  installable: boolean;
+  /** Why it is not installable, when it is not. */
+  blocked_reason: string | null;
+  /** The request body `POST /api/v1/automations` takes, verbatim. */
+  body: Record<string, unknown>;
+};
+
+/** The six starter rules, in gallery order. */
+export function fetchAutomationTemplates(): Promise<{ templates: AutomationTemplate[] }> {
+  return request<{ templates: AutomationTemplate[] }>("/api/v1/automations/templates");
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * The run history and the two controls that act on a run
+ *
+ * A rule is a workflow whose trigger is an event, so the run history is the *workflow*
+ * execution list — inventing an automation-specific one would mean two answers to "what did
+ * this rule do last week". The two controls that repair a run (retry and resume) are the same
+ * write on purpose: re-running only the failed step would let a run whose middle failed march
+ * on to completion, which is not what "try that again" means to anybody reading a trace.
+ * ------------------------------------------------------------------------------------------- */
+
+/** One run of a rule, as the run **list** answers it (no steps). */
+export type AutomationRunSummary = {
+  /** Execution id — the trace route is addressed by it. */
+  id: string;
+  /** The rule that ran. */
+  workflow_id: string;
+  /** `running`, `completed`, `failed`, `cancelled` or `awaiting_approval`. */
+  status: string;
+  /** `manual`, `schedule` or `event`. */
+  trigger: string;
+  /** When it started, RFC 3339. */
+  started_at: string;
+  /** When it settled. */
+  finished_at: string | null;
+  /** The failing step's message, when the run failed. */
+  error: string | null;
+  /** How many steps the run carries. */
+  step_count?: number;
+};
+
+/**
+ * The run history of one rule, newest first.
+ *
+ * `step_count` is filled here when the API sent a step array and left `undefined` when it
+ * did not, so the column shows an em dash rather than a fabricated zero — "the API did not
+ * say" and "the run had no steps" are different facts.
+ */
+export async function fetchAutomationRunHistory(
+  automationId: string,
+  limit = 50,
+): Promise<AutomationRunSummary[]> {
+  const answer = await request<{
+    workflow_id: string;
+    executions: (AutomationRunSummary & { steps?: unknown[] })[];
+  }>(`/api/v1/workflows/${encodeURIComponent(automationId)}/executions?limit=${limit}`);
+
+  return answer.executions.map((run) => ({
+    ...run,
+    step_count: Array.isArray(run.steps) ? run.steps.length : undefined,
+  }));
+}
+
+/** Stop a running execution. */
+export function cancelAutomationRun(executionId: string): Promise<AutomationRunDetail> {
+  return request<AutomationRunDetail>(
+    `/api/v1/workflow-executions/${encodeURIComponent(executionId)}/cancel`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
 // ---------------------------------------------------------------------------------------------
 // Transformation presets (docs/requests/REQ-010, slice 3)
 // ---------------------------------------------------------------------------------------------
@@ -4212,6 +5159,222 @@ export function releaseMediaQuarantine(
   );
 }
 
+// ---------------------------------------------------------------------------------------------
+// The visual workflow builder (REQ-004)
+// ---------------------------------------------------------------------------------------------
+
+/** One output port of a node type. */
+export interface GraphPort {
+  /** What an edge's `source_port` refers to. */
+  key: string;
+  /** What leaving through this port means. */
+  label: string;
+  /** `true` when leaving here ends the run. */
+  terminal: boolean;
+}
+
+/** One field of a node's parameter form. */
+export interface GraphParamField {
+  /** Key in the node's `params`. */
+  key: string;
+  /** Label above the input. */
+  label: string;
+  /** `text`, `textarea`, `number`, `select` or `boolean`. */
+  kind: string;
+  /** `true` when the node is refused without it. */
+  required: boolean;
+  /** The legal values of a `select`. */
+  options: string[];
+  /** Help text under the input. */
+  help: string;
+}
+
+/** One node type the palette offers. */
+export interface GraphNodeType {
+  /** Registry key, stored on a node as `type`. */
+  key: string;
+  /** What the palette calls it. */
+  label: string;
+  /** Which rail group it sits in. */
+  category: string;
+  /** One line under the card. */
+  summary: string;
+  /** Output ports, in draw order. */
+  outputs: GraphPort[];
+  /** The parameter fields the inspector draws. */
+  params: GraphParamField[];
+  /** `true` when the engine never runs it. Always `false` for a plugin node. */
+  inert: boolean;
+  /** The parameters a freshly dropped card starts with. */
+  defaults: Record<string, unknown>;
+  /**
+   * `Plugin: <name>` for a plugin node, `undefined` for a core one.
+   *
+   * Optional rather than an empty string so the palette can tell "not a plugin" from "a
+   * plugin that failed to name itself" — and the second is refused server-side, so `undefined`
+   * is safe to treat as an ordinary node.
+   */
+  badge?: string;
+  /** The providing plugin's key, when this is a plugin node. Names the badge's tooltip. */
+  provider?: string;
+}
+
+/** The palette's whole registry. */
+export interface GraphNodeTypes {
+  /** Every node type, in rail order: core first, then plugin types. */
+  node_types: GraphNodeType[];
+  /**
+   * The rail's groups, in draw order. `Plugins` appears **only** when a plugin contributed a
+   * node type — an organization with no plugins never sees a heading it cannot fill.
+   */
+  categories: string[];
+}
+
+/** One node of a graph. */
+export interface GraphNode {
+  /** Stable id within the graph. */
+  id: string;
+  /** The registry key. */
+  type: string;
+  /** What the canvas draws on the card. */
+  label: string;
+  /** The node's parameters. */
+  params: Record<string, unknown>;
+  /** Where it sits. */
+  position: { x: number; y: number };
+}
+
+/** One connection between two nodes. */
+export interface GraphEdge {
+  /** Stable id within the graph. */
+  id: string;
+  /** Node the edge leaves. */
+  source: string;
+  /** Output port it leaves from. */
+  source_port: string;
+  /** Node it arrives at. */
+  target: string;
+}
+
+/** One thing validation has to say about a graph. */
+export interface GraphFinding {
+  /** `error` or `warning`. */
+  severity: "error" | "warning";
+  /** Stable machine-readable code. */
+  code: string;
+  /** Human-readable explanation, naming the node. */
+  message: string;
+  /** The node the finding is about, when there is one. */
+  node_id: string | null;
+  /** The other end of a two-node finding. */
+  related_node_id: string | null;
+}
+
+/** What a validation answers. */
+export interface GraphValidation {
+  /** `true` when nothing is an error. */
+  valid: boolean;
+  /** Every finding. */
+  findings: GraphFinding[];
+  /** How many are errors. */
+  error_count: number;
+  /** How many are warnings. */
+  warning_count: number;
+}
+
+/** A definition as the builder reads it. */
+export interface WorkflowGraph {
+  /** The rule's id. */
+  id: string;
+  /** The nodes and the connections between them. */
+  graph: { nodes: GraphNode[]; edges: GraphEdge[] };
+  /** Positions, viewport and collapsed groups. */
+  ui_state: Record<string, unknown>;
+  /** The version a save must quote. */
+  graph_version: number;
+  /** When the definition was last validated. */
+  validated_at: string | null;
+  /** The first validation error, when there was one. */
+  validation_error: string | null;
+  /** The step list the projection derived. */
+  steps: unknown[];
+  /** How many nodes the canvas draws. */
+  node_count: number;
+  /** How many connections the canvas draws. */
+  edge_count: number;
+  /** What the author would see if they pressed Run now. */
+  projection: { valid: boolean; step_count: number; reason: string | null };
+  /**
+   * Every finding, so the problems panel lists all of them. A save of a graph that is still
+   * being wired succeeds and reports them here — a rule is built by being incomplete, and a
+   * save that refused the work would refuse the first card the author adds.
+   */
+  findings?: GraphFinding[];
+  /** How many of `findings` are errors. */
+  error_count?: number;
+}
+
+/** The node-type registry the palette draws. */
+export function fetchGraphNodeTypes(): Promise<GraphNodeTypes> {
+  return request<GraphNodeTypes>("/api/v1/workflows/node-types");
+}
+
+/** One rule's graph, layout, version and projection. */
+export function fetchWorkflowGraph(workflowId: string): Promise<WorkflowGraph> {
+  return request<WorkflowGraph>(`/api/v1/workflows/${workflowId}/graph`);
+}
+
+/**
+ * Replace a rule's graph.
+ *
+ * `graphVersion` is the version the editor loaded. A mismatch is a `409`, and the caller
+ * keeps its local copy on screen rather than reloading over the author's work.
+ */
+export function saveWorkflowGraph(
+  workflowId: string,
+  input: {
+    graph: WorkflowGraph["graph"];
+    ui_state?: Record<string, unknown> | null;
+    graph_version: number;
+  },
+): Promise<WorkflowGraph> {
+  return request<WorkflowGraph>(`/api/v1/workflows/${workflowId}/graph`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Save only the layout.
+ *
+ * Positions are not semantics: this bumps neither the version nor the step list, so panning
+ * the canvas all afternoon never invalidates a colleague's edit.
+ */
+export function saveWorkflowUiState(
+  workflowId: string,
+  uiState: Record<string, unknown>,
+): Promise<null> {
+  return request<null>(`/api/v1/workflows/${workflowId}/graph/ui-state`, {
+    method: "PUT",
+    body: JSON.stringify({ ui_state: uiState }),
+  });
+}
+
+/**
+ * Validate a graph, stored or not.
+ *
+ * A body validates what the editor is holding without storing it; no body validates the
+ * stored graph, which is what the toolbar's Validate button sends.
+ */
+export function validateWorkflowGraph(
+  workflowId: string,
+  graph?: WorkflowGraph["graph"],
+): Promise<GraphValidation> {
+  return request<GraphValidation>(`/api/v1/workflows/${workflowId}/validate`, {
+    method: "POST",
+    body: JSON.stringify(graph ? { graph, graph_version: 0 } : {}),
+  });
+}
 
 // ---------------------------------------------------------------------------------------------
 // Notifications (docs/requests/REQ-021, slice 1)
@@ -4853,1360 +6016,6 @@ export function importSecurityReport(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Observability (REQ-126) and secrets (REQ-125)
-// ---------------------------------------------------------------------------------------------
-//
-// Two surfaces share this section because they share one rule: **this client never receives a
-// secret value.** A credential row carries a name, a kind, a provider and a validation state; a
-// lease row carries a name, a version and a redemption budget. The single exception is
-// `createDeploymentKey`, which answers the key exactly once at creation and nowhere else — the
-// response type is named `CreatedDeploymentKey` rather than `DeploymentKey` for that reason, and
-// the value is not cached in the module or in any store.
-//
-// Every type below mirrors a Rust view in `apps/api/src/routes/{observability,observability_
-// traces,observability_alerts,secrets,secrets_audit,secrets_credentials,secrets_leases}.rs`. When
-// a field exists on screen and not here, the screen is wrong; when it exists here and not on
-// screen, the client is carrying a field no operator can act on. Both have happened.
-
-/* ── metrics (REQ-126 slice 2) ────────────────────────────────────────────────────────────── */
-
-/** One documented metric family, as the catalogue records it. */
-export type MetricFamily = {
-  /** The exposition name, e.g. `omnion_http_requests_total`. */
-  name: string;
-  /** `counter`, `gauge` or `histogram`. */
-  kind: string;
-  /** The unit shown next to the chart. */
-  unit: string;
-  /** The one-sentence description, so a name is never the only documentation. */
-  description: string;
-  /** The label names, positionally. */
-  labels: string[];
-  /** `core`, `module` or `worker`. */
-  source: string;
-  /** The series the registry holds right now. */
-  cardinality_estimate: number;
-  /** The cap this family is held to. */
-  cardinality_budget: number;
-  /** Whether the cap is enforced for this family. */
-  budgeted: boolean;
-  /** When the family last recorded a sample, if it ever has. `null` and an old date are different. */
-  last_seen_at: string | null;
-  /** `true` when this build emits the family. */
-  live: boolean;
-  /** `true` when the family is folding samples into its `other` series. */
-  over_budget: boolean;
-};
-
-/**
- * The label values the registry has actually seen for one family.
- *
- * The selector builder is fed from this rather than from a hardcoded list, so a label an operator
- * cannot select is never offered — which is the difference between a filter and a guessing game.
- */
-export type MetricLabelCatalogue = {
-  metric: string;
-  labels: string[];
-  values: string[];
-  bounded_set_cap: number;
-};
-
-/** The catalogue response. */
-export type MetricCatalogResponse = {
-  families: MetricFamily[];
-  label_catalogues: MetricLabelCatalogue[];
-  over_budget: string[];
-  global_budget: number;
-  max_points: number;
-};
-
-/** One point of a series: the instant and the value. */
-export type MetricPoint = {
-  /** RFC 3339 instant of the bucket. */
-  at: string;
-  /** The value in the family's unit. */
-  value: number;
-};
-
-/** One line of a multi-series chart. */
-export type MetricSeries = {
-  /** The label values, positionally, matching the family's `labels`. */
-  labels: string[];
-  /** The running total, which a rate is computed from. */
-  total: number;
-  /** How many samples the buckets cover. */
-  observations: number;
-  /** The buckets, oldest first. */
-  points: MetricPoint[];
-};
-
-/** A chart's worth of data, for one catalogue selector. */
-export type MetricQueryResponse = {
-  metric: string;
-  kind: string;
-  unit: string;
-  labels: string[];
-  window_minutes: number;
-  max_points: number;
-  series: MetricSeries[];
-  /** PromQL for the same selection, ready to paste into a dashboard. */
-  promql: string;
-  /**
-   * `true` when the family is declared but has never recorded a sample.
-   *
-   * This is a third state next to "no samples in this window": a blank graph and an idle metric
-   * and an undeclared-in-this-build family look identical unless one of them says so.
-   */
-  no_samples: boolean;
-};
-
-/** `GET /api/v1/observability/metrics/catalog` — the documented families. */
-export function fetchMetricCatalog(): Promise<MetricCatalogResponse> {
-  return request<MetricCatalogResponse>("/api/v1/observability/metrics/catalog");
-}
-
-/**
- * `GET /api/v1/observability/overview` — the landing screen (docs/requests/REQ-126).
- *
- * Every headline is `number | null` and the difference is load-bearing: `null` means "this
- * family has no samples in the window", which on a fresh install is every one of them, and `0`
- * means "the counter is genuinely at zero". The screen renders the first as "—" with an
- * explanation and the second as a number, because a panel of zeroes on an instance that has
- * served nothing is indistinguishable from a healthy flat line.
- *
- * `unavailable` names the sources that could not be read. It exists because the screen is
- * assembled defensively server-side: a tile whose source is unreadable degrades to `null` and
- * adds its name here rather than failing the whole read, since the operator opening this page
- * during an incident must not get an error page.
- */
-export interface ObservabilityOverview {
-  window_minutes: number;
-  requests_total: number | null;
-  error_ratio: number | null;
-  p95_latency_seconds: number | null;
-  queue_depth: number | null;
-  ai_cost_micros_today: number | null;
-  exporters: OverviewExporter[];
-  alerts: OverviewAlerts | null;
-  unavailable: string[];
-  no_traffic: boolean;
-}
-
-/** One exporter's chip and the drop count that says whether to trust it. */
-export interface OverviewExporter {
-  name: string;
-  health: string;
-  dropped_total: number;
-  buffered: number;
-}
-
-/** The alert surface in one count per state, plus the newest firing incident. */
-export interface OverviewAlerts {
-  firing: number;
-  pending: number;
-  latest_firing: OverviewIncident | null;
-}
-
-/**
- * The newest firing incident.
- *
- * `rule` is nullable because the event stores a rule id and the rule may since have been
- * deleted; the incident stays linkable by `rule_id` either way.
- */
-export interface OverviewIncident {
-  id: string;
-  rule_id: string;
-  rule: string | null;
-  started_at: string;
-}
-
-/** `GET /api/v1/observability/overview`. */
-export function fetchObservabilityOverview(): Promise<ObservabilityOverview> {
-  return request<ObservabilityOverview>("/api/v1/observability/overview");
-}
-
-/**
- * `GET /api/v1/observability/metrics/query` — a bounded chart for one family.
- *
- * `metric` is required: the API refuses an unknown family with `unknown_metric` rather than
- * answering an empty series, so a wrong name is a named error and never a blank graph.
- */
-export function fetchMetricQuery(
-  metric: string,
-  windowMinutes: number,
-): Promise<MetricQueryResponse> {
-  const query = new URLSearchParams({
-    metric,
-    window_minutes: String(windowMinutes),
-  });
-  return request<MetricQueryResponse>(`/api/v1/observability/metrics/query?${query}`);
-}
-
-/** `POST /api/v1/observability/metrics/sync` — re-seed the catalogue from the live registry. */
-export function syncMetricCatalog(): Promise<MetricCatalogResponse> {
-  return request<MetricCatalogResponse>("/api/v1/observability/metrics/sync", { method: "POST" });
-}
-
-/* ── the log explorer (REQ-126 slice 1) ────────────────────────────────────────────────── */
-
-/**
- * One stored line, in the panel's shape.
- *
- * Every field here is a **column** of `obs_log_entries` except `fields`, which was redacted at
- * write time — this client never receives a value to mask, so there is no second rule here to
- * keep in sync with the one in `crates/telemetry::redact`. A screen that wanted to "show the raw
- * message" would find nothing to show, which is the point.
- */
-export type LogEntry = {
-  id: number;
-  /** RFC 3339 instant the line was emitted. */
-  ts: string;
-  /** `trace`, `debug`, `info`, `warn` or `error` — the set is closed and the API rejects anything else. */
-  level: string;
-  /** The Rust module path, so a line can be narrowed to one module. */
-  target: string;
-  /** The message. Redacted before it was ever stored. */
-  message: string;
-  request_id: string | null;
-  trace_id: string | null;
-  user_id: string | null;
-  organization_id: string | null;
-  /** The route TEMPLATE (`/api/v1/secrets/{id}`), never a raw path. */
-  route: string | null;
-  method: string | null;
-  status: number | null;
-  duration_ms: number | null;
-  /** Which process emitted it: `api`, `worker` or `cli`. */
-  source: string;
-  host: string | null;
-  version: string | null;
-  /** Structured detail, already redacted. */
-  fields: unknown;
-};
-
-/**
- * The explorer's query string.
- *
- * `level` is an array because the screen's control is a multi-select, and `?level=info` also
- * works for a hand-typed link — the API takes both forms. `requestId` is a separate field rather
- * than a text search because it routes to `/logs/requests/{id}`, which returns the lines in the
- * opposite order (a timeline, not a list) and covers the workers as well as the API.
- */
-export type LogFilters = {
-  levels?: string[];
-  target?: string;
-  requestId?: string;
-  traceId?: string;
-  /** RFC 3339 lower bound. */
-  since?: string;
-  /** RFC 3339 upper bound. */
-  until?: string;
-  /** `api`, `worker` or `cli`. */
-  source?: string;
-  /** Substring of the message. */
-  text?: string;
-  limit?: number;
-};
-
-/**
- * The explorer response.
- *
- * `levels` and `targets` come from the store rather than from a constant, so the filter's chips
- * are the values this instance has actually recorded — a hard-coded level list offers an option
- * that can never return a row, which is how a filter becomes a guessing game.
- */
-export type LogListResponse = {
-  /** The rows, newest first — except through `fetchRequestLines`, which is oldest first. */
-  entries: LogEntry[];
-  levels: string[];
-  targets: string[];
-  /** How many lines the store holds in total, so an empty page is not an empty store. */
-  stored_total: number;
-  /** The window the store will answer, in days. */
-  max_window_days: number;
-  /** The cap on one search, in rows. */
-  max_rows: number;
-};
-
-/**
- * `GET /api/v1/observability/logs` — the bounded explorer.
- *
- * An empty parameter is dropped rather than sent blank: `?target=` is a filter for the empty
- * string, and the difference between "no target filter" and "the target is ''" is one the store
- * answers differently.
- */
-export function fetchLogs(filters: LogFilters = {}): Promise<LogListResponse> {
-  const query = new URLSearchParams();
-  for (const level of filters.levels ?? []) query.append("level", level);
-  if (filters.target) query.set("target", filters.target);
-  if (filters.traceId) query.set("trace_id", filters.traceId);
-  if (filters.since) query.set("since", filters.since);
-  if (filters.until) query.set("until", filters.until);
-  if (filters.source) query.set("source", filters.source);
-  if (filters.text) query.set("text", filters.text);
-  if (filters.limit) query.set("limit", String(filters.limit));
-
-  // A request id takes the dedicated route rather than this one: the ordering is the opposite and
-  // a caller who has to remember `&order=asc` to read a timeline will eventually get it wrong.
-  if (filters.requestId) return fetchRequestLines(filters.requestId);
-
-  const suffix = query.toString();
-  return request<LogListResponse>(`/api/v1/observability/logs${suffix ? `?${suffix}` : ""}`);
-}
-
-/**
- * `GET /api/v1/observability/logs/requests/{id}` — **one request's lines, oldest first**.
- *
- * This is the route an error banner is for: every line the request produced, across the API and
- * the workers, in the order it happened. The same response type is returned deliberately — the
- * shape of a line does not change with the direction of the list.
- */
-export function fetchRequestLines(requestId: string): Promise<LogListResponse> {
-  return request<LogListResponse>(
-    `/api/v1/observability/logs/requests/${encodeURIComponent(requestId)}`,
-  );
-}
-
-/**
- * The one log settings row, as the explorer reads it.
- *
- * `max_retention_days` is carried so the screen can say WHY a number is refused rather than only
- * that it was — "must be 14 or less" without the cap in hand is a validation message that reads
- * as an arbitrary rule, and an operator who cannot see the cap will not know whether to argue
- * with the value or the operator.
- */
-export type LogSettingsView = {
-  /** The level a module logs at unless it is raised. */
-  log_level_default: string;
-  /** Per-module raises, including the ones that have already expired. */
-  log_level_overrides: Record<string, unknown>;
-  /** How many days are kept. */
-  logs_retention_days: number;
-  /** When the row was last written, RFC 3339. */
-  updated_at: string;
-  /** The cap retention is allowed to reach. */
-  max_retention_days: number;
-};
-
-/**
- * `GET /api/v1/observability/logs/settings` — the one settings row, read-only from here.
- *
- * `PUT /logs/settings` is a separate route under `observability.manage` and is the whole settings
- * screen's job; this client deliberately does not wrap it, so a log explorer cannot silently
- * change retention. The screen shows the retention window so "the store only goes back N days"
- * is visible next to the results it is limiting.
- */
-export function fetchLogSettings(): Promise<LogSettingsView> {
-  return request<LogSettingsView>("/api/v1/observability/logs/settings");
-}
-
-/* ── traces and exporters (REQ-126 slice 3) ───────────────────────────────────────────────── */
-
-/** The trace list's filter. `undefined` means "no filter on this column", never "match nothing". */
-export type TraceFilters = {
-  request_id?: string;
-  route?: string;
-  /** `ok` or `error`. */
-  status?: string;
-  min_duration_ms?: number;
-  window_minutes?: number;
-  limit?: number;
-};
-
-/** One row of the trace list. */
-export type TraceSummary = {
-  trace_id: string;
-  root_name: string;
-  route: string | null;
-  request_id: string | null;
-  started_at: string;
-  duration_ms: number;
-  span_count: number;
-  /** The spans the platform kept; lower than `span_count` when the trace was truncated. */
-  spans_kept: number;
-  /** `true` when the waterfall on screen is incomplete, so the screen must say so. */
-  spans_truncated: boolean;
-  status: string;
-  /** The sampling decision, so an operator can tell "fast" from "unsampled". */
-  sampling: string;
-};
-
-/** The trace list response. */
-export type TracesResponse = {
-  traces: TraceSummary[];
-  total: number;
-  window_minutes: number;
-};
-
-/** One span of a waterfall. */
-export type TraceSpan = {
-  span_id: string;
-  parent_span_id: string | null;
-  name: string;
-  service: string;
-  offset_ms: number;
-  duration_ms: number;
-  attributes: Record<string, unknown>;
-  failed: boolean;
-  root: boolean;
-};
-
-/** One trace with its waterfall. */
-export type TraceDetail = TraceSummary & {
-  service: string;
-  /** Where the full trace lives in the operator's tracing backend, when one is configured. */
-  backend_trace_url: string | null;
-  spans: TraceSpan[];
-};
-
-/** `GET /api/v1/observability/traces`. */
-export function fetchTraces(filters: TraceFilters = {}): Promise<TracesResponse> {
-  const query = new URLSearchParams();
-  // Only the filters that were set travel: an empty string in a query parameter is a filter that
-  // matches nothing, which is why the screens normalise blanks to `undefined` before calling.
-  for (const [key, value] of Object.entries(filters)) {
-    if (value === undefined || value === null || value === "") continue;
-    query.set(key, String(value));
-  }
-  const suffix = query.toString();
-  return request<TracesResponse>(`/api/v1/observability/traces${suffix ? `?${suffix}` : ""}`);
-}
-
-/**
- * `GET /api/v1/observability/traces/{trace_id}`.
- *
- * A trace that is not in the index is `404 trace_not_found` — an unsampled trace and an expired
- * one are both "not here", and the message says which the operator should expect.
- */
-export function fetchTrace(traceId: string): Promise<TraceDetail> {
-  return request<TraceDetail>(`/api/v1/observability/traces/${encodeURIComponent(traceId)}`);
-}
-
-/** One configured exporter, with its live health and drop counters. */
-export type ExporterRow = {
-  id: string;
-  name: string;
-  kind: string;
-  endpoint: string;
-  protocol: string | null;
-  /** `true` when an auth credential is referenced — never the credential itself. */
-  auth_configured: boolean;
-  batch_ms: number;
-  timeout_ms: number;
-  enabled: boolean;
-  /** `healthy`, `degraded`, `disabled` or `unknown` before this process loaded it. */
-  health: string;
-  buffered: number;
-  capacity: number;
-  dropped_total: number;
-  last_flush_at: string | null;
-  last_error: string | null;
-};
-
-/** The exporter form's body. Every field is what the API's `ExporterInput` accepts. */
-export type ExporterInput = {
-  name: string;
-  kind: string;
-  endpoint: string;
-  protocol?: string | null;
-  /**
-   * Omitted on an edit that leaves the box empty.
-   *
-   * An empty box means "keep the current reference", so it is not sent at all: sending `null`
-   * would silently de-authenticate the exporter over a typo.
-   */
-  auth_secret_id?: string;
-  batch_ms?: number;
-  timeout_ms?: number;
-  enabled?: boolean;
-};
-
-/** The exporter list response. */
-export type ExportersResponse = {
-  exporters: ExporterRow[];
-  kinds: string[];
-  /** The sentence about what leaves this instance, stated on the payload and not only in a component. */
-  egress_notice: string;
-};
-
-/**
- * The result of a test send.
- *
- * A failed send is a `200` carrying the backend's own words, not an error page: a `Test` button
- * that renders an error page has told the operator nothing they could not have learned by waiting.
- */
-export type ExporterTestResult = {
-  name: string;
-  kind: string;
-  ok: boolean;
-  detail: string;
-  health: string;
-};
-
-/** `GET /api/v1/observability/exporters`. */
-export function fetchExporters(): Promise<ExportersResponse> {
-  return request<ExportersResponse>("/api/v1/observability/exporters");
-}
-
-/** `POST /api/v1/observability/exporters` — answers `201` with the new row's id and name. */
-export function createExporter(input: ExporterInput): Promise<{ id: string; name: string }> {
-  return request<{ id: string; name: string }>("/api/v1/observability/exporters", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** `PATCH /api/v1/observability/exporters/{id}`. */
-export function updateExporter(
-  id: string,
-  input: ExporterInput,
-): Promise<{ id: string; name: string }> {
-  return request<{ id: string; name: string }>(
-    `/api/v1/observability/exporters/${encodeURIComponent(id)}`,
-    { method: "PATCH", body: JSON.stringify(input) },
-  );
-}
-
-/** `DELETE /api/v1/observability/exporters/{id}`. */
-export function deleteExporter(id: string): Promise<null> {
-  return request<null>(`/api/v1/observability/exporters/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-}
-
-/** `POST /api/v1/observability/exporters/{id}/test` — a real send of a synthetic batch. */
-export function testExporter(id: string): Promise<ExporterTestResult> {
-  return request<ExporterTestResult>(
-    `/api/v1/observability/exporters/${encodeURIComponent(id)}/test`,
-    { method: "POST" },
-  );
-}
-
-/* ── alert rules, alerts and silences (REQ-126 slice 4) ────────────────────────────────────── */
-
-/** One rule, with the live evaluation state the catalogue does not hold. */
-export type AlertRuleRow = {
-  id: string;
-  name: string;
-  expr: string;
-  parsed: string | null;
-  severity: string;
-  for_seconds: number;
-  summary: string;
-  runbook_url: string | null;
-  labels: Record<string, unknown>;
-  /** `built_in` for the rules the platform ships, `custom` for an operator's own. */
-  source: string;
-  enabled: boolean;
-  state: string | null;
-  value: number | null;
-  silenced: boolean;
-  silenced_until: string | null;
-  /** Whether the expression parsed. A rule that does not parse is stored, and flagged. */
-  expression_valid: boolean;
-  expression_error: string | null;
-};
-
-/** The rule list response. */
-export type AlertRulesResponse = {
-  rules: AlertRuleRow[];
-  families: string[];
-  severities: string[];
-  max_for_seconds: number;
-};
-
-/** The rule form's body. */
-export type AlertRuleInput = {
-  name: string;
-  expr: string;
-  severity: string;
-  for_seconds: number;
-  summary: string;
-  runbook_url?: string | null;
-  labels?: Record<string, unknown>;
-};
-
-/** The rule patch. Every field is optional, and a misspelled one is refused by the API. */
-export type AlertRulePatch = Partial<AlertRuleInput> & { enabled?: boolean };
-
-/** One firing, pending or resolved alert. */
-export type AlertEventRow = {
-  id: number;
-  rule_id: string;
-  state: string;
-  value: number | null;
-  /** The value at the moment it crossed, which is not always the current one. */
-  firing_value: number | null;
-  started_at: string;
-  ended_at: string | null;
-  fired_at: string | null;
-  notified: boolean;
-  reason: string;
-  context: Record<string, unknown>;
-};
-
-/** One suppression window. */
-export type SilenceRow = {
-  id: string;
-  rule_id: string | null;
-  reason: string;
-  starts_at: string | null;
-  ends_at: string;
-  active: boolean;
-  minutes_remaining: number;
-};
-
-/** The alerts response, with the counts the header strip reads. */
-export type AlertsResponse = {
-  firing: AlertEventRow[];
-  pending: AlertEventRow[];
-  resolved: AlertEventRow[];
-  silences: SilenceRow[];
-  counts: {
-    firing: number;
-    pending: number;
-    silenced: number;
-    worst_severity: string | null;
-  };
-};
-
-/** What an expression evaluates to right now, before it is saved. */
-export type AlertPreview = {
-  /** The expression as the evaluator understood it. */
-  rendered: string;
-  family: string;
-  value: number | null;
-  series: number;
-  breaching: boolean;
-  /** `true` when the family has no samples, so `breaching: false` means "no data". */
-  no_data: boolean;
-};
-
-/** `GET /api/v1/observability/alert-rules`. */
-export function fetchAlertRules(): Promise<AlertRulesResponse> {
-  return request<AlertRulesResponse>("/api/v1/observability/alert-rules");
-}
-
-/** `POST /api/v1/observability/alert-rules` — answers `201`, like every other create here. */
-export function createAlertRule(input: AlertRuleInput): Promise<AlertRuleRow> {
-  return request<AlertRuleRow>("/api/v1/observability/alert-rules", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** `PATCH /api/v1/observability/alert-rules/{id}` — the enable/disable toggle lives here. */
-export function updateAlertRule(id: string, patch: AlertRulePatch): Promise<AlertRuleRow> {
-  return request<AlertRuleRow>(
-    `/api/v1/observability/alert-rules/${encodeURIComponent(id)}`,
-    { method: "PATCH", body: JSON.stringify(patch) },
-  );
-}
-
-/** `DELETE /api/v1/observability/alert-rules/{id}` — answers `204`. */
-export function deleteAlertRule(id: string): Promise<null> {
-  return request<null>(`/api/v1/observability/alert-rules/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-}
-
-/** `POST /api/v1/observability/alert-rules/preview` — evaluate without saving. */
-export function previewAlertRule(expr: string): Promise<AlertPreview> {
-  return request<AlertPreview>("/api/v1/observability/alert-rules/preview", {
-    method: "POST",
-    body: JSON.stringify({ expr }),
-  });
-}
-
-/** `GET /api/v1/observability/alerts`. */
-export function fetchAlerts(): Promise<AlertsResponse> {
-  return request<AlertsResponse>("/api/v1/observability/alerts");
-}
-
-/** The silence form's body. `rule_id: null` silences every rule, which the screen states. */
-export type SilenceInput = {
-  rule_id: string | null;
-  reason: string;
-  ends_at: string;
-  starts_at?: string | null;
-};
-
-/** `POST /api/v1/observability/silences` — answers `201`. */
-export function createSilence(input: SilenceInput): Promise<SilenceRow> {
-  return request<SilenceRow>("/api/v1/observability/silences", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** `DELETE /api/v1/observability/silences/{id}` — answers `204`. */
-export function deleteSilence(id: string): Promise<null> {
-  return request<null>(`/api/v1/observability/silences/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-}
-
-/* ── observability settings and the probe contract (REQ-126 slice 4) ──────────────────────── */
-
-/** The caps the settings screen enforces client-side, so a refusal is a field message. */
-export type ObservabilityCaps = {
-  logs_retention_max: number;
-  traces_retention_max: number;
-  sampling_max: number;
-  cardinality_max: number;
-  log_levels: string[];
-};
-
-/** One module's level override. */
-export type LogLevelOverrideRow = {
-  target: string;
-  level: string;
-  expires_at: string | null;
-  /** `true` once the override lapsed — it is still listed so the screen can offer a clean-up. */
-  expired: boolean;
-};
-
-/** The one settings row. */
-export type ObservabilitySettings = {
-  /** The share of non-error requests whose trace is kept. Errors are always kept. */
-  sampling_ratio: number;
-  logs_retention_days: number;
-  traces_retention_days: number;
-  log_level_default: string;
-  log_level_overrides: Record<string, unknown>;
-  cardinality_budget: number;
-  prometheus_public: boolean;
-  caps: ObservabilityCaps;
-  /** The sentence about egress, stated on the payload so it can be audited. */
-  egress_note: string;
-  level_overrides: LogLevelOverrideRow[];
-};
-
-/** The settings form's body. */
-export type ObservabilitySettingsInput = {
-  sampling_ratio: number;
-  logs_retention_days: number;
-  traces_retention_days: number;
-  log_level_default: string;
-  log_level_overrides: Record<string, unknown>;
-  cardinality_budget: number;
-  prometheus_public: boolean;
-};
-
-/** Where this process is in its own shutdown, and the probe paths that describe it. */
-export type LifecycleResponse = {
-  draining: boolean;
-  in_flight: number;
-  drain_timeout_ms: number;
-  probes: {
-    liveness: { path: string; alias: string; fails_on_drain: boolean };
-    readiness: { path: string; alias: string; fails_on_drain: boolean };
-  };
-  /** Why liveness deliberately does not report the drain. */
-  note: string;
-  summary: Record<string, unknown>;
-};
-
-/** `GET /api/v1/observability/settings`. */
-export function fetchObservabilitySettings(): Promise<ObservabilitySettings> {
-  return request<ObservabilitySettings>("/api/v1/observability/settings");
-}
-
-/** `PUT /api/v1/observability/settings` — a write, and audited like one. */
-export function saveObservabilitySettings(
-  input: ObservabilitySettingsInput,
-): Promise<ObservabilitySettings> {
-  return request<ObservabilitySettings>("/api/v1/observability/settings", {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
-}
-
-/** `GET /api/v1/observability/lifecycle` — the probe contract, as data. */
-export function fetchLifecycle(): Promise<LifecycleResponse> {
-  return request<LifecycleResponse>("/api/v1/observability/lifecycle");
-}
-
-/* ── credentials (REQ-125) ───────────────────────────────────────────────────────────────── */
-
-/** One credential, described without ever carrying its value. */
-export type Credential = {
-  id: string;
-  name: string;
-  kind: string;
-  kind_description: string;
-  /** `true` when the kind can be checked without a network call. */
-  offline_checkable: boolean;
-  /** The masked values, for display only. */
-  fields: Record<string, unknown>;
-  /** The non-secret fields as `[name, value]` pairs, for the detail row. */
-  field_pairs: [string, string][];
-  validation_state: string;
-  validation_message: string;
-  validation_checked_at: string | null;
-  validation_interval_days: number;
-  next_validation_at: string | null;
-  provider: string;
-  provider_locator: string | null;
-  read_only: boolean;
-  version: number;
-  created_at: string;
-  slots: string[];
-};
-
-/** One of the five credential kinds, with the fields it wants. */
-export type CredentialKindOption = {
-  kind: string;
-  description: string;
-  fields: string[];
-  offline: boolean;
-};
-
-/** The credential list response. */
-export type CredentialsResponse = {
-  credentials: Credential[];
-  kinds: CredentialKindOption[];
-  total: number;
-  valid: number;
-  invalid: number;
-  unknown: number;
-};
-
-/** What a validation run answered. */
-export type CredentialValidation = {
-  id: string;
-  validation_state: string;
-  validation_message: string;
-  checked_at: string;
-  valid: boolean;
-};
-
-/** `GET /api/v1/secrets/credentials`. */
-export function fetchCredentials(): Promise<CredentialsResponse> {
-  return request<CredentialsResponse>("/api/v1/secrets/credentials");
-}
-
-/**
- * `POST /api/v1/secrets/{id}/validate` — check a credential against its provider.
- *
- * A failed check is still a `200` carrying the provider's own words; only a broken store is an
- * error, because "the check failed" is the answer an operator asked for.
- */
-export function validateCredential(id: string): Promise<CredentialValidation> {
-  return request<CredentialValidation>(`/api/v1/secrets/${encodeURIComponent(id)}/validate`, {
-    method: "POST",
-  });
-}
-
-/** The typed profile body: a kind and its non-secret fields. */
-export type CredentialProfileInput = {
-  kind: string;
-  fields: Record<string, unknown>;
-};
-
-/**
- * `POST /api/v1/secrets/{id}/credential` — pin a secret to a kind — answers `201`.
- *
- * `fields` is a `Record` on purpose: the five kinds want different field names, and a fixed shape
- * would force a screen to know the union of all of them to send one.
- */
-export function attachCredentialProfile(
-  secretId: string,
-  kind: string,
-  fields: Record<string, unknown>,
-): Promise<Credential> {
-  return request<Credential>(`/api/v1/secrets/${encodeURIComponent(secretId)}/credential`, {
-    method: "POST",
-    body: JSON.stringify({ kind, fields }),
-  });
-}
-
-/* ── credential slots (REQ-125) ──────────────────────────────────────────────────────────── */
-
-/** One slot's definition, independent of any scope. */
-export type SlotDef = {
-  slot: string;
-  description: string;
-  /** Which parts of the platform read this slot, so the cost of leaving it empty is legible. */
-  consumers: string;
-};
-
-/** One assignment row. */
-export type CredentialSlot = {
-  id: string;
-  scope_type: string;
-  scope_id: string;
-  slot: string;
-  description: string;
-  consumers: string;
-  primary_secret_id: string | null;
-  primary_name: string | null;
-  primary_version: number | null;
-  fallback_secret_id: string | null;
-  fallback_name: string | null;
-  fallback_version: number | null;
-  last_resolved_by: string | null;
-  last_resolved_at: string | null;
-  /** Why an empty slot is empty — "unassigned" is not an answer an operator can act on. */
-  empty_reason: string;
-};
-
-/** A credential that may be assigned to a slot. */
-export type AssignableCredential = {
-  id: string;
-  name: string;
-  kind: string;
-  read_only: boolean;
-  provider: string;
-};
-
-/** The slot matrix response. */
-export type SlotsResponse = {
-  slots: CredentialSlot[];
-  catalog: SlotDef[];
-  assignable: AssignableCredential[];
-  assigned: number;
-};
-
-/** What a consumer would actually get, without pretending to be one. */
-export type SlotResolution = {
-  scope_type: string;
-  scope_id: string;
-  slot: string;
-  secret_id: string;
-  name: string;
-  version: number;
-  /** `true` when the primary was unavailable and the fallback answered instead. */
-  fell_back: boolean;
-  summary: string;
-};
-
-/** `GET /api/v1/credential-slots` — the assignment matrix. */
-export function fetchSlots(): Promise<SlotsResponse> {
-  return request<SlotsResponse>("/api/v1/credential-slots");
-}
-
-/**
- * `PUT /api/v1/credential-slots/{scope}/{slot}` — assign a scope's slot.
- *
- * `primary` and `fallback` are `string | null` rather than optional: passing `null` is how a slot
- * is *cleared*, and omitting the argument is not the same intent. A slot that points at itself is
- * refused by the API with `credential_slot_self_reference`, which belongs next to the field.
- */
-export function assignSlot(
-  scopeType: string,
-  slot: string,
-  scopeId: string,
-  primary: string | null,
-  fallback: string | null,
-): Promise<CredentialSlot> {
-  return request<CredentialSlot>(
-    `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(slot)}`,
-    {
-      method: "PUT",
-      body: JSON.stringify({
-        scope_id: scopeId,
-        primary_secret_id: primary,
-        fallback_secret_id: fallback,
-      }),
-    },
-  );
-}
-
-/** `GET /api/v1/credential-slots/{scope}/{slot}/resolve/{scope_id}` — show a resolution. */
-export function resolveSlot(
-  scopeType: string,
-  slot: string,
-  scopeId: string,
-): Promise<SlotResolution> {
-  return request<SlotResolution>(
-    `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(
-      slot,
-    )}/resolve/${encodeURIComponent(scopeId)}`,
-  );
-}
-
-/* ── leases and deployment keys (REQ-125) ───────────────────────────────────────────────── */
-
-/** One lease. A lease is a live copy of a credential, which is why it has a redemption budget. */
-export type SecretLease = {
-  id: string;
-  secret_id: string;
-  name: string;
-  consumer: string;
-  environment: string;
-  state: string;
-  max_uses: number;
-  uses: number;
-  expires_in_seconds: number;
-  expires_at: string;
-  issued_at: string;
-  revoked_at: string | null;
-  revoke_reason: string | null;
-  last_redeemed_at: string | null;
-  /**
-   * The address the last redemption came from.
-   *
-   * This is the column an operator reads to find a leak, and it is written by the redemption
-   * itself — a keyless loopback redemption writes no use-log row, so this is the only place the
-   * answer exists.
-   */
-  last_address: string | null;
-  deployment_key_id: string | null;
-  version: number;
-};
-
-/** The lease list response. */
-export type LeasesResponse = {
-  leases: SecretLease[];
-  total: number;
-  live: number;
-  spent: number;
-  revoked: number;
-  environments: string[];
-};
-
-/** `GET /api/v1/secret-leases`. */
-export function fetchSecretLeases(): Promise<LeasesResponse> {
-  return request<LeasesResponse>("/api/v1/secret-leases");
-}
-
-/**
- * `POST /api/v1/secret-leases/{id}/revoke` — with a reason.
- *
- * The reason is mandatory in spirit and optional in shape because the API stores it either way;
- * a bare "revoked" is not worth keeping, and the screen asks for it for that reason.
- */
-export function revokeLease(id: string, reason: string): Promise<SecretLease> {
-  return request<SecretLease>(`/api/v1/secret-leases/${encodeURIComponent(id)}/revoke`, {
-    method: "POST",
-    body: JSON.stringify({ reason }),
-  });
-}
-
-/** One deployment key, described without the key. */
-export type DeploymentKey = {
-  id: string;
-  name: string;
-  environment: string;
-  /** Credential scopes with a `prefix.*` wildcard — not permission names. */
-  scopes: string[];
-  state: string;
-  expires_at: string;
-  expires_in_seconds: number;
-  uses: number;
-  last_used_at: string | null;
-  allowed_ips: string[];
-  /** The visible prefix, so an operator can tell two keys apart without either of them. */
-  key_prefix: string;
-  fingerprint: string;
-  created_at: string;
-  revoked_at: string | null;
-  revoke_reason: string | null;
-  /** `false` while a key is live: a live key can only be revoked, not deleted. */
-  deletable: boolean;
-};
-
-/** The deployment key list response, with the header a caller must send. */
-export type DeploymentKeysResponse = {
-  keys: DeploymentKey[];
-  total: number;
-  active: number;
-  expired: number;
-  revoked: number;
-  header: string;
-  guidance: string;
-};
-
-/**
- * The one response in this file that carries a value.
- *
- * The key is answered here, at creation, and nowhere else — not on the list, not on the detail,
- * not in any store on this side. The name says so, so a reader can see the exception in the type.
- */
-export type CreatedDeploymentKey = DeploymentKey & {
-  value: string;
-  header: string;
-};
-
-/** One use of a deployment key. */
-export type DeploymentKeyUse = {
-  action: string;
-  lease_id: string | null;
-  identity: string;
-  address: string | null;
-  result: string;
-  created_at: string;
-};
-
-/** The deployment key form's body. */
-export type DeploymentKeyInput = {
-  name: string;
-  environment: string;
-  scopes: string[];
-  /** RFC 3339. A backdated key is refused at creation — "dead on arrival" is caught early. */
-  expires_at: string;
-  allowed_ips?: string | null;
-};
-
-/** `GET /api/v1/deployment-keys`. */
-export function fetchDeploymentKeys(): Promise<DeploymentKeysResponse> {
-  return request<DeploymentKeysResponse>("/api/v1/deployment-keys");
-}
-
-/** `POST /api/v1/deployment-keys` — answers `201` and the value, exactly once. */
-export function createDeploymentKey(input: DeploymentKeyInput): Promise<CreatedDeploymentKey> {
-  return request<CreatedDeploymentKey>("/api/v1/deployment-keys", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** `POST /api/v1/deployment-keys/{id}/revoke` — answers `204`. */
-export function revokeDeploymentKey(id: string, reason: string): Promise<null> {
-  return request<null>(`/api/v1/deployment-keys/${encodeURIComponent(id)}/revoke`, {
-    method: "POST",
-    body: JSON.stringify({ reason }),
-  });
-}
-
-/** `DELETE /api/v1/deployment-keys/{id}` — a revoked key's record; answers `204`. */
-export function deleteDeploymentKey(id: string): Promise<null> {
-  return request<null>(`/api/v1/deployment-keys/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-}
-
-/** `GET /api/v1/deployment-keys/{id}/uses` — the use log, as a bare array. */
-export function fetchDeploymentKeyUses(id: string): Promise<DeploymentKeyUse[]> {
-  return request<DeploymentKeyUse[]>(
-    `/api/v1/deployment-keys/${encodeURIComponent(id)}/uses`,
-  );
-}
-
-/* ── the secrets audit trail and its detectors (REQ-125) ─────────────────────────────────── */
-
-/** The audit filter. `undefined` means "no filter", never "match nothing". */
-export type SecretAuditFilter = {
-  actions?: string[];
-  secret_id?: string;
-  actor_user_id?: string;
-  address?: string;
-  request_id?: string;
-  since?: string;
-  limit?: number;
-};
-
-/** One trail entry. Metadata is a `Record` because each action documents different fields. */
-export type SecretAuditEntry = {
-  id: number;
-  action: string;
-  target_type: string | null;
-  target_id: string | null;
-  actor_user_id: string | null;
-  /** `user`, `deployment_key` or `system` — who acted is never inferred from the row. */
-  actor_type: string;
-  ip_address: string | null;
-  request_id: string | null;
-  lease_id: string | null;
-  deployment_key_id: string | null;
-  /** Which lifecycle the action belongs to, for the filter chips. */
-  pipeline: string | null;
-  metadata: Record<string, unknown>;
-  created_at: string;
-};
-
-/** One flag a detector raised. Flags are advisory: acknowledging one deletes nothing. */
-export type SecretAnomaly = {
-  id: number;
-  pattern: string;
-  severity: string;
-  secret_id: string | null;
-  secret_name: string | null;
-  actor_user_id: string | null;
-  address: string | null;
-  detail: Record<string, unknown>;
-  request_id: string | null;
-  created_at: string;
-  acknowledged: boolean;
-  acknowledged_by: string | null;
-  acknowledged_at: string | null;
-};
-
-/** The audit response. */
-export type SecretAuditResponse = {
-  entries: SecretAuditEntry[];
-  open_anomalies: number;
-  filters: string[];
-  detectors: {
-    business_hours_start: number;
-    business_hours_end: number;
-    reveal_burst_per_hour: number;
-    detect_new_network: boolean;
-    /** `true` when the platform refuses a reveal outright, not merely flags it. */
-    hard_rule_enforced: boolean;
-    explanation: string;
-  };
-  local_hour: number;
-};
-
-/** `GET /api/v1/secrets/audit`. */
-export function fetchSecretAudit(filter: SecretAuditFilter = {}): Promise<SecretAuditResponse> {
-  const query = new URLSearchParams();
-  // The API accepts `?action=a&action=b` for the multi-select; a repeated key is the only
-  // encoding that carries a list without inventing an envelope the server does not have.
-  for (const action of filter.actions ?? []) query.append("action", action);
-  for (const [key, value] of [
-    ["secret_id", filter.secret_id],
-    ["actor_user_id", filter.actor_user_id],
-    ["address", filter.address],
-    ["request_id", filter.request_id],
-    ["since", filter.since],
-    ["limit", filter.limit],
-  ] as const) {
-    if (value === undefined || value === null || value === "") continue;
-    query.set(key, String(value));
-  }
-  const suffix = query.toString();
-  return request<SecretAuditResponse>(`/api/v1/secrets/audit${suffix ? `?${suffix}` : ""}`);
-}
-
-/** `GET /api/v1/secrets/audit/anomalies` — the flags, unacknowledged first. */
-export function fetchSecretAnomalies(): Promise<{ anomalies: SecretAnomaly[] }> {
-  return request<{ anomalies: SecretAnomaly[] }>("/api/v1/secrets/audit/anomalies");
-}
-
-/**
- * `PATCH /api/v1/secrets/audit/anomalies/{id}/acknowledge` — clear one flag.
- *
- * The answer distinguishes "cleared" from "already cleared", because a second click on an
- * acknowledged row is a normal thing to do and should say so rather than report a change that did
- * not happen.
- */
-export function acknowledgeSecretAnomaly(
-  id: number,
-): Promise<{ state: "acknowledged" | "already_acknowledged"; id: number }> {
-  return request<{ state: "acknowledged" | "already_acknowledged"; id: number }>(
-    `/api/v1/secrets/audit/anomalies/${id}/acknowledge`,
-    { method: "PATCH", body: JSON.stringify({}) },
-  );
-}
-
-/**
- * `GET /api/v1/secrets/audit/export` — the SIEM feed, as **text**.
- *
- * This is the one call here that does not go through `request()`: the endpoint answers
- * newline-delimited JSON, not a JSON document, and running it through the JSON reader would turn
- * a real export into `null`. A read is still audited by the server, and the read itself is
- * therefore an event an operator can find in the trail.
- */
-export async function downloadSecretAuditExport(filter: SecretAuditFilter = {}): Promise<string> {
-  const query = new URLSearchParams();
-  for (const action of filter.actions ?? []) query.append("action", action);
-  for (const [key, value] of [
-    ["secret_id", filter.secret_id],
-    ["actor_user_id", filter.actor_user_id],
-    ["address", filter.address],
-    ["request_id", filter.request_id],
-    ["limit", filter.limit],
-  ] as const) {
-    if (value === undefined || value === null || value === "") continue;
-    query.set(key, String(value));
-  }
-  const suffix = query.toString();
-  const response = await fetch(
-    `/api/v1/secrets/audit/export${suffix ? `?${suffix}` : ""}`,
-    { credentials: "same-origin", headers: { accept: "application/x-ndjson" } },
-  );
-  if (!response.ok) {
-    // Shaped like every other refusal so the screen's error path needs no second code path.
-    const body = (await readJson(response)) as ErrorBody;
-    throw new ApiError(
-      response.status,
-      body.error?.code ?? "unknown_error",
-      body.error?.message ?? `The export failed with status ${response.status}.`,
-      body.error?.details ?? null,
-    );
-  }
-  return response.text();
-}
-
-/* ── the root key and its rewrap jobs (REQ-125) ──────────────────────────────────────────── */
-
-/** One key version. A fingerprint, never material. */
-export type RootKey = {
-  key_id: string;
-  status: string;
-  fingerprint: string;
-  version_count: number;
-  created_at: string;
-  retired_at: string | null;
-  retired_reason: string | null;
-};
-
-/** Whether the sealed versions can still be opened, and what to do when they cannot. */
-export type RootKeySeal = {
-  healthy: boolean;
-  sealed: number;
-  /** `(key_id, source)` pairs: which key and which file refused to unseal. */
-  unsealed: [string, string][];
-  source: string | null;
-  guidance: string;
-};
-
-/** One rewrap job — the ceremony that moves sealed versions onto a new key. */
-export type RewrapJob = {
-  id: string;
-  status: string;
-  from_key_id: string;
-  to_key_id: string;
-  rewrapped_count: number;
-  total_count: number;
-  /** 0..1. A job that paused reports its progress so the screen can say how far it got. */
-  progress: number;
-  resume_note: string | null;
-  pause_reason: string | null;
-  last_error: string | null;
-  started_at: string;
-  completed_at: string | null;
-};
-
-/** The whole root-key state, as one read. */
-export type RootKeyState = {
-  keys: RootKey[];
-  seal: RootKeySeal;
-  /** The job in flight, if any. */
-  job: RewrapJob | null;
-  recent_jobs: RewrapJob[];
-  versions_to_rewrap: number;
-  has_active_key: boolean;
-};
-
-/** `GET /api/v1/secrets/root-key`. */
-export function fetchRootKeyState(): Promise<RootKeyState> {
-  return request<RootKeyState>("/api/v1/secrets/root-key");
-}
-
-/** `POST /api/v1/secrets/root-key/rotate` — start the ceremony. */
-export function rotateRootKey(): Promise<RewrapJob> {
-  return request<RewrapJob>("/api/v1/secrets/root-key/rotate", { method: "POST" });
-}
-
-/** `POST /api/v1/secrets/root-key/rewrap-jobs/{id}/pause`. */
-export function pauseRewrapJob(id: string): Promise<RewrapJob> {
-  return request<RewrapJob>(
-    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}/pause`,
-    { method: "POST" },
-  );
-}
-
-/** `POST /api/v1/secrets/root-key/rewrap-jobs/{id}/resume`. */
-export function resumeRewrapJob(id: string): Promise<RewrapJob> {
-  return request<RewrapJob>(
-    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}/resume`,
-    { method: "POST" },
-  );
-}
 // Security centre (REQ-012, slice 2) — the header policy
 // ---------------------------------------------------------------------------------------------
 
@@ -6712,317 +6521,376 @@ export function saveBackupSettings(input: {
   });
 }
 
-
 // ---------------------------------------------------------------------------------------------
-// REQ-127 — the platform-wide rate limiter (slice 1)
-//
-// Every function here talks to `/api/v1/reliability/rate-limits/*`, which is a DIFFERENT surface
-// from `/api/v1/security/rate-limits`: the security one is the gateway's per-route document
-// (REQ-040) and the reliability one is the platform-wide budgets (user / organization / IP /
-// route). Both can refuse the same caller, so both exist, and every refusal the reliability
-// layer writes names which of the two answered.
+// AI workflow builder (docs/requests/REQ-046) — the draft console
 // ---------------------------------------------------------------------------------------------
 
-/**
- * One policy, in resolution order, with the ceiling already added.
- *
- * `enforced_here` is the field that stops a stored-but-unspent row from reading as protection:
- * a `route`-scoped policy is stored and listed, but the platform limiter runs before the router
- * publishes a matched route and has no template to match on, so the panel says so on the row
- * rather than leaving the operator to find out from a caller that was never refused.
- */
-export interface ReliabilityPolicy {
-  id: string | null;
+/** One draft as the console list renders it. */
+export type AiWorkflowDraft = {
+  id: string;
+  title: string;
+  status: string;
+  model_key: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  workflow_id: string | null;
+  has_definition: boolean;
+  error: string | null;
+  tokens: number;
+};
+
+/** One step of a draft's definition, as the review screen draws it. */
+export type AiWorkflowStep = {
+  position: number;
   name: string;
-  scope: string;
-  target_id: string | null;
-  route_pattern: string | null;
-  limit_count: number;
-  window_seconds: number;
-  burst: number;
-  /** `limit_count + burst`, computed by the API so a table never makes the reader add it up. */
-  ceiling: number;
-  priority: number;
-  is_default: boolean;
-  enabled: boolean;
-  enforced_here: boolean;
-}
+  kind: string;
+  action: string | null;
+  params: unknown;
+};
 
-/** The policy list: the rows, the scope vocabulary and this deployment's failure mode. */
-export interface ReliabilityPolicies {
-  policies: ReliabilityPolicy[];
-  vocabulary: string[];
-  limiter: string;
-  /** Whether an unreadable counter fails open (availability) or closed (protection). */
-  fail_mode: string;
-}
+/** One draft as the review screen renders it. */
+export type AiWorkflowDraftDetail = AiWorkflowDraft & {
+  organization_id: string;
+  site_id: string | null;
+  prompt: string;
+  rationale: string | null;
+  definition: unknown;
+  tokens_input: number;
+  tokens_output: number;
+  revision_note: string | null;
+  revision_count: number;
+  decided_by: string | null;
+  decision_reason: string | null;
+  steps: AiWorkflowStep[];
+  decided_at: string | null;
+};
 
-/** A write. The API owns every range; the client sends numbers and shows what came back. */
-export interface ReliabilityPolicyInput {
-  name: string;
-  scope: string;
-  target_id?: string | null;
-  route_pattern?: string | null;
-  limit_count: number;
-  window_seconds: number;
-  burst?: number;
-  priority?: number;
-  enabled?: boolean;
-}
-
-/** The dry-run's input: the same four facts the middleware reads off a request. */
-export interface ReliabilityEvaluateInput {
-  scope?: string | null;
-  user_id?: string | null;
-  ip?: string | null;
-  route?: string | null;
-  /** The counter to assume, for explaining a refusal a caller is already seeing. */
-  count?: number | null;
-}
-
-/**
- * The dry-run's verdict, as the API's `Verdict` enum actually serialises: an externally tagged
- * enum, so the variant is the KEY and its fields are the value.
- *
- * It is an enum rather than a flat answer because the four shapes are genuinely different and a
- * client-side "allowed + remaining" collapses the two that matter:
- *
- * - `Unlimited` — no policy applies. The request proceeds and there is **no budget number at
- *   all**; rendering it as "0 remaining" sends an operator hunting for a policy that does not
- *   exist.
- * - `Uncounted` — a policy applies, the counter was unreadable, the deployment fails **open**.
- *   The request proceeds and nothing was counted, so `remaining` is absent on purpose: a number
- *   here would be a measurement nobody took.
- * - `RefusedUncounted` — the same outage with the deployment failing **closed**. Refused, with
- *   no `retry_after`, because a wait the platform cannot compute is not a promise.
- * - `Allowed` / `Limited` — the two answers that carry a real measurement, and the only two the
- *   middleware is allowed to write `X-RateLimit-*` headers for.
- */
-/**
- * The dry-run's verdict, as the API's `Verdict` actually serialises.
- *
- * It is `#[serde(tag = "decision", rename_all = "snake_case")]` — internally tagged, so every
- * variant carries a `decision` KEY with the variant name in snake_case, and the variant's own
- * fields sit alongside it. A client written against serde's *external* tagging (the variant as
- * the key) parses nothing here, and nothing about the response looks wrong: every field is
- * simply `undefined`.
- *
- * It is an enum rather than a flat answer because the five shapes are genuinely different and a
- * client-side "allowed + remaining" collapses the two that matter:
- *
- * - `unlimited` — no policy applies. The request proceeds and there is **no budget number at
- *   all**; rendering it as "0 remaining" sends an operator hunting for a policy that does not
- *   exist.
- * - `uncounted` — a policy applies, the counter was unreadable, the deployment fails **open**.
- *   The request proceeds and nothing was counted, so `remaining` is absent on purpose: a number
- *   here would be a measurement nobody took.
- * - `refused_uncounted` — the same outage failing **closed**. Refused, with no `retry_after`,
- *   because a wait the platform cannot compute is not a promise.
- * - `allowed` / `limited` — the two answers that carry a real measurement, and the only two the
- *   middleware is allowed to write `X-RateLimit-*` headers for.
- */
-export interface ReliabilityVerdictBase {
-  decision: "allowed" | "limited" | "unlimited" | "uncounted" | "refused_uncounted";
-  policy_id: string | null;
-  /** Which scope answered, or `null` when no policy matched at all. */
-  scope: string | null;
-  /** Requests left in the window. Present only on the two answers with a real measurement. */
-  remaining?: number;
-  limit?: number;
-  ceiling?: number;
-  retry_after?: number;
-}
-
-export type ReliabilityVerdict = ReliabilityVerdictBase;
-
-/** The variant name, which is what the screen renders and what a test asserts on. */
-export function reliabilityVerdictKind(verdict: ReliabilityVerdict): string {
-  return verdict?.decision ?? "unknown";
-}
-
-export interface ReliabilityEvaluated {
-  policy: ReliabilityPolicy | null;
-  verdict: ReliabilityVerdict;
-  counted: { count: number; authoritative: boolean };
-  window_start: string | null;
-  counter_key: string | null;
-  fail_mode: string;
-}
-
-/** One refusal rollup: a scope, a route and one window. */
-export interface ReliabilityRefusal {
-  scope: string;
-  target_id: string | null;
-  route: string;
-  window_start: string;
-  refusals: number;
-  last_refusal_at: string;
-}
-
-export interface ReliabilityRefusals {
-  refusals: ReliabilityRefusal[];
-  last_24_hours: number;
-}
-
-/**
- * The policies, in the order the resolver walks them.
- *
- * `no-store`: a cached table is a screen that says "600 per minute" while the platform enforces
- * something else, and the whole value of the screen is that the two agree.
- */
-export function fetchReliabilityPolicies(): Promise<ReliabilityPolicies> {
-  return request<ReliabilityPolicies>("/api/v1/reliability/rate-limits", { cache: "no-store" });
-}
-
-/** Create a policy. The body never carries an id — the route decides which row it writes. */
-export function createReliabilityPolicy(
-  input: ReliabilityPolicyInput,
-): Promise<ReliabilityPolicy> {
-  return request<ReliabilityPolicy>("/api/v1/reliability/rate-limits", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Edit a policy. A default row is edited in place; deleting one disables it instead. */
-export function updateReliabilityPolicy(
-  id: string,
-  input: ReliabilityPolicyInput,
-): Promise<ReliabilityPolicy> {
-  return request<ReliabilityPolicy>(`/api/v1/reliability/rate-limits/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    body: JSON.stringify(input),
-  });
-}
-
-/**
- * Remove a custom policy.
- *
- * A default row is **disabled, not removed** — the shipped budgets are the document that
- * protects a deployment nobody has configured yet, and a delete that dropped them would turn an
- * install with no configuration into one with no protection. The API reports which it did.
- */
-export function deleteReliabilityPolicy(
-  id: string,
-): Promise<{ id: string; disabled: boolean; message: string }> {
-  return request<{ id: string; disabled: boolean; message: string }>(
-    `/api/v1/reliability/rate-limits/${encodeURIComponent(id)}`,
-    { method: "DELETE" },
-  );
-}
-
-/**
- * Dry-run one request through the limiter.
- *
- * A **server** call on purpose: the acceptance criterion is that the tool names the same policy
- * the middleware resolves, and only the server holds that resolver. A client-side reimplementation
- * agrees on the day it is written and drifts the first time somebody tunes a limit — which is
- * the day somebody is relying on it. It also does not spend the budget it measures.
- */
-export function evaluateReliabilityLimit(
-  input: ReliabilityEvaluateInput,
-): Promise<ReliabilityEvaluated> {
-  return request<ReliabilityEvaluated>("/api/v1/reliability/rate-limits/evaluate", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** The refusal rollups — one row per scope, route and window, never one per request. */
-export function fetchReliabilityRefusals(limit = 50): Promise<ReliabilityRefusals> {
-  return request<ReliabilityRefusals>(
-    `/api/v1/reliability/rate-limits/refusals?limit=${encodeURIComponent(String(limit))}`,
-    { cache: "no-store" },
-  );
-}
-
-
-// ---------------------------------------------------------------------------------------------
-// REQ-127 — the keyed-write ledger (slice 2)
-//
-// Every function here talks to `/api/v1/reliability/idempotency/*`. The read routes are the
-// caller's OWN keys: a key is `(scope, subject, key)`, so "the key abc" is one row per subject
-// and the screen shows the account that is signed in, never the platform's table.
-//
-// The detail route returns stored-response METADATA and never the body — that is the API's
-// contract, not a client choice, and the type below has no body field so that a future edit
-// cannot quietly add one.
-// ---------------------------------------------------------------------------------------------
-
-/** One key as the ledger lists it. `has_response` is not the same as being `completed`. */
-export interface IdempotencyKey {
-  key: string;
-  scope: string;
-  state: string;
-  replay_count: number;
-  expires_at: string;
-  completed_at: string | null;
-  has_response: boolean;
-}
-
-/** The list, with the two counts the header tiles read. */
-export interface IdempotencyKeys {
-  keys: IdempotencyKey[];
+/** One page of drafts, with the vocabulary the console renders itself from. */
+export type AiWorkflowDraftList = {
+  drafts: AiWorkflowDraft[];
   total: number;
-  in_progress: number;
-  state_filter: string | null;
-}
+  statuses: string[];
+  page_size: number;
+};
 
-/**
- * One key's stored-response metadata.
- *
- * There is no `response_body` field, and that omission is the reason the request is phrased as
- * "metadata": the store must never become a second request archive, so a read route that handed
- * back a write's payload would be the archive.
- */
-export interface IdempotencyKeyDetail {
-  key: string;
-  scope: string;
-  state: string;
-  method: string;
-  path: string;
-  response_status: number | null;
-  stored_body: boolean;
-  stored_body_bytes: number | null;
-  inline_cap_bytes: number;
-  response_body_ref: string | null;
-  replay_count: number;
-  original_request_id: string | null;
-  created_expires_at: string;
-  completed_at: string | null;
-  next_attempt: string;
-}
+/** One action of the engine's closed registry. */
+export type AiWorkflowAction = {
+  action: string;
+  summary: string;
+  host: boolean;
+};
 
-/** The release answer: what happened, in the API's words, so the notice is not invented. */
-export interface IdempotencyReleased {
-  key: string;
-  scope: string;
-  state: string;
-  released: boolean;
-  message: string;
-}
+/** One worked example the empty state offers. */
+export type AiWorkflowExample = {
+  title: string;
+  prompt: string;
+  note: string;
+};
 
-/**
- * The caller's keys, newest first.
- *
- * `no-store`, and the state filter is a QUERY parameter rather than a client-side filter: the
- * tile next to the list says how many are stuck, and that number has to come from the same
- * filtered read the table is showing or the two disagree the moment the page is more than one
- * window old.
- */
-export function fetchIdempotencyKeys(options: {
-  state?: string | null;
+/** The examples and the action vocabulary. */
+export type AiWorkflowVocabulary = {
+  examples: AiWorkflowExample[];
+  actions: AiWorkflowAction[];
+};
+
+/** The "created by" select's options. */
+export type AiWorkflowAuthor = { id: string; drafts: number };
+
+/** Every list filter is a query parameter, because the console keeps them in the URL. */
+export type AiWorkflowDraftQuery = {
+  status?: string[];
+  q?: string;
+  by?: string;
+  siteId?: string;
+  organizationId?: string;
+  offset?: number;
   limit?: number;
-} = {}): Promise<IdempotencyKeys> {
+};
+
+/** The query string a filter set produces, with empty values omitted. */
+function draftQueryString(query: AiWorkflowDraftQuery): string {
   const params = new URLSearchParams();
-  if (options.state) params.set("state", options.state);
-  params.set("limit", String(options.limit ?? 100));
-  return request<IdempotencyKeys>(`/api/v1/reliability/idempotency?${params.toString()}`, {
-    cache: "no-store",
+  if (query.status && query.status.length > 0) {
+    params.set("status", query.status.join(","));
+  }
+  if (query.q && query.q.trim()) params.set("q", query.q.trim());
+  if (query.by) params.set("by", query.by);
+  if (query.siteId) params.set("site_id", query.siteId);
+  if (query.organizationId) params.set("organization_id", query.organizationId);
+  if (query.offset) params.set("offset", String(query.offset));
+  if (query.limit) params.set("limit", String(query.limit));
+  return params.toString();
+}
+
+/** One page of drafts. */
+export function fetchAiWorkflowDrafts(
+  query: AiWorkflowDraftQuery = {},
+): Promise<AiWorkflowDraftList> {
+  const search = draftQueryString(query);
+  return request<AiWorkflowDraftList>(
+    `/api/v1/ai/workflows/drafts${search ? `?${search}` : ""}`,
+  );
+}
+
+/** One draft, with its definition and its step list. */
+export function fetchAiWorkflowDraft(draftId: string): Promise<AiWorkflowDraftDetail> {
+  return request<AiWorkflowDraftDetail>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}`,
+  );
+}
+
+/** The authors this organization's drafts carry. */
+export function fetchAiWorkflowAuthors(organizationId?: string): Promise<AiWorkflowAuthor[]> {
+  const search = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<AiWorkflowAuthor[]>(`/api/v1/ai/workflows/drafts/authors${search}`);
+}
+
+/** The empty state's examples and the engine's closed action registry. */
+export function fetchAiWorkflowVocabulary(): Promise<AiWorkflowVocabulary> {
+  return request<AiWorkflowVocabulary>("/api/v1/ai/workflows/examples");
+}
+
+/** Delete a draft. Never the workflow it produced. */
+export function removeAiWorkflowDraft(draftId: string): Promise<null> {
+  return request<null>(`/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}`, {
+    method: "DELETE",
   });
 }
 
-// ---------------------------------------------------------------------------------------------
+// ---- The decision half (REQ-046 slice 4) ---------------------------------------------------
+
+/** What a decision answers: the draft as it now reads, plus what the decision produced. */
+export type AiWorkflowDecision = {
+  draft: AiWorkflowDraftDetail;
+  workflow_id?: string;
+  enabled: boolean;
+};
+
+/** One planned step of a test run, as the review screen draws the plan. */
+export type AiWorkflowTestRunStep = {
+  position: number;
+  name: string;
+  kind: string;
+  action: string | null;
+  /** Whether the HOST runs this action — the line that says the step leaves the process. */
+  host: boolean;
+  /** The permission the action needs at run time, or `null` for the engine's own actions. */
+  permission: string | null;
+  params: unknown;
+};
+
+/**
+ * What a test run reports.
+ *
+ * A test run validates the definition and projects it step by step; it does **not** dispatch
+ * a run, so the `note` is the platform's own sentence about that and the screen shows it
+ * rather than letting the operator assume a rule was exercised.
+ */
+export type AiWorkflowTestRun = {
+  draft_id: string;
+  workflow_id: string | null;
+  definition: unknown;
+  steps: AiWorkflowTestRunStep[];
+  verdict: string;
+  note: string;
+};
+
+/**
+ * Approve a draft: it becomes a **disabled** workflow.
+ *
+ * `409` on a second call, naming the workflow the first call created — the message is the
+ * reason the operator can act on the conflict.
+ */
+export function approveAiWorkflowDraft(
+  draftId: string,
+): Promise<AiWorkflowDecision> {
+  return request<AiWorkflowDecision>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/approve`,
+    { method: "POST" },
+  );
+}
+
+/** Reject a draft. The reason is required by the API, not merely by this form. */
+export function rejectAiWorkflowDraft(
+  draftId: string,
+  reason: string,
+): Promise<AiWorkflowDecision> {
+  return request<AiWorkflowDecision>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/reject`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
+
+/** Save an operator-edited definition. The API revalidates and changes nothing on failure. */
+export function saveAiWorkflowDefinition(
+  draftId: string,
+  definition: unknown,
+): Promise<AiWorkflowDraftDetail> {
+  return request<AiWorkflowDraftDetail>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}`,
+    { method: "PATCH", body: JSON.stringify({ definition }) },
+  );
+}
+
+/** Validate a draft's definition and get the plan back, without running anything. */
+export function testRunAiWorkflowDraft(draftId: string): Promise<AiWorkflowTestRun> {
+  return request<AiWorkflowTestRun>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/test-run`,
+    { method: "POST" },
+  );
+}
+
+/** One stage of a generation, as the progress panel draws it. */
+export type AiWorkflowStage = "plan" | "validate" | "repair";
+
+/** What a finished generation reports. */
+export type AiWorkflowDone = {
+  draft_id: string;
+  status: string;
+  repaired: boolean;
+  attempts: number;
+  tokens: number;
+};
+
+/**
+ * Generate a draft, streaming.
+ *
+ * The API answers `text/event-stream` with `stage` frames (what the platform is doing),
+ * a `done` frame carrying the stored draft's id, or an `error` frame with a stable code. It
+ * carries **no prose**: the answer is validated before `done`, so a client that rendered
+ * deltas would be rendering a definition that may still be refused. A `409` before the first
+ * frame is the console's no-provider state, which is raised here as an `ApiError` so the
+ * caller handles one shape either way.
+ *
+ * `signal` is the Cancel button: aborting closes the stream, and the draft row keeps the
+ * `generating` status its own cleanup answers — nothing is written from the client side.
+ */
+export async function streamGenerateWorkflowDraft(
+  input: { prompt: string; model?: string; siteId?: string; organizationId?: string },
+  handlers: AiWorkflowStreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<void> {
+  await streamDraft(
+    "/api/v1/ai/workflows/generate",
+    {
+      prompt: input.prompt,
+      model: input.model && input.model.trim() ? input.model.trim() : null,
+      site_id: input.siteId || null,
+      organization_id: input.organizationId || null,
+    },
+    handlers,
+    signal,
+  );
+}
+
+/**
+ * Ask the model for a change to an existing draft, streaming.
+ *
+ * The same frames and the same reader as [`streamGenerateWorkflowDraft`], and that is the
+ * point: a revision that answered after one round-trip would leave the operator staring at
+ * a button they can press again, and the review screen's progress panel would have to be a
+ * second implementation of the panel the console already has.
+ */
+export async function streamReviseWorkflowDraft(
+  draftId: string,
+  note: string,
+  model: string | undefined,
+  handlers: AiWorkflowStreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<void> {
+  await streamDraft(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/revise`,
+    { note, model: model && model.trim() ? model.trim() : null },
+    handlers,
+    signal,
+  );
+}
+
+/** The callbacks a generation stream reports through. */
+export type AiWorkflowStreamHandlers = {
+  onStage?: (stage: AiWorkflowStage) => void;
+  onDone?: (done: AiWorkflowDone) => void;
+};
+
+/**
+ * Read one generation or revision stream.
+ *
+ * One reader for both routes: the frames are the same contract (`stage` / `done` / `error`),
+ * and two readers would be two places where an `error` frame is handled slightly differently
+ * — which is exactly the kind of difference that shows up as "asking for changes does
+ * nothing" while generating works.
+ */
+async function streamDraft(
+  path: string,
+  body: Record<string, unknown>,
+  handlers: AiWorkflowStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      // The METHOD is what makes this a mutating call; passing only `{ signal }` would read as
+      // a `GET`, send no token, and this stream would be the one screen whose save answers
+      // `403 csrf_failed` while every other write on the platform works.
+      ...csrfHeader({ method: "POST" }),
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+
+      const payload = JSON.parse(data) as Record<string, unknown>;
+      if (event === "stage") {
+        handlers.onStage?.(payload.stage as AiWorkflowStage);
+      } else if (event === "done") {
+        handlers.onDone?.(payload as unknown as AiWorkflowDone);
+        return;
+      } else if (event === "error") {
+        throw new ApiError(
+          502,
+          (payload.code as string) ?? "generation_failed",
+          (payload.message as string) ?? "The generation did not finish.",
+        );
+      }
+    }
+  }
+}
+
 // System health (REQ-014).
 //
 // The overview is fetched with `cache: "no-store"` and the POST carries the CSRF header
@@ -7051,181 +6919,11 @@ export function runHealthChecks(): Promise<HealthOverview> {
   });
 }
 
-/** One key's metadata. Metadata only — the body is not on this surface. */
-export function fetchIdempotencyKey(key: string): Promise<IdempotencyKeyDetail> {
-  return request<IdempotencyKeyDetail>(
-    `/api/v1/reliability/idempotency/${encodeURIComponent(key)}`,
-    { cache: "no-store" },
-  );
-}
-
-/**
- * Release a stuck `in_progress` key so the next attempt of that write runs again.
- *
- * The reason is not optional: the API refuses an empty one, and a release with nobody to explain
- * it is a release nobody can audit. The screen asks for it in a dialog rather than defaulting it.
- */
-export function releaseIdempotencyKey(
-  key: string,
-  reason: string,
-): Promise<IdempotencyReleased> {
-  return request<IdempotencyReleased>(
-    `/api/v1/reliability/idempotency/${encodeURIComponent(key)}`,
-    { method: "DELETE", body: JSON.stringify({ reason }) },
-  );
-}
-
-
-// ---------------------------------------------------------------------------------------------
-// REQ-127 — retry policies, the attempt ledger and the outbound breakers (slice 3)
-// ---------------------------------------------------------------------------------------------
-//
-// Every function here talks to `/api/v1/reliability/retry-*` and `/api/v1/reliability/breakers`.
-//
-// Two shapes in this file are NOT interchangeable and the screens must not blur them:
-//
-// - `delay_preview` is the policy's **ceiling** curve (the server computed it with draw = 1.0).
-//   With `full` jitter the real delay is a random point at or below it. Rendering it as "the
-//   schedule" would promise timings the platform does not keep, so the screens label it as the
-//   worst case.
-// - `stored: false` means the subsystem has no row and the shipped in-process default is in
-//   force. It is NOT an unconfigured subsystem, and treating it as one is how an operator
-//   deletes a policy that was never written.
-
-export interface ReliabilityRetryPolicy {
-  subsystem: string;
-  /** `null` for the subsystem default; a provider's name for an override. */
-  provider_override: string | null;
-  max_attempts: number;
-  base_delay_ms: number;
-  factor: number;
-  jitter: string;
-  max_elapse_ms: number;
-  retry_on: string[];
-  enabled: boolean;
-  /** Whether a row exists, as opposed to the shipped default being in force. */
-  stored: boolean;
-  /** The ceiling curve for attempts 1-8. A real delay is at or below this, never above. */
-  delay_preview: number[];
-  /** The cumulative preview runs past the policy's own elapsed budget. */
-  exceeds_budget: boolean;
-}
-
-export interface ReliabilityRetryPolicies {
-  policies: ReliabilityRetryPolicy[];
-  subsystems: string[];
-  jitter_modes: string[];
-}
-
-export interface ReliabilityRetryPolicyInput {
-  provider_override?: string | null;
-  max_attempts: number;
-  base_delay_ms: number;
-  factor: number;
-  jitter: string;
-  max_elapse_ms: number;
-  retry_on?: string[];
-  enabled?: boolean;
-}
-
-/** One attempt row of the ledger. `next_attempt_at` is what a restarted worker reads. */
-export interface ReliabilityAttempt {
-  id: number;
-  subsystem: string;
-  subject_kind: string;
-  subject_id: string | null;
-  attempt: number;
-  scheduled_at: string | null;
-  executed_at: string | null;
-  outcome: string;
-  error_class: string | null;
-  next_delay_ms: number | null;
-  dead_letter: boolean;
-  next_attempt_at: string | null;
-  created_at: string;
-}
-
-export interface ReliabilityAttempts {
-  attempts: ReliabilityAttempt[];
-  dead_letters: ReliabilityAttempt[];
-  /** How many sequences are owed an attempt right now — the scheduler's own predicate. */
-  due_now: number;
-  /** Named so the counter can be traced to the worklist that spends it. */
-  scheduler: string;
-  subsystems: string[];
-}
-
-export interface ReliabilityBreaker {
-  key: string;
-  name: string;
-  state: string;
-  forced_open: boolean;
-  failure_threshold: number;
-  window_seconds: number;
-  cooldown_seconds: number;
-  half_open_probes: number;
-  success_threshold: number;
-  failures_in_window: number;
-  successes_in_half_open: number;
-  trips_total: number;
-  opened_at: string | null;
-  state_changed_at: string;
-  /** Seconds until a probe is allowed; `null` while held open deliberately. */
-  retry_after: number | null;
-}
-
-export interface ReliabilityBreakerEvent {
-  id: number;
-  key: string;
-  from_state: string;
-  to_state: string;
-  reason: string | null;
-  failure_rate: number | null;
-  created_at: string;
-}
-
-export interface ReliabilityBreakers {
-  breakers: ReliabilityBreaker[];
-  state_counts: [string, number][];
-  states: string[];
-  recent_events: ReliabilityBreakerEvent[];
-}
-
-export function fetchReliabilityRetryPolicies(): Promise<ReliabilityRetryPolicies> {
-  return request<ReliabilityRetryPolicies>("/api/v1/reliability/retry-policies", {
-    cache: "no-store",
-  });
-}
-
 /** One service, with the checks it ran and the metrics it has published. */
 export function fetchHealthService(key: string): Promise<HealthServiceDetail> {
   return request<HealthServiceDetail>(`/api/v1/health/services/${encodeURIComponent(key)}`, {
     cache: "no-store",
   });
-}
-
-/**
- * Save a subsystem policy or one provider's override.
- *
- * `PUT` on `(subsystem, provider_override)`, which is the table's uniqueness constraint — so this
- * creates on the first call and replaces on the second, and a double-click cannot produce two
- * competing rows.
- */
-export function saveReliabilityRetryPolicy(
-  subsystem: string,
-  input: ReliabilityRetryPolicyInput,
-): Promise<ReliabilityRetryPolicy> {
-  return request<ReliabilityRetryPolicy>(
-    `/api/v1/reliability/retry-policies/${encodeURIComponent(subsystem)}`,
-    { method: "PUT", body: JSON.stringify(input) },
-  );
-}
-
-export function fetchReliabilityAttempts(limit = 50): Promise<ReliabilityAttempts> {
-  return request<ReliabilityAttempts>(
-    `/api/v1/reliability/retry-attempts?limit=${encodeURIComponent(String(limit))}`,
-    { cache: "no-store" },
-  );
 }
 
 /**
@@ -7240,7 +6938,6 @@ export function fetchReliabilityAttempts(limit = 50): Promise<ReliabilityAttempt
  * the same window with two spellings, and the second one travels into the CSV
  * filename, so there must be exactly one.
  */
-
 export function fetchHealthSamples(
   service: string,
   metric: string,
@@ -7280,234 +6977,6 @@ export function fetchHealthMetrics(
   return request<HealthMetricsReport>(
     `/api/v1/health/metrics?range=${encodeURIComponent(range)}`,
     { cache: "no-store" },
-  );
-}
-
-/**
- * Requeue one dead letter.
- *
- * The API **appends** an attempt rather than clearing the flag, so the failure stays in the
- * timeline an operator reads afterwards. The screens must not claim the row is "fixed" — it is
- * requeued, and the original failure is still there by design.
- */
-export function retryNow(id: number): Promise<ReliabilityAttempt> {
-  return request<ReliabilityAttempt>(
-    `/api/v1/reliability/retry-attempts/${encodeURIComponent(String(id))}/retry-now`,
-    { method: "POST" },
-  );
-}
-
-export function fetchReliabilityBreakers(): Promise<ReliabilityBreakers> {
-  return request<ReliabilityBreakers>("/api/v1/reliability/breakers", { cache: "no-store" });
-}
-
-/**
- * Retune a breaker's thresholds.
- *
- * Every field is optional: the form sends what the operator changed, and a `PATCH` that sent
- * the whole row would overwrite a threshold somebody else moved while the form was open.
- */
-export function updateReliabilityBreaker(
-  key: string,
-  input: Partial<
-    Pick<
-      ReliabilityBreaker,
-      | "name"
-      | "failure_threshold"
-      | "window_seconds"
-      | "cooldown_seconds"
-      | "half_open_probes"
-      | "success_threshold"
-    >
-  >,
-): Promise<ReliabilityBreaker> {
-  return request<ReliabilityBreaker>(
-    `/api/v1/reliability/breakers/${encodeURIComponent(key)}`,
-    { method: "PATCH", body: JSON.stringify(input) },
-  );
-}
-
-/**
- * Close a breaker by hand. The reason is required by the API and asked for in the dialog.
- *
- * A reset clears `forced_open` as well as `state` — the two are separate columns, and a breaker
- * that renders `closed` while the flag is set would refuse every call while looking healthy.
- */
-export function resetReliabilityBreaker(
-  key: string,
-  reason: string,
-): Promise<ReliabilityBreaker> {
-  return request<ReliabilityBreaker>(
-    `/api/v1/reliability/breakers/${encodeURIComponent(key)}/reset`,
-    { method: "POST", body: JSON.stringify({ reason }) },
-  );
-}
-
-/** Drain a provider until somebody says otherwise: the flag outranks the cooldown. */
-export function forceOpenReliabilityBreaker(
-  key: string,
-  reason: string,
-): Promise<ReliabilityBreaker> {
-  return request<ReliabilityBreaker>(
-    `/api/v1/reliability/breakers/${encodeURIComponent(key)}/force-open`,
-    { method: "POST", body: JSON.stringify({ reason }) },
-  );
-}
-
-// Every function here talks to `/api/v1/reliability/intake` and `/api/v1/reliability/intake/*`
-// (REQ-127, slice 4). The screen is the one an integrator opens after a provider says `401` and
-// the platform says the signature is invalid, so three shapes in this block are NOT
-// interchangeable and the UI must not blur them:
-//
-// - `has_secret: true` with a `secret_id` is a **reference**, never a value. Nothing in this
-//   file can return a signing key, because nothing in the API can: a client that could show the
-//   key is a client every future bug in this area can exfiltrate through.
-// - `reason_counts` is the whole-table rollup and the `rejections` list is one page of it. They
-//   are rendered from the same call so a chip can never claim a different number than the log
-//   beneath it — a screen where those two disagree sends the operator to the wrong filter.
-// - `detail` on a `SampleVerdict` is a sentence written for a person. It never carries the
-//   payload and never carries the secret, and that is a property of the route rather than a
-//   promise this client makes.
-
-export interface ReliabilityIntakeEndpoint {
-  id: string;
-  path: string;
-  name: string;
-  hmac_scheme: string;
-  signature_header: string;
-  timestamp_header: string | null;
-  tolerance_seconds: number;
-  secret_id: string | null;
-  /** Whether a secret is referenced. The VALUE is never on this surface. */
-  has_secret: boolean;
-  max_payload_bytes: number;
-  sanitize_profile: string;
-  enabled: boolean;
-  created_at: string;
-  rejection_count: number;
-  last_rejection_at: string | null;
-}
-
-export interface ReliabilityIntake {
-  endpoints: ReliabilityIntakeEndpoint[];
-  schemes: string[];
-  profiles: string[];
-  reasons: string[];
-  reason_counts: [string, number][];
-}
-
-export interface ReliabilityIntakeRejection {
-  id: number;
-  endpoint_id: string | null;
-  /** The declared path, resolved on read so a renamed endpoint does not orphan its log. */
-  path: string | null;
-  reason: string;
-  source_ip: string | null;
-  request_id: string | null;
-  body_bytes: number;
-  created_at: string;
-}
-
-export interface ReliabilityIntakeSample {
-  valid: boolean;
-  /** One of the declared reasons, or `null` for an accepted sample. */
-  reason: string | null;
-  detail: string;
-  /** What the sanitisation pass would change, or `null` when the sample was refused first. */
-  changes: string[] | null;
-  body_bytes: number;
-}
-
-export function fetchReliabilityIntake(): Promise<ReliabilityIntake> {
-  return request<ReliabilityIntake>("/api/v1/reliability/intake", { cache: "no-store" });
-}
-
-export function fetchReliabilityIntakeRejections(params: {
-  endpointId?: string;
-  reason?: string;
-  limit?: number;
-}): Promise<{ rejections: ReliabilityIntakeRejection[]; reasons: string[] }> {
-  const query = new URLSearchParams();
-  if (params.endpointId) query.set("endpoint_id", params.endpointId);
-  if (params.reason) query.set("reason", params.reason);
-  if (params.limit) query.set("limit", String(params.limit));
-  const suffix = query.toString();
-  return request<{ rejections: ReliabilityIntakeRejection[]; reasons: string[] }>(
-    `/api/v1/reliability/intake/rejections${suffix ? `?${suffix}` : ""}`,
-    { cache: "no-store" },
-  );
-}
-
-/** Declare a path. The only fields required are the ones the guard cannot default. */
-export function createReliabilityIntakeEndpoint(input: {
-  path: string;
-  name: string;
-  hmac_scheme: string;
-  signature_header: string;
-  timestamp_header?: string | null;
-  tolerance_seconds?: number;
-  secret_id?: string | null;
-  max_payload_bytes?: number;
-  sanitize_profile?: string;
-  enabled?: boolean;
-}): Promise<ReliabilityIntakeEndpoint> {
-  return request<ReliabilityIntakeEndpoint>("/api/v1/reliability/intake", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Every field is optional, so the form sends what changed and nothing else. */
-export function updateReliabilityIntakeEndpoint(
-  id: string,
-  input: Partial<{
-    path: string;
-    name: string;
-    hmac_scheme: string;
-    signature_header: string;
-    timestamp_header: string | null;
-    tolerance_seconds: number;
-    secret_id: string | null;
-    max_payload_bytes: number;
-    sanitize_profile: string;
-    enabled: boolean;
-  }>,
-): Promise<ReliabilityIntakeEndpoint> {
-  return request<ReliabilityIntakeEndpoint>(
-    `/api/v1/reliability/intake/${encodeURIComponent(id)}`,
-    { method: "PATCH", body: JSON.stringify(input) },
-  );
-}
-
-/**
- * Remove a declaration. The reason is required by the API and by the dialog: removing a
- * declaration turns a guarded door into an open one, and that is a change somebody reading the
- * audit log has to be able to explain.
- */
-export function deleteReliabilityIntakeEndpoint(
-  id: string,
-  reason: string,
-): Promise<void> {
-  return request<void>(`/api/v1/reliability/intake/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-    body: JSON.stringify({ reason }),
-  });
-}
-
-/**
- * Ask the platform whether a signature is right.
- *
- * This is the SAME guard the request path runs — that is the entire value of the action, and it
- * is why the client sends the payload to the server rather than computing an HMAC in the
- * browser. A tester that verifies locally would need the secret in the browser.
- */
-export function verifyReliabilityIntakeSample(
-  id: string,
-  input: { payload: string; signature: string },
-): Promise<ReliabilityIntakeSample> {
-  return request<ReliabilityIntakeSample>(
-    `/api/v1/reliability/intake/${encodeURIComponent(id)}/verify-sample`,
-    { method: "POST", body: JSON.stringify(input) },
   );
 }
 
@@ -7692,6 +7161,369 @@ export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
   return request<void>(`/api/v1/health/maintenance-windows/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// AI App Builder (REQ-045).
+//
+// The console and the review workspace talk to nine routes and one stream. Two decisions are
+// worth naming because they are the reason the client looks like this:
+//
+// * **The decision routes answer with the counters and the blockers.** Accepting one artifact
+//   usually removes one blocker, so a client that re-fetched the whole plan after every
+//   decision would spend a round trip to redraw three numbers the answer already carried —
+//   and would show a stale count for the duration of the request.
+// * **`getAppBuilderPlan` is the only read that is not cached.** The review screen is a
+//   decision surface: a plan that renders from a cached body is a plan whose artifacts may
+//   have been regenerated since, which is precisely the change the reviewer came to see.
+// ---------------------------------------------------------------------------------------------
+
+/** The composer's vocabulary: sample prompts, kinds, statuses, field types. */
+export function fetchAppBuilderVocabulary(): Promise<AppBuilderVocabulary> {
+  return request<AppBuilderVocabulary>("/api/v1/app-builder/examples");
+}
+
+/**
+ * The plan list. Every filter is in the URL, so a reload and a bookmark land on the same
+ * view — the QA pass depends on it, and so does anybody comparing two screenshots.
+ */
+export function fetchAppBuilderPlans(query: {
+  status?: string;
+  q?: string;
+  mine?: boolean;
+  offset?: number;
+  limit?: number;
+  organizationId?: string;
+} = {}): Promise<AppBuilderPlanList> {
+  const params = new URLSearchParams();
+  if (query.status) params.set("status", query.status);
+  if (query.q && query.q.trim()) params.set("q", query.q.trim());
+  if (query.mine) params.set("mine", "true");
+  if (query.offset) params.set("offset", String(query.offset));
+  if (query.limit) params.set("limit", String(query.limit));
+  if (query.organizationId) params.set("organization_id", query.organizationId);
+  const search = params.toString();
+  return request<AppBuilderPlanList>(`/api/v1/app-builder/plans${search ? `?${search}` : ""}`);
+}
+
+/** One plan with its artifacts, counters and blockers — the review workspace's whole state. */
+export function fetchAppBuilderPlan(planId: string): Promise<AppBuilderPlanDetail> {
+  return request<AppBuilderPlanDetail>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/** Accept one artifact. Refused with `422` naming the finding when the validator refused it. */
+export function acceptAppBuilderArtifact(
+  planId: string,
+  artifactId: string,
+): Promise<AppBuilderDecision> {
+  return request<AppBuilderDecision>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}/accept`,
+    { method: "POST" },
+  );
+}
+
+/** Refuse one artifact. `reason` is required by the store: a bare refusal teaches nobody anything. */
+export function rejectAppBuilderArtifact(
+  planId: string,
+  artifactId: string,
+  reason: string,
+): Promise<AppBuilderDecision> {
+  return request<AppBuilderDecision>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}/reject`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
+
+/**
+ * Edit one draft artifact. The body is **untrusted input of the same kind the model's is**, so
+ * it goes back through the same validator: a `422` here carries the field path that broke.
+ */
+export function editAppBuilderArtifact(
+  planId: string,
+  artifactId: string,
+  spec: Record<string, unknown>,
+): Promise<AppBuilderDecision> {
+  return request<AppBuilderDecision>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}`,
+    { method: "PATCH", body: JSON.stringify({ spec }) },
+  );
+}
+
+/** Refuse the whole plan. */
+export function rejectAppBuilderPlan(planId: string, reason: string): Promise<AppBuilderPlanDecision> {
+  return request<AppBuilderPlanDecision>(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/reject`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
+
+/** Delete a plan that was never applied; an applied plan answers `409` and stays. */
+export function deleteAppBuilderPlan(planId: string): Promise<void> {
+  return request<void>(`/api/v1/app-builder/plans/${encodeURIComponent(planId)}`, {
+    method: "DELETE",
+  });
+}
+
+/**
+ * Remove a selection of drafts in one call (REQ-045 slice 4).
+ *
+ * **`POST /plans/bulk-delete` and not `DELETE /plans/{id}` repeated by the client.** Three
+ * reasons, and the third is the one that decides it:
+ *
+ * * twenty row-level deletes are twenty round trips, twenty audit rows and twenty chances for
+ *   a filter change to land between two of them;
+ * * a per-row delete cannot report a *partial* outcome — it answers `204` or `409` for the
+ *   whole page, so a selection mixing three drafts with the one applied plan would show the
+ *   operator a refusal and leave the three untouched;
+ * * the refusals are the server's. An applied plan has to stay, and the client does not own
+ *   that rule — it re-derives it, it can only ever agree with the store until it does not.
+ */
+export function bulkDeleteAppBuilderPlans(ids: string[]): Promise<AppBuilderBulkDelete> {
+  return request<AppBuilderBulkDelete>("/api/v1/app-builder/plans/bulk-delete", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+}
+
+/**
+ * The plan as a downloadable JSON document (REQ-045 slice 4).
+ *
+ * A raw `fetch` rather than `request<T>` for two reasons, both of which the health export
+ * above already had to solve: the response is an **attachment**, so going through the JSON
+ * helper would parse the file into an object and throw away the one thing the caller wants
+ * (the bytes), and a `request` that cannot parse the body reports a parse failure as an
+ * API error with a status of `200`.
+ *
+ * The artifact count is read back **out of the file**, not taken from a header, because the
+ * header would be written by the same code path that made the mistake — the assertion in the
+ * console's note ("22 artifacts") is only worth anything if it was counted from the
+ * download the operator got.
+ */
+export async function downloadAppBuilderPlanExport(
+  planId: string,
+): Promise<{ blob: Blob; filename: string; artifacts: number; schema: string }> {
+  const url = `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/export`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    let code = "export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(await response.text()) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON error body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  const blob = await response.blob();
+
+  let artifacts = 0;
+  let schema = "";
+  try {
+    const parsed = JSON.parse(await blob.text()) as {
+      schema?: string;
+      artifacts?: unknown[];
+    };
+    artifacts = Array.isArray(parsed.artifacts) ? parsed.artifacts.length : 0;
+    schema = parsed.schema ?? "";
+  } catch {
+    // An unparseable download is reported by the caller's note as an artifact count of
+    // zero, which is the honest reading: the file did not carry a plan this panel can name.
+  }
+
+  return { blob, filename: match?.[1] ?? `omnion-app-plan-${planId.slice(0, 8)}.json`, artifacts, schema };
+}
+
+/** One frame of a generation, as the two handlers report it. */
+export type AppBuilderStreamHandlers = {
+  /** What the platform is doing right now (`plan`). */
+  onStage?: (stage: string) => void;
+  /** The plan the generation produced or failed on — it exists either way. */
+  onFailed?: (failure: { code: string; message: string }) => void;
+};
+
+/**
+ * Generate a plan from a prompt, reading the stream to its end.
+ *
+ * The frames carry **no artifact bodies**: the answer is validated before it is stored, so a
+ * client that rendered deltas would be rendering something apply may still refuse. What the
+ * stream does carry is the failure — and the plan row exists whichever way it ends, so the
+ * reviewer can *see* the attempt that failed instead of watching a banner and losing the
+ * sentence they typed. `signal` is the Cancel button; aborting stops the read and nothing
+ * is written from this side.
+ */
+export async function streamGenerateAppBuilderPlan(
+  input: { prompt: string; model?: string; title?: string; organizationId?: string },
+  handlers: AppBuilderStreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch("/api/v1/app-builder/generate", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      // The METHOD is what makes this a mutating call; a `{ signal }`-only init reads as a
+      // GET, sends no token, and this one screen answers `403 csrf_failed` while every other
+      // write on the platform works.
+      ...csrfHeader({ method: "POST" }),
+    },
+    body: JSON.stringify({
+      prompt: input.prompt,
+      model: input.model && input.model.trim() ? input.model.trim() : null,
+      title: input.title && input.title.trim() ? input.title.trim() : null,
+      organization_id: input.organizationId || null,
+    }),
+    signal,
+  });
+
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+
+      const payload = JSON.parse(data) as Record<string, unknown>;
+      if (event === "stage") {
+        handlers.onStage?.(payload.stage as string);
+      } else if (event === "error") {
+        handlers.onFailed?.({
+          code: (payload.code as string) ?? "generation_failed",
+          message: (payload.message as string) ?? "The generation did not finish.",
+        });
+        return;
+      }
+    }
+  }
+}
+
+/**
+ * Ask the model for one artifact again, with a note, streaming.
+ *
+ * Same reader as the plan generation on purpose: a revision that answered after one round
+ * trip would leave the operator pressing a button again, and the review screen would need a
+ * second implementation of the progress panel the console already has. The answer carries
+ * the artifact as it now reads, the counters and the blockers.
+ */
+export async function streamRegenerateAppBuilderArtifact(
+  planId: string,
+  artifactId: string,
+  feedback: string,
+  handlers: {
+    onStage?: (stage: string) => void;
+    onArtifact?: (decision: AppBuilderDecision) => void;
+  } = {},
+  model?: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(
+    `/api/v1/app-builder/plans/${encodeURIComponent(planId)}/artifacts/${encodeURIComponent(artifactId)}/regenerate`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        ...csrfHeader({ method: "POST" }),
+      },
+      body: JSON.stringify({
+        feedback,
+        model: model && model.trim() ? model.trim() : null,
+      }),
+      signal,
+    },
+  );
+
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+
+      const payload = JSON.parse(data) as Record<string, unknown>;
+      if (event === "stage") {
+        handlers.onStage?.(payload.stage as string);
+      } else if (event === "artifact") {
+        handlers.onArtifact?.(payload as unknown as AppBuilderDecision);
+        return;
+      } else if (event === "error") {
+        throw new ApiError(
+          502,
+          (payload.code as string) ?? "regeneration_failed",
+          (payload.message as string) ?? "The regeneration did not finish.",
+        );
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

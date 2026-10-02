@@ -101,22 +101,6 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, code, message)
     }
 
-    /// `404` — the addressed row does not exist, named in the message.
-    ///
-    /// The `what` and the `id` are both in the message on purpose. A `404` with the body
-    /// `{"code":"not_found"}` tells a form nothing about which of its rows vanished, and the
-    /// one case worth naming is a double-submit: the row was deleted, the second write answers
-    /// `404`, and the operator needs to know that is what happened rather than that the
-    /// identifier was malformed.
-    #[must_use]
-    pub fn not_found(what: &'static str, id: impl std::fmt::Display) -> Self {
-        Self::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            format!("no {what} with the id {id}"),
-        )
-    }
-
     /// Map a core error onto the API surface.
     ///
     /// A dependency that did not answer becomes `503` (retryable); everything else is an
@@ -156,46 +140,20 @@ impl ApiError {
         self.code
     }
 
-    /// The human-readable message.
-    ///
-    /// Read-only by design: the message is what a screen shows and what a test asserts on when it
-    /// needs to know that a refusal *names* the thing it refused over (a cap, an accepted set).
-    /// There is deliberately no setter — a message that can be rewritten after construction is a
-    /// message no longer derived from the code that produced it.
-    ///
-    /// The human-readable explanation, for assertions and for a log line.
+    /// The sentence a client reads.
     ///
     /// The companion of [`ApiError::code`]: the code is what a client branches on and the
     /// message is what a person reads, so a test that checks one without the other pins half
     /// the contract — and it is the message that has to name the field and the three legal
     /// values, which is the part a client cannot reconstruct.
+    ///
+    /// Public for the same reason it is worth asserting: a test that asserts "this 404 does
+    /// not name the gate" cannot reach a private field, and a test that only asserts the
+    /// *code* would not notice a sentence that started leaking the id. It is never used to
+    /// build a response — `IntoResponse` reads the field directly.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
-    }
-
-    /// The structured explanation of a refusal, when it has one.
-    ///
-    /// Added for the reliability limiter, whose acceptance criterion is about **wire behaviour**
-    /// rather than about a function's return value: "`429` carries `Retry-After`,
-    /// `X-RateLimit-Limit/Remaining/Reset` and the standard error code", and a `429` body that
-    /// names only the scope cannot say which of the two limiters refused it. The accessors existed
-    /// for status, code and message and not for details, which meant the one field a refusal adds
-    /// most — the thing that makes it explainable — was the one field no test could read.
-    #[must_use]
-    pub fn details(&self) -> Option<&Value> {
-        self.details.as_ref()
-    }
-
-    /// The wait this error attaches, in seconds.
-    ///
-    /// `None` for every error that is not a refusal with a window behind it, and `None` for a
-    /// refusal whose window **cannot** be computed — a counter that could not be read. Both are
-    /// the same answer for the same reason: a `Retry-After` is a promise, and there is nothing to
-    /// promise when the platform does not know when its window rolls.
-    #[must_use]
-    pub fn retry_after(&self) -> Option<u64> {
-        self.retry_after
     }
 }
 
@@ -993,6 +951,14 @@ impl From<WorkflowError> for ApiError {
                 err.to_string(),
             ),
             WorkflowError::Audit(err) => err.into(),
+            // A stale `graph_version` is a `409`, not a `400`: the request was well formed and the
+            // row's *state* is what the author has to change first (reload, or choose to overwrite).
+            // A `400` tells them to fix their request, which is not the problem, and it is the
+            // status `workflow_graph.rs` documents for exactly this case. Every other invalid
+            // definition really is a `400` — the graph they sent is what has to change.
+            WorkflowError::Invalid { code, message } if code == "graph_version_conflict" => {
+                Self::new(StatusCode::CONFLICT, code, message)
+            }
             WorkflowError::Invalid { code, message } => Self::bad_request(code, message),
         }
     }
@@ -1224,6 +1190,26 @@ mod tests {
             ApiError::forbidden("account_disabled", "no").status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    // A stale `graph_version` answers `409` and every other invalid definition answers `400`.
+    // The two must not collapse: a `400` sends the author to fix a request that was already
+    // correct, and the module documentation for `workflow_graph.rs` promises the `409`.
+    #[test]
+    fn a_stale_graph_version_is_a_conflict_and_not_a_bad_request() {
+        let error = ApiError::from(WorkflowError::invalid(
+            "graph_version_conflict",
+            "it is now at version 3",
+        ));
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "graph_version_conflict");
+    }
+
+    #[test]
+    fn an_invalid_definition_is_still_a_bad_request() {
+        let error = ApiError::from(WorkflowError::invalid("invalid_step_action", "no such action"));
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.code(), "invalid_step_action");
     }
 
     #[test]

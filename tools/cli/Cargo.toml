@@ -12,11 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 rpassword.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util", "net"] }
+tokio.workspace = true
 omnion-core = { path = "../../crates/core" }
 omnion-identity = { path = "../../crates/identity" }
 omnion-onboarding = { path = "../../crates/onboarding" }
-omnion-migrations = { path = "../../crates/migrations" }
 omnion-storage = { path = "../../crates/storage" }

@@ -134,18 +134,15 @@ pub async fn create_organization(
     )
     .await?;
 
+    // The setup marker, and the tenancy the account now actually has. Both statements are the
+    // same fact recorded twice, and writing only the first is what made every organization-
+    // scoped route answer `organization_required` after a wizard that reported success — the
+    // setup state is one global row, and `apps/api::scope` never reads it.
     state::set_organization(pool, organization.id).await?;
-
-    // The owner's ACCOUNT must point at the new organization too, not only the onboarding
-    // progress record. `scope::resolve_organization` reads `users.organization_id` on every
-    // org-scoped route, and an account with `None` is answered `400 organization_required` — so
-    // writing only `onboarding_state` produced a first run that reported itself complete and
-    // then refused every org-scoped read on the installation it had just created. `onboarding_state`
-    // is progress; `users.organization_id` is tenancy, and only the second one is load bearing.
     users::set_organization(pool, actor, Some(organization.id))
         .await?
-        .ok_or_else(|| OnboardingError::Incomplete {
-            missing: String::from("owner"),
+        .ok_or_else(|| {
+            OnboardingError::Invalid("the account that created the organization is gone".to_owned())
         })?;
 
     record(
@@ -414,6 +411,47 @@ mod tests {
         for bad in ["", "   ", "---", "üöç"] {
             assert!(derive_slug(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    /// THE REGRESSION GATE FOR A DEFECT THAT WAS NOT A TYPO.
+    ///
+    /// `create_organization` created the organization, recorded it in the setup state
+    /// (`onboarding_state`, one global row), audited it — and stopped. It never attached the
+    /// actor, and `apps/api::scope` resolves every request's tenant from
+    /// **`users.organization_id`**, which it does not read. So the wizard reported
+    /// `organization: done`, the checklist turned green, and then *every* organization-scoped
+    /// route answered `400 organization_required`: pages, media, sites, automations, and every
+    /// console that is scoped by tenant. Nothing about the failure names the write that was
+    /// missing.
+    ///
+    /// **This reads the step's own body** rather than only its outcome. An outcome assertion
+    /// would pass against a step that attaches the actor and then a day later stops doing so,
+    /// and it would pass against this very code until somebody's *first* walk happened to
+    /// check the account row — which none of the other onboarding tests do. Reading the source
+    /// is a proxy; the walk in `apps/api/tests/ai_workflow_builder.rs` is the ground truth,
+    /// because it is the walk that found the defect: a console that cannot read its own
+    /// organization's drafts.
+    #[test]
+    fn creating_an_organization_attaches_the_actor_and_not_only_the_setup_state() {
+        let source = include_str!("steps.rs");
+        let body = source
+            .split("pub async fn create_organization")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn ").next())
+            .expect("create_organization must be a function in this file");
+
+        assert!(
+            body.contains("users::set_organization(pool, actor, Some(organization.id))"),
+            "create_organization must attach the actor to the tenant it created — the setup \
+             state is one global row and apps/api::scope never reads it, so without this the \
+             wizard reports success and every organization-scoped route answers \
+             `organization_required`"
+        );
+        assert!(
+            body.contains("state::set_organization"),
+            "the setup marker is still written: it is what makes the checklist honest, and the \
+             two statements are one fact recorded twice"
+        );
     }
 
     #[test]

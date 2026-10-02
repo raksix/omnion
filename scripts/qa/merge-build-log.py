@@ -1,85 +1,101 @@
 #!/usr/bin/env python3
-"""Merge an append-only BUILD-LOG across a merge conflict, and PROVE nothing was dropped.
+"""Three-way merge for an append-only log (every side only ADDS at the tail).
 
-Both sides append, so a merge that keeps only one side silently deletes the other
-writer's whole tick history. Textual `git merge` gives a conflict; taking one side
-"because it is bigger" is a guess.
+base/ours/theirs are the three blob contents. Insert opcodes from base->ours and
+base->theirs are spliced into base; anything else (a deletion, a replacement) is
+a violation of append-only and is reported rather than silently applied.
 
-The merge is a splice: every line the two sides INSERTED onto the common base is
-re-inserted, in each side's own order, at the position it took on that side.
+VERIFICATION. The obvious check — `(Counter(ours) + Counter(theirs)) -
+Counter(merged)` — is wrong, and it fails every time it is run: the two sides
+share every line they inherited from base, so their counts SUM to twice what the
+merged file can hold. A build log is ~600 entries and ~40% of its lines are blank,
+so the failure always reads as "MISSING x372 ''" — a log full of missing blank
+lines, which is nonsense and easy to talk yourself out of.
 
-Verification is a MULTISET check, not a line count. `base + ours + theirs == merged`
-holds for a merge that duplicated a block and dropped another; it is the count that
-lies, which is exactly why a sibling writer's history can vanish under it. Instead:
+The identity that actually holds, because the merge only splices inserts into
+base, is
 
-  * every line of `ours` and of `theirs` must be present in `merged` at least as
-    many times as it appears in that side (nothing dropped),
-  * every `## ` heading of both sides must survive (a dropped tick is a lost day),
-  * the base's own line multiset must still be covered (nothing rewritten).
+    Counter(merged) == Counter(base) + Counter(inserted_ours) + Counter(inserted_theirs)
+
+checked for equality, not for containment. It catches a dropped block, a block
+spliced in twice, and a block spliced at the wrong offset (which changes the
+counter for that block even when every line is present). Line *counts* alone are
+not a check: base+ours+theirs=total passes while half a block is duplicated.
 """
+import difflib
 import subprocess
 import sys
 from collections import Counter
-from difflib import SequenceMatcher
-
-path = sys.argv[1] if len(sys.argv) > 1 else "docs/BUILD-LOG.md"
 
 
-def git(*args):
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+def rev(*specs):
+    return subprocess.run(["git", "show", *specs], capture_output=True, text=True, check=True).stdout
 
 
-def lines(text):
-    return text.splitlines(keepends=True)
-
-
-base = lines(git("show", f":1:{path}"))
-ours = lines(git("show", f":2:{path}"))
-theirs = lines(git("show", f":3:{path}"))
-
-
-def inserted(side):
-    """Lines side added relative to base, grouped into the blocks it added them in."""
-    sm = SequenceMatcher(None, base, side, autojunk=False)
-    out = []
+def ops_inserts(base, other):
+    """Return [(start, end, inserted_lines)] for pure inserts, plus any non-insert edit."""
+    sm = difflib.SequenceMatcher(None, base, other, autojunk=False)
+    ins, bad = [], []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag in ("insert", "replace") and j2 > j1:
-            out.append((i1, side[j1:j2]))
-    return out
+        if tag == "insert":
+            ins.append((i1, i2, other[j1:j2]))
+        elif tag != "equal":
+            bad.append((tag, i1, i2, j1, j2, other[j1:j2][:3]))
+    return ins, bad
 
 
-# Splice both sides' insertions into the base, ordered by where they attach.
-chunks = [(pos, blk, "ours") for pos, blk in inserted(ours)]
-chunks += [(pos, blk, "theirs") for pos, blk in inserted(theirs)]
-chunks.sort(key=lambda c: (c[0], 0 if c[2] == "ours" else 1))
+def strip_trailing_blank(lines):
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
-merged = []
-cursor = 0
-for pos, blk, _side in chunks:
-    if pos < cursor:  # overlapping edit region: keep the earlier block, skip the overlap
-        pos = cursor
-    merged.extend(base[cursor:pos])
-    merged.extend(blk)
-    cursor = pos
-merged.extend(base[cursor:])
 
-mc, oc, tc, bc = Counter(merged), Counter(ours), Counter(theirs), Counter(base)
-missing = {s: sum((c - mc).values()) for s, c in (("ours", oc), ("theirs", tc), ("base", bc))}
+def main():
+    path, base_spec, ours_spec, theirs_spec = sys.argv[1:5]
+    base = strip_trailing_blank(rev(base_spec).split("\n"))
+    ours = strip_trailing_blank(rev(ours_spec).split("\n"))
+    theirs = strip_trailing_blank(rev(theirs_spec).split("\n"))
 
-head_base = [l for l in base if l.startswith("## ")]
-head_ours = [l for l in ours if l.startswith("## ")]
-head_theirs = [l for l in theirs if l.startswith("## ")]
-lost_heads = [h for h in set(head_ours) | set(head_theirs) if h not in mc]
+    ours_ins, ours_bad = ops_inserts(base, ours)
+    theirs_ins, theirs_bad = ops_inserts(base, theirs)
 
-with open(path, "w", encoding="utf-8") as fh:
-    fh.write("".join(merged))
+    if ours_bad or theirs_bad:
+        print("NON-APPEND-ONLY EDITS DETECTED — resolve by hand")
+        for side, bad in (("ours", ours_bad), ("theirs", theirs_bad)):
+            for b in bad:
+                print(" ", side, b)
+        sys.exit(2)
 
-print(
-    f"base={len(base)} ours={len(ours)} theirs={len(theirs)} merged={len(merged)}\n"
-    f"missing lines: {missing}\n"
-    f"lost headings: {len(lost_heads)}"
-)
-for h in lost_heads[:10]:
-    print("  LOST", h.strip())
-if any(missing.values()) or lost_heads:
-    sys.exit(1)
+    merged = list(base)
+    # Splice from the tail backwards so earlier offsets stay valid.
+    splices = sorted(
+        [(i1, i2, blk, "ours") for i1, i2, blk in ours_ins]
+        + [(i1, i2, blk, "theirs") for i1, i2, blk in theirs_ins],
+        key=lambda s: (-s[0], s[3] == "theirs"),
+    )
+    for i1, i2, blk, _side in splices:
+        merged[i1:i2] = blk
+
+    expected = Counter(base)
+    for blk in [b for _, _, b in ours_ins] + [b for _, _, b in theirs_ins]:
+        expected.update(blk)
+    got = Counter(merged)
+    if got != expected:
+        print("MERGE VERIFICATION FAILED")
+        for k, v in list((expected - got).items())[:20]:
+            print("  MISSING x%d %r" % (v, k[:90]))
+        for k, v in list((got - expected).items())[:20]:
+            print("  UNEXPECTED x%d %r" % (v, k[:90]))
+        sys.exit(3)
+
+    out = "\n".join(merged) + "\n"
+    with open(path, "w") as fh:
+        fh.write(out)
+    print(
+        "merged %s: base=%d ours=%d theirs=%d -> merged=%d (+%d) | exact multiset OK"
+        % (path, len(base), len(ours), len(theirs), len(merged), len(merged) - len(base))
+    )
+
+
+if __name__ == "__main__":
+    main()

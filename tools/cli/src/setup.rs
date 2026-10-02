@@ -49,50 +49,17 @@ struct SetupReport {
 }
 
 /// Run the first-run setup.
-///
-/// `json` and `quiet` come from the global flags rather than from `SetupOptions` so that every
-/// command reports through the same envelope (REQ-131 acceptance 15). `--json` writes the report
-/// to stdout as a document; `--quiet` leaves stdout empty and keeps stderr and the exit code,
-/// which is what a provisioning script that only cares whether the owner now exists wants.
-pub async fn run(options: SetupOptions, json: bool, quiet: bool) -> ExitCode {
+pub async fn run(options: SetupOptions) -> ExitCode {
     match execute(options).await {
         Ok(report) => {
-            if json {
-                crate::envelope::print(&crate::envelope::success(
-                    "setup",
-                    serde_json::json!({
-                        "owner_email": report.owner_email,
-                        "organization_name": report.organization_name,
-                        "organization_slug": report.organization_slug,
-                        "site_name": report.site_name,
-                        "site_key": report.site_key,
-                        "domain": report.domain,
-                        "theme": report.theme,
-                    }),
-                    &[],
-                ));
-            } else if !quiet {
-                print_report(&report, crate::output::Sink::new(json, quiet));
-            }
+            print_report(&report);
             ExitCode::SUCCESS
         }
         Err(SetupError::Usage(message)) => {
-            let failure =
-                crate::envelope::Failure::new(crate::envelope::ErrorCode::Usage, message.clone());
-            if json {
-                crate::envelope::print_failure("setup", &failure, &[]);
-            }
             eprintln!("omnion setup: {message}");
             ExitCode::from(2)
         }
         Err(SetupError::Failed(message)) => {
-            let failure = crate::envelope::Failure::new(
-                crate::envelope::ErrorCode::DatabaseUnreachable,
-                message.clone(),
-            );
-            if json {
-                crate::envelope::print_failure("setup", &failure, &[]);
-            }
             eprintln!("omnion setup: {message}");
             ExitCode::FAILURE
         }
@@ -256,16 +223,10 @@ fn derive(name: &str) -> String {
 }
 
 /// The closing report: what exists now and where to sign in.
-///
-/// Routed through the sink like every other report, so `omnion setup --json` leaves stdout
-/// holding one document. This function is only reached on the non-JSON path today, but a helper
-/// that reached for stdout on its own would make that an accident of the call site rather than a
-/// property of the code.
-fn print_report(report: &SetupReport, sink: crate::output::Sink) {
-    sink.print(format_args!("Setup complete."));
-    output::pair(sink, "Owner", &report.owner_email);
+fn print_report(report: &SetupReport) {
+    println!("Setup complete.");
+    output::pair("Owner", &report.owner_email);
     output::pair(
-        sink,
         "Organization",
         &format!(
             "{} ({})",
@@ -276,13 +237,11 @@ fn print_report(report: &SetupReport, sink: crate::output::Sink) {
         Some(domain) => format!("{} ({}) — {domain}", report.site_name, report.site_key),
         None => format!("{} ({})", report.site_name, report.site_key),
     };
-    output::pair(sink, "Site", &site);
-    output::pair(sink, "Theme", report.theme);
-    sink.print(format_args!(""));
-    sink.print(format_args!(
-        "  Sign in to the admin panel with the owner account above (apps/admin, `/login`)."
-    ));
-    sink.print(format_args!(
+    output::pair("Site", &site);
+    output::pair("Theme", report.theme);
+    println!();
+    println!("  Sign in to the admin panel with the owner account above (apps/admin, `/login`).");
+    println!(
         "  `omnion doctor` re-checks the environment; `omnion migrate` applies schema changes."
-    ));
+    );
 }

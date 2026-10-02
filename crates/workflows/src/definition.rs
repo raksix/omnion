@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::actions;
+use crate::branch::MAX_STOP_REASON;
 use crate::cron::CronSchedule;
 use crate::error::{Result, WorkflowError};
-use crate::model::{StepKind, TriggerKind};
+use crate::model::{DEFAULT_STEP_TIMEOUT_MS, MAX_STEP_TIMEOUT_MS, OnError, StepKind, TriggerKind};
 
 /// Most steps one definition may carry.
 pub const MAX_STEPS: usize = 50;
@@ -178,17 +179,37 @@ impl Trigger {
 pub struct StepDefinition {
     /// Display name; unique within the workflow.
     pub name: String,
-    /// `task` or `wait`.
+    /// `task`, `wait`, `branch` or `stop`.
     pub kind: StepKind,
     /// Built-in action of a task step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    /// Action parameters (task) or `{"seconds": n}` (wait).
+    /// Action parameters (task), `{"seconds": n}` (wait), a comparison (branch) or a reason
+    /// (stop).
     #[serde(default = "empty_params")]
     pub params: Value,
-    /// Attempts allowed in total (1–5); a wait step is never retried.
+    /// What this step's own failure does (REQ-003 slice 2). `inherit` — the default — takes
+    /// the rule's policy, so a definition written before the policy existed behaves exactly
+    /// as it did.
+    #[serde(default = "inherit_error")]
+    pub on_error: OnError,
+    /// How long the step may block before the engine fails it with the limit named. A wait
+    /// parks rather than blocking, so its own bound applies instead.
+    #[serde(default = "default_timeout")]
+    pub timeout_ms: i32,
+    /// Attempts allowed in total (1–5); a control step is never retried.
     #[serde(default = "one")]
     pub max_attempts: i32,
+}
+
+/// Serde default for [`StepDefinition::on_error`]: take the rule's own policy.
+fn inherit_error() -> OnError {
+    OnError::Inherit
+}
+
+/// Serde default for [`StepDefinition::timeout_ms`].
+fn default_timeout() -> i32 {
+    DEFAULT_STEP_TIMEOUT_MS
 }
 
 /// Serde default for [`StepDefinition::max_attempts`]: one attempt, no retries.
@@ -233,6 +254,8 @@ impl StepDefinition {
             kind: StepKind::Task,
             action: Some(action.into()),
             params,
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
             max_attempts: 1,
         }
     }
@@ -245,6 +268,84 @@ impl StepDefinition {
             kind: StepKind::Wait,
             action: None,
             params: serde_json::json!({ "seconds": seconds }),
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
+            max_attempts: 1,
+        }
+    }
+
+    /// A branch step: the run ends when `field` does not stand in `operator` against `value`.
+    ///
+    /// The comparison is the engine's, not the automation layer's: a branch reads what a
+    /// *step* produced (`{{steps.2.output.ok}}`), and the engine is what knows a step's
+    /// output. The operator set is the same closed one the panel offers everywhere else.
+    #[must_use]
+    pub fn branch(
+        name: impl Into<String>,
+        field: impl Into<String>,
+        operator: impl Into<String>,
+        value: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind: StepKind::Branch,
+            action: Some(crate::branch::BRANCH_ACTION.to_owned()),
+            params: serde_json::json!({
+                "field": field.into(),
+                "operator": operator.into(),
+                "value": value,
+            }),
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
+            max_attempts: 1,
+        }
+    }
+
+    /// A stop step: the run ends here, with a reason the trace shows.
+    #[must_use]
+    pub fn stop(name: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: StepKind::Stop,
+            action: None,
+            params: serde_json::json!({ "reason": reason.into() }),
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
+            max_attempts: 1,
+        }
+    }
+
+    /// An approval step: the run parks until a person decides (REQ-003 slice 3).
+    ///
+    /// The parameters are the gate's own (`permission`, `message`, `expires_in_hours`) and
+    /// they are written here from checked values rather than taken raw, so a constructor
+    /// call cannot build a gate the validator would refuse. `None` for any of them means
+    /// the default — which is what makes dropping the step into a rule enough.
+    #[must_use]
+    pub fn approval(
+        name: impl Into<String>,
+        permission: Option<&str>,
+        message: Option<&str>,
+        expires_in_hours: Option<i32>,
+    ) -> Self {
+        let mut params = serde_json::Map::new();
+        if let Some(permission) = permission {
+            params.insert("permission".to_owned(), serde_json::json!(permission));
+        }
+        if let Some(message) = message {
+            params.insert("message".to_owned(), serde_json::json!(message));
+        }
+        if let Some(hours) = expires_in_hours {
+            params.insert("expires_in_hours".to_owned(), serde_json::json!(hours));
+        }
+
+        Self {
+            name: name.into(),
+            kind: StepKind::Approval,
+            action: None,
+            params: serde_json::Value::Object(params),
+            on_error: OnError::Inherit,
+            timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
             max_attempts: 1,
         }
     }
@@ -256,9 +357,46 @@ impl StepDefinition {
         self
     }
 
+    /// Set what this step's own failure does.
+    #[must_use]
+    pub fn on_error(mut self, policy: OnError) -> Self {
+        self.on_error = policy;
+        self
+    }
+
+    /// Set how long this step may block.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout_ms: i32) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
     /// Seconds a wait step parks for.
     pub fn wait_seconds(&self) -> Result<i64> {
         wait_seconds_from(&self.params)
+    }
+
+    /// The reason a stop step carries.
+    pub fn stop_reason(&self) -> Result<&str> {
+        let reason = self
+            .params
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if reason.is_empty() {
+            return Err(WorkflowError::invalid(
+                "invalid_stop",
+                "a stop step needs a non-empty `reason` an operator can read",
+            ));
+        }
+        if reason.chars().count() > MAX_STOP_REASON {
+            return Err(WorkflowError::invalid(
+                "invalid_stop",
+                format!("a stop reason is at most {MAX_STOP_REASON} characters"),
+            ));
+        }
+        Ok(reason)
     }
 
     /// Check the step against the engine's rules.
@@ -281,6 +419,12 @@ impl StepDefinition {
                 "invalid_step_params",
                 format!("step \"{name}\" needs a JSON object as its parameters"),
             ));
+        }
+
+        // A control step never blocks on an action, so its timeout is the engine's business
+        // and only a task step's is the author's — a `wait` that blocks would be a bug.
+        if self.kind == StepKind::Task {
+            self.validate_timeout(name)?;
         }
 
         match self.kind {
@@ -313,7 +457,60 @@ impl StepDefinition {
                 }
                 self.wait_seconds().map(|_| ())
             }
+            StepKind::Branch => {
+                if self.max_attempts != 1 {
+                    return Err(WorkflowError::invalid(
+                        "invalid_max_attempts",
+                        format!("step \"{name}\" is a branch; a comparison is not retried"),
+                    ));
+                }
+                crate::branch::validate_params(&self.params)
+                    .map_err(|err| WorkflowError::invalid("invalid_branch", err))
+            }
+            StepKind::Stop => {
+                if self.action.is_some() {
+                    return Err(WorkflowError::invalid(
+                        "invalid_stop",
+                        format!("step \"{name}\" is a stop step and cannot name an action"),
+                    ));
+                }
+                self.stop_reason().map(|_| ())
+            }
+            StepKind::Approval => {
+                // A gate claims no action, and it is resumed rather than retried — the same
+                // two rules a wait follows, because it is the same kind of machine.
+                if self.action.is_some() {
+                    return Err(WorkflowError::invalid(
+                        "invalid_approval",
+                        format!(
+                            "step \"{name}\" is an approval step and cannot name an action; \
+                             the engine decides it"
+                        ),
+                    ));
+                }
+                if self.max_attempts != 1 {
+                    return Err(WorkflowError::invalid(
+                        "invalid_max_attempts",
+                        format!("step \"{name}\" is an approval; a gate is resumed, not retried"),
+                    ));
+                }
+                crate::approval::params_from(&self.params).map(|_| ())
+            }
         }
+    }
+
+    /// A task step's timeout must be positive and inside the engine's ceiling.
+    fn validate_timeout(&self, name: &str) -> Result<()> {
+        if !(1..=MAX_STEP_TIMEOUT_MS).contains(&self.timeout_ms) {
+            return Err(WorkflowError::invalid(
+                "invalid_step_timeout",
+                format!(
+                    "step \"{name}\" allows {} ms; the engine takes 1 to {MAX_STEP_TIMEOUT_MS}",
+                    self.timeout_ms
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Attempts must sit inside the engine's cap.
@@ -337,20 +534,47 @@ impl StepDefinition {
 pub struct WorkflowDefinition {
     /// How the workflow starts.
     pub trigger: Trigger,
-    /// Conditions an event trigger's payload must satisfy, in order. Empty for the other
-    /// triggers — a manual run and a schedule have no payload to evaluate them against.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conditions: Vec<Value>,
+    /// Conditions an event trigger's payload must satisfy, as stored JSON: an `all` / `any`
+    /// group tree, or the flat array every definition written before migration 0020 carries
+    /// (which reads as one `all` group). Empty for the other triggers — a manual run and a
+    /// schedule have no payload to evaluate conditions against.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub conditions: Value,
     /// Steps, in the order they run.
     pub steps: Vec<StepDefinition>,
 }
 
 impl WorkflowDefinition {
     /// Build a definition and check it.
+    ///
+    /// The opening `conditions` is `[]` and **must stay an array**, which is a conclusion this
+    /// constructor reached the expensive way and the doc comment is here to keep.
+    ///
+    /// Two columns have an opinion about this field, and they do not agree:
+    ///
+    /// * `workflows_conditions_is_group` (migration 0020) accepts an **array** *or* an object
+    ///   with exactly one of `all` / `any`.
+    /// * `workflows_conditions_need_event` (migration 0010) reads
+    ///   `jsonb_array_length(conditions) = 0` — and `jsonb_array_length` does not return
+    ///   `null` for a non-array, it **raises** `cannot get array length of a non-array`. The
+    ///   check therefore only survives a non-array when the trigger is an event, because the
+    ///   left-hand side `trigger_kind = 'event'` short-circuits the `or` before the length is
+    ///   ever taken.
+    ///
+    /// So `[]` is the only value a **manual or scheduled** rule can store, and a value like
+    /// `null` or `{"all": []}` answers `workflow_store_error` at the insert. That is a real
+    /// constraint, not a mistake in the migration: a non-event trigger has no payload to
+    /// evaluate conditions against, so there is no group to describe.
+    ///
+    /// The failure this doc exists for looked like a store fault. An approval of a generated
+    /// draft — a **manual** rule, the shape the model writes most often — came back
+    /// `400 workflow_store_error … violates check constraint "workflows_conditions_is_group"`,
+    /// naming the column's *other* constraint and blaming the database for a value the
+    /// constructor had chosen three lines earlier.
     pub fn new(trigger: Trigger, steps: Vec<StepDefinition>) -> Result<Self> {
         let definition = Self {
             trigger,
-            conditions: Vec::new(),
+            conditions: Value::Array(Vec::new()),
             steps,
         };
         definition.validate()?;
@@ -359,7 +583,7 @@ impl WorkflowDefinition {
 
     /// Attach the conditions of an event trigger.
     #[must_use]
-    pub fn with_conditions(mut self, conditions: Vec<Value>) -> Self {
+    pub fn with_conditions(mut self, conditions: Value) -> Self {
         self.conditions = conditions;
         self
     }
@@ -397,21 +621,23 @@ impl WorkflowDefinition {
         Ok(())
     }
 
-    /// Conditions belong to an event trigger, and every condition is an object.
+    /// Conditions belong to an event trigger, and are a list of comparisons or a group tree.
     ///
-    /// What a condition *means* — which field, which operator — is the automation layer's rule
-    /// (`omnion-automation`), which validates the same list before it is stored; the engine
-    /// holds the shape, because it is what writes them into `workflows.conditions`.
+    /// What a condition *means* — which field, which operator, and how groups nest — is the
+    /// automation layer's rule (`omnion-automation::groups`), which validates the same value
+    /// before it is stored; the engine holds the *shape*, because it is what writes it into
+    /// `workflows.conditions`. Two shapes are accepted: the v0 array of comparisons, and the
+    /// `{"all": […]}` / `{"any": […]}` object the depth pass added (migration 0020).
     fn validate_conditions(&self) -> Result<()> {
-        if self.conditions.len() > MAX_CONDITIONS {
-            return Err(WorkflowError::invalid(
-                "invalid_conditions",
-                format!("a trigger carries at most {MAX_CONDITIONS} conditions"),
-            ));
-        }
-        if self.conditions.is_empty() {
+        let empty = match &self.conditions {
+            Value::Array(items) => items.is_empty(),
+            Value::Null => true,
+            _ => false,
+        };
+        if empty {
             return Ok(());
         }
+
         if self.trigger.kind != TriggerKind::Event {
             return Err(WorkflowError::invalid(
                 "invalid_conditions",
@@ -419,14 +645,30 @@ impl WorkflowDefinition {
                  payload to evaluate them against",
             ));
         }
-        for condition in &self.conditions {
-            if !condition.is_object() {
-                return Err(WorkflowError::invalid(
-                    "invalid_conditions",
-                    "every condition is a JSON object",
-                ));
+
+        let well_formed = match &self.conditions {
+            Value::Array(items) => items.iter().all(Value::is_object),
+            // A group is an object with exactly one of `all` / `any`, and its members are
+            // objects too — a comparison or a nested group.
+            Value::Object(map) => {
+                (map.contains_key("all") || map.contains_key("any"))
+                    && map.len() == 1
+                    && map
+                        .values()
+                        .next()
+                        .and_then(Value::as_array)
+                        .is_some_and(|nodes| nodes.iter().all(Value::is_object))
             }
+            _ => false,
+        };
+
+        if !well_formed {
+            return Err(WorkflowError::invalid(
+                "invalid_conditions",
+                "conditions are a list of objects, or one `all` / `any` group of them",
+            ));
         }
+
         Ok(())
     }
 
@@ -499,11 +741,11 @@ mod tests {
     fn unknown_actions_are_refused() {
         let steps = vec![StepDefinition::task(
             "call",
-            "http_request",
+            "smtp_send",
             serde_json::json!({}),
         )];
         let error = WorkflowDefinition::new(Trigger::manual(), steps)
-            .expect_err("v0 ships a closed action set");
+            .expect_err("the action set is closed");
         assert_eq!(error.code(), "invalid_step_action");
         assert!(error.to_string().contains("noop"), "{error}");
     }
@@ -683,7 +925,7 @@ mod tests {
             vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
         )
         .expect("the trigger is valid")
-        .with_conditions(vec![condition.clone()]);
+        .with_conditions(serde_json::json!([condition.clone()]));
         definition
             .validate()
             .expect("a condition on an event trigger is valid");
@@ -692,13 +934,25 @@ mod tests {
             "status"
         );
 
+        // A group tree is the shape the depth pass added, and the engine holds it as-is.
+        let grouped = WorkflowDefinition::new(
+            Trigger::event("page.published"),
+            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+        )
+        .expect("the trigger is valid")
+        .with_conditions(serde_json::json!({ "any": [{ "all": [condition] }] }));
+        grouped
+            .validate()
+            .expect("a group on an event trigger is valid");
+        assert!(grouped.conditions_json().expect("stores")["any"].is_array());
+
         // The same condition on a manual workflow has nothing to evaluate it against.
         let manual = WorkflowDefinition::new(
             Trigger::manual(),
             vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
         )
         .expect("the trigger is valid")
-        .with_conditions(vec![condition.clone()]);
+        .with_conditions(serde_json::json!([condition.clone()]));
         assert_eq!(
             manual
                 .validate()
@@ -707,30 +961,85 @@ mod tests {
             "invalid_conditions"
         );
 
-        // The list is bounded and every entry is an object.
-        let many = WorkflowDefinition::new(
-            Trigger::event("page.published"),
-            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
-        )
-        .expect("the trigger is valid")
-        .with_conditions(vec![condition; MAX_CONDITIONS + 1]);
-        assert_eq!(
-            many.validate().expect_err("the cap holds").code(),
-            "invalid_conditions"
-        );
+        // Shapes that are neither a list nor a one-key group are refused. The count cap now
+        // lives in the automation layer (a group tree is not a flat list of ten), so what
+        // the engine refuses is the *shape*.
+        for broken in [
+            serde_json::json!([serde_json::json!("status")]),
+            serde_json::json!({ "all": [condition.clone()], "any": [] }),
+            serde_json::json!({ "none": [condition.clone()] }),
+            serde_json::json!({ "all": "everything" }),
+            serde_json::json!(["nope"]),
+        ] {
+            let definition = WorkflowDefinition::new(
+                Trigger::event("page.published"),
+                vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+            )
+            .expect("the trigger is valid")
+            .with_conditions(broken.clone());
+            assert_eq!(
+                definition.validate().expect_err("refused").code(),
+                "invalid_conditions",
+                "{broken}"
+            );
+        }
+    }
+    #[test]
+    fn a_rule_with_no_conditions_stores_an_array_because_the_column_asks_for_a_length() {
+        // **The regression test for a real failure**, and the reason it lives here rather
+        // than beside the migration. `conditions` reaches the column as whatever this
+        // constructor chose, and the two columns that inspect it disagree about what "empty"
+        // looks like:
+        //
+        //   * `workflows_conditions_is_group` (0020) accepts an array **or** a group object;
+        //   * `workflows_conditions_need_event` (0010) evaluates `jsonb_array_length(…) = 0`,
+        //     and `jsonb_array_length` **raises** on a non-array rather than returning
+        //     something falsy. The `or` short-circuits it away only when the trigger is an
+        //     event.
+        //
+        // So for a manual or scheduled rule the *only* storable "no conditions" is `[]`, and
+        // the natural-looking alternatives (`null` for "absent", `{"all": []}` for "one stored
+        // shape") both answer `workflow_store_error` at the insert. The error names
+        // `workflows_conditions_is_group`, which is the constraint that *passed* — the check
+        // that actually failed is a different one, and a reader is sent to audit the wrong
+        // column.
+        //
+        // Asserting `is_array()` rather than "the definition validates" is the point: the
+        // value that made every manual create fail **is** valid by this crate's own rules.
+        for trigger in [Trigger::manual(), Trigger::schedule("0 8 * * *")] {
+            let definition = WorkflowDefinition::new(
+                trigger,
+                vec![StepDefinition::task("greet", "noop", serde_json::json!({}))],
+            )
+            .expect("a definition with no conditions is valid");
 
-        let not_an_object = WorkflowDefinition::new(
+            let stored = definition.conditions_json().expect("conditions serialise");
+            assert!(
+                stored.is_array(),
+                "a non-event rule stored conditions as {stored}; \
+                 `jsonb_array_length` raises on a non-array, so only an array can be stored"
+            );
+            assert_eq!(stored, serde_json::json!([]), "and it must be the EMPTY array");
+        }
+    }
+
+    #[test]
+    fn an_event_trigger_still_normalises_the_v0_flat_array_to_one_stored_shape() {
+        // The counterpart: the automation layer normalises `[]` into `{"all": []}` before it
+        // reaches the constructor, and a definition that read one way on the way in and
+        // another way on the way out would make "the stored definition round-trips unchanged"
+        // false for reasons that have nothing to do with what the operator wrote.
+        let definition = WorkflowDefinition::new(
             Trigger::event("page.published"),
-            vec![StepDefinition::task("step", "noop", serde_json::json!({}))],
+            vec![StepDefinition::task("greet", "noop", serde_json::json!({}))],
         )
-        .expect("the trigger is valid")
-        .with_conditions(vec![serde_json::json!("status")]);
+        .expect("an event definition with no conditions is valid")
+        .with_conditions(serde_json::json!({ "all": [] }));
+
         assert_eq!(
-            not_an_object
-                .validate()
-                .expect_err("a condition is an object")
-                .code(),
-            "invalid_conditions"
+            definition.conditions_json().expect("stores"),
+            serde_json::json!({ "all": [] })
         );
     }
+
 }

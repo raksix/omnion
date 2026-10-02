@@ -26,31 +26,11 @@ sqlx.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-# The anonymised-export salt (REQ-129 slice 4). `rand` is already in this workspace as a dev
-# dependency for the sign-in walks, but a dev-dependency is not linkable from library code, so the
-# export route needs it declared here as well — and the dependency is justified on its own: the
-# salt is the one value in the feature whose predictability would undo every hashed column.
-rand.workspace = true
 tokio-stream = { version = "0.1", features = ["sync", "time"] }
 omnion-audit = { path = "../../crates/audit" }
 omnion-ai-hub = { path = "../../crates/ai-hub" }
 omnion-automation = { path = "../../crates/automation" }
 omnion-content = { path = "../../crates/content" }
-# The GraphQL decision layer (REQ-130 slice 1). The crate itself stays free of a database and of
-# every other crate — that is what lets the playground's cost meter predict the endpoint instead of
-# agreeing with it after the fact — so the ONE check that needs both sides, "every permission this
-# surface names is a key the platform actually ships", can only live here, in a crate that links
-# `omnion-permissions`. See `tests/graphql_parity.rs`.
-omnion-graphql = { path = "../../crates/graphql" }
-# The resolver layer (REQ-130 slice 1): the seam where the pure decision layer meets the store.
-# A separate crate so its tests can assert the rule that matters — every resolver calls a service
-# function REST also calls, and holds no SQL of its own — without a running server.
-omnion-graphql-resolvers = { path = "../../crates/graphql-resolvers" }
-# Deployment tooling (REQ-128): the release cache, the artifacts, the bundles and the upgrade
-# plan. Its own crate because the decision layer — which steps, in what order, and what is known
-# about whether the database can be rolled back — is a property of the release contract and not of
-# the HTTP layer that renders it.
-omnion-deployment = { path = "../../crates/deployment" }
 omnion-core = { path = "../../crates/core" }
 omnion-events = { path = "../../crates/events" }
 # System health (REQ-014). Its own crate rather than a module of the security centre: the
@@ -62,28 +42,18 @@ omnion-health = { path = "../../crates/health" }
 omnion-identity = { path = "../../crates/identity" }
 omnion-backup = { path = "../../crates/backup" }
 omnion-media = { path = "../../crates/media" }
-# Migration safety (REQ-129): the ledger, the runner, the advisory lock and the lint. Its own crate
-# because the CLI, the deploy job, the CI gate and this panel all have to reach the same answers
-# from processes that do not link each other — a second "what is pending" implementation in the
-# HTTP layer would be a second answer, and the divergence would show up as a panel promising a
-# clean deploy while `omnion migrate plan` exits 1.
-omnion-migrations = { path = "../../crates/migrations" }
 omnion-notifications = { path = "../../crates/notifications" }
 omnion-security = { path = "../../crates/security" }
 omnion-module-analytics = { path = "../../modules/analytics" }
 omnion-onboarding = { path = "../../crates/onboarding" }
 omnion-developer = { path = "../../crates/developer" }
 omnion-permissions = { path = "../../crates/permissions" }
-omnion-reliability = { path = "../../crates/reliability" }
-# The integration walk clears its own Redis counter with the same key builder the middleware
-# uses, rather than a hand-built string that could drift from the bucket layout.
-redis = { workspace = true }
-omnion-secrets = { path = "../../crates/secrets" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }
 omnion-storage = { path = "../../crates/storage" }
-omnion-telemetry = { path = "../../crates/telemetry" }
 omnion-workflows = { path = "../../crates/workflows" }
+omnion-module-ai = { path = "../../modules/ai" }
+omnion-module-app-builder = { path = "../../modules/app-builder" }
 
 # Enterprise sign-in (REQ-006, slice 4b-2): the authorization URL is assembled with a real
 # URL parser (so a provider endpoint cannot smuggle a fragment or a second origin into it), and
@@ -92,12 +62,6 @@ url.workspace = true
 base64.workspace = true
 
 [dev-dependencies]
-# The intake guard walk (tests/reliability_intake.rs) SIGNS a payload with the same HMAC the
-# guard verifies, because a fixture that hard-codes a signature would only prove that the
-# hard-coded value is accepted. `hex` is here for the same reason: the `v1,<id>:<tag>` shape is
-# hexadecimal, and a base64 tag would be testing a different scheme.
-hmac.workspace = true
-hex.workspace = true
 http-body-util = "0.1"
 # The passkey integration walk (tests/webauthn.rs) holds the private half of a credential and
 # signs the ceremony's own message, so the verification runs exactly as it does in production.

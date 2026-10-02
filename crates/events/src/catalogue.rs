@@ -443,74 +443,6 @@ catalogue! {
     "A domain was detached from its site.",
     [("domain_id", Uuid, req), ("site_id", Uuid, opt), ("hostname", String, opt)];
 
-    // ---- Secrets -------------------------------------------------------------------------------
-    // Every row here has a writer in this tree. That is the direction this table is held in:
-    // `apps/api/tests/events.rs` walks the source for `bus::emit` names and refuses any that is
-    // not declared, so a name may not exist in the catalogue until something records it, and a
-    // recorded fact may not exist without a row that says what it carries. The rows were added
-    // from the emitters' own `payload(json!({ … }))`, not from the names — a catalogue row
-    // written from the event's spelling rather than its body is a signature that validates
-    // nothing, and the walk that checks the name never checks the shape.
-    "secrets.credential_validation_failed", "secrets", Live,
-    "A credential profile was tested against its upstream and the provider rejected it.",
-    [("secret_id", Uuid, req), ("name", String, req), ("kind", String, req), ("message", String, req)];
-    "secrets.credential_validation_recovered", "secrets", Live,
-    "A credential profile passed validation again after an earlier failure.",
-    [("secret_id", Uuid, req), ("name", String, req), ("kind", String, req)];
-    "secrets.credential_slot_assigned", "secrets", Live,
-    "A primary or fallback credential was bound to a slot.",
-    [("scope_type", String, req), ("scope_id", Uuid, req), ("slot", String, req),
-     ("primary", String, opt), ("fallback", String, opt)];
-    "secrets.audit_anomaly_acknowledged", "secrets", Live,
-    "An operator acknowledged a secrets audit anomaly.",
-    [("anomaly_id", Uuid, req), ("changed", Boolean, opt)];
-    "secrets.lease_issued", "secrets", Live,
-    "A consumer was granted a bounded lease on a secret.",
-    [("lease_id", Uuid, req), ("secret_id", Uuid, req), ("name", String, req),
-     ("consumer", String, req), ("environment", String, opt), ("max_uses", Integer, opt)];
-    "secrets.lease_revoked", "secrets", Live,
-    "A lease was revoked before it was used up.",
-    [("lease_id", Uuid, req), ("secret_id", Uuid, req), ("name", String, req),
-     ("consumer", String, req), ("reason", String, opt)];
-    "secrets.lease_redeemed", "secrets", Live,
-    "A lease was redeemed once and its value released to the consumer.",
-    [("lease_id", Uuid, req), ("secret_id", Uuid, req), ("name", String, req),
-     ("version", Integer, opt), ("deployment_key_id", Uuid, opt), ("consumer", String, req)];
-    "secrets.deployment_key_created", "secrets", Live,
-    "A deployment key was minted for a consumer outside the panel.",
-    [("deployment_key_id", Uuid, req), ("name", String, req), ("environment", String, opt),
-     ("scopes", String, opt), ("fingerprint", String, opt)];
-    "secrets.deployment_key_revoked", "secrets", Live,
-    "A deployment key was revoked.",
-    [("deployment_key_id", Uuid, req), ("name", String, req), ("reason", String, opt)];
-    // ---- Deployment tooling (REQ-128) ------------------------------------------------------------
-    // Three of the request's six names. `release.artifact.published` and `release.manifest.updated`
-    // belong to the update check that FETCHES a manifest, which is REQ-024's fetch and not this
-    // request's cache; they are declared there rather than here so a name is not in two places.
-    // `deployment.bundle.downloaded` is a download counter, not a fact anybody subscribes to, and
-    // it is deliberately NOT declared: an event that lands in every webhook for a file download
-    // is noise in the one channel the request calls out as worth subscribing to.
-    //
-    // The payloads carry versions, digests and flags — never a file body and never a credential,
-    // because these names are exactly the two an operator watching a fleet of installs
-    // subscribes to.
-    "deployment.bundle.generated", "deployment", Live,
-    "An environment bundle was generated for a target.",
-    [("bundle_id", Uuid, req), ("name", String, req), ("kind", String, req),
-     ("version", String, req), ("checksum", String, opt)];
-    "deployment.upgrade_plan.created", "deployment", Live,
-    "An upgrade plan was generated from the running version to a cached release.",
-    [("from_version", String, req), ("to_version", String, req), ("topology", String, req),
-     ("destructive_verdict", String, req), ("migrations", Integer, opt)];
-    "deployment.upgrade_plan.acknowledged", "deployment", Live,
-    "An operator accepted a range's destructiveness warning.",
-    [("plan_id", Uuid, req), ("from_version", String, req), ("to_version", String, req),
-     ("verdict", String, req)];
-    "secrets.root_key_rotated", "secrets", Live,
-    "The root encryption key was rotated and existing versions were re-wrapped.",
-    [("job_id", Uuid, req), ("from_key_id", Uuid, opt), ("to_key_id", Uuid, opt),
-     ("versions", Integer, opt)];
-
     // ---- Plugins, themes, workflows --------------------------------------------------------------
     "plugin.installed", "plugins", Reserved,
     "A plugin was installed.",
@@ -536,6 +468,29 @@ catalogue! {
     "workflow.run.failed", "workflows", Reserved,
     "A workflow run stopped on a step that failed.",
     [("workflow_id", Uuid, req), ("run_id", Uuid, req), ("error", String, opt)];
+    // The AI workflow builder's own facts (docs/requests/REQ-046). `generated` rather than
+    // `created`, because the row is created before the provider is called and a receiver that
+    // subscribes to "created" would be told a draft exists before anybody can open it — the
+    // name the platform records is the one a person can act on. Identifiers only: never the
+    // prompt, never the definition, never a provider key.
+    "ai.workflow_draft.generated", "workflows", Live,
+    "A prompt became a generated workflow draft waiting for review.",
+    [("draft_id", Uuid, req), ("title", String, req), ("model_key", String, opt),
+     ("repaired", Boolean, opt), ("attempts", Integer, opt)];
+    "ai.workflow_draft.failed", "workflows", Live,
+    "A generation ran out of answers and the draft carries the reason.",
+    [("draft_id", Uuid, req), ("reason", String, req)];
+    // The decision half of the console (slice 4). `approved` carries the workflow id because
+    // a receiver whose job is "tell the channel we now have a rule" cannot do it from a
+    // draft id alone; `rejected` carries the reason because "a draft was rejected" with
+    // nothing else is not actionable — it does not distinguish a duplicate idea from a
+    // dangerous one. Neither carries the prompt, the definition or a provider key.
+    "ai.workflow_draft.approved", "workflows", Live,
+    "A person approved a draft and it became a disabled workflow.",
+    [("draft_id", Uuid, req), ("workflow_id", Uuid, req)];
+    "ai.workflow_draft.rejected", "workflows", Live,
+    "A person rejected a draft and left a reason.",
+    [("draft_id", Uuid, req), ("reason", String, req)];
 
     // ---- Webhooks ------------------------------------------------------------------------------
     "webhook.endpoint.created", "webhooks", Live,
@@ -652,93 +607,6 @@ catalogue! {
     "A channel accepted a notification the reader asked to be sent, one attempt at a time.",
     [("notification_id", Uuid, req), ("channel", String, req), ("test", Boolean, req),
      ("delivered", Boolean, opt)];
-
-    // ---- Migration backfills -------------------------------------------------------------------
-    // Four rows for the one write in the platform that touches every existing row. The split that
-    // matters is NOT started-vs-resumed (both mean "a batch ran") but ran-vs-**what else could
-    // have happened**: a pause, a completion and a failure are four different facts about a
-    // migration in flight, and a receiver that cannot tell them apart either pages an operator for
-    // a pause or misses a failure. Every payload carries `resume_key` as well as `rows_done`,
-    // because a receiver handed only a row count cannot distinguish a stalled job from a finished
-    // one — both counters stop moving.
-    "backfill.started", "migrations", Live,
-    "The first batch of a backfill ran. `resume_key` is the last key processed, in the key column's \
-     OWN type — sorting it as text is the defect that makes a restart redo work.",
-    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
-     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt),
-     ("batch_rows", Integer, opt)];
-
-    "backfill.resumed", "migrations", Live,
-    "A later batch ran after a pause, continuing from the stored cursor rather than from the \
-     beginning of the table. `resumed_from` is the cursor the job restarted at, so a receiver can \
-     prove it did not rewind.",
-    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
-     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt),
-     ("resumed_from", String, opt), ("batch_rows", Integer, opt)];
-
-    "backfill.paused", "migrations", Live,
-    "An operator stopped a job after its current batch. The cursor is KEPT: a pause is not a \
-     reset, and `resume_key` is what the next run continues from. Never paired with \
-     `backfill.completed` — recording a completion for a pause is a permanent fact for something \
-     that did not happen.",
-    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
-     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt),
-     ("reason", String, opt)];
-
-    "backfill.completed", "migrations", Live,
-    "A backfill reached the end of its rows: the batch found nothing left to write. Emitted from \
-     the batch OUTCOME, never from the job's state, so a pause cannot record one.",
-    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
-     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt)];
-
-    "backfill.failed", "migrations", Live,
-    "A batch's statement failed and the job stopped. `error` carries the database's own message: \
-     the statement is written by the migration author, so nobody else can reconstruct it. \
-     `resume_key` is the cursor the retry starts from — it is the last GOOD key, never the failing \
-     one, so a retry is exactly the work that did not happen.",
-    [("job_id", Uuid, req), ("name", String, req), ("version", String, opt), ("table_name", String, req),
-     ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt),
-     ("error", String, opt)];
-
-    // ---- Anonymised exports ---------------------------------------------------------------------
-    // Three events, and the split between the first two is the one that matters. `created` says
-    // somebody asked for a file; `downloaded` says the bytes LEFT. An operator reading the trail
-    // during an incident needs to tell those apart, because "an export exists" and "an export
-    // reached a third party" are answers to different questions and only one of them is an
-    // incident. A single `exported` event could not answer either.
-    //
-    // Neither event carries a column NAME list, a row count per column, or anything read out of
-    // the data. The payload is the request and the decision, which is what an audit needs; the
-    // contents of a support file must not travel in the event stream, because the event stream is
-    // fan-out to every subscriber and therefore has a wider audience than the export itself.
-    "anonymized_export.created", "migrations", Live,
-    "An anonymised export was requested. `tables` is what was ASKED for and `reason` is the free \
-     text an operator typed — the two things a reviewer reads. `column_actions` is the plan that \
-     was resolved BEFORE any row was read, never the contents of the file. Recorded only after the \
-     classification map accepted every selected column, so its presence also proves the fail-closed \
-     check passed.",
-    [("export_id", Uuid, req), ("reason", String, req), ("tables", Json, req),
-     ("columns_planned", Integer, req), ("columns_removed", Integer, req),
-     ("columns_hashed", Integer, opt), ("columns_synthetic", Integer, opt),
-     ("salt_fingerprint", String, opt)];
-
-    "anonymized_export.downloaded", "migrations", Live,
-    "The single permitted download of a prepared export happened — the moment the bytes left the \
-     platform. `expires_at` travels with it so a receiver can see how long the artifact was \
-     live, and `checksum` lets the recipient prove which bytes they hold. A second attempt is \
-     refused with `410` and emits NOTHING: a refused download is not a fact about the export, and \
-     recording it would turn the trail into a counter a third party could inflate.",
-    [("export_id", Uuid, req), ("downloaded_at", Timestamp, opt),
-     ("expires_at", Timestamp, req), ("checksum", String, opt),
-     ("file_size", Integer, opt)];
-
-    "anonymized_export.expired", "migrations", Live,
-    "An export passed its expiry without being downloaded, or was revoked before anyone fetched \
-     it. Carries which of the two happened (`expired` vs `revoked`) because the two have different \
-     follow-ups: an expired file nobody wanted is routine, a revoked one is a decision somebody \
-     made under pressure.",
-    [("export_id", Uuid, req), ("reason", String, opt),
-     ("download_count", Integer, req)];
 
     // ---- Commerce (reserved: the module is not shipped yet) -------------------------------------
     "order.created", "commerce", Reserved,

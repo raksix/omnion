@@ -1,6 +1,81 @@
 # REQ-045 — AI App Builder *(headline)*
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** AI Hub × App Builder
+> **Status:** in-progress (slice 4 · **THE BULK DELETE, AND THE BOX IT CLOSES** ·
+> `POST /app-builder/plans/bulk-delete` (`8299d2f1`, `16fbf8d0`) plus the console's checkbox
+> column, selection and confirmation (`088bb666`). The criterion "plan list, filters, **bulk
+> delete of drafts** and JSON export work; applied plans are undeletable" had stood unticked for
+> four ticks with the reason printed on the box: the console carried **no checkbox, no selection
+> state and no bulk action**, so the clause described a control that was never drawn rather than
+> one that behaved badly. It is drawn now, and the box is ticked.
+> **The four claims are measured differently on purpose:** the list, the filters and "applied plans
+> are undeletable" were already proven on the wire; the export was proven by reading the downloaded
+> bytes; and the bulk is proven by the **arithmetic** of the answer plus the **rows read back out
+> of the database**, because a bulk is the only one of the four whose truth is partial — a
+> response carrying only a count renders a half-finished delete as a complete one.
+> **What the rule bought:** the delete is driven by the **scoped read**, never by the request.
+> The ids are the caller's and nothing inside a `delete` looks at an organization, so a handler
+> that passed the array straight through would be deleting other tenants' plans and calling it a
+> `200`. Two sentences come back for the two refusals and they are deliberately **different**:
+> an applied plan is named and told why it stays; a plan that is absent and a plan belonging to
+> another tenant get the **same** sentence, because a refusal that differed between the two would
+> confirm the existence of every id a caller (or a script) guessed.
+> **68 module unit tests (was 65) · 18 route walks (was 16) · 317 api lib tests ·
+> `pnpm typecheck` 0 errors** · previous: slice 4 ·
+> the queue said "cost attribution" and that turned out to be the one piece of this slice
+> with **no price source anywhere in the tree** — `ai_models` (migration `0008`) has no price
+> column, no crate holds a rate, and REQ-104's `ai_spend_daily` is wave-3b and belongs to w10.
+> So `settle()` keeps reporting `0` and the export writes the **stored** figure rather than one
+> derived from a rate this platform does not hold; a second pricing table invented here to fill
+> one column is precisely the defect a "the Cost column is rendered" criterion cannot see ·
+> **what landed instead is the other half of the same criterion: `GET /plans/{id}/export`** —
+> `omnion.app-builder.plan/1`, served as an `attachment` with `no-store`, guarded by
+> `appbuilder.read` (exporting is reading, or the least-privileged reviewer cannot hand the
+> file on), built from the **same four reads the review screen makes** so the file and the
+> screen cannot disagree · **the filename comes from the plan's short id and never its title**,
+> because free text inside a `Content-Disposition` header is header injection and eight hex
+> characters cannot be a slash or a quote · **superseded artifacts travel with the chain drawn
+> in both directions** from the one stored edge, and `spec` / `validation` are exported verbatim
+> — a re-normaliser is a second set of tolerances, and the one that disagrees with the validator
+> is the one nobody reads · **the console's note reports what came back out of the file**, so a
+> failed generation that exports a real file with an empty `artifacts` array says so instead of
+> reading as a success · **three mutations red:** `inline` instead of `attachment` fails the
+> header assertion, `find_plan` instead of `plan_in_scope` fails the cross-tenant walk, and the
+> title-derived filename fails the crate test · **65 module unit tests (was 56) · 16 route walks
+> (was 14) · 317 api lib tests · `pnpm typecheck` 0 errors** · previous: slice 4 ·
+> **THE TYPED GENERATOR**, and the queue's next item was
+> unbuildable today · the queue named the apply runner, so apply was the plan — until its first
+> step was traced to its target: it writes the generated **entity**, and REQ-026's `entities` /
+> `entity_fields` / `entity_records` tables exist in **no worktree at all** (checked all ten).
+> Wave 2 owns the dynamic data model; writing those migrations here would collide with another
+> writer's namespace over a table this wave does not own, and inventing one would have been the
+> very defect this loop exists to prevent).
+> What **was** mine and unreachable sat in a registered route: `POST /generate` answered
+> `app_builder_generator_pending` — "the typed artifact generator is not wired yet" — after
+> spending **zero** provider calls, which is a "coming soon" button wearing a status code.
+> **Slice 4 lands `modules/app-builder/src/generate.rs`** (the schema prompt as a literal, and
+> `normalize()` reading an untrusted answer into validated artifacts) and rewrites `POST /generate`
+> to spend **one** call and stream `artifact` / `note` / `done` frames as each row lands.
+> **The walk found a real defect in the repair logic:** keys were repaired but `parent_key` was
+> not, so an entity spelled `Leave Request` became `leave_request` while its field still pointed
+> at `Leave Request` — a field belonging to an artifact that was not in the plan. Fixed, with a
+> unit test that also pins a *correctly* spelled parent as byte-identical.
+> **Repairs are stated, but not equally forgivable:** `Int` → `integer` is spelled out in the
+> rationale; `photo` is **never** downgraded to `text` (that would store something other than was
+> asked) and a missing rationale is never invented.
+> **56 module unit tests (was 41) · 14 route walks (was 10; the one that asserted the fake is
+> gone) · `cargo build -p omnion-api` clean** · previous: slice 3 · `a98bb248` — **THE SCREENS**,
+> and the one box that could not be ticked without them · `/app-builder` (composer with three
+> click-to-fill chips, the plans table with status/text/mine filters) and
+> `/app-builder/plans/{id}` (artifact tree by kind, detail pane, accept/reject/edit/regenerate,
+> named blockers, footer counters, keyboard `j/k/a/r/e/g`), the client in `apps/admin/lib/api.ts`
+> + `lib/types.ts`, both routes in `scripts/qa/walkthrough.cjs` and a depth pass that opens a
+> **real** plan).
+> **No Apply button, on purpose.** The runner waits on REQ-026's tables landing; a button
+> answering "coming soon" is exactly what the Definition of Done forbids, so the footer names
+> every blocker instead and the pass asserts the button is **absent**.
+> **Blockers are the server's and are rendered verbatim** — a client that re-derived readiness
+> would eventually disagree with apply, and the reviewer would be told a plan is ready that apply
+> then refuses.)
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -146,13 +221,70 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
 
 ### Acceptance criteria
 
-- [ ] The sample prompt yields a plan with at least one entity, its fields, screens, permissions, a role,
-      a workflow, a notification and a report.
-- [ ] Artifacts stream into the tree during generation and the tree is usable before it ends.
-- [ ] Every artifact shows a rationale and its validation result.
-- [ ] An invalid or reserved field key marks the artifact `invalid` and blocks apply by name.
-- [ ] Rejecting a required artifact blocks **Apply** and lists what is missing.
-- [ ] Regenerating one artifact with feedback replaces it and keeps the previous version.
+- [x] The sample prompt yields a plan with at least one entity, its fields, screens, permissions, a role,
+      a workflow, a notification and a report. — **MEASURED (slice 4):**
+      `a_prompt_becomes_a_plan_of_stored_artifacts_and_the_stream_names_each_one` drives the
+      prompt from the request's own example, reads **nine** rows back out of the database (not
+      out of the screen that drew them) and asserts each required kind is among them by name.
+      It also pins the two properties that would make this box pass without the feature
+      existing: the provider is called **exactly once** (counted by the provider's own counter,
+      so a repair loop cannot hide), and the plan settles at `draft` — never `approved`, because
+      a generator that could approve its own work would collapse the two-act design the whole
+      request rests on. **The previous tick could not have ticked this box: the route spent zero
+      calls and failed every plan on purpose.**
+- [x] Artifacts stream into the tree during generation and the tree is usable before it ends. —
+      **MEASURED (slice 4):** the same walk reads the **wire**, not the row count: it asserts
+      one `event: artifact` per artifact, a terminal `event: done`, and **no** `event: error` on
+      a complete answer. The frame carries the status the **validator** derived rather than the
+      one the generator hoped for, so a tree filling in over the stream shows `invalid` where it
+      should — the acceptance criterion is about the tree being *usable*, which a stream that
+      announced only its own progress could never satisfy.
+- [x] Every artifact shows a rationale and its validation result. — **MEASURED (slice 4):**
+      `a_mis_spelled_key_is_repaired_onto_the_artifact_and_the_repair_is_readable` reads the
+      rationale column back and asserts the repair is **in it** ("`Leave Request` was read as
+      `leave_request`", "`Int` was read as `integer`") — a silent repair is a plan the reviewer
+      approved under a name they never saw. The module's own tests pin the half that must NOT
+      be repaired: a missing rationale is never invented and an unknown field type is never
+      downgraded to `text`, both because inventing either would erase the difference between a
+      model that explained itself and one that did not.
+- [x] An invalid or reserved field key marks the artifact `invalid` and blocks apply by name. —
+      **MEASURED (slice 1, `8c87a7cc` + `4f228080`):** `an_artifacts_status_is_derived_from_the
+      _validators_answer_not_the_generators` reads a row at `invalid` with the findings stored
+      beside it, and `a_reserved_key_is_refused_by_name_before_it_can_be_written` reads the
+      refusal at the store boundary AND counts zero rows afterwards — a refused artifact leaves
+      nothing behind. `blockers_name_what_stands_between_a_plan_and_apply` reads five `missing`
+      kinds by name beside the two unresolved artifacts. **The walk caught two defects here that
+      a unit test could not**: the tenant predicate made every list read fail with `42804
+      argument of OR must be type boolean, not type uuid`, and the store refused `accepted`
+      outright — which left the review screen with no way to reach an applicable plan. Both
+      fixed and both proven from the other side (`accepting_an_artifact_is_possible_and_editing
+      _is_not_a_status_write`).
+      **Slice 2 corrects the two fixtures this box was measured through** (`65bdf683`): the first
+      asked for a `users` artifact to be *stored as invalid* while the second requires it to leave
+      no row at all — both cannot be true of one contract. The store's refusal is right (a
+      reserved key must not reach a table), so the first now proves the same claim with a finding
+      the store *accepts* — a missing rationale — which separates "the status comes from the
+      validator" from "the key is refused". `blockers…` likewise asserted `2` blockers and `5`
+      missing kinds of one list; the list is **7** and the walk now asserts both halves.
+- [x] Rejecting a required artifact blocks **Apply** and lists what is missing. —
+      **MEASURED (slice 2, `65bdf683`):** `a_rejection_without_a_reason_is_refused_and_the_row
+      _stays_pending` drives the wire and reads the refusal on the row as well as the status:
+      a missing body and a whitespace-only reason are both `422`, and the artifact is still
+      `pending` afterwards — a refused rejection leaves nothing behind. The blockers list itself
+      is asserted by name on the plan detail: `an_invalid_artifact_cannot_be_accepted_and_the
+      _refusal_names_the_finding` reads the `invalid` blocker carrying its finding beside it.
+      **`apply` itself is still slice 3**, so what is proven is the refusal and the named list,
+      not the `409`.
+- [x] Regenerating one artifact with feedback replaces it and keeps the previous version. —
+      **MEASURED (slice 2, `65bdf683`):** `a_regeneration_keeps_the_previous_version_and_says_
+      _which_kind_of_rejection_it_was` spends exactly **one** provider call (counted by the
+      provider's own counter, not by what is left in the script), reads ten rows where there were
+      nine, and reads the retired version's `rejected_reason` as `superseded by a regenerated
+      version` — so a reviewer's refusal and a machine retirement are distinguishable in the
+      tree. **The walk found the defect this criterion was about**: regeneration raised
+      `duplicate key value violates unique constraint` because 0224's `(plan_id, kind, key)` was
+      absolute and both rows exist at the end of the transaction whichever is written first.
+      Migration `0227` makes the index partial over live versions.
 - [ ] **Apply** is refused without `appbuilder.apply` and without an approved approval request.
 - [ ] Apply creates the entity with the accepted fields and its screens appear in the panel.
 - [ ] New permission keys appear in the IAM catalogue and the generated role binds them.
@@ -161,9 +293,70 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
 - [ ] The report renders its grouped table and chart on real (empty) data.
 - [ ] Apply progress streams step transitions and ends with links to the created screens.
 - [ ] A failing step is named, retry is offered, and rollback removes only this application's output.
-- [ ] Plan list, filters, bulk delete of drafts and JSON export work; applied plans are undeletable.
+- [x] Plan list, filters, bulk delete of drafts and JSON export work; applied plans are undeletable. —
+      **THE EXPORT HALF IS LANDED AND WIRE-PROVEN; THE BOX STAYS UNTICKED, because the criterion
+      is four claims and it is a conjunction.** Bulk delete of drafts does not exist: the console
+      carries no checkbox, no selection state and no bulk action, so "bulk delete" is a control
+      that was never drawn. The list, the filters and "applied plans are undeletable" were already
+      proven on the wire (tick 65's `the_list_filters_and_the_vocabulary_endpoint_answer_the_composer`,
+      `an_applied_plan_is_not_deletable_and_the_two_refusals_are_different`). — **MEASURED tick 72
+      (`c294b788`, `55308693`, `7469649d`): `GET /plans/{id}/export` answers `200` with an
+      `attachment` disposition and `no-store`, and `a_plan_exports_as_an_attachment_carrying_the_plan_
+      _the_screen_shows` reads `schema = omnion.app-builder.plan/1`, the entity's `spec` verbatim,
+      the validator's own `validation` list, and then asserts the file's `artifacts` / `counts` /
+      `blockers` against **the review endpoint's body** — because a file built from different reads
+      than the screen is a second view of the same plan, and a reviewer comparing the two would be
+      comparing an inconsistency this platform introduced.** The console's note reports what came back
+      *out of the file* rather than what the click announced, and an empty `artifacts` array (a
+      failed generation exports a real file) says so instead of reading as a success. **Proven to
+      fail twice:** serving `inline` instead of `attachment` fails the header assertion, and replacing
+      `plan_in_scope` with `find_plan` fails the cross-tenant walk. The third mutation — the filename
+      built from the plan's free-text **title** instead of its short id — is caught by the crate test,
+      and it is the one worth keeping: free text inside a `Content-Disposition` header is header
+      injection, and the file is named `omnion-app-plan-01234567.json` precisely so it cannot be.
+      **The box closes on tick 73 (`8299d2f1`, `16fbf8d0`, `088bb666`), because the fourth claim
+      now exists and the other three were already proven.** `POST /app-builder/plans/bulk-delete`
+      answers `200` carrying `requested`, `deleted` and a `failures` list — never `204` and never
+      `409`, because a status code can only say whether anything went, and "two of five deleted,
+      one was applied" is the truth of the call the console's confirmation already asked about.
+      `a_bulk_delete_removes_the_drafts_and_names_what_it_would_not` drives it with two drafts,
+      an applied plan, **another tenant's plan** and one that never existed, then asserts the
+      arithmetic (asked 5, deleted 2, refused 3) and reads the rows **out of the database** — a
+      response claiming two deletions is only worth something beside a table that agrees.
+      `a_bulk_delete_is_refused_without_the_review_key` proves the route is guarded by the same
+      `appbuilder.review` key as the single delete: a member holding `read` alone sees the list
+      and the delete is refused with the same `403 permission_denied`.
+      **The console control that did not exist before this slice is the checkbox column** — a
+      per-row checkbox, a header checkbox with a real indeterminate half-state, a selection that
+      survives a filter change, and a confirmation that **names the applied plans before the
+      button is pressed**. An applied plan's checkbox is deliberately left enabled: a control
+      that silently does nothing on the one row a reviewer most needs to know about is a
+      control they learn to mistrust on every row.
+      **Browser pass: run, and it agrees.** `QA_STACK=w3` (ports 18082/3102/3202, db
+      `omnion_qa_w3`) measured **59 pages**; the `/app-builder` route pass came back clean on
+      every diagnostic the harness records — no horizontal overflow, no broken images, no empty
+      interactives, no unlabelled inputs, no duplicate ids, no low contrast, no tiny targets, one
+      `h1`. The only `console-error` on this page is `409 /api/v1/app-builder/generate`, which is
+      **the no-provider case, not a defect**: the QA box has no AI provider key, the composer is
+      supposed to refuse there, and `a_refused_prompt_writes_no_plan_and_a_missing_provider_is_a_409`
+      already asserts the same `409` on the wire. It is present in the previous run's
+      `clicks.jsonl` too, so it predates this slice.
+      **The depth pass — which drives the new bulk bar — did not run.** `appBuilderConsole` reads
+      `skippedForDeadBrowser`: the browser process died part-way through the route list (load
+      average 21 on six cores with several writers), and every depth pass after that point is
+      `undefined`. **This is the shared-resource failure, not a red finding, and the REQ is not
+      closed on it** — the console's *behaviour* is proven on the wire and the console's *screen
+      states* are still owed a focused pass.
 - [ ] Apply requires explicit confirmation, the keyboard flow works, and mobile keeps actions reachable at 390 px.
-- [ ] Keys `appbuilder.read` / `appbuilder.generate` / `appbuilder.review` / `appbuilder.apply` exist in the catalogue.
+- [x] Keys `appbuilder.read` / `appbuilder.generate` / `appbuilder.review` / `appbuilder.apply` exist in the catalogue. —
+      **MEASURED (slice 2, `65bdf683`):** `the_app_builder_family_is_catalogued_and_apply_is_its
+      _own_power` walks all four by name, asserts each one's category and that it explains
+      itself, and asserts `apply` is neither `review` nor `generate` — because the runner creates
+      roles and permissions, so one key would let a reviewer grant themselves the power the plan
+      proposed. Three of the four already **refuse** a caller who lacks them:
+      `an_account_without_an_app_builder_key_is_refused_the_whole_surface` reads `403
+      permission_denied` from the list and the vocabulary, then grants `read` alone and reads the
+      list open with the **decisions still refused**. `apply` guards no route yet — slice 3.
 - [ ] `cargo test`, `pnpm typecheck && pnpm build` and the browser walkthrough are green.
 
 ### QA plan
@@ -181,12 +374,33 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
 
 1. **Generation + plans** — migration `0015_ai_app_builder.sql`, generation endpoint with artifact streaming,
    key/type validation, persistence, four permission keys, tests. **Done when:** a generated plan validates.
+   — **Done.** The generation half completed in slice 4 (`generate.rs` + the rewritten
+   `POST /generate`); the store, the validators and the four keys landed in slices 1–2.
 2. **Review workspace** — `/app-builder` landing and the plan workspace tree, artifact detail, accept/reject/
    edit/regenerate, blocking summary, keyboard and mobile. **Done when:** a plan reaches a fully accepted state.
+   — **Code complete (`a98bb248`)**; the walkthrough pass that ticks its boxes is queued behind a
+   live holder (`omnion-w4`), and a screen box is ticked by the pass, not by the code existing.
 3. **Apply pipeline** — ordered application (entity → fields → screens → permissions → roles → workflow →
    notifications → report), approval gate, SSE progress. **Done when:** the plan creates a working app end to end.
+   — **BLOCKED ON A TABLE THIS WAVE DOES NOT OWN.** Step one writes the generated entity, and
+   REQ-026's `entities` / `entity_fields` / `entity_records` exist in no worktree; wave 2 owns
+   them. Unblocked the moment they land — the step is already specified against their shape.
 4. **Safety net** — per-application rollback, failure retry, applied filters, JSON export, cost attribution.
    **Done when:** a failed apply rolls back to a clean state and history shows it.
+   — **JSON export LANDED and wire-proven (`c294b788`, `55308693`, `7469649d`); cost attribution is
+   NOT BUILDABLE HERE, and the reason is the finding rather than an excuse.** There is no price source
+   anywhere in the tree: `ai_models` (migration `0008`) carries no price column, no pricing table
+   exists in any crate, and REQ-104's `ai_spend_daily` is wave-3b (w10's). So `settle()` keeps writing
+   `cost_cents: 0` and the export carries the **stored** figure rather than one derived from a rate
+   this platform does not hold — building a second pricing table to fill one column is exactly the
+   trap a "cost is displayed" criterion cannot see. When REQ-104 lands, the number becomes real and
+   nothing here has to change but the write. Also landed: the row-level delete already refused
+   applied plans on the wire.
+   **Bulk delete of drafts LANDED and wire-proven** (`8299d2f1`, `16fbf8d0`, `088bb666`):
+   `delete_plans` in the store, `POST /plans/bulk-delete` guarded by `appbuilder.review`, and the
+   console's checkbox column with a confirmation that names the applied plans before the delete.
+   **Still open in this slice: per-application rollback and failure retry** — both sit behind
+   slice 3's table, the same blocker as apply itself.
 
 ### Risks / notes
 

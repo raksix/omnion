@@ -19,6 +19,9 @@ LOCKDIR="${QA_SLOT_DIR:-/tmp/omnion-qa-slot}"
 # directory would be counted as a second place and halve the real capacity.
 HOLDERDIR="${LOCKDIR}-holders"
 WAIT="${QA_SLOT_WAIT:-1800}"
+# The pass that wants a place, by pid. The holder is told to watch it, because the
+# holder outliving its pass is the one leak this semaphore cannot survive.
+OWNER="${QA_SLOT_OWNER_PID:-}"
 
 mkdir -p "$LOCKDIR" "$HOLDERDIR"
 mine="$LOCKDIR/$$-$(date +%s)"
@@ -64,17 +67,16 @@ reap() {
     fi
   done
 }
-reap
-
-# A holder can die WHILE the queue is waiting, and the reaper above already ran before
-# the loop started. So a place whose owner crashed mid-pass was never reclaimed: every
-# later waiter counted it, printed "waiting for a QA slot" and sat until its own
-# deadline — on this box twenty-two waiters behind one dead holder, each holding a
-# loop's tick open for the full hour. Reaping once more per poll makes the queue a
-# function of who is ALIVE rather than of who was alive when the waiter started, and
-# it costs one `kill -0` per place per fifteen seconds.
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  # Reap INSIDE the loop, not once before it. The single pre-loop call only covers a place
+  # that was already stale when this writer arrived; a place that goes stale while a writer
+  # is already queued is never reclaimed, so the queue sits on a dead place and every writer
+  # behind it burns its whole deadline waiting for a pass that is not running. That is the
+  # same failure the grace period was added to fix, one step later in time: on a box where
+  # one crashed pass costs the other seven writers 40 minutes each, "reclaimed eventually" is
+  # not a repair. The holder check is cheap and the reap is idempotent, so running it every
+  # turn costs one `find` and buys the queue its capacity back within 15 seconds.
   reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
@@ -84,10 +86,43 @@ while :; do
     # sees EOF — the pass prints "place taken" and then hangs there forever, with a slot held
     # and no walkthrough running. Redirecting the holder's stdio to /dev/null is what makes the
     # pipeline finish.
-    while :; do sleep 30; done </dev/null >/dev/null 2>&1 &
+    # The holder exists to keep the place alive, so it must be the thing that notices
+    # the pass is gone. Watching the OWNER instead of "am I wanted any more" is what
+    # makes a hard kill survivable: `trap … EXIT` in run.sh never fires for SIGKILL,
+    # and an OOM kill or a terminal timeout is exactly how this loop's passes end.
+    # Without the owner check the holder is reparented to init when its pass dies and
+    # lives forever — it is a `while :; do sleep 30; done`, so `kill -0` on it is
+    # ALWAYS true, and the reaper below, which is required to test the holder, can
+    # therefore never reclaim it. That is a place held for the life of the box with
+    # every other writer queued behind it: measured here as 17 writers waiting on one
+    # place whose owning pass had been dead for over an hour.
+    #
+    # Two things follow, and both are needed. The holder exits when the owner is gone
+    # — the liveness signal the reaper could not supply. And it removes its OWN place
+    # on the way out: leaving the file for the reaper means recovery waits out
+    # QA_SLOT_REAP_GRACE (two minutes by default) after every hard kill, so a queue
+    # that is otherwise free keeps standing at a place nobody is using.
+    watch_owner() {
+      while :; do
+        if ! kill -0 "$OWNER" 2>/dev/null; then
+          rm -f "$mine" "${HOLDERDIR}/${mine##*/}" 2>/dev/null || true
+          exit 0
+        fi
+        sleep 5
+      done
+    }
+    if [ -n "$OWNER" ]; then
+      watch_owner </dev/null >/dev/null 2>&1 &
+    else
+      while :; do sleep 30; done </dev/null >/dev/null 2>&1 &
+    fi
     holder=$!
     echo "$holder" > "${HOLDERDIR}/${mine##*/}"
     echo "$holder"                                # stdout: the holder pid for run.sh
+    # Carry the reap output off stdout: run.sh reads this script's stdout with `| tail -n 1`
+    # to get the holder pid, and a "[qa-slot] reclaimed..." line after the pid would be the
+    # last line instead. The message is real information, so it goes to stderr, where the
+    # first (pre-loop) reap already proved it is visible.
     echo "[qa-slot] place taken ($(( count + 1 ))/$MAX)" >&2
     exit 0
   fi

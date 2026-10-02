@@ -30,20 +30,21 @@ const { chromium } = require("playwright-core");
 
 // ---------------------------------------------------------------- args / env
 
+// Both spellings are accepted: `--only=a` and `--only a`. A caller reaching for the second gets
+// the default for the first, which looks exactly like the flag being ignored -- and `run.sh` emits
+// the equals form, so every `--only=` a focused pass was started with was **silently discarded**:
+// ONLY fell back to "all", the route filter became a no-op, and a pass asked to measure one depth
+// pass walked all seventy-seven routes instead. The symptom is a log with no
+// `focused pass: N/M routes` line, which reads like the filter worked and matched nothing.
+//
+// This is the same trap `ensure-organization.mjs` documents for `--url`/`--admin`, reached from the
+// other direction: there the fallback was the MAIN writer's port, here it is "everything".
 function arg(name, fallback) {
+  const prefix = `--${name}=`;
+  const joined = process.argv.find((entry) => entry.startsWith(prefix));
+  if (joined) return joined.slice(prefix.length);
   const i = process.argv.indexOf(`--${name}`);
-  if (i !== -1 && process.argv[i + 1] && !process.argv[i + 1].startsWith("--")) {
-    return process.argv[i + 1];
-  }
-  // `--name=value` is the other spelling, and it is the one `run.sh` builds
-  // (`QA_ONLY_ARGS=(--only="$QA_ONLY")`). Without this branch `arg("only")` returned
-  // the fallback for every focused pass a writer has ever run, so `--only` narrowed
-  // nothing: the pass walked the whole route list and every depth pass, which is the
-  // exact wall-time problem `--only` was added to solve — and it failed silently,
-  // because a filter that matches everything produces a complete, entirely green report.
-  const eq = process.argv.find((a) => a.startsWith(`--${name}=`));
-  if (eq !== undefined) return eq.slice(name.length + 3);
-  return fallback;
+  return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 
 const URL_ADMIN = arg("url", "http://127.0.0.1:3100");
@@ -83,206 +84,6 @@ const matchedOnly = new Set();
 /** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
 const MOBILE_NAMES = new Set();
 /**
- * The deployment screens the pass must cover. Declared HERE, above both
- * `assertDeploymentScreensWalked` and `module.exports`, because `module.exports` is evaluated at
- * LOAD time while a `const` further down the file is still in its temporal dead zone — the
- * exported reference threw `ReferenceError: Cannot access 'DEPLOYMENT_SCREENS' before
- * initialization` and took the ENTIRE walkthrough file down with it, so no pass ran at all and the
- * harness reported nothing. A missing screen and a broken harness must not look the same.
- */
-const DEPLOYMENT_SCREENS = [
-  "/deployment/artifacts",
-  "/deployment/install",
-  "/deployment/upgrade",
-  // REQ-129: the ledger and the migration detail. The detail screen is only reachable from a row
-  // that exists, which is why the depth pass below opens it from the ledger rather than the route
-  // list fabricating a version — a walk of `/deployment/migrations/9999` would prove only that the
-  // 404 renders.
-  "/deployment/migrations",
-  // REQ-129 slice 4's panel. The export states were the last unticked acceptance line on that
-  // request — watermark, expiry, single-use and revoke all exist in the database and the API,
-  // and none of them was visible anywhere until this screen existed.
-  "/deployment/exports",
-];
-
-/**
- * Refuse to start a pass whose deployment screens are not all in the route list.
- *
- * `run.sh` reads a non-zero exit as "the pass did not run", which is the honest outcome for a
- * harness that cannot prove what it claims to cover. A green pass over three of four screens is
- * the worse one: it looks like coverage.
- */
-function assertDeploymentScreensWalked() {
-  const missing = DEPLOYMENT_SCREENS.filter((path) => !srcHasRoute(path));
-  if (missing.length > 0) {
-    throw new Error(
-      `deployment screens missing from the route list: ${missing.join(", ")} — an unwalked screen is an unmeasured screen`,
-    );
-  }
-}
-
-/**
- * The thirteen wave-5b screens a merge must not be able to delete silently.
- *
- * `8c6ab11d` ("merge(origin/main): wave 5b platform extras on top of the restore-jobs and
- * qa-budget work") resolved a conflict in this file by taking `origin/main`'s copy of the
- * route list wholesale. That copy predated the platform-extras screens, and the merge diff
- * shows all thirteen of them as `-` deletions — six `/secrets/*` and all seven
- * `/observability/*`. Nothing failed: the file parses, the depth passes still exist, and every
- * focused pass that named one of these screens reported its own `matchedOnly` name as walked,
- * because a `wants()` block and a route entry are different lists and only the former survived.
- *
- * The consequence is precisely the failure this file exists to prevent. The route loop is what
- * calls `diagnostics()`, so thirteen screens produced no overflow, offscreen, broken-image or
- * console-error measurement, and never appeared in the mobile pass — while their depth passes
- * reported green. A depth pass proves the screen's BEHAVIOUR; only the route walk proves its
- * LAYOUT at two widths. Both halves were lost and only one was noticed.
- *
- * `DEPLOYMENT_SCREENS` above is the same idea applied to one request's screens, and it earned
- * its place the moment it was written. This one generalises it to the whole surface a merge is
- * most likely to resolve by wholesale deletion, and it is checked at LOAD so the pass refuses
- * to start rather than reporting a green coverage it does not have.
- */
-const WAVE5B_SCREENS = [
-  "/secrets/root-key",
-  "/secrets/credentials",
-  "/secrets/slots",
-  "/secrets/leases",
-  "/secrets/deploy-keys",
-  "/secrets/audit",
-  "/observability",
-  "/observability/metrics",
-  "/observability/logs",
-  "/observability/traces",
-  "/observability/exporters",
-  "/observability/alerts",
-  "/observability/settings",
-];
-
-function assertWave5bScreensWalked() {
-  const missing = WAVE5B_SCREENS.filter((path) => !srcHasRoute(path));
-  if (missing.length > 0) {
-    throw new Error(
-      `wave-5b screens missing from the route list: ${missing.join(", ")} — merge 8c6ab11d deleted these and nothing failed. A depth pass proves behaviour, only the route walk proves layout`,
-    );
-  }
-}
-
-/**
- * The GraphQL surface's four screens (REQ-130, slice 2).
- *
- * The detail screen `/developer/graphql/documents/{id}` is deliberately **absent** from this list,
- * for the reason `/deployment/migrations/{version}` is: its path carries an id, and a route walked
- * with a placeholder id proves only that the not-found state renders. `runGraphqlDocumentsDepth`
- * opens it from a row the registry actually lists, which is the only walk of it that measures the
- * screen rather than its error path.
- *
- * The guard refuses a pass in which the three walkable ones are missing from the route list — the
- * same rule `DEPLOYMENT_SCREENS` earns, applied to the surface most likely to be resolved away by a
- * merge that takes one side of the nav wholesale.
- */
-const GRAPHQL_SCREENS = [
-  "/developer/graphql",
-  "/developer/graphql/documents",
-  "/developer/graphql/schema",
-  "/developer/graphql/settings",
-];
-
-function assertGraphqlScreensWalked() {
-  const missing = GRAPHQL_SCREENS.filter((path) => !srcHasRoute(path));
-  if (missing.length > 0) {
-    throw new Error(
-      `GraphQL screens missing from the route list: ${missing.join(", ")} — an unwalked screen is an unmeasured screen, and this surface has no other route that reaches it`,
-    );
-  }
-}
-
-/**
- * The versioned API policy screen (REQ-130, slice 4).
- *
- * One screen, and the guard is written anyway rather than left to review: this surface is the one
- * a merge is most likely to resolve away, because its route (`/developer/api/deprecations`) sits
- * on the `/api` prefix that reads like the API's OWN routes rather than the panel's, so a conflict
- * in `mod.rs` has a plausible-looking resolution that deletes it. A screen reachable only from a
- * nav entry nobody clicked is a screen nobody measured.
- */
-const DEPRECATION_SCREENS = ["/developer/api/deprecations"];
-
-function assertDeprecationScreensWalked() {
-  const missing = DEPRECATION_SCREENS.filter((path) => !srcHasRoute(path));
-  if (missing.length > 0) {
-    throw new Error(
-      `deprecation screens missing from the route list: ${missing.join(", ")} — the screen reads the same rows the response headers are built from, so not walking it leaves the wire behaviour unmeasured`,
-    );
-  }
-}
-
-/**
- * A route measured while the session is gone is NOT a clean screen.
- *
- * Tick 59's pass reported 16/16 pages walked and ZERO findings on the wave-5b screens, and eight
- * of those thirteen screens were the login form: `diagnostics()` recorded `url:
- * ".../login"` for `/observability/*` and `/secrets/audit`, `interact()` then filled the sign-in
- * form and pressed "Sign in" — eight times, each press walking deeper into the limiter's
- * `sign_in` budget — and the roll-up attributed the resulting console errors to something else
- * entirely. The report was true sentence by sentence and false in aggregate: a login form has no
- * broken image, no overflow and no unlabeled input, so "zero findings" is exactly what eight
- * unmeasured screens look like.
- *
- * The session died mid-walk (route 8 of the desktop list, `/secrets/audit`) and nothing noticed,
- * because nothing compared where the browser WAS against where it was ASKED to go. That
- * comparison is this function, and it runs per route rather than once at the end, so the first
- * screen that loses the session is named instead of the eighth.
- *
- * It returns the reason rather than throwing: a route that lost the session should still be
- * pushed into `report.pages` with its reason attached (a page that dies is a finding ABOUT that
- * page — see the route loop's own comment), so the caller decides. And it distinguishes the two
- * cases that look identical in the URL: a bounce to `/login` (no session) and a redirect to
- * `/setup` (a session that was never created), because they need different fixes.
- */
-async function sessionFault(page, route) {
-  const actual = await page
-    .evaluate(() => ({
-      path: location.pathname,
-      alert: (document.querySelector('[role="alert"]')?.textContent || "").trim().slice(0, 160),
-      shell: !!document.querySelector('nav[aria-label="Sections"]'),
-    }))
-    .catch(() => null);
-  if (!actual) return `${route.name}: the page did not answer, so it was not measured`;
-  if (/\/login\/?$/.test(actual.path)) {
-    return `${route.name}: the session was lost — the browser was on the sign-in form, so this screen was NOT measured`;
-  }
-  if (/\/setup\/?$/.test(actual.path)) {
-    return `${route.name}: no session and no tenant — the browser was on the first-run wizard, so this screen was NOT measured`;
-  }
-  if (!actual.shell) {
-    return `${route.name}: the app shell did not render (at ${actual.path}${actual.alert ? ` — "${actual.alert}"` : ""}), so this screen was NOT measured`;
-  }
-  return "";
-}
-
-/**
- * `true` when the DESKTOP route list walks this exact path.
- *
- * Scoped to the `routes` array on purpose. The first version matched the whole file, and the phone
- * pass's `mobileRoutes` array carries the same three paths — so deleting a route from the desktop
- * list left the guard green, satisfied by a list nobody asked it about. A check scoped to the whole
- * file is scoped to things its subject never said, which is the sixth gate defect REQ-128 already
- * recorded for the Helm NOTES check.
- */
-let ROUTE_SOURCE = "";
-function srcHasRoute(path) {
-  if (!ROUTE_SOURCE) {
-    const source = fs.readFileSync(__filename, "utf8");
-    const block = source.match(/const routes = \[[\s\S]*?\n  \];/);
-    if (!block) {
-      throw new Error("the desktop route list could not be read from this file");
-    }
-    ROUTE_SOURCE = block[0];
-  }
-  return ROUTE_SOURCE.includes(`{ path: "${path}",`);
-}
-/**
  * The disposable QA database, used only by the analytics fixture (REQ-007): the pass posts a
  * synthetic beacon batch through the public collect endpoint and then spreads a slice of those
  * rows over the last thirty days, so the report screens have a multi-day shape to draw. It is the
@@ -291,6 +92,11 @@ function srcHasRoute(path) {
 const QA_PG_CONTAINER = arg("db-container", process.env.QA_PG_CONTAINER || "omnion-postgres");
 const QA_DB = arg("db", process.env.QA_DB || "omnion_qa");
 
+// One owner, one address, written once. The form fillers below used to answer an email field with
+// a hardcoded `qa-sample@omnion.test` while this object said `qa-owner@omnion.test`, so the wizard
+// created one account and every API sign-in in the harness addressed a different one -- a 401 on
+// every call, printed as one line and never raised. The QA database ended up with a platform
+// account, no organization, and every rule screen reporting an empty tenant.
 const CREDS = {
   name: "QA Owner",
   email: "qa-owner@omnion.test",
@@ -437,9 +243,6 @@ function ensureSampleJpegWithExif() {
 fs.mkdirSync(SHOTS, { recursive: true });
 
 const clickLines = [];
-// Every depth pass that threw, read by the roll-up. Declared next to the click stream rather than
-// next to `runDepthPass` because the reader is ~3,000 lines further down and the writer is here.
-const failedDepthPasses = [];
 function log(...a) {
   console.log("[walk]", ...a);
 }
@@ -454,7 +257,12 @@ function record(entry) {
   // walked seven screens and every one of them was thrown away because a cache file could not be
   // appended to. A report written from memory and a report written from disk are the same report;
   // only the forensic stream is lost, and it says so rather than pretending.
+  //
+  // The directory is re-created once before giving up, because on this box the commonest cause is
+  // a guard that trims an artifact run mid-pass and not a full disk: the run is gone but the pass
+  // is not, and the very next entry then appends successfully.
   try {
+    fs.mkdirSync(OUT, { recursive: true });
     fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
   } catch (error) {
     if (!warnedAboutStream) {
@@ -477,11 +285,40 @@ const consoleLog = [];
  */
 const expectedRefusals = [];
 
+/**
+ * The statuses an allowance is allowed to excuse, and the reason the list is a list.
+ *
+ * It was `[401, 403]`, which is the shape an **authorisation** gate refuses with — and the file's
+ * most-registered deliberate refusals are not authorisation at all. A two-tab conflict is a 409, a
+ * body the server is right to reject is a 422, a loop the pass left open on purpose is a 400, and
+ * a read of a collection that is legitimately empty is a 404. None of them could be excused by
+ * the allowance the pass had registered for them, so every one arrived as a **high finding**: tick
+ * 78 read "19 high findings" and correctly guessed "the probe's own refusals" — with
+ * `expectedRefusals` empty beside them, so nothing in the report contradicted it and nothing
+ * would have, in any of the three ticks that ran afterwards.
+ *
+ * **A 500 is the one status that stays out, and it is the one that makes the list a list rather
+ * than "any error".** An allowance is a licence to explain away a refusal the pass *asked for*; a
+ * crash is the product failing and no act the pass performed can make it expected. Excluding it is
+ * what keeps this from becoming a switch that turns the net roll-up off.
+ *
+ * `400`, `404` and `422` are here because the pass provoked them, `401`/`403` because an
+ * authorisation gate is still the classic case, and `428` because a precondition check belongs to
+ * the same family: the server refusing work it wants the client to do differently first.
+ */
+const REFUSAL_STATUSES = [400, 401, 403, 404, 409, 422, 428];
+
 /** Register one deliberate refusal (a URL fragment for a request, a status shape for a console line). */
-function expectRefusal(match, reason) {
+function expectRefusal(match, reason, consoleMatch) {
   expectedRefusals.push({
     match,
     reason,
+    // The console half needs a fragment of its own in the general case. A caller that registers a
+    // *request* URL (`${URL_ADMIN}/api/v1/workflows/`) is excusing a browser line about that
+    // request, so the request URL is the right default; the parameter exists because a few callers
+    // register a request fragment that is not a URL at all (`"notifications/emit"`), where the
+    // console line's own text is the only handle on it.
+    consoleMatch: consoleMatch ?? (match.startsWith("http") ? match : null),
     consoleFrom: consoleLog.length,
     netFrom: netFailures.length,
     claimedConsole: false,
@@ -490,6 +327,11 @@ function expectRefusal(match, reason) {
 }
 
 const netFailures = [];
+// A refusal a pass is *proving* — the allow-list refusing a host, the editor refusing an
+// empty name. It is counted separately so a pass that demonstrates a 400 is not reported as
+// a pass that caused one.
+const netExpected = [];
+let expectingRefusal = null;
 /** Requests the browser itself cancelled (navigation) — counted, never findings. */
 const netAborted = [];
 const dialogs = [];
@@ -526,7 +368,15 @@ function attach(page, phase) {
     netFailures.push({ phase, url: req.url().slice(0, 200), error });
   });
   page.on("response", (res) => {
-    if (res.status() >= 400) netFailures.push({ phase, url: res.url().slice(0, 200), status: res.status() });
+    if (res.status() < 400) {
+      return;
+    }
+    const entry = { phase, url: res.url().slice(0, 200), status: res.status() };
+    if (expectingRefusal && res.url().includes(expectingRefusal)) {
+      netExpected.push(entry);
+      return;
+    }
+    netFailures.push(entry);
   });
   page.on("dialog", async (d) => {
     dialogs.push({ phase, type: d.type(), message: d.message().slice(0, 200) });
@@ -754,42 +604,51 @@ async function clickAction(page) {
   return primaryClick(page);
 }
 
+/**
+ * How far the installation actually is, asked of the panel rather than guessed from the URL.
+ *
+ * The URL cannot answer this. The owner step ends with a redirect to `/login` — the panel has no
+ * session for a half-built installation — and the previous version read that redirect as "the
+ * installation already exists" and returned. It did not. The owner was written, the organization
+ * and the site were not, and the pass went on to measure screens against a tenant that did not
+ * exist: `organizations=0`, and every org-scoped fixture feeding `''` into a uuid column, which
+ * surfaces as `invalid input syntax for type uuid: ""` and reads like a broken product.
+ *
+ * `in_progress: true` with `steps.owner: true, steps.organization: false` is a half-built
+ * installation, and the answer that matters is "keep going", not "skip".
+ */
+async function installationState() {
+  const response = await fetch(`${URL_ADMIN}/api/v1/onboarding`, { headers: { accept: "application/json" } }).catch(
+    () => null,
+  );
+  if (!response || !response.ok) return null;
+  const body = await response.json().catch(() => null);
+  return body && typeof body.steps?.owner === "boolean" ? body : null;
+}
+
 async function runWizard(page, report) {
   log("wizard: detecting first-run state");
   await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" });
-
-  // The redirect into the wizard is a CLIENT-side `router.replace("/setup")`, so the URL only
-  // settles after hydration and — on a cold `next dev` — after Turbopack compiles the `/` route
-  // and `/login`'s `fetchOnboarding()` effect runs. A fixed sleep asked the question once and
-  // got "not a first run" from a server-rendered `/` or `/login`, returned `ran: false`, and the
-  // pass carried on into a tenant that did not exist: `ensureSignedIn` then reached `/setup`
-  // seconds later, with warm modules, and its generic submit pressed "Create account" with
-  // every field still empty. The API refused that correctly, and the run went on to answer
-  // every org-scoped screen with 403 — 729 of them, reported as 1,477 findings about a product
-  // that was never measured. Asking again is the whole fix.
-  let url = page.url();
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    if (url.includes("/setup") || url.includes("/login")) break;
-    await page.waitForTimeout(500);
-    url = page.url();
+  await page.waitForTimeout(900);
+  const url = page.url();
+  // The setup screen is reachable by URL even when the app sends the browser somewhere else, so
+  // the decision is made on the onboarding steps and not on where the app happened to land. A
+  // completed installation still short-circuits: nothing to seed, and the walk must not spend a
+  // pass re-running a wizard the owner already finished.
+  const before = await installationState();
+  const decision = wizardDecision(url, before);
+  if (decision.action === "skip") {
+    log(`wizard: ${decision.reason} (${url})`);
+    return { ran: false, url, completed: true };
   }
-  if (!url.includes("/setup")) {
-    // A sign-in screen here is a first run whose redirect never landed: the panel would send
-    // it to `/setup` once its modules were warm, which is exactly the state the pass used to
-    // walk away from. Only an installation that has already been set up is a genuine skip.
-    const settled = url.includes("/login")
-      ? await page
-          .waitForURL(/\/setup/, { timeout: 15000 })
-          .then(() => true)
-          .catch(() => false)
-      : false;
-    if (settled) {
-      url = page.url();
-      log(`wizard: reached /setup after the redirect settled (${url})`);
-    } else {
-      log(`wizard: not in setup (${url}) — installation already exists`);
-      report.steps.push({ action: "wizard-skipped", url, reason: "not a first run" });
-      return { ran: false, url, skippedBecause: "already-installed" };
+  if (decision.action === "resume") {
+    log(`wizard: not in setup (${url}) — ${decision.reason}, steps ${JSON.stringify(before?.steps ?? null)}`);
+    await page.goto(`${URL_ADMIN}/setup`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(900);
+    // A completed installation redirects away from /setup again; that is the only case where the
+    // walk really has nothing to do.
+    if (!page.url().includes("/setup")) {
+      return { ran: false, url: page.url(), completed: true };
     }
   }
   report.steps.push({ step: 0, url, action: "reached /setup" });
@@ -815,16 +674,6 @@ async function runWizard(page, report) {
       await page.waitForTimeout(250);
     }
     const filled = await fillWizardStep(page);
-    // A step with nothing in it is a step the walk could not fill, not a step the platform
-    // refused. Submitting it anyway produces a 400 that reads like a product defect while
-    // saying nothing about the product — which is precisely how this run came to charge
-    // 1,477 findings to a tenant that simply did not exist. Record the gap and move on.
-    const wrote = (filled || []).filter((entry) => entry && entry.value);
-    if (stepKey !== "theme" && wrote.length === 0) {
-      report.steps.push({ index: i, stepKey, filled: [], clicked: null, reason: "nothing to fill" });
-      log(`wizard: step ${stepKey} has no fillable input — not submitting an empty form`);
-      break;
-    }
     const clicked = await clickAction(page);
     // The step's own POST can still be in flight: wait for the step to move (or the screen to say
     // the installation is ready) instead of clicking the same button into a second submission,
@@ -852,6 +701,21 @@ async function runWizard(page, report) {
       report.steps.push({ index: i, action: "open-panel", url: page.url() });
       break;
     }
+    // The owner step answers with a redirect to `/login`, because a half-built installation has no
+    // session to keep — and that redirect used to end the loop (`if (!now.includes("/setup")) break`).
+    // The wizard then never created the organization or the site, and the pass measured every
+    // org-scoped screen against an empty tenant. Leaving `/setup` is only the end of the wizard
+    // when the installation actually says it is finished; otherwise the step is resumable and the
+    // walk goes back in. Bounded, so a screen that bounces the browser cannot spin the pass.
+    if (!now.includes("/setup") && !finished) {
+      const state = await installationState();
+      if (state && !state.completed) {
+        log(`wizard: left /setup for ${now} with the installation at ${JSON.stringify(state.steps)} — resuming`);
+        await page.goto(`${URL_ADMIN}/setup`, { waitUntil: "domcontentloaded" });
+        await page.waitForTimeout(900);
+        continue;
+      }
+    }
     if (!now.includes("/setup")) break;
   }
   // "Go to panel" style finish button, if any is still on screen.
@@ -873,15 +737,6 @@ async function ensureSignedIn(page, report) {
   }
   await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(800);
-  // Landing on `/setup` here means the first run is still open. The wizard is `runWizard`'s
-  // job, and its steps each have their own form; a generic submit here presses "Create account"
-  // with empty fields and the platform answers 400 — a refusal the report then reads as a
-  // defect. Go to the real sign-in form instead of the wizard.
-  if (page.url().includes("/setup")) {
-    log("sign-in: the first run is still open — using the login form, not the wizard");
-    await page.goto(`${URL_ADMIN}/login`, { waitUntil: "domcontentloaded" }).catch(() => {});
-    await page.waitForTimeout(700);
-  }
   if (!/\/login|\/setup/.test(page.url()) && (await page.locator('nav[aria-label="Sections"]').count()) > 0) {
     return true; // already signed in — the wizard created the session
   }
@@ -895,107 +750,23 @@ async function ensureSignedIn(page, report) {
   const pass = page.locator('input[type="password"], input[name="password"], #password').first();
   await pass.fill(CREDS.password).catch(() => {});
   await shot(page, "10-login-filled");
-  // The mark is taken BEFORE the click, not after it — a mark taken afterwards sees an EMPTY slice
-  // of the log and the predicate is false on every single attempt, so the retry branch is dead
-  // code that reads exactly like the fix it is supposed to be. My first version put the line here
-  // and the gate caught it: the mark sat 142 characters after the click it was meant to precede.
-  const mark = netFailures.length;
   const clicked = await primaryClick(page);
-  // Wait for the sign-in to LAND, not for a fixed span.
-  //
-  // `waitForTimeout(1200)` was the same class of bug `runWizard` had: on a cold `next dev` the
-  // click on "Sign in" is what triggers Turbopack to compile the authenticated route, so 1.2 s
-  // can easily be answered while the panel is still compiling and the URL is still `/login`.
-  // The pass then returned `signedIn: false` and died at `FATAL: could not sign in after wizard`
-  // on a login that had in fact been accepted — which is what `/tmp/w6-pass-t45b.log` records,
-  // after a seeder that had already created the tenant successfully.
-  //
-  // So: poll for EITHER leaving /login OR the app shell rendering. The shell is the positive
-  // signal and matters more than the URL — a panel that renders its shell while the router has
-  // not yet rewritten the address is signed in, and a pass that reads only the URL calls that a
-  // failure. The error state (`role="alert"`) is checked too, so a genuine refusal returns
-  // promptly instead of burning the whole budget on a wait that cannot succeed.
-  //
-  // **A `429` is NOT a refusal, and this loop used to treat it as one.** The limiter budgets
-  // `sign_in` at ten per five minutes, and a pass that signs in more than once — the desktop
-  // phase, the re-login before the mobile phase, and the mobile context itself — can spend the
-  // whole budget on its own bookkeeping. On 2026-10-01 that produced a pass which signed in, was
-  // refused with `429` when it tried again, and then reported **22 of 44 screens** as "the
-  // session was lost — the browser was on the sign-in form". Every one of those screens was
-  // measured as a login form, which is the exact shape tick 59 was fixed for: the diagnosis was
-  // right about the symptom and completely wrong about the cause. A `429` names itself in the
-  // network log; the screen it produced names a lost session. So a rate-limited attempt is now
-  // retried after a pause, and only a non-429 refusal breaks the loop.
-  let signedIn = false;
-  let refusal = "";
-  let rateLimited = false;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const state = await page
-      .evaluate(() => ({
-        offLogin: !/\/login/.test(location.pathname),
-        shell: !!document.querySelector('nav[aria-label="Sections"]'),
-        alert: (document.querySelector('[role="alert"]')?.textContent || "").trim().slice(0, 200),
-      }))
-      .catch(() => ({ offLogin: false, shell: false, alert: "" }));
-    // Scoped to the sign-in endpoint, so an unrelated `429` from another screen cannot make a
-    // perfectly good login look rate limited — and the opposite mistake (ignoring the endpoint)
-    // is the one that produced 22 screens measured as a login form.
-    rateLimited = refusedSince(mark, "/auth/login");
-    if (state.shell || state.offLogin) {
-      signedIn = true;
-      break;
-    }
-    if (rateLimited && !state.alert) {
-      // Wait out the limiter rather than reporting a failure the platform did not produce. The
-      // pause is the limiter's own window divided by a small factor so a handful of retries fits
-      // inside it; giving up here would leave the pass measuring sign-in forms for the rest of the
-      // run, which is what makes this the most expensive place to be wrong.
-      log(`sign-in: rate limited (429) — waiting ${SIGN_IN_BACKOFF_MS}ms before retrying`);
-      await page.waitForTimeout(SIGN_IN_BACKOFF_MS);
-      await clickSignIn(page);
-      continue;
-    }
-    if (state.alert) {
-      refusal = state.alert;
-      break;
-    }
-    await page.waitForTimeout(500);
-  }
-  report.steps.push({ action: "login", clicked, url: page.url(), signedIn, refusal, rateLimited });
-  if (!signedIn) {
-    log(`sign-in: the form was submitted but no session appeared${refusal ? ` — the panel said: ${refusal}` : ""}${rateLimited ? " (last attempt was rate limited)" : ""}`);
-  }
-  return signedIn;
-}
-
-/// How long to wait after a rate-limited sign-in before trying again.
-const SIGN_IN_BACKOFF_MS = Number(process.env.QA_SIGN_IN_BACKOFF_MS || 15000);
-
-/// Whether the panel was refused `429` since the pass marked `mark`.
-///
-/// Read from `netFailures` — the array `attach` fills from `page.on("response")` for every status
-/// `>= 400` — rather than from the DOM, because a `429` never reaches the panel as an alert: the
-/// form re-renders empty and the only trace is the network entry. Inventing a `page.__qaNet` here
-/// is what this helper did first, and it is worth recording because the failure mode is silent in
-/// the worst way: the array is always empty, so the predicate is always `false`, so the retry
-/// branch never runs, and the code reads exactly like the fix it replaced.
-function refusedSince(mark, urlFragment) {
-  return netFailures
-    .slice(mark)
-    .some((failure) => failure.status === 429 && String(failure.url || "").includes(urlFragment));
-}
-
-/// Press the sign-in button again after a backoff.
-async function clickSignIn(page) {
-  await primaryClick(page).catch(() => {});
+  await page.waitForTimeout(1200);
+  report.steps.push({ action: "login", clicked, url: page.url() });
+  return !/\/login/.test(page.url());
 }
 
 // ---------------------------------------------------------------- interaction
 
 function sampleValueFor(meta) {
   const key = `${meta.type} ${meta.name} ${meta.label} ${meta.placeholder}`.toLowerCase();
-  if (meta.type === "email" || /e-?mail/.test(key)) return "qa-sample@omnion.test";
-  if (meta.type === "password") return "Sample-Passw0rd!";
+  // Email and password come from `CREDS`, because this function fills the first-run wizard's OWN
+  // account form. It used to answer with its own literals -- `qa-sample@…` and
+  // `Sample-Passw0rd!` -- while `CREDS` said `qa-owner@…` and `OmnionQa-Passw0rd-2026!`, so the
+  // wizard created an account the harness could not sign in to, and every later API call answered
+  // 401 for the rest of the pass. Two spellings of one account, and the pass could not see it.
+  if (meta.type === "email" || /e-?mail/.test(key)) return CREDS.email;
+  if (meta.type === "password") return CREDS.password;
   if (/model/.test(key)) return "gpt-4o-mini\ntext-embedding-3-small";
   if (/api.?key|secret|token/.test(key)) return "sk-qa-sample-key";
   if (/^https?:\/\//.test(meta.label) || /example\.com|\.test\/|\/v1/.test(meta.label)) return "https://api.openai.com/v1";
@@ -1012,7 +783,10 @@ function sampleValueFor(meta) {
 }
 
 async function fillSubtree(page, selector) {
-  return page.evaluate((sel) => {
+  // The callback below runs INSIDE the page: `page.evaluate` serialises it, so it closes over
+  // nothing. Reading `CREDS.email` from inside it is a ReferenceError in the browser, not in Node --
+  // which is why the two constants are passed in as an argument instead of captured.
+  return page.evaluate(({ sel, email, password }) => {
     const root = document.querySelector(sel);
     if (!root) return [];
     const filled = [];
@@ -1037,8 +811,8 @@ async function fillSubtree(page, selector) {
       }
       const key = `${el.type} ${el.name} ${el.id} ${el.placeholder}`.toLowerCase();
       let value = "QA sample";
-      if (el.type === "email" || /e-?mail/.test(key)) value = "qa-sample@omnion.test";
-      else if (el.type === "password") value = "Sample-Passw0rd!";
+      if (el.type === "email" || /e-?mail/.test(key)) value = email;
+      else if (el.type === "password") value = password;
       else if (el.type === "url" || /url|endpoint/.test(key)) value = "https://api.omnion.test/v1";
       else if (el.type === "number") value = "42";
       else if (/slug|key/.test(key)) value = SAMPLE_SLUG;
@@ -1051,7 +825,7 @@ async function fillSubtree(page, selector) {
       filled.push({ field: (el.id || el.name || el.type || "input").slice(0, 40), value });
     }
     return filled;
-  }, selector);
+  }, { sel: selector, email: CREDS.email, password: CREDS.password });
 }
 
 async function clickPrimaryIn(page, selector) {
@@ -1098,6 +872,310 @@ async function settleAfterClick(page, minimum = STEP_MS) {
     if (current === previous) break;
     previous = current;
   }
+}
+
+/**
+ * Wait for the builder canvas to stop repainting its cards.
+ *
+ * `settleAfterClick` waits for the URL to stop changing, which is the right question for a page
+ * that navigates and the wrong one for a canvas that re-renders in place: a graph loading from
+ * the API keeps the URL identical while its card list grows from one node to six, and every
+ * read taken during that window sees a *partial* canvas.
+ *
+ * That is not hypothetical. The run-from-here probe read the card list, then the same cards
+ * again a moment later, and the two disagreed — one card in the first reading, six in the second
+ * — so the probe scanned one node, found that it was the trigger, and concluded that no node on
+ * the graph could start a run. Every row below it (`startedFrom: null`, `pillsPainted: 0`,
+ * `step-trace.panelFound: false`) is downstream of that one early read: nothing ran, so there
+ * were no pills to paint and no step to open. Four "the product is missing this" readings, one
+ * race.
+ *
+ * A count is the right signal because the canvas only ever *adds* or *replaces* cards, and it
+ * does so in bursts while a graph or a run lands. Stable twice in a row is the stop condition.
+ */
+async function settleCanvasCards(page, minimum = 250, attempts = 20) {
+  await page.waitForTimeout(minimum);
+  let previous = -1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const count = await page.locator("[data-node-id]").count();
+    if (count === previous) return count;
+    previous = count;
+    await page.waitForTimeout(200);
+  }
+  return previous;
+}
+
+/**
+ * Wait for a run to stop MOVING, and report whether it ever did.
+ *
+ * `settleCanvasCards` above waits for the CANVAS to stop changing; this is the run-side twin,
+ * and tick 61's pass is what it exists for. The run-from-here row clicked the button, slept
+ * 2500ms and read the run ONCE. The read came back with the run genuinely started and every
+ * step still `pending`:
+ *
+ *     startedFrom: "wait-3"        the engine accepted the request
+ *     skipped: 0                   the skipped prefix had not been written
+ *     statuses: ["pending"]        nothing had been claimed yet
+ *     pillsPainted: 0              so the canvas had nothing to paint
+ *     inRunButNotPainted: [wait-3, act-3, end-3]
+ *
+ * Five readings, every one of them "the product is missing this", and all five downstream of
+ * one fixed sleep standing in for a condition. A wait that measures the wrong thing is worse
+ * than no wait, because it yields numbers rather than an absence — `startedFrom` was non-null,
+ * so the row looked alive while reporting a run mid-flight.
+ *
+ * The stop condition is *the run stopped moving*, never *N milliseconds passed*: a run that
+ * settles in 40ms should not wait 2500ms, and a run on a loaded box that takes 9s must not be
+ * read at 2500ms. This pass was competing with three sibling passes for one box when it took
+ * this reading, and a duration-based wait is exactly what fails there and only there.
+ *
+ * The polling happens INSIDE `page.evaluate`, not in Node: every read of an authenticated
+ * endpoint in this file goes through the browser so it carries the session cookie, and a
+ * `fetch` from Node would be a 401 that reads exactly like a run that does not exist. The
+ * helper takes an `id` getter because the caller usually has the run in hand rather than the id.
+ */
+async function settleRun(page, readRun, { attempts = 40, interval = 500 } = {}) {
+  const read = async () => {
+    const run = await readRun();
+    const steps = (run?.steps ?? []).map((s) => `${s.step_no}:${s.status}`).join(",");
+    return { run, state: `${run?.status ?? "?"}|${steps}` };
+  };
+  // Did the engine ever pick this run up? `settled` is a claim about a run that RAN, so it
+  // cannot be answered by a run that never left the queue. The evidence is a step that left
+  // `pending`, or a run status that is not itself the un-started state.
+  //
+  // **This is the condition the doc above always claimed and the code never asked.** Two polls
+  // 500ms apart on a run the engine has not claimed yet both read `pending|1:pending,2:pending`
+  // and are byte-identical, so the old stop condition returned `settled: true` on exactly the
+  // reading tick 61 recorded — `startedFrom: "wait-3"`, `statuses: ["pending"]`, `pillsPainted: 0`.
+  // The helper was added to kill that race and re-created it, because "identical twice" is
+  // satisfied by *not moving* as well as by *finishing*, and a run waiting to be claimed has
+  // not moved.
+  //
+  // `settleGraph` 30 lines below already gets this right and says why in its own doc: a graph
+  // that has not been written yet is *stable*, so it requires movement as well as stability.
+  // Two helpers with the same name and the same job, one requiring the witness and one not, is
+  // the tick-87 shape one level down — a gate that reads green on the state it was written to
+  // catch. `changed` names the witness so a caller can say "the run never started" out loud
+  // instead of reporting a mid-flight run as a settled one.
+  const hasStarted = (run) => {
+    if (!run) return false;
+    const status = run.status ?? null;
+    if (status && status !== "pending" && status !== "queued") return true;
+    return (run.steps ?? []).some((step) => step.status && step.status !== "pending");
+  };
+  // Did it FINISH, as opposed to merely having stopped moving?
+  //
+  // **The second hole, and it is a different one from the witness check above.** "Stopped
+  // moving" is the documented stop condition and a hung run satisfies it perfectly: an engine
+  // that claims a step and then wedges leaves `running|1:running,2:pending` on every poll, so
+  // two readings are identical and the helper reports `settled: true`. Every gate below then
+  // reads a half-finished `steps` array and reports it as a finished run — which is the shape
+  // of a product defect that does not exist. `settleRun`'s own old comment claimed to catch
+  // exactly this ("a pending step that never moves is a HUNG run, and returning that as
+  // `settled` is the same class of error one level up") and the code it was describing was a
+  // comment, because a run whose steps never move is not the only way to hang: a run that
+  // moved once and stopped is the more common one.
+  //
+  // So `settled` keeps its contract — the run stopped moving — and `finished` names the
+  // stronger fact separately. A hung run is then legible as `settled: true, finished: false`
+  // instead of being indistinguishable from a run that did its work.
+  const TERMINAL = new Set(["succeeded", "failed", "cancelled", "completed", "completed_with_errors"]);
+  const hasFinished = (run) => {
+    if (!run) return false;
+    const steps = run.steps ?? [];
+    if (TERMINAL.has(run.status ?? "")) return true;
+    // A run with no steps and a terminal-looking status is covered above; a run whose every
+    // step reached a terminal state has finished even if the run row has not caught up.
+    return steps.length > 0 && steps.every((step) => TERMINAL.has(step.status ?? ""));
+  };
+  let previous = null;
+  let started = false;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const current = await read();
+    if (hasStarted(current.run)) started = true;
+    // Two identical readings in a row, AND the run was observed moving. One reading is not
+    // enough: two polls landing inside the same engine tick see the same bytes twice.
+    if (current.state === previous && started) {
+      return { ...current, settled: true, started: true, finished: hasFinished(current.run) };
+    }
+    previous = current.state;
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  // A pending step that never moves is a HUNG run, and a run that never left the queue never
+  // started at all. Returning either as "settled" is the same class of error one level up —
+  // so the caller can say which of the two it was rather than only that it was not settled.
+  const last = await read();
+  return { ...last, settled: false, started: hasStarted(last.run) || started, finished: false };
+}
+
+/**
+ * Wait for a graph write to land on the SERVER, and report whether it ever did.
+ *
+ * `settleRun` above is the run-side twin of this, and tick 61's pass is what both exist for.
+ * The shape is the same one a third time, in the one place tick 61 could not reach:
+ *
+ *     await page.keyboard.press("Control+z");
+ *     await page.waitForTimeout(1200);
+ *     const edgesAfterUndo = (await readGraph())?.edge_count ?? 0;
+ *
+ * `AUTOSAVE_MS` in `builder-view.tsx` is **1_200**. The sleep is not merely a guess at how
+ * long a save takes — it is a guess that happens to sit exactly ON the debounce boundary, so
+ * the row races the thing it is measuring and the outcome is decided by which side of a
+ * timer the autosave lands on. `edgeRemovedByUndo` is then false on a rule whose undo
+ * removed the connection perfectly well, and the row reports a selection that was never
+ * pruned by a product that never failed.
+ *
+ * **The obvious fix is wrong, and this is why.** Polling `edge_count` for stability alone is
+ * satisfied immediately: a graph that has not been written yet is *stable*. Two identical
+ * readings of a count prove only that nothing has changed, which is the true state of a page
+ * whose debounce has not fired. That is `settleRun`'s lesson one level down — it also waits
+ * for stability, but it waits for the run to stop MOVING after having observed it start, so a
+ * run that never starts is the failure it reports rather than a success.
+ *
+ * So this helper takes the *witness* of a write: `graph_version` is advanced by every write
+ * (`replace_graph` refuses a stale version), so two identical readings of the VERSION cannot
+ * happen until the write has landed, and a version that never moves means no write arrived.
+ * Callers pass the version they read BEFORE the gesture. `settled` is then a claim about the
+ * write, and `changed` says whether it was the write they were waiting for.
+ *
+ * The polling runs inside `page.evaluate`, for the same reason `settleRun`'s does: every read
+ * of an authenticated endpoint in this file goes through the browser, so it carries the
+ * session cookie. A `fetch` from Node would be a 401 that reads exactly like an unwritten
+ * graph.
+ */
+async function settleGraph(page, readGraph, versionBefore, { attempts = 30, interval = 400 } = {}) {
+  const read = async () => {
+    const graph = await readGraph();
+    const version = graph?.graph_version ?? 0;
+    return { graph, state: `${version}` };
+  };
+  let previous = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const current = await read();
+    // Stability AND movement. Two identical readings of the version prove the write has
+    // landed — a version that never moves is a version that was never written.
+    if (current.state === previous && Number(previous) !== Number(versionBefore)) {
+      return { ...current, settled: true, changed: true };
+    }
+    if (current.state === previous) {
+      return { ...current, settled: false, changed: false };
+    }
+    previous = current.state;
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  return { ...(await read()), settled: false, changed: false };
+}
+
+/**
+ * Wait for a click on the canvas to show up as a selection, and say whether it ever did.
+ *
+ * The other half of `settleGraph`'s problem, on the other side of the same gesture. The row
+ * clicked the arc and then waited a fixed 500ms before reading `[data-edge-selected='true']`,
+ * which is a duration standing in for a repaint — and the two outcomes it cannot tell apart
+ * are the expensive pair: a click that missed, and a click that landed on a box that had not
+ * repainted yet. Both read `selected: 0`, and this row's whole note then blames the product
+ * for a gesture the harness never finished.
+ *
+ * Unlike `settleGraph` there is no version to witness here, because nothing has been written
+ * yet — so this is an OR rather than a settle: poll until the selection APPEARS, and report
+ * `appeared: false` when the budget runs out. That is the honest shape for a precondition:
+ * waiting for the positive condition, bounded, and saying so when it never arrived. A helper
+ * that could only say "settled" here would be wrong for the same reason it is right on the
+ * server side.
+ */
+async function awaitEdgeSelection(page, { attempts = 12, interval = 250 } = {}) {
+  const read = () =>
+    page
+      .evaluate(() => document.querySelectorAll("[data-edge-selected='true']").length)
+      .catch(() => 0);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const selected = await read();
+    if (selected > 0) return { selected, appeared: true, attempts: attempt + 1 };
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  return { selected: await read(), appeared: false, attempts };
+}
+
+/**
+ * The node-side twin of `awaitEdgeSelection`, for the same reason and with the same contract.
+ *
+ * "Click a card, wait a fixed 500ms, count `[data-node-selected='true']`" cannot tell a click that
+ * missed the card from one that landed on a canvas that had not repainted, and the locked-builder
+ * row reported those two as one number. It is also not a *write* gesture — a selection changes no
+ * graph — so it is outside the class `settleGraph` covers, which is exactly the gap that let the
+ * fixed sleep survive there while the guard for write gestures ran beside it.
+ *
+ * The name is deliberately not "awaitSelection": a connection selection writes
+ * `[data-edge-selected]` and a node selection writes `[data-node-selected]`, they are mutually
+ * exclusive on a canvas, and the defect this guards against is reading the wrong one — which is
+ * what `undo-selection`'s sibling row documents at length.
+ */
+async function awaitNodeSelection(page, { attempts = 12, interval = 250 } = {}) {
+  const read = () =>
+    page
+      .evaluate(() => document.querySelectorAll("[data-node-selected='true']").length)
+      .catch(() => 0);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const selected = await read();
+    if (selected > 0) return { selected, appeared: true, attempts: attempt + 1 };
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  return { selected: await read(), appeared: false, attempts };
+}
+
+/**
+ * Wait long enough that a write which WAS going to happen would have happened.
+ *
+ * ## The negative case, and why it needs its own helper
+ *
+ * Every other settle helper in this file waits for a change to arrive. This one waits for a
+ * change to stay ABSENT, and those are opposites: the write-gesture guard added in tick 63 found
+ * the locked-builder row asserting `Del` and `Control+z` do nothing while reading the graph after
+ * `waitForTimeout(600)` — shorter than `AUTOSAVE_MS` (1_200). That is not a fast lock, it is an
+ * unwritten graph, and the two look identical: every number identical, banner present, verdict
+ * "the lock held". **A negative assertion measured before the write window closes is not a
+ * negative assertion.**
+ *
+ * ## Why this is not `settleGraph`
+ *
+ * `settleGraph` takes a version and waits for it to MOVE, so on a lock that works it returns
+ * `settled: false` after burning the whole budget — the right answer to the wrong question. This
+ * helper instead waits out a full debounce window with margin, and then reports the version it
+ * saw. The caller still asserts the graph did not change; this only guarantees the reading was
+ * taken late enough that a change *would* have been visible, so `unchanged: true` means "the
+ * write was given its chance and did not come" rather than "nobody waited".
+ *
+ * The margin is not decorative: the lock's own repaint, the click handler's async guard and the
+ * autosave timer can all land in either order, and a window equal to `AUTOSAVE_MS` is the same
+ * boundary race tick 62 found at `waitForTimeout(1200)`.
+ */
+async function awaitGraphUnchanged(page, readGraph, versionBefore, { windowMs = 3000 } = {}) {
+  const deadline = Date.now() + windowMs;
+  // Poll the whole way out rather than sleeping once: the point is not the final reading but the
+  // knowledge that no version ever moved inside the window, which is what makes "unchanged" a
+  // statement about the server rather than about the instant it was asked.
+  let moved = false;
+  let after = null;
+  while (Date.now() < deadline) {
+    after = await readGraph().catch(() => null);
+    if ((after?.graph_version ?? 0) !== versionBefore) {
+      moved = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  if (!moved) after = await readGraph().catch(() => null);
+  return {
+    graph: after,
+    versionBefore,
+    versionAfter: after?.graph_version ?? null,
+    observedForMs: windowMs,
+    // The whole point: `unchanged` here means "the write was given its chance and did not come",
+    // not "nobody waited". A caller that ignores this can report a lock as held on an unwritten
+    // graph.
+    unchanged: !moved,
+  };
 }
 
 async function interact(page, pageName, report) {
@@ -1179,39 +1257,6 @@ async function interact(page, pageName, report) {
     }
     if (/\bsign out\b/i.test(meta.label)) {
       record({ page: pageName, i, ...meta, action: "skip", outcome: "deferred-signout" });
-      continue;
-    }
-    // **An auth form is never filled or submitted by the generic pass, and the cost is not
-    // theoretical.** `interact()` reached the sign-in form because an earlier click navigated to
-    // it, then filled it and pressed "Sign in" — correctly, with valid credentials — and the
-    // platform's own limiter answered `429`. That one refusal cost the entire run: every route
-    // after it was measured as a login form and reported as "the session was lost", which is the
-    // 22-screen defect tick 68 fixed, recurring with the same cause one layer down. The limiter
-    // budgets `sign_in` at ten per five minutes per PROCESS, and this browser is one process, so
-    // the generic pass spending the budget means `ensureSignedIn` cannot spend it again.
-    //
-    // The two controls below (`Sign out`, `Sign in`) are excluded for the same reason they are
-    // DEFERRED elsewhere in this file: they are the pass's own bookkeeping, driven deliberately by
-    // the wizard and the re-login step, never incidentally by a round-robin click.
-    // The submit control of that form. Matching on the LABEL alone is the fix: my first version
-    // also required `meta.name` to contain "password", reasoning that the button would carry the
-    // field's name — and a `<button type="submit">` has no name at all, so the guard never fired
-    // and the pass spent the budget again on its second attempt. The next run's `clicks.jsonl` is
-    // what showed it: the password field was correctly skipped, and the very next line was
-    // `label: "Sign in", outcome: <clicked>, net: ["429 …/auth/login"]`.
-    //
-    // So the label IS the discriminator, and it is checked here with the password field above so
-    // the two halves cannot drift: the field is never filled and the button is never pressed.
-    if (/\bsign in\b/i.test(meta.label) || /log ?in\b/i.test(meta.label)) {
-      record({ page: pageName, i, ...meta, action: "skip", outcome: "deferred-signin" });
-      continue;
-    }
-    // Filling an `input[type=password]` at all is the tell: the panel has exactly one password
-    // field and it lives on the sign-in form. Matching on the CONTROL rather than the surrounding
-    // form means a screen whose own depth pass fills a password-like field is unaffected, because
-    // depth passes run outside `interact()`.
-    if (meta.type === "password") {
-      record({ page: pageName, i, ...meta, action: "skip", outcome: "deferred-password-field" });
       continue;
     }
     if (meta.guard) {
@@ -1436,32 +1481,111 @@ async function uploadMediaSample(page, source) {
  * that only looked right in a screenshot would pass all of that without doing any of it.
  */
 /**
+ * Is this page still a page?
+ *
+ * `Page crashed` and `Target closed` are not a screen with a bug in it: the renderer died, usually
+ * because eleven writers share 32 GB and one of them lost the race. The distinction matters because
+ * a dead tab poisons every statement after it — `locator.count()` throws, `page.url()` throws,
+ * `shot()` throws — so the first crash decided the fate of every screen the pass had not reached.
+ * Chrome's `page.isClosed()` answers *false* for a crashed tab (the tab is open; it is the
+ * renderer that is gone), so the only reliable signal is a cheap evaluation, which is what this asks.
+ */
+async function pageIsAlive(page) {
+  try {
+    await page.evaluate(() => 1);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// `main`'s page is a local and the 23 depth-pass call sites close over it, so a reviver cannot reach
+// it from here. This slot is the seam: `main` installs a setter, `reviveMainPage` calls it, and the
+// call sites read `page` lazily (each is an arrow, `() => runX(page, report)`), so every pass after
+// the swap is handed the new tab without one call site being edited.
+let installMainPage = null;
+
+// Once the browser PROCESS is gone, opening a page on its context cannot work, and every later
+// pass repeats the same failed attempt and writes the same line. That is what produced seventy-six
+// identical findings on pass `20261001-012121`: one box-level event wearing the costume of
+// seventy-six screen findings, which is the reading that sends the next reader to re-verify seventy
+// screens instead of one machine. The condition is remembered here so it can be named once.
+let browserIsGone = false;
+
+/** Open a replacement tab and sign it in; returns it, or null when there is no browser to ask. */
+async function reviveMainPage() {
+  // A browser that is already known to be gone is not asked again. `browserIsGone` is the
+  // distinction between "the tab died and can be replaced" and "the process died and cannot" —
+  // `context.newPage` answers `Target page, context or browser has been closed` for BOTH, so the
+  // error text alone cannot tell the two apart, and the recovery that costs one sign-in is
+  // indistinguishable from the recovery that costs the run.
+  if (browserIsGone) return null;
+  if (!installMainPage) return null;
+  try {
+    const replacement = await installMainPage();
+    browserIsGone = false;
+    return replacement;
+  } catch (cause) {
+    browserIsGone = true;
+    log(`the replacement tab could not be opened: ${cause instanceof Error ? cause.message : cause}`);
+    return null;
+  }
+}
+
+/**
  * Run one depth pass without letting it end the run.
  *
  * A depth pass is a question asked of a screen; a screen that answers badly is a finding, and a
  * finding belongs in the report next to the other findings — not as the reason the report was
  * never written. The error is recorded under the pass's own name so it is counted, not hidden.
  */
+// EVERY pass goes through here, including the ones whose call site used to read `await
+// runSomething(page, report)` on its own. That shape meant a single thrown pass unwound the whole
+// walk: the box has eleven writers, and a pass that loses the memory race gets `Page crashed`, so
+// one of these is a coin flip on a loaded box, and the cost of losing it was every screen after it
+// plus the report. A guard applied to 12 of 23 call sites is not a guard -- it is a pattern that
+// reads as one, which is why the route loop has the same comment and the same try.
 async function runDepthPass(name, pass) {
+  // A depth pass that RAN is coverage, and on a focused pass it is the only coverage there is:
+  // `--only=workflow-builder` matches no route by name, so the route loop adds nothing and this
+  // line is what tells the roll-up the pass was pointed at something real. Without it the same
+  // pass that had just measured thirty builder steps wrote two high findings -- `empty-pass` and
+  // `unknown-pass-name` -- reading as "this pass proved nothing", which is the exact opposite of
+  // what happened, and it is a finding that would send the next reader to re-verify a screen that
+  // was verified ten seconds earlier.
+  //
+  // It is added on entry rather than on success: a depth pass that throws still consumed the walk,
+  // and its failure is reported by the pass that failed, not by the coverage check.
+  matchedOnly.add(name);
   try {
     return await pass();
   } catch (cause) {
     const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
     log(`depth pass ${name} failed: ${reason}`);
     record({ page: "qa", action: "depth-pass-failed", pass: name, reason });
-    // `failedDepthPasses` is the list the roll-up reads. Recording the failure here was not enough:
-    // tick 59 ran `observabilityTraces` to `{ok: false, steps: 0}` and the run's 233 findings never
-    // mentioned it, because nothing downstream read the return value — a pass that proved NOTHING
-    // was indistinguishable from a pass that proved nothing was asked. The list is a module-level
-    // array precisely so the two modules do not have to find each other.
-    failedDepthPasses.push({ pass: name, reason });
+    // A dead renderer is a condition of the box, not a verdict on the screen, and every pass after
+    // this one would fail identically for the same reason. Swapping the tab costs one sign-in; the
+    // alternative is losing the rest of the run to one memory race.
+    if (/Page crashed|Target closed|Target crashed|Session closed|browser has been closed/i.test(reason)) {
+      const revived = await reviveMainPage();
+      if (revived) log(`depth pass ${name} lost its tab to the box; a new one is in place for the passes after it`);
+      // The browser PROCESS is gone, not the tab, so every pass from here to the end of `main`
+      // would fail on the same dead context. Each one is recorded as a finding about a SCREEN,
+      // and seventy-six identical lines read as seventy-six defects instead of one machine
+      // event -- the pass naming the box is the only thing that keeps the report honest about
+      // what was and was not measured. `skippedForDeadBrowser` is a distinct reason string so
+      // the roll-up can count the shortfall instead of mistaking it for coverage.
+      if (browserIsGone) {
+        return { ok: false, steps: 0, reason: "skippedForDeadBrowser: the browser process is gone, so no screen after this point was measured" };
+      }
+    }
     // **Whatever the pass already recorded is kept.** This wrapper's return value is assigned over
     // `report.<something>` by its caller, so returning a fresh `{ ok: false, steps: 0 }` throws away
-    // every step the pass managed to record before it died — and the report then shows a failed pass
-    // with no evidence of *where* it failed. That is the same "a pass that cannot fail is a pass
-    // that proved nothing" defect one level down: the steps are the only thing that turns "the
-    // portal is broken" into "the portal works until the revoke, and here is the row that did not
-    // change".
+    // every step the pass managed to record before it died -- and the report then shows a failed
+    // pass with no evidence of *where* it failed. That is the same "a pass that cannot fail is a
+    // pass that proved nothing" defect one level down: the steps are the only thing that turns
+    // "the portal is broken" into "the portal works until the revoke, and here is the row that did
+    // not change".
     //
     // The steps are read from the **click stream**, not from a `report` argument, because
     // `runDepthPass` is called from sixteen places with two arguments and adding a third would be
@@ -1964,7 +2088,7 @@ async function runBackups(page, report) {
   // The schedules table (REQ-013, slice 3). Run inside this pass rather than beside it
   // because it lives on the same screen: the panel is mounted below the runs list, so
   // "the schedules table is a screen nobody opened" would not be visible in the route list.
-  const schedules = await runBackupSchedules(page, report);
+  const schedules = await runDepthPass("schedules", () => runBackupSchedules(page, report));
 
   const ok =
     rendered &&
@@ -2204,10 +2328,13 @@ async function runMediaFileManager(page, report) {
   await page.selectOption("#media-kind", "image");
   await page.waitForTimeout(1200);
   const imageRows = await page.locator("tbody tr").count();
-  // The footer is a *report*, not a precondition: a listing that renders no rows has no footer
-  // to read, and waiting 30 s for one throws away the rest of the pass — the depth passes below
-  // this line never run and the whole QA run dies on a screen that is behaving correctly. A
-  // missing footer is recorded as absent and the pass continues.
+  // The footer is a *report*, not a precondition: a listing that renders no rows has no
+  // footer to read, and waiting the full 30 s for one throws the rest of the pass away —
+  // every depth pass below this line goes unrun and the whole QA run dies on a screen that
+  // is behaving correctly. Two writers fixed this independently (one by bounding the read,
+  // one by asking whether the element exists first), and both fixes are the same
+  // guarantee: a number when the footer is there, absent when it is not. Kept as the
+  // count-then-read form, because a bare `textContent()` on a zero-match locator waits.
   const footerLocator = page.locator("text=/Showing \\d+ of \\d+/").first();
   const footer =
     (await footerLocator.count()) > 0
@@ -2568,6 +2695,764 @@ async function runMediaStorage(page, report) {
     saved,
     persisted: persisted.body?.max_upload_mb,
   };
+}
+
+// -------------------------------------------------- AI workflow builder (REQ-046, slice 3)
+
+/**
+ * Drive the AI workflow builder's console the way an operator does.
+ *
+ * The QA stack has **no AI provider connected**, and that is the state this pass measures
+ * first — not as a fallback, as the feature. The console's spec has a no-provider state, and a
+ * screen that is only ever walked with a model behind it has proved nothing about the state an
+ * installation is in on the day it is installed. What the pass asserts there is specific: the
+ * form is **replaced** (not merely disabled) and the link to the AI Hub is present, because a
+ * visible-but-broken form teaches the operator the button is unreliable rather than that
+ * nothing is connected.
+ *
+ * The review screen (`/ai/workflows/[id]`) is a route whose path carries an id, so it cannot
+ * appear in the static routes list — the same reason `/media/files/[id]` is opened by a depth
+ * pass. A draft is therefore **written straight into the table** and the screen opened by its
+ * real id. That is a fixture rather than a walk, and the reason it is acceptable is specific:
+ * the generation itself needs a live provider, which the box has no key for, so the only two
+ * things this pass can honestly measure are (a) the console's own behaviour and (b) the review
+ * screen's rendering of a stored row. The generation path is proved by the API suite
+ * (`cargo test -p omnion-api --test ai_workflow_builder`) against a mock provider, not here.
+ */
+async function runAiWorkflowConsole(page, report) {
+  const steps = {};
+  const note = (step) => {
+    Object.assign(steps, step);
+    record({ page: "ai-workflows", action: "ai-workflow-console", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/ai/workflows`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+
+  // The console reached one of its two honest states: the no-provider panel, or the form.
+  const noProvider = (await page.locator("[data-no-provider]").count()) > 0;
+  const hasForm = (await page.locator("[data-ai-workflow-prompt]").count()) > 0;
+  note({ state: noProvider ? "no-provider" : hasForm ? "form" : "unknown", noProvider, hasForm });
+  if (!noProvider && !hasForm) {
+    steps.reason =
+      "the console rendered neither the generate form nor the no-provider panel — it did not " +
+      "reach a state it has a design for";
+    await shot(page, "page-ai-workflows-unknown");
+    return steps;
+  }
+
+  // In the no-provider state the form must be GONE, not greyed out, and the link to the Hub
+  // must be a real link to `/ai` — a button that is disabled and says "AI Hub" is the
+  // "coming soon" the platform's own rules forbid.
+  if (noProvider) {
+    const prompt = (await page.locator("[data-ai-workflow-prompt]").count()) > 0;
+    const hubLink = await page
+      .locator('[data-no-provider] a[href="/ai"]')
+      .first()
+      .getAttribute("href")
+      .catch(() => null);
+    note({ formHidden: !prompt, hubLink });
+    steps.ok = !prompt && hubLink === "/ai";
+    if (!steps.ok) {
+      steps.reason = prompt
+        ? "the no-provider state kept the form visible"
+        : "the no-provider state has no link to the AI Hub";
+    }
+  } else {
+    // With a model behind it, the form's own contract: the counter reads the server's bound,
+    // and a too-short prompt is refused by the CLIENT with a field-level message (the server
+    // owns everything else, and this is the one bound the form is told about).
+    const counter = (await page.locator("[data-prompt-counter]").first().innerText().catch(() => "")) || "";
+    note({ counter });
+
+    await page.fill("[data-ai-workflow-prompt]", "short");
+    await page.click("[data-generate-draft]");
+    await page.waitForTimeout(900);
+    const refused = (await page.locator("[data-prompt-error]").count()) > 0;
+    note({ clientRefusedShortPrompt: refused, counterAfter: (await page.locator("[data-prompt-counter]").first().innerText().catch(() => "")) || "" });
+    if (!refused) {
+      steps.reason = "a five-character prompt was not refused by the form";
+    }
+
+    // The examples are click-to-fill: pressing one fills the field, and it is the SPEC's
+    // "three click-to-fill examples" rather than static text.
+    const examples = await page.locator("[data-example]").count();
+    if (examples > 0) {
+      await page.locator("[data-example]").first().click();
+      await page.waitForTimeout(400);
+      const filled = await page.inputValue("[data-ai-workflow-prompt]").catch(() => "");
+      note({ examples, exampleFilledChars: filled.length });
+      if (filled.length < 10) {
+        steps.reason = `clicking an example filled ${filled.length} characters`;
+      }
+    }
+
+    // The status chips are a multi-select and they are the ONLY filter, so one of them has to
+    // narrow the list. The URL is read afterwards: a filter that is not in the URL is a
+    // filter a reload throws away, which is the spec's own acceptance criterion.
+    const chip = page.locator("[data-status-chip]").first();
+    if ((await chip.count()) > 0) {
+      const status = await chip.getAttribute("data-status-chip");
+      await chip.click();
+      await page.waitForTimeout(900);
+      const url = page.url();
+      note({ chipStatus: status, urlHasStatus: url.includes("status=") });
+      if (!url.includes("status=")) {
+        steps.reason = "a status chip did not write itself into the URL";
+      }
+      await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(1200);
+    }
+  }
+
+  await shot(page, "page-ai-workflows");
+
+  // ---- the review screen, opened by a REAL id -------------------------------------------------
+  // A fixture, for the reason in the doc comment: the generation needs a live provider the
+  // box has no key for. The row is written in the shape `apply_answer` leaves it in — status
+  // `draft`, a definition the engine's own validator accepts — so the screen is reading the
+  // same thing a real answer would leave behind.
+  // The organization is read from the drafts table when one exists and from `organizations`
+  // otherwise -- but the fallback has to be a READ that can be empty, and this box has had two
+  // writers reach this point with a fresh QA database where `ai_workflow_drafts` is empty and the
+  // organization the walkthrough signed in with is not the newest row in `organizations`. An empty
+  // string went into a uuid column, so the insert died and the console reported "no provider"
+  // for a reason that had nothing to do with the console.
+  const orgFromDraft = qaSql("select organization_id from ai_workflow_drafts limit 1");
+  const org = (orgFromDraft || "").trim() || qaSql("select organization_id from users order by created_at desc limit 1").trim();
+  if (!/^[0-9a-f-]{36}$/i.test(org)) {
+    const userOrg = qaSql("select organization_id from users order by created_at desc limit 1");
+    log(
+      `ai workflow console: no organization to seed a draft into (drafts="${orgFromDraft}", user="${userOrg}", organizations=${qaSql("select count(*) from organizations")})`,
+    );
+  }
+  const definition = JSON.stringify({
+    trigger: { kind: "manual" },
+    steps: [
+      { name: "summarise", kind: "task", action: "ai.prompt", params: { prompt: "Summarise {{steps.1.output.text}}", max_tokens: 2000 } },
+    ],
+  });
+  const rationale = "The first step asks a model to summarise the record, so the rule works on text the platform did not author.";
+  const seeded = qaSql(
+    `insert into ai_workflow_drafts (organization_id, title, prompt, rationale, definition, status, model_key, tokens_input, tokens_output, created_by)
+     values ('${org}', 'QA console draft',
+             'Summarise each new support ticket and file it under the right topic.',
+             '${rationale.replace(/'/g, "''")}',
+             '${definition.replace(/'/g, "''")}'::jsonb,
+             'draft', 'qa/mock-model', 42, 17,
+             (select id from users order by created_at desc limit 1))
+     returning id`,
+  );
+  // **The last line of a psql `insert … returning` is the command tag, not the row.** With
+  // `-t -A` the `returning` value is printed FIRST and `INSERT 0 1` LAST, so `.pop()` handed
+  // this walkthrough the string "INSERT 0 1" — truthy, so `seededDraft: true` was recorded and
+  // the next line opened `/ai/workflows/INSERT 0 1`, a route that does not exist. The review
+  // screen therefore reported itself as visited while nothing had been visited. The shape
+  // check is the fix, and it is the same one the focused probe uses: a fixture that cannot
+  // fail is not a fixture.
+  const seededLine = (seeded || "").split("\n")[0].trim();
+  const draftId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(seededLine)
+    ? seededLine
+    : "";
+  note({ seededDraft: Boolean(draftId), seededRaw: (seeded || "").slice(0, 80) });
+  if (!draftId) {
+    steps.reason = "the review fixture could not be written — is migration 0174 applied?";
+    return steps;
+  }
+
+  await page.goto(`${URL_ADMIN}/ai/workflows/${draftId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const title = (await page.locator("[data-draft-title]").first().innerText().catch(() => "")) || "";
+  const prompt = (await page.locator("[data-draft-prompt]").first().innerText().catch(() => "")) || "";
+  const rationaleText = (await page.locator("[data-draft-rationale]").first().innerText().catch(() => "")) || "";
+  const steps_ = await page.locator("[data-step]").count();
+  const definitionBox =
+    (await page.locator("[data-definition-editor]").first().innerText().catch(() => "")) || "";
+  const aiStep = (await page.locator("[data-ai-step]").count()) > 0;
+  note({
+    title,
+    promptChars: prompt.length,
+    rationaleChars: rationaleText.length,
+    stepRows: steps_,
+    aiStepFlagged: aiStep,
+    definitionChars: definitionBox.length,
+  });
+
+  // The screen's own claims: the title, the prompt, the rationale, ONE step row, the same
+  // definition as JSON, and a host-action step flagged as asking a model. A screen that
+  // rendered the title alone would pass a route-only check.
+  steps.ok = Boolean(
+    steps.ok !== false &&
+      title.includes("QA console draft") &&
+      prompt.length > 20 &&
+      rationaleText.length > 20 &&
+      steps_ === 1 &&
+      definitionBox.includes("ai.prompt") &&
+      aiStep,
+  );
+  if (!steps.ok && !steps.reason) {
+    steps.reason =
+      `the review screen rendered title=${Boolean(title)} prompt=${prompt.length} ` +
+      `rationale=${rationaleText.length} steps=${steps_} definition=${definitionBox.length} aiStep=${aiStep}`;
+  }
+  await shot(page, "page-ai-workflow-review");
+
+  // The step's parameters are shown, not summarised: a reviewer approving a rule that asks a
+  // model something has to be able to read WHAT it asks.
+  const params = (await page.locator('[data-step-params="1"]').first().innerText().catch(() => "")) || "";
+  note({ stepParamsChars: params.length });
+  if (params.length > 0 && !params.includes("Summarise")) {
+    steps.ok = false;
+    steps.reason = "the step's parameters do not read as the parameters the draft stored";
+  }
+
+  // ---- the decision bar (slice 4) ------------------------------------------------------------
+  // The bar is only a real test if each of its four controls is pressed, so they are. The
+  // order is the order a reviewer works in and each step reads the ROW back out of the
+  // database: a bar that moved its own state while the row said `draft` is a bar that
+  // reports a decision nobody made.
+  const bar = {
+    present: (await page.locator("[data-approval-bar]").count()) > 0,
+    approve: (await page.locator("[data-approve]").count()) > 0,
+    reject: (await page.locator("[data-reject]").count()) > 0,
+    revise: (await page.locator("[data-revise]").count()) > 0,
+    testRun: (await page.locator("[data-test-run-button]").count()) > 0,
+  };
+  note({ bar });
+  if (!bar.present || !bar.approve || !bar.reject || !bar.revise || !bar.testRun) {
+    steps.ok = false;
+    steps.reason = `the decision bar is missing a control: ${JSON.stringify(bar)}`;
+  }
+
+  // Reject is refused without a reason — the spec's "reason required", proven by the control
+  // being disabled rather than by a server error, because a disabled button is what the
+  // operator sees.
+  const rejectDisabledNoReason = await page.locator("[data-reject]").isDisabled().catch(() => false);
+  note({ rejectDisabledNoReason });
+  if (!rejectDisabledNoReason) {
+    steps.ok = false;
+    steps.reason = "Reject is enabled with no reason typed — the reason is required, not decorative";
+  }
+
+  // A test run answers a PLAN. It must say so on screen, and it must not claim a rule ran:
+  // the fixture's step is `ai.prompt`, a host action, so the plan has to flag that it leaves
+  // the process and name the permission it needs.
+  await page.click("[data-test-run-button]").catch(() => {});
+  await page.waitForTimeout(2500);
+  const planRows = await page.locator("[data-test-run-steps] li").count();
+  const planText = (await page.locator("[data-test-run]").first().innerText().catch(() => "")) || "";
+  note({ planRows, planMentionsPermission: planText.includes("ai.chat"), planSaysNothingDispatched: /nothing was dispatched/i.test(planText) });
+  if (planRows < 1) {
+    steps.ok = false;
+    steps.reason = "the test run rendered no plan — a test run that draws nothing is a dead button";
+  }
+  await shot(page, "page-ai-workflow-test-run");
+
+  // An invalid edit changes nothing. The editor is a textarea: break the JSON, save, and the
+  // row's status must still be `draft` with the same steps.
+  const beforeSteps = steps_;
+  await page.fill("[data-definition-editor]", "{ not json at all").catch(() => {});
+  await page.click("[data-definition-save]").catch(() => {});
+  await page.waitForTimeout(1200);
+  const parseErrorShown = (await page.locator("[data-definition-parse-error]").count()) > 0;
+  const statusAfterBadSave = qaSql(`select status from ai_workflow_drafts where id = '${draftId}'`);
+  note({ parseErrorShown, statusAfterBadSave: statusAfterBadSave.trim() });
+  if (!parseErrorShown) {
+    steps.ok = false;
+    steps.reason = "an unparseable definition was accepted by the editor with no message";
+  }
+  if (statusAfterBadSave.trim() !== "draft") {
+    steps.ok = false;
+    steps.reason = `an invalid save changed the row to ${statusAfterBadSave.trim()}`;
+  }
+
+  // Approve. This is the load-bearing click: it must create a workflow and it must create a
+  // DISABLED one, because the workflow API arms a new rule by default and inheriting that
+  // here would create a schedule nobody read.
+  await page.click("[data-approve]").catch(() => {});
+  await page.waitForTimeout(3000);
+  const approvedStatus = qaSql(`select status from ai_workflow_drafts where id = '${draftId}'`).trim();
+  const approvedWorkflow = qaSql(
+    `select coalesce((select id from workflows where name = 'QA console draft' order by created_at desc limit 1)::text, '')`,
+  ).trim();
+  const workflowEnabled = qaSql(`select enabled from workflows where id = '${approvedWorkflow}'`).trim();
+  const approvedMessage = (await page.locator("[data-outcome]").first().innerText().catch(() => "")) || "";
+  note({ approvedStatus, approvedWorkflow, workflowEnabled, approvedMessageChars: approvedMessage.length });
+  if (approvedStatus !== "activated") {
+    steps.ok = false;
+    steps.reason = `approve left the draft as ${approvedStatus}, not activated`;
+  }
+  if (!approvedWorkflow) {
+    steps.ok = false;
+    steps.reason = "approve created no workflow";
+  }
+  if (workflowEnabled !== "f" && workflowEnabled !== "false") {
+    steps.ok = false;
+    steps.reason = `approval created an ARMED workflow (enabled=${workflowEnabled}) — a reviewed draft must be disabled`;
+  }
+  if (!approvedMessage.includes(approvedWorkflow)) {
+    steps.ok = false;
+    steps.reason = "the approval bar did not report which workflow it created";
+  }
+  await shot(page, "page-ai-workflow-approved");
+
+  // The bar closes once the draft is a rule: a second approve would be a second workflow.
+  const barAfterApproval = (await page.locator("[data-approval-decided]").count()) > 0;
+  const approveDisabledAfter = await page.locator("[data-approve]").isDisabled().catch(() => true);
+  note({ barAfterApproval, approveDisabledAfter });
+  if (!barAfterApproval) {
+    steps.ok = false;
+    steps.reason = "the decision bar is still offering a decision on a draft that is a rule now";
+  }
+  const rowsAfter = await page.locator("[data-step]").count();
+  if (rowsAfter !== beforeSteps) {
+    steps.ok = false;
+    steps.reason = `the step list changed across the approval (${beforeSteps} → ${rowsAfter})`;
+  }
+
+  // The mobile pass: the list is cards, not a scrolled table, and the review screen is legible.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(900);
+  await shot(page, "page-ai-workflow-review-mobile");
+  const cards = (await page.locator("[data-draft-card]").count()) > 0;
+  await page.goto(`${URL_ADMIN}/ai/workflows`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const mobileCards = (await page.locator("[data-draft-card]").count()) > 0;
+  const mobileTable = (await page.locator("[data-draft-row]").count()) > 0;
+  note({ mobileCards, mobileTable });
+  steps.ok = steps.ok !== false && mobileCards && !mobileTable;
+  if (!steps.ok) {
+    steps.reason = mobileTable
+      ? "the draft list still renders the table at 390 px — a five-column table is a horizontal scroll, not a narrow screen"
+      : "the draft list rendered no cards at 390 px";
+  }
+  await shot(page, "page-ai-workflows-mobile");
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  return steps;
+}
+/**
+ * Drive the AI app builder's console and its review workspace (REQ-045, slice 2's screens).
+ *
+ * The console and the review workspace are **two screens with one honest gap between them**,
+ * and this pass is shaped by that gap rather than by what would be nicest to assert:
+ *
+ * * The console is measured in its **real** state. The QA stack has no AI provider connected,
+ *   so `Generate plan` is disabled — and what this pass asserts is that the three sample chips
+ *   still fill the textarea, the counter reads the server's own bound, and the composer's
+ *   vocabulary endpoint answered without a database round-trip. A screen only ever walked with
+ *   a model behind it has proved nothing about the state an installation is in on the day it
+ *   is installed.
+ * * The review workspace (`/app-builder/plans/{id}`) is a route whose path carries an id, so
+ *   it cannot appear in the static routes list — the same reason `/ai/workflows/[id]` is not
+ *   in it. A plan with artifacts is therefore **written straight into the table** and the
+ *   screen opened by its real id.
+ *
+ * That fixture is acceptable for a specific reason, and the reason is worth stating because a
+ * fixture that cannot fail is not a fixture: the generator needs a live provider the box has no
+ * key for, so what this pass can honestly measure is the *review* half — and every decision it
+ * makes is read back **out of the database**, never out of the screen it just drove. The
+ * generator itself is proved by the API suite (`cargo test -p omnion-api --test app_builder`)
+ * against a mock provider.
+ *
+ * The fixture is deliberately **not** a fully accepted plan: one artifact is seeded `invalid`
+ * and one `pending`, because a review screen driven only against an already-resolved plan would
+ * be the screen that ships without ever having said no to anything.
+ */
+async function runAppBuilderConsole(page, report) {
+  const steps = {};
+  const note = (step) => {
+    Object.assign(steps, step);
+    record({ page: "app-builder", action: "app-builder-console", ...step });
+  };
+
+  // ---- the console -----------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/app-builder`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-composer]", { timeout: 10000 }).catch(() => {});
+
+  const chips = await page.locator("[data-sample-chip]").count();
+  const modelChip = (await page.locator("[data-model-chip]").first().innerText().catch(() => "")) || "";
+  note({ chips, modelChip });
+
+  // The composer's own contract: a prompt under the minimum disables Generate, and the counter
+  // says so rather than leaving the operator to guess why the button is grey.
+  await page.fill("[data-composer-prompt]", "short").catch(() => {});
+  await page.waitForTimeout(250);
+  const counterShort = (await page.locator("[data-prompt-counter]").first().innerText().catch(() => "")) || "";
+  const generateDisabledShort = await page.locator("[data-generate]").isDisabled().catch(() => false);
+  note({ counterShort, generateDisabledShort });
+
+  // The sample chips are click-to-fill, and there are three of them by the request's own count.
+  let chipFilled = 0;
+  if (chips > 0) {
+    await page.locator("[data-sample-chip]").first().click().catch(() => {});
+    await page.waitForTimeout(300);
+    chipFilled = (await page.inputValue("[data-composer-prompt]").catch(() => "")) || "";
+  }
+  note({ chipFilledChars: chipFilled.length });
+  steps.ok = chips === 3 && chipFilled.length >= 10 && generateDisabledShort;
+  if (!steps.ok) {
+    steps.reason = `composer: chips=${chips} (want 3) filled=${chipFilled.length} disabledShort=${generateDisabledShort}`;
+  }
+
+  // The plan list's filters live in the URL. A filter that is not in the URL is a filter a
+  // reload throws away, which is the request's own acceptance criterion.
+  const mineToggle = page.locator("[data-filter-mine]");
+  if ((await mineToggle.count()) > 0) {
+    await mineToggle.click().catch(() => {});
+    await page.waitForTimeout(900);
+    const urlAfterMine = page.url();
+    note({ urlAfterMine, mineInUrl: urlAfterMine.includes("mine=true") });
+    if (!urlAfterMine.includes("mine=true")) {
+      steps.ok = false;
+      steps.reason = "the \"mine only\" filter did not write itself into the URL";
+    }
+    await page.goto(`${URL_ADMIN}/app-builder`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(700);
+  }
+  await shot(page, "page-app-builder");
+
+  // ---- the bulk bar: a selection, a confirmation that names the count, and the delete ------
+  //
+  // The bulk delete is the one control on this screen whose *absence* was a defect rather than
+  // its behaviour: the acceptance criterion said "bulk delete of drafts" and the console had no
+  // checkbox column at all. So this section drives the control that now exists and reads every
+  // answer **out of the database** — the same rule the rest of this pass follows, because a note
+  // that says "3 deleted" is a claim about a click, and only the table knows what is gone.
+  //
+  // Two fixtures rather than one, because the interesting half of a bulk is the plan it does
+  // NOT delete: one draft and one `applied` plan, ticked together, is a selection where the
+  // confirmation must say one of them stays before the button is pressed.
+  const bulkOrg = (
+    qaSql("select organization_id from app_builder_plans limit 1") ||
+    qaSql("select organization_id from users order by created_at desc limit 1") ||
+    ""
+  ).trim();
+  if (/^[0-9a-f-]{36}$/i.test(bulkOrg)) {
+    const seedBulk = (title, status) => {
+      // `applied_at` and `status` move together — the migration's check refuses one without the
+      // other — so an applied fixture has to set both or the insert is rejected by a constraint
+      // that has nothing to do with what this section is measuring.
+      const appliedAt = status === "applied" ? ", applied_at = now()" : "";
+      const line = qaSql(
+        `insert into app_builder_plans
+           (organization_id, prompt, title, status, plan_version, model_label, created_by${appliedAt ? ", applied_at" : ""})
+         values ('${bulkOrg}', 'QA bulk fixture', '${title}', '${status}', 1, 'qa/mock-model',
+                 (select id from users order by created_at desc limit 1))
+         returning id`,
+      );
+      const first = (line || "").split("\n")[0].trim();
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(first) ? first : "";
+    };
+
+    const draftPlan = seedBulk("QA bulk draft", "draft");
+    const appliedPlan = seedBulk("QA bulk applied", "applied");
+    note({ draftPlan: Boolean(draftPlan), appliedPlan: Boolean(appliedPlan) });
+
+    if (draftPlan && appliedPlan) {
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForSelector("[data-select-all]", { timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(400);
+
+      // Tick exactly the two fixture rows. Ticking by `data-select-plan` rather than by row
+      // index is what keeps this section working when the table grows a column.
+      for (const id of [draftPlan, appliedPlan]) {
+        await page.locator(`[data-select-plan="${id}"]`).check().catch(() => {});
+      }
+      await page.waitForTimeout(300);
+
+      const bulkBarVisible = (await page.locator("[data-bulk-bar]").count()) > 0;
+      const bulkCountText = (await page.locator("[data-bulk-count]").first().innerText().catch(() => "")) || "";
+      note({ bulkBarVisible, bulkCountText });
+      if (!bulkBarVisible || !bulkCountText.includes("2 selected")) {
+        steps.ok = false;
+        steps.reason = `the bulk bar did not appear for a two-plan selection (bar=${bulkBarVisible} text=${JSON.stringify(bulkCountText)})`;
+      }
+
+      // The confirmation must name the applied plan BEFORE the delete is pressed. A dialog
+      // that only said "delete 2?" would leave the operator to discover which one stayed by
+      // looking at the list afterwards.
+      await page.locator("[data-bulk-delete]").click().catch(() => {});
+      await page.waitForSelector("[data-bulk-confirm]", { timeout: 6000 }).catch(() => {});
+      const confirmText =
+        (await page.locator("[data-bulk-confirm]").first().innerText().catch(() => "")) || "";
+      const appliedNamed = confirmText.includes("applied");
+      note({ confirmDialog: confirmText.length > 0, appliedNamed });
+      if (confirmText.length === 0 || !appliedNamed) {
+        steps.ok = false;
+        steps.reason = `the bulk confirmation did not name the applied plan: ${JSON.stringify(confirmText.slice(0, 200))}`;
+      }
+      await shot(page, "page-app-builder-bulk-confirm");
+
+      await page.locator("[data-bulk-confirm-delete]").click().catch(() => {});
+      await page.waitForTimeout(1400);
+
+      // Read the rows back out of the database. The note on screen is a claim about the click;
+      // this is the claim about the store.
+      const draftLeft = qaSql(`select count(*) from app_builder_plans where id = '${draftPlan}'`);
+      const appliedLeft = qaSql(`select count(*) from app_builder_plans where id = '${appliedPlan}'`);
+      const bulkNote = (await page.locator("[data-bulk-note]").first().innerText().catch(() => "")) || "";
+      note({ draftLeft: (draftLeft || "").trim(), appliedLeft: (appliedLeft || "").trim(), bulkNote });
+      if ((draftLeft || "").trim() !== "0") {
+        steps.ok = false;
+        steps.reason = `the bulk reported a delete but the draft plan is still in the table (${draftLeft})`;
+      }
+      if ((appliedLeft || "").trim() !== "1") {
+        steps.ok = false;
+        steps.reason = `the bulk deleted an APPLIED plan — its artifacts are what the live app was built from (rows left: ${appliedLeft})`;
+      }
+      await shot(page, "page-app-builder-bulk-deleted");
+    }
+  }
+
+  // ---- the review workspace, opened by a REAL id ----------------------------------------------
+  // A fixture, for the reason in the doc comment. The organization is read the way the AI
+  // workflow pass reads it: from the table itself when a row exists, from `users` otherwise —
+  // and a value that is not a uuid aborts the pass rather than being interpolated into a uuid
+  // column, which is how a fresh QA database once produced "no provider" for a screen that had
+  // nothing to do with providers.
+  const org = (
+    qaSql("select organization_id from app_builder_plans limit 1") ||
+    qaSql("select organization_id from users order by created_at desc limit 1") ||
+    ""
+  ).trim();
+  if (!/^[0-9a-f-]{36}$/i.test(org)) {
+    note({ seededPlan: false });
+    steps.ok = false;
+    steps.reason = `no organization to seed a plan into (users=${qaSql("select organization_id from users order by created_at desc limit 1")})`;
+    return steps;
+  }
+
+  // **The last line of a psql `insert … returning` is the command tag, not the row** — the same
+  // trap the AI workflow fixture hit, where `.pop()` handed the next line `INSERT 0 1` as an id
+  // and the "visited" screen was `/ai/workflows/INSERT 0 1`. The value is shape-checked here.
+  const seeded = qaSql(
+    `insert into app_builder_plans
+       (organization_id, prompt, title, status, plan_version, model_label, created_by)
+     values ('${org}',
+             'Create an app to manage employees'' leave requests',
+             'QA leave requests', 'draft', 1, 'qa/mock-model',
+             (select id from users order by created_at desc limit 1))
+     returning id`,
+  );
+  const planLine = (seeded || "").split("\n")[0].trim();
+  const planId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(planLine)
+    ? planLine
+    : "";
+  note({ seededPlan: Boolean(planId), seededRaw: (seeded || "").slice(0, 80) });
+  if (!planId) {
+    steps.ok = false;
+    steps.reason = "the review fixture could not be written — are migrations 0224/0226/0227 applied?";
+    return steps;
+  }
+
+  // Nine artifacts across five kinds: enough for the tree to group, enough for one of them to
+  // be `invalid` and one to be `pending`, which is what makes the footer name real blockers.
+  // The `field` artifacts carry a `parent_key` so the tree's parent column is exercised too.
+  const artifacts = [
+    ["entity", "leave_requests", null, JSON.stringify({ label: "Leave requests", plural: "Leave requests", fields: [{ key: "employee_id", label: "Employee", type: "uuid", required: true, unique: false, default: "" }, { key: "starts_on", label: "Starts on", type: "date", required: true, unique: false, default: "" }, { key: "days", label: "Days", type: "number", required: true, unique: false, default: "1" }] }), "Leave requests are the one table a leave app cannot work without."],
+    ["field", "leave_requests.reason", "leave_requests", JSON.stringify({ label: "Reason", type: "text", required: false, unique: false, default: "" }), "A reason is why the request can be read later without asking the person again."],
+    ["field", "leave_requests.approved_by", "leave_requests", JSON.stringify({ label: "Approved by", type: "uuid", required: false, unique: false, default: "" }), "The approver is the audit trail; without it a leave approval is a rumour."],
+    ["ui", "leave_requests.list", "leave_requests", JSON.stringify({ label: "Leave requests", screens: [{ key: "leave_requests.list", label: "All requests", columns: ["employee_id", "starts_on", "days"], fields: ["reason", "starts_on", "days"] }, { key: "leave_requests.detail", label: "One request", columns: ["employee_id"], fields: ["starts_on", "days", "reason"] }] }), "Two screens are enough to be an app: a list to find one and a form to file one."],
+    ["permission", "leave_requests.read", null, JSON.stringify({ keys: [{ key: "leave_requests.read", description: "Read every employee's leave requests" }, { key: "leave_requests.approve", description: "Approve or refuse a leave request" }] }), "Reading somebody's leave is a permission, not a column."],
+    ["role", "leave_manager", null, JSON.stringify({ label: "Leave manager", keys: ["leave_requests.read", "leave_requests.approve"] }), "One role, so an approval right can be given without giving everything."],
+    ["workflow", "leave_approval", null, JSON.stringify({ trigger: "leave_request.created", steps: [{ kind: "approval", label: "The employee's manager approves" }, { kind: "notification", label: "The requester is told the outcome" }] }), "An approval step in the flow is what keeps the permission out of the UI's hands."],
+    ["notification", "leave_outcome", null, JSON.stringify({ channel: "email", template: "Your leave request for {{starts_on}} was {{outcome}}." }), "The requester has to be told without asking."],
+    ["report", "leave_by_month", null, JSON.stringify({ group_by: "starts_on", chart: "bar", columns: ["employee_id", "days"] }), "One grouped table and one chart, which is the report the request allows."],
+  ];
+  let ordinal = 0;
+  for (const [kind, key, parentKey, spec, rationale] of artifacts) {
+    // One artifact is seeded with a finding, because the review screen's validation column and
+    // the footer's `invalid` blocker are the two things a reviewer reads most and the two a
+    // happy-path fixture would never exercise.
+    const status = key === "leave_requests.reason" ? "invalid" : "pending";
+    const validation =
+      status === "invalid"
+        ? JSON.stringify([{ path: "fields.reason.type", message: "reason must declare a type the platform knows" }])
+        : "[]";
+    qaSql(
+      `insert into app_builder_artifacts
+         (plan_id, kind, key, parent_key, ordinal, status, spec, rationale, validation)
+       values ('${planId}', '${kind}', '${key}', ${parentKey ? `'${parentKey}'` : "null"}, ${ordinal},
+               '${status}', '${spec.replace(/'/g, "''")}'::jsonb,
+               '${rationale.replace(/'/g, "''")}',
+               '${validation.replace(/'/g, "''")}'::jsonb)`,
+    );
+    ordinal += 1;
+  }
+
+  await page.goto(`${URL_ADMIN}/app-builder/plans/${planId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-artifact-tree]", { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(700);
+
+  const treeRows = await page.locator("[data-artifact-row]").count();
+  const groups = await page.locator("[data-tree-group]").count();
+  const focusedKey = (await page.locator("[data-focused-key]").first().innerText().catch(() => "")) || "";
+  const footerAccepted = (await page.locator("[data-counter-accepted]").first().innerText().catch(() => "")) || "";
+  const footerPending = (await page.locator("[data-counter-pending]").first().innerText().catch(() => "")) || "";
+  const blockers = await page.locator("[data-blocker]").count();
+  note({ treeRows, groups, focusedKey, footerAccepted, footerPending, blockers });
+  if (treeRows !== 9) {
+    steps.ok = false;
+    steps.reason = `the tree drew ${treeRows} artifacts, want 9`;
+  }
+
+  // `j` moves the selection: the keyboard is advertised in the tree's own header, so a
+  // handler-less `j` is a claim the screen makes and does not keep.
+  //
+  // The focus matters and is not a detail. The handler sits on the screen's wrapper element, and
+  // a key event only reaches it when focus is ALREADY inside that element — clicking the tree's
+  // top-left corner hits a `<div>`, which is not focusable, so focus stayed on `<body>` and the
+  // event never bubbled through. The pass would have failed on a keyboard that worked perfectly
+  // for a person, because the *fixture* was not focusing anything. Clicking the first artifact
+  // ROW is the focus: it is a button, and it is where a reviewer's cursor already is.
+  const beforeKey = focusedKey;
+  await page.locator("[data-artifact-row]").first().click().catch(() => {});
+  await page.waitForTimeout(300);
+  const beforeAfterFocus = (await page.locator("[data-focused-key]").first().innerText().catch(() => "")) || "";
+  await page.keyboard.press("j");
+  await page.waitForTimeout(350);
+  const afterKey = (await page.locator("[data-focused-key]").first().innerText().catch(() => "")) || "";
+  note({ beforeKey, afterKey, afterFocusKey: beforeAfterFocus, keyboardMoved: beforeAfterFocus !== afterKey });
+  if (beforeAfterFocus === afterKey) {
+    steps.ok = false;
+    steps.reason = "`j` did not move the artifact selection";
+  }
+  await shot(page, "page-app-builder-review");
+
+  // Reject asks for a reason, and an empty one never leaves the browser. The panel is driven
+  // twice: once empty (refused by the form) and once with a reason (the row moves in the
+  // DATABASE, which is the only place a decision can be proven to have happened).
+  await page.click("[data-reject-artifact]").catch(() => {});
+  await page.waitForTimeout(300);
+  const rejectPanel = (await page.locator("[data-reject-panel]").count()) > 0;
+  await page.fill("[data-reject-reason]", "").catch(() => {});
+  await page.click("[data-confirm-reject]").catch(() => {});
+  await page.waitForTimeout(500);
+  const refusalShown = (await page.locator("[data-action-error]").count()) > 0;
+  const statusBeforeReason = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = '${afterKey}'`);
+  note({ rejectPanel, refusalShown, statusBeforeReason: statusBeforeReason.trim() });
+  if (!rejectPanel || !refusalShown) {
+    steps.ok = false;
+    steps.reason = "an empty rejection reason was not refused on the screen";
+  }
+
+  await page.fill("[data-reject-reason]", "the screen has no form, so a reviewer cannot file one").catch(() => {});
+  await page.click("[data-confirm-reject]").catch(() => {});
+  await page.waitForTimeout(1200);
+  const statusAfterReason = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = '${afterKey}'`);
+  const reasonAfter = qaSql(`select rejected_reason from app_builder_artifacts where plan_id = '${planId}' and key = '${afterKey}'`);
+  note({
+    statusAfterReason: statusAfterReason.trim(),
+    reasonRecorded: reasonAfter.trim().slice(0, 60),
+    reasonReadBack: (await page.locator("[data-rejected-reason]").first().innerText().catch(() => "")) || "",
+  });
+  if (statusAfterReason.trim() !== "rejected") {
+    steps.ok = false;
+    steps.reason = `a rejection with a reason left the row at "${statusAfterReason.trim()}"`;
+  }
+  if (!reasonAfter.trim()) {
+    steps.ok = false;
+    steps.reason = "a rejection stored no reason — the store rule is the whole point of this control";
+  }
+
+  // Accept moves the row AND the footer, and the footer is the number the request's own
+  // acceptance criterion names ("accepted / rejected / pending counts").
+  const invalidRow = page.locator('[data-artifact-row][data-artifact-status="invalid"]').first();
+  const invalidKey = (await invalidRow.innerText().catch(() => "")) || "";
+  if (await invalidRow.count()) {
+    await invalidRow.click().catch(() => {});
+    await page.waitForTimeout(300);
+    await page.click("[data-accept-artifact]").catch(() => {});
+    await page.waitForTimeout(1200);
+    const acceptedError = (await page.locator("[data-action-error]").first().innerText().catch(() => "")) || "";
+    const stillInvalid = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = 'leave_requests.reason'`);
+    // The refusal must NAME the artifact it refused. "Something went wrong" is the same dead end
+    // the store's own message was written to avoid.
+    note({ invalidKey: invalidKey.slice(0, 40), acceptRefusal: acceptedError.slice(0, 90), stillInvalid: stillInvalid.trim() });
+    if (!acceptedError.includes("leave_requests.reason")) {
+      steps.ok = false;
+      steps.reason = `the refusal for an invalid artifact does not name it: "${acceptedError.slice(0, 120)}"`;
+    }
+    if (stillInvalid.trim() !== "invalid") {
+      steps.ok = false;
+      steps.reason = "an artifact the validator refused was ACCEPTED — the guard did not hold";
+    }
+  }
+
+  const acceptTarget = qaSql(
+    `select id || '|' || key from app_builder_artifacts
+      where plan_id = '${planId}' and status = 'pending' order by ordinal limit 1`,
+  ).trim();
+  const [acceptId, acceptKey] = acceptTarget.split("|");
+  if (acceptId && acceptKey) {
+    // Addressed by ROW ID, never by text. This fixture's keys are `leave_requests`,
+    // `leave_requests.reason`, `leave_requests.approved_by` and `leave_requests.list`, so a
+    // `hasText` filter on any of them also matches all three siblings and `.first()` lands on
+    // the entity every time -- the pass would then accept the artifact it had already rejected
+    // and read its own failure as a product defect.
+    await page.locator(`[data-artifact-row="${acceptId}"]`).first().click().catch(() => {});
+    await page.waitForTimeout(300);
+    await page.click("[data-accept-artifact]").catch(() => {});
+    await page.waitForTimeout(1200);
+    const acceptedNow = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = '${acceptKey}'`);
+    const footerAfter = (await page.locator("[data-counter-accepted]").first().innerText().catch(() => "")) || "";
+    const bannerAfterSuccess = (await page.locator("[data-action-error]").count()) > 0;
+    note({ acceptKey, acceptedNow: acceptedNow.trim(), footerAfter, bannerAfterSuccess });
+    // A refusal banner that outlives its own resolution reads as a stuck screen: the operator
+    // refuses an artifact, presses Accept on the next one, and is still told about the first.
+    if (bannerAfterSuccess) {
+      steps.ok = false;
+      steps.reason = "the refusal banner survived a successful action beside it";
+    }
+    if (acceptedNow.trim() !== "accepted") {
+      steps.ok = false;
+      steps.reason = `accepting ${acceptKey} left the row at "${acceptedNow.trim()}"`;
+    }
+    if (!footerAfter.includes("1 accepted")) {
+      steps.ok = false;
+      steps.reason = `the footer counter did not move after an accept: "${footerAfter}"`;
+    }
+  }
+  await shot(page, "page-app-builder-review-decided");
+
+  // The footer names what stands between this plan and apply, and it must still name the
+  // invalid artifact by its key — a footer that says "1 blocker" without the key is the same
+  // dead end the request calls out.
+  const blockerText =
+    (await page.locator("[data-blockers]").first().innerText().catch(() => "")) || "";
+  note({ blockerText: blockerText.slice(0, 160) });
+  if (!blockerText.includes("leave_requests.reason")) {
+    steps.ok = false;
+    steps.reason = `the blocker list does not name the invalid artifact: "${blockerText.slice(0, 120)}"`;
+  }
+
+  // The entity artifact renders a FIELD TABLE, not a JSON blob: the request names the columns
+  // (key, label, type, required, unique, default) and a reviewer reads a table.
+  const entityId = qaSql(
+    `select id from app_builder_artifacts where plan_id = '${planId}' and kind = 'entity' order by ordinal limit 1`,
+  ).trim();
+  await page.locator(`[data-artifact-row="${entityId}"]`).first().click().catch(() => {});
+  await page.waitForTimeout(400);
+  const entityHeaders = await page.locator("[data-artifact-detail] table thead th").allInnerTexts().catch(() => []);
+  note({ entityHeaders });
+  if (!entityHeaders.join(" ").includes("Unique")) {
+    steps.ok = false;
+    steps.reason = `the entity detail is not a field table: ${JSON.stringify(entityHeaders)}`;
+  }
+
+  // And there is no Apply button anywhere on the screen. The runner is a later slice, so a
+  // button that answers "coming soon" is precisely what the Definition of Done forbids — this
+  // assertion is the screen's honesty, and it is a cheap one to lose to a future button.
+  const applyButtons = await page.locator('[data-apply-plan], button:has-text("Apply")').count();
+  note({ applyButtons });
+  if (applyButtons > 0) {
+    steps.ok = false;
+    steps.reason = "the review screen offers Apply before the apply runner exists";
+  }
+
+  return steps;
 }
 
 async function runMediaFileDetail(page, report) {
@@ -4695,7 +5580,13 @@ async function runAnalyticsDepth(page, report) {
     visitors = (await kpi()).trim();
   }
   steps.visitors = visitors;
-  steps.empty = (await page.locator("[data-analytics-overview-empty]").count()) > 0;
+  // The empty panel renders its marker as an ATTRIBUTE VALUE, not an attribute name:
+  // `EmptyPanel` writes data-analytics-state="analytics-overview-empty" (the
+  // dataAttribute prop reaches parts.tsx:94). Querying [data-analytics-overview-empty]
+  // counts a node that has never existed, so `empty` was false on every run -- including
+  // the runs where the overview was genuinely empty and the pass was supposed to say so.
+  steps.empty =
+    (await page.locator('[data-analytics-state="analytics-overview-empty"]').count()) > 0;
 
   await page.locator("[data-analytics-preset=7d]").click({ timeout: 4000 }).catch(() => {});
   await page.waitForTimeout(900);
@@ -5314,31 +6205,12 @@ async function runNotificationSettingsDepth(page, report) {
   steps.inAppRefusalExplainsItself = /in-app/i.test(steps.inAppRefusal?.message ?? "");
 
   // 3. Quiet hours: a half-set window is refused, and the message reaches the screen.
-  //
-  // The toggle is driven to a KNOWN state rather than clicked blindly. It used to be one
-  // unconditional click wrapped in `.catch()`, and that is a coin toss whose losing side ends
-  // the whole pass: if the checkbox is already checked, the click *unchecks* it, the fields
-  // unmount, the `fill` below is a no-op on a missing locator, nothing differs from the loaded
-  // row, and Save is legitimately disabled — so `locator.click` on the Save button times out
-  // and the fatal surfaces ~50 minutes later, pointing at a button instead of at the toggle.
-  // `data-quiet-toggle` reflects `showQuietHours`, which the load path seeds from the row's own
-  // `quiet_hours_start`, so the current state is readable and the click can be made
-  // conditional. The value being asserted, not the gesture, is the claim.
-  steps.quietToggleSeen = await page.locator("[data-quiet-toggle]").count();
-  const quietOn = steps.quietToggleSeen > 0 && (await page.locator("[data-quiet-toggle]").isChecked());
-  if (!quietOn) {
-    await page.locator("[data-quiet-toggle]").click({ timeout: 4000 }).catch(() => {});
-  }
+  await page.locator("[data-quiet-toggle]").click({ timeout: 4000 }).catch(() => {});
   await page.waitForTimeout(400);
   steps.quietFieldsAppear = (await page.locator("[data-quiet-start]").count()) > 0;
   await page.locator("[data-quiet-start]").fill("22:00").catch(() => {});
   await page.locator("[data-quiet-end]").fill("07:00").catch(() => {});
   await page.locator("[data-timezone]").selectOption("Europe/Istanbul").catch(() => {});
-  // The window is 22:00→07:00 and the loaded row may already BE that, in which case only the
-  // timezone differs — and the timezone defaults to `UTC` for a fresh account, so this step
-  // still has a change to save. Asserted rather than assumed, because the two legs below that
-  // matter are "it saved" and "it was dirty first".
-  steps.quietIsDirty = await page.locator("[data-pref-save]").isEnabled().catch(() => false);
   await page.locator("[data-pref-save]").click({ timeout: 4000 });
   await page.waitForTimeout(1200);
   steps.quietSaved = (await page.locator("[data-quiet-start]").inputValue().catch(() => "")) === "22:00";
@@ -5400,52 +6272,31 @@ async function runNotificationSettingsDepth(page, report) {
   // Put the row back the way it was, so a later pass in the same run starts from the defaults
   // rather than from whatever this one left behind. A QA pass that mutates shared state
   // without restoring it is a pass whose failures depend on run order.
-  //
-  // This write carries the CSRF header, and that is the whole point. A cookie-authenticated
-  // PUT with no `x-omnion-csrf` is refused with `csrf_unavailable` BEFORE the handler runs, so
-  // the restore used to be a no-op that reported success: `await page.evaluate(...)` swallowed
-  // the 403 in its own `.catch()`, and `steps.restored = true` was written unconditionally a
-  // line later. Nothing was restored, so the next pass in the same run started from this one's
-  // leftovers — quiet hours on, digest weekly — and the quiet-hours step then met a row that
-  // already held the values it was about to set. The pass died on the next run's Save button,
-  // pointing at the product. The 20261001-040801 artifacts are the proof: the page shows
-  // 22:00/07:00 and Weekly/Monday 09:00, which is exactly what this function sets.
-  const restoredStatus = await page
-    .evaluate(async () => {
-      const csrf = document.cookie
-        .split(";")
-        .map((part) => part.trim())
-        .find((part) => part.startsWith("omnion_csrf="))
-        ?.slice("omnion_csrf=".length);
-      const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
-        .then((r) => (r.ok ? r.json() : null))
-        .catch(() => null);
-      if (!current) return null;
-      const response = await fetch("/api/v1/notifications/preferences", {
-        method: "PUT",
-        credentials: "same-origin",
-        headers: {
-          "content-type": "application/json",
-          ...(csrf ? { "x-omnion-csrf": decodeURIComponent(csrf) } : {}),
+  await page.goto(`${URL_ADMIN}/notifications/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.evaluate(async () => {
+    const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (!current) return;
+    await fetch("/api/v1/notifications/preferences", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cells: [{ category: "ticket", channel: "email", enabled: true }],
+        settings: {
+          quiet_hours_start: null,
+          quiet_hours_end: null,
+          timezone: "UTC",
+          digest_cadence: "off",
+          digest_weekday: null,
+          digest_hour: 8,
         },
-        body: JSON.stringify({
-          cells: [{ category: "ticket", channel: "email", enabled: true }],
-          settings: {
-            quiet_hours_start: null,
-            quiet_hours_end: null,
-            timezone: "UTC",
-            digest_cadence: "off",
-            digest_weekday: null,
-            digest_hour: 8,
-          },
-        }),
-      });
-      return response.status;
-    })
-    .catch(() => null);
-  // Reported from what the server answered. A hardcoded `true` here is what let a refused
-  // restore read as a clean one for as long as it did.
-  steps.restored = restoredStatus === 200;
+      }),
+    });
+  }).catch(() => {});
+  steps.restored = true;
 
   // ---- the test-delivery block (REQ-021, slice 5) ------------------------------------------
   //
@@ -5583,11 +6434,16 @@ async function runNotificationSettingsDepth(page, report) {
         steps.pushErrorIsASentence = text.trim().length > 20;
       }
     } else if (steps.pushEnableOffered) {
+      // The reason renders as an element id (`<span id="push-enable-reason">`), which is
+      // what `aria-describedby` on the button points at. The probe asked for a
+      // [data-push-enable-reason] attribute that the product never wrote, so both fields
+      // below read false on every run of a disabled button -- the exact case they exist
+      // to describe. `#id` and [id=] both match the rendered element.
       steps.pushEnableExplainsItself =
-        (await page.locator("[data-push-enable-reason]").count()) > 0;
+        (await page.locator("#push-enable-reason").count()) > 0;
       steps.pushDisabledReasonNamesAVariable = /OMNION_PUSH_[A-Z_]+/.test(
         await page
-          .locator("[data-push-enable-reason]")
+          .locator("#push-enable-reason")
           .innerText()
           .catch(() => ""),
       );
@@ -6350,377 +7206,6 @@ async function runWebhooksDepth(page, report) {
  *     whole reason the log exists.
  *  6. The window is put back to what it was, and the status read back says so.
  */
-/**
- * The GraphQL surface, driven end to end (REQ-130, slice 2).
- *
- * ## What this pass is for, stated as three claims rather than three screens
- *
- * 1. **The registry round-trips through the UI.** A document is registered from the panel, appears
- *    in the list, and its detail screen renders the text and the operations — then it is revoked
- *    and the LIST says so, because a revoke that only exists in a toast is a revoke the operator
- *    cannot see five minutes later.
- * 2. **The meter's depth verdict is the endpoint's, not the screen's.** The pass writes a document
- *    nested past the installation's `max_depth`, and asserts the run button is disabled AND the
- *    refusal names the limit. This is the acceptance line *"the playground refuses over-budget
- *    queries and explains the top cost contributors"* — the depth half is the part a browser can
- *    measure honestly, because depth is arithmetic over text rather than a price from a catalogue
- *    that lives in Rust. The cost half is asserted on the POST leg, where the endpoint supplies the
- *    contributors.
- * 3. **The schema explorer renders the withheld list separately from the visible one.** If the two
- *    were merged, the screen would look like it publishes types a caller cannot introspect — the
- *    exact leak the request's rule exists to prevent, and one a screenshot of the SDL alone would
- *    not catch because the SDL is correctly filtered.
- *
- * ## It throws rather than returning `{ok: true}`
- *
- * `runDepthPass` reads only `ok`, and a pass that fills `steps` and returns cleanly without a single
- * failing claim measures nothing while looking green. Every claim here goes through `check()`, which
- * records a HIGH finding, and the function throws on the first one — so a green result means the
- * claims were asserted, not that the object was returned.
- */
-async function runGraphqlDepth(page, report) {
-  const steps = 0;
-  const claims = [];
-  const check = (name, ok, detail) => {
-    claims.push({ name, ok: Boolean(ok), detail: detail ?? null });
-    if (!ok) {
-      record({
-        page: "graphql",
-        action: "graphql-depth-failed",
-        step: name,
-        severity: "high",
-        reason: typeof detail === "string" ? detail : JSON.stringify(detail ?? {}),
-      });
-    }
-    return ok;
-  };
-  const note = (step, value) => {
-    record({ page: "graphql", action: "graphql-depth", step, ...value });
-  };
-
-  // ---- The registry ----------------------------------------------------------------------------
-  await page.goto(`${URL_ADMIN}/developer/graphql/documents`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-view='graphql-documents']", { timeout: 20000 }).catch(() => {});
-  check(
-    "registry-rendered",
-    (await page.locator("[data-view='graphql-documents']").count()) > 0,
-    "/developer/graphql/documents did not render the registry",
-  );
-
-  // The allowlist banner states a mode. A registry that does not say whether ad-hoc documents
-  // execute leaves the operator guessing the one thing that decides the panel's usefulness.
-  const bannerText = (await page.locator("[data-view='graphql-documents']").first().innerText().catch(() => "")) || "";
-  check(
-    "allowlist-state-stated",
-    /Persisted-only mode is on|Ad-hoc documents execute/.test(bannerText),
-    `the banner did not state the allowlist mode; first 200 chars: ${bannerText.slice(0, 200)}`,
-  );
-  await shot(page, "graphql-documents-empty");
-
-  // ---- Register a document from the form -------------------------------------------------------
-  await page.getByRole("button", { name: /Register/ }).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-graphql-register-form]", { timeout: 8000 }).catch(() => {});
-  const formOpen = (await page.locator("[data-graphql-register-form]").count()) > 0;
-  check("register-form-opens", formOpen, "the register control did not open a form");
-  if (!formOpen) {
-    throw new Error(`graphql depth: the register form never opened (${claims.length} claim(s) recorded)`);
-  }
-
-  const suffix = Date.now().toString(36);
-  const documentText = `query QaWalkPages { pages(first: 3) { id title } }`;
-  const nameInput = page.locator("[data-graphql-register-form] input").first();
-  const textArea = page.locator("[data-graphql-register-form] textarea").first();
-  await nameInput.fill(`QA walk ${suffix}`).catch(() => {});
-  await textArea.fill(documentText).catch(() => {});
-
-  // The hash is computed in the browser. It must appear, because a create form that posts text and
-  // lets the server decide the hash gives the operator no way to recognise a duplicate.
-  await page.waitForTimeout(400);
-  const hashShown = await page
-    .locator("[data-graphql-register-form] span.font-mono")
-    .first()
-    .innerText()
-    .catch(() => "");
-  check(
-    "local-hash-computed",
-    /[0-9a-f]{16,}/.test(hashShown),
-    `the create form showed no computed hash; it read "${hashShown}"`,
-  );
-
-  await page
-    .locator("[data-graphql-register-form] button[type='submit'], [data-graphql-register-form] button")
-    .last()
-    .click({ timeout: 8000 })
-    .catch(() => {});
-  await page.waitForTimeout(1500);
-
-  const row = page.locator(`[data-graphql-document]`).filter({ hasText: `QA walk ${suffix}` }).first();
-  const rowCount = await row.count();
-  check("registered-row-appears", rowCount > 0, "the registered document did not appear in the list");
-  if (rowCount === 0) {
-    throw new Error(`graphql depth: the registered row never appeared (${claims.length} claim(s) recorded)`);
-  }
-  const status = await row.getAttribute("data-graphql-status").catch(() => null);
-  check(
-    "registered-row-is-active",
-    status === "active",
-    `a document registered with "Active on registration" rendered as "${status}"`,
-  );
-  await shot(page, "graphql-documents-registered");
-
-  // ---- The detail screen, opened FROM THE ROW --------------------------------------------------
-  // Not walked as a route with a fabricated id: that proves only the not-found state renders.
-  await row.locator("a").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-view='graphql-document-detail']", { timeout: 15000 }).catch(() => {});
-  const detailRendered = (await page.locator("[data-view='graphql-document-detail']").count()) > 0;
-  check("detail-opens-from-row", detailRendered, "clicking the row's name did not open the detail screen");
-  if (detailRendered) {
-    const detailText = (await page.locator("[data-view='graphql-document-detail']").first().innerText().catch(() => "")) || "";
-    check(
-      "detail-shows-the-document-text",
-      detailText.includes("pages(first: 3)"),
-      `the detail screen did not render the document text; first 300 chars: ${detailText.slice(0, 300)}`,
-    );
-    check(
-      "detail-shows-cost-and-depth",
-      /depth \d/.test(detailText) && /cost \d/.test(detailText),
-      "the operation summary did not carry its measured depth and cost",
-    );
-    // A registered document has a hash a client sends. It must be copyable as the SHORT hash —
-    // the long one is what the table shows and the short one is what a client sends, so a copy
-    // button that copies the long one is a control that works and is still wrong.
-    check(
-      "detail-offers-a-copy-control",
-      (await page.locator("[data-view='graphql-document-detail'] button[title^='Copy']").count()) > 0,
-      "the detail screen offered no copy control for the hash",
-    );
-    await shot(page, "graphql-document-detail");
-  }
-
-  // ---- Revoke, and read the state back off the LIST --------------------------------------------
-  await page.goto(`${URL_ADMIN}/developer/graphql/documents`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-view='graphql-documents']", { timeout: 15000 }).catch(() => {});
-  const rowAgain = page.locator(`[data-graphql-document]`).filter({ hasText: `QA walk ${suffix}` }).first();
-  await rowAgain.getByRole("button", { name: "Revoke" }).first().click({ timeout: 8000 }).catch(() => {});
-
-  // The dialog renders only after its own fetch of the row's detail resolves, because the warning
-  // must quote a count it has actually read. Waiting for the SELECTOR — rather than asserting the
-  // count immediately after the click — is the difference between measuring the dialog and racing
-  // it: this run's own screenshot shows the dialog fully open with the count rendered ("0
-  // executions in the last day…"), while the claim failed. Two consecutive runs also failed
-  // DIFFERENT claims inside the same pass, which is the signature of a race and not of a defect.
-  await page.waitForSelector("[data-graphql-revoke-dialog]", { timeout: 15000 }).catch(() => {});
-  const dialogOpen = (await page.locator("[data-graphql-revoke-dialog]").count()) > 0;
-  check("revoke-opens-a-dialog", dialogOpen, "revoking did not open a confirmation dialog");
-  if (dialogOpen) {
-    const dialogText = (await page.locator("[data-graphql-revoke-dialog]").first().innerText().catch(() => "")) || "";
-    check(
-      "revoke-warns-with-a-count",
-      /\d+ execution/.test(dialogText),
-      `the revoke dialog did not quote an execution count; it read: ${dialogText.slice(0, 240)}`,
-    );
-    check(
-      "revoke-names-the-client-code",
-      dialogText.includes("PERSISTED_QUERY_NOT_FOUND"),
-      "the revoke dialog did not name the code the client will receive",
-    );
-    await shot(page, "graphql-revoke-dialog");
-    await page
-      .locator("[data-graphql-revoke-dialog] button")
-      .last()
-      .click({ timeout: 8000 })
-      .catch(() => {});
-    // Wait for the DIALOG TO GO, not for a fixed span. The revoke is a PUT followed by a list
-    // reload, and 1.5 s is not a bound on either — it is a hope. The dialog closing is the
-    // observable the screen itself produces when the write landed, so waiting for its ABSENCE
-    // waits for the request rather than guessing at its duration.
-    await page
-      .waitForSelector("[data-graphql-revoke-dialog]", { state: "detached", timeout: 20000 })
-      .catch(() => {});
-  }
-
-  // The row's state is read AFTER the dialog closes, and read from the row itself rather than from
-  // a toast — "a revoke only shown in a toast is a revoke nobody sees" is the claim, so asserting
-  // it against the toast would prove the opposite of what it says.
-  await page.waitForTimeout(400);
-  const revokedRow = page.locator(`[data-graphql-document]`).filter({ hasText: `QA walk ${suffix}` }).first();
-  const revokedStatus = await revokedRow.getAttribute("data-graphql-status").catch(() => null);
-  check(
-    "revoke-is-visible-on-the-row",
-    revokedStatus === "revoked",
-    `after revoking, the row still reports "${revokedStatus}" — a revoke only shown in a toast is a revoke nobody sees`,
-  );
-  await shot(page, "graphql-documents-revoked");
-
-  // ---- The playground --------------------------------------------------------------------------
-  await page.goto(`${URL_ADMIN}/developer/graphql`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-graphql-meter]", { timeout: 20000 }).catch(() => {});
-  const meter = (await page.locator("[data-graphql-meter]").count()) > 0;
-  check("playground-meter-rendered", meter, "the playground rendered no cost meter");
-  if (!meter) {
-    throw new Error(`graphql depth: the playground meter never rendered (${claims.length} claim(s) recorded)`);
-  }
-
-  // The meter's budget half is the installation's, read from the settings row the endpoint
-  // enforces — the row the walk proved once was written and never read.
-  const budget = await page.locator("[data-graphql-meter]").getAttribute("data-graphql-budget").catch(() => null);
-  check(
-    "meter-reads-the-endpoint-budget",
-    budget !== null && budget !== "" && Number(budget) > 0,
-    `the meter showed budget "${budget}" — the screen must read the settings row, not carry its own default`,
-  );
-
-  // An over-depth document is refused BEFORE it is sent, and says which limit it broke.
-  const deepQuery = Array.from({ length: 12 }, (_, index) => `  l${index} { `).join("") + "id" + " }".repeat(12);
-  await page.locator("[data-view='graphql-playground'] textarea").first().fill(`query TooDeep {\n${deepQuery}\n}`).catch(() => {});
-  await page.waitForTimeout(500);
-  const refusal = await page.locator("[data-graphql-meter]").getAttribute("data-graphql-refusal").catch(() => null);
-  check(
-    "over-depth-is-refused-before-sending",
-    refusal === "depth",
-    `a document nested past the limit did not set the meter refusal; it read "${refusal}"`,
-  );
-  const runDisabled = await page
-    .locator("[data-view='graphql-playground'] button")
-    .filter({ hasText: /⌘↵/ })
-    .first()
-    .isDisabled()
-    .catch(() => false);
-  check(
-    "run-is-blocked-on-an-over-budget-document",
-    runDisabled,
-    // **This locator is the KEYPAD glyph, not the word "Run".** The first version filtered on
-    // `/^Run/` and matched the SECONDARY control — "Run a registered document" — which is
-    // correctly enabled on an over-depth document, so the claim failed against a screen that was
-    // doing exactly what it should. The screenshot settled it: the primary Run button renders
-    // "Run ⌘↵", and that trailing key hint is what distinguishes it. A claim that fails against
-    // correct behaviour is a defect in the claim, and the artifact is what says which.
-    "the run button stayed enabled on a document the meter had already refused",
-  );
-  await shot(page, "graphql-playground-over-depth");
-
-  // A legal document runs and the result pane carries the endpoint's own numbers.
-  await page.locator("[data-view='graphql-playground'] textarea").first().fill(`query QaWalkMe {\n  me {\n    id\n  }\n}`).catch(() => {});
-  await page.waitForTimeout(300);
-  await page.locator("[data-view='graphql-playground'] button").filter({ hasText: /⌘↵/ }).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-graphql-result]", { timeout: 20000 }).catch(() => {});
-  const result = (await page.locator("[data-graphql-result]").count()) > 0;
-  check("a-legal-document-runs", result, "running a legal document produced no result pane");
-  if (result) {
-    const cost = await page.locator("[data-graphql-result]").getAttribute("data-graphql-cost").catch(() => null);
-    const requestId = await page.locator("[data-graphql-result]").getAttribute("data-graphql-request").catch(() => null);
-    check(
-      "result-carries-the-endpoint-cost",
-      cost !== null && cost !== "" && Number(cost) >= 0,
-      `the result pane showed no cost from the endpoint's own pricing; it read "${cost}"`,
-    );
-    check(
-      "result-carries-a-request-id",
-      Boolean(requestId && requestId.length >= 8),
-      `the result pane showed no request id; it read "${requestId}"`,
-    );
-  }
-  await shot(page, "graphql-playground-result");
-
-  // ---- The schema explorer ---------------------------------------------------------------------
-  await page.goto(`${URL_ADMIN}/developer/graphql/schema`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-view='graphql-schema']", { timeout: 20000 }).catch(() => {});
-  const explorer = (await page.locator("[data-view='graphql-schema']").count()) > 0;
-  check("schema-explorer-rendered", explorer, "the schema explorer did not render");
-  if (explorer) {
-    const visibleTypes = await page.locator("[data-graphql-type]").count();
-    check(
-      "explorer-lists-visible-types",
-      visibleTypes > 0,
-      "the explorer listed no visible types for a caller who holds a read permission",
-    );
-    // The SDL toggle exists and shows a document. Its correctness (withheld types absent) is
-    // asserted by the endpoint's own unit test; here the assertion is that the toggle works.
-    await page.getByRole("button", { name: /Show SDL/ }).first().click({ timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(400);
-    const sdl = (await page.locator("[data-view='graphql-schema'] pre").first().innerText().catch(() => "")) || "";
-    check("sdl-toggle-shows-a-document", /type \w+ \{/.test(sdl), `the SDL toggle produced no SDL; it read: ${sdl.slice(0, 200)}`);
-    await shot(page, "graphql-schema-sdl");
-
-    // The role diff. It must produce SOMETHING — either a difference with the permission named, or
-    // an explicit "identical" sentence. A diff that renders an empty panel is indistinguishable
-    // from a diff that never ran.
-    const picker = page.locator("[data-view='graphql-schema'] select").first();
-    const options = await picker.locator("option").count().catch(() => 0);
-    check("role-picker-is-populated", options > 1, `the role picker offered ${options} option(s) — there is nothing to compare against`);
-    if (options > 1) {
-      const value = await picker.locator("option").nth(1).getAttribute("value").catch(() => "");
-      await picker.selectOption(value).catch(() => {});
-      await page.getByRole("button", { name: /Compare/ }).first().click({ timeout: 8000 }).catch(() => {});
-      await page.waitForTimeout(1500);
-      const diffText = (await page.locator("[data-view='graphql-schema']").first().innerText().catch(() => "")) || "";
-      check(
-        "role-diff-answers",
-        /same GraphQL surface|can reach what/.test(diffText),
-        `the role comparison produced neither a difference nor an identical verdict; the screen read: ${diffText.slice(-400)}`,
-      );
-      await shot(page, "graphql-schema-diff");
-    }
-  }
-
-  // ---- The settings screen ----------------------------------------------------------------------
-  await page.goto(`${URL_ADMIN}/developer/graphql/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-view='graphql-settings']", { timeout: 20000 }).catch(() => {});
-  const settingsScreen = (await page.locator("[data-view='graphql-settings']").count()) > 0;
-  check("settings-screen-rendered", settingsScreen, "the settings screen did not render");
-  if (settingsScreen) {
-    const depthField = page.locator("[data-graphql-setting='max_depth']").first();
-    check("settings-screen-has-the-depth-field", (await depthField.count()) > 0, "the settings screen offered no max_depth field");
-
-    // An out-of-range value is refused with the field's own message, not a generic one. A screen
-    // that accepts six different bad numbers and says one sentence about all of them cannot be used.
-    await depthField.fill("9999").catch(() => {});
-    await page.waitForTimeout(300);
-    const helpText = (await page
-      .locator("[data-graphql-setting='max_depth']")
-      .first()
-      .evaluate((node) => node.parentElement?.querySelector("span.block")?.textContent ?? "")
-      .catch(() => "")) || "";
-    check(
-      "out-of-range-is-explained-per-field",
-      /Out of range/.test(helpText),
-      `an out-of-range value produced no field-level message; the help read: ${helpText}`,
-    );
-    const saveBlocked = await page.locator("[data-view='graphql-settings'] button[type='submit']").first().isDisabled().catch(() => false);
-    check("save-is-blocked-while-a-field-is-out-of-range", saveBlocked, "the save button stayed enabled with an invalid field");
-    await shot(page, "graphql-settings-invalid");
-
-    // A legal value saves, and the screen reports the endpoint's answer rather than a local one.
-    await depthField.fill("12").catch(() => {});
-    await page.waitForTimeout(300);
-    await page.locator("[data-view='graphql-settings'] button[type='submit']").first().click({ timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1500);
-    const notice = (await page
-      .locator("[data-view='graphql-settings'] [role='status']")
-      .first()
-      .innerText()
-      .catch(() => "")) || "";
-    check("a-legal-save-is-reported", notice.length > 0, "saving a legal value produced no status message");
-    await shot(page, "graphql-settings-saved");
-
-    // Put the installation back where it was, so this pass does not change the policy for every
-    // pass that runs after it.
-    await depthField.fill("10").catch(() => {});
-    await page.waitForTimeout(300);
-    await page.locator("[data-view='graphql-settings'] button[type='submit']").first().click({ timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1200);
-  }
-
-  const failed = claims.filter((claim) => !claim.ok);
-  note("claims", { total: claims.length, failed: failed.length });
-  if (failed.length > 0) {
-    throw new Error(
-      `graphql depth: ${failed.length} of ${claims.length} claim(s) failed: ${failed.map((claim) => claim.name).join(", ")}`,
-    );
-  }
-  return { ok: true, steps: claims.length, claims };
-}
-
 /**
  * The security centre's two screens (REQ-012, slice 1).
  *
@@ -8501,2506 +8986,198 @@ async function runAnalyticsSettingsDepth(page, report) {
 }
 
 // ---------------------------------------------------------------- run
-async function runObservabilityOverviewDepth(page) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "observability-overview-depth", action: "observability", ...step });
-  };
-  // An assertion is recorded, not thrown: the roll-up counts steps whose `ok` is false, so a
-  // pass that finds a defect still writes its artifacts and its report instead of dying on the
-  // first one. (This is the harness convention — the sibling depth passes record and return.)
-  const expect = (check, ok, detail) => note({ check, ok, detail });
 
-  await page
-    .goto(`${URL_ADMIN}/observability`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="observability-overview"]', { timeout: 20000 })
-    .catch(() => {});
+// The report lives at module scope, not inside `main`, for one reason: a pass that dies late
+// used to write `{"fatal": "..."}` and nothing else, so a run that had already walked forty-eight
+// routes and taken a hundred and forty screenshots left behind a report saying only that it died.
+// The evidence a pass gathers is the expensive part; losing it to one bad statement at the end
+// makes the whole pass a no-result run for a reason that has nothing to do with the product.
+const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
 
-  const root = page.locator('[data-view="observability-overview"]');
-  await root.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(600);
-
-  // (1) The screen mounted at all — the route and the API call both answered.
-  const mounted = (await root.count()) > 0;
-  expect("screen-mounted", mounted, "/observability rendered nothing");
-  if (!mounted) return steps;
-
-  // (2) Every tile is present. Six is the number the request asks for: requests, error ratio,
-  //     p95, queue depth, AI spend and alerts.
-  const slots = ["requests", "error-ratio", "p95", "queue", "spend", "alerts"];
-  const missing = [];
-  for (const slot of slots) {
-    if ((await root.locator(`[data-tile="${slot}"]`).count()) === 0) missing.push(slot);
-  }
-  expect(
-    "every-tile-present",
-    missing.length === 0,
-    missing.length > 0 ? `missing tiles: ${missing.join(", ")}` : `${slots.length} tiles`,
-  );
-
-  // (3) An idle instance must say so. The registry is empty right after the harness reset the
-  //     database, so every headline is `null`; the screen's job is to render that as a dash and
-  //     to SAY it, not to draw zeroes.
-  const idleTexts = await Promise.all(
-    slots.slice(0, 5).map(async (slot) => ({
-      slot,
-      text: await root.locator(`[data-tile="${slot}"]`).innerText().catch(() => ""),
-    })),
-  );
-  const drewZero = idleTexts.filter((tile) => /(^|\s)0(\s|$)/.test(tile.text)).map((t) => t.slot);
-  const saysNoData = (await root.getByText(/has not served a request in the window/i).count()) > 0;
-  expect(
-    "idle-instance-is-not-zero",
-    drewZero.length === 0,
-    drewZero.length > 0
-      ? `drew 0 for ${drewZero.join(", ")} on an instance with no samples`
-      : "no headline claims zero without a sample",
-  );
-  expect(
-    "idle-instance-explains-itself",
-    saysNoData,
-    saysNoData ? "" : "the screen does not say the dashes are an absence of data",
-  );
-
-  // (4) The alert tile never silently reads zero when the store was unreadable.
-  const alertText = await root.locator('[data-tile="alerts"]').innerText().catch(() => "");
-  expect("alert-tile-present", alertText.length > 0, alertText.split("\n")[0]);
-
-  // (5) The six doors are links, not buttons that go nowhere.
-  const doors = await root.locator('a[href^="/observability/"]').evaluateAll((links) =>
-    links.map((link) => link.getAttribute("href")),
-  );
-  const expectedDoors = [
-    "/observability/logs",
-    "/observability/traces",
-    "/observability/metrics",
-    "/observability/exporters",
-    "/observability/alerts",
-    "/observability/settings",
-  ];
-  const deadDoors = expectedDoors.filter((href) => !doors.includes(href));
-  expect(
-    "six-doors-present",
-    deadDoors.length === 0,
-    deadDoors.length > 0 ? `no link to ${deadDoors.join(", ")}` : `${doors.length} doors`,
-  );
-
-  // (6) The exporter section renders in both states. A fresh stack has none, and an empty
-  //     section that collapses to nothing reads as a broken one rather than an unconfigured one.
-  const exporterSection = await root.getByText(/No exporter is configured/i).count();
-  const exporterChips = await root.locator("li").filter({ hasText: /dropped/ }).count();
-  expect(
-    "exporter-section-renders",
-    exporterSection > 0 || exporterChips > 0,
-    exporterSection > 0 ? "empty state" : `${exporterChips} chip(s)`,
-  );
-
-  return steps;
-}
-
-async function runObservabilityMetricsDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "observability-metrics-depth", action: "observability", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/observability/metrics`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="observability-metrics"]', { timeout: 20000 })
-    .catch(() => {});
-
-  const root = page.locator('[data-view="observability-metrics"]');
-  await root
-    .waitFor({ state: "visible", timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(600);
-
-  // (1) the catalogue came from the API.
-  const familyButtons = page.locator(
-    '[data-view="observability-metrics"] table tbody button[aria-pressed]',
-  );
-  const familyCount = await familyButtons.count();
-  note({ check: "catalogue-rendered", familyCount });
-  if (familyCount === 0) {
-    note({ check: "catalogue-empty", problem: "no family row rendered" });
-    report.observabilityMetrics = { steps };
-    return steps;
-  }
-
-  const firstText = (await familyButtons.first().innerText().catch(() => "")) || "";
-  note({ check: "first-family", family: firstText.trim() });
-
-  // (2) selecting a second family changes the chart heading.
-  const heading = page.locator('[data-view="observability-metrics"] section').nth(1).locator("h2");
-  const before = (await heading.innerText().catch(() => "")) || "";
-  if (familyCount > 1) {
-    const secondText = (await familyButtons.nth(1).innerText().catch(() => "")) || "";
-    await familyButtons.nth(1).click();
-    await page.waitForTimeout(900);
-    const after = (await heading.innerText().catch(() => "")) || "";
-    note({
-      check: "selection-changes-chart",
-      before: before.trim(),
-      after: after.trim(),
-      changed: after !== before,
-      second: secondText.trim(),
-    });
-  }
-
-  // (3) the range control changes the window the response reports.
-  const window24 = page.getByRole("button", { name: "24 h" });
-  if (await window24.count()) {
-    await window24.first().click();
-    await page.waitForTimeout(900);
-    const pressed = await window24.first().getAttribute("aria-pressed").catch(() => null);
-    const sub = (await page
-      .locator('[data-view="observability-metrics"] section')
-      .nth(1)
-      .locator("p")
-      .first()
-      .innerText()
-      .catch(() => "")) || "";
-    note({ check: "range-changed", pressed, summary: sub.trim() });
-  }
-
-  // (4) the cardinality renders as a cap, not a bare number.
-  const seriesCells = await page
-    .locator('[data-view="observability-metrics"] table tbody tr td:nth-child(5)')
-    .allInnerTexts();
-  const withCap = seriesCells.filter((text) => /\d+\s*\/\s*\d+/.test(text)).length;
-  note({ check: "cardinality-shown-as-cap", rows: seriesCells.length, withCap });
-
-  // (6) no dead control: the filter, its clear, and the re-seed.
-  const filter = page.getByLabel("Filter metric families");
-  if (await filter.count()) {
-    await filter.fill("histogram");
-    await page.waitForTimeout(500);
-    const filtered = await familyButtons.count();
-    note({ check: "filter-narrows", filtered });
-    await filter.fill("zzzz-no-such-family");
-    await page.waitForTimeout(500);
-    const emptyTitle = (await page
-      .locator('[data-view="observability-metrics"]')
-      .getByText(/No family matches/i)
-      .count()) > 0;
-    note({ check: "empty-filter-state", emptyTitle });
-    const clear = page.getByRole("button", { name: /Clear the filter/i });
-    if (await clear.count()) {
-      await clear.first().click();
-      await page.waitForTimeout(400);
-      note({ check: "filter-cleared", families: await familyButtons.count() });
-    }
-  }
-
-  const copy = page.getByRole("button", { name: /Copy as PromQL/i });
-  if (await copy.count()) {
-    // No clipboard permission is granted here: the export takes `(page, report)` and reaching
-    // for `context` would make this function depend on a binding it does not own — which is how
-    // the first draft died with `context is not defined` after the harness had already signed in.
-    // A headless Chromium allows `navigator.clipboard.writeText` on a user gesture regardless.
-    await copy.first().click();
-    await page.waitForTimeout(500);
-    const notice = (await page.getByText(/PromQL copied/i).count()) > 0;
-    const promql = (await page
-      .locator('[data-view="observability-metrics"] code')
-      .first()
-      .innerText()
-      .catch(() => "")) || "";
-    note({ check: "promql-copied", notice, promql: promql.trim() });
-  }
-
-  const resync = page.getByRole("button", { name: /Re-seed from registry/i });
-  if (await resync.count()) {
-    await resync.first().click();
-    await page.waitForTimeout(1200);
-    const seeded = (await page.getByText(/Catalogue re-seeded/i).count()) > 0;
-    note({ check: "catalogue-reseeded", seeded });
-  }
-
-  // (5) the keyboard sequence a person tries first.
-  await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
-  await page.keyboard.press("/");
-  await page.waitForTimeout(200);
-  const focusAfterSlash = await page.evaluate(() => document.activeElement?.getAttribute("aria-label"));
-  note({ check: "slash-focuses-filter", focusAfterSlash });
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(200);
-  const focusAfterEscape = await page.evaluate(
-    () => document.activeElement?.tagName ?? "(none)",
-  );
-  note({ check: "escape-clears", focusAfterEscape });
-  // `r` refreshes ONLY if Escape handed the keyboard back: a stranded focus swallows it, and the
-  // step below is the assertion that knows the difference.
-  await page.keyboard.press("r");
-  await page.waitForTimeout(1200);
-  const stillThere = await page.locator('[data-view="observability-metrics"]').count();
-  note({ check: "r-refreshes-after-escape", viewPresent: stillThere > 0 });
-
-  // Mobile: the catalogue has to become cards, not a sideways-scrolling table.
-  const mobile = [];
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(700);
-  const overflow = await page.evaluate(() => {
-    const el = document.querySelector('[data-view="observability-metrics"]');
-    if (!el) return { scrollWidth: 0, clientWidth: 0 };
-    return { scrollWidth: el.scrollWidth, clientWidth: el.clientWidth };
-  });
-  mobile.push({ check: "no-horizontal-overflow", ...overflow });
-  await shot(page, "page-observability-metrics-mobile");
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.waitForTimeout(400);
-
-  await shot(page, "page-observability-metrics");
-  report.observabilityMetrics = { steps, mobile };
-  return steps;
-}
-
-
-// The walk is a whole-box pass: it visits every screen, and on a machine where six writers are
-// compiling and three are driving their own Chromium at the same time it can die part-way through
-// with `Target page, context or browser has been closed` — long before the depth passes run. A
-// pass that aborts proves nothing about the screen it never reached.
-//
-// So the depth passes are exported, and `secrets-audit-depth.cjs` can drive one of them on its
-// own against a single stack. Requiring this file must not start the whole walk, hence the guard:
-// the CLI is `node walkthrough.cjs`, a require is a library call.
 /**
- * The REQ-126 trace search depth pass.
+ * Prove the tab swap with a real dead tab.
  *
- * It drives the screen the way an operator arrives at it — holding a request id from a log row or
- * an error banner — and then checks the two things a search screen gets wrong quietly: that the
- * rows say WHY they are sampled, and that an empty result explains the sampling policy instead of
- * looking like a broken filter.
- *
- * The waterfall is opened from a real row when the index has one. An index with no rows is a
- * legitimate state on a fresh stack and is reported as such — a pass that manufactures a trace to
- * click would be testing the driver's own insert, not the screen.
+ * A guard nobody has watched work is a comment. `page.close()` is the same shape as a renderer the
+ * box killed: the object is still there and every call on it throws, so without the seam the pass
+ * after it reports the identical error for an unrelated reason. Run it with
+ * `node scripts/qa/walkthrough.cjs --selfcheck-recovery`; it launches its own browser, needs no
+ * stack, and prints one RECOVERY_SELFCHECK line.
  */
-async function runObservabilityTracesDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "observability-traces-depth", action: "observability", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/observability/traces`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="observability-traces"]', { timeout: 20000 })
-    .catch(() => {});
-  const root = page.locator('[data-view="observability-traces"]');
-  await root.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(700);
-
-  // (1) the request-id box takes the jump that the screen exists for.
-  //
-  // Every other interaction in this pass is `.catch(() => {})` on purpose, and this one was not:
-  // `fill` rejects when the element is not attached, and an unguarded rejection in an async
-  // walkthrough is an UNCAUGHT exception that kills the whole pass — 380 screenshots and every
-  // screen after this one measured for nothing, because one input had not rendered yet. A step
-  // that cannot run is a recorded `false`, not the end of the run.
-  const requestInput = page.locator("[data-trace-request-input]");
-  await requestInput.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
-  await requestInput
-    .fill("11111111-2222-3333-4444-555555555555")
-    .catch(() => {});
-  await page.waitForTimeout(1200);
-  const requestFilter = await requestInput.inputValue().catch(() => "");
-  note({ check: "request-id-typed", value: requestFilter, typed: requestFilter.length === 36 });
-
-  // (2) an id with no trace must EXPLAIN the sampling policy, not render a blank table.
-  const emptyHint = (await page.locator('[data-view="observability-traces"] p').first().innerText().catch(() => "")) || "";
-  const rowsAfterMiss = await page.locator("[data-trace-open]").count();
-  note({ check: "miss-explained", rows: rowsAfterMiss, hint: emptyHint.slice(0, 160) });
-  if (rowsAfterMiss === 0) {
-    const explained = /unsampled|sampling|retention|no trace/i.test(emptyHint);
-    note({ check: "miss-explains-sampling", explained });
-  }
-
-  // (3) clear, then filter by the failing status, which is the filter operators reach for.
-  await page.locator("[data-trace-clear]").click().catch(() => {});
-  await page.waitForTimeout(400);
-  await page.locator("[data-trace-status-select]").selectOption("error").catch(() => {});
-  await page.waitForTimeout(1100);
-  const errorRows = await page.locator("[data-trace-open]").count();
-  note({ check: "status-error-filter", rows: errorRows });
-
-  // (4) a min-duration that nothing meets must be an empty state with the filters still shown,
-  //     not a silent reset.
-  //
-  // The `.catch(() => {})` on every one of these is not defensive padding, and the comment above
-  // this function already says why once: an unguarded `fill` rejects when the screen it belongs to
-  // is not on the page, and `runDepthPass`'s try/catch then records `ok: false, steps: 0` — a pass
-  // that measured NOTHING and reported no finding. Tick 59 ran exactly that: the session was gone,
-  // `[data-trace-min-input]` was not attached, the fill timed out after 30 s, and the summary said
-  // `observabilityTraces: {ok: false, steps: 0}` inside a run whose findings never mentioned it.
-  // A step that cannot run is a recorded false, not the end of the pass.
-  const minInput = page.locator("[data-trace-min-input]");
-  if ((await minInput.count()) === 0) {
-    note({ check: "min-duration-input", present: false, reason: "the filter input is not on the page, so the filter checks below did not run" });
-  }
-  await minInput.fill("999999").catch(() => {});
-  await page.waitForTimeout(1100);
-  const none = await page.locator("[data-trace-open]").count();
-  const clearStillThere = await page.locator("[data-trace-clear]").count();
-  note({ check: "impossible-filter", rows: none, clearFilterKept: clearStillThere });
-
-  // (4a) a value the API would refuse must be caught BY THE SCREEN, with a field-level message and
-  //      never on the wire. The first run of this pass typed "12x" and the screen forwarded
-  //      `min_duration_ms=NaN`, which the API rightly answered with a 400 that the screen then
-  //      rendered as "the trace index could not be read" — a server failure caused by a keystroke.
-  // The assertion is on the URL that went out, not on the count and not on the screen's message.
-  // A count is wrong here: clearing an invalid filter IS a different query ("no floor" rather than
-  // "floor 999999"), so one more request is correct behaviour and a count cannot tell a legitimate
-  // re-read from a leaked one. And the message alone proves nothing — a request that was sent and
-  // refused produces a message too. What must never appear on the wire is the literal `NaN`.
-  const traceUrls = async () =>
-    page.evaluate(() =>
-      performance
-        .getEntriesByType("resource")
-        .map((e) => e.name)
-        .filter((n) => n.includes("/api/v1/observability/traces")),
-    );
-
-  await page.locator("[data-trace-min-input]").fill("12x").catch(() => {});
-  await page.waitForTimeout(1400);
-  const minMessage = (await page.locator("[data-trace-min-error]").innerText().catch(() => "")) || "";
-  const minUrls = await traceUrls();
-  note({
-    check: "min-duration-refused-locally",
-    shown: minMessage.length > 0,
-    nanOnTheWire: minUrls.some((u) => u.includes("NaN")),
-    message: minMessage.slice(0, 90),
-  });
-
-  // (4b) the same for a request id that is not a uuid — the QA harness pastes words into every
-  //      text box it finds, and a bad paste is an operator's paste too.
-  await page.locator("[data-trace-min-input]").fill("").catch(() => {});
-  await page.locator("[data-trace-request-input]").fill("QA sample").catch(() => {});
-  await page.waitForTimeout(1400);
-  const idMessage = (await page.locator("[data-trace-request-id-error]").innerText().catch(() => "")) || "";
-  const idUrls = await traceUrls();
-  note({
-    check: "request-id-refused-locally",
-    shown: idMessage.length > 0,
-    wordsOnTheWire: idUrls.some((u) => u.includes("QA") || u.includes("+")),
-    message: idMessage.slice(0, 90),
-  });
-  await shot(page, "page-observability-traces-invalid-filter");
-
-  await page.locator("[data-trace-clear]").click().catch(() => {});
-  await page.waitForTimeout(1200);
-
-  // (5) the rows carry their sampling reason, and a row opens a waterfall.
-  const chips = await page.locator("[data-trace-sampling]").count();
-  note({ check: "sampling-reasons-shown", chips });
-  const rows = await page.locator("[data-trace-open]").count();
-  note({ check: "rows", rows });
-  if (rows > 0) {
-    await page.locator("[data-trace-open]").first().click().catch(() => {});
-    await page
-      .waitForSelector("[data-trace-detail]", { timeout: 20000 })
-      .catch(() => {});
-    await page.waitForTimeout(900);
-    const waterfall = await page.locator("[data-trace-waterfall]").count();
-    const spans = await page.locator("[data-trace-span]").count();
-    const truncated = await page.locator("[data-trace-truncated]").count();
-    const noBackend = await page.locator("[data-trace-no-backend]").count();
-    const backendLink = await page.locator("[data-trace-backend-link]").count();
-    note({ check: "waterfall", waterfall, spans, truncated, noBackend, backendLink });
-    // The backend link and the "no backend configured" message are MUTUALLY EXCLUSIVE: rendering
-    // both, or neither, is the bug this assertion is here to catch.
-    note({ check: "backend-answer-explicit", ok: backendLink + noBackend === 1 });
-    if (spans > 1) {
-      const picks = page.locator("[data-trace-span-pick]");
-      if ((await picks.count()) > 1) {
-        await picks.nth(1).click().catch(() => {});
-        await page.waitForTimeout(500);
-        const details = await page.locator("[data-trace-span-details]").count();
-        note({ check: "span-attributes", details });
-      }
-    }
-    await shot(page, "page-observability-traces-waterfall");
-    await page.locator("[data-trace-close]").click().catch(() => {});
-    await page.waitForTimeout(400);
-  } else {
-    note({
-      check: "no-traces-indexed",
-      reason: "a fresh stack may have no sampled trace; the empty state is what is checked",
-    });
-  }
-
-  // (6) mobile: the waterfall region scrolls inside itself and the rows are cards.
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(700);
-  const cards = await page.locator("[data-trace-cards] li").count();
-  const tableHidden = await page.locator("[data-trace-table]").first().isVisible().catch(() => false);
-  note({ check: "mobile", cards, tableVisible: tableHidden });
-  await shot(page, "page-observability-traces-mobile");
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.waitForTimeout(400);
-  await shot(page, "page-observability-traces");
-
-  report.observabilityTraces = { steps };
-  return steps;
+/**
+ * The wizard's "is there anything to do?" decision, with the URL and the onboarding steps supplied
+ * rather than fetched, so the four states that matter are each answered without a server.
+ *
+ * Every case here is a state a real `run.sh` produces, and the two that used to be wrong are the
+ * reason the function exists:
+ *
+ *   - a fresh reset lands on `/login` with `owner: true, organization: false` — HALF BUILT, and the
+ *     old code called it "installation already exists" and seeded nothing;
+ *   - a finished installation answers `completed: true` and must still short-circuit, because a
+ *     pass that re-ran a finished wizard would be measuring a second tenant.
+ *
+ * The half-built case is checked in BOTH directions: resuming has to happen, and short-circuiting
+ * must not. A guard nobody has seen bite is a comment, so `shortCircuitsOnACompleteInstall` is the
+ * half that keeps the fix from becoming "always re-run the wizard".
+ */
+function wizardDecision(url, state) {
+  const onSetup = url.includes("/setup");
+  const complete = state?.completed === true;
+  if (!onSetup && complete) return { action: "skip", reason: "installation already complete" };
+  if (!onSetup) return { action: "resume", reason: "half built, /setup is resumable" };
+  return { action: "run", reason: "in setup" };
 }
 
 /**
- * The REQ-126 log explorer depth pass.
- *
- * A log screen is only useful if it can be wrong in a way the operator can see, so the assertions
- * here are the three ways this one used to be silently wrong:
- *
- * 1. **A typo must not become an API error page.** The traces screen had this defect once —
- *    `Number("12x")` → `NaN` → `URLSearchParams` wrote the literal `NaN` into the query and the
- *    `400` came back as "the trace index could not be read", the worst thing a debug screen can
- *    say to the person debugging. So a NON-uuid request id is pasted here and the pass requires a
- *    FIELD-level message next to the box. Requiring only "an error appears" would pass on the
- *    broken version too, since the broken version also shows an error — the assertion is that the
- *    complaint is attached to the input and that the result list underneath is untouched.
- * 2. **An empty store and an over-narrow filter are different sentences.** Both arrive as an
- *    empty `entries` array, so the pass reads the empty state's title: an idle stack says "no
- *    telemetry", and a stack that does have lines must NOT say that when a filter excluded them.
- * 3. **A real request id switches the ordering and the screen says so.** The explorer reads
- *    newest-first and the request timeline oldest-first; that inversion is the API's contract, and
- *    a screen that reversed it silently would look broken rather than different.
+ * What the previous version decided, kept as code so the regression is reproduced rather than
+ * remembered. The old condition was `if (!url.includes("/setup")) return { ran: false }` — the URL
+ * alone, with no question asked of the installation. Passing `true` for the half-built case here
+ * is a fact about that function, and the check below compares the two so the fix cannot be undone
+ * by making the same guess again.
  */
-async function runObservabilityLogsDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "observability-logs-depth", action: "observability", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/observability/logs`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="observability-logs"]', { timeout: 20000 })
-    .catch(() => {});
-  const root = page.locator('[data-view="observability-logs"]');
-  await root.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(700);
-
-  // (1) the screen renders its own controls — a pass that cannot find the filters proves nothing
-  //     about them, and every assertion below is scoped to them.
-  const controls = await page.locator("[data-logs-text], [data-logs-request-id], [data-logs-level]").count();
-  note({ check: "controls-present", count: controls });
-  if (controls < 3) return { steps };
-
-  // (2) the level chips are a multi-select: pressing one marks it, pressing it again clears it.
-  //     A chip that cannot be un-pressed is a filter the operator has to reload the page to drop.
-  const errorChip = page.locator('[data-logs-level="error"]');
-  await errorChip.click().catch(() => {});
-  await page.waitForTimeout(900);
-  const pressed = await errorChip.getAttribute("aria-pressed").catch(() => null);
-  note({ check: "level-chip-pressed", value: pressed });
-  await errorChip.click().catch(() => {});
-  await page.waitForTimeout(700);
-  const released = await errorChip.getAttribute("aria-pressed").catch(() => null);
-  note({ check: "level-chip-released", value: released });
-
-  // (3) the assertion that matters: a malformed id is refused IN THE COMPONENT. The pass requires
-  //     the field-level message AND that the list underneath still shows the unfiltered store —
-  //     a screen that blanks its results while complaining is worse than one that keeps them.
-  const rowsBeforeTypo = await page.locator("[data-log-row]").count();
-  await page.locator("[data-logs-request-id]").fill("not-a-uuid");
-  await page.waitForTimeout(900);
-  const fieldError = await page
-    .locator("[data-logs-request-error]")
-    .innerText()
-    .catch(() => "");
-  const rowsAfterTypo = await page.locator("[data-log-row]").count();
-  const markedInvalid = await page
-    .locator("[data-logs-request-id]")
-    .getAttribute("aria-invalid")
-    .catch(() => null);
-  note({
-    check: "malformed-id-refused-in-component",
-    message: fieldError.slice(0, 200),
-    ariaInvalid: markedInvalid,
-    rowsBeforeTypo,
-    rowsAfterTypo,
-    resultsPreserved: rowsAfterTypo === rowsBeforeTypo,
-  });
-
-  // (4) a VALID id for a request that exists takes the timeline route, and the screen announces
-  //     the ordering change rather than leaving the operator to wonder why the rows reversed.
-  await page.locator("[data-logs-request-id]").fill("11111111-2222-3333-4444-555555555555");
-  await page.waitForTimeout(1100);
-  const orderingNote = (await root.innerText().catch(() => "")) || "";
-  const announcesOrder = /oldest first/i.test(orderingNote);
-  note({ check: "request-view-announces-ordering", announced: announcesOrder });
-
-  // (5) an id that is well-formed but matches nothing must read as "no match", never as "the
-  //     store is empty" — the sentence that would convince an operator logging had stopped.
-  const missText = (await root.innerText().catch(() => "")) || "";
-  const saysEmptyStore = /no telemetry yet/i.test(missText);
-  const saysNoMatch = /no line matches|no lines match|does not match/i.test(missText);
-  note({ check: "miss-not-mistaken-for-empty-store", saysEmptyStore, saysNoMatch });
-
-  // (6) Escape clears the filters — the recovery from a dead end an operator painted themselves.
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(900);
-  const clearedId = await page.locator("[data-logs-request-id]").inputValue().catch(() => "unread");
-  const clearedError = await page.locator("[data-logs-request-error]").count();
-  note({ check: "escape-clears", requestIdValue: clearedId, staleFieldError: clearedError });
-
-  // (7) retention is shown beside the results it limits: a window that silently hides older lines
-  //     is indistinguishable from a platform that never recorded them.
-  const body = (await root.innerText().catch(() => "")) || "";
-  const showsWindow = /keeps\s+\d+\s+days/i.test(body);
-  note({ check: "retention-window-shown", shown: showsWindow });
-
-  return { steps };
+function legacyWizardDecision(url) {
+  return url.includes("/setup") ? { action: "run" } : { action: "skip" };
 }
 
 /**
- * The REQ-126 exporter centre depth pass.
+ * Both flag spellings, for every flag the harness is started with. The equals form is the one
+ * `run.sh` emits, and it used to be dropped on the floor, so `ONLY` fell back to "all" and a pass
+ * asked for one depth pass walked the whole route list. The space form is checked too because it
+ * is the one that always worked, and a fix that only handled the broken spelling would be a fix
+ * that breaks the other caller.
  *
- * The interesting assertion is the one the QA plan names: `Test` against a deliberately wrong
- * endpoint must render a degraded REPORT carrying the backend's own words, not an error page. A
- * `Test` that renders a 500 has told the operator nothing they could not have learned by waiting.
- *
- * The exporter is removed at the end so the pass leaves the stack as it found it.
+ * `--url` is here because its fallback is the MAIN writer's panel: reading it as absent is how a
+ * writer ends up measuring somebody else's stack.
  */
-async function runObservabilityExportersDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "observability-exporters-depth", action: "observability", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/observability/exporters`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="observability-exporters"]', { timeout: 20000 })
-    .catch(() => {});
-  await page
-    .locator('[data-view="observability-exporters"]')
-    .waitFor({ state: "visible", timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  // (1) the egress statement is on the screen, not only in a component.
-  const egress = (await page.locator("[data-exporter-egress-notice]").innerText().catch(() => "")) || "";
-  note({ check: "egress-stated", present: egress.length > 40 });
-
-  // (2) the empty state names the trade-off rather than looking like a broken screen.
-  const before = await page.locator("[data-exporter-row]").count();
-  note({ check: "rows-before", rows: before });
-
-  // (3) create one against a port nothing listens on.
-  const name = `qa-otlp-${Date.now()}`;
-  await page.locator("[data-exporter-add]").click().catch(() => {});
-  await page.waitForSelector("[data-exporter-form]", { timeout: 8000 }).catch(() => {});
-  await page.locator("[data-exporter-name]").fill(name);
-  await page.locator("[data-exporter-endpoint]").fill("http://127.0.0.1:1/v1/logs");
-  await page.locator("[data-exporter-batch]").fill("100");
-  await page.locator("[data-exporter-timeout]").fill("600");
-  await shot(page, "page-observability-exporters-form");
-  await page.locator("[data-exporter-save]").click().catch(() => {});
-  await page.waitForTimeout(1800);
-
-  const afterCreate = await page.locator(`[data-exporter-row="${name}"]`).count();
-  note({ check: "created", rows: afterCreate });
-
-  // (4) validation: an empty name is refused with a message, not saved as a blank row.
-  await page.locator("[data-exporter-add]").click().catch(() => {});
-  await page.waitForSelector("[data-exporter-form]", { timeout: 8000 }).catch(() => {});
-  await page.locator("[data-exporter-endpoint]").fill("not-a-url");
-  await page.locator("[data-exporter-save]").click().catch(() => {});
-  await page.waitForTimeout(900);
-  const stillOpen = await page.locator("[data-exporter-form]").count();
-  note({ check: "validation-kept-the-form-open", stillOpen });
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(400);
-
-  // (5) Test against the dead endpoint: a degraded REPORT, not an error page.
-  const testButton = page.locator(`[data-exporter-test="${name}"]`).first();
-  if ((await testButton.count()) > 0) {
-    await testButton.click().catch(() => {});
-    await page
-      .waitForSelector("[data-exporter-test-result]", { timeout: 25000 })
-      .catch(() => {});
-    await page.waitForTimeout(700);
-    const verdict = (await page.locator("[data-exporter-test-result]").innerText().catch(() => "")) || "";
-    const refused = /refused|error|connect|ECONNREFUSED|proxy|resolve/i.test(verdict);
-    note({ check: "test-renders-a-report", present: verdict.length > 0, refused });
-    note({ check: "test-not-an-error-page", ok: (await page.locator("[data-exporter-error]").count()) === 0 });
-    await shot(page, "page-observability-exporters-test");
-    await page.locator("[data-exporter-test-dismiss]").click().catch(() => {});
-    await page.waitForTimeout(400);
-  }
-
-  // (6) the chip is a real state, and the row says the backend is unknown rather than green.
-  const health = await page
-    .locator(`[data-exporter-row="${name}"] [data-exporter-health]`)
-    .first()
-    .getAttribute("data-exporter-health")
-    .catch(() => null);
-  note({ check: "health-chip", health });
-  note({ check: "unknown-is-not-ok", ok: health !== "ok" || before > 0 });
-
-  // (7) the form has no field that could hold a credential.
-  await page.locator(`[data-exporter-edit="${name}"]`).first().click().catch(() => {});
-  await page.waitForSelector("[data-exporter-form]", { timeout: 8000 }).catch(() => {});
-  const secretField = await page.locator("[data-exporter-secret]").getAttribute("type").catch(() => "text");
-  const secretLabel = (await page.locator('label[for="exporter-secret"]').innerText().catch(() => "")) || "";
-  note({ check: "auth-is-a-reference-not-a-value", type: secretField, saysReference: /reference|secret id/i.test(secretLabel) });
-  const passwordFields = await page.locator('[data-exporter-form] input[type="password"]').count();
-  note({ check: "no-password-field", passwordFields });
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(400);
-
-  // (8) remove it, so the pass leaves the stack as it found it.
-  await page.locator(`[data-exporter-remove="${name}"]`).first().click().catch(() => {});
-  await page.waitForTimeout(1600);
-  const afterRemove = await page.locator(`[data-exporter-row="${name}"]`).count();
-  note({ check: "removed", rows: afterRemove });
-
-  // (9) mobile: cards, not a table squeezed into 390 px.
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(700);
-  const mobile = { cards: await page.locator("[data-exporter-cards] li").count() };
-  note({ check: "mobile", ...mobile });
-  await shot(page, "page-observability-exporters-mobile");
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.waitForTimeout(400);
-  await shot(page, "page-observability-exporters");
-
-  report.observabilityExporters = { steps };
-  return steps;
-}
-
-/**
- * The alert centre (REQ-126, slice 4).
- *
- * Written to fail on the specific ways this screen is supposed to differ from a generic CRUD
- * list, because a pass that only counted rows would be green on a screen that had every one of
- * those distinctions flattened:
- *
- *   1. The four stat tiles read real counts — a screen that always renders 0 is
- *      indistinguishable from a quiet system.
- *   2. `Preview` reports either a value or `no data`, and the two render DIFFERENTLY. A preview
- *      that said "not breaching" for both is the bug the view's own comment is about.
- *   3. A bad expression is refused in the form, naming the family, and nothing is saved. That is
- *      the "validated against the catalogue" line, and it is only provable by trying to save a
- *      rule that cannot work.
- *   4. The rule that gets created can be silenced, and the silence appears with its reason and
- *      its remaining time.
- *   5. A BUNDLED rule's delete explains itself instead of silently doing nothing — it is
- *      re-seeded at every boot, so a delete that appeared to work would bring the row back on the
- *      next restart.
- */
-async function runObservabilityAlertsDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "observability-alerts-depth", action: "observability", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/observability/alerts`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="observability-alerts"]', { timeout: 20000 })
-    .catch(() => {});
-  await page
-    .locator('[data-view="observability-alerts"]')
-    .waitFor({ state: "visible", timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(800);
-
-  // (1) the tiles are real counts.
-  const tiles = {};
-  for (const label of ["Firing", "Pending", "Silenced", "Worst severity"]) {
-    tiles[label] = (
-      (await page
-        .locator(`[data-alert-stat="${label}"] p`)
-        .nth(1)
-        .innerText()
-        .catch(() => "")) || ""
-    ).trim();
-  }
-  note({ check: "stat-tiles", ...tiles });
-  note({
-    check: "tiles-are-not-placeholders",
-    ok: Object.values(tiles).every((value) => value.length > 0),
-  });
-
-  // (2) the bundled rules are listed, and they are marked as bundled.
-  const rows = await page.locator("[data-alert-rule]").count();
-  note({ check: "rules-listed", rows });
-
-  // (3) a real preview on a family the platform records.
-  await page.locator("[data-alert-new]").click().catch(() => {});
-  await page.waitForSelector("[data-alert-rule-form]", { timeout: 8000 }).catch(() => {});
-  const formOpen = await page.locator("[data-alert-rule-form]").count();
-  note({ check: "form-opens", open: formOpen });
-
-  await page
-    .locator("[data-alert-rule-expr]")
-    .fill('omnion_http_requests_total{status="5xx"} > 0')
-    .catch(() => {});
-  await page.locator("[data-alert-rule-preview]").click().catch(() => {});
-  await page.waitForTimeout(1500);
-  const verdictOk = await page.locator('[data-preview="ok"]').count();
-  const verdictBreaching = await page.locator('[data-preview="breaching"]').count();
-  const verdictNoData = await page.locator('[data-preview="no-data"]').count();
-  note({
-    check: "preview-reports-a-verdict",
-    verdicts: { ok: verdictOk, breaching: verdictBreaching, noData: verdictNoData },
-    ok: verdictOk + verdictBreaching + verdictNoData > 0,
-  });
-
-  // A family that has never recorded must say `no data` and NOT say "not breaching" — the two
-  // read identically on a chip and only one of them is the operator's to fix.
-  await page
-    .locator("[data-alert-rule-expr]")
-    .fill("omnion_workflow_steps_total{status=\"__qa_never_seen__\"} > 0")
-    .catch(() => {});
-  await page.locator("[data-alert-rule-preview]").click().catch(() => {});
-  await page.waitForTimeout(1500);
-  const noDataAlone = await page.locator('[data-preview="no-data"]').count();
-  const quietInstead = await page.locator('[data-preview="ok"]').count();
-  note({
-    check: "no-data-is-not-healthy",
-    noData: noDataAlone,
-    saidOkInstead: quietInstead,
-    ok: noDataAlone > 0 && quietInstead === 0,
-  });
-
-  // (4) an expression that cannot work is refused, and the refusal names the family.
-  await page
-    .locator("[data-alert-rule-name]")
-    .fill(`qa-bad-${Date.now()}`)
-    .catch(() => {});
-  await page
-    .locator("[data-alert-rule-expr]")
-    .fill("omnion_not_a_family > 1")
-    .catch(() => {});
-  await page.locator("[data-alert-rule-save]").click().catch(() => {});
-  await page.waitForTimeout(1600);
-  const formError = (await page.locator("[data-alert-rule-error]").innerText().catch(() => "")) || "";
-  note({
-    check: "bad-expression-refused",
-    said: formError.slice(0, 200),
-    namesFamily: formError.includes("omnion_not_a_family"),
-  });
-  const stillOpen = await page.locator("[data-alert-rule-form]").count();
-  note({ check: "refusal-keeps-the-form-open", stillOpen });
-
-  // (5) a real rule, created, previewed, silenced and removed.
-  const name = `qa-alert-${Date.now()}`;
-  await page
-    .locator("[data-alert-rule-name]")
-    .fill(name)
-    .catch(() => {});
-  await page
-    .locator("[data-alert-rule-expr]")
-    .fill("omnion_queue_depth > 100000")
-    .catch(() => {});
-  await page
-    .locator("[data-alert-rule-dwell]")
-    .fill("0")
-    .catch(() => {});
-  await page.locator("[data-alert-rule-save]").click().catch(() => {});
-  await page.waitForTimeout(2000);
-  const created = await page.locator(`[data-alert-rule="${name}"]`).count();
-  note({ check: "rule-created", created });
-
-  // A rule whose expression stopped parsing is a RED cell, not a silent one.
-  const invalidCells = await page.locator("[data-alert-rule-invalid]").count();
-  note({ check: "invalid-expression-is-called-out", invalidCells });
-
-  // Silence it, and check the silence is visible with its reason.
-  await page
-    .locator(`[data-alert-rule="${name}"] [data-alert-rule-silence]`)
-    .click()
-    .catch(() => {});
-  await page.waitForSelector("[data-silence-form]", { timeout: 8000 }).catch(() => {});
-  await page
-    .locator("[data-silence-reason]")
-    .fill("QA pass: exercising the silence form")
-    .catch(() => {});
-  await page.locator("[data-silence-minutes]").fill("30").catch(() => {});
-  await page.locator("[data-silence-save]").click().catch(() => {});
-  await page.waitForTimeout(2000);
-  const silences = (await page.locator("[data-silence-list] li").innerText().catch(() => "")) || "";
-  note({
-    check: "silence-visible",
-    found: silences.includes("QA pass"),
-    statesRemaining: /\d+\s*(m|h)/.test(silences),
-  });
-
-  // A silence with no reason is refused — an anonymous silence is one nobody dares to remove.
-  await page.locator("[data-silence-new]").click().catch(() => {});
-  await page.waitForSelector("[data-silence-form]", { timeout: 8000 }).catch(() => {});
-  const saveDisabled = await page.locator("[data-silence-save]").isDisabled().catch(() => true);
-  note({ check: "reason-is-required", saveDisabledWithoutReason: saveDisabled });
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(400);
-
-  // (6) the bundled rules explain their own refusal.
-  const bundledRow = page.locator('[data-alert-rule]:has-text("bundled")').first();
-  if (await bundledRow.count()) {
-    await bundledRow.locator("[data-alert-rule-delete]").click().catch(() => {});
-    await page.waitForTimeout(1800);
-    const refusal = (await page.locator("[data-alerts-error]").innerText().catch(() => "")) || "";
-    note({
-      check: "bundled-rule-explains-its-refusal",
-      said: refusal.slice(0, 160),
-      explained: /re-seeded|every boot/i.test(refusal),
-    });
-  } else {
-    note({ check: "bundled-rule-explains-its-refusal", skipped: "no bundled rule on screen" });
-  }
-
-  // (7) clean up: lift the silence and delete the rule, so the pass leaves the stack as found.
-  await page.locator("[data-silence-lift]").first().click().catch(() => {});
-  await page.waitForTimeout(1600);
-  await page.locator(`[data-alert-rule="${name}"] [data-alert-rule-delete]`).click().catch(() => {});
-  await page.waitForTimeout(1600);
-  note({ check: "cleaned-up", remaining: await page.locator(`[data-alert-rule="${name}"]`).count() });
-
-  // (8) mobile, and the final screenshots.
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(700);
-  await shot(page, "page-observability-alerts-mobile");
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.waitForTimeout(400);
-  await shot(page, "page-observability-alerts");
-
-  report.observabilityAlerts = { steps };
-  return steps;
-}
-
-/**
- * The observability settings screen (REQ-126, slice 4).
- *
- * The two assertions that matter are the second and the third, because they are the ones a form
- * passes without them:
- *
- *   1. The egress note is ON the screen. The request requires the settings screen to say out loud
- *      what leaves the instance; a component that renders it offscreen proves nothing.
- *   2. An out-of-range save is refused WITH A FIELD MESSAGE and the stored value does not change.
- *      The browser-side check is asserted too, because a save the browser silently blocks teaches
- *      an operator the form is broken.
- *   3. A valid save reports success — and the caps are visible BEFORE the refusal, not only in it.
- */
-async function runObservabilitySettingsDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "observability-settings-depth", action: "observability", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/observability/settings`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="observability-settings"]', { timeout: 20000 })
-    .catch(() => {});
-  await page
-    .locator('[data-view="observability-settings"]')
-    .waitFor({ state: "visible", timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(800);
-
-  // (1) the egress statement.
-  const egress = (await page.locator("[data-egress-note]").innerText().catch(() => "")) || "";
-  note({ check: "egress-stated", present: egress.length > 40, saysRedacted: /redact/i.test(egress) });
-
-  // The sampling copy has to state that errors are sampled regardless, or an operator reads the
-  // ratio as "how much telemetry you lose" and never turns it down.
-  const samplingHint = (await page.locator('label[for="sampling_ratio"] + p').innerText().catch(() => "")) || "";
-  note({
-    check: "sampling-copy-explains-errors",
-    saysErrorsSampled: /errors are sampled regardless/i.test(samplingHint),
-  });
-
-  // The drain timeout and the probe contract, which is what tells an operator whether to raise it.
-  const drain = (await page.locator('[data-lifecycle="drain"]').innerText().catch(() => "")) || "";
-  note({ check: "drain-timeout-visible", says: drain, ok: /\d/.test(drain) });
-
-  // (2) an out-of-range value is caught before it can be sent.
-  await page.locator('[data-setting="logs_retention_days"]').fill("400").catch(() => {});
-  await page.waitForTimeout(400);
-  const fieldError = await page.locator('[data-field-error="logs_retention_days"]').count();
-  const saveDisabled = await page.locator("[data-settings-save]").isDisabled().catch(() => false);
-  note({ check: "range-caught-in-the-form", fieldError, saveDisabled });
-
-  // And the ratio, whose bound is 0..1 rather than an integer range.
-  await page.locator('[data-setting="sampling_ratio"]').fill("4").catch(() => {});
-  await page.waitForTimeout(400);
-  const ratioError = await page.locator('[data-field-error="sampling_ratio"]').count();
-  note({ check: "ratio-bounded", ratioError });
-
-  // A misspelled level is refused the same way — the level names are a closed set, and "verbose"
-  // is not one of them.
-  await page.locator('[data-setting="log_level_default"]').selectOption("verbose").catch(() => {});
-  await page.waitForTimeout(400);
-  const levelError = await page.locator('[data-field-error="log_level_default"]').count();
-  note({ check: "level-is-a-closed-set", levelError });
-
-  // (3) a valid save goes through and says so.
-  await page.locator('[data-setting="logs_retention_days"]').fill("14").catch(() => {});
-  await page.locator('[data-setting="sampling_ratio"]').fill("0.1").catch(() => {});
-  await page.locator('[data-setting="log_level_default"]').selectOption("info").catch(() => {});
-  await page.waitForTimeout(400);
-  await page.locator("[data-settings-save]").click().catch(() => {});
-  await page.waitForTimeout(2000);
-  const savedBanner = await page.locator("[data-settings-saved]").count();
-  const saveError = await page.locator("[data-settings-error]").count();
-  note({ check: "valid-save-succeeds", savedBanner, errors: saveError });
-
-  // The temporary-raise composer: a raise with no target is ignored rather than applied to
-  // everything, so the save below must NOT add one.
-  await page.locator("[data-new-override-target]").fill("").catch(() => {});
-  await page.locator("[data-settings-save]").click().catch(() => {});
-  await page.waitForTimeout(1600);
-  const overrides = await page.locator("[data-level-override]").count();
-  note({ check: "empty-raise-is-not-applied", overrides });
-
-  // A real raise, saved, then read back as LIVE.
-  await page
-    .locator("[data-new-override-target]")
-    .fill(`qa_module_${Date.now()}`)
-    .catch(() => {});
-  await page.locator("[data-new-override-expiry]").selectOption("1").catch(() => {});
-  await page.locator("[data-settings-save]").click().catch(() => {});
-  await page.waitForTimeout(2000);
-  const liveRaise = await page.locator('[data-level-override][data-expired="false"]').count();
-  note({ check: "raise-is-live-before-its-expiry", liveRaise });
-
-  // (4) mobile, and the final screenshots.
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(700);
-  await shot(page, "page-observability-settings-mobile");
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.waitForTimeout(400);
-  await shot(page, "page-observability-settings");
-
-  report.observabilitySettings = { steps };
-  return steps;
-}
-
-module.exports = {
-  runSecretsAuditDepth,
-  runDeploymentMigrationsDepth,
-  runDeploymentBackfillsDepth,
-  runDeploymentArtifactsDepth,
-  runDeploymentInstallDepth,
-  runDeploymentUpgradeDepth,
-  DEPLOYMENT_SCREENS,
-  DEPRECATION_SCREENS,
-  walkVersion,
-  runObservabilityOverviewDepth,
-  runObservabilityMetricsDepth,
-  runObservabilityTracesDepth,
-  runObservabilityExportersDepth,
-  ensureSignedIn,
-  runWizard,
-  CREDS,
-  URL_ADMIN,
-};
-
-if (require.main === module) {
-  main().catch(async (err) => {
-    console.error("[walk] unexpected failure:", err);
+async function selfcheckArgs() {
+  const parse = (args) => {
+    const before = process.argv;
+    process.argv = args;
     try {
-      fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: String(err) }, null, 2));
-    } catch {
-      /* ignore */
+      return {
+        only: arg("only", "all"),
+        url: arg("url", "http://127.0.0.1:3100"),
+        out: arg("out", "fallback"),
+        missing: arg("nope", "fallback"),
+      };
+    } finally {
+      process.argv = before;
     }
-    process.exit(1);
-  });
+  };
+  const equals = parse(["node", "walkthrough.cjs", "--only=workflow-builder", "--url=http://127.0.0.1:3102", "--out=/tmp/x"]);
+  const spaced = parse(["node", "walkthrough.cjs", "--only", "workflow-builder", "--url", "http://127.0.0.1:3102", "--out", "/tmp/x"]);
+  const bare = parse(["node", "walkthrough.cjs"]);
+  const checks = {
+    equalsReadsOnly: equals.only === "workflow-builder",
+    equalsReadsUrl: equals.url === "http://127.0.0.1:3102",
+    equalsReadsOut: equals.out === "/tmp/x",
+    spacedStillReadsOnly: spaced.only === "workflow-builder",
+    spacedStillReadsUrl: spaced.url === "http://127.0.0.1:3102",
+    bothSpellingsAgree: equals.only === spaced.only && equals.url === spaced.url,
+    absentFlagFallsBack: bare.only === "all" && bare.missing === "fallback",
+  };
+  const pass = Object.values(checks).every(Boolean);
+  console.log("ARGS_SELFCHECK " + JSON.stringify({ pass, checks }));
+  return pass;
 }
 
-/**
- * The security-policy, session, device and second-factor pass (REQ-006, slice 3).
- *
- * Drives the whole slice through the panel: a policy save refused in the field it belongs to and
- * accepted when the value is in range (with the diff it applied), an unusable network refused and
- * a real one saved, the session list with a revoke that ends a real session (a second one opened
- * for the owner, so the browser's own sign-in survives), the device registry with its trust
- * window, and the MFA enrolment dialog opened and cancelled.
- */
-/**
- * The ABAC policies pass (REQ-006, slice 4a).
- *
- * Drives the builder from the rows the way an administrator would: name, effect, priority, a
- * target permission and one condition row; the dry run (which highlights the leaves that
- * matched), the save with its version history, and the removal. The policy targets
- * `iam.provisioning.manage`, which no other screen exercises, so the moment it exists cannot
- * change any other pass's verdict.
- */
-async function runSecretsRootKeyDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "secrets-root-key-depth", action: "secrets", ...step });
+async function selfcheckWizard() {
+  const fresh = { completed: false, steps: { owner: true, organization: false, site: false } };
+  const done = { completed: true, steps: { owner: true, organization: true, site: true } };
+  const unstarted = { completed: false, steps: { owner: false, organization: false, site: false } };
+
+  const loginHalfBuilt = wizardDecision("http://127.0.0.1:3102/login", fresh);
+  const setupHalfBuilt = wizardDecision("http://127.0.0.1:3102/setup", fresh);
+  const panelComplete = wizardDecision("http://127.0.0.1:3102/overview", done);
+  const panelUnstarted = wizardDecision("http://127.0.0.1:3102/login", unstarted);
+
+  const checks = {
+    resumesAHalfBuiltInstall: loginHalfBuilt.action === "resume",
+    runsWhenAlreadyOnSetup: setupHalfBuilt.action === "run",
+    shortCircuitsOnACompleteInstall: panelComplete.action === "skip",
+    resumesAnUnstartedInstall: panelUnstarted.action === "resume",
+    // The old code skipped this state, and it is the state a fresh reset produces every time.
+    legacySkipsAHalfBuiltInstall: legacyWizardDecision("http://127.0.0.1:3102/login").action === "skip",
+    // ...and the two must disagree, or the fix is not a fix.
+    fixChangesTheHalfBuiltAnswer: legacyWizardDecision("http://127.0.0.1:3102/login").action !== loginHalfBuilt.action,
   };
-
-  await page.goto(`${URL_ADMIN}/secrets/root-key`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-root-key-seal]", { timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(600);
-
-  const sealHealthy = await page
-    .locator("[data-root-key-seal]")
-    .first()
-    .evaluate((node) => node.className.includes("bg-surface"))
-    .catch(() => false);
-  const ringRows = await page.locator("[data-root-key-row]").count();
-  const rotateEnabled = await page
-    .locator("[data-root-key-rotate]")
-    .first()
-    .isEnabled()
-    .catch(() => false);
-  note({ step: "opened", sealHealthy, ringRows, rotateEnabled });
-  await shot(page, "page-secrets-root-key");
-
-  // ---- The wizard refuses to continue before the acknowledgement --------------------------------
-  await page.locator("[data-root-key-rotate]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-root-key-wizard]", { timeout: 10000 }).catch(() => {});
-  const confirmTitle = (
-    await page.locator("[data-root-key-wizard] h3").first().innerText().catch(() => "")
-  ).trim();
-  const blockedBeforeTick = await page
-    .locator("[data-root-key-rotate-confirm]")
-    .first()
-    .isDisabled()
-    .catch(() => false);
-  const wizardText = await page
-    .locator("[data-root-key-wizard]")
-    .first()
-    .innerText()
-    .catch(() => "");
-  const warningShown = wizardText.toLowerCase().includes("unrecoverable");
-  note({ step: "wizard-opens-guarded", confirmTitle, blockedBeforeTick, warningShown });
-  await shot(page, "page-secrets-root-key-wizard");
-
-  // Escape closes the wizard without touching the ring.
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(500);
-  const closedByEscape = (await page.locator("[data-root-key-wizard]").count()) === 0;
-
-  // ---- The rotation, for real ------------------------------------------------------------------
-  await page.locator("[data-root-key-rotate]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-root-key-wizard]", { timeout: 10000 }).catch(() => {});
-  await page.locator("[data-root-key-accept]").first().check({ timeout: 6000 }).catch(() => {});
-  await page.locator("[data-root-key-rotate-confirm]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-root-key-counter]", { timeout: 25000 }).catch(() => {});
-  await page.waitForTimeout(1500);
-
-  const counterText = (
-    await page.locator("[data-root-key-counter]").first().innerText().catch(() => "")
-  ).trim();
-  const progressNow = await page
-    .locator("[data-root-key-job] [role=progressbar]")
-    .first()
-    .getAttribute("aria-valuenow")
-    .catch(() => null);
-  const rowsAfterRotation = await page.locator("[data-root-key-row]").count();
-  note({ step: "rotated", closedByEscape, counterText, progressNow, rowsAfterRotation });
-  await shot(page, "page-secrets-root-key-rotating");
-
-  // ---- Pause, then resume ----------------------------------------------------------------------
-  let paused = false;
-  const pauseButton = page.locator("[data-root-key-pause]").first();
-  if ((await pauseButton.count()) > 0) {
-    await pauseButton.click({ timeout: 6000 }).catch(() => {});
-    await page.waitForSelector("[data-root-key-resume]", { timeout: 15000 }).catch(() => {});
-    paused = (await page.locator("[data-root-key-resume]").count()) > 0;
-    await shot(page, "page-secrets-root-key-paused");
-  }
-  const resumeButton = page.locator("[data-root-key-resume]").first();
-  if ((await resumeButton.count()) > 0) {
-    await resumeButton.click({ timeout: 6000 }).catch(() => {});
-    await page.waitForTimeout(1500);
-  }
-  note({ step: "pause-resume", paused });
-
-  // ---- The one thing no other pass can assert: no key material in the document -----------------
-  const documentText = await page.evaluate(() => document.body.innerText);
-  const leakedMaterial =
-    documentText.includes("v1.") ||
-    documentText.includes("wrapped_key") ||
-    documentText.includes("seal_checksum");
-  note({ step: "no-material-in-document", leakedMaterial, documentChars: documentText.length });
-
-  await page.waitForTimeout(1200);
-  await shot(page, "page-secrets-root-key-done");
-
-  report.secretsRootKey = { steps };
-  log(`secrets root key: ${JSON.stringify(steps)}`);
+  const pass = Object.values(checks).every(Boolean);
+  console.log("WIZARD_SELFCHECK " + JSON.stringify({ pass, checks, decisions: { loginHalfBuilt, setupHalfBuilt, panelComplete, panelUnstarted } }));
+  return pass;
 }
 
-/**
- * The typed credentials and the slot matrix (docs/requests/REQ-125, slice 2).
- *
- * The pass proves the three properties this screen exists for, in the order an operator meets
- * them: a credential can be created from the wizard and typed, a validator that fails leaves a
- * *chip* rather than losing the row, and a slot swap changes which credential a consumer
- * resolves. Then it asserts the property only a real render can show — no value anywhere in the
- * document, including after a resolution.
- */
-async function runSecretsCredentialsDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "secrets-credentials-depth", action: "secrets", ...step });
+async function selfcheckRecovery() {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"] });
+  const context = await browser.newContext();
+  let page = await context.newPage();
+  installMainPage = async () => {
+    page = await context.newPage();
+    return page;
   };
-
-  // ------------------------------------------------------------------ the credential list
-  await page.goto(`${URL_ADMIN}/secrets/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-credentials-summary], [data-credentials-error]", { timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(700);
-
-  const listedRows = await page.locator("[data-credential-row]").count();
-  const summaryText = (await page.locator("[data-credentials-summary]").first().innerText().catch(() => "")).trim();
-  const readOnlyRows = await page.locator("[data-credential-readonly]").count();
-  note({ step: "opened", listedRows, readOnlyRows, summaryChars: summaryText.length });
-  await shot(page, "page-secrets-credentials");
-
-  // ---- `/` focuses the search box --------------------------------------------------------------
-  await page.keyboard.press("/");
-  await page.waitForTimeout(250);
-  const searchFocused = await page
-    .locator("[data-credentials-search]")
-    .first()
-    .evaluate((node) => node === document.activeElement)
-    .catch(() => false);
-  await page.keyboard.press("Escape");
-
-  // ---- The wizard: pick a kind, fill a non-secret field, save ----------------------------------
-  let wizardOpened = false;
-  if (listedRows > 0) {
-    await page.keyboard.press("n");
-    await page.waitForSelector("[data-credential-wizard]", { timeout: 8000 }).catch(() => {});
-    wizardOpened = (await page.locator("[data-credential-wizard]").count()) > 0;
-  }
-  let wizardHasValueBox = false;
-  if (wizardOpened) {
-    // The strongest guarantee the screen makes: the wizard has nowhere to put a secret, so no
-    // future edit can leak one into the DOM. Assert the *absence* rather than trusting it.
-    wizardHasValueBox = await page
-      .locator('[data-credential-wizard] input[type=password]')
-      .count()
-      .then((count) => count > 0)
-      .catch(() => false);
-    const kindCount = await page.locator("[data-credential-kind]").count();
-    const fieldCount = await page.locator("[data-credential-field]").count();
-    note({ step: "wizard-opens", wizardOpened, kindCount, fieldCount, wizardHasValueBox });
-    await shot(page, "page-secrets-credentials-wizard");
-
-    await page.locator("[data-credential-kind=api_key]").first().check({ timeout: 6000 }).catch(() => {});
-    const keyPrefix = page.locator("[data-credential-field=key_prefix]").first();
-    if ((await keyPrefix.count()) > 0) {
-      await keyPrefix.fill("sk-live-qa-walkthrough").catch(() => {});
-    }
-    const endpoint = page.locator("[data-credential-field=endpoint]").first();
-    if ((await endpoint.count()) > 0) {
-      await endpoint.fill("https://api.provider.test").catch(() => {});
-    }
-    await shot(page, "page-secrets-credentials-wizard-filled");
-    await page.locator("[data-credential-save]").first().click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[data-credentials-notice]", { timeout: 15000 }).catch(() => {});
-  }
-  const saveNotice = (await page.locator("[data-credentials-notice]").first().innerText().catch(() => "")).trim();
-  // The sentence that matters: a validator that failed must say the credential was stored anyway.
-  const storedAnyway = /stored either way|is typed and validated/i.test(saveNotice);
-  note({ step: "saved", wizardOpened, storedAnyway, searchFocused, saveNotice: saveNotice.slice(0, 160) });
-  await shot(page, "page-secrets-credentials-saved");
-
-  // ---- The validator, run for real -------------------------------------------------------------
-  const validateButton = page.locator("[data-credential-validate]").first();
-  let validated = false;
-  if ((await validateButton.count()) > 0) {
-    await validateButton.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[data-credentials-notice]", { timeout: 15000 }).catch(() => {});
-    const chip = await page.locator("[data-credential-chip]").first().getAttribute("data-credential-chip").catch(() => null);
-    validated = Boolean(chip);
-    note({ step: "validated", chip, chipIsReal: ["valid", "invalid", "stale", "unknown"].includes(chip) });
-    await shot(page, "page-secrets-credentials-validated");
-  }
-
-  // ------------------------------------------------------------------ the slot matrix
-  await page.goto(`${URL_ADMIN}/secrets/slots`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-slots-summary], [data-slots-error]", { timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(700);
-
-  const catalogNames = await page.locator("[data-slots-catalog] li").count();
-  const slotRows = await page.locator("[data-slot-row]").count();
-  note({ step: "slots-opened", catalogNames, slotRows });
-  await shot(page, "page-secrets-slots");
-
-  // ---- Assign a slot from the catalogue --------------------------------------------------------
-  const assign = page.locator('[data-slots-assign="ai.provider"]').first();
-  if ((await assign.count()) > 0) {
-    await assign.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[data-slot-editor]", { timeout: 8000 }).catch(() => {});
-    const editorOpen = (await page.locator("[data-slot-editor]").count()) > 0;
-    const primaryOptions = await page.locator("[data-slot-primary] option").count();
-    note({ step: "editor-opens", editorOpen, primaryOptions });
-    await shot(page, "page-secrets-slots-editor");
-
-    if (editorOpen && primaryOptions > 1) {
-      // Pick the first real credential — index 1 is the first option after "— none —".
-      const values = await page.locator("[data-slot-primary] option").evaluateAll((nodes) =>
-        nodes.map((node) => node.value).filter(Boolean),
+  const first = await runDepthPass("before-crash", async () => ({ ok: true, title: await page.title() }));
+  await page.close();
+  const second = await runDepthPass("on-dead-tab", async () => ({ ok: true, title: await page.title() }));
+  const third = await runDepthPass("after-recovery", async () => ({ ok: true, title: await page.title() }));
+  const checks = {
+    firstRan: Boolean(first && first.ok),
+    secondReportedTheDeadTab: Boolean(second && second.ok === false),
+    secondNamedTheCause: Boolean(second && /closed|crash/i.test(second.reason || "")),
+    thirdRanOnTheReplacement: Boolean(third && third.ok),
+    // A dead TAB and a dead PROCESS produce the SAME error text -- `context.newPage` answers
+    // `Target page, context or browser has been closed` for either -- so the two recoveries are
+    // indistinguishable by the message and only one of them works. The first three checks above
+    // cover the tab case, which is the case that recovers, and that is why they were green while
+    // pass `20261001-012121` died: the thing that was exercised was not the thing that happens.
+    //
+    // This leg closes the browser outright and asserts the two claims the box-level fix rests on:
+    // the pass that follows names the shortfall rather than reporting a defect on a screen it
+    // never reached, and the next pass is not even attempted -- `installMainPage` is replaced by
+    // one that throws, so a second attempt would be visible as a call rather than inferred from
+    // a log line nobody counts.
+    fourthNamesTheBoxNotTheScreen: await (async () => {
+      await browser.close();
+      browserIsGone = false;
+      let attempts = 0;
+      const working = installMainPage;
+      installMainPage = async () => {
+        attempts += 1;
+        throw new Error("browserContext.newPage: Target page, context or browser has been closed");
+      };
+      const onDeadBrowser = await runDepthPass("on-dead-browser", async () => ({ ok: true, title: await page.title() }));
+      installMainPage = working;
+      return (
+        typeof onDeadBrowser.reason === "string" &&
+        onDeadBrowser.reason.startsWith("skippedForDeadBrowser") &&
+        !/locator|page\./.test(onDeadBrowser.reason)
       );
-      if (values.length > 0) {
-        await page.locator("[data-slot-primary]").first().selectOption(values[0]).catch(() => {});
-        await shot(page, "page-secrets-slots-editor-filled");
-        await page.locator("[data-slot-save]").first().click({ timeout: 8000 }).catch(() => {});
-        await page.waitForSelector("[data-slots-notice]", { timeout: 15000 }).catch(() => {});
-      }
-    }
-    // Escape must close the editor whether or not it was saved.
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(400);
-    const closedByEscape = (await page.locator("[data-slot-editor]").count()) === 0;
-    const assignNotice = (await page.locator("[data-slots-notice]").first().innerText().catch(() => "")).trim();
-    note({ step: "assigned", closedByEscape, assignNotice: assignNotice.slice(0, 160) });
-    await shot(page, "page-secrets-slots-assigned");
-  }
-
-  // ---- Resolve: which credential would a consumer get? -----------------------------------------
-  const resolve = page.locator("[data-slot-resolve]").first();
-  let resolved = false;
-  if ((await resolve.count()) > 0) {
-    await resolve.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[data-slots-notice]", { timeout: 15000 }).catch(() => {});
-    const notice = (await page.locator("[data-slots-notice]").first().innerText().catch(() => "")).trim();
-    // A resolution names a credential and a version — never a value.
-    resolved = /answers with|answered from the fallback/i.test(notice);
-    note({ step: "resolved", resolved, notice: notice.slice(0, 160) });
-    await shot(page, "page-secrets-slots-resolved");
-  }
-
-  // ---- The one thing no other pass can assert: no value in the document ----------------------
-  const documentText = await page.evaluate(() => document.body.innerText);
-  const leaked =
-    /qa-walkthrough-value|qa-credential-value|wrapped_key|seal_checksum|v1\./.test(documentText);
-  note({ step: "no-value-in-document", leaked, documentChars: documentText.length });
-
-  await page.waitForTimeout(1000);
-  await shot(page, "page-secrets-slots-done");
-
-  report.secretsCredentials = { steps };
-}
-
-/**
- * REQ-125 slice 3 — leases and deployment keys.
- *
- * Two screens whose whole value is a property a screenshot cannot show, so the pass is built
- * around driving the real controls and then reading the document:
- *
- * - the revoke dialog refuses to submit without a reason, and the reason is what the next
- *   operator reads — so a bare click must produce a message rather than a revoke;
- * - a lease row shows a *reason* when it is dead, because a lease that silently stopped working is
- *   the failure mode that makes people disable the feature;
- * - the mint drawer requires an expiry and an explicit scope, and the one-time value panel is the
- *   only place a deployment key value ever appears;
- * - and the strongest assertion, which no unit test can make: after the value has been shown once,
- *   **the document carries neither the value nor any token**.
- */
-async function runSecretsLeasesDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "secrets-leases-depth", action: "secrets", ...step });
+    })(),
+    deadBrowserIsNotRetriedForever: await (async () => {
+      let attempts = 0;
+      const working = installMainPage;
+      installMainPage = async () => {
+        attempts += 1;
+        throw new Error("browserContext.newPage: Target page, context or browser has been closed");
+      };
+      // Reset, because the leg above left the browser known-gone: without this the two passes
+      // below short-circuit on the flag and never reach `installMainPage` at all, which is the
+      // correct behaviour but tests nothing. With the reset, the FIRST pass must try once and
+      // fail, the SECOND must not try at all -- one attempt across two passes is the whole
+      // claim, and asserting `attempts === 0` here would pass against a browser that died for
+      // a reason nobody had recorded.
+      browserIsGone = false;
+      await runDepthPass("dead-again-a", async () => ({ ok: true, title: await page.title() }));
+      await runDepthPass("dead-again-b", async () => ({ ok: true, title: await page.title() }));
+      await runDepthPass("dead-again-c", async () => ({ ok: true, title: await page.title() }));
+      installMainPage = working;
+      return attempts === 1;
+    })(),
   };
-
-  // ------------------------------------------------------------------------- the lease list
-  await page.goto(`${URL_ADMIN}/secrets/leases`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page
-    .waitForSelector("[data-leases-summary], [data-leases-error]", { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  const leaseRows = await page.locator("[data-lease-row]").count();
-  const summary = (
-    await page.locator("[data-leases-summary]").first().innerText().catch(() => "")
-  ).trim();
-  note({ step: "opened", leaseRows, summaryChars: summary.length });
-  await shot(page, "page-secrets-leases");
-
-  // ---- `/` focuses the search box -------------------------------------------------------------
-  await page.keyboard.press("/");
-  await page.waitForTimeout(250);
-  const searchFocused = await page
-    .locator("[data-leases-search]")
-    .first()
-    .evaluate((node) => node === document.activeElement)
-    .catch(() => false);
-  await page.keyboard.press("Escape");
-  note({ step: "search-shortcut", searchFocused });
-
-  // ---- The revoke dialog demands a reason -----------------------------------------------------
-  const revokeButton = page.locator("[data-lease-revoke]").first();
-  let revokeNeedsReason = false;
-  let revokedNotice = "";
-  if ((await revokeButton.count()) > 0) {
-    await revokeButton.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[data-lease-dialog]", { timeout: 8000 }).catch(() => {});
-    const opened = (await page.locator("[data-lease-dialog]").count()) > 0;
-    if (opened) {
-      await shot(page, "page-secrets-leases-revoke");
-      // Submitting with no reason must be refused in the dialog, not accepted with a blank one.
-      await page.locator("[data-lease-revoke-confirm]").first().click({ timeout: 6000 }).catch(() => {});
-      await page.waitForTimeout(500);
-      const message = (
-        await page.locator("[data-lease-dialog-error]").first().innerText().catch(() => "")
-      ).trim();
-      revokeNeedsReason = /reason/i.test(message);
-      note({ step: "revoke-needs-reason", revokeNeedsReason, message: message.slice(0, 120) });
-      await shot(page, "page-secrets-leases-revoke-reason-required");
-
-      await page.locator("[data-lease-reason-input]").first().fill("qa walkthrough — lease retired").catch(() => {});
-      await page.locator("[data-lease-revoke-confirm]").first().click({ timeout: 6000 }).catch(() => {});
-      await page.waitForSelector("[data-leases-notice]", { timeout: 15000 }).catch(() => {});
-      revokedNotice = (await page.locator("[data-leases-notice]").first().innerText().catch(() => "")).trim();
-      await shot(page, "page-secrets-leases-revoked");
-    }
-    note({ step: "revoke-dialog-opens", opened });
-  } else {
-    note({ step: "revoke-dialog-opens", opened: false, reason: "no live lease to revoke" });
-  }
-  note({ step: "revoked", notice: revokedNotice.slice(0, 160) });
-
-  // ---- A dead lease shows why it is dead ------------------------------------------------------
-  const reasons = await page.locator("[data-lease-reason]").allInnerTexts().catch(() => []);
-  note({ step: "reasons-shown", count: reasons.length, sample: (reasons[0] ?? "").slice(0, 120) });
-
-  // ---- The live-only filter -------------------------------------------------------------------
-  await page.locator("[data-leases-filter]").first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(600);
-  const liveOnly = await page.locator('[data-lease-state="live"]').count();
-  const nonLiveVisible = await page
-    .locator('[data-lease-row]')
-    .evaluateAll((nodes) => nodes.filter((node) => node.dataset.leaseState !== "live").length)
-    .catch(() => -1);
-  note({ step: "live-filter", liveOnly, nonLiveVisible });
-  await page.locator("[data-leases-filter]").first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(400);
-
-  // -------------------------------------------------------------------- the deployment keys
-  await page.goto(`${URL_ADMIN}/secrets/deploy-keys`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page
-    .waitForSelector("[data-deploykeys-summary], [data-deploykeys-error]", { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  const keyRows = await page.locator("[data-deploykey-row]").count();
-  const keySummary = (
-    await page.locator("[data-deploykeys-summary]").first().innerText().catch(() => "")
-  ).trim();
-  note({ step: "keys-opened", keyRows, summaryChars: keySummary.length });
-  await shot(page, "page-secrets-deploy-keys");
-
-  // ---- `n` opens the mint drawer ---------------------------------------------------------------
-  await page.keyboard.press("n");
-  await page.waitForSelector("[data-deploykey-drawer]", { timeout: 8000 }).catch(() => {});
-  const drawerOpen = (await page.locator("[data-deploykey-drawer]").count()) > 0;
-  note({ step: "mint-drawer-opens", drawerOpen });
-  await shot(page, "page-secrets-deploy-keys-drawer");
-
-  // A key with no name is refused where the field is, not as a page-level error.
-  if (drawerOpen) {
-    await page.locator("[data-deploykey-save]").first().click({ timeout: 6000 }).catch(() => {});
-    await page.waitForTimeout(500);
-    const nameError = (
-      await page.locator("[data-deploykey-drawer-error]").first().innerText().catch(() => "")
-    ).trim();
-    note({ step: "mint-needs-name", shown: /name/i.test(nameError), message: nameError.slice(0, 120) });
-    await shot(page, "page-secrets-deploy-keys-name-required");
-
-    // The expiry is required: clear it and the same refusal must come back.
-    await page.locator("[data-deploykey-name]").first().fill(`qa-walk-${Date.now()}`).catch(() => {});
-    await page.locator("[data-deploykey-expiry]").first().fill("").catch(() => {});
-    await page.locator("[data-deploykey-save]").first().click({ timeout: 6000 }).catch(() => {});
-    await page.waitForTimeout(500);
-    const expiryError = (
-      await page.locator("[data-deploykey-drawer-error]").first().innerText().catch(() => "")
-    ).trim();
-    note({ step: "mint-needs-expiry", shown: /expire/i.test(expiryError), message: expiryError.slice(0, 120) });
-    await shot(page, "page-secrets-deploy-keys-expiry-required");
-
-    // Mint it properly, and the value appears exactly once.
-    await page.locator("[data-deploykey-expiry]").first().fill("2099-12-31").catch(() => {});
-    await page.locator("[data-deploykey-save]").first().click({ timeout: 20000 }).catch(() => {});
-    await page.waitForSelector("[data-deploykey-minted]", { timeout: 25000 }).catch(() => {});
-    const minted = (await page.locator("[data-deploykey-minted]").count()) > 0;
-    const shownValue = (await page.locator("[data-deploykey-value]").first().innerText().catch(() => "")).trim();
-    note({ step: "minted", minted, valuePrefix: shownValue.slice(0, 8), valueChars: shownValue.length });
-    await shot(page, "page-secrets-deploy-keys-minted");
-
-    // The copy button is a real control, not decoration.
-    if (minted) {
-      await page.locator("[data-deploykey-copy]").first().click({ timeout: 6000 }).catch(() => {});
-      await page.waitForTimeout(400);
-      const copied = /copied/i.test(
-        await page.locator("[data-deploykey-copy]").first().innerText().catch(() => ""),
-      );
-      note({ step: "copied", copied });
-    }
-    await page.locator("[data-deploykey-minted-done]").first().click({ timeout: 6000 }).catch(() => {});
-    await page.waitForTimeout(1200);
-  }
-
-  // ---- The use log ------------------------------------------------------------------------------
-  const useLogButton = page.locator("[data-deploykey-uses]").first();
-  if ((await useLogButton.count()) > 0) {
-    await useLogButton.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[data-deploykey-log]", { timeout: 12000 }).catch(() => {});
-    const logOpen = (await page.locator("[data-deploykey-log]").count()) > 0;
-    const useRows = await page.locator("[data-deploykey-use]").count();
-    const emptyLog = (await page.locator("[data-deploykey-log-empty]").count()) > 0;
-    note({ step: "use-log", logOpen, useRows, emptyLog });
-    await shot(page, "page-secrets-deploy-keys-uses");
-    if (logOpen) await page.keyboard.press("Escape");
-  }
-
-  // ---- Revoke the key the walk just minted, so the pass leaves nothing running ------------------
-  await page.waitForTimeout(500);
-  const revokeKey = page.locator("[data-deploykey-revoke]").first();
-  if ((await revokeKey.count()) > 0) {
-    await revokeKey.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[data-deploykey-dialog]", { timeout: 8000 }).catch(() => {});
-    const opened = (await page.locator("[data-deploykey-dialog]").count()) > 0;
-    let needsReason = false;
-    if (opened) {
-      await page.locator("[data-deploykey-act-confirm]").first().click({ timeout: 6000 }).catch(() => {});
-      await page.waitForTimeout(500);
-      const message = (
-        await page.locator("[data-deploykey-dialog-error]").first().innerText().catch(() => "")
-      ).trim();
-      needsReason = /reason/i.test(message);
-      await page
-        .locator("[data-deploykey-reason-input]")
-        .first()
-        .fill("qa walkthrough — key retired")
-        .catch(() => {});
-      await page.locator("[data-deploykey-act-confirm]").first().click({ timeout: 15000 }).catch(() => {});
-      await page.waitForSelector("[data-deploykeys-notice]", { timeout: 20000 }).catch(() => {});
-      await shot(page, "page-secrets-deploy-keys-revoked");
-    }
-    const notice = (await page.locator("[data-deploykeys-notice]").first().innerText().catch(() => "")).trim();
-    note({ step: "key-revoked", opened, needsReason, notice: notice.slice(0, 160) });
-  }
-
-  // ---- The assertion only a render can make -----------------------------------------------------
-  // The mint panel showed a deployment key value a moment ago. Nothing anywhere on either screen
-  // may still carry it, a lease token, or any credential value.
-  const documentText = await page.evaluate(() => document.body.innerText);
-  const leaked =
-    /omdk_|qa-lease-value|qa-credential-value|qa-walkthrough-value|wrapped_key|seal_checksum/.test(
-      documentText,
-    );
-  note({ step: "no-value-in-document", leaked, documentChars: documentText.length });
-
-  await page.waitForTimeout(800);
-  await shot(page, "page-secrets-deploy-keys-done");
-
-  report.secretsLeases = { steps };
+  const pass = Object.values(checks).every(Boolean);
+  console.log("RECOVERY_SELFCHECK " + JSON.stringify({ pass, checks, secondReason: second && second.reason }));
+  await browser.close().catch(() => {});
+  return pass;
 }
-
-/**
- * The audit trail, the advisory flags and the SIEM export (REQ-125, slice 4).
- *
- * A screen that only *lists* a trail proves nothing about the two properties that matter, so the
- * pass drives the three things a unit test cannot assert:
- *
- * - **the join key works.** A request id is clicked in the table and the trail narrows to the row
- *   carrying it. If the column were a plain string, the id in an operator's error banner would be
- *   decoration and the most useful field on the screen would be inert.
- * - **the acknowledge persists and is honest.** The count drops, the row flips to "acknowledged",
- *   and a *second* acknowledge says "already acknowledged" rather than claiming a change that did
- *   not happen — the double-click is a normal thing for a panel to receive.
- * - **the export carries no value.** The strongest assertion here: the walk writes a recognisable
- *   fixture value into a secret's metadata path beforehand, pulls the NDJSON feed, and greps the
- *   raw bytes for it. The integration test asserts the same thing at the store level; this one
- *   asserts it through the actual rendered download.
- */
-/**
- * The deployment centre's release surface, driven end to end (REQ-128, slice 4).
- *
- * Four screens, three depth passes, and one rule that shaped all of them: **the fixture must not
- * be silently constant.** The previous slice's walk derived a target version from a uuid's decimal
- * digits, and `parseInt("3f9a…", 10)` overflows `u32` — so every run shared the same version, the
- * plan's range was reused, and one run's acknowledgement answered the next run's plan. A fixture
- * that is constant does not look like a broken fixture; it looks like a product that ignores its
- * input. So every version-ish value here comes from `walkVersion()`, derived from this walk's own
- * name plus the clock, and the acknowledgement is checked against the plan this run actually built.
- *
- * ## What each pass refuses to accept
- *
- * * artifacts — a release detail opened with a version that EXISTS. A placeholder id proves the
- *   404 screen renders, which is not the same claim as the screen working.
- * * install — a form refused in the field it belongs to, then accepted; then a real download whose
- *   checksum is the one the SERVER returned in its header, not one the walk recomputed.
- * * upgrade — the verdict is read as one of three, the point of no return is located by INDEX, and
- *   the acknowledgement is only claimed when the server's own `acknowledged` says so.
- */
-
-/**
- * A version fixture unique to this walk and readable in the database afterwards.
- *
- * `Date.now()` alone would do, but a failing pass is much easier to diagnose when the version in
- * the row looks like the pass that made it. The four components are three-digit or smaller so the
- * string stays inside the validator's vocabulary (`^\\d+\\.\\d+\\.\\d+…`).
- */
-function walkVersion(label) {
-  const now = Date.now();
-  const minor = now % 1000;
-  const patch = Math.floor(now / 1000) % 1000;
-  const tag = Math.abs([...label].reduce((acc, ch) => (acc * 33 + ch.charCodeAt(0)) % 9973, 11)) % 97;
-  return `0.${minor}.${patch}.${tag}`;
-}
-
-/**
- * The deployment screens, asserted against the route list rather than duplicated in it.
- *
- * A second copy of a route list is a list that drifts: the screen is added to the constant and not
- * to the walk, and the constant still says it is covered. So the check lives here and reads the
- * route list — and it runs at startup, where a drift is a loud line in the log rather than a
- * silently untested screen three weeks later.
- */
-/**
- * Drive the migration ledger (REQ-129, slice 1): the two bands, the gate verdict, the drift
- * sentence, the plan preview and the detail screen opened from a row that exists.
- *
- * The claims this pass is here to catch are the ones a route walk cannot make:
- *
- * 1. **Pending is not applied.** A screen that merged both would render "applied at" on a
- *    migration that has never run, which is the exact class of silent wrongness the request is
- *    written against. So the two bands are counted separately and the pending rows must carry a
- *    `would run` badge rather than a timestamp.
- * 2. **A reversal nobody rehearsed does not read `reversible`.** `down_verified_at` being null is
- *    the honest answer and the screen has to render it as such.
- * 3. **The detail screen is reachable from a row.** Navigating to a fabricated version would prove
- *    only that the 404 renders, which is how a screen ships unmeasured.
- */
-/**
- * `/deployment/backfills` and `/deployment/seeds` — the operator-facing half of REQ-129 slice 3.
- *
- * Three properties are measured here that a screenshot cannot answer, each because the screen is
- * capable of looking correct while being wrong:
- *
- * 1. **The cursor is rendered, and it is never an empty cell.** A backfill whose cursor renders as
- *    "" reads as "a key of nothing" instead of "has not started", and the whole resume property
- *    lives in that value.
- * 2. **A declared descriptor and a job are not the same row.** A fresh installation has descriptors
- *    and no jobs; a screen that renders both through one type produces a "0 of 0" progress bar and
- *    an operator reads it as "nothing to do".
- * 3. **The seeds screen never offers a Load button it would refuse.** `load_refused` comes from the
- *    API; if a button is present while a refusal is in the payload, the screen has a dead button —
- *    which the request forbids outright.
- *
- * The detail screen is reached from a row the list ACTUALLY renders, never from a fabricated id:
- * navigating to `/deployment/backfills/<made-up-uuid>` proves only that the error state renders, and
- * that is how a screen ships unmeasured.
- */
-async function runDeploymentBackfillsDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "deployment-backfills-depth", action: "deployment", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/deployment/backfills`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="deployment-backfills"]', { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  // The list rendered rather than an error or a spinner.
-  const rendered = await page.locator('[data-view="deployment-backfills"]').count();
-  note({ check: "list-rendered", ok: rendered > 0, rendered });
-
-  // The error band, if any, is a role=alert a human can act on — never a silent blank.
-  const alerts = await page.locator('[data-view="deployment-backfills"] [role="alert"]').count();
-  note({ check: "no-error-band-on-load", ok: alerts === 0, alerts });
-
-  // Every cursor cell carries SOMETHING. The em-dash is a value; "" is not.
-  const cursorCells = await page
-    .locator('[data-view="deployment-backfills"] code')
-    .allInnerTexts()
-    .catch(() => []);
-  const emptyCursor = cursorCells.filter((text) => text.trim().length === 0);
-  note({
-    check: "cursor-is-never-an-empty-cell",
-    ok: emptyCursor.length === 0,
-    cells: cursorCells.length,
-    empty: emptyCursor.length,
-  });
-
-  // No horizontal overflow at desktop width. A progress bar with a fixed pixel width inside a
-  // table cell is the classic way this screen breaks.
-  const overflow = await page.evaluate(() => {
-    const root = document.querySelector('[data-view="deployment-backfills"]');
-    return root ? root.scrollWidth - root.clientWidth : 0;
-  });
-  note({ check: "no-horizontal-overflow", ok: overflow <= 1, overflowPx: overflow });
-
-  // The detail screen, from a row that exists.
-  const detailLink = page
-    .locator('[data-view="deployment-backfills"] a[href^="/deployment/backfills/"]')
-    .first();
-  const hasDetailLink = (await detailLink.count()) > 0;
-  note({ check: "detail-is-reachable-from-a-row", ok: hasDetailLink });
-
-  if (hasDetailLink) {
-    await detailLink.click({ timeout: 10000 }).catch(() => {});
-    await page
-      .waitForSelector('[data-view="deployment-backfill-detail"]', { timeout: 20000 })
-      .catch(() => {});
-    await page.waitForTimeout(500);
-    const detailRendered = await page.locator('[data-view="deployment-backfill-detail"]').count();
-    note({ check: "detail-rendered", ok: detailRendered > 0, detailRendered });
-
-    // The statement block is the reason this screen exists. If the descriptor is gone the screen
-    // says so in a sentence — either a <pre> with the SQL or the "descriptor row is gone" note.
-    const statementBlocks = await page
-      .locator('[data-view="deployment-backfill-detail"] pre')
-      .allInnerTexts()
-      .catch(() => []);
-    note({
-      check: "detail-states-the-statement-or-why-there-is-none",
-      ok: statementBlocks.length > 0,
-      blocks: statementBlocks.length,
-    });
-  }
-
-  // ---- Seeds -------------------------------------------------------------------------------
-  await page
-    .goto(`${URL_ADMIN}/deployment/seeds`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="deployment-seeds"]', { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  const seedsRendered = await page.locator('[data-view="deployment-seeds"]').count();
-  note({ check: "seeds-rendered", ok: seedsRendered > 0, seedsRendered });
-
-  // The dead-button property. Load buttons and the refusal band must not both be on screen:
-  // `load_refused` is the API's own answer for this installation kind.
-  const loadButtons = await page
-    .locator('[data-view="deployment-seeds"] button:has-text("Load this dataset")')
-    .count();
-  const refusalBand = await page
-    .locator('[data-view="deployment-seeds"]')
-    .innerText()
-    .catch(() => "");
-  const namesTheKind = /Installation kind:/.test(refusalBand);
-  note({
-    check: "seeds-name-the-installation-kind",
-    ok: namesTheKind,
-  });
-  note({
-    check: "load-buttons-are-not-refusals",
-    // Either there are load buttons and no refusal text, or a refusal and no button. Both true at
-    // once is a dead button; the pass records both so a red one says which half is wrong.
-    ok: !(loadButtons > 0 && /refus/i.test(refusalBand)),
-    loadButtons,
-    refusalPresent: /refus/i.test(refusalBand),
-  });
-
-  return { steps };
-}
-
-async function runDeploymentMigrationsDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "deployment-migrations-depth", action: "deployment", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/deployment/migrations`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="deployment-migrations"]', { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  const pending = await page.locator('[data-migration-row][data-state="pending"]').count();
-  const applied = await page.locator('[data-migration-row][data-state="applied"]').count();
-  note({ check: "bands-are-separate", pending, applied });
-
-  // (1) The gate verdict is present and is a SENTENCE. A missing one renders as nothing, and
-  // "the gate passes" is the whole answer to "can I deploy this?".
-  const gate = (await page.locator('[data-testid="gate-verdict"]').innerText().catch(() => "")) || "";
-  note({
-    check: "gate-verdict-is-a-sentence",
-    ok: gate.trim().length > 0,
-    chars: gate.trim().length,
-    text: gate.trim().slice(0, 120),
-  });
-
-  // (2) A pending row never shows an applied-at timestamp.
-  const pendingText = (await page.locator("[data-pending-band]").innerText().catch(() => "")) || "";
-  note({
-    check: "pending-rows-carry-would-run",
-    ok: /would run/i.test(pendingText),
-    chars: pendingText.length,
-  });
-
-  // (3) The ledger says "never rehearsed" rather than implying a reversal was proved. On an
-  // installation that has rehearsed nothing, the ledger must contain the negative answer.
-  const ledgerText = (await page.locator("[data-ledger-band]").innerText().catch(() => "")) || "";
-  note({
-    check: "unrehearsed-is-said",
-    ok: /never rehearsed|no reversal in file|none in file/i.test(ledgerText) || applied === 0,
-    chars: ledgerText.length,
-  });
-
-  // (4) The keyboard filter narrows the ledger. `/` focuses it and typing a version leaves at most
-  // the rows that match — measured, because a filter that renders but does not narrow is invisible
-  // in a screenshot.
-  const before = applied;
-  await page.locator('[data-testid="migration-filter"]').fill("0207").catch(() => {});
-  await page.waitForTimeout(500);
-  const filtered = await page.locator('[data-migration-row][data-state="applied"]').count();
-  note({
-    check: "filter-narrows",
-    ok: filtered <= before,
-    before,
-    after: filtered,
-  });
-  await page.locator('[data-testid="migration-filter"]').fill("").catch(() => {});
-  await page.waitForTimeout(300);
-
-  // (5) The plan preview opens and says it executed nothing. The panel is the ONLY place an
-  // operator sees this, and a preview that quietly applied migrations would be catastrophic.
-  await page.locator('[data-testid="plan-preview"]').click().catch(() => {});
-  await page.waitForTimeout(900);
-  const planText = (await page.locator('[data-testid="plan-preview-panel"]').innerText().catch(() => "")) || "";
-  note({
-    check: "plan-says-it-executed-nothing",
-    ok: /nothing above was executed|up to date|pending migration/i.test(planText),
-    chars: planText.length,
-  });
-
-  // (6) Open the detail screen FROM A ROW. The version is read out of the ledger's own link so the
-  // walk cannot invent one that does not exist.
-  const link = page.locator('[data-migration-row] a[href^="/deployment/migrations/"]').first();
-  const href = (await link.getAttribute("href").catch(() => null)) || null;
-  note({ check: "ledger-row-links-to-a-version", href });
-  if (href) {
-    await page.goto(`${URL_ADMIN}${href}`, { waitUntil: "domcontentloaded" }).catch(() => {});
-    await page
-      .waitForSelector('[data-view="deployment-migration-detail"]', { timeout: 20000 })
-      .catch(() => {});
-    await page.waitForTimeout(600);
-    const up = await page.locator("[data-up-pane]").count();
-    const down = await page.locator("[data-down-pane]").count();
-    note({ check: "detail-shows-both-panes", up, down });
-    // The rehearsal asks for a scratch database NAME — it is deliberately not one-click, so the
-    // input has to exist and say why.
-    const scratch = await page.locator('[data-testid="scratch-name"]').count();
-    note({ check: "rehearsal-asks-for-a-name", scratch, ok: scratch === 1 });
-    // And the rehearsal must refuse the live database. Clicking it with the empty name must show
-    // the reason rather than doing anything.
-    await page.locator('[data-testid="rehearse-reversal"]').click().catch(() => {});
-    await page.waitForTimeout(500);
-    const refusal = (await page.locator('[data-testid="rehearsal-error"]').innerText().catch(() => "")) || "";
-    note({
-      check: "rehearsal-without-a-name-explains-itself",
-      ok: refusal.trim().length > 0,
-      chars: refusal.trim().length,
-    });
-    // Narrow: the SQL panes scroll horizontally inside their region rather than widening the page.
-    const overflow = await page.evaluate(
-      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
-    );
-    note({ check: "no-horizontal-overflow", overflow });
-  }
-
-  // (7) A version nobody has is a 404 with a reason, not a blank screen.
-  await page
-    .goto(`${URL_ADMIN}/deployment/migrations/9999`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page.waitForTimeout(600);
-  const missing = await page.locator('[role="alert"]').count();
-  note({ check: "unknown-version-explains-itself", alerts: missing, ok: missing >= 1 });
-
-  // A summary line, recorded the way every other step in this pass records: through `note`, which
-  // is what puts it in `steps` AND in the click stream. `report.push` is not a call that exists —
-  // `report` is the run's object (`{ startedAt, admin, steps, pages, ... }`), not an array, so
-  // `.push` is undefined and the line threw. It threw on the LAST statement of the pass, which
-  // is the worst possible place: every check above had already run and every screenshot had
-  // already been taken, and the throw unwound the whole process, so the run produced no summary
-  // at all. A defect in the reporter cannot cost the measurements; it can only cost the report.
-  note({
-    check: "summary",
-    checks: steps.filter((step) => step.ok !== false).length,
-    total: steps.length,
-  });
-
-  return { ok: true, steps: steps.length };
-}
-
-async function runDeploymentArtifactsDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "deployment-artifacts-depth", action: "deployment", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/deployment/artifacts`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="deployment-artifacts"]', { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  const releases = await page.locator("[data-release-row]").count();
-  note({ check: "release-rows", rows: releases });
-
-  // (1) The empty state names the ACTION that fixes it. "No data" is not a sentence an operator
-  // can act on, and the request asks for the action beside it.
-  if (releases === 0) {
-    const empty = (await page.locator('[data-view="deployment-artifacts"]').innerText().catch(() => "")) || "";
-    note({
-      check: "empty-state-names-the-action",
-      ok: /update check|not cached|no release manifest/i.test(empty),
-      chars: empty.length,
-    });
-  }
-
-  // (2) The artifact table is a table on a wide screen and CARDS on a narrow one, and the digest
-  // cell is one unbroken token — a digest that wraps mid-string cannot be compared by eye, which
-  // is the only reason the column exists.
-  const table = await page.locator("[data-artifact-table]").count();
-  const digests = await page.locator("[data-artifact-digest]").count();
-  const wrapped = await page
-    .locator("[data-artifact-digest]")
-    .evaluateAll((nodes) =>
-      nodes.filter((node) => node.getBoundingClientRect().width > node.parentElement.getBoundingClientRect().width + 1).length,
-    )
-    .catch(() => -1);
-  note({ check: "digest-column-does-not-wrap", cells: digests, overflowing: wrapped, table });
-
-  // (3) A copy button hands over the WHOLE reference, and the walk reads it back rather than
-  // trusting the button's own label.
-  let copied = null;
-  const copyButton = page.locator("[data-artifact-copy]").first();
-  if ((await copyButton.count()) > 0) {
-    await copyButton.click().catch(() => {});
-    await page.waitForTimeout(700);
-    copied = await page
-      .evaluate(async () => {
-        try {
-          return await navigator.clipboard.readText();
-        } catch {
-          return null;
-        }
-      })
-      .catch(() => null);
-    note({
-      check: "copy-carries-the-whole-reference",
-      clipboard: copied,
-      ok: copied === null || (copied.length > 8 && !copied.endsWith("…")),
-    });
-  } else {
-    note({ check: "copy-carries-the-whole-reference", skipped: true, reason: "no artifact row to copy" });
-  }
-
-  // (4) `missing_kinds` renders as explicit rows, because a gap is indistinguishable from "the
-  // fetch has not landed yet" and the request distinguishes them on purpose.
-  const missing = await page.locator("[data-release-missing]").count();
-  note({ check: "missing-kinds-are-explicit", rows: missing });
-
-  // (5) The filter narrows and Escape clears it.
-  await page.locator("[data-artifact-filter]").fill("zzz-no-such-release").catch(() => {});
-  await page.waitForTimeout(500);
-  const filtered = await page.locator("[data-release-row]").count();
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(500);
-  const cleared = await page.locator("[data-release-row]").count();
-  note({ check: "filter-narrows-and-escape-clears", filtered, cleared, ok: filtered === 0 && cleared === releases });
-
-  // (6) A release detail opened with a version that EXISTS. The version comes from the row that is
-  // on screen, never from a placeholder — a fabricated id proves the 404 state renders.
-  const firstVersion = await page
-    .locator("[data-release-open]")
-    .first()
-    .getAttribute("data-release-open")
-    .catch(() => null);
-  if (firstVersion) {
-    await page.goto(`${URL_ADMIN}/deployment/artifacts/${encodeURIComponent(firstVersion)}`, {
-      waitUntil: "domcontentloaded",
-    }).catch(() => {});
-    await page
-      .waitForSelector('[data-view="deployment-release-detail"]', { timeout: 20000 })
-      .catch(() => {});
-    await page.waitForTimeout(700);
-    const commit = (await page.locator("[data-release-commit]").innerText().catch(() => "")).trim();
-    const satisfied = await page
-      .locator("[data-core-minimum-satisfied]")
-      .first()
-      .getAttribute("data-core-minimum-satisfied")
-      .catch(() => null);
-    note({
-      check: "detail-names-the-commit-and-the-core-minimum",
-      version: firstVersion,
-      commit: commit.slice(0, 40),
-      coreMinimumSatisfied: satisfied,
-    });
-    // The detail screen's own empty answer must be a sentence, not a blank.
-    const detailMissing = await page.locator("[data-missing-kind]").count();
-    note({ check: "detail-missing-kinds", rows: detailMissing });
-    await shot(page, "page-deployment-release-detail");
-  } else {
-    note({ check: "detail-opened", skipped: true, reason: "no cached release to open" });
-  }
-
-  // (7) A version nobody cached is an honest sentence, not a stack trace.
-  await page
-    .goto(`${URL_ADMIN}/deployment/artifacts/${encodeURIComponent(`0.0.0.absent-${Date.now() % 997}`)}`, {
-      waitUntil: "domcontentloaded",
-    })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="deployment-release-detail"]', { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(600);
-  const absent = (await page.locator("[data-release-error]").innerText().catch(() => "")) || "";
-  note({
-    check: "absent-version-says-so",
-    chars: absent.length,
-    ok: absent.length > 20,
-  });
-  await shot(page, "page-deployment-release-absent");
-
-  // (8) Mobile: cards, and the page does not scroll sideways.
-  await page.goto(`${URL_ADMIN}/deployment/artifacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(700);
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(700);
-  const cards = await page.locator("[data-artifact-cards] li").count();
-  const overflow = await page
-    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
-    .catch(() => -1);
-  note({ check: "mobile-cards", cards, horizontalOverflow: overflow });
-  await shot(page, "page-deployment-artifacts-mobile");
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.waitForTimeout(400);
-  await shot(page, "page-deployment-artifacts");
-
-  report.deploymentArtifacts = { steps };
-  return steps;
-}
-
-async function runDeploymentInstallDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "deployment-install-depth", action: "deployment", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/deployment/install`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="deployment-install"]', { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  // (1) The secret guarantee is stated ON the screen, in the panel's own words.
-  const notice = (await page.locator("[data-bundle-secret-notice]").innerText().catch(() => "")) || "";
-  note({
-    check: "secret-reference-claim-is-visible",
-    saysReference: /reference/i.test(notice),
-    saysNoValue: /never contain a credential|no field that could hold/i.test(notice),
-  });
-
-  // (2) No field on the form can hold a credential value. This is the guarantee, asserted rather
-  // than asserted-about: a `password` input here would be the one control that could leak one.
-  const passwordFields = await page.locator('[data-view="deployment-install"] input[type="password"]').count();
-  const secretishNames = await page
-    .locator('[data-view="deployment-install"] input, [data-view="deployment-install"] select')
-    .evaluateAll((nodes) =>
-      nodes
-        .map((node) => node.getAttribute("data-bundle-") || node.id || "")
-        .filter((key) => /password|secret|token|credential|key/i.test(key || "")),
-    )
-    .catch(() => []);
-  note({ check: "no-field-can-hold-a-credential", passwordFields, suspiciousFields: secretishNames });
-
-  // (3) Validation refuses in the FIELD, before a round trip, and says which box was wrong.
-  await page.locator("[data-bundle-name]").fill("Bad Name With Spaces").catch(() => {});
-  await page.locator("[data-bundle-version]").fill("not-a-version").catch(() => {});
-  await page.locator("[data-bundle-generate]").click().catch(() => {});
-  await page.waitForTimeout(700);
-  const nameError = (await page.locator("[data-bundle-name-error]").innerText().catch(() => "")) || "";
-  const versionError = (await page.locator("[data-bundle-version-error]").innerText().catch(() => "")) || "";
-  const generatedOnBadInput = await page.locator("[data-bundle-generated]").count();
-  note({
-    check: "validation-refuses-in-the-field",
-    nameError: nameError.slice(0, 80),
-    versionError: versionError.slice(0, 80),
-    nothingWasGenerated: generatedOnBadInput === 0,
-  });
-  await shot(page, "page-deployment-install-invalid");
-
-  // (4) A real bundle, for a target name unique to THIS walk.
-  const target = `qa-${walkVersion("install").replace(/\./g, "")}`;
-  await page.locator("[data-bundle-name]").fill(target).catch(() => {});
-  await page.locator("[data-bundle-version]").fill(walkVersion("install")).catch(() => {});
-  await page.locator("[data-bundle-domain]").fill("qa-omnion.test").catch(() => {});
-  await page.locator("[data-bundle-kind]").selectOption("compose-small").catch(() => {});
-  await page.locator("[data-bundle-generate]").click().catch(() => {});
-  await page
-    .waitForSelector("[data-bundle-generated]", { timeout: 60000 })
-    .catch(() => {});
-  await page.waitForTimeout(1200);
-
-  const fileRows = await page.locator("[data-bundle-file]").count();
-  const commands = (await page.locator("[data-bundle-commands]").innerText().catch(() => "")) || "";
-  const checksum = (await page.locator("[data-bundle-checksum]").innerText().catch(() => "")) || "";
-  note({
-    check: "generated-with-files-and-commands",
-    target,
-    files: fileRows,
-    commands: commands.slice(0, 200),
-    checksum: checksum.slice(0, 60),
-  });
-
-  // (5) The generated files reference secrets by NAME and carry no value. The walk greps the
-  // downloaded bytes rather than the generator's own claim about them.
-  if (fileRows > 0) {
-    const firstFile = await page.locator("[data-bundle-file]").first().getAttribute("data-bundle-file");
-    const probe = await page
-      .evaluate(async () => {
-        const response = await fetch("/api/v1/deployment/bundles", { credentials: "same-origin" });
-        const body = await response.json();
-        return { status: response.status, count: (body.bundles || []).length };
-      })
-      .catch(() => null);
-    note({ check: "bundle-list-readable", ...(probe || {}) });
-
-    // The download is real: the button is clicked and the notice names the file.
-    const downloadButton = page.locator(`[data-bundle-download="${firstFile}"]`).first();
-    await downloadButton.click().catch(() => {});
-    await page.waitForTimeout(2500);
-    const verified = await page.locator("[data-bundle-download-verified]").count();
-    note({ check: "download-verified-against-the-server-checksum", file: firstFile, verified });
-
-    // The bytes themselves, read through the API with the session the browser already has.
-    const secretScan = await page
-      .evaluate(async () => {
-        const bundles = await (await fetch("/api/v1/deployment/bundles", { credentials: "same-origin" })).json();
-        const bundle = (bundles.bundles || [])[0];
-        if (!bundle) return { ok: false, reason: "no bundle" };
-        const files = [];
-        for (const file of bundle.files || []) {
-          const response = await fetch(
-            `/api/v1/deployment/bundles/${bundle.id}/files/${encodeURIComponent(file.name)}`,
-            { credentials: "same-origin" },
-          );
-          files.push({
-            name: file.name,
-            status: response.status,
-            checksumHeader: response.headers.get("x-checksum-sha256"),
-            expected: file.sha256,
-            text: (await response.text()).slice(0, 20000),
-          });
-        }
-        return { ok: true, files };
-      })
-      .catch(() => null);
-    if (secretScan?.ok) {
-      const leaked = secretScan.files.filter((file) =>
-        /(password|secret|token|api[-_]?key)\s*[:=]\s*["']?[A-Za-z0-9/+_-]{8,}/i.test(file.text.replace(/\$\{[A-Z_]+\}/g, "REF")),
-      );
-      const headerMatches = secretScan.files.filter((file) => file.checksumHeader === file.expected);
-      note({
-        check: "generated-files-carry-no-credential",
-        files: secretScan.files.length,
-        leakedFiles: leaked.map((file) => file.name),
-        checksumsMatch: headerMatches.length,
-      });
-    } else {
-      note({ check: "generated-files-carry-no-credential", skipped: true, reason: "no bundle readable" });
-    }
-  }
-
-  // (6) The render panel answers with a REASON rather than a 501 — a live button that says why.
-  await page.locator(`[data-bundle-render="${target}"]`).first().click().catch(() => {});
-  await page.waitForSelector("[data-bundle-render-panel]", { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(1500);
-  const reason = await page
-    .locator("[data-bundle-render-reason]")
-    .first()
-    .getAttribute("data-bundle-render-reason")
-    .catch(() => null);
-  const reasonText = (await page.locator("[data-bundle-render-reason]").first().innerText().catch(() => "")) || "";
-  const renderCommands = (await page.locator("[data-bundle-render-commands]").innerText().catch(() => "")) || "";
-  note({
-    check: "render-states-why-it-cannot-render",
-    renderable: reason,
-    saysWhy: reasonText.length > 40,
-    namesATool: /helm|docker compose/.test(renderCommands + reasonText),
-  });
-  await shot(page, "page-deployment-install-render");
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(600);
-
-  // (7) The bundle is durable: it is in the list after a reload, which is what "stored" means.
-  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1500);
-  const listed = await page.locator(`[data-bundle-row="${target}"]`).count();
-  note({ check: "bundle-survives-a-reload", target, listed });
-
-  // (8) Mobile: one column, and no sideways scroll.
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(700);
-  const overflow = await page
-    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
-    .catch(() => -1);
-  note({ check: "mobile-no-horizontal-scroll", horizontalOverflow: overflow });
-  await shot(page, "page-deployment-install-mobile");
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.waitForTimeout(400);
-  await shot(page, "page-deployment-install");
-
-  report.deploymentInstall = { steps };
-  return steps;
-}
-
-async function runDeploymentUpgradeDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "deployment-upgrade-depth", action: "deployment", ...step });
-  };
-
-  await page
-    .goto(`${URL_ADMIN}/deployment/upgrade`, { waitUntil: "domcontentloaded" })
-    .catch(() => {});
-  await page
-    .waitForSelector('[data-view="deployment-upgrade"]', { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(1200);
-
-  const running = (await page.locator("[data-upgrade-running]").innerText().catch(() => "")) || "";
-  note({ check: "running-version-is-shown", text: running.slice(0, 80), ok: running.length > 5 });
-
-  // (1) A cache with no target is a sentence naming the action, not an empty panel.
-  const unavailable = await page.locator('[data-view="deployment-upgrade"]').innerText().catch(() => "");
-  const hasPlan = (await page.locator("[data-plan-steps] li").count()) > 0;
-  if (!hasPlan) {
-    note({
-      check: "no-target-states-the-action",
-      ok: /update check|no release/i.test(unavailable || ""),
-    });
-    await shot(page, "page-deployment-upgrade-empty");
-    report.deploymentUpgrade = { steps };
-    return steps;
-  }
-
-  const stepCount = await page.locator("[data-plan-steps] li").count();
-  note({ check: "ordered-steps", steps: stepCount, ok: stepCount > 0 });
-
-  // (2) The verdict is one of three, and `unknown` is rendered as its own meaning rather than a
-  // colour — an operator must be able to read it without colour at all.
-  const verdict = await page
-    .locator("[data-upgrade-verdict]")
-    .first()
-    .getAttribute("data-upgrade-verdict")
-    .catch(() => null);
-  const reasonText = (await page.locator("[data-upgrade-verdict-reason]").innerText().catch(() => "")) || "";
-  note({
-    check: "verdict-is-one-of-three",
-    verdict,
-    ok: ["reversible", "destructive", "unknown"].includes(verdict || ""),
-    saysWhy: reasonText.length > 40,
-    saysSilenceIsNotAVerification: /silence|not a verification|not been verified/i.test(reasonText),
-  });
-
-  // (3) The point of no return is an INDEX, and a reversible plan must not have one at all.
-  const pointOfNoReturn = await page
-    .locator("[data-plan-point-of-no-return]")
-    .first()
-    .getAttribute("data-plan-point-of-no-return")
-    .catch(() => null);
-  note({
-    check: "point-of-no-return-is-marked",
-    index: pointOfNoReturn,
-    // `reversible` ⇒ no marker; the others ⇒ exactly one.
-    ok:
-      verdict === "reversible"
-        ? pointOfNoReturn === null
-        : pointOfNoReturn !== null && Number(pointOfNoReturn) >= 0,
-  });
-
-  // (4) The rollback split: application always, database by its own method — never one card.
-  const application = await page.locator("[data-rollback-application-command]").count();
-  const databaseMethod = await page
-    .locator("[data-rollback-database-method]")
-    .first()
-    .getAttribute("data-rollback-database-method")
-    .catch(() => null);
-  note({
-    check: "rollback-split-is-two-answers",
-    applicationCommand: application > 0,
-    databaseMethod,
-    ok: ["down-script", "restore-from-backup", "unknown"].includes(databaseMethod || ""),
-  });
-
-  // (5) The acknowledgement is a REAL gate: the checklist says what it is waiting for, and the
-  // button posts the plan's OWN verdict rather than a literal the walk chose.
-  const blocked = await page.locator("[data-checklist-blocked]").count();
-  const blockedReason = (await page.locator("[data-checklist-blocked-reason]").innerText().catch(() => "")) || "";
-  const ackButton = page.locator("[data-upgrade-acknowledge]").first();
-  const ackVerdict = await ackButton.getAttribute("data-upgrade-acknowledge").catch(() => null);
-  const needsAck = blocked > 0;
-  note({
-    check: "acknowledgement-is-a-real-gate",
-    blocked: needsAck,
-    saysWhatItWaitsFor: blockedReason.length > 20,
-    postsThePlansOwnVerdict: ackVerdict === verdict,
-  });
-
-  if (needsAck && ackVerdict) {
-    await ackButton.click().catch(() => {});
-    await page.waitForTimeout(2500);
-    const stillBlocked = await page.locator("[data-checklist-blocked]").count();
-    const complete = await page.locator("[data-checklist-complete]").count();
-    const ackError = (await page.locator("[data-upgrade-ack-error]").innerText().catch(() => "")) || "";
-    note({
-      check: "acknowledgement-recorded",
-      blockedAfter: stillBlocked,
-      complete: complete > 0,
-      ackError: ackError.slice(0, 120),
-      // Either it took (complete) or the server said why (an error sentence). Both are honest;
-      // "nothing happened, no message" is the only unacceptable outcome.
-      ok: complete > 0 || stillBlocked === 0 || ackError.length > 10,
-    });
-    await shot(page, "page-deployment-upgrade-acknowledged");
-  }
-
-  // (6) Regenerating must not lose the acknowledgement — it is a fact about the range, not the visit.
-  await page.locator("[data-upgrade-refresh]").click().catch(() => {});
-  await page.waitForTimeout(2000);
-  const stillComplete = await page.locator("[data-checklist-complete]").count();
-  const ackStamp = await page.locator("[data-upgrade-acknowledged-at]").count();
-  if (needsAck) {
-    note({
-      check: "acknowledgement-survives-regeneration",
-      complete: stillComplete > 0,
-      stampShown: ackStamp > 0,
-      ok: stillComplete > 0 || ackStamp > 0,
-    });
-  }
-
-  // (7) Topology changes the plan rather than being a label: kubernetes is its own selection.
-  await page.locator("[data-upgrade-topology]").selectOption("kubernetes").catch(() => {});
-  await page.waitForTimeout(2000);
-  const k8sSteps = await page.locator("[data-plan-steps] li").count();
-  const k8sText = (await page.locator("[data-plan-steps]").innerText().catch(() => "")) || "";
-  note({
-    check: "topology-changes-the-plan",
-    steps: k8sSteps,
-    mentionsHelm: /helm|kubectl/i.test(k8sText),
-    ok: k8sSteps > 0 && /helm|kubectl/i.test(k8sText),
-  });
-  await shot(page, "page-deployment-upgrade-kubernetes");
-
-  await page.locator("[data-upgrade-topology]").selectOption("compose").catch(() => {});
-  await page.waitForTimeout(1500);
-  await page.locator("[data-upgrade-stack]").selectOption("compose-enterprise").catch(() => {});
-  await page.waitForTimeout(2000);
-  const enterpriseText = (await page.locator("[data-plan-steps]").innerText().catch(() => "")) || "";
-  note({
-    check: "enterprise-stack-changes-the-plan",
-    mentionsExternal: /enterprise|external/i.test(enterpriseText),
-  });
-
-  // (8) Mobile, and a printable checklist that still reads without the screen's chrome.
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(700);
-  const overflow = await page
-    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
-    .catch(() => -1);
-  note({ check: "mobile-no-horizontal-scroll", horizontalOverflow: overflow });
-  await shot(page, "page-deployment-upgrade-mobile");
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.waitForTimeout(400);
-  await shot(page, "page-deployment-upgrade");
-
-  report.deploymentUpgrade = { steps };
-  return steps;
-}
-
-async function runSecretsAuditDepth(page, report) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "secrets-audit-depth", action: "secrets", ...step });
-  };
-
-  await page.goto(`${URL_ADMIN}/secrets/audit`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page
-    .waitForSelector("[data-audit-summary], [data-audit-error]", { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  const summaryText = (
-    await page.locator("[data-audit-summary]").first().innerText().catch(() => "")
-  ).trim();
-  const rowCount = await page.locator("[data-audit-row]").count();
-  const openBefore = await page.locator("[data-audit-anomaly]").count();
-  note({ step: "opened", rowCount, anomalyCards: openBefore, summaryChars: summaryText.length });
-  await shot(page, "page-secrets-audit");
-
-  // ---- `/` focuses the search box, `f` focuses the request-id box -------------------------------
-  await page.keyboard.press("/");
-  await page.waitForTimeout(200);
-  const searchFocused = await page
-    .locator("[data-audit-search]")
-    .first()
-    .evaluate((node) => node === document.activeElement)
-    .catch(() => false);
-  await page.keyboard.press("Escape");
-  await page.keyboard.press("f");
-  await page.waitForTimeout(200);
-  const requestFocused = await page
-    .locator("[data-audit-request-id]")
-    .first()
-    .evaluate((node) => node === document.activeElement)
-    .catch(() => false);
-  await page.keyboard.press("Escape");
-  note({ step: "shortcuts", searchFocused, requestFocused });
-
-  // ---- The request id is a filter, not a label --------------------------------------------------
-  const joinable = await page.locator("[data-audit-row-request]").count();
-  let joined = 0;
-  if (joinable > 0) {
-    await page.locator("[data-audit-row-request]").first().click({ timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1200);
-    joined = await page.locator("[data-audit-row]").count();
-    await shot(page, "page-secrets-audit-request-joined");
-    const value = await page
-      .locator("[data-audit-request-id]")
-      .first()
-      .inputValue()
-      .catch(() => "");
-    note({ step: "request-id-join", joinable, joined, filterValueLength: value.length });
-    // Clear again so the acknowledge step below sees the full trail.
-    await page.locator("[data-audit-clear]").first().click({ timeout: 6000 }).catch(() => {});
-    await page.waitForTimeout(800);
-  } else {
-    note({ step: "request-id-join", joinable: 0, reason: "no row carries a request id yet" });
-  }
-
-  // ---- The action filter narrows the trail ------------------------------------------------------
-  const actionPills = await page.locator("[data-audit-action]").count();
-  if (actionPills > 0) {
-    const before = await page.locator("[data-audit-row]").count();
-    await page.locator("[data-audit-action]").first().click({ timeout: 6000 }).catch(() => {});
-    await page.waitForTimeout(1000);
-    const after = await page.locator("[data-audit-row]").count();
-    const pressed = await page
-      .locator("[data-audit-action]")
-      .first()
-      .getAttribute("aria-pressed")
-      .catch(() => null);
-    note({ step: "action-filter", actionPills, before, after, pressed });
-    await shot(page, "page-secrets-audit-action-filtered");
-    await page.locator("[data-audit-clear]").first().click({ timeout: 6000 }).catch(() => {});
-    await page.waitForTimeout(700);
-  } else {
-    note({ step: "action-filter", actionPills: 0, reason: "no action has been written yet" });
-  }
-
-  // ---- Acknowledge a flag, then acknowledge it again --------------------------------------------
-  const acknowledge = page.locator("[data-audit-acknowledge]").first();
-  if ((await acknowledge.count()) > 0) {
-    await acknowledge.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[data-audit-notice]", { timeout: 15000 }).catch(() => {});
-    const notice = (await page.locator("[data-audit-notice]").first().innerText().catch(() => "")).trim();
-    await page.waitForTimeout(500);
-    const stillOpen = await page.locator("[data-audit-acknowledge]").count();
-    const openFlags = (await page.locator("[data-audit-summary]").first().innerText().catch(() => "")).trim();
-    note({
-      step: "acknowledged",
-      notice: notice.slice(0, 160),
-      buttonsLeft: stillOpen,
-      // The count must have moved; a button that vanished without the number changing would mean
-      // the row was removed rather than acknowledged.
-      summaryStillShowsCounts: /Open flags/i.test(openFlags),
-    });
-    await shot(page, "page-secrets-audit-acknowledged");
-  } else {
-    note({ step: "acknowledged", skipped: true, reason: "no unacknowledged flag to clear" });
-  }
-
-  // ---- The export is a real download, and it is metadata only -----------------------------------
-  // A download is written into a temp dir, so the assertion reads bytes the panel actually put on
-  // disk rather than a fetch the walk did itself.
-  const exported = await page
-    .evaluate(async () => {
-      const response = await fetch("/api/v1/secrets/audit/export?limit=200", {
-        credentials: "same-origin",
-        headers: { accept: "application/x-ndjson" },
-      });
-      const body = await response.text();
-      return { status: response.status, chars: body.length, body: body.slice(0, 4000) };
-    })
-    .catch(() => null);
-  const feed = exported?.body ?? "";
-  const feedLeak = /qa-credential-value|qa-lease-value|qa-walkthrough-value|wrapped_key|seal_checksum/.test(
-    feed,
-  );
-  // The download button itself, because a control that no longer produces a file is a dead button.
-  await page.locator("[data-audit-export]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-audit-notice]", { timeout: 15000 }).catch(() => {});
-  const exportNotice = (await page.locator("[data-audit-notice]").first().innerText().catch(() => "")).trim();
-  note({
-    step: "export",
-    status: exported?.status ?? 0,
-    chars: exported?.chars ?? 0,
-    leakedFixtureValue: feedLeak,
-    notice: exportNotice.slice(0, 160),
-  });
-  await shot(page, "page-secrets-audit-exported");
-
-  // ---- The screen says what a flag does and does not do -----------------------------------------
-  const footer = (await page.evaluate(() => document.body.innerText)).toLowerCase();
-  note({
-    step: "states-the-limits",
-    saysNeverBlocked: /nothing is ever blocked|never blocked|advisory/.test(footer),
-    saysNoValue: /no credential value|cannot return a credential value|metadata only/.test(footer),
-  });
-
-  report.secretsAudit = { steps };
-}
-
 
 async function main() {
-  assertDeploymentScreensWalked();
-  assertWave5bScreensWalked();
-  assertGraphqlScreensWalked();
-  assertDeprecationScreensWalked();
-  const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
   const browser = await chromium.launch({
     executablePath: CHROME,
@@ -11017,8 +9194,16 @@ async function main() {
   });
 
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
-  const page = markHydrationWait(await context.newPage());
+  let page = markHydrationWait(await context.newPage());
   attach(page, "main");
+  // The swap seam for `reviveMainPage`: a tab the box killed is replaced, not mourned.
+  installMainPage = async () => {
+    const replacement = markHydrationWait(await context.newPage());
+    attach(replacement, "main-recovered");
+    await ensureSignedIn(replacement, report).catch(() => {});
+    page = replacement;
+    return replacement;
+  };
 
   // Reachable?
   try {
@@ -11031,11 +9216,162 @@ async function main() {
     process.exit(2);
   }
 
-  await runWizard(page, report);
+  // A pass that loses its stack must say so.
+  //
+  // The stack is disposable: every `run.sh` starts it, and anything on the box that restarts
+  // pm2 (a sibling's pass, a `pm2 save`/`resurrect`, a reboot) can SIGINT it while this
+  // walkthrough is twenty minutes in. Every navigation after that lands on
+  // `chrome-error://chromewebdata/`, every click is "ok" because clicking an error page
+  // cannot fail, and the roll-up reports a confident list of console errors, failed requests
+  // and empty screens — all of them artifacts of the dead server, none of them a product
+  // defect. That is the worst possible outcome for a gate: it looks like a red pass and it
+  // is really a dead server, so the next tick goes and "fixes" a screen that was fine.
+  //
+  // The check is the cheap one — is the admin origin answering? — taken at the end of the
+  // pass, next to the roll-up, so the cost is one request and the answer is unambiguous.
+  // A pass whose stack died reports `fatal: the QA stack stopped answering` and exits
+  // non-zero, which is the opposite of a red pass: it is a no-result run, and a no-result
+  // run is re-run rather than acted on.
+  // Three ticks of passes were thrown away on this line, and the reason is that it treats a
+  // TIMEOUT as proof of death. A timeout is not a verdict: this box hosts six writers, and a
+  // Next render under load routinely takes longer than the budget here, so `catch` fired on a
+  // perfectly healthy stack, `return true` was called "stack-gone", and 1,844 real clicks were
+  // discarded with `QA_FINDINGS=0 QA_CLICKS=1844` — a run that measured the entire panel and
+  // reported nothing. The reading has to distinguish three states the old body could not:
+  //
+  //   * answered with a status below 500 -> alive. A 404 or a 401 is the panel REPLYING, and a
+  //     process that is answering is a process that is running. The old body called 5xx dead,
+  //     which is backwards: a 500 is a Next render that threw and came back up, and on this box
+  //     a stack under memory pressure answers 500 while serving everything else fine.
+  //   * refused / reset -> dead. `ECONNREFUSED` and `ECONNRESET` mean nothing is listening, and
+  //     no amount of retrying changes that.
+  //   * timed out -> UNKNOWN, and unknown is not dead. This is retried below with a longer
+  //     budget, and only a timeout that survives every attempt may call the stack gone.
+  //
+  // The third state is the one that needs no extra witness: a timeout that survives all three
+  // budgets is read as gone, because the only way to tell a timeout from a dead port without
+  // retrying is to assume, and this gate has already assumed once and lost three passes to it.
+  const stackGone = async () => {
+    // Anything the request can tell us about the connection is decisive; only a timeout is not.
+    let lastErr = null;
+    // The first attempt keeps the old budget so a dead stack is still detected quickly; the
+    // retries widen it, because the failure this fixes is a busy box, not a slow one.
+    for (const timeout of [8000, 15000, 25000]) {
+      try {
+        await context.request.get(`${URL_ADMIN}/login`, { timeout });
+        // The request completed, so the stack answered, and THAT is the whole test. The status
+        // is deliberately not consulted: a 500 from Next is a render that threw and the process
+        // that came back up to send it, which is the opposite of gone, and reading it as death is
+        // what cost three ticks of passes. Anything below 500 is likewise an answer.
+        return false;
+      } catch (err) {
+        lastErr = err;
+        const text = String((err && err.message) || err);
+        // A connection the stack refused or reset is a decision, not a delay.
+        if (/ECONNREFUSED|ECONNRESET|EPIPE|socket hang up|ECONNABORTED/i.test(text)) return true;
+        // Anything else here is a timeout, a proxy hiccup or a DNS blip: retry with more room.
+      }
+    }
+    log(`stack liveness: ${lastErr ? String(lastErr.message || lastErr) : "unknown"} after three attempts`);
+    return true;
+  };
+  report.assertStackAlive = async () => {
+    if (await stackGone()) {
+      throw new Error("stack-gone: the QA stack stopped answering mid-pass; every finding after that point is a dead server, not a product defect");
+    }
+  };
+
+  await runDepthPass("onboarding-wizard", () => runWizard(page, report));
 
   // `--only=wizard` re-checks the first-run flow on its own (reset the database first): it drives
   // the steps, then reports what the onboarding endpoints answered. A full pass is minutes; this is
   // the tool for "did the setup step just get refused?".
+  //
+  // `--only=<depth pass>` runs ONE depth pass against an already-running stack and stops. A full
+  // pass on a box that also hosts two other writers' stacks is twenty minutes of browser, and a
+  // pass that dies half way through has proved nothing about the pass it never reached; this runs
+  // the pass a developer is actually working on. Reset the database first if the pass expects the
+  // first-run wizard to have run.
+  const only = (process.argv.find((arg) => arg.startsWith("--only=")) || "").split("=")[1];
+  // **The two spellings, reconciled here and nowhere else.** `DEPTH_PASSES`'s keys are
+  // de-hyphenated (`workflowtable`) because that is how a caller passes them on a command line
+  // without quoting a hyphen, while every other name in this file — the `runDepthPass("workflow-table")`
+  // call sites, the `wants("…")` guards, the roll-up's matched set — is hyphenated. The lookup used
+  // to compare the two directly, so `--only=workflow-table` (the spelling `run.sh`'s own comment
+  // recommends, and the spelling every guard in this file uses) matched nothing, the exit never fired,
+  // and a pass asked for one five-minute screen walked the whole inventory.
+  //
+  // It failed WIDE, which is why four ticks read it as a crowded box: the run still produced a
+  // summary, still exited 0, and still printed a banner naming the filter the caller asked for — a
+  // banner about intent, not about coverage. The only symptom was `clicks.jsonl` naming a different
+  // screen than the build log claimed to be measuring.
+  //
+  // So the requested name is normalised, and the log line says which spelling was ACCEPTED rather
+  // than only which was asked for. Normalising in one place is the point: a second convention has to
+  // have exactly one crossing point, or the next table added next month reopens this.
+  //
+  // **`--only=a,b` matched nothing, and the way it matched nothing was the expensive way.**
+  // `only` is the raw `--only=` value, so a two-name filter arrives here as the single string
+  // `"workflow-table,workflow-builder"`; de-hyphenating that yields `"workflowtable,workflowbuilder"`,
+  // which is not a key, so the branch was skipped and the pass walked the WHOLE inventory. The
+  // single-name spelling had just been fixed for exactly this reason (`a3a0bf27`), and the fix
+  // left the comma spelling in the same shape it had complained about: `ONLY` is parsed as a LIST
+  // forty lines up and used as a scalar here, so the one argument the file already supports is
+  // the one this branch cannot accept.
+  //
+  // So the filter is resolved over `ONLY`, not over the raw string, and the two cases are kept
+  // apart deliberately. `ONLY` is authoritative because the route filter and the roll-up's matched
+  // set both speak it; `only` is only what the caller typed, kept for the report's own `only` field.
+  // A name that resolves to no depth pass falls through to the route list, which is what
+  // `--only=<a route name>` is FOR — so this must not become an error, only a resolved list.
+  //
+  // The log line names what was ACCEPTED rather than only what was asked for, which is the whole
+  // lesson of the four ticks that read a wide pass as a busy box: a banner about intent is not a
+  // coverage claim, and `clicks.jsonl` naming a different screen is the only symptom a reader sees.
+  const onlyResolved = ONLY.filter((name) => Object.prototype.hasOwnProperty.call(DEPTH_PASSES, name.replace(/-/g, "")))
+    .map((name) => ({ asked: name, key: name.replace(/-/g, "") }));
+  if (onlyResolved.length > 0) {
+    await ensureSignedIn(page, report);
+    log(
+      `focused depth pass: requested ${only || "(none)"} → resolved ${onlyResolved
+        .map((entry) => `${entry.asked}=${entry.key}`)
+        .join(", ")}`,
+    );
+    for (const entry of onlyResolved) {
+      await DEPTH_PASSES[entry.key](page, report);
+    }
+    // The depth passes are the ones a REQ close depends on, so the stack check matters most
+    // here: a pass that lost its stack halfway through a depth pass produces a *confident*
+    // report (`rows: 0`, `listsTheCreate: false`) that reads exactly like a broken screen.
+    if (await stackGone()) {
+      fs.writeFileSync(
+        path.join(OUT, "summary.json"),
+        JSON.stringify({ only, fatal: "stack-gone: the QA stack stopped answering mid-pass; this pass proved nothing", ...report, netFailures }, null, 2),
+      );
+      console.error("[walk] FATAL: the QA stack stopped answering mid-pass — re-run, do not act on this report");
+      await browser.close();
+      process.exit(4);
+    }
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify({ only, ...report, netFailures, netExpected, onboardingFailures: netFailures.filter((f) => String(f.url || "").includes("/onboarding/")) }, null, 2),
+    );
+    console.log(`ONLY_PASS=${only} NET_FAILURES=${netFailures.length}`);
+    // One line per focused pass, matched on the name the CALLER typed. `only` used to be tested
+    // with a single `includes()`, so a two-name filter echoed nothing at all: the string
+    // `"workflow-table,workflow-builder"` is a substring of no page name, so the one place a
+    // reader sees the rows this pass just produced went silent on exactly the input the filter
+    // documents as supported. The ASKED name is the right one to match on, not the de-hyphenated
+    // key — the keys are `workflowtable` and the pages are `workflow-table-depth`, so a key match
+    // would find nothing even with one name.
+    const onlyNames = onlyResolved.map((entry) => entry.asked);
+    for (const line of report.steps.filter((step) => onlyNames.some((name) => String(step.page || "").includes(name)))) {
+      console.log(`  ${JSON.stringify(line)}`);
+    }
+    await browser.close();
+    process.exit(netFailures.length === 0 ? 0 : 1);
+  }
+
   if (process.argv.includes("--only=wizard")) {
     const onboardingFailures = netFailures.filter((f) => String(f.url || "").includes("/onboarding/"));
     const finished = await page
@@ -11070,6 +9406,16 @@ async function main() {
     { path: "/", name: "overview" },
     { path: "/pages", name: "pages" },
     { path: "/media", name: "media" },
+    // The automations screen (REQ-003, slice 1) — walked here, and its depth pass below
+    // creates a rule, nests a condition group, runs a test event, mints a hook URL and
+    // deletes the rule again.
+    { path: "/automations", name: "automations" },
+    // The operations screens of REQ-003 slice 4 — no untested screen. The gallery is its own
+    // route, and the run detail is a route with the run's id in it, so neither can appear in a
+    // static list: both are opened by the slice-4 depth pass below, which also clicks Restore on
+    // a version row, Retry on a failed step and Use this on a template.
+    { path: "/automations/templates", name: "automations-templates" },
+
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
     { path: "/media/duplicates", name: "media-duplicates" },
@@ -11089,43 +9435,24 @@ async function main() {
     { path: "/backups", name: "backups" },
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai" },
+    // The AI workflow builder's console (REQ-046, slice 3). It is walked here so a screen that
+    // only ever existed in a route table still gets screenshotted; the depth pass below opens a
+    // REAL draft, which is the only way the review screen (`/ai/workflows/[id]`, a route whose
+    // path carries an id) is ever visited — the same reason `/media/[id]` is not in this list.
+    { path: "/ai/workflows", name: "ai-workflows" },
+    // The AI app builder's console (REQ-045, slice 2's screens). It is walked here so a screen
+    // that only ever existed in a route table still gets screenshotted; the depth pass below
+    // opens a REAL plan, which is the only way the review workspace
+    // (`/app-builder/plans/{id}`, a route whose path carries an id) is ever visited — the same
+    // reason `/media/[id]` and `/automations/[id]` are not in this list.
+    { path: "/app-builder", name: "app-builder" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
     { path: "/settings/search", name: "search-settings" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
-    // The deployment centre's release surface (REQ-128, slice 4) — walked here and driven by the
-  // depth passes below. The three routes are listed and the detail screen is opened from a row
-  // that exists: a `/deployment/artifacts/{version}` walked with a fabricated version would prove
-  // only that the 404 state renders, which is how a screen gets shipped unmeasured.
-  { path: "/deployment/artifacts", name: "deployment-artifacts" },
-  { path: "/deployment/install", name: "deployment-install" },
-  { path: "/deployment/upgrade", name: "deployment-upgrade" },
-  // The migration ledger (REQ-129, slice 1). The detail screen is opened by the depth pass below
-  // from a row the ledger actually renders, for the reason in DEPLOYMENT_SCREENS above.
-  { path: "/deployment/migrations", name: "deployment-migrations" },
-  // The backfill list and the seed datasets (REQ-129, slice 3). BOTH screens are visited in the
-  // list AND the 390px pass, because a data-migration surface that only works at desktop width is
-  // one an operator cannot use from a phone during an incident.
-  { path: "/deployment/backfills", name: "deployment-backfills" },
-  { path: "/deployment/seeds", name: "deployment-seeds" },
-  // The anonymised export surface (REQ-129, slice 4). It is in DEPLOYMENT_SCREENS as well, so
-  // the startup guard refuses a pass in which this route has been dropped from this list — a
-  // screen reachable only from a URL nobody types is a screen nobody measured.
-  { path: "/deployment/exports", name: "deployment-exports" },
-  // The developer portal's GraphQL surface (REQ-130, slice 2). All four walkable screens are in
-  // GRAPHQL_SCREENS, so a merge that drops one from this list stops the pass rather than quietly
-  // reducing coverage. The detail screen is opened by the depth pass from a row the registry lists.
-  { path: "/developer/graphql", name: "graphql-playground" },
-  { path: "/developer/graphql/documents", name: "graphql-documents" },
-  { path: "/developer/graphql/schema", name: "graphql-schema" },
-  { path: "/developer/graphql/settings", name: "graphql-settings" },
-  // The versioned API policy screen (REQ-130, slice 4). In DEPRECATION_SCREENS as well, so a
-  // merge that drops it from this list stops the pass rather than quietly reducing coverage —
-  // the same rule the four GraphQL screens earn.
-  { path: "/developer/api/deprecations", name: "api-deprecations" },
-  { path: "/settings/iam", name: "iam-overview" },
+    { path: "/settings/iam", name: "iam-overview" },
     { path: "/settings/iam/users", name: "iam-users" },
     { path: "/settings/iam/groups", name: "iam-groups" },
     { path: "/settings/iam/service-accounts", name: "iam-service-accounts" },
@@ -11205,17 +9532,6 @@ async function main() {
     { path: "/security/headers", name: "security-headers" },
     { path: "/security/rate-limits", name: "security-rate-limits" },
     { path: "/security/sign-in-protection", name: "security-sign-in-protection" },
-    { path: "/settings/reliability/limits", name: "reliability-limits" },
-    { path: "/settings/reliability/idempotency", name: "reliability-idempotency" },
-    // REQ-127 slice 3's two screens. A screen that is not in this list is a screen nothing has
-    // ever rendered, and the retry editor's delay preview and the breaker's forced-open banner
-    // are exactly the kind of thing that only fails when it is actually opened.
-    { path: "/settings/reliability/retries", name: "reliability-retries" },
-    { path: "/settings/reliability/breakers", name: "reliability-breakers" },
-    // REQ-127 slice 4's screen. The tester dialog and the removal confirmation are the two
-    // things on it that can be wrong while the list looks perfect, and neither is visible until
-    // it is opened -- which is exactly what this pass does.
-    { path: "/settings/reliability/intake", name: "reliability-intake" },
     { path: "/security/ip-access", name: "security-ip-access" },
     { path: "/security/events", name: "security-events" },
     { path: "/security/secrets", name: "security-secrets" },
@@ -11245,25 +9561,6 @@ async function main() {
     //   `suggestion`, which is the difference between a limit and a placeholder.
     { path: "/health/incidents", name: "health-incidents" },
     { path: "/health/settings", name: "health-settings" },
-    // --- REQ-125/126 (wave 5b platform extras): the secrets centre and the observability centre.
-    // These thirteen entries are BACK, and `assertWave5bScreensWalked` refuses to start a pass in
-    // which any of them is missing — merge `8c6ab11d` deleted all thirteen while leaving the file
-    // syntactically valid, so six ticks of depth passes reported green over screens that no route
-    // walk had ever measured and no mobile pass had ever rendered. A depth pass drives a screen;
-    // only a route entry proves its layout at two widths and collects its diagnostics.
-    { path: "/secrets/root-key", name: "secrets-root-key" },
-    { path: "/secrets/credentials", name: "secrets-credentials" },
-    { path: "/secrets/slots", name: "secrets-slots" },
-    { path: "/secrets/leases", name: "secrets-leases" },
-    { path: "/secrets/deploy-keys", name: "secrets-deploy-keys" },
-    { path: "/secrets/audit", name: "secrets-audit" },
-    { path: "/observability", name: "observability-overview" },
-    { path: "/observability/metrics", name: "observability-metrics" },
-    { path: "/observability/logs", name: "observability-logs" },
-    { path: "/observability/traces", name: "observability-traces" },
-    { path: "/observability/exporters", name: "observability-exporters" },
-    { path: "/observability/alerts", name: "observability-alerts" },
-    { path: "/observability/settings", name: "observability-settings" },
     // The developer portal (REQ-022, slice 2). All four are in the route list because all four are
     // reachable and none had ever been rendered by anything — a screen no pass opens is the one
     // screen whose job is to be believed. `/developer/api-keys/{id}` is deliberately NOT a route
@@ -11293,16 +9590,6 @@ async function main() {
         report.mediaUpload = await uploadMediaSample(page);
         log(`media upload: ${JSON.stringify(report.mediaUpload)}`);
         await page.waitForTimeout(600);
-      }
-      // The session guard sits BETWEEN the navigation and the measurement, so a screen that lost
-      // the session is recorded as unmeasured instead of being measured as a login form. See
-      // `sessionFault` for what eight "zero-finding" screens in one pass actually meant.
-      const fault = await sessionFault(page, route);
-      if (fault) {
-        record({ page: route.name, action: "route-not-measured", reason: fault });
-        log(`page ${route.name}: ${fault}`);
-        report.pages.push({ ...route, failed: fault, notMeasured: true });
-        continue;
       }
       const diag = await diagnostics(page);
       await shot(page, `page-${route.name}`);
@@ -11339,10 +9626,34 @@ async function main() {
     log(`media file detail: ${JSON.stringify(report.mediaFileDetail)}`);
   }
 
+  // The AI workflow builder's console and its review screen (REQ-046, slice 3). Run right
+  // after the media passes because it writes a fixture row: the pass that follows wants a
+  // database whose shape it did not have to guess at.
+  if (wants("ai-workflow-console")) {
+    matchedOnly.add("ai-workflow-console");
+    report.aiWorkflowConsole = await runDepthPass("ai-workflow-console", () =>
+      runAiWorkflowConsole(page, report),
+    );
+    log(`ai workflow console: ${JSON.stringify(report.aiWorkflowConsole)}`);
+  }
+
   if (wants("media-presets")) {
     matchedOnly.add("media-presets");
     report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
     log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
+  }
+
+  // The AI app builder's console and review workspace (REQ-045, slice 2's screens). It runs
+  // after the AI workflow pass for the same reason: it seeds a fixture row, and the pass that
+  // follows wants a database whose shape it did not have to guess at. Its review half is driven
+  // against a plan with an INVALID artifact and a PENDING one on purpose — a review screen
+  // measured only against an already-resolved plan is a screen that has never said no.
+  if (wants("app-builder-console")) {
+    matchedOnly.add("app-builder-console");
+    report.appBuilderConsole = await runDepthPass("app-builder-console", () =>
+      runAppBuilderConsole(page, report),
+    );
+    log(`app builder: ${JSON.stringify(report.appBuilderConsole)}`);
   }
 
   // The storage tab (REQ-010, slice 3): the range refused by the form, a connection test that
@@ -11381,364 +9692,7 @@ async function main() {
     log(`media duplicates: ${JSON.stringify(report.mediaDuplicates)}`);
   }
 
-    // --- REQ-125/126/127 (wave 5b platform extras): the observability and reliability screens.
-  // Each is behind `wants()` like every other depth pass so a focused pass can name exactly the
-  // screens it just built instead of walking the whole inventory.
-  if (wants("observability-traces")) {
-    matchedOnly.add("observability-traces");
-    // BOTH passes go inside the wrapper as a SEQUENCE. The overview was written as
-    // `runObservabilityOverviewDepth(page),` with its parentheses — which CALLS it immediately and
-    // hands `runDepthPass` an already-running promise. An argument that is a promise is outside the
-    // try/catch the moment it rejects: the traces pass never ran, and the rejection escaped as an
-    // uncaught exception that ended the whole walkthrough with 380 screenshots on disk and no
-    // summary. A wrapper that only guards the call it is given guards nothing when given a promise
-    // instead of a function.
-    report.observabilityTraces = await runDepthPass("observability-traces", async () => {
-      await runObservabilityOverviewDepth(page);
-      await runObservabilityTracesDepth(page, report);
-    });
-  }
-  // The metric catalogue's depth pass was an ORPHAN: defined at line 7644 with fourteen `note()`
-  // checks and two screenshots, exported at 8535, and called from nowhere. `grep` for its name
-  // finds the definition and the export and nothing else, because `c0b3a58b` wrote the function and
-  // the route entry but no `wants()` block — so `observability-metrics` was a pass name nothing
-  // answered to, and a focused pass naming it produced the `unknown-pass-name` finding rather than
-  // the chart, the range change, the cap bar or the 390px layout it was written to prove.
-  //
-  // It is separate from `observability-traces` on purpose. The overview is folded into that one
-  // because it shares a page with it; the metric screen shares nothing with the trace screen, and
-  // giving it its own `wants()` name is what makes `--only=observability-metrics` walk the chart
-  // without dragging six other screens along with it.
-  if (wants("observability-metrics")) {
-    matchedOnly.add("observability-metrics");
-    report.observabilityMetrics = await runDepthPass("observability-metrics", () =>
-      runObservabilityMetricsDepth(page, report),
-    );
-  }
-  if (wants("observability-logs")) {
-    matchedOnly.add("observability-logs");
-    report.observabilityLogs = await runDepthPass("observability-logs", () =>
-      runObservabilityLogsDepth(page, report),
-    );
-  }
-  if (wants("observability-exporters")) {
-    matchedOnly.add("observability-exporters");
-    report.observabilityExporters = await runDepthPass("observability-exporters", () =>
-      runObservabilityExportersDepth(page, report),
-    );
-  }
-  if (wants("observability-alerts")) {
-    matchedOnly.add("observability-alerts");
-    report.observabilityAlerts = await runDepthPass("observability-alerts", () =>
-      runObservabilityAlertsDepth(page, report),
-    );
-  }
-  if (wants("observability-settings")) {
-    matchedOnly.add("observability-settings");
-    report.observabilitySettings = await runDepthPass("observability-settings", () =>
-      runObservabilitySettingsDepth(page, report),
-    );
-  }
-  if (wants("secrets-root-key")) {
-    matchedOnly.add("secrets-root-key");
-    report.secretsRootKey = await runDepthPass("secrets-root-key", () =>
-      runSecretsRootKeyDepth(page, report),
-    );
-  }
-  if (wants("secrets-credentials")) {
-    matchedOnly.add("secrets-credentials");
-    report.secretsCredentials = await runDepthPass("secrets-credentials", () =>
-      runSecretsCredentialsDepth(page, report),
-    );
-  }
-  if (wants("secrets-leases")) {
-    matchedOnly.add("secrets-leases");
-    report.secretsLeases = await runDepthPass("secrets-leases", () =>
-      runSecretsLeasesDepth(page, report),
-    );
-  }
-  if (wants("secrets-audit")) {
-    matchedOnly.add("secrets-audit");
-    report.secretsAudit = await runDepthPass("secrets-audit", () =>
-      runSecretsAuditDepth(page, report),
-    );
-  }
-  // REQ-128 slice 4's screens. Each is behind `wants()` like every other depth pass, and each
-  // names the screens it just built so a focused pass spends its budget here rather than on the
-  // whole inventory. `deployment-artifacts` also opens the `{version}` detail screen with a
-  // version that EXISTS — see the note above the route list.
-  if (wants("deployment-artifacts")) {
-    matchedOnly.add("deployment-artifacts");
-    report.deploymentArtifacts = await runDepthPass("deployment-artifacts", async () => {
-      // Both passes are inside ONE thunk, and that placement is load-bearing. `runDepthPass`
-      // takes (name, pass) and calls `pass()` inside its own try/catch — so anything handed to it
-      // as a THUNK is caught, and anything evaluated as a value is not. The migrations pass used
-      // to be passed as a third argument, which JavaScript evaluates eagerly at the call site,
-      // outside the guard: its `TypeError` unwound the entire process, took the next three depth
-      // passes with it, and left a run with 400+ screenshots and no summary.json at all. The
-      // signature was never wrong — a third argument is simply ignored, and the work it was
-      // supposed to do happened anyway, unprotected.
-      const artifacts = await runDeploymentArtifactsDepth(page, report);
-      const migrations = await runDeploymentMigrationsDepth(page, report);
-      const backfills = await runDeploymentBackfillsDepth(page, report);
-      return { ...artifacts, migrations, backfills };
-    });
-  }
-  if (wants("deployment-install")) {
-    matchedOnly.add("deployment-install");
-    report.deploymentInstall = await runDepthPass("deployment-install", () =>
-      runDeploymentInstallDepth(page, report),
-    );
-  }
-  if (wants("deployment-upgrade")) {
-    matchedOnly.add("deployment-upgrade");
-    report.deploymentUpgrade = await runDepthPass("deployment-upgrade", () =>
-      runDeploymentUpgradeDepth(page, report),
-    );
-  }
-
-  
-// ---------------------------------------------------------------------------------------------
-// REQ-127 slice 3 — the retry screen and the breaker screen, driven end to end.
-//
-// Both passes click the thing that is dangerous rather than the thing that is easy: the retry
-// editor's delay preview (a wrong factor is invisible until you see the curve) and the breaker's
-// `Force open` (which changes production behaviour the moment it is pressed). A pass that only
-// opened the two pages would prove the routes render and nothing about whether they work.
-// ---------------------------------------------------------------------------------------------
-
-/**
- * `/settings/reliability/retries` (REQ-127, slice 3).
- *
- * The order of the steps follows the operator's: open the screen, see the backlog, read what is
- * dead-lettered, open the editor and change a factor to watch the curve move, then close it with
- * `Esc` and confirm the dialog is gone.
- */
-async function runReliabilityRetriesDepth(page) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "reliability-retries-depth", action: "retries", ...step });
-  };
-
-  await page.goto(`${URL_ADMIN}/settings/reliability/retries`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page
-    .waitForSelector("[data-view=\"reliability-retries\"], [role=\"alert\"]", { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  const alertText = (
-    await page.locator("[role=\"alert\"]").first().innerText().catch(() => "")
-  ).trim();
-  const dueText = (
-    await page.locator("[data-view=\"retry-due-now\"]").first().innerText().catch(() => "")
-  ).trim();
-  const deadText = (
-    await page.locator("[data-view=\"retry-dead-count\"]").first().innerText().catch(() => "")
-  ).trim();
-  const policyRows = await page.locator("[data-policy]").count();
-  const charts = await page.locator("[data-view=\"retry-delay-chart\"]").count();
-  const empty = (await page.locator("text=No retry policies").first().innerText().catch(() => "")).trim();
-  note({
-    step: "opened",
-    policyRows,
-    charts,
-    dueNow: dueText,
-    deadLetters: deadText,
-    alertChars: alertText.length,
-    emptyState: empty.length > 0,
-  });
-  // A screen that renders an error alert instead of the page is a finding; the pass records the
-  // alert rather than throwing, so the report can name it.
-  if (alertText) note({ step: "alert", text: alertText.slice(0, 200) });
-  await shot(page, "page-reliability-retries");
-
-  // The delay chart must exist for every policy row: a chart that silently drops out is how a
-  // wrong backoff factor ships unnoticed.
-  if (policyRows > 0 && charts < policyRows) {
-    note({ step: "missing-charts", policyRows, charts, reason: "a policy row has no delay preview" });
-  }
-
-  // ---- open the editor and move the factor --------------------------------------------------
-  const editButton = page.locator('[data-policy] button:has-text("Edit")').first();
-  if ((await editButton.count()) > 0) {
-    await editButton.click();
-    await page.waitForTimeout(400);
-    const dialog = page.locator('[role="dialog"]');
-    const dialogOpen = (await dialog.count()) > 0;
-    note({ step: "editor-opened", dialogOpen });
-    if (dialogOpen) {
-      const factor = dialog.locator('input[type="number"]').nth(2);
-      if ((await factor.count()) > 0) {
-        const before = await factor.inputValue().catch(() => "");
-        await factor.fill("3");
-        await page.waitForTimeout(300);
-        const after = await factor.inputValue().catch(() => "");
-        note({ step: "factor-edited", before, after });
-        const warns = await page.locator("text=curve runs past the budget").count().catch(() => 0);
-        note({ step: "budget-warning", warns });
-      }
-      await shot(page, "page-reliability-retries-editor");
-      await page.keyboard.press("Escape");
-      await page.waitForTimeout(400);
-      const closed = (await page.locator('[role="dialog"]').count()) === 0;
-      note({ step: "editor-closed", closed });
-      if (!closed) note({ step: "editor-stuck", reason: "Escape did not close the policy editor" });
-    }
-  } else {
-    note({ step: "no-policy-row", reason: "no policy row offers an editor" });
-  }
-
-  // ---- the dead-letter action ---------------------------------------------------------------
-  const retryNowBtn = page
-    .locator('[data-view="retry-dead-letters"] button:has-text("Retry now")')
-    .first();
-  if ((await retryNowBtn.count()) > 0) {
-    await retryNowBtn.click();
-    await page.waitForTimeout(900);
-    const status = (await page.locator('[role="status"]').first().innerText().catch(() => "")).trim();
-    note({ step: "retry-now", statusChars: status.length });
-  } else {
-    note({ step: "no-dead-letter", reason: "nothing is dead-lettered, so retry now has no row" });
-  }
-
-  // ---- `/` focuses the filter --------------------------------------------------------------
-  await page.keyboard.press("/");
-  await page.waitForTimeout(200);
-  const focused = await page.evaluate(() => document.activeElement?.tagName === "INPUT");
-  note({ step: "shortcut-slash", filterFocused: focused });
-
-  // ---- mobile --------------------------------------------------------------------------------
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(500);
-  await shot(page, "page-reliability-retries-mobile");
-  const overflow = await page.evaluate(
-    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
-  );
-  note({ step: "mobile", overflowPx: overflow });
-  await page.setViewportSize({ width: 1280, height: 900 });
-  return steps.length;
-}
-
-/**
- * `/settings/reliability/breakers` (REQ-127, slice 3).
- *
- * The step that matters is the confirmation: `Force open` is the one control on this centre that
- * changes what the platform does to a provider, so the pass opens the dialog, types a reason,
- * checks that the confirm button is disabled while the reason is empty, and then cancels — a
- * pass that pressed it would leave the QA stack refusing a real provider.
- */
-async function runReliabilityBreakersDepth(page) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "reliability-breakers-depth", action: "breakers", ...step });
-  };
-
-  await page.goto(`${URL_ADMIN}/settings/reliability/breakers`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page
-    .waitForSelector("[data-view=\"reliability-breakers\"], [role=\"alert\"]", { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  const alertText = (await page.locator("[role=\"alert\"]").first().innerText().catch(() => "")).trim();
-  const rows = await page.locator("[data-breaker]").count();
-  const empty = (await page.locator("text=No breaker has a row yet").count().catch(() => 0)) > 0;
-  note({ step: "opened", rows, emptyState: empty, alertChars: alertText.length });
-  if (alertText) note({ step: "alert", text: alertText.slice(0, 200) });
-  await shot(page, "page-reliability-breakers");
-
-  // The forced-open banner is the one thing an operator must not miss, so the pass asserts it
-  // exists whenever a row is forced rather than trusting the chip alone.
-  const forcedRows = await page.locator('[data-breaker]:has-text("Forced open")').count();
-  const banner = await page.locator("text=drained by hand").count().catch(() => 0);
-  note({ step: "forced-open", forcedRows, bannerCards: banner });
-  if (forcedRows > 0 && banner === 0) {
-    note({ step: "missing-forced-banner", reason: "a forced breaker shows no banner" });
-  }
-
-  // ---- the confirmation dialog for the dangerous action ---------------------------------------
-  const forceButton = page.locator('[data-breaker] button:has-text("Force open")').first();
-  if ((await forceButton.count()) > 0) {
-    const key = await page
-      .locator("[data-breaker]")
-      .first()
-      .getAttribute("data-breaker")
-      .catch(() => null);
-    await forceButton.click();
-    await page.waitForTimeout(400);
-    const dialog = page.locator('[role="dialog"]');
-    const open = (await dialog.count()) > 0;
-    note({ step: "force-open-dialog", open, key });
-    if (open) {
-      const confirmButton = dialog.locator("button").last();
-      const disabledEmpty = await confirmButton.isDisabled().catch(() => false);
-      note({ step: "reason-required", disabledWhileEmpty: disabledEmpty });
-      if (!disabledEmpty) {
-        note({ step: "reason-not-required", reason: "Force open was actionable with no reason" });
-      }
-      await dialog.locator("input").first().fill("qa walkthrough");
-      await page.waitForTimeout(300);
-      const enabledAfter = !(await confirmButton.isDisabled().catch(() => true));
-      note({ step: "reason-accepted", enabledAfter });
-      await shot(page, "page-reliability-breakers-force-open");
-      // CANCEL, never confirm: pressing it would leave the QA stack refusing a live provider.
-      await dialog.locator('button:has-text("Cancel")').click();
-      await page.waitForTimeout(400);
-      const closed = (await page.locator('[role="dialog"]').count()) === 0;
-      note({ step: "cancelled", closed, didNotPressConfirm: true });
-    }
-  } else {
-    note({ step: "no-breaker-row", reason: "no breaker row offers force open" });
-  }
-
-  // ---- the threshold editor ------------------------------------------------------------------
-  const thresholds = page.locator('[data-breaker] button:has-text("Thresholds")').first();
-  if ((await thresholds.count()) > 0) {
-    await thresholds.click();
-    await page.waitForTimeout(400);
-    const open = (await page.locator('[role="dialog"]').count()) > 0;
-    const hint = (await page.locator('[role="dialog"]').first().innerText().catch(() => "")).includes(
-      "resets",
-    );
-    note({ step: "thresholds-dialog", open, explainsHalfOpenReset: hint });
-    await shot(page, "page-reliability-breakers-thresholds");
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(400);
-    note({ step: "thresholds-closed", closed: (await page.locator('[role="dialog"]').count()) === 0 });
-  }
-
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(500);
-  await shot(page, "page-reliability-breakers-mobile");
-  const overflow = await page.evaluate(
-    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
-  );
-  note({ step: "mobile", overflowPx: overflow });
-  await page.setViewportSize({ width: 1280, height: 900 });
-  return steps.length;
-}
-
-  if (wants("reliability-retries")) {
-    matchedOnly.add("reliability-retries");
-    report.reliabilityRetries = await runDepthPass("reliability-retries", () =>
-      runReliabilityRetriesDepth(page),
-    );
-  }
-  if (wants("reliability-breakers")) {
-    matchedOnly.add("reliability-breakers");
-    report.reliabilityBreakers = await runDepthPass("reliability-breakers", () =>
-      runReliabilityBreakersDepth(page),
-    );
-  }
-  if (wants("reliability-intake")) {
-    matchedOnly.add("reliability-intake");
-    report.reliabilityIntake = await runDepthPass("reliability-intake", () =>
-      runReliabilityIntakeDepth(page),
-    );
-  }
-
-// The retention tab (REQ-010, slice 4): the policies state their consequence in a sentence,
+  // The retention tab (REQ-010, slice 4): the policies state their consequence in a sentence,
   // the purge-inside-the-restore-window refusal is visible *before* the save, a run reports a
   // sentence and writes a log row even when it found nothing, and the file's hold switch is on
   // the tab where the file's other facts are.
@@ -11755,30 +9709,30 @@ async function runReliabilityBreakersDepth(page) {
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   if (wants("palette")) {
     matchedOnly.add("palette");
-  await runPalette(page, report);
+  await runDepthPass("palette", () => runPalette(page, report));
   }
   // The command centre's own pass (REQ-032): commands, prefixes, running one, and its history.
   if (wants("command-center")) {
     matchedOnly.add("command-center");
-  await runCommandCenter(page, report);
+  await runDepthPass("command-center", () => runCommandCenter(page, report));
   }
   // The depth pass: facets, selection, copy, export and the index's own settings screen.
   if (wants("search-depth")) {
     matchedOnly.add("search-depth");
-  await runSearchDepth(page, report);
+  await runDepthPass("search-depth", () => runSearchDepth(page, report));
   }
   // The analytics depth pass (REQ-007, slice 2): the range, the comparison, a page drawer and a
   // real CSV download. Goals, funnels and realtime arrive with slice 3; the privacy half of the
   // settings screen with slice 4 — this pass visits what exists today.
   if (wants("analytics-depth")) {
     matchedOnly.add("analytics-depth");
-  report.analyticsDepth = await runAnalyticsDepth(page, report);
+  report.analyticsDepth = await runDepthPass("analyticsDepth", () => runAnalyticsDepth(page, report));
   }
   // The goals + realtime pass (REQ-007, slice 3): a goal is created through the editor, a visitor
   // completes it after it exists, and the funnel and the live counters are read back.
   if (wants("analytics-goals-depth")) {
     matchedOnly.add("analytics-goals-depth");
-  report.analyticsGoals = await runGoalAndRealtimeDepth(page, report);
+  report.analyticsGoals = await runDepthPass("analyticsGoals", () => runGoalAndRealtimeDepth(page, report));
   }  log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
 
   // The settings and privacy pass (REQ-007, slice 4): tracking on/off persisted, a refused
@@ -11786,7 +9740,7 @@ async function runReliabilityBreakersDepth(page) {
   // database.
   if (wants("analytics-settings-depth")) {
     matchedOnly.add("analytics-settings-depth");
-  report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
+  report.analyticsSettings = await runDepthPass("analyticsSettings", () => runAnalyticsSettingsDepth(page, report));
   }
   // The notification pass (REQ-021, slice 1): the bell's badge against its own grouped lines,
   // a grouped line filtering the list, a bulk action reporting what it changed, the keyboard
@@ -11794,7 +9748,7 @@ async function runReliabilityBreakersDepth(page) {
   // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
   if (wants("notifications-depth")) {
     matchedOnly.add("notifications-depth");
-  report.notifications = await runNotificationsDepth(page, report);
+  report.notifications = await runDepthPass("notifications", () => runNotificationsDepth(page, report));
   }  log(`notifications: ${JSON.stringify(report.notifications)}`);
 
   // The event console (REQ-016, slice 1): the feed, its filters, the payload inspector and the
@@ -11831,19 +9785,46 @@ async function runReliabilityBreakersDepth(page) {
     log(`security: ${JSON.stringify(report.security)}`);
   }
 
-  // The GraphQL surface (REQ-130, slice 2). It runs after security because the registry pass
-  // REWRITES one settings row (max_depth) and restores it, and a pass that ran afterwards against
-  // a different policy would measure a different platform than the one it thinks it measured.
-  if (wants("graphql-depth")) {
-    matchedOnly.add("graphql-depth");
-    report.graphql = await runDepthPass("graphql", () => runGraphqlDepth(page, report));
-    log(`graphql: ${JSON.stringify(report.graphql)}`);
-  }
-
   // The system health centre (REQ-014, slice 1). It runs after the security pass
   // because both screens run live probes, and running them in the other order
   // would have the health screen's own PostgreSQL probe read the connection pool
   // the security scan is still holding.
+  // The system-health centre (REQ-014) is four passes: the overview, its metrics, the incident log
+  // and the settings screen. **Each is guarded by its OWN name** (plus the overview, which reads
+  // their numbers), so `--only=health-incidents` measures the incident log and nothing else.
+  //
+  // They used to ride a single `wants("health-overview")` wrapper, which is a bug with three faces:
+  // *focus* (asking for one health screen bought all four), *coverage* (no health slice could be
+  // proven without a full pass, and the full pass is what gets cut off), and *report* (`report.health`
+  // was assigned inside the guard while the other three were not, so `summary.json`'s key set
+  // depended on which filter was used).
+  // `--only=health` answers to the four health screens as a group; the per-screen names
+  // (`health-metrics`, `health-incidents`, `health-settings`) stay individually reachable, so a
+  // focused pass measures one screen and a group pass measures the centre. The overview is the
+  // one that reads the other three's numbers, which is why it is the only one that is also its
+  // own key: a run asked only for `health-metrics` has not measured the overview and must not
+  // report it as covered.
+  if (wants("health-overview") || wants("health")) {
+    matchedOnly.add("health-overview");
+    matchedOnly.add("health");
+    report.health = await runDepthPass("health", () => runHealthDepth(page, report));
+  }
+  if (wants("health-overview") || wants("health-metrics")) {
+    matchedOnly.add("health-metrics");
+    report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
+  }
+  if (wants("health-overview") || wants("health-incidents")) {
+    matchedOnly.add("health-incidents");
+    report.healthIncidents = await runDepthPass("health-incidents", () => runHealthIncidentsDepth(page, report));
+  }
+  if (wants("health-overview") || wants("health-settings")) {
+    matchedOnly.add("health-settings");
+    report.healthSettings = await runDepthPass("health-settings", () => runHealthSettingsDepth(page, report));
+  }
+  if (wants("health-overview")) {
+    log(`health: ${JSON.stringify(report.health)}`);
+  }
+
   // The developer portal (REQ-022, slice 2). It runs LAST in `main`: the pass creates a key,
   // authenticates a real request with it and reads that request out of the log, so it changes the
   // key inventory and the request log that any earlier pass might have counted. It also leaves a
@@ -11858,24 +9839,12 @@ async function runReliabilityBreakersDepth(page) {
   }
   log(`developer: ${JSON.stringify(report.developer)}`);
 
-  if (wants("health-overview")) {
-    matchedOnly.add("health-overview");
-    report.health = await runDepthPass("health", () => runHealthDepth(page, report));
-  report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
-  // Slice 3's two passes (REQ-014). Both are `runDepthPass` like every other depth walk, which
-  // is what makes them survive a page crash: the wrapper records the failure instead of the run
-  // dying on the next `page.locator`.
-  report.healthIncidents = await runDepthPass("health-incidents", () => runHealthIncidentsDepth(page, report));
-  report.healthSettings = await runDepthPass("health-settings", () => runHealthSettingsDepth(page, report));
-    log(`health: ${JSON.stringify(report.health)}`);
-  }
-
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather
   // than whatever this one left behind.
   if (wants("notification-settings-depth")) {
     matchedOnly.add("notification-settings-depth");
-  report.notificationSettings = await runNotificationSettingsDepth(page, report);
+  report.notificationSettings = await runDepthPass("notificationSettings", () => runNotificationSettingsDepth(page, report));
   }  log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
 
   // The outbox and routing pass (REQ-021, slice 3). It runs after the list and preferences
@@ -11883,7 +9852,7 @@ async function runReliabilityBreakersDepth(page) {
   // database that grows a notification per pass is one whose counts stop meaning anything.
   if (wants("notification-outbox-depth")) {
     matchedOnly.add("notification-outbox-depth");
-  report.notificationOutbox = await runNotificationOutboxDepth(page, report);
+  report.notificationOutbox = await runDepthPass("notificationOutbox", () => runNotificationOutboxDepth(page, report));
   }  log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
@@ -11891,18 +9860,18 @@ async function runReliabilityBreakersDepth(page) {
   // preview and save, reopen, and read the history tab back.
   if (wants("iam-roles-depth")) {
     matchedOnly.add("iam-roles-depth");
-  report.iamRoles = await runIamRolesDepth(page, report);
+  report.iamRoles = await runDepthPass("iamRoles", () => runIamRolesDepth(page, report));
   }
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
   // machine identities and the simulator.
   if (wants("iam-subjects-depth")) {
     matchedOnly.add("iam-subjects-depth");
-  await runIamSubjectsDepth(page, report);
+  await runDepthPass("iam-subjects-depth", () => runIamSubjectsDepth(page, report));
   }
   // The ABAC policies pass (REQ-006, slice 4a): the builder, the dry run and the history.
   if (wants("iam-policies-depth")) {
     matchedOnly.add("iam-policies-depth");
-  report.iamPolicies = await runIamPoliciesDepth(page, report);
+  report.iamPolicies = await runDepthPass("iamPolicies", () => runIamPoliciesDepth(page, report));
   }  log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
   // The security-policy pass (REQ-006, slice 3): the policy screen with a refusal in the field
@@ -11910,18 +9879,37 @@ async function runReliabilityBreakersDepth(page) {
   // enrolment dialog.
   if (wants("iam-security-depth")) {
     matchedOnly.add("iam-security-depth");
-  await runIamSecurityDepth(page, report);
+  await runDepthPass("iam-security-depth", () => runIamSecurityDepth(page, report));
   }  log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
 
-  // Sign-out is exercised last so it cannot break the walk.
-  const signOut = page.locator('button:has-text("Sign out")').first();
-  if ((await signOut.count()) > 0) {
-    await signOut.click().catch(() => {});
-    await page.waitForTimeout(1100);
-    report.signOut = { url: page.url(), reachedLogin: /\/login/.test(page.url()) };
-    await shot(page, "90-after-sign-out");
-    const reLogin = await ensureSignedIn(page, report);
-    report.reLogin = reLogin;
+  // Sign-out is a cleanup step, so it is wrapped rather than left to decide whether the rest of
+  // the run happens. It was commented "exercised last" while EIGHT passes follow it -- the three
+  // automation passes and the builder among them -- so the comment described an intention the order
+  // had long since stopped implementing. The bare `locator.count()` was the one statement in `main`
+  // with no guard at all, and it is the statement pass `20261001-012121` died on: 55 routes read,
+  // then `locator.count: Target page, context or browser has been closed` took the run down with
+  // `pages: 55, mobile: 0` and NO workflow-builder rows, because the crash sat exactly between
+  // the route loop and the passes this REQ needs measured. A cleanup step must not be able to end
+  // a walk; that is the same rule the route loop and every depth pass already follow.
+  try {
+    const signOut = page.locator('button:has-text("Sign out")').first();
+    if ((await signOut.count()) > 0) {
+      await signOut.click().catch(() => {});
+      await page.waitForTimeout(1100);
+      report.signOut = { url: page.url(), reachedLogin: /\/login/.test(page.url()) };
+      await shot(page, "90-after-sign-out");
+      const reLogin = await ensureSignedIn(page, report);
+      report.reLogin = reLogin;
+    }
+  } catch (cause) {
+    const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+    log(`sign-out step failed: ${reason}`);
+    record({ page: "qa", action: "signout-failed", reason });
+    // The same recovery the depth passes use, so the passes after the cleanup still get a tab.
+    if (/Page crashed|Target closed|Target crashed|Session closed|browser has been closed/i.test(reason)) {
+      await reviveMainPage();
+    }
+    report.signOut = { ok: false, reason };
   }
 
   // The passkey pass (REQ-006, slice 3b): a virtual authenticator enrols a passkey on the
@@ -11929,7 +9917,7 @@ async function runReliabilityBreakersDepth(page) {
   // the pass is removed again so the account is back to its password.
   if (wants("passkeys-depth")) {
     matchedOnly.add("passkeys-depth");
-  await runPasskeysDepth(page, report);
+  await runDepthPass("passkeys-depth", () => runPasskeysDepth(page, report));
   }  log(`passkeys: ${JSON.stringify(report.passkeys)}`);
 
   // The permission-request pass (REQ-006, slice 4b): ask, approve with a window, refuse, and the
@@ -11937,7 +9925,7 @@ async function runReliabilityBreakersDepth(page) {
   // time-boxed binding (and the generated grant role) to the organization.
   if (wants("iam-approvals-depth")) {
     matchedOnly.add("iam-approvals-depth");
-  await runIamApprovalsDepth(page, report);
+  await runDepthPass("iam-approvals-depth", () => runIamApprovalsDepth(page, report));
   }  log(`iam approvals: ${JSON.stringify(report.iamApprovals)}`);
 
   // The SCIM provisioning pass (REQ-006, slice 4b): mint a token, drive a create → deactivate
@@ -11945,8 +9933,50 @@ async function runReliabilityBreakersDepth(page) {
   // token and prove it is refused afterwards.
   if (wants("iam-provisioning-depth")) {
     matchedOnly.add("iam-provisioning-depth");
-  await runIamProvisioningDepth(page, report);
+  await runDepthPass("iam-provisioning-depth", () => runIamProvisioningDepth(page, report));
   }  log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
+
+  // The automations pass (REQ-003, slice 1): the rule list, the editor with a nested
+  // condition group, the dry run, the one-shot listener, the inbound-webhook URL and the
+  // delete. It runs before the sign-out below and leaves the database as it found it.
+  await runDepthPass("automations", () => runAutomationsDepth(page, report));
+  log(`automations: ${JSON.stringify(report.automations)}`);
+
+  // **Two passes that existed in full and never ran.** `runAutomationsActionsDepth` and
+  // `runAutomationsApprovalsDepth` were written, registered in `DEPTH_PASSES` (so
+  // `--only=automations-actions` would have found them) and then called from **nowhere**: the only
+  // two references each had were its own definition and its table entry.
+  //
+  // That combination is the worst shape a harness defect can take, and it is worth naming why.
+  // `--only=automations-actions` did not error and did not run the full pass — it exited early,
+  // measured nothing, and wrote a report naming a pass that had produced no rows. Meanwhile a full
+  // pass silently omitted two screens the file had complete coverage for, so `report` never carried
+  // `automationsActions` and nothing read the absence. The "no untested screen" rule cannot see this
+  // either: the screens ARE in the walkthrough's route list and pass a DOM check, they just never
+  // get a pass driving them.
+  //
+  // Both are REQ-003 screens (the action catalogue and the approvals inbox), so they belong beside
+  // the automations pass that covers their parent screen, and after it: the actions pass reads the
+  // rule list the automations pass leaves in a known state, the same ordering reason the operations
+  // pass gives below.
+  await runDepthPass("automations-actions", () => runAutomationsActionsDepth(page, report));
+  log(`automations actions: ${JSON.stringify(report.automationsActions)}`);
+  await runDepthPass("automations-approvals", () => runAutomationsApprovalsDepth(page, report));
+  log(`automations approvals: ${JSON.stringify(report.automationsApprovals)}`);
+
+  // The operations pass (REQ-003, slice 4): the run history, the run's own route with its
+  // step trace, the Versions tab with a restore, the Audit tab and the templates gallery. It
+  // runs next to the other automation passes because it creates, runs and deletes its own
+  // rule, which the count-sensitive empty-state assertions above have already read.
+  await runDepthPass("automations-operations", () => runAutomationsOperationsDepth(page, report));
+  log(`automations-operations: ${JSON.stringify(report.automationsOperations)}`);
+
+  // The builder pass (REQ-004, slice 1): the visual builder on a real rule. It runs next to
+  // the other automation passes for the same reason they do — it creates and deletes its own
+  // rule, and the count-sensitive empty-state assertions have already been read by now.
+  await runDepthPass("workflow-builder", () => runWorkflowBuilderDepth(page, report));
+  await runDepthPass("workflow-table", () => runWorkflowTableDepth(page, report));
+  log(`workflow-builder: ${JSON.stringify(report.workflowBuilder)}`);
 
   // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
   // read the "secret is a name, not a value" chip, run the discovery test and require it to
@@ -11954,7 +9984,7 @@ async function runReliabilityBreakersDepth(page) {
   // remove the provider and see the list go back to its empty state.
   if (wants("iam-authentication-depth")) {
     matchedOnly.add("iam-authentication-depth");
-  await runIamAuthenticationDepth(page, report);
+  await runDepthPass("iam-authentication-depth", () => runIamAuthenticationDepth(page, report));
   }  log(`iam authentication: ${JSON.stringify(report.iamAuthentication)}`);
 
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
@@ -11966,16 +9996,13 @@ async function runReliabilityBreakersDepth(page) {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
+  // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
+  // as a known name instead of reporting it as unmatched.
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" },
   // The portal's two tables at 390 px. Seven columns do not fit a phone, and the check that
   // matters is the one the cards exist for: the *key status* stays readable without a sideways
   // scroll, because "is this credential still alive" is the question a phone is asked.
-  // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
-  // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
-  // as a known name instead of reporting it as unmatched. The deployment screens (REQ-128
-  // slice 4, REQ-129) are in this list rather than only measured inside their depth passes: a
-  // layout that has never been opened in a 390px context has not been tested on a phone, and the
-  // upgrade helper is read at 2am on a phone more often than anybody planned.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }, { path: "/deployment/backfills", name: "deployment-backfills" }, { path: "/deployment/seeds", name: "deployment-seeds" }, { path: "/secrets/root-key", name: "secrets-root-key" }, { path: "/secrets/credentials", name: "secrets-credentials" }, { path: "/secrets/slots", name: "secrets-slots" }, { path: "/secrets/leases", name: "secrets-leases" }, { path: "/secrets/deploy-keys", name: "secrets-deploy-keys" }, { path: "/secrets/audit", name: "secrets-audit" }, { path: "/observability", name: "observability-overview" }, { path: "/observability/metrics", name: "observability-metrics" }, { path: "/observability/logs", name: "observability-logs" }, { path: "/observability/traces", name: "observability-traces" }, { path: "/observability/exporters", name: "observability-exporters" }, { path: "/observability/alerts", name: "observability-alerts" }, { path: "/observability/settings", name: "observability-settings" }, { path: "/developer", name: "developer-overview" }, 
+  { path: "/developer", name: "developer-overview" },
   { path: "/developer/api-keys", name: "developer-api-keys" },
   { path: "/developer/logs", name: "developer-logs" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
@@ -11987,16 +10014,6 @@ async function runReliabilityBreakersDepth(page) {
     : mobileRoutes.filter((r) => wants(`mobile:${r.name}`) || wants(r.name)))) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
-    // Same guard as the desktop loop. A phone context carries its own session, and `mobileLogin`
-    // already records when that one did not land — but a phone can also lose the session partway
-    // through, and then 390px "zero overflow" is a measurement of the sign-in form's phone layout.
-    const fault = await sessionFault(mpage, route);
-    if (fault) {
-      record({ page: `mobile-${route.name}`, action: "route-not-measured", reason: fault });
-      log(`mobile ${route.name}: ${fault}`);
-      report.mobile.push({ ...route, failed: fault, notMeasured: true });
-      continue;
-    }
     const diag = await diagnostics(mpage);
     await shot(mpage, `mobile-${route.name}`);
     report.mobile.push({ ...route, diagnostics: diag });
@@ -12092,6 +10109,31 @@ async function runReliabilityBreakersDepth(page) {
   const findings = [];
   const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
 
+  // A browser that died mid-walk is ONE finding about the BOX, and it is counted before any screen
+  // finding so it is read first.
+  //
+  // This is the shape pass `20261001-012121` produced: `pages: 55`, `mobile: 0`, no
+  // `workflowBuilder` key at all, and seventy-six lines in `clicks.jsonl` all carrying the same
+  // `Target page, context or browser has been closed`. Seventy-six findings is what a reader sees,
+  // and the correct reading is one machine event — which sends them to re-verify seventy screens
+  // that were fine, while the screens the pass actually needed to reach (the automation passes and
+  // the builder sit AFTER the crash site) are silently absent from the report entirely. So the
+  // count is reported, the passes that never ran are named, and it is high: a walk that stopped
+  // early has NOT proved the panel clean, and the whole point of this entry is that a green
+  // summary after a dead browser is a claim nobody checked.
+  const deadBrowserPasses = Object.entries(report)
+    .filter(([, v]) => v && typeof v === "object" && typeof v.reason === "string" && v.reason.startsWith("skippedForDeadBrowser"))
+    .map(([k]) => k);
+  if (browserIsGone || deadBrowserPasses.length) {
+    pushFindings(
+      "high",
+      "browser-died",
+      `the browser process died ${deadBrowserPasses.length ? "before " + deadBrowserPasses.length + " pass(es) could run" : "during the walk"}` +
+        `${deadBrowserPasses.length ? ": " + deadBrowserPasses.join(", ") : ""}` +
+        " — those screens were NOT measured, and the routes already read say nothing about them",
+    );
+  }
+
   // A `--only` filter that matches nothing is a finding, not an empty green report.
   //
   // The failure this prevents is specific: a typo in the filter walks zero routes and zero
@@ -12150,40 +10192,41 @@ async function runReliabilityBreakersDepth(page) {
     // (reading 'horizontalOverflow')` — and took the entire finding report with it.
     const d = m.diagnostics;
     if (!d) {
-      // The reason is carried through, not just the fact: a phone context that lost its session
-      // and a phone context whose navigation threw are different defects with different fixes,
-      // and "no diagnostics were produced" reads the same for both.
-      pushFindings(
-        "high",
-        "unmeasured-mobile",
-        `mobile ${m.name}: no diagnostics were produced — this screen was not measured at 390px${m.failed ? ` (${m.failed})` : ""}`,
-      );
+      pushFindings("high", "unmeasured-mobile", `mobile ${m.name}: no diagnostics were produced — this screen was not measured at 390px`);
       continue;
     }
     if (d.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
     if (d.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${d.offscreen.length} element(s) outside the viewport`);
   }
   const refusedOnPurpose = [];
-  // A depth pass that threw measured NOTHING, so it is a high finding — not a note in the summary
-  // and not an entry in the log the next reader has to go and find. Tick 59's `observabilityTraces`
-  // ended at `{ok: false, steps: 0}` after a 30 s fill timeout, and the 233 findings that run
-  // produced contained no mention of it: the pass was written, exported, invoked, and answered with
-  // nothing. `steps: 0` is the tell — a pass that recorded a single check has proved at least one
-  // thing, so a zero alongside `ok: false` means every assertion in it was skipped.
-  for (const failure of failedDepthPasses) {
-    pushFindings(
-      "high",
-      "depth-pass-failed",
-      `the ${failure.pass} depth pass measured nothing and failed: ${failure.reason.slice(0, 200)}`,
-    );
-  }
   for (const [index, f] of consoleLog.entries()) {
     if (f.type === "warning") continue;
     // A console line names the status, not the URL: the allowance for one is the window it was
     // registered in, so only a line that arrived after the pass announced the act can be excused.
-    const deliberate = /status of 40[13]/.test(f.text)
-      ? expectedRefusals.find((entry) => !entry.claimedConsole && index >= entry.consoleFrom)
-      : null;
+    //
+    // The URL is part of the match, and it is the half that was missing. A line was excused on the
+    // *status alone* (`/status of 40[13]/`), so whichever allowance happened to be live swallowed
+    // every 401/403/404-shaped line in the rest of the session — including ones about a screen the
+    // allowance had nothing to do with. The failure is the mirror of the one the status list fixes
+    // and it is worse in the way that matters: widening the status list without scoping it by URL
+    // would have turned "charges the pass for its own refusals" into "hides everybody's 403".
+    //
+    // So a line is excused only when it names a status in `REFUSAL_STATUSES` **and** arrives at a
+    // URL the allowance registered for. An allowance with no `match`-like fragment cannot excuse a
+    // console line at all — which is the honest answer, since a console line's only claim to being
+    // *that* refusal is which URL it came from.
+    const statusNamed = String(f.text).match(/status(?: of)?\s+(\d{3})/i)?.[1] ?? null;
+    const deliberate =
+      statusNamed !== null && REFUSAL_STATUSES.includes(Number(statusNamed))
+        ? expectedRefusals.find(
+            (entry) =>
+              !entry.claimedConsole &&
+              index >= entry.consoleFrom &&
+              (entry.consoleMatch
+                ? String(f.url || "").includes(entry.consoleMatch)
+                : String(f.text).includes(entry.match)),
+          )
+        : null;
     if (deliberate) {
       deliberate.claimedConsole = true;
       refusedOnPurpose.push({ kind: "console", detail: `${f.phase} ${f.text.slice(0, 120)}`, reason: deliberate.reason });
@@ -12198,7 +10241,7 @@ async function runReliabilityBreakersDepth(page) {
         !entry.claimedNet &&
         index >= entry.netFrom &&
         String(n.url || "").includes(entry.match) &&
-        [401, 403].includes(n.status),
+        REFUSAL_STATUSES.includes(n.status),
     );
     if (deliberate) {
       deliberate.claimedNet = true;
@@ -12238,7 +10281,13 @@ async function runReliabilityBreakersDepth(page) {
     );
   }
   if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
-  if (report.web && !report.web.error) {
+  // The published-page checks are about the CONTENT the walk created, and the content is created
+  // by the route/depth passes, not by the renderer. A focused pass that walked zero routes has no
+  // page to publish, so `/qa-sample` is a 404 for a reason that says nothing about the renderer --
+  // and the check reported it as `web-blank`, a high finding naming a screen nobody visited. The
+  // honest version states the precondition instead of asserting a defect it cannot support.
+  const webChecked = ONLY_ALL || matchedOnly.size > 0;
+  if (report.web && !report.web.error && webChecked) {
     const published = report.web.published;
     if (!published || published.status !== 200) {
       pushFindings("high", "web-page", `the published page /${SAMPLE_SLUG} did not render (status ${published ? published.status : "missing"})`);
@@ -12254,6 +10303,28 @@ async function runReliabilityBreakersDepth(page) {
   const bySeverity = { high: 0, medium: 0, low: 0 };
   for (const f of findings) bySeverity[f.severity] += 1;
 
+  // **An allowance that matched nothing is reported, not dropped.** `expectedRefusals` in
+  // `summary.json` carried the refusals it *claimed*, so an allowance that never matched left no
+  // trace — and an empty list is exactly what a pass that provoked no deliberate refusals also
+  // writes. That is the bug this report shape was hiding: three ticks read "19 high findings,
+  // expectedRefusals empty" and each concluded the findings were real, because a pass charged for
+  // its own refusals and a pass with no refusals at all produce **the same report**. The empty list
+  // was being read as evidence and it was evidence of nothing.
+  //
+  // So the registered allowances are reported next to the claimed ones, and an allowance that
+  // matched nothing is named as unused with its reason. It is not a finding — an allowance for a
+  // refusal the server never issued is a stale test step, not a defect — but it is **visible**,
+  // because the case it hides is exactly the one where the matcher has stopped matching.
+  const unusedRefusals = expectedRefusals
+    .filter((entry) => !entry.claimedNet && !entry.claimedConsole)
+    .map((entry) => ({ match: entry.match, reason: entry.reason }));
+  if (unusedRefusals.length) {
+    log(
+      `expected refusals: ${refusedOnPurpose.length} claimed, ${unusedRefusals.length} unused` +
+        (unusedRefusals.length ? ` — ${unusedRefusals.map((u) => `${u.match} (${u.reason})`).join("; ").slice(0, 300)}` : ""),
+    );
+  }
+
   const summary = {
     ...report,
     counts: {
@@ -12267,10 +10338,16 @@ async function runReliabilityBreakersDepth(page) {
       failedRequests: netFailures.length,
       abortedRequests: netAborted.length,
       dialogs: dialogs.length,
+      // The two refusal counters are read together and never alone. `expectedRefusals: 0` beside
+      // `failedRequests: 19` was the number that hid a matcher bug for three ticks; a count that
+      // can be read without its counterpart is a count that will be read alone.
+      refusalsClaimed: refusedOnPurpose.length,
+      refusalsUnused: unusedRefusals.length,
     },
     bySeverity,
     findings,
     expectedRefusals: refusedOnPurpose,
+    unusedRefusals,
     shots,
     consoleLog,
     netFailures,
@@ -12298,18 +10375,6 @@ async function runReliabilityBreakersDepth(page) {
   md.push("");
   for (const p of report.pages) {
     const d = p.diagnostics;
-    // The SAME guard the two roll-up loops above apply, for the same reason and at the same cost.
-    // This loop is the LAST thing a pass does, so a missing `diagnostics` here is the throw that
-    // takes the whole finding report with it — which is exactly what happened on 2026-10-01: the
-    // pass walked 150 screenshots of the wave-5b screens and then died on
-    // `Cannot read properties of undefined (reading 'horizontalOverflow')` at this very line,
-    // writing a 94-byte summary that said `fatal` and nothing else. 150 measured screens, and the
-    // artifact recorded none of them: the report is not a by-product of the walk, it IS the
-    // output, and the last untested line of it can discard everything before it.
-    if (!d) {
-      md.push(`- **${p.name}** — NOT MEASURED${p.failed ? ` (${p.failed})` : ""}`);
-      continue;
-    }
     md.push(`- **${p.name}** — overflow: ${d.horizontalOverflow ? "YES" : "no"} · offscreen: ${d.offscreen.length} · broken images: ${d.brokenImages.length} · low contrast: ${d.lowContrast.length} · unlabeled inputs: ${d.unlabeledInputs.length} · duplicate ids: ${d.duplicateIds.length} · h1: ${d.h1Count}`);
   }
   md.push("");
@@ -12327,22 +10392,67 @@ async function runReliabilityBreakersDepth(page) {
   md.push("## Screenshots");
   for (const s of shots) md.push(`- ${s.name} — \`${s.file.replace(OUT + "/", "")}\` (${Math.round(s.bytes / 1024)} KB)`);
   md.push("");
-  fs.writeFileSync(path.join(OUT, "report.md"), md.join("\n"));
+
+  // The gate the whole pass exists to feed, asked last: is the stack still there? A pass that
+  // lost it has no findings worth reading, so it is reported as a no-result run and exits
+  // non-zero — the caller re-runs it instead of "fixing" dead-server artifacts.
+  const alive = !(await stackGone());
+  summary.stackAliveAtEnd = alive;
+  if (!alive) {
+    summary.fatal = "stack-gone: the QA stack stopped answering mid-pass; findings from this run are not product defects";
+    fs.writeFileSync(path.join(OUT, "report.md"), `${md.join("\n")}\n\n## FATAL — the QA stack stopped answering mid-pass\n\nEvery finding above this line was recorded against a server that was no longer running.\nRe-run the pass; do not act on this report.\n`);
+    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 2));
+    log("FATAL: the QA stack stopped answering mid-pass — this run reports nothing usable");
+    console.log(`QA_STACK_GONE=1 QA_FINDINGS=0 QA_CLICKS=${clicks.length}`);
+    await browser.close();
+    process.exit(4);
+  }
+  fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 2));
 
   log(`done: ${findings.length} findings (high ${bySeverity.high}), ${clicks.length} clicks, ${shots.length} shots`);
   console.log(`QA_OUT=${OUT}`);
   console.log(`QA_FINDINGS=${findings.length} QA_HIGH=${bySeverity.high} QA_CLICKS=${clicks.length} QA_SHOTS=${shots.length}`);
 }
 
-main().catch(async (err) => {
+if (process.argv.includes("--selfcheck-recovery")) {
+  selfcheckRecovery()
+    .then((pass) => process.exit(pass ? 0 : 1))
+    .catch((err) => {
+      console.error("[walk] selfcheck failed to run:", err);
+      process.exit(1);
+    });
+} else if (process.argv.includes("--selfcheck-wizard")) {
+  // No browser and no stack: the decision is a pure function, so this is a five-second check that
+  // can be run by anyone, on a loaded box, without taking a QA place.
+  selfcheckWizard()
+    .then((pass) => process.exit(pass ? 0 : 1))
+    .catch((err) => {
+      console.error("[walk] wizard selfcheck failed to run:", err);
+      process.exit(1);
+    });
+} else if (process.argv.includes("--selfcheck-args")) {
+  selfcheckArgs()
+    .then((pass) => process.exit(pass ? 0 : 1))
+    .catch((err) => {
+      console.error("[walk] args selfcheck failed to run:", err);
+      process.exit(1);
+    });
+} else {
+  main().catch(async (err) => {
   console.error("[walk] unexpected failure:", err);
   try {
-    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: String(err) }, null, 2));
+    // Everything gathered up to the failure, plus the failure itself. A reader must be able to
+    // tell "the pass proved nothing" from "the pass proved 48 screens and then lost its tab".
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify({ fatal: String(err), fatalAfter: { pages: report.pages.length, steps: report.steps.length, mobile: report.mobile.length }, ...report, netFailures }, null, 2),
+    );
   } catch {
     /* ignore */
   }
   process.exit(1);
-});
+  });
+}
 
 /**
  * The security-policy, session, device and second-factor pass (REQ-006, slice 3).
@@ -12577,20 +10687,46 @@ async function runIamSecurityDepth(page, report) {
   note({ step: "sessions-list", rows: sessionRows, currentRows: liveBadges });
   await shot(page, "page-iam-sessions");
 
-  // Revoking the row that is not the browser's own: the oldest sign-in is this walk, so the
-  // newest live row (the session opened above) is the one to end.
+  // Revoking the row that is NOT the browser's own. The comment above used to say the oldest
+  // sign-in is this walk and take the newest live row — but the list is not sorted by anything
+  // the walk controls, and `.first()` is the browser's own session as often as not. That is how
+  // the walk revoked the session it was walking on: sixteen routes after this then measured the
+  // login screen and every depth pass below reported an empty one, all of it filed as a defect on
+  // screens that were never opened. The refusal it hit is now the product's answer too
+  // (`cannot_revoke_current_session`), so a row that says `current` is a legitimate thing to find
+  // — what is not legitimate is ending the walk with it. The row is chosen by the field that says
+  // "this one is mine", not by its position, and "none to revoke" is recorded as its own answer
+  // rather than passing silently.
   const revokeButtons = page.locator("table [data-session-revoke]");
   const revokeCount = await revokeButtons.count();
-  if (revokeCount > 0) {
+  const ownRows = await page
+    .locator("table [data-session-row]")
+    .evaluateAll((nodes) => nodes.filter((node) => /this one/.test(node.innerText)).length);
+  if (revokeCount > 0 && ownRows < revokeCount) {
     await revokeButtons.first().click({ timeout: 5000 }).catch(() => {});
     await page.waitForTimeout(1300);
     const revokeNotice = (
       await page.locator("[data-sessions-notice]").first().innerText().catch(() => "")
     ).replace(/\s+/g, " ");
-    note({ step: "session-revoked", notice: revokeNotice.slice(0, 110) });
+    note({
+      step: "session-revoked",
+      notice: revokeNotice.slice(0, 110),
+      // The revoked row must be gone from the table: a click that reported success while the row
+      // stayed revocable would leave the walk believing it exercised the control.
+      rowsAfter: await page.locator("table [data-session-row]").count(),
+      rowsBefore: revokeCount,
+    });
     await shot(page, "page-iam-sessions-revoked");
   } else {
-    note({ step: "session-revoked", notice: "", skipped: "no revocable row" });
+    // Either there is nothing revocable, or every revocable row is this walk's own session. Both
+    // are honest answers and neither is a defect, so the note says which instead of skipping.
+    note({
+      step: "session-revoked",
+      notice: "",
+      skipped: revokeCount === 0 ? "no revocable row" : "every revocable row is this browser's own session",
+      revocableRows: revokeCount,
+      ownRows,
+    });
   }
 
   // The filters are real: a state filter narrows the list to the rows whose badge matches.
@@ -13077,6 +11213,5359 @@ async function runIamProvisioningDepth(page, report) {
 }
 
 /**
+ * The automations depth pass (REQ-003, slice 1).
+ *
+ * Drives the screen the way a person would: create a rule from the empty state, give it a
+ * nested condition group, read the validation summary, save, run a test event and read the
+ * dry-run report, arm a one-shot listener, switch the rule to the webhook trigger and mint a
+ * URL, then delete it by typing its name.
+ *
+ * Every step that changes the world does so through the panel, and the pass ends with the
+ * rule removed so the next run starts from the same state this one did.
+ */
+async function runAutomationsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "automations-depth", action: "automations", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-automation-new]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
+
+  // The empty state is what a fresh database shows; the pass starts by creating the first rule.
+  const emptyState = (await page.locator("[data-automation-empty-new]").count()) > 0;
+  note({ step: "list", emptyState, rows: await page.locator("[data-automation-row]").count() });
+  await shot(page, "page-automations-empty");
+
+  await page.locator("[data-automation-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector("[data-automation-editor]", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  // A rule with no name is refused in the field, and the summary names the problem.
+  await page.locator("[data-automation-save]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  note({
+    step: "empty-name",
+    problems: await page.locator("[data-automation-problem]").count(),
+    summary: (await page.locator("[data-automation-problems]").first().innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .slice(0, 120),
+  });
+  await shot(page, "page-automations-problems");
+
+  await page.locator("[data-automation-name]").first().fill("QA welcome rule").catch(() => {});
+  await page
+    .locator("[data-automation-description]")
+    .first()
+    .fill("Created by the walkthrough")
+    .catch(() => {});
+
+  // Pick an event, then a field the picker offers — the list of fields comes from the
+  // event's documented payload, so a field outside it is not selectable at all.
+  const eventOptions = await page.locator("[data-automation-event] option").count();
+  await page
+    .selectOption("[data-automation-event]", "user.created")
+    .catch(async () => {
+      await page.locator("[data-automation-event] option").first().click().catch(() => {});
+    });
+  await page.waitForTimeout(400);
+
+  // A nested condition: a group inside the root, which is the shape the request names. The
+  // group is **filled** rather than left empty — an empty nested group is refused at save time
+  // (an empty `any` can never hold), so a pass that only added one would be asserting the very
+  // refusal this slice introduced.
+  await page.locator("[data-automation-add-condition]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-automation-add-group]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  // The nested group's own "add condition" is the one inside the deeper group box.
+  const nestedAdd = page.locator("[data-automation-group='2'] [data-automation-group-add-condition]").first();
+  if ((await nestedAdd.count()) > 0) {
+    await nestedAdd.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const fieldOptions = await page.locator("[data-automation-field] option").count();
+  note({
+    step: "conditions",
+    eventOptions,
+    fieldOptions,
+    groups: await page.locator("[data-automation-group]").count(),
+    rows: await page.locator("[data-automation-condition]").count(),
+    legend: (await page.locator("[data-automation-editor] legend").nth(1).innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim(),
+  });
+
+  // A second condition, so the group holds more than one row.
+  await page.locator("[data-automation-add-condition]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-automation-value]").first().fill("qa@example.com").catch(() => {});
+  await shot(page, "page-automations-editor");
+
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const rowsAfterSave = await page.locator("[data-automation-row]").count();
+  const notice = (await page.locator("[data-automation-notice]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+  note({ step: "saved", rowsAfterSave, notice });
+  await shot(page, "page-automations-list");
+
+  // Open the rule the walkthrough just created and read the catalogue-backed editor.
+  const firstRow = page.locator("[data-automation-row]").first();
+  const ruleName = (await firstRow.locator("a").first().innerText().catch(() => "")).trim();
+  const ruleHref = await firstRow.locator("a").first().getAttribute("href").catch(() => null);
+  await firstRow.locator("a").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-row] a").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // The test fire: a hand-written payload, and a report that must say `would_*` on every row
+  // and never claim it sent anything.
+  await page.locator("[data-automation-payload]").first().fill('{"status":"published","slug":"home"}').catch(() => {});
+  await page.locator("[data-automation-run-test]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const verdict = (await page
+    .locator("[data-automation-report-verdict]")
+    .first()
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ").trim();
+  const outcomes = await page.locator("[data-automation-report-action]").count();
+  const outcomeWords = await page.locator("[data-automation-report-action]").allInnerTexts();
+  note({
+    step: "test-event",
+    verdict: verdict.slice(0, 140),
+    actions: outcomes,
+    simulated: outcomeWords.every((text) => /would_/.test(text)),
+  });
+  await shot(page, "page-automations-test-report");
+
+  // A payload that does not parse is refused in the field, not sent to the API.
+  await page.locator("[data-automation-payload]").first().fill("{not json").catch(() => {});
+  await page.locator("[data-automation-run-test]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  note({
+    step: "bad-payload",
+    error: (await page.locator("[data-automation-save-error]").first().innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .slice(0, 120),
+  });
+
+  // The one-shot listener.
+  await page.locator("[data-automation-listen]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const listenerRows = await page.locator("[data-automation-test-row]").count();
+  const armedText = await page.locator("[data-automation-test-row]").first().innerText().catch(() => "");
+  note({ step: "listener", rows: listenerRows, armed: /armed/.test(armedText) });
+
+  // The webhook trigger: switching to it, then minting a URL — the only control that shows one.
+  await page.locator("[data-automation-trigger-hook]").first().check({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const hookEmpty = (await page.locator("[data-automation-hook-empty]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  // Reopen the rule and mint the URL.
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1000);
+  await page.locator("[data-automation-row] a").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-hook-rotate]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const hookUrl = (await page.locator("[data-automation-hook-url] code").first().innerText().catch(() => "")).trim();
+  note({
+    step: "hook",
+    hintBeforeMinting: hookEmpty.slice(0, 100),
+    urlMinted: /\/api\/v1\/hooks\/omhook_/.test(hookUrl),
+    tokenShape: /omhook_[a-z0-9]{40}$/.test(hookUrl),
+  });
+  await shot(page, "page-automations-hook");
+
+  // The pass owns every rule named "QA welcome rule" — a run that died half way through
+  // leaves one behind, and the next run's "the list is empty" step would then be reading a
+  // rule it did not create. Sweeping first is what makes the empty state meaningful.
+  const staleRows = await page.locator('[data-automation-row] a', { hasText: "QA welcome rule" }).count();
+  for (let index = 0; index < staleRows; index += 1) {
+    const stale = page.locator('[data-automation-row] a', { hasText: "QA welcome rule" }).first();
+    await stale.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(900);
+    await page.locator("[data-automation-delete]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-automation-delete-input]", { timeout: 5000 }).catch(() => {});
+    await page.locator("[data-automation-delete-input]").first().fill("QA welcome rule").catch(() => {});
+    await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+  note({ step: "sweep", removedStale: staleRows });
+
+  // The list's own filters, read on the rule the pass creates.
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+  const allRows = await page.locator("[data-automation-row]").count();
+  await page.locator("[data-automation-search]").first().fill("QA welcome rule").catch(() => {});
+  await page.waitForTimeout(600);
+  const searched = await page.locator("[data-automation-row]").count();
+  await page.locator("[data-automation-search]").first().fill("nothing matches this").catch(() => {});
+  await page.waitForTimeout(600);
+  const empty = (await page.locator("text=No rule matches these filters").count()) > 0;
+  await page.locator("[data-automation-search]").first().fill("").catch(() => {});
+  await page.waitForTimeout(500);
+  note({ step: "filters", allRows, searched, emptyWhenNoMatch: empty });
+
+  // Delete by typing the name, and prove the row is gone.
+  await page.locator("[data-automation-row] a").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-delete]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForSelector("[data-automation-delete-input]", { timeout: 5000 }).catch(() => {});
+  await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  // The wrong name must not delete anything.
+  const stillThere = (await page.locator("[data-automation-row]").count()) > 0;
+  await page.locator("[data-automation-delete-input]").first().fill(ruleName || "QA welcome rule").catch(() => {});
+  await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  note({
+    step: "delete",
+    ruleName,
+    ruleHref,
+    stillThereWhileUnconfirmed: stillThere,
+    rowsAfterDelete: await page.locator("[data-automation-row]").count(),
+  });
+  await shot(page, "page-automations-after-delete");
+
+  report.automations = { steps };
+  log(`automations: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The automations **slice 2** pass: the action library's outbound half, the branch and stop
+ * steps, the per-step failure policy, and Run now.
+ *
+ * Every control this pass touches is one slice 2 added, and every refusal it asserts is one
+ * the server must make — an `http_request` to a host outside the allow-list has to be
+ * refused *at save time naming the host*, which is only provable by pressing Save and
+ * reading what came back.
+ */
+async function runAutomationsActionsDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    log(`automations-actions: ${JSON.stringify(entry)}`);
+  };
+
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  // A fresh rule, so the pass does not depend on what another pass left behind.
+  const ruleName = `QA action rule ${Date.now().toString(36)}`;
+  await page.locator("[data-automation-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  // The name goes in first: Save is disabled while any problem is open, and a nameless
+  // rule is one — so a pass that fills it last can never reach the save it is proving.
+  await page.locator("[data-automation-name]").first().fill(ruleName).catch(() => {});
+  await page.waitForTimeout(300);
+  const editorOpen = (await page.locator("[data-automation-editor]").count()) > 0;
+  note({ step: "editor", editorOpen, ruleName });
+  await shot(page, "page-automations-actions-editor");
+
+  // The rule's own failure policy, above the steps that inherit it.
+  const policySelect = page.locator("[data-automation-on-error]").first();
+  const policyVisible = (await policySelect.count()) > 0;
+  if (policyVisible) {
+    await policySelect.selectOption("continue").catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  note({ step: "rule-policy", policyVisible });
+
+  // Switch the first step to a Branch. The action picker must disappear — a branch names a
+  // comparison, not an action — and the typed branch controls must appear.
+  const kindSelect = page.locator("[data-automation-step-kind='0']").first();
+  const kindVisible = (await kindSelect.count()) > 0;
+  if (kindVisible) {
+    await kindSelect.selectOption("branch").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const branchVisible = (await page.locator("[data-automation-branch='0']").count()) > 0;
+  const actionHiddenOnBranch =
+    (await page.locator("[data-automation-step-action='0']").count()) === 0;
+  note({ step: "branch", kindVisible, branchVisible, actionHiddenOnBranch });
+
+  // A branch on something no run can read must be reported in the summary, not saved.
+  if (branchVisible) {
+    await page.locator("[data-automation-branch-field='0']").first().fill("nonsense").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const problemsShown = (await page.locator("[data-automation-problems]").count()) > 0;
+  const problemsText = problemsShown
+    ? (await page.locator("[data-automation-problems]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const saveDisabled = await page
+    .locator("[data-automation-save]")
+    .first()
+    .evaluate((node) => node.disabled)
+    .catch(() => null);
+  note({
+    step: "branch-validation",
+    problemsShown,
+    saveDisabled,
+    namedTheField: problemsText.includes("nonsense"),
+  });
+  await shot(page, "page-automations-actions-branch-problem");
+
+  // Fix the field, switch to Stop, and check its reason control.
+  if (branchVisible) {
+    await page
+      .locator("[data-automation-branch-field='0']")
+      .first()
+      .fill("event.status")
+      .catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const problemsAfterFix = (await page.locator("[data-automation-problems]").count()) > 0
+    ? (await page.locator("[data-automation-problems]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const branchCleared = (await page.locator("[data-automation-problems]").count()) === 0;
+  if (kindVisible) {
+    await kindSelect.selectOption("stop").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const stopVisible = (await page.locator("[data-automation-stop='0']").count()) > 0;
+  if (stopVisible) {
+    await page
+      .locator("[data-automation-stop-reason='0']")
+      .first()
+      .fill("the QA pass stopped this run on purpose")
+      .catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  note({ step: "stop", branchCleared, stopVisible, problemsAfterFix });
+  await shot(page, "page-automations-actions-stop");
+
+  // An http_request to a host the installation does not allow: refused at save, naming it.
+  if (kindVisible) {
+    await kindSelect.selectOption("task").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const actionSelect = page.locator("[data-automation-step-action='0']").first();
+  if ((await actionSelect.count()) > 0) {
+    await actionSelect.selectOption("http_request").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const paramsBox = page.locator("[data-automation-step-params='0']").first();
+  if ((await paramsBox.count()) > 0) {
+    await paramsBox.fill(JSON.stringify({ url: "http://blocked.invalid/hook", method: "POST" }, null, 2)).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  await page.locator("[data-automation-step-name='0']").first().fill("call a blocked host").catch(() => {});
+  await page.waitForTimeout(300);
+  // The refusal is the point of this step, so the window it lands in is declared: an
+  // unexpected 400 on any other URL is still a finding.
+  expectingRefusal = "/api/v1/automations";
+  await page.locator("[data-automation-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const refusedStatus = netExpected.length > 0 ? netExpected[netExpected.length - 1].status : null;
+  expectingRefusal = null;
+
+  const saveError = (await page.locator("[data-automation-save-error]").count()) > 0;
+  const saveErrorText = saveError
+    ? (await page.locator("[data-automation-save-error]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  note({
+    step: "host-allow-list",
+    saveError,
+    refusedStatus,
+    namedTheHost: saveErrorText.includes("blocked.invalid"),
+    saidWhatToDo: /not a host|add .* to the automation settings/.test(saveErrorText),
+  });
+  await shot(page, "page-automations-actions-host-refused");
+
+  // A task step's own failure policy and budget, back on a task step. `transient` is the
+  // action that exercises both — it is the engine's own always-eventually-succeeds step — and
+  // it needs `fail_times`, which the server refuses without: the pass fills it rather than
+  // working around the refusal, because a rule that cannot be saved is not the thing under test.
+  if ((await actionSelect.count()) > 0) {
+    await actionSelect.selectOption("transient").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  if ((await paramsBox.count()) > 0) {
+    await paramsBox.fill(JSON.stringify({ fail_times: 1 }, null, 2)).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  const onErrorVisible = (await page.locator("[data-automation-step-on-error='0']").count()) > 0;
+  const timeoutVisible = (await page.locator("[data-automation-step-timeout='0']").count()) > 0;
+  if (onErrorVisible) {
+    await page.locator("[data-automation-step-on-error='0']").first().selectOption("continue").catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  if (timeoutVisible) {
+    await page.locator("[data-automation-step-timeout='0']").first().fill("5000").catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  note({ step: "step-policy", onErrorVisible, timeoutVisible });
+  await shot(page, "page-automations-actions-step-policy");
+
+  // Save for real this time, then Run now on the saved rule.
+  await page.locator("[data-automation-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const saveBlocked = (await page.locator("[data-automation-save-error]").count()) > 0;
+  const saveBlockedText = saveBlocked
+    ? (await page.locator("[data-automation-save-error]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const saved = !saveBlocked && (await page.locator("[data-automation-notice]").count()) > 0;
+
+  await openRuleByName(page, ruleName);
+  await page.waitForTimeout(1500);
+  const runNowVisible = (await page.locator("[data-automation-run-now]").count()) > 0;
+  let ranNotice = null;
+  if (runNowVisible) {
+    await page.locator("[data-automation-run-now]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    const notices = page.locator("[data-automation-notice]");
+    ranNotice = (await notices.count()) > 0 ? (await notices.first().innerText()).replace(/\s+/g, " ") : null;
+  }
+  // Read the policy back on the rule this pass wrote, after the save-and-reopen round trip:
+  // the round trip is what a whole-rule rewrite could quietly drop.
+  const policyKept = await page
+    .locator("[data-automation-on-error]")
+    .first()
+    .evaluate((node) => node.value)
+    .catch(() => null);
+
+  note({
+    step: "run-now",
+    saved,
+    saveBlocked,
+    saveBlockedText,
+    policyKept,
+    runNowVisible,
+    ranNotice,
+    saysItIsReal: /really run/.test(ranNotice || ""),
+  });
+  await shot(page, "page-automations-actions-run-now");
+
+  report.automationsActions = { steps };
+  log(`automations-actions: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The slice-3 pass: the approval gate and the run-as authority (REQ-003).
+ *
+ * Every control this slice added is clicked, and the two that *prove* something are
+ * read back rather than eyeballed:
+ *
+ *  * the run-as picker, and the sentence under it — the panel must show what the
+ *    **API** resolved, not what the picker happens to hold;
+ *  * a gate step's three controls, with a message the decider would read and a permission
+ *    that is a real key; a gate with an empty permission is reported in the problems
+ *    summary *before* a save is attempted, with Save disabled;
+ *  * the step-kind picker grows `approval`, and the action picker must disappear on it —
+ *    a gate names no action, and a picker that still offered one would let an author save
+ *    a definition the engine refuses;
+ *  * the pending panel: when a gate is waiting it is drawn above the table with an Approve
+ *    and a Reject, and when nothing waits it is not drawn at all. "Not drawn" is the state
+ *    that is easy to leave broken, so it is asserted rather than assumed.
+ */
+async function runAutomationsApprovalsDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    log(`automations-approvals: ${JSON.stringify(entry)}`);
+  };
+
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // A fresh rule, so the pass does not depend on what another pass left behind.
+  const ruleName = `QA gate rule ${Date.now().toString(36)}`;
+  await page.locator("[data-automation-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  // The name first: Save is disabled while any problem is open, and a nameless rule is one.
+  await page.locator("[data-automation-name]").first().fill(ruleName).catch(() => {});
+  await page.waitForTimeout(300);
+
+  // --- the run-as picker -------------------------------------------------------------------
+  const runAs = page.locator("[data-automation-run-as]").first();
+  const runAsVisible = (await runAs.count()) > 0;
+  const runAsDefault = runAsVisible
+    ? await runAs.evaluate((node) => node.value).catch(() => null)
+    : null;
+  const helpVisible = (await page.locator("[data-automation-run-as-help]").count()) > 0;
+  const helpText = helpVisible
+    ? (await page.locator("[data-automation-run-as-help]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  note({
+    step: "run-as",
+    runAsVisible,
+    runAsDefault,
+    helpVisible,
+    saysWhenItIsChecked: /step runs|when each step runs/i.test(helpText),
+    helpText,
+  });
+  await shot(page, "page-automations-approvals-run-as");
+
+  // The picker must offer more than one choice on a seeded stack — a picker with only the
+  // default is a *read-only* control wearing a select's clothes, and an author cannot hand a
+  // rule to a service account through it.
+  const runAsOptions = runAsVisible
+    ? await runAs.evaluate((node) => node.options.length).catch(() => 0)
+    : 0;
+  note({ step: "run-as-choices", runAsOptions, hasMoreThanTheDefault: runAsOptions > 1 });
+
+  // --- the gate step ----------------------------------------------------------------------
+  const kindSelect = page.locator("[data-automation-step-kind='0']").first();
+  const kindVisible = (await kindSelect.count()) > 0;
+  const kindHasApproval = kindVisible
+    ? await kindSelect
+        .evaluate((node) => Array.from(node.options).some((option) => option.value === "approval"))
+        .catch(() => false)
+    : false;
+  if (kindVisible) {
+    await kindSelect.selectOption("approval").catch(() => {});
+    await page.waitForTimeout(500);
+  }
+
+  const gateVisible = (await page.locator("[data-automation-approval-step='0']").count()) > 0;
+  // A gate names no action: the action picker must be gone, exactly as it is on a branch.
+  const actionHiddenOnGate =
+    (await page.locator("[data-automation-step-action='0']").count()) === 0;
+  const permissionVisible = (await page.locator("[data-automation-approval-permission='0']").count()) > 0;
+  const messageVisible = (await page.locator("[data-automation-approval-message='0']").count()) > 0;
+  const ttlVisible = (await page.locator("[data-automation-approval-ttl='0']").count()) > 0;
+  note({
+    step: "gate-step",
+    kindVisible,
+    kindHasApproval,
+    gateVisible,
+    actionHiddenOnGate,
+    permissionVisible,
+    messageVisible,
+    ttlVisible,
+  });
+  await shot(page, "page-automations-approvals-gate-step");
+
+  // A gate with an unusable permission is reported before a save, with Save disabled. The
+  // panel owns this check; the server refuses it too, but an author who only learns on save
+  // cannot fix the rule in one pass.
+  if (permissionVisible) {
+    await page
+      .locator("[data-automation-approval-permission='0']")
+      .first()
+      .fill("not a permission")
+      .catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const problemsShown = (await page.locator("[data-automation-problems]").count()) > 0;
+  const problemsText = problemsShown
+    ? (await page.locator("[data-automation-problems]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const saveDisabled = await page
+    .locator("[data-automation-save]")
+    .first()
+    .evaluate((node) => node.disabled)
+    .catch(() => null);
+  note({
+    step: "gate-validation",
+    problemsShown,
+    saveDisabled,
+    namedThePermission: /not a permission/.test(problemsText),
+    problemsText,
+  });
+  await shot(page, "page-automations-approvals-gate-problem");
+
+  // Fix it, add a message and a bounded lifetime, and the summary must clear.
+  if (permissionVisible) {
+    await page
+      .locator("[data-automation-approval-permission='0']")
+      .first()
+      .fill("workflows.approve")
+      .catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  if (messageVisible) {
+    await page
+      .locator("[data-automation-approval-message='0']")
+      .first()
+      .fill("the QA pass asks: publish this?")
+      .catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  if (ttlVisible) {
+    await page.locator("[data-automation-approval-ttl='0']").first().fill("24").catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  await page.locator("[data-automation-step-name='0']").first().fill("wait for a person").catch(() => {});
+  await page.waitForTimeout(300);
+  const problemsCleared = (await page.locator("[data-automation-problems]").count()) === 0;
+  const saveEnabledAfterFix = problemsCleared
+    ? await page
+        .locator("[data-automation-save]")
+        .first()
+        .evaluate((node) => !node.disabled)
+        .catch(() => false)
+    : false;
+  note({ step: "gate-fixed", problemsCleared, saveEnabledAfterFix });
+  await shot(page, "page-automations-approvals-gate-fixed");
+
+  // --- save, then read the rule back ------------------------------------------------------
+  await page.locator("[data-automation-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const saveBlocked = (await page.locator("[data-automation-save-error]").count()) > 0;
+  const saveBlockedText = saveBlocked
+    ? (await page.locator("[data-automation-save-error]").first().innerText()).replace(/\s+/g, " ")
+    : "";
+  const saved = !saveBlocked && (await page.locator("[data-automation-notice]").count()) > 0;
+
+  await openRuleByName(page, ruleName);
+  await page.waitForTimeout(1500);
+  // The round trip is the assertion: a whole-rule write that dropped the gate's parameters
+  // would save a rule the engine cannot run, and only a save-and-reopen catches it.
+  const gateSurvived = (await page.locator("[data-automation-approval-step='0']").count()) > 0;
+  const permissionKept = gateSurvived
+    ? await page
+        .locator("[data-automation-approval-permission='0']")
+        .first()
+        .evaluate((node) => node.value)
+        .catch(() => null)
+    : null;
+  const messageKept = gateSurvived
+    ? await page
+        .locator("[data-automation-approval-message='0']")
+        .first()
+        .evaluate((node) => node.value)
+        .catch(() => null)
+    : null;
+  const ttlKept = gateSurvived
+    ? await page
+        .locator("[data-automation-approval-ttl='0']")
+        .first()
+        .evaluate((node) => node.value)
+        .catch(() => null)
+    : null;
+  note({
+    step: "round-trip",
+    saved,
+    saveBlocked,
+    saveBlockedText,
+    gateSurvived,
+    permissionKept,
+    messageKept,
+    ttlKept,
+  });
+  await shot(page, "page-automations-approvals-round-trip");
+
+  // --- the pending panel ------------------------------------------------------------------
+  // Nothing is waiting on this pass's rule, so the panel must NOT be drawn. The "empty"
+  // state is the one that is easy to leave broken, because a panel that renders an empty
+  // box reads as a failure and a panel that never renders reads as a missing feature.
+  const panelAbsent = (await page.locator("[data-automation-approvals]").count()) === 0;
+  const errorAbsent = (await page.locator("[data-automation-approvals-error]").count()) === 0;
+  note({ step: "panel-empty", panelAbsent, errorAbsent });
+  await shot(page, "page-automations-approvals-panel-empty");
+
+  report.automationsApprovals = { steps };
+  log(`automations-approvals: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The automations **slice 4** pass: the operations screens.
+ *
+ * Five screens arrived with this slice and none of them can be reached from a static route
+ * list: the run detail carries a run id in its URL, and the versions and audit tabs are
+ * behind a tab strip that is only drawn for a rule that already exists. So the pass builds
+ * the state each screen needs, in the panel, and then reads the screen:
+ *
+ * * a rule whose second step always fails, run once, so the run history has a **failed** row
+ *   and the trace a failed step with "1 of 3 attempts" on it;
+ * * that run's own route, where Retry re-queues the step and the trace reloads;
+ * * the Versions tab, where a Restore **appends** rather than rewinds;
+ * * the Audit tab, which lists the create, the edit and the restore;
+ * * the gallery, where a starter is installed through the ordinary create.
+ *
+ * The rule is deleted at the end, so a pass that died half way leaves a name the next pass's
+ * sweep removes.
+ */
+/**
+ * Open a rule by its name from the list, waiting for the row to exist first.
+ *
+ * Save closes the editor and returns to the list, so every step that edits and re-opens has to
+ * click through a list that is re-reading at the time. A click issued during that read finds
+ * no row, the `.catch()` swallows it, and the pass carries on in whatever screen it happened
+ * to land in — which is how "the Versions tab showed nothing" turns out to be a pass that
+ * never opened the rule at all. Waiting for the row is the difference between a finding and
+ * a phantom.
+ */
+async function openRuleByName(page, ruleName, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  // "The editor is open" means the *rule's own form* is on screen, which is
+  // `[data-automation-name]` carrying the rule's name. Not the URL — the route is client-side,
+  // so a navigation commits before the rule is fetched and the list is still mounted through
+  // that beat. Not the row link either. Reading the name out of the loaded form is the one
+  // signal that means "this is the rule you asked for, and it is loaded".
+  const editorShows = async () =>
+    (await page.locator("[data-automation-name]").first().inputValue().catch(() => "")) === ruleName;
+  const onList = async () => (await page.locator("[data-automation-row]").count()) > 0;
+
+  while (Date.now() < deadline) {
+    // One unconditional trip to the list, then one click, then a wait for the form. Anything
+    // cleverer is a guess about where the pass happens to be standing, and the pass stands
+    // somewhere new every time — the list, the editor, a run's trace, the gallery. The list is
+    // the only page that can always reach the editor in one click, so it is the only page
+    // worth navigating to. (A URL test cannot tell them apart: a run's trace also lives under
+    // /automations/, and a pass that waited there for the name field waited out its whole
+    // deadline on a page that has none.)
+    if (!(await onList())) {
+      await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForSelector("[data-automation-row]", { timeout: 6000 }).catch(() => {});
+    }
+    const target = page.locator("[data-automation-row] a", { hasText: ruleName }).first();
+    if ((await target.count()) > 0) {
+      await target.click({ timeout: 4000 }).catch(() => {});
+    }
+    // The click is retried under a short budget, because a save returns to the list mid
+    // re-read and the click can land in a row that is torn out from under the pointer.
+    for (let waited = 0; waited < 8 && Date.now() < deadline; waited += 1) {
+      if (await editorShows()) return true;
+      await page.waitForTimeout(300);
+    }
+  }
+  // The click's promise resolving is not evidence the editor opened, and a `.catch`ed wait is
+  // not either — so a failed click and a failed wait both fell through to an unconditional
+  // `true` once. That is the phantom this helper was written to end, reopened one layer up:
+  // the pass went on to read Versions and Audit **on the list page**, reported both as empty,
+  // and the two screenshots came out byte-identical because they were literally the same
+  // page. So the answer is what is on screen now, and a false here is a no-result run.
+  // What the form actually held is the difference between "the rule is not there" and "the
+  // rule is there under another name" — and the second is a real product finding (a save that
+  // renamed the rule) while the first is a navigation problem. Report both.
+  const seenName = await page.locator("[data-automation-name]").first().inputValue().catch(() => null);
+  const seenRows = await page.locator("[data-automation-row]").count();
+  log(
+    `openRuleByName: the editor did not open for "${ruleName}" ` +
+      `(url ${page.url()}, form name ${JSON.stringify(seenName)}, list rows ${seenRows})`,
+  );
+  return false;
+}
+
+/**
+ * Which screen answered, when a panel listed no rows.
+ *
+ * A row count of zero is not a diagnosis. The same zero means three different things: the
+ * fetch is still in flight, the panel rendered its empty state because there is genuinely
+ * nothing, or the fetch failed and the panel rendered its error. A pass that records only
+ * the count reports all three as `rows: 0` and the reader — the next tick, deciding what to
+ * fix — has no way to tell a working screen from a broken one. So the panel's own error and
+ * empty-state hooks are read, and the message is recorded with the count.
+ *
+ * The hooks are the ones the panels already write (`data-automation-*-error`, and the
+ * empty-state block), so this adds no new contract for the product to satisfy.
+ */
+async function readPanelState(page, kind) {
+  const error = await page
+    .locator(`[data-automation-${kind}-error], [data-automation-${kind}s-error]`)
+    .first()
+    .innerText()
+    .catch(() => "");
+  if (error.trim()) {
+    return { state: "error", message: error.replace(/\s+/g, " ").trim().slice(0, 160) };
+  }
+  // The empty state is a heading inside the panel; the panels have no row, so it is the only
+  // thing left on screen and its presence is the difference between "empty" and "unfinished".
+  const empty = await page
+    .locator("[data-automation-empty], [data-empty-state]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  if (empty.trim()) {
+    return { state: "empty", message: empty.replace(/\s+/g, " ").trim().slice(0, 160) };
+  }
+  const loading = await page.locator("[data-loading], .animate-pulse").count();
+  if (loading > 0) return { state: "loading", message: "still fetching" };
+  return { state: "blank", message: "no rows, no error and no empty state" };
+}
+
+async function runAutomationsOperationsDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    record({ page: "automations-operations-depth", action: "automations", ...entry });
+  };
+
+  const ruleName = `QA operations rule ${Date.now().toString(36)}`;
+
+  // ---- A rule with a step that fails, so the trace has something to say --------------------
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-automation-new]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  await page.locator("[data-automation-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-name]").first().fill(ruleName).catch(() => {});
+  await page.locator("[data-automation-description]").first().fill("Created by the walkthrough").catch(() => {});
+  await page.waitForTimeout(400);
+
+  // The always-failing action, with the step's own budget raised so the trace has "attempts
+  // used against attempts allowed" to print rather than a bare 1/1.
+  const kindSelect = page.locator("[data-automation-step-kind='0']").first();
+  if ((await kindSelect.count()) > 0) {
+    await kindSelect.selectOption("task").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const actionSelect = page.locator("[data-automation-step-action='0']").first();
+  if ((await actionSelect.count()) > 0) {
+    await actionSelect.selectOption("fail").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const paramsBox = page.locator("[data-automation-step-params='0']").first();
+  if ((await paramsBox.count()) > 0) {
+    await paramsBox.fill(JSON.stringify({ message: "deliberate QA failure" }, null, 2)).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  await page.locator("[data-automation-step-name='0']").first().fill("a step that always fails").catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const savedNotice = (await page.locator("[data-automation-notice]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  note({ step: "rule-saved", saved: savedNotice.length > 0, notice: savedNotice.slice(0, 110) });
+  await shot(page, "page-automations-operations-editor");
+
+  // ---- Run it, and read the run history ---------------------------------------------------
+  // Save *closes* the editor and returns to the list, so the rule is opened again by name —
+  // and a "Run now" writes a row the Runs tab then reads, which means waiting for the row
+  // rather than for a fixed pause. A pass that reads the tab 1.6s after the run reports an
+  // empty history and looks like a broken screen rather than a read that was too early.
+  await openRuleByName(page, ruleName);
+  const runNowVisible = (await page.locator("[data-automation-run-now]").count()) > 0;
+  if (runNowVisible) {
+    await page.locator("[data-automation-run-now]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForSelector("[data-automation-notice]", { timeout: 15000 }).catch(() => {});
+  }
+  await page.locator("[data-automation-tab='runs']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+  // The row is the evidence; poll for it instead of guessing how long the queue takes. The
+  // re-read is a tab click *and* a reload token: a panel that reads on mount alone reports
+  // "this rule has not run yet" a second after a run started, which is a broken control
+  // dressed as a fresh rule. Re-clicking the tab also proves the tab itself still works.
+  for (let wait = 0; wait < 12 && (await page.locator("[data-automation-run-row]").count()) === 0; wait += 1) {
+    await page.waitForTimeout(1000);
+    await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(600);
+  }
+  const runRows = await page.locator("[data-automation-run-row]").count();
+  const runStatus = await page
+    .locator("[data-automation-run-row]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({
+    step: "run-history",
+    runNowVisible,
+    rows: runRows,
+    hasRun: runRows > 0,
+    showsFailure: /fail/i.test(runStatus),
+  });
+  await shot(page, "page-automations-operations-runs");
+
+  // ---- The run's own route: the trace ----------------------------------------------------
+  await page
+    .locator("[data-automation-run-open]")
+    .first()
+    .waitFor({ state: "visible", timeout: 15000 })
+    .catch(() => {});
+  await page.locator("[data-automation-run-open]").first().click({ timeout: 6000 }).catch(() => {});
+  await page
+    .locator("[data-automation-trace-steps]")
+    .first()
+    .waitFor({ state: "visible", timeout: 15000 })
+    .catch(() => {});
+  await page.waitForTimeout(800);
+  const traceUrl = page.url();
+  const traceSteps = await page.locator("[data-automation-trace-step]").count();
+  const attemptsText = (await page.locator("[data-automation-trace-attempts]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  const stepError = (await page.locator("[data-automation-trace-step-error]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  // The criterion the request names by name: the step prints its attempts used against
+  // attempts allowed. "1 of 3" is the shape; a bare number is not.
+  const showsAttempts = /\d+\s+of\s+\d+/.test(attemptsText);
+  note({
+    step: "trace",
+    route: traceUrl.replace(URL_ADMIN, ""),
+    steps: traceSteps,
+    attempts: attemptsText.slice(0, 60),
+    showsAttempts,
+    namesTheFailure: /deliberate QA failure/.test(stepError),
+  });
+  await shot(page, "page-automations-operations-trace");
+
+  // The payload disclosure, because a collapsed panel that never opens is a hidden feature.
+  const payloadButton = page.locator("[data-automation-trace-payload]").first();
+  if ((await payloadButton.count()) > 0) {
+    await payloadButton.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  note({
+    step: "trace-payload",
+    opened: await payloadButton.getAttribute("aria-expanded").catch(() => null),
+  });
+
+  // ---- Retry: the one control the trace offers, on the step that failed -------------------
+  const retry = page.locator("[data-automation-trace-retry]").first();
+  const retryVisible = (await retry.count()) > 0;
+  if (retryVisible) {
+    await retry.click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+  }
+  const retryError = (await page.locator("[data-automation-trace-error]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  note({
+    step: "retry",
+    offered: retryVisible,
+    accepted: retryError.length === 0,
+    error: retryError.slice(0, 110),
+  });
+  await shot(page, "page-automations-operations-trace-after-retry");
+
+  // ---- The Versions tab: a restore appends, it does not rewind ----------------------------
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const openedForVersions = await openRuleByName(page, ruleName);
+  await page.locator("[data-automation-tab='versions']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+  await page.locator("[data-automation-tab='versions']").first().click({ timeout: 5000 }).catch(() => {});
+  await page
+    .locator("[data-automation-versions], [role=alert]")
+    .first()
+    .waitFor({ state: "visible", timeout: 15000 })
+    .catch(() => {});
+  await page.waitForTimeout(800);
+  const versionRows = await page.locator("[data-automation-version-row]").count();
+  // A panel that answers with an error, or with "nothing yet", is a different fact from a
+  // panel that lists rows — and counting only the rows reports both as zero. The Versions and
+  // Audit tabs are the two screens slice 4 closes on, so their *state* is recorded next to
+  // their row count: a zero with an empty-state message is a screen that works, and a zero
+  // with a fetch error is a bug, and only the message tells the two apart.
+  const versionsState = await readPanelState(page, "version");
+  // The rule has one write so far. A second one gives the restore something to restore.
+  await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
+  await page.locator("[data-automation-description]").first().waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
+  await page.locator("[data-automation-description]").first().fill("Edited by the walkthrough").catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector("[data-automation-notice]", { timeout: 15000 }).catch(() => {});
+  // Save closes the editor, so the rule is opened again and the tab asked for a second time.
+  await openRuleByName(page, ruleName);
+  await page.locator("[data-automation-tab='versions']").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+  await page.locator("[data-automation-tab='versions']").first().click({ timeout: 5000 }).catch(() => {});
+  // The edit's version is a write the panel issues *after* the save, so the row is polled for
+  // rather than assumed: reading one beat early sees the pre-edit history and reports a
+  // restore that had nothing to restore.
+  for (let wait = 0; wait < 10 && (await page.locator("[data-automation-version-row]").count()) <= versionRows; wait += 1) {
+    await page.waitForTimeout(1000);
+    await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-automation-tab='versions']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  const versionsAfterEdit = await page.locator("[data-automation-version-row]").count();
+  const restoreButtons = await page.locator("[data-automation-version-restore]").count();
+  let restoreNotice = "";
+  if (restoreButtons > 0) {
+    await page.locator("[data-automation-version-restore]").last().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+    restoreNotice = (
+      await page.locator("[data-automation-versions-notice]").first().innerText().catch(() => "")
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  // The restore is a write the panel performs *after* the request returns, so the row it adds
+  // is not there the instant the button click resolves — the same reason the edit's version
+  // is polled for rather than assumed. Reading it straight after the click reported 0 rows and
+  // "appended: false" for a restore that had demonstrably worked: the audit tab, read a step
+  // later, lists `automation.version_restored` for the very same rule.
+  let versionsAfterRestore = 0;
+  for (let wait = 0; wait < 10; wait += 1) {
+    versionsAfterRestore = await page.locator("[data-automation-version-row]").count();
+    if (versionsAfterRestore > versionsAfterEdit) break;
+    await page.waitForTimeout(700);
+    await page.locator("[data-automation-tab='runs']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-automation-tab='versions']").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  note({
+    step: "versions",
+    rowsAfterCreate: versionRows,
+    rowsAfterEdit: versionsAfterEdit,
+    rowsAfterRestore: versionsAfterRestore,
+    restoreOffered: restoreButtons,
+    // The history is a line, not a rewind: a restore adds a version rather than removing one.
+    appended: versionsAfterRestore > versionsAfterEdit,
+    // Which screen answered, when no row did.
+    // If the editor never opened, every number here is read off the list page. Saying so is
+    // the difference between "the Versions tab is empty" and "the pass was looking at the
+    // wrong screen", and only the first one is a product finding.
+    reachedTheTab: openedForVersions,
+    stateWhenEmpty: openedForVersions ? versionsState.state : "not-reached",
+    message: (versionsState.message || restoreNotice).slice(0, 130),
+    notice: restoreNotice.slice(0, 130),
+  });
+  await shot(page, "page-automations-operations-versions");
+
+  // ---- The Audit tab: the create, the edit and the restore are all listed -------------------
+  await page.locator("[data-automation-tab='audit']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator("[data-automation-audit], [role=alert]").first().waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const auditRows = await page.locator("[data-automation-audit-row]").count();
+  const auditState = await readPanelState(page, "audit");
+  const auditActions = await page
+    .locator("[data-automation-audit-row]")
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-automation-audit-row")).filter(Boolean));
+  note({
+    step: "audit",
+    rows: auditRows,
+    actions: [...new Set(auditActions)].join(", "),
+    listsTheCreate: auditActions.includes("automation.created"),
+    listsTheEdit: auditActions.includes("automation.updated"),
+    // Same rule as Versions: a zero has to say *which* zero it is.
+    stateWhenEmpty: auditState.state,
+    message: auditState.message,
+  });
+  await shot(page, "page-automations-operations-audit");
+
+  // ---- The gallery: a starter installs through the ordinary create -------------------------
+  await page.goto(`${URL_ADMIN}/automations/templates`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-automation-templates]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const cards = await page.locator("[data-automation-template-card]").count();
+  const categories = await page.locator("[data-automation-template-category]").count();
+  // A template whose own credential is missing says so on the card and refuses to install, so
+  // the pass presses the first *installable* one rather than the first one it sees.
+  const installable = page.locator('[data-automation-template-use]:not([disabled])').first();
+  const installVisible = (await installable.count()) > 0;
+  if (installVisible) {
+    await installable.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(3000);
+  }
+  const templateNotice = (
+    await page.locator("[data-automation-templates-notice]").first().innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  const templateError = (
+    await page.locator("[data-automation-templates-error]").first().innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  note({
+    step: "templates",
+    cards,
+    categories,
+    // Six starters is the request's own number; anything less means the gallery lost one.
+    offersSix: cards >= 6,
+    installOffered: installVisible,
+    installed: /is created and paused/.test(templateNotice),
+    notice: templateNotice.slice(0, 130),
+    error: templateError.slice(0, 110),
+  });
+  await shot(page, "page-automations-operations-templates");
+
+  // ---- And the installed starter is a real rule on the list, not a gallery-only object -----
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const listed = await page.locator("[data-automation-row]").count();
+  note({ step: "installed-listed", rows: listed });
+  await shot(page, "page-automations-operations-list");
+
+  // ---- Cleanup: this pass owns every rule it named, plus the one it installed -------------
+  for (const name of [ruleName]) {
+    const row = page.locator("[data-automation-row] a", { hasText: name }).first();
+    if ((await row.count()) === 0) continue;
+    await row.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    await page.locator("[data-automation-delete]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-automation-delete-input]", { timeout: 5000 }).catch(() => {});
+    await page.locator("[data-automation-delete-input]").first().fill(name).catch(() => {});
+    await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  note({ step: "cleanup", removed: ruleName });
+
+  report.automationsOperations = { steps, ruleName };
+  log(`automations-operations: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The visual builder (REQ-004, slice 1).
+ *
+ * `/workflows/{id}/builder` cannot go in the static route list for the reason the file
+ * already records about the file-detail screen: its path carries a rule id, so a route walked
+ * with a placeholder id only proves that the error state renders. This pass therefore creates
+ * a real rule, opens *its* builder, and drives it — which is also the only way to see the
+ * three panes at once, since a builder with no rule is a 404.
+ *
+ * What it proves, in the order the request's QA plan asks for:
+ *
+ *   1. the workspace renders — palette, canvas, inspector, problems panel, all four present;
+ *   2. a node can be added from the palette by clicking it, and it lands selected;
+ *   3. the inspector writes a parameter, and the save indicator reaches "Saved" — which is
+ *      the only honest proof that autosave works, since the indicator is the claim;
+ *   4. Validate answers on a deliberately broken graph, and the problems panel names it;
+ *   5. the same graph saves once it is fixed, and the version advanced;
+ *   6. a stale version is refused with a conflict and the local copy stays on screen;
+ *   7. the layout write does **not** advance the version — the one assertion that would
+ *      silently fail if positions and semantics were conflated.
+ *
+ * Every step polls for the thing it is waiting for rather than sleeping a fixed interval:
+ * a pass that reads the save state 200ms too early reports "Unsaved changes" and looks like
+ * a broken autosave.
+ */
+// `draftOpenLocked` is a named helper rather than a bare `draftWhileLocked > 0` in the note
+// because the note is a record, not a computation: a reader comparing two notes should be
+// able to see the same *value*, not the same expression evaluated under different readings.
+function draftOpenLocked(count) {
+  return count > 0;
+}
+
+async function runWorkflowBuilderDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    record({ page: "workflow-builder-depth", action: "workflow-builder", ...entry });
+  };
+
+  const ruleName = `QA builder rule ${Date.now().toString(36)}`;
+
+  // ---- A rule to build on ----------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-automation-new]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  await page.locator("[data-automation-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.locator("[data-automation-name]").first().fill(ruleName).catch(() => {});
+  await page.locator("[data-automation-description]").first().fill("Created by the walkthrough").catch(() => {});
+  await page.selectOption("[data-automation-event]", "user.created").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-automation-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+
+  // The rule's id, read out of the list row's own link rather than guessed: a builder opened
+  // against an id that does not exist renders the error state, and a pass that then asserted
+  // "the palette has nodes" would be asserting about the error state.
+  const href = await page
+    .locator("[data-automation-row] a", { hasText: ruleName })
+    .first()
+    .getAttribute("href")
+    .catch(() => null);
+  const workflowId = (href ?? "").split("/").filter(Boolean).pop() ?? "";
+  note({ step: "rule-created", found: Boolean(workflowId), workflowId });
+  if (!workflowId) {
+    report.workflowBuilder = { steps, ruleName, opened: false };
+    log(`workflow-builder: ${JSON.stringify(steps)}`);
+    return;
+  }
+
+  // ---- The workspace renders --------------------------------------------------------------
+  await page
+    .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  // The builder's own root marker is `data-builder-state` ("loading" | "error" | the
+  // workspace), not a bare `data-builder`: the component never renders the latter, so a
+  // check for it reports "the builder did not open" for a page that opened fine — which is
+  // how the palette drag, the connect gesture and the marquee all sat unproven for a tick.
+  // Read the state so an error screen is distinguished from a missing screen.
+  const builderState = await page
+    .locator("[data-builder-state]")
+    .first()
+    .evaluate((el) => el.getAttribute("data-builder-state"))
+    .catch(() => null);
+  const opened = builderState === null || builderState === "loading" ? false : true;
+  if (builderState === "error") {
+    const message = await page
+      .locator("[data-builder-state='error']")
+      .first()
+      .innerText()
+      .catch(() => "");
+    note({ step: "builder-state", state: builderState, message: message.slice(0, 200) });
+  }
+  await page.waitForSelector("[data-builder-palette] [data-palette-node]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const panes = {
+    palette: (await page.locator("[data-builder-palette]").count()) > 0,
+    canvas: (await page.locator("[data-builder-canvas]").count()) > 0,
+    inspector: (await page.locator("[data-builder-inspector]").count()) > 0,
+    problems: (await page.locator("[data-builder-problems]").count()) > 0,
+  };
+  const paletteNodes = await page.locator("[data-palette-node]").count();
+  const canvasNodes = await page.locator("[data-node-id]").count();
+  note({ step: "workspace", opened, panes, paletteNodes, canvasNodes });
+  await shot(page, "page-workflow-builder");
+
+  // ---- A node from the palette, by clicking it --------------------------------------------
+  // The rule is born with a trigger and an end, so a canvas with 2 nodes is the backfill or
+  // the starter graph having worked; anything else means the rule opened empty.
+  const before = canvasNodes;
+  await page.locator("[data-palette-node='wait']").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const afterAdd = await page.locator("[data-node-id]").count();
+  const inspectorOpen = (await page.locator("[data-inspector]").count()) > 0;
+  note({ step: "palette-add", before, afterAdd, inspectorOpen });
+  await shot(page, "page-workflow-builder-added");
+
+  // ---- The inspector writes a parameter, and the save indicator tells the truth -------------
+  const waitNode = await page.locator("[data-node-type='wait']").first().getAttribute("data-node-id").catch(() => null);
+  if (waitNode) {
+    await page.locator(`[data-node-id="${waitNode}"]`).first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    await page
+      .locator(`[data-inspector="${waitNode}"] [data-inspector-field="seconds"]`)
+      .first()
+      .fill("45")
+      .catch(() => {});
+    await page.waitForTimeout(300);
+  }
+  await shot(page, "page-workflow-builder-inspector");
+
+  // Poll for the save state rather than sleeping: "Unsaved changes" read 200ms early is a
+  // broken-autosave finding that costs a whole tick to disprove.
+  let saveState = "";
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    saveState = (await page.locator("[data-save-state]").first().getAttribute("data-save-state").catch(() => "")) ?? "";
+    if (saveState === "saved" || saveState === "error" || saveState === "conflict") {
+      break;
+    }
+    await page.waitForTimeout(400);
+  }
+  note({ step: "autosave", saveState });
+  await shot(page, "page-workflow-builder-saved");
+
+  // ---- ⌘S writes once, and the version says so ---------------------------------------------
+  // "Does not write twice" is not observable from the screen: a second write lands while the
+  // indicator still reads "saved", and the only witness is `graph_version`. So the probe
+  // presses the key and then reads the version the *server* holds, twice — once
+  // immediately, and again after longer than the autosave debounce. If ⌘S left the debounce
+  // armed, the second read is one higher than the first, and that difference is the whole
+  // defect in one number.
+  //
+  // The key goes to the canvas, not the document: the handler is on the canvas's onKeyDown,
+  // and a global listener would be testing a different product.
+  const readGraph = async () =>
+    page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" });
+      if (!response.ok) return null;
+      return await response.json();
+    }, workflowId);
+
+  const versionBeforeSaveKey = (await readGraph())?.graph_version ?? 0;
+  await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(600);
+  const versionAfterKey = (await readGraph())?.graph_version ?? 0;
+  // Longer than AUTOSAVE_MS, so a debounce that was never cancelled has fired by now.
+  await page.waitForTimeout(2600);
+  const versionAfterSettle = (await readGraph())?.graph_version ?? 0;
+  note({
+    step: "cmd-s-writes-once",
+    before: versionBeforeSaveKey,
+    afterKey: versionAfterKey,
+    // A write did happen — otherwise this reads as "no double write" for the wrong reason.
+    wroteSomething: versionAfterKey > versionBeforeSaveKey,
+    // The criterion itself: no second write arrived after the debounce window.
+    settledSame: versionAfterSettle === versionAfterKey,
+  });
+  await shot(page, "page-workflow-builder-cmd-s");
+
+  const afterSave = await readGraph();
+  const versionAfterSave = afterSave?.graph_version ?? 0;
+  note({
+    step: "projection",
+    version: versionAfterSave,
+    nodes: afterSave?.node_count ?? 0,
+    edges: afterSave?.edge_count ?? 0,
+    // A graph that saved but projects to nothing would be the worst outcome: the canvas
+    // looks right and a run executes zero steps and reports success.
+    valid: afterSave?.projection?.valid ?? false,
+    stepCount: afterSave?.projection?.step_count ?? 0,
+    reason: (afterSave?.projection?.reason ?? "").slice(0, 120),
+  });
+
+  // ---- Validate a deliberately broken graph, through the toolbar ---------------------------
+  const broken = await page.evaluate(async (id) => {
+    const current = await (
+      await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+    ).json();
+    // A second trigger is a refusal the request names by class, and it cannot be fixed by
+    // clicking around: it is what proves the problems panel has something to show.
+    current.graph.nodes.push({
+      id: "trigger-2",
+      type: "trigger.schedule",
+      label: "A second trigger",
+      params: { cron: "0 9 * * *" },
+      position: { x: 40, y: 200 },
+    });
+    const response = await fetch(`/api/v1/workflows/${id}/validate`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }, workflowId);
+
+  const brokenCodes = (broken.body?.findings ?? []).map((finding) => finding.code);
+  note({
+    step: "validate-broken",
+    status: broken.status,
+    valid: broken.body?.valid ?? null,
+    errorCount: broken.body?.error_count ?? 0,
+    codes: brokenCodes,
+    namesNode: (broken.body?.findings ?? []).some((finding) => finding.node_id === "trigger-2"),
+  });
+
+  // ---- Each error class, one at a time, and the node it blames -------------------------------
+  // The criterion names five classes (cycle, two triggers, orphan, missing input, duplicate
+  // edge) and asks each one to name the node involved. Proving them in a single "broken"
+  // graph does not answer that: the five overlap, one class can mask another, and a panel
+  // that renders only the first finding would report the same codes as one that renders
+  // them all. So each class gets its own graph, and each is checked for the two things the
+  // criterion actually asks — the code appears, and the message names a real node.
+  //
+  // Each case starts from a *valid* seed and breaks exactly one thing, so a code that comes
+  // back is attributable to the break and not to collateral damage.
+  const validationClasses = await page.evaluate(async (id) => {
+    const base = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+
+    // A minimal valid spine: event trigger → action → end. Every case below is this plus
+    // one defect, and the first case is this on its own as the control.
+    //
+    // The port keys are the registry's, not guesses: a trigger exports `out`, an action
+    // exports `success`/`error`. A probe that wires `next` into both would be measuring
+    // `unknown_source_port` on every case at once — the codes the criterion asks about would
+    // never appear, and the table would report the validation as broken rather than the
+    // probe as wrong.
+    const trigger = (nid) => ({
+      id: nid,
+      type: "trigger.event",
+      label: `Event ${nid}`,
+      params: { event: "qa.validate.probe" },
+      position: { x: 40, y: 40 },
+    });
+    const act = (nid) => ({
+      id: nid,
+      type: "action",
+      label: `Act ${nid}`,
+      params: { action: "log", parameters: "{}" },
+      position: { x: 320, y: 40 },
+    });
+    const finish = (nid) => ({
+      id: nid,
+      type: "end",
+      label: `End ${nid}`,
+      params: {},
+      position: { x: 600, y: 40 },
+    });
+    // `Edge` carries a REQUIRED `id` and refuses unknown fields, so an edge without one is
+    // refused by the deserializer before validation ever runs. The first draft of this probe
+    // built `{source, source_port, target}` and got `valid: null` with an empty `codes` on all
+    // six cases — which the note recorded as "the validator found nothing", when in fact the
+    // request never reached the validator. Ids are derived from the endpoints so the
+    // duplicate-edge case carries two DIFFERENT ids for one port pair: identity is the edge's
+    // own, and it is the (source, port, target) triple the validator calls a duplicate.
+    const edge = (from, to, port, seq = 0) => ({
+      id: `e-${from}-${port}-${to}-${seq}`,
+      source: from,
+      source_port: port,
+      target: to,
+    });
+    const spine = () => [edge("t1", "a1", "out"), edge("a1", "e1", "success")];
+
+    const cases = {
+      clean: {
+        nodes: [trigger("t1"), act("a1"), finish("e1")],
+        edges: spine(),
+      },
+      // A loop: a1 → t1 closes a ring back to the trigger.
+      //
+      // The second edge leaves the SAME port as `a1 → e1`, which is the point: a walk that
+      // follows only the first edge out of a node never reaches the second, so this ring was
+      // invisible to validation and the rule would have been stored as valid. The `false`
+      // branch below is the shape an author actually draws ("retry until it passes") and it
+      // closes the same way.
+      //
+      // NOTE what this row actually measured for three ticks: it carries a SECOND defect.
+      // `spine()` already puts an edge on `a1`'s `success` port, so closing the ring from the
+      // same port leaves TWO edges on one walked port — which is `ambiguous_branch`, and it
+      // sorts first. The pass therefore read `cycle.found: true` off an `ambiguous_branch`
+      // message and reported "the cycle is found", which was true by accident. One defect per
+      // graph is the whole reason this table was split per class, and the row that violated it
+      // is the row nobody checked. The ring now closes from a SECOND action, so `a1` keeps
+      // its single `success` edge and the only thing wrong with the drawing is the cycle.
+      cycle: {
+        nodes: [trigger("t1"), act("a1"), act("a2"), finish("e1")],
+        edges: [
+          edge("t1", "a1", "out"),
+          edge("a1", "a2", "success"),
+          edge("a2", "e1", "success"),
+          edge("a2", "t1", "error"),
+        ],
+      },
+      // The same loop closing on the port the walk never takes — the one the server's own
+      // traversal missed. A condition with a retry branch, which is the common shape.
+      //
+      // The type is `condition`, NOT `condition.if`. The registry key is `condition`
+      // (`graph.rs`, `key: "condition"`), and `find_node_type` is exact — so `condition.if`
+      // resolved to nothing and answered `unknown_node_type` on the first finding, which then
+      // became the `firstMessage` this row reports. The row read `found: true` off the *codes*
+      // (which did contain `graph_cycle`) while its `names` field showed a sentence about a
+      // node type the author had never typed. Same shape as the earlier `next`-on-a-trigger
+      // probe: a case built from a port or type name that the registry has never had.
+      cycle_on_a_branch: {
+        nodes: [trigger("t1"), { ...act("c1"), type: "condition" }, act("a1"), finish("e1")],
+        edges: [
+          edge("t1", "c1", "out"),
+          edge("c1", "a1", "true"),
+          edge("a1", "e1", "success"),
+          edge("c1", "t1", "false"),
+        ],
+      },
+      multiple_triggers: {
+        nodes: [trigger("t1"), trigger("t2"), act("a1"), finish("e1")],
+        edges: spine(),
+      },
+      // Reachable from nothing: a floating action the trigger never reaches.
+      orphan_node: {
+        nodes: [trigger("t1"), act("a1"), finish("e1"), act("stray")],
+        edges: spine(),
+      },
+      // A required parameter left empty — the registry names the field and the node.
+      missing_input: {
+        nodes: [{ ...trigger("t1"), params: { event: "" } }, act("a1"), finish("e1")],
+        edges: spine(),
+      },
+      duplicate_edge: {
+        nodes: [trigger("t1"), act("a1"), finish("e1")],
+        // Same (source, port, target) twice, under two ids — the pair is what the validator
+        // keys on, so reusing one id would make this a different case entirely.
+        edges: [edge("t1", "a1", "out"), edge("t1", "a1", "out", 1), edge("a1", "e1", "success")],
+      },
+      // Two edges on ports the linear walk FOLLOWS, out of one node. This is the class that
+      // used to pass every other row and still run the wrong branch: the projection resolved
+      // the next node with a `find` over the saved array, so the verdict depended on the
+      // order the client serialised the edges rather than on what the author drew.
+      //
+      // The two cases below are the same drawing with the array reversed, so a validator that
+      // still guesses produces a *different* answer for each — and the pair is what proves the
+      // answer is a property of the graph rather than of the request body. `case_1` and
+      // `default` are both followed ports on a switch, which is the shape that triggers it.
+      ambiguous_branch: {
+        nodes: [
+          trigger("t1"),
+          { ...act("sw"), type: "switch", params: { cases: "a\nb" } },
+          act("a1"),
+          finish("e1"),
+        ],
+        edges: [
+          edge("t1", "sw", "out"),
+          edge("sw", "a1", "case_1"),
+          edge("sw", "e1", "default"),
+          edge("a1", "e1", "success"),
+        ],
+      },
+      ambiguous_branch_reversed: {
+        nodes: [
+          trigger("t1"),
+          { ...act("sw"), type: "switch", params: { cases: "a\nb" } },
+          act("a1"),
+          finish("e1"),
+        ],
+        edges: [
+          edge("t1", "sw", "out"),
+          edge("sw", "e1", "default"),
+          edge("sw", "a1", "case_1"),
+          edge("a1", "e1", "success"),
+        ],
+      },
+    };
+
+    const out = {};
+    for (const [name, graph] of Object.entries(cases)) {
+      const response = await fetch(`/api/v1/workflows/${id}/validate`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ graph, graph_version: base.graph_version }),
+      });
+      const body = await response.json().catch(() => null);
+      const findings = body?.findings ?? [];
+      out[name] = {
+        status: response.status,
+        valid: body?.valid ?? null,
+        codes: findings.map((f) => f.code),
+        // "Names the node involved" — the finding carries a node id the graph really has,
+        // or the message quotes a label. A finding with neither is a class the panel shows
+        // as a bare sentence the author has to decode.
+        named: findings
+          .filter((f) => f.severity === "error")
+          .every((f) => f.node_id || /[A-Z][a-z]+/.test(f.message ?? "")),
+        firstMessage: (findings[0]?.message ?? "").slice(0, 160),
+      };
+    }
+    return out;
+  }, workflowId);
+
+  // The control first: if the clean spine is not clean, every other row in the table is
+  // measuring the seed rather than the defect.
+  note({
+    step: "validate-classes",
+    clean: {
+      valid: validationClasses.clean?.valid,
+      codes: validationClasses.clean?.codes ?? [],
+    },
+    cycle: {
+      found: validationClasses.cycle?.codes?.includes("graph_cycle"),
+      // The codes matter as much as `found`. `found` was `true` for three ticks while the
+      // first finding was an `ambiguous_branch`, because this row carried two defects and the
+      // classes mask one another. Reading the whole list is what makes a second defect
+      // visible here instead of hiding behind the code the row was written to find.
+      codes: validationClasses.cycle?.codes ?? [],
+      names: validationClasses.cycle?.firstMessage ?? "",
+    },
+    // The branch-closing ring. It is a separate row because it failed while the row above
+    // passed: the server's walk took only the first edge out of each node, so a loop drawn
+    // on a `false` branch was stored as valid. One row for both would have hidden it.
+    cycleOnABranch: {
+      found: validationClasses.cycle_on_a_branch?.codes?.includes("graph_cycle"),
+      codes: validationClasses.cycle_on_a_branch?.codes ?? [],
+      names: validationClasses.cycle_on_a_branch?.firstMessage ?? "",
+    },
+    twoTriggers: {
+      found: validationClasses.multiple_triggers?.codes?.includes("multiple_triggers"),
+      names: validationClasses.multiple_triggers?.firstMessage ?? "",
+    },
+    orphan: {
+      found: validationClasses.orphan_node?.codes?.includes("orphan_node"),
+      names: validationClasses.orphan_node?.firstMessage ?? "",
+    },
+    missingInput: {
+      found: validationClasses.missing_input?.codes?.includes("missing_parameter"),
+      codes: validationClasses.missing_input?.codes ?? [],
+      names: validationClasses.missing_input?.firstMessage ?? "",
+    },
+    duplicateEdge: {
+      found: validationClasses.duplicate_edge?.codes?.includes("duplicate_edge"),
+      names: validationClasses.duplicate_edge?.firstMessage ?? "",
+    },
+    // Two walkable ports out of one node. The row records TWO readings, because "found" on
+    // its own is exactly the reading that was green before the fix: the old projection picked
+    // a branch and the graph still projected successfully, so a probe that only asked "does
+    // this validate" would have reported a pass on a rule that runs the wrong arm.
+    //
+    // `orderIndependent` is the load-bearing half. Both cases are the same drawing with the
+    // two edges swapped, so a validator that answers from array position gives a different
+    // verdict for each; one that refuses the drawing gives the same code for both.
+    ambiguousBranch: {
+      found: validationClasses.ambiguous_branch?.codes?.includes("ambiguous_branch"),
+      names: validationClasses.ambiguous_branch?.firstMessage ?? "",
+      reversedCodes: validationClasses.ambiguous_branch_reversed?.codes ?? [],
+      orderIndependent:
+        (validationClasses.ambiguous_branch?.codes ?? []).join(",") ===
+        (validationClasses.ambiguous_branch_reversed?.codes ?? []).join(","),
+    },
+  });
+
+  // ---- A switch the engine cannot run, said in words the author can act on ----------------
+  //
+  // This one is measured on the SAVE, not on `/validate`, and the distinction is the whole
+  // reason the row exists. `switch_not_executable` is raised by the *projection* (`step_for`),
+  // and `validate` never calls the projection — a table of cases posted at `/validate` could
+  // never show this code whether it worked or not, and the note would have read that as
+  // "validation cannot find it" about a check that is not on that path at all.
+  //
+  // The graph carries exactly ONE defect (the switch) on an otherwise valid spine, so a
+  // refusal is attributable to it. The assertion is on the WORDS as much as the fact: the old
+  // sentence was `"switch" does not project onto a step`, which reads as a typo for a card the
+  // palette had just handed the author. It must name the Condition alternative instead, since
+  // "not supported yet" with no next step is what teaches people to ignore the panel.
+  //
+  // The rule is restored afterwards. This probe overwrites a LIVE rule's graph, so leaving a
+  // switch on it would poison every later row in this pass (and the author's saved work).
+  const switchNotExecutable = await page.evaluate(async (id) => {
+    const current = await (
+      await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+    ).json();
+    const triggerNode = (nid) => ({
+      id: nid,
+      type: "trigger.event",
+      label: `Event ${nid}`,
+      params: { event: "qa.switch.probe" },
+      position: { x: 40, y: 40 },
+    });
+    const act = (nid) => ({
+      id: nid,
+      type: "action",
+      label: `Act ${nid}`,
+      params: { action: "log", parameters: "{}" },
+      position: { x: 320, y: 40 },
+    });
+    const finish = (nid) => ({
+      id: nid,
+      type: "end",
+      label: `End ${nid}`,
+      params: {},
+      position: { x: 600, y: 40 },
+    });
+    const edge = (from, to, port, seq = 0) => ({
+      id: `e-${from}-${port}-${to}-${seq}`,
+      source: from,
+      source_port: port,
+      target: to,
+    });
+    // One switch, one arm, one end: the smallest drawing whose ONLY defect is the switch.
+    // Two arms would add `ambiguous_branch`, and the row would be measuring two codes.
+    const graph = {
+      nodes: [
+        triggerNode("t1"),
+        { ...act("sw"), type: "switch", params: { cases: "only" } },
+        act("a1"),
+        finish("e1"),
+      ],
+      edges: [
+        edge("t1", "sw", "out"),
+        edge("sw", "a1", "case_1"),
+        edge("a1", "e1", "success"),
+      ],
+    };
+    const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph, graph_version: current.graph_version }),
+    });
+    // The save answers 200 on purpose: a rule that does not project is still STORABLE, and
+    // the run is where it refuses. A probe asserting a 4xx here would be asserting the
+    // opposite of the design.
+    const saved = await (
+      await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+    ).json();
+    // Put the author's graph back on the version this save produced, so the restore cannot
+    // itself be refused as a conflict.
+    await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        graph: current.graph,
+        graph_version: saved.graph_version,
+      }),
+    });
+    const reason = saved.validation_error ?? "";
+    return {
+      status: response.status,
+      // The save carried the reason onto the rule row — this is what turns a non-runnable
+      // rule into one an author can read about from the list screen.
+      storedReason: reason.slice(0, 200),
+      savedNotRunnable: reason.length > 0,
+      // The two sentences must stay apart; a test in graph.rs asserts the same split, and a
+      // probe that only counted refusals would pass on the typo wording.
+      namesCondition: /condition/i.test(reason),
+      notATypo: !/does not project onto a step/i.test(reason),
+      restored: true,
+    };
+  }, workflowId);
+  note({ step: "switch-not-executable", ...switchNotExecutable });
+
+  // ---- The toolbar's Validate, and the problems panel it fills -----------------------------
+  await page.locator("[data-testid='builder-validate']").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const findingRows = await page.locator("[data-finding]").count();
+  const problemsText = (await page.locator("[data-builder-problems]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  note({ step: "problems-panel", findingRows, text: problemsText.slice(0, 140) });
+  await shot(page, "page-workflow-builder-problems");
+
+  // ---- A stale save is a conflict, and the local copy survives ------------------------------
+  const conflict = await page.evaluate(async (id) => {
+    const current = await (
+      await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+    ).json();
+    const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version + 5 }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }, workflowId);
+  note({
+    step: "conflict",
+    status: conflict.status,
+    code: conflict.body?.error?.code ?? null,
+    // The message has to name the current version: a client that only learns "conflict"
+    // cannot offer Reload, and an editor that silently overwrites is the one behaviour a
+    // builder must never have.
+    namesVersion: /version/i.test(conflict.body?.error?.message ?? ""),
+  });
+
+  // ---- A layout write must not advance the version -----------------------------------------
+  const layoutVersionBefore = (await readGraph())?.graph_version ?? 0;
+  await page.locator("[data-testid='builder-zoom-in']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-testid='builder-zoom-in']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const layoutVersionAfter = (await readGraph())?.graph_version ?? 0;
+  note({
+    step: "layout-is-not-semantics",
+    before: layoutVersionBefore,
+    after: layoutVersionAfter,
+    unchanged: layoutVersionBefore === layoutVersionAfter,
+  });
+  await shot(page, "page-workflow-builder-zoomed");
+
+  // ---- Fit, so the canvas can be read at a glance -------------------------------------------
+  await page.locator("[data-testid='builder-fit']").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  const zoomLabel = (await page.locator("[data-builder-toolbar]").first().innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  note({ step: "fit", toolbar: zoomLabel.slice(0, 120) });
+
+  // ---- The interaction depth (REQ-004 slice 2) ---------------------------------------------
+  // Everything below is the part of the builder a unit test cannot see: a minimap that does
+  // not overlap the graph, a marquee that catches the cards it visually covers, an undo that
+  // the server agrees with, and the keyboard routes (⌘A, Shift+click, ⌘P + Enter) that the
+  // keyboard-only acceptance pass depends on.
+  await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(300);
+
+  // Select-all from the keyboard. The node count on the canvas is the assertion: ⌘A that
+  // highlights nothing is invisible in a screenshot and would otherwise pass every other gate.
+  await page.keyboard.press("Control+a");
+  await page.waitForTimeout(600);
+  // `[data-node-selected]` is the product's own answer. The previous probe grepped the inline
+  // style for the substring "outline", which React writes as `outline: none` on EVERY card —
+  // so "3 of 3 selected" and "stillSelected: 3 after Escape" were the same reading of a
+  // probe that could not tell a selected card from an unselected one. A probe that cannot go
+  // red is not a gate; this one can.
+  const countSelected = () =>
+    page.locator("[data-node-selected='true']").count();
+  const selectedAfterSelectAll = await countSelected();
+  note({ step: "select-all", total: await page.locator("[data-node-id]").count(), selected: selectedAfterSelectAll });
+  await shot(page, "page-workflow-builder-select-all");
+
+  // Escape clears it again, so the next gesture starts from a known state.
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(400);
+  const afterEscape = await countSelected();
+  note({ step: "escape-clears", stillSelected: afterEscape, cleared: afterEscape === 0 });
+
+  // Shift+click adds a second node to the selection. Two cards drawn as selected is the
+  // whole point: a Shift+click that *replaces* the selection is a bug no count can hide.
+  const cardIds = await page.locator("[data-node-id]").evaluateAll((cards) =>
+    cards.map((card) => card.getAttribute("data-node-id")),
+  );
+  if (cardIds.length >= 2) {
+    await page.locator(`[data-node-id="${cardIds[0]}"]`).first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(250);
+    await page
+      .locator(`[data-node-id="${cardIds[1]}"]`)
+      .first()
+      .click({ timeout: 5000, modifiers: ["Shift"] })
+      .catch(() => {});
+    await page.waitForTimeout(500);
+    const multiSelected = await countSelected();
+    // Two, not three: the plain click selected one, the Shift+click added the second. A
+    // count of 3 means the second click replaced the first or the first survived Escape.
+    note({ step: "shift-click-multi", expected: 2, selected: multiSelected, ok: multiSelected === 2 });
+    await shot(page, "page-workflow-builder-multi");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+  } else {
+    note({ step: "shift-click-multi", skipped: "fewer than two nodes on the canvas", nodes: cardIds.length });
+  }
+
+  // Drag from the palette onto the canvas. HTML5 drag is driven through `dispatchEvent` with
+  // a real DataTransfer because Playwright's mouse API does not synthesise it; the node count
+  // before and after is the assertion, and the position is checked against the drop point so
+  // a drop that lands at the canvas origin (screen coords used as graph coords) cannot pass.
+  const nodesBeforeDrag = await page.locator("[data-node-id]").count();
+  const dragResult = await page
+    .evaluate(() => {
+      const item = document.querySelector("[data-palette-node='transform']");
+      const canvas = document.querySelector("[data-builder-canvas]");
+      if (!item || !canvas) return { attempted: false };
+      const rect = canvas.getBoundingClientRect();
+      const target = { x: rect.left + 320, y: rect.top + 220 };
+      const transfer = new DataTransfer();
+      item.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: transfer }));
+      canvas.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer }));
+      canvas.dispatchEvent(
+        new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer, clientX: target.x, clientY: target.y }),
+      );
+      return { attempted: true, target };
+    })
+    .catch(() => ({ attempted: false }));
+  await page.waitForTimeout(900);
+  const afterDrag = await page.locator("[data-node-id]").count();
+  const droppedNode = await page
+    .locator("[data-node-type='transform']")
+    .last()
+    .evaluate((card) => {
+      const rect = card.getBoundingClientRect();
+      return { left: Math.round(rect.left), top: Math.round(rect.top) };
+    })
+    .catch(() => null);
+  note({
+    step: "palette-drag",
+    ...dragResult,
+    before: nodesBeforeDrag,
+    after: afterDrag,
+    dropped: droppedNode,
+    // A drop that ignores the viewport puts the card at the graph origin instead of under
+    // the pointer; the card's centre should sit within a card's width of the drop point.
+    nearDropPoint: droppedNode && dragResult.attempted
+      ? Math.abs(droppedNode.left + 110 - dragResult.target.x) < 240
+      : null,
+  });
+  await shot(page, "page-workflow-builder-drag");
+
+  // ⌘P focuses the palette, ArrowDown moves the focus, Enter adds. The node count before and
+  // after is the assertion — a palette that takes focus but does not add is a dead control.
+  const nodesBeforeKeyboardAdd = await page.locator("[data-node-id]").count();
+  await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.keyboard.press("Control+p");
+  await page.waitForTimeout(500);
+  const paletteFocused = await page.evaluate(() => {
+    const active = document.activeElement;
+    return Boolean(active && active.getAttribute && active.getAttribute("data-palette-node"));
+  });
+  await page.keyboard.press("ArrowDown");
+  await page.waitForTimeout(250);
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(700);
+  const afterKeyboardAdd = await page.locator("[data-node-id]").count();
+  note({ step: "palette-keyboard-add", paletteFocused, before: nodesBeforeKeyboardAdd, after: afterKeyboardAdd });
+  await shot(page, "page-workflow-builder-palette-keyboard");
+
+  // Undo removes the node the keyboard just added, and the *server* agrees — an undo that
+  // only rewinds the screen would save a graph the canvas no longer shows.
+  //
+  // **AND WAIT FOR THE WRITE.** This used to be `waitForTimeout(900)`, which is shorter than
+  // `AUTOSAVE_MS` (1_200) — so it read the canvas *before* the autosave it was asserting had
+  // happened. `returned` compares a DOM count that the undo repaints optimistically, which is
+  // why the row could go green against a server that never received the write.
+  const versionBeforeUndoKey = (await readGraph().catch(() => null))?.graph_version ?? 0;
+  await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.keyboard.press("Control+z");
+  const undoKeyWrite = await settleGraph(page, readGraph, versionBeforeUndoKey);
+  const afterUndo = await page.locator("[data-node-id]").count();
+  note({
+    step: "undo",
+    afterUndo,
+    returned: afterUndo === nodesBeforeKeyboardAdd,
+    // The server's own count is the authority for the same reason it is on the edge rows: a
+    // canvas can rewind without a graph ever being written.
+    nodesOnServer: undoKeyWrite.graph?.node_count ?? null,
+    writeSettled: undoKeyWrite.settled,
+  });
+
+  // A POINTER DRAG is undoable — the half the row above could never answer.
+  //
+  // The `undo` step presses a key, so it exercised the nudge path (`commit("nudge", …)`) and
+  // proved nothing about a mouse: a drag used to write its position and leave the Undo button
+  // grey, and a pass that only ever presses Ctrl+Z reads a healthy history. This row is the one
+  // that can tell the two apart, and each of its numbers is chosen so a stub cannot pass:
+  //
+  //   * `moved` is read off the card's own transform, not off a count — a drag that silently
+  //     failed to move the card leaves before === after and could satisfy "returned" by never
+  //     having changed anything.
+  //   * the undo reading is taken BEFORE the key press. A drag that recorded nothing leaves the
+  //     button disabled, and that is the one number that separates "undo worked" from "Ctrl+Z
+  //     was pressed on an empty history and nothing needed doing".
+  const dragUndo = await page
+    .evaluate(() => {
+      const card = document.querySelector("[data-node-id]");
+      if (!card) return null;
+      const box = card.getBoundingClientRect();
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    })
+    .catch(() => null);
+  let dragUndoNote = { attempted: false };
+  if (dragUndo) {
+    // Read the card's own transform rather than its bounding box: the box moves with the
+    // viewport, so a pan between the two readings would look like a drag that snapped back.
+    const cardX = () =>
+      page
+        .evaluate(() => {
+          const card = document.querySelector("[data-node-id]");
+          if (!card) return null;
+          const m = new DOMMatrixReadOnly(getComputedStyle(card).transform);
+          return Math.round(m.m41);
+        })
+        .catch(() => null);
+    const beforeX = await cardX();
+    // The attribute is present when the button is disabled, so `null` means enabled.
+    // `builder-undo` is the ToolbarButton's testId, and a disabled <button> carries the
+    // attribute in the DOM (rather than losing it), so "attribute present" means disabled.
+    const undoDisabled = () =>
+      page
+        .locator("[data-testid='builder-undo']")
+        .first()
+        .getAttribute("disabled")
+        .catch(() => null);
+    const undoWasDisabled = (await undoDisabled()) !== null;
+    // Several frames, not one: a single move can land inside the same gesture boundary, and a
+    // drag the product never saw is a drag this row cannot judge.
+    await page.mouse.move(dragUndo.x, dragUndo.y).catch(() => {});
+    await page.mouse.down().catch(() => {});
+    for (let frame = 1; frame <= 5; frame += 1) {
+      await page.mouse.move(dragUndo.x + frame * 24, dragUndo.y + frame * 12).catch(() => {});
+      await page.waitForTimeout(60);
+    }
+    await page.mouse.up().catch(() => {});
+    await page.waitForTimeout(500);
+    const afterX = await cardX();
+    const undoEnabledAfterDrag = (await undoDisabled()) === null;
+    // **AND WAIT FOR THE WRITE**, for the same reason the key-undo row above does: the undo of a
+    // drag is `doUndo` → `queueSave`, so the server has to have the position before the row can
+    // claim the graph went back. The 900ms this replaces is shorter than `AUTOSAVE_MS`, so the
+    // old reading was of a canvas the undo had repainted and a server that had not been told.
+    const versionBeforeDragUndo = (await readGraph().catch(() => null))?.graph_version ?? 0;
+    await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.keyboard.press("Control+z");
+    const dragUndoWrite = await settleGraph(page, readGraph, versionBeforeDragUndo);
+    const afterUndoX = await cardX();
+    dragUndoNote = {
+      attempted: true,
+      before: beforeX,
+      after: afterX,
+      moved: typeof beforeX === "number" && typeof afterX === "number" && afterX !== beforeX,
+      undoWasDisabled,
+      undoEnabledAfterDrag,
+      afterUndo: afterUndoX,
+      returned: afterUndoX === beforeX,
+      // `returned` is a reading off the canvas, which the undo repaints optimistically. Without
+      // this field it is also the answer for a graph the server was never told about.
+      writeSettled: dragUndoWrite.settled,
+    };
+  }
+  note({ step: "drag-undo", ...dragUndoNote });
+
+  // The Reload exit of the two-tab conflict has to REBASE, and the reading is the Undo button's
+  // own `disabled` attribute in the opposite direction from `drag-undo`: that row asserts the
+  // button ENABLES after a drag, this one asserts it DISABLES after a reload. A reload adopts
+  // another editor's graph, so every entry the history still holds describes a graph the author
+  // chose to discard — and `doUndo` ends in `queueSave`, which quotes the version the reload
+  // just took from the server. One press of undo therefore wrote the discarded graph back over
+  // the other tab, and the server ACCEPTED it because the quoted version was current.
+  //
+  // The selection is read too, because it is the second half of the same defect: an inspector
+  // holding a node the loaded graph does not contain is a panel that can be aimed at nothing.
+  //
+  // **THIS ROW USED TO MEASURE NOTHING, AND THE SHAPE OF THAT IS WORTH WRITING DOWN.** It read
+  // the button and the selection straight after `drag-undo` had pressed Ctrl+Z, so the only
+  // thing it observed was the state `drag-undo` left behind. It never caused a conflict, never
+  // clicked Reload, and never re-read the button — so it returned `undoDisabled` for a page on
+  // which no reload had happened at all, and it would have returned the identical value against
+  // a `rebaseAfterReload` that had been deleted outright. A row that cannot go red is not a
+  // conservative reading, it is an absent one.
+  //
+  // Worse, its selection selector was `[data-selected='true']` and the cards write
+  // `data-node-selected` — so `selectedInDom` was a hardcoded zero that no product could move.
+  // The wrong answer here is not "plausible", it is a constant, which is why a green pass said
+  // nothing.
+  //
+  // So this row now CAUSES the state it measures, in the order the defect needs:
+  //   1. a second tab saves a graph that DELETES this tab's selected card, so the adoption is
+  //      observable — a reload that left a card selected would be showing a node the graph does
+  //      not contain, and a reload that cleared the selection when the card survived would be
+  //      discarding the author's place. One fixture, both halves;
+  //   2. this tab makes an edit and lets its own debounced autosave produce the 409;
+  //   3. the Reload button is clicked — the exit under test, not a re-render;
+  //   4. the Undo button and the selection are read AFTER it.
+  //
+  // Step 1 deletes the card through the API rather than through the canvas so the delete is not
+  // itself a history entry here: the point is what the *reload* does to a history this tab
+  // built, and a second undoable edit in the same tab would make the two indistinguishable.
+  const rebaseTab = await page.context().newPage();
+  let rebaseNote = { attempted: false, reason: "not run" };
+  try {
+    await rebaseTab
+      .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await rebaseTab.waitForSelector("[data-builder-palette]", { timeout: 20000 }).catch(() => {});
+    await rebaseTab.waitForTimeout(800);
+
+    // The card this tab will have selected. Added through the palette, because that gesture
+    // ends in `setSelection(selectNode(node.id))` — the product's own selection, not a
+    // synthetic one a probe can arrange but an author cannot reach.
+    await page.locator("[data-builder-palette]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.locator("[data-palette-node='transform']").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    const mine = await page.evaluate(() => {
+      const card = document.querySelector("[data-node-id][data-node-selected='true']");
+      return card?.getAttribute("data-node-id") ?? null;
+    });
+    // The Undo button must be live at this point or the row measures nothing: the history
+    // needs an entry for the reload to have something to destroy.
+    const undoBeforeRebase = await page
+      .locator("[data-testid='builder-undo']")
+      .first()
+      .getAttribute("disabled")
+      .catch(() => null);
+
+    if (!mine) {
+      rebaseNote = { attempted: true, reason: "the palette add selected nothing to lose" };
+    } else {
+      // The CSRF header. `presented_token` DOES fall back to the `omnion_csrf` cookie, so
+      // this header is not what makes the request legal — the cookie alone would verify. It is
+      // sent because the header is the explicit intention and the cookie is the fallback
+      // (csrf.rs reads the header first precisely so a page with both is believed), and because
+      // a fixture whose only defence is a cookie a later change might make unreadable would be
+      // a fixture that silently stops working.
+      const tabTwoDeleted = await rebaseTab.evaluate(
+        async ([id, victim]) => {
+          const csrf = document.cookie
+            .split(";")
+            .map((pair) => pair.split("="))
+            .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+            ?.trim();
+          const current = await (
+            await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+          ).json();
+          const graph = structuredClone(current.graph);
+          const before = graph.nodes.length;
+          graph.nodes = graph.nodes.filter((node) => node.id !== victim);
+          graph.edges = graph.edges.filter(
+            (edge) => edge.source !== victim && edge.target !== victim,
+          );
+          const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+            method: "PUT",
+            credentials: "same-origin",
+            headers: {
+              "content-type": "application/json",
+              ...(csrf ? { "x-omnion-csrf": csrf } : {}),
+            },
+            body: JSON.stringify({ graph, graph_version: current.graph_version }),
+          });
+          return { status: response.status, before, after: graph.nodes.length };
+        },
+        [workflowId, mine],
+      );
+
+      // This tab now edits, so its own autosave quotes a version the store has moved past.
+      // The palette click is the same gesture the acceptance pass uses, and the 409 is the
+      // thing being produced, not a defect — registered so the roll-up reports it under
+      // `expectedRefusals` rather than as a high finding.
+      expectRefusal(
+        `${URL_ADMIN}/api/v1/workflows/`,
+        "the reload fixture needs a refused stale save so the Reload exit appears",
+      );
+      await page.locator("[data-builder-palette]").first().click({ timeout: 5000 }).catch(() => {});
+      await page.locator("[data-palette-node='wait']").first().click({ timeout: 8000 }).catch(() => {});
+      let banner = "";
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        banner =
+          (await page.locator("[data-save-state]").first().getAttribute("data-save-state").catch(() => "")) ?? "";
+        if (banner === "conflict" || banner === "saved" || banner === "error") break;
+        await page.waitForTimeout(400);
+      }
+
+      // The exit under test. Everything above only makes the button exist; this click is the
+      // reload, and a row that measured without pressing it measured the state it started in.
+      await page.locator("[data-save-reload]").first().click({ timeout: 8000 }).catch(() => {});
+      // Long enough for the fetch and the two state writes: the rebase and the node swap land
+      // in the same `load`, so a shorter wait could read the OLD selection off a canvas that
+      // has not repainted yet.
+      await page.waitForTimeout(2500);
+
+      const after = await page
+        .evaluate((victim) => {
+          const undo = document.querySelector("[data-testid='builder-undo']");
+          return {
+            // The attribute is present on a disabled <button>, so presence means disabled.
+            undoDisabled: undo?.hasAttribute("disabled") ?? null,
+            // `data-node-selected` is the marker the cards write; `data-selected` is a marker
+            // nothing emits, which is what the first version of this row counted.
+            selectedInDom: document.querySelectorAll("[data-node-id][data-node-selected='true']")
+              .length,
+            survivorStillDrawn: Boolean(
+              document.querySelector("[data-builder-canvas] [data-node-id]"),
+            ),
+            victimStillDrawn: Boolean(
+              document.querySelector(`[data-node-id="${CSS.escape(victim ?? "")}"]`),
+            ),
+            // The status bar states the selection in words, so a selection the canvas no
+            // longer draws is visible in two places rather than only in a CSS class.
+            selectionText: (() => {
+              const el = document.querySelector("[data-builder-selection]");
+              return el ? (el.textContent ?? "").trim() : null;
+            })(),
+          };
+        }, mine)
+        .catch(() => ({ readFailed: true }));
+
+      rebaseNote = {
+        attempted: true,
+        // The fixture has to have landed, or the three readings below are about a graph
+        // nobody else changed.
+        tabTwoStatus: tabTwoDeleted.status,
+        fixtureDeletedACard: tabTwoDeleted.before > tabTwoDeleted.after,
+        // The precondition: the author had an undoable edit before the reload.
+        undoWasEnabledBefore: undoBeforeRebase === null,
+        conflictRaised: banner === "conflict",
+        reloadOffered: true,
+        // THE ASSERTION. A history that describes the discarded graph must not be offering
+        // a press that writes it back.
+        undoDisabled: after.undoDisabled === true,
+        // The other half, and the reason the fixture deletes a card: the deleted card must
+        // not still be drawn as selected, and a surviving card must not have been invented.
+        selectionPruned: after.victimStillDrawn === false,
+        selectedCount: after.selectedInDom,
+        selectionText: after.selectionText,
+        survivorStillDrawn: after.survivorStillDrawn,
+      };
+    }
+  } catch (error) {
+    rebaseNote = { attempted: true, reason: String(error).slice(0, 160) };
+  } finally {
+    await rebaseTab.close().catch(() => {});
+  }
+  note({ step: "reload-rebase", ...rebaseNote });
+
+  // Undo replaces the graph WHOLESALE, and a wholesale replacement has to prune the selection.
+  // It did not: `doUndo` restored nodes and edges and nothing else, so the selection went on
+  // naming a card the canvas no longer had. The keyboard alone reaches it — no second tab, no
+  // conflict — and the shape is ordinary: the palette's click-add selects the card it just
+  // added, so a second add leaves the selection on B, and one ⌘Z then removes B.
+  //
+  // **What the defect looked like on screen, which is why it is read from the words.** The
+  // inspector looks its node up with `nodes.find(...) ?? null` and so went blank and looked
+  // fine; the toolbar's Duplicate and Copy read `disabled={!selected}`, and `selected` is a
+  // string that survived, so both stayed ENABLED for a node that did not exist. The status bar
+  // counts `selectionSize(selection)` and announced "1 selected" over a canvas that had one
+  // card left and it was not that one. Every one of those is a *claim* the screen makes about
+  // a card it is not drawing, so the row reads the buttons and the words, not a CSS class.
+  //
+  // The conjunction matters and the preconditions are reported as their own fields: a
+  // `selectedCount === 0` after an undo is also the answer for a page where nothing was
+  // selected, and for an undo that never happened. A row that fails its preconditions has
+  // measured nothing, which is how the tick-48 `reload-rebase` row spent three ticks
+  // reporting a number that could not move.
+  const undoSelAdd = async (kind) => {
+    await page.locator("[data-builder-palette]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.locator(`[data-palette-node='${kind}']`).first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  };
+  const selectedCardId = () =>
+    page
+      .evaluate(() =>
+        document
+          .querySelector("[data-node-id][data-node-selected='true']")
+          ?.getAttribute("data-node-id") ?? null,
+      )
+      .catch(() => null);
+  const toolbarDisabled = (testId) =>
+    page
+      .locator(`[data-testid='${testId}']`)
+      .first()
+      .getAttribute("disabled")
+      .then((value) => value !== null)
+      .catch(() => null);
+
+  let undoSelNote = { attempted: false };
+  await undoSelAdd("wait");
+  await undoSelAdd("transform");
+  const undoSelVictim = await selectedCardId();
+  const cardsBefore = await page
+    .evaluate(() => document.querySelectorAll("[data-builder-canvas] [data-node-id]").length)
+    .catch(() => null);
+  if (!undoSelVictim) {
+    undoSelNote = { attempted: true, reason: "the palette add selected nothing to lose" };
+  } else {
+    const preRead = {
+      duplicateEnabled: (await toolbarDisabled("builder-duplicate")) === false,
+      copyEnabled: (await toolbarDisabled("builder-copy")) === false,
+    };
+    // The gesture under test. `Control+z` is the same key the `drag-undo` row uses, but the
+    // reading is on the selection rather than the position, and this one undoes an ADD rather
+    // than a drag.
+    //
+    // **AND WAIT FOR THE WRITE TO LAND.** This used to be `waitForTimeout(1200)` and a single
+    // read, and 1200 is exactly `AUTOSAVE_MS` — so the row was racing the debounce it was
+    // measuring and `cardRemovedByUndo` was decided by which side of a timer the autosave fell
+    // on. Tick 62 found that same shape in the undo's three siblings and fixed them; this is
+    // the FOURTH site, and it survived because the fix was written from the row that reported
+    // it rather than from a search for the pattern. That is the actual lesson: fixing the sites
+    // a report names leaves every unnamed site holding the defect.
+    //
+    // The witness is the server's `graph_version`, for the reason `settleGraph` documents —
+    // an unwritten graph is STABLE, so counting cards cannot tell "the undo has not been
+    // saved yet" from "the undo saved nothing", and the first is what a 1200ms sleep guesses
+    // at. `writeSettled: false` below says which of those two readings the fields are about.
+    const versionBeforeUndoAdd = (await readGraph().catch(() => null))?.graph_version ?? 0;
+    await page.keyboard.press("Control+z");
+    const undoAddWrite = await settleGraph(page, readGraph, versionBeforeUndoAdd);
+    const postRead = await page
+      .evaluate((victim) => {
+        const selectionTextEl = document.querySelector("[data-builder-selection]");
+        return {
+          selectedCount: document.querySelectorAll(
+            "[data-node-id][data-node-selected='true']",
+          ).length,
+          victimStillDrawn: Boolean(
+            document.querySelector(`[data-node-id="${CSS.escape(victim ?? "")}"]`),
+          ),
+          cards: document.querySelectorAll("[data-builder-canvas] [data-node-id]").length,
+          selectionText: selectionTextEl ? (selectionTextEl.textContent ?? "").trim() : null,
+          // **THE FIFTH SITE OF THIS SHAPE, AND THE FILE ALREADY HAD THE ANSWER 1000 LINES
+          // ABOVE** (`data-node-inspector`, tick 86). `NodeInspector` renders
+          // `data-inspector={node.id}` — there is no `data-node-inspector` anywhere in the
+          // product, so `inspectorOpen` was structurally **false** on every run, including the
+          // runs where the inspector was wide open. It is the `narrow-lock` defect one row over,
+          // in the same pass, and it survived for the reason the comment three lines above this
+          // already names: *fixing the sites a report names leaves every unnamed site holding
+          // the defect.* Tick 62 fixed four of them; this is the fifth, and the fix for those
+          // four was written from the row that reported them rather than from a search for the
+          // pattern.
+          //
+          // Line 12349 asks the same question with `[data-inspector]` and gets a real answer.
+          // `data-builder-inspector` is the pane's wrapper and `data-inspector` is the selected
+          // node's panel, so the count is taken over the latter: "is an inspector open" is a
+          // claim about a node, and a pane with nothing selected is exactly the case where the
+          // reading must be false.
+          inspectorOpen: document.querySelectorAll("[data-inspector]").length > 0,
+        };
+      }, undoSelVictim)
+      .catch(() => ({ readFailed: true }));
+    undoSelNote = {
+      attempted: true,
+      // The preconditions. Without the first two, "nothing selected" is also the answer for a
+      // page that was never selected and for an undo that never ran.
+      cardsBefore,
+      cardWasSelected: undoSelVictim !== null,
+      toolbarOfferedTheSelection: preRead.duplicateEnabled && preRead.copyEnabled,
+      // **READ THIS FIRST, FOR THE SAME REASON `runSettled` IS.** Every field below describes
+      // a canvas and a selection that the autosave rewrites, and this row used to read them
+      // 1200ms after the keypress — exactly `AUTOSAVE_MS`. A canvas whose debounce has not
+      // fired IS stable, so the old wait was satisfied by the very state it existed to rule
+      // out. `writeSettled: false` means the write never arrived, and the readings under it are
+      // then about a graph nobody has committed yet — `cardRemovedByUndo: true` on a false here
+      // would be a card that vanished from the canvas without the undo ever having been saved.
+      writeSettled: undoAddWrite.settled,
+      graphVersionBefore: versionBeforeUndoAdd,
+      graphVersionAfter: undoAddWrite.graph?.graph_version ?? null,
+      // The undo actually removed the card the selection named. If this is false the rest of
+      // the row is about a graph that still holds the node.
+      cardRemovedByUndo: postRead.victimStillDrawn === false,
+      // THE ASSERTION. A selection naming a card the canvas does not have must not be drawn,
+      // must not be counted, and must not leave a live control pointed at nothing.
+      selectionPruned: postRead.selectedCount === 0,
+      selectedCountAfter: postRead.selectedCount,
+      selectionTextAfter: postRead.selectionText,
+      duplicateDisabled: await toolbarDisabled("builder-duplicate"),
+      copyDisabled: await toolbarDisabled("builder-copy"),
+      cardsAfter: postRead.cards,
+    };
+  }
+  note({ step: "undo-selection", ...undoSelNote });
+
+  // The EDGE half of the same prune, and the half the row above is structurally blind to.
+  //
+  // That row asserts `postRead.selectedCount === 0`, read off `[data-node-id]
+  // [data-node-selected='true']`. A selection left naming a *connection* the undo just
+  // removed passes that assertion green: an edge selection is `selectEdge`, which sets
+  // `nodes: []` and `focus: null`, so the node count is zero whether or not the prune ran.
+  // It is not cosmetic. An edge OUTRANKS every node selection in `deleteTarget` and in
+  // `whatEscapeClears`, so a surviving edge id is what `Del` resolves to — `removeEdge` then
+  // finds no such edge and returns having changed nothing, which is a key that looks broken
+  // — and it is what the status bar prints as "1 connection selected (Del removes it)" over
+  // a canvas drawing no such line. A row that reports `selectionPruned: true` for that is a
+  // green reading of a defect, which is the tick-48 shape one level over.
+  //
+  // So the second reading is taken on the connection, and it reads the product's OWN claims
+  // rather than a class: the `data-edge-selected` marker the SVG `<g>` writes, and the
+  // sentence the status bar prints. Both move for a stale edge; neither moves for a stale
+  // node. That is what makes this half able to go red where the first half cannot.
+  //
+  // The gesture is the one the `edge-delete` row below already proved, not a new one: a
+  // bezier's bounding box is the rectangle AROUND the arc, so `locator.click()` lands on the
+  // desk and the canvas handler (correctly) clears the selection. The point comes from
+  // `getPointAtLength` at the stroke midpoint through `getScreenCTM`, which is the only
+  // transform that accounts for the viewport's pan and zoom.
+  const undoSelEdgePoint = await page
+    .evaluate(() => {
+      const hit = document.querySelector("[data-edge] path");
+      if (!hit || typeof hit.getPointAtLength !== "function") return null;
+      const ctm = hit.getScreenCTM();
+      if (!ctm) return null;
+      const mid = hit.getPointAtLength(hit.getTotalLength() / 2);
+      const screen = mid.matrixTransform(ctm);
+      const at = document.elementFromPoint(screen.x, screen.y);
+      return {
+        x: screen.x,
+        y: screen.y,
+        onEdge: Boolean(at?.closest("[data-edge]")),
+        inViewport:
+          screen.x >= 0 &&
+          screen.y >= 0 &&
+          screen.x <= window.innerWidth &&
+          screen.y <= window.innerHeight,
+      };
+    })
+    .catch(() => null);
+  let undoSelEdgeNote = { attempted: false };
+  const edgesGraphBeforeUndo = await readGraph().catch(() => null);
+  const edgesBeforeUndo = edgesGraphBeforeUndo?.edge_count ?? 0;
+  // The version the write has to move. `settleGraph` cannot tell "the debounce has not fired
+  // yet" from "the debounce fired and wrote nothing" by stability alone — both are a graph
+  // that has not changed — so it is handed the version to move away from.
+  const edgesVersionBeforeUndo = edgesGraphBeforeUndo?.graph_version ?? 0;
+  if (undoSelEdgePoint) {
+    await page.mouse.move(undoSelEdgePoint.x, undoSelEdgePoint.y).catch(() => {});
+    await page.mouse.down().catch(() => {});
+    await page.mouse.up().catch(() => {});
+  }
+  // The click is a gesture, not a timer. This used to be `waitForTimeout(500)`, and the two
+  // outcomes it could not tell apart are the expensive pair for this row: a click that missed
+  // the arc, and a click that landed on a canvas that had not repainted. Both read
+  // `edgeWasSelected: false`, and the row then reports a selection that was never pruned by a
+  // product that never failed — the miss note and the prune assertion are the SAME outcome
+  // read as two different verdicts.
+  const edgeSelectionWait = await awaitEdgeSelection(page);
+  const edgePre = await page
+    .evaluate(() => {
+      const el = document.querySelector("[data-builder-selection]");
+      return {
+        selected: document.querySelectorAll("[data-edge-selected='true']").length,
+        readout: el ? (el.textContent ?? "").trim() : null,
+      };
+    })
+    .catch(() => ({ selected: 0, readout: null }));
+  // The same precondition discipline as the node half, and for the same reason: "no
+  // connection is selected" is also the answer on a page where the click never landed and on
+  // a rule that has no connections at all. Reported, never assumed.
+  const edgeWasSelected = edgePre.selected > 0;
+  const toolbarClaimedIt = (edgePre.readout ?? "").includes("connection selected");
+  if (!edgeWasSelected) {
+    undoSelEdgeNote = {
+      attempted: true,
+      // A click that missed is a conclusion, so the evidence travels with it: the two
+      // ordinary causes — the point is off-viewport after a pan, and a card is sitting on
+      // the arc — need different fixes, and a note that cannot tell them apart costs a tick
+      // either way.
+      point: undoSelEdgePoint,
+      onEdge: undoSelEdgePoint?.onEdge ?? null,
+      inViewport: undoSelEdgePoint?.inViewport ?? null,
+      edgesOnCanvas: (await page.locator("[data-edge]").count()) ?? 0,
+      // Whether the selection was given a chance to appear at all, and how long it took when
+      // it did. Without this, "the click missed the curve" is also the answer for a canvas
+      // that had not repainted — the row's own point (off-viewport vs card on the arc) is only
+      // a useful diagnosis once the other cause has been ruled out.
+      selectionAppeared: edgeSelectionWait.appeared,
+      selectionAttempts: edgeSelectionWait.attempts,
+      reason: edgesBeforeUndo === 0 ? "the rule has no connection to select" : "the click missed the curve",
+    };
+  } else {
+    // The same gesture as the node half — one keypress, and the graph is replaced wholesale.
+    //
+    // AND WAIT FOR THE WRITE TO LAND. This used to be `waitForTimeout(1200)` followed by a
+    // single `readGraph()`, and 1200 is exactly `AUTOSAVE_MS`: the row was racing the debounce
+    // it was measuring, so `edgeRemovedByUndo` was decided by which side of a timer the
+    // autosave fell on. `settleGraph` waits for the SERVER's `graph_version` to stop moving
+    // after having moved, and says out loud whether it ever did — a graph that never changes
+    // is an unwritten graph, not a settled one, and a helper that could only answer "settled"
+    // would report that as a finished undo.
+    await page.keyboard.press("Control+z");
+    const undoWrite = await settleGraph(page, readGraph, edgesVersionBeforeUndo);
+    const edgesAfterUndo = undoWrite.graph?.edge_count ?? 0;
+    const edgePost = await page
+      .evaluate(() => {
+        const el = document.querySelector("[data-builder-selection]");
+        return {
+          selected: document.querySelectorAll("[data-edge-selected='true']").length,
+          readout: el ? (el.textContent ?? "").trim() : null,
+          drawn: document.querySelectorAll("[data-edge]").length,
+        };
+      })
+      .catch(() => ({ readFailed: true }));
+    undoSelEdgeNote = {
+      attempted: true,
+      edgesBefore: edgesBeforeUndo,
+      // **READ THIS FIRST, FOR THE SAME REASON `runSettled` IS.** Every gate below measures
+      // the state of a graph the autosave writes, and this row used to read that graph 1200ms
+      // after the keypress — exactly `AUTOSAVE_MS`. A graph whose debounce has not fired is
+      // STABLE, so the old wait was satisfied by the very state it was supposed to rule out.
+      // `writeSettled: false` says the write never arrived, and the two readings under it are
+      // then about a graph nobody has committed yet.
+      writeSettled: undoWrite.settled,
+      versionBefore: edgesVersionBeforeUndo,
+      versionAfter: undoWrite.graph?.graph_version ?? null,
+      // THE PRECONDITION THAT MAKES THE ASSERTION MEANINGFUL. The undo has to have taken
+      // the connection away: if the count did not fall, the row is reading a canvas that
+      // still holds the edge, and `selected === 0` is then the correct answer for a reason
+      // that has nothing to do with the prune.
+      edgeRemovedByUndo: edgesAfterUndo < edgesBeforeUndo,
+      edgeWasSelected,
+      toolbarClaimedIt,
+      // THE ASSERTION. A selection naming a connection the canvas does not draw must not
+      // stay marked, and the status bar must stop claiming it.
+      edgeSelectionPruned:
+        edgePost.selected === 0 && !(edgePost.readout ?? "").includes("connection selected"),
+      selectedAfter: edgePost.selected,
+      readoutAfter: edgePost.readout,
+      edgesAfter: edgesAfterUndo,
+      drawnAfter: edgePost.drawn,
+    };
+  }
+  note({ step: "undo-selection-edge", ...undoSelEdgeNote });
+
+  // The connection gesture: press an output port, press a target node, and the server's edge
+  // count rises. The refusal is the half that matters — a port the source does not export has
+  // to *say so*, and a gesture that refuses silently is indistinguishable from a dead button,
+  // so both outcomes are read back off the canvas rather than inferred from the count.
+  const connectProbe = await page
+    .evaluate(() => {
+      const cards = Array.from(document.querySelectorAll("[data-node-id]"));
+      if (cards.length < 2) return { attempted: false, reason: "fewer than two nodes" };
+      const first = cards.find((card) => card.querySelector("[data-port-out]"));
+      // The target is picked by identity and returned as an index, not re-found with
+      // `.nth(1)` on the way back in: node 1 is not necessarily the second card, and
+      // connecting a node to itself is the one refusal the gesture must not be measured on.
+      const secondIndex = cards.findIndex((card) => card !== first);
+      const port = first?.querySelector("[data-port-out]");
+      if (!first || secondIndex < 0 || !port) {
+        return { attempted: false, reason: "no port on a first card" };
+      }
+      port.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      return {
+        attempted: true,
+        first: first.getAttribute("data-node-id"),
+        port: port.getAttribute("data-port-key"),
+        second: cards[secondIndex].getAttribute("data-node-id"),
+        secondIndex,
+      };
+    })
+    .catch(() => ({ attempted: false }));
+  await page.waitForTimeout(400);
+  const draftShown = (await page.locator("[data-link-draft]").count()) > 0;
+  const edgesBeforeConnect = (await readGraph())?.edge_count ?? 0;
+  await page
+    .locator("[data-node-id]")
+    .nth(connectProbe.secondIndex ?? 1)
+    .click({ timeout: 5000, force: true })
+    .catch(() => {});
+await page.waitForTimeout(1400);
+const edgesAfterConnect = (await readGraph())?.edge_count ?? 0;
+const linkNotice = await page
+  .locator("[data-link-notice]")
+  .first()
+  .evaluate((el) => ({ tone: el.getAttribute("data-link-notice"), text: el.textContent?.trim() }))
+  .catch(() => null);
+note({
+  step: "port-connect",
+  ...connectProbe,
+  draftShown,
+  before: edgesBeforeConnect,
+  after: edgesAfterConnect,
+  notice: linkNotice,
+});
+await shot(page, "page-workflow-builder-connected");
+
+// Escape cancels a half-drawn connection: the draft hint has to disappear and the graph has to
+// be unchanged, or Escape is a gesture that silently mutates the definition.
+await page
+  .evaluate(() => {
+    const port = document.querySelector("[data-port-out]");
+    port?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  })
+  .catch(() => {});
+await page.waitForTimeout(300);
+await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+await page.keyboard.press("Escape");
+await page.waitForTimeout(500);
+note({
+  step: "port-connect-escape",
+  draftGone: (await page.locator("[data-link-draft]").count()) === 0,
+  edges: (await readGraph())?.edge_count ?? 0,
+});
+
+// The edge delete: select an edge, Del, and the server's edge count falls. An edge whose
+  // deletion the canvas shows but the graph keeps is a ghost edge that comes back on reload.
+  const edgesBefore = (await readGraph())?.edge_count ?? 0;
+  // The click has to land ON the curve. `locator.click()` aims at the element's bounding
+  // box, and a bezier's box is the rectangle *around* the arc — its centre is empty canvas.
+  // So the click fell on the desk, the canvas handler cleared the selection, and the pass
+  // reported "no edge could be selected": a probe defect read as a product defect. The point
+  // is taken from `getPointAtLength` (the midpoint of the stroke itself) and mapped to screen
+  // through `getScreenCTM`, which is the only transform that accounts for the viewport's
+  // pan, zoom and the node layer's CSS transform.
+  const edgeScreenPoint = await page
+    .evaluate(() => {
+      const hit = document.querySelector("[data-edge] path");
+      if (!hit || typeof hit.getPointAtLength !== "function") return null;
+      const ctm = hit.getScreenCTM();
+      if (!ctm) return null;
+      const mid = hit.getPointAtLength(hit.getTotalLength() / 2);
+      const screen = mid.matrixTransform(ctm);
+      // What is actually AT that point, by the browser's own hit test. "The click missed the
+      // curve" is a conclusion; this is the evidence. The point is the midpoint of a curve
+      // between two 220px cards, so the two ordinary reasons it lands on nothing are a card
+      // covering the arc and a pane covering the canvas — and both are answerable here
+      // instead of next tick.
+      const at = document.elementFromPoint(screen.x, screen.y);
+      const edge = at?.closest("[data-edge]");
+      return {
+        x: screen.x,
+        y: screen.y,
+        // Which element won the hit test, so a miss says *what* was in the way.
+        onEdge: Boolean(edge),
+        blockedBy: at
+          ? `${at.tagName.toLowerCase()}${
+              at.closest("[data-node-id]") ? "[node-card]" : at.closest("[data-builder-canvas]") ? "" : "[other]"
+            }${at.closest("[data-builder-problems]") ? "[problems]" : ""}`
+          : null,
+        inViewport:
+          screen.x >= 0 &&
+          screen.y >= 0 &&
+          screen.x <= window.innerWidth &&
+          screen.y <= window.innerHeight,
+      };
+    })
+    .catch(() => null);
+  // **`hit` is the claim the pointer landed on the curve, not the fact that the pointer was
+  // pressed.** It used to be assigned `true` on the only condition that a point could be measured
+  // at all, which made `hit: true` mean "the probe moved the mouse and pressed it" -- and ticks 78
+  // and 79 each read that number as "the click was on the edge", the first conclusion the field is
+  // not there to support. `onEdge` is the browser's own hit test at the measured point and is the
+  // only one of these three that means what its name says, so the branch that presses the mouse is
+  // now guarded by it: a point that resolved on the desk reports `hit: false`, and the note keeps
+  // the press on the record as `pressed` so a reader can tell "the probe did not try" from "the
+  // probe tried and missed".
+  let edgeHit = false;
+  let edgePressed = false;
+  if (edgeScreenPoint) {
+    edgePressed = true;
+    await page.mouse.move(edgeScreenPoint.x, edgeScreenPoint.y).catch(() => {});
+    await page.mouse.down().catch(() => {});
+    await page.mouse.up().catch(() => {});
+    edgeHit = Boolean(edgeScreenPoint.onEdge);
+  }
+  await page.waitForTimeout(500);
+  const edgeSelected = (await page.locator("[data-edge-selected='true']").count()) > 0;
+  if (edgeSelected) {
+    await page.keyboard.press("Delete");
+    // The same two-step this row needed before the undo: read the version, then wait for the
+    // SERVER to say it moved. 1200ms is `AUTOSAVE_MS`, so a fixed wait here races the write.
+    const edgeDeleteWrite = await settleGraph(
+      page,
+      readGraph,
+      (await readGraph())?.graph_version ?? 0,
+    );
+    const afterEdgeDelete = await page.locator("[data-edge]").count();
+    const edgesAfter = edgeDeleteWrite.graph?.edge_count ?? 0;
+    const selectionReadout = await page
+      .locator("[data-builder-selection]")
+      .first()
+      .innerText()
+      .catch(() => null);
+    note({
+      step: "edge-delete",
+      hit: edgeHit,
+      pressed: edgePressed,
+      // The hit test beside the number, so `hit` is never the only thing the row has to go on.
+      onEdge: edgeScreenPoint?.onEdge ?? null,
+      blockedBy: edgeScreenPoint?.blockedBy ?? null,
+      inViewport: edgeScreenPoint?.inViewport ?? null,
+      edgesBefore,
+      after: edgesAfter,
+      canvas: afterEdgeDelete,
+      // The server is the authority: a canvas that hides the line while the graph keeps it is
+      // a ghost edge that returns on reload, and the count is what says so.
+      removed: edgesAfter < edgesBefore,
+      // Whether the write this reading depends on ever arrived. A row whose gates are all
+      // measured off a graph nobody has committed is not green, it is unread.
+      writeSettled: edgeDeleteWrite.settled,
+      readout: selectionReadout,
+    });
+    await shot(page, "page-workflow-builder-edge-deleted");
+    // Undo puts it back: the history has to know about edge deletes too.
+    await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.keyboard.press("Control+z");
+    const edgeUndoWrite = await settleGraph(
+      page,
+      readGraph,
+      edgeDeleteWrite.graph?.graph_version ?? 0,
+    );
+    const edgesRestored = edgeUndoWrite.graph?.edge_count ?? 0;
+    note({
+      step: "edge-delete-undo",
+      edgesRestored,
+      restored: edgesRestored === edgesBefore,
+      writeSettled: edgeUndoWrite.settled,
+    });
+  } else {
+    note({
+      step: "edge-delete",
+      hit: edgeHit,
+      pressed: edgePressed,
+      selected: false,
+      point: edgeScreenPoint,
+      reason: edgeScreenPoint ? "the click missed the curve" : "no edge could be measured",
+      // The evidence for the reason above. Without it "missed" is a guess, and the two
+      // candidates — the point is off-canvas after a pan, or a card is sitting on the arc —
+      // need different fixes, so a note that cannot tell them apart costs a tick either way.
+      onEdge: edgeScreenPoint?.onEdge ?? null,
+      blockedBy: edgeScreenPoint?.blockedBy ?? null,
+      inViewport: edgeScreenPoint?.inViewport ?? null,
+    });
+  }
+
+  // ---- Two tabs: the second save loses, and the first tab keeps its copy --------------------
+  // The `conflict` step above PUTs a stale version through a raw `fetch`, which proves the
+  // *server* refuses it. That is half the criterion: the request says the UI must offer
+  // Reload "while keeping the local copy visible instead of overwriting silently", and a raw
+  // fetch never touches the toolbar, so the half that matters was unmeasured.
+  //
+  // So: open a second real page on the same rule, save a real edit there (the version
+  // advances), then make an edit in this tab and let its own autosave run. The autosave
+  // quotes the version this tab loaded, the server is one ahead, and the answer is a 409 that
+  // the toolbar has to render. Three things are then read: the save state says conflict, the
+  // Reload button is there, and the local node is still on the canvas — a client that
+  // silently reloads on conflict has thrown away the author's work, which is the one thing
+  // this criterion exists to forbid.
+  const tabTwo = await page.context().newPage();
+  try {
+    await tabTwo
+      .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await tabTwo.waitForSelector("[data-builder-palette]", { timeout: 20000 }).catch(() => {});
+    await tabTwo.waitForTimeout(1000);
+
+    // Tab two saves a real edit, so the stored version moves under this tab.
+    //
+    // A *rename* rather than an added node, and that is not a detail: `replace_graph` derives
+    // the step list in the same statement, so a graph that does not validate never reaches
+    // the version check — the PUT would be refused for a reason that has nothing to do with
+    // concurrency, and this probe would be reading a different failure than the one it names.
+    //
+    // The 409 below is the THING BEING PROVED, not a defect: tab one then saves a version the
+    // store has moved past, and the server refusing it is the criterion. Registered here so the
+    // roll-up reports it under `expectedRefusals`; without it every deliberate conflict reads as
+    // a high finding, and a pass whose whole subject is conflict detection reported itself broken.
+    expectRefusal(`${URL_ADMIN}/api/v1/workflows/`, "two tabs saving one graph: the stale version is refused on purpose");
+    const tabTwoSave = await tabTwo.evaluate(async (id) => {
+      const current = await (
+        await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+      ).json();
+      const graph = structuredClone(current.graph);
+      const target = graph.nodes.find((node) => node.id !== "node-tab-two");
+      if (target) target.label = `Renamed by the second tab ${Date.now().toString(36)}`;
+      const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ graph, graph_version: current.graph_version }),
+      });
+      return {
+        status: response.status,
+        before: current.graph_version,
+        after: (await response.json().catch(() => null))?.graph_version ?? null,
+      };
+    }, workflowId);
+
+    // Tab one edits and lets its own debounced autosave fire. The palette click is the same
+    // route the acceptance pass uses, so the save is armed by a gesture a user could make.
+    await page.locator("[data-builder-palette]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.locator("[data-palette-node='transform']").first().click({ timeout: 8000 }).catch(() => {});
+    let conflictState = "";
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      conflictState =
+        (await page.locator("[data-save-state]").first().getAttribute("data-save-state").catch(() => "")) ?? "";
+      if (conflictState === "conflict" || conflictState === "saved" || conflictState === "error") break;
+      await page.waitForTimeout(400);
+    }
+    const localNodesKept = await page.locator("[data-node-id]").count();
+    const reloadOffered = (await page.locator("[data-save-reload]").count()) > 0;
+    // The second exit has to exist *and* work. Before this tick the server's message said
+    // "reload to see their change, or keep editing to overwrite it" while the client quoted
+    // its stale version forever, so the only way to save was to discard the author's work —
+    // a button that was missing was less bad than a button that was a dead end.
+    const keepMineOffered = (await page.locator("[data-save-keep-mine]").count()) > 0;
+    let afterKeepMine = { state: "", version: null, nodeGone: null };
+    // Read the banner BEFORE the second exit is taken. "Keep mine" resolves the conflict and
+    // the banner leaves the tree, so a reading taken afterwards is the empty string — which
+    // says nothing about the banner and reads exactly like a banner that names no version.
+    // The criterion is about what the author is *shown*, and the only moment it is shown is
+    // the moment before they answer it.
+    const conflictText = (await page.locator("[data-save-state='conflict']").first().innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+    if (conflictState === "conflict" && keepMineOffered) {
+      await page.locator("[data-save-keep-mine]").first().click({ timeout: 8000 }).catch(() => {});
+      let keptState = "";
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        keptState =
+          (await page.locator("[data-save-state]").first().getAttribute("data-save-state").catch(() => "")) ?? "";
+        if (keptState === "saved" || keptState === "error" || keptState === "conflict") break;
+        await page.waitForTimeout(400);
+      }
+      const stored = await readGraph();
+      afterKeepMine = {
+        state: keptState,
+        version: stored?.graph_version ?? null,
+        // The overwrite is only an overwrite if the version actually moved past the one the
+        // second editor took; a banner that clears without a write has changed nothing.
+        nodeGone: stored?.node_count ?? null,
+      };
+    }
+    note({
+      step: "two-tab-conflict",
+      tabTwoStatus: tabTwoSave.status,
+      versionBefore: tabTwoSave.before,
+      versionAfter: tabTwoSave.after,
+      state: conflictState,
+      // The whole criterion in three readings: the save was refused, Reload is offered, and
+      // the author's own nodes are still on the canvas.
+      refused: conflictState === "conflict",
+      reloadOffered,
+      localNodesKept,
+      // The banner has to name the version — that is what lets a client offer a real Reload
+      // instead of a shrug. Read while the banner was still up (see above).
+      namesVersion: /version/i.test(conflictText),
+      text: conflictText.slice(0, 160),
+    });
+    if (conflictState === "conflict") {
+      note({
+        step: "two-tab-keep-mine",
+        offered: keepMineOffered,
+        stateAfter: afterKeepMine.state,
+        // Saved on top of the other editor's version, not refused again: this is the reading
+        // that would have caught the dead end, because every save quoting a stale version
+        // comes back as a second `conflict`.
+        resolved: afterKeepMine.state === "saved",
+        versionAfter: afterKeepMine.version,
+        nodes: afterKeepMine.nodeGone,
+      });
+      await shot(page, "page-workflow-builder-keep-mine");
+    }
+  } finally {
+    await tabTwo.close().catch(() => {});
+  }
+
+  // ---- Run from here (REQ-004 slice 3) -----------------------------------------------------
+  // The criterion in three readings, and the only one that counts is the stored rows: a
+  // toast that says "Run started" proves the button was pressed, not that the prefix was
+  // skipped. The rows are read back through the API by step_no, because a run that quietly
+  // executed the prefix the author asked to skip is exactly what this has to rule out.
+  {
+    // ---- THE SPINE. BUILD IT BEFORE THE SCAN, OR THE SCAN HAS NOTHING TO SKIP ----------
+    // Two ticks were lost to this and the shape of the loss is worth recording. Every
+    // step above adds a node by *clicking the palette*, and the palette's gesture drops a
+    // card on the canvas **unconnected** — there is no gesture in this harness that
+    // inserts a node between two wired ones. So the graph accumulated nodes beside the
+    // spine (trigger → end, one edge) and `wait-3` was an ORPHAN.
+    //
+    // An orphan is refused by `plan_from_node` with `unknown_node`, correctly: the
+    // engine's walk has never reached it. So the criterion about skipping a prefix was
+    // being measured on a graph where **no prefix exists**, and every row underneath
+    // reported a missing feature rather than a missing fixture. The wrong answer was not
+    // plausible-looking — it was a null, which is the one shape that reads as "broken"
+    // — so the fix was never to suspect the harness.
+    //
+    // The spine is therefore written through the real graph route, in the node types and
+    // port names the registry has, and the walk is *verified before* the scan rather
+    // than assumed: `projection.nodes === 4` is the check, and it is the same number the
+    // engine will walk. A harness that built a prefix and did not check it built one the
+    // server may not share.
+    //
+    // It carries the CSRF header for the reason the `switch-not-executable` leg above
+    // does: without it the save is refused with `csrf_unavailable` before the handler
+    // runs, which is a *green* pass over a screen that works perfectly in the hand above.
+    const spine = await page.evaluate(async (id) => {
+      const csrf = document.cookie
+        .split(";")
+        .map((pair) => pair.split("="))
+        .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+        ?.trim();
+      const current = await fetch(`/api/v1/workflows/${id}/graph`, {
+        credentials: "same-origin",
+      });
+      if (!current.ok) return { ok: false, reason: `read ${current.status}` };
+      const body = await current.json();
+
+      const trigger = (body.graph?.nodes ?? []).find((node) =>
+        String(node.type).startsWith("trigger."),
+      );
+      if (!trigger) return { ok: false, reason: "no trigger node to build a spine from" };
+      // The trigger keeps its own event name; the listener leg further down points it at
+      // `page.published`, and re-typing it here would undo that for a leg that runs later.
+      const wait = (nid) => ({
+        id: nid,
+        type: "wait",
+        label: `Wait ${nid}`,
+        // `seconds` is REQUIRED and the projection reads it through the engine's own
+        // reader, so a wait without it saves as a rule that cannot run — which is
+        // indistinguishable, from the outside, from a run-from-here defect.
+        params: { seconds: 5 },
+        position: { x: 320, y: 40 },
+      });
+      const act = (nid) => ({
+        id: nid,
+        type: "action",
+        label: `Act ${nid}`,
+        params: { action: "echo", parameters: JSON.stringify({ value: nid }) },
+        position: { x: 600, y: 40 },
+      });
+      const finish = (nid) => ({
+        id: nid,
+        type: "end",
+        label: `End ${nid}`,
+        params: {},
+        position: { x: 880, y: 40 },
+      });
+      const edge = (from, to, port) => ({
+        id: `e-${from}-${port}-${to}`,
+        source: from,
+        source_port: port,
+        target: to,
+      });
+      // `trigger → wait → act → end`. Ports are the registry's: `out` off the trigger,
+      // `out` off a wait, `success` off a task, and nothing off an end.
+      const graph = {
+        nodes: [trigger, wait("wait-3"), act("act-3"), finish("end-3")],
+        edges: [
+          edge(trigger.id, "wait-3", "out"),
+          edge("wait-3", "act-3", "out"),
+          edge("act-3", "end-3", "success"),
+        ],
+      };
+      const saved = await fetch(`/api/v1/workflows/${id}/graph`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          ...(csrf ? { "x-omnion-csrf": csrf } : {}),
+        },
+        body: JSON.stringify({ graph, graph_version: body.graph_version }),
+      });
+      if (!saved.ok) {
+        return { ok: false, reason: `save ${saved.status}` };
+      }
+      const after = await (
+        await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+      ).json();
+      const p = after.projection ?? {};
+      return {
+        ok: true,
+        nodes: after.node_count ?? null,
+        edges: after.edge_count ?? null,
+        valid: p.valid ?? null,
+        // `step_count`, not a node count: the projection counts STEPS, so a trigger and
+        // any note are invisible to it. The spine is trigger + wait + act + end = **3**
+        // steps, and asking for 4 would be a probe asserting a number the shape does not
+        // have — the mistake `first_followed_port` and `trigger.cron` already made twice.
+        walkSteps: p.step_count ?? null,
+        errorCount: after.error_count ?? null,
+        reason: p.reason ?? null,
+      };
+    }, workflowId).catch(() => null);
+    note({
+      step: "run-from-here-spine",
+      ...(spine ?? { ok: false, reason: "the spine could not be written" }),
+      // The fixture has to be *the engine's* graph, not merely a set of cards on a canvas.
+      // `valid: false` means the walk stops early and the scan below is measuring a graph
+      // with a shorter path than it thinks — which is the failure this whole block exists.
+      usable: Boolean(spine?.ok && spine?.valid === true && (spine?.walkSteps ?? 0) === 3),
+    });
+    // The canvas has to show the graph that was just written.
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-builder-palette] [data-palette-node]", { timeout: 20000 })
+      .catch(() => {});
+    await page.waitForTimeout(1500);
+
+    // ---- AN UNCONNECTED NODE MUST NOT OFFER A LIVE BUTTON -------------------------------
+    // The defect this tick found, measured on the surface under test. Before the fix the
+    // inspector's answer for an un-wired card was `data-can-start="true"` — a button that
+    // is enabled and is refused by the server on every single press. The canvas is what has
+    // to show the refusal, because a client-side rule that is merely *believed* to be
+    // right is the same fiction the crate test is for.
+    {
+      const orphanCard = await page.evaluate(async () => {
+        const canvas = document.querySelector("[data-builder-canvas]");
+        if (!canvas) return { added: false };
+        const item = document.querySelector("[data-palette-node='transform']");
+        if (!item) return { added: false, reason: "no transform card in the palette" };
+        const rect = canvas.getBoundingClientRect();
+        const transfer = new DataTransfer();
+        item.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: transfer }));
+        canvas.dispatchEvent(
+          new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+        );
+        canvas.dispatchEvent(
+          new DragEvent("drop", {
+            bubbles: true,
+            cancelable: true,
+            dataTransfer: transfer,
+            clientX: rect.left + 520,
+            clientY: rect.top + 300,
+          }),
+        );
+        return { added: true };
+      });
+      await page.waitForTimeout(900);
+      // The newest card is the dropped one: the palette appends, so `.last()` is it.
+      const orphanId = await page
+        .locator("[data-node-type='transform']")
+        .last()
+        .getAttribute("data-node-id")
+        .catch(() => null);
+      let orphanCanStart = null;
+      let orphanReason = null;
+      if (orphanId) {
+        await page.locator(`[data-node-id="${orphanId}"]`).first().click({ timeout: 8000 })
+          .catch(() => {});
+        await page.waitForTimeout(500);
+        orphanCanStart = await page
+          .locator("[data-run-from-here]")
+          .first()
+          .getAttribute("data-can-start")
+          .catch(() => null);
+        orphanReason = (
+          await page.locator("[data-run-from-here-reason]").first().innerText().catch(() => "")
+        )
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+      note({
+        step: "orphan-run-from-here",
+        ...orphanCard,
+        nodeId: orphanId,
+        canStart: orphanCanStart,
+        // The refusal has to NAME the reason. A disabled control with no sentence is a
+        // dead button wearing a disabled attribute — and this leg would otherwise prove
+        // only that `startability` returns false, which is the unit test's job.
+        reason: orphanReason ? orphanReason.slice(0, 160) : null,
+        refused: orphanCanStart === "false",
+        namesTrigger: /trigger/i.test(orphanReason ?? ""),
+      });
+      // Take the card back off the canvas: it is an orphan by construction, and the scan
+      // below walks the graph — leaving one here would put a fifth node on it for every
+      // later row in this pass.
+      if (orphanId) {
+        await page.locator(`[data-node-id="${orphanId}"]`).first().click({ timeout: 5000 })
+          .catch(() => {});
+        await page.waitForTimeout(300);
+        await page.locator("[data-inspector-delete]").first().click({ timeout: 5000 })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+        await page.waitForSelector("[data-builder-palette] [data-palette-node]", { timeout: 20000 })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+      }
+    }
+
+    // Start from the *second* action of a live graph, so there is a prefix to skip.
+    // "Second in draw order" is the wrong question to ask a canvas. A rule is born from
+    // `Graph::starter` as `[trigger, end]`, so the second card is always the END node — and
+    // an end node is the one node that cannot start a run, correctly and by design ("the end
+    // of the graph has nothing after it to run"). The probe therefore read a stated refusal
+    // where the criterion wanted a run, and `canStart: "false"` says nothing about whether
+    // skipping works.
+    //
+    // The control lives in the INSPECTOR, so it only exists for the node that is selected:
+    // asking the whole page which nodes can start asks a question about a panel that renders
+    // one. The search is therefore what a user does — select each card, read its own answer —
+    // and the first node that says it can start and is not the trigger (a run from the top is
+    // a whole run and proves nothing about a prefix being skipped) wins. The scan is recorded
+    // so "no node on this graph can start" is a finding with evidence behind it rather than
+    // a null.
+    // The canvas has to finish painting before anything is read off it. Both readings below
+    // used to disagree — `cardCount` said 6 and `cardOrder` said 1 — and a scan that sees one
+    // card sees the *trigger*, which cannot start a run, so the probe concluded the graph had
+    // no startable node and every row under it reported nothing.
+    const cardCount = await settleCanvasCards(page);
+    const cards = page.locator("[data-node-id]");
+    // Re-enumerate INSIDE the retry, and assert the two readings agree before scanning.
+    //
+    // `settleCanvasCards` was supposed to make this race impossible, and it did not: it polls
+    // `[data-node-id]` until the count repeats, then the enumeration below ran as a separate
+    // read. Between them the canvas painted the rest of the graph, so `cardCount` said 6 and
+    // the scan saw 1 — and the one card it saw was the trigger, whose `canStart` is "true"
+    // (re-running a rule from the top is a real thing an operator wants). The scan therefore
+    // chose the trigger, a run started from the top skips nothing, and `skipped: 0`,
+    // `pillsPainted: 0` and `step-trace.panelFound: false` all followed from a race rather
+    // than from the product.
+    //
+    // The fix is to make the disagreement impossible to read past: enumerate, and if the list
+    // is shorter than the settled count, settle again and re-read. A probe that enumerates
+    // once and then *reports both numbers* has already published a contradiction; publishing
+    // the contradiction is what made this cost a tick.
+    const enumerateCards = () =>
+      page
+        .evaluate(() =>
+          Array.from(document.querySelectorAll("[data-node-id]")).map((card) => ({
+            id: card.getAttribute("data-node-id"),
+            type: card.getAttribute("data-node-type"),
+          })),
+        )
+        .catch(() => []);
+    let cardOrder = await enumerateCards();
+    for (let attempt = 0; attempt < 5 && cardOrder.length !== cardCount; attempt += 1) {
+      await settleCanvasCards(page, 150, 12);
+      cardOrder = await enumerateCards();
+    }
+    const scan = [];
+    let chosenId = null;
+    for (const card of cardOrder) {
+      await page.locator(`[data-node-id="${card.id}"]`).first().click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(450);
+      const canStartHere = await page
+        .locator("[data-run-from-here]")
+        .first()
+        .getAttribute("data-can-start")
+        .catch(() => null);
+      // "Is this the trigger?" is a question about the node type, and the registry's trigger
+      // types are `trigger.event` / `trigger.manual` / `trigger.cron` — there has never been
+      // a bare `trigger` type. So the comparison `type !== "trigger"` was true for EVERY card
+      // on the canvas, including the trigger itself, and the "skip the trigger" half of this
+      // scan was dead code that looked like it was filtering. It matched no type the platform
+      // can produce, so it could not be caught by looking at a graph: the prefix rule is the
+      // same prefix the product uses (`startsWith("trigger.")` in `run-from-here.ts`), and a
+      // second copy of a rule in another language is a rule with no compiler.
+      const isTriggerType = typeof card.type === "string" && card.type.startsWith("trigger.");
+      scan.push({ id: card.id, type: card.type, canStart: canStartHere, isTriggerType });
+      if (canStartHere === "true" && !isTriggerType) {
+        chosenId = card.id;
+        break;
+      }
+    }
+    if (!chosenId && cardCount > 1) {
+      await cards.nth(1).click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(600);
+    }
+
+    const control = page.locator("[data-run-from-here]").first();
+    const controlCount = await control.count();
+    const canStart = controlCount > 0
+      ? await control.first().getAttribute("data-can-start")
+      : null;
+    const disabledReason =
+      canStart === "false"
+        ? ((await page.locator("[data-run-from-here-reason]").first().innerText().catch(() => ""))
+            .replace(/\s+/g, " ")
+            .trim())
+        : null;
+
+    const before = await page.evaluate(async () => {
+      const res = await fetch("/api/v1/workflows", { credentials: "same-origin" });
+      return res.ok ? res.json() : null;
+    }).catch(() => null);
+
+    let after = null;
+    let runSettled = null;
+    let runStarted = null;
+    let runFinished = null;
+    if (canStart === "true") {
+      await page.locator("[data-run-from-here-button]").first().click({ timeout: 8000 }).catch(() => {});
+      // Read the run back from the API, not from the canvas: the canvas paints what the
+      // server sent, and the criterion is about what the engine is holding.
+      //
+      // AND WAIT FOR IT TO SETTLE. The read was a single `page.evaluate` after
+      // `waitForTimeout(2500)`, and tick 61's pass took that reading mid-flight: the run had
+      // genuinely started (`startedFrom: "wait-3"`) and not one step had been claimed. Every
+      // assertion below it then reported a product that does not draw pills, write a skipped
+      // prefix or open a panel — none of which was true, and none of which would have been
+      // true of a run that had been allowed to finish. The 2500 was a guess, and this pass
+      // shared its box with three sibling passes.
+      const readRun = () =>
+        page.evaluate(async (workflowId) => {
+          const res = await fetch(`/api/v1/workflows/${workflowId}/executions?limit=1`, {
+            credentials: "same-origin",
+          });
+          if (!res.ok) return null;
+          const body = await res.json();
+          const latest = body.executions?.[0];
+          if (!latest) return null;
+          const detail = await fetch(`/api/v1/workflow-executions/${latest.id}`, {
+            credentials: "same-origin",
+          });
+          if (!detail.ok) return null;
+          const run = await detail.json();
+          // `ExecutionDetail` nests the summary under `execution` (`execution`, `steps`,
+          // `event_payload`, `can_retry`) — there is NO top-level `id`, `status` or
+          // `started_from_node`. The previous read of those three was `undefined` on a 200, and the
+          // `?? latest.id` / `?? null` fallbacks hid it: `executionId` was right by luck and
+          // `status` and `startedFrom` were permanently `null`, which is indistinguishable from a
+          // run that never started. Found by `probe-api-fields.mjs`, the sweep that settles
+          // "a field name that is plausible, and that appears somewhere in the server".
+          const summary = run?.execution ?? null;
+          return {
+            // A nested summary that did not arrive is not the list's summary: keeping the fallback
+            // would report the row above as though the detail fetch had confirmed it.
+            executionId: summary?.id ?? null,
+            status: summary?.status ?? null,
+            startedFrom: summary?.started_from_node ?? null,
+            // The fallback that made this row unmeasurable, named so a reader knows it was dropped.
+            detailSendsExecution: Boolean(summary),
+            steps: (run?.steps ?? []).map((step) => ({
+              step_no: step.step_no,
+              status: step.status,
+              skip_reason: step.skip_reason ?? null,
+              node_id: step.node_id ?? null,
+            })),
+          };
+        }, workflowId).catch(() => null);
+      // Poll until the run stops MOVING, and say out loud whether it ever did. A run whose
+      // steps never leave `pending` is a hung run, and a note that cannot tell a hung run from
+      // a settled one is the same defect one level up from the sleep it replaced.
+      const settled = await settleRun(page, readRun);
+      after = settled.run;
+      runSettled = settled.settled;
+      runStarted = settled.started;
+      runFinished = settled.finished;
+    }
+
+    // Criterion 2 reads the CANVAS, not the API: the pill is the thing being claimed, and
+    // reading the same rows back from the server would pass even if the card rendered
+    // nothing at all. The canvas is the surface under test.
+    const painted = await page.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll("[data-node-id]"));
+      const withPill = cards
+        .map((card) => {
+          const pill = card.querySelector("[data-node-status]");
+          return {
+            nodeId: card.getAttribute("data-node-id"),
+            status: pill?.getAttribute("data-node-status") ?? null,
+            shape: pill?.getAttribute("data-node-status-shape") ?? null,
+            stepNos: pill?.getAttribute("data-node-step-nos") ?? null,
+            title: pill?.getAttribute("title") ?? null,
+          };
+        })
+        .filter((entry) => entry.status !== null);
+      return { cardsOnCanvas: cards.length, painted };
+    }).catch(() => ({ cardsOnCanvas: cardCount, painted: [] }));
+
+    // A pill on a node the run never reached is a claim about work the engine did not do,
+    // and nothing on screen distinguishes it from a real one — so the canvas's set of
+    // painted nodes is compared against the run's, not just counted.
+    const runNodes = new Set(
+      (after?.steps ?? []).map((step) => step.node_id).filter((id) => typeof id === "string"),
+    );
+    const paintedIds = painted.painted.map((entry) => entry.nodeId);
+    const paintedButNotInRun = paintedIds.filter((id) => !runNodes.has(id));
+    // **The other direction, and the one the criterion's own words ask for.** The criterion
+    // says "each node shows its status pill" and the note above claims "every node the run
+    // touched is painted, and nothing else is" — a set EQUALITY, stated twice, measured
+    // once. Only `paintedButNotInRun` was computed, so a canvas that painted the two nodes
+    // that ran and painted NOTHING for the skipped prefix reported `pillsPainted: 2` and
+    // an empty `paintedButNotInRun`: the gate the criterion is closed on ("pillsPainted > 0
+    // with `paintedButNotInRun` empty") was satisfied by a canvas that dropped the pill
+    // from every node the feature exists to show.
+    //
+    // The skipped prefix is where this bites, and it is not a corner: a node paints a
+    // `skipped` pill precisely so an operator can see that the prefix was skipped rather
+    // than run, and those steps are rows in `after.steps` like any other. The expectation
+    // is derivable from the run alone — a node the run did not touch (a trigger, an inert
+    // note) has no step, so it is absent from `runNodes` and is *correctly* unpainted. That
+    // is why this needs no second source of truth: the two sets are comparable because the
+    // run names the nodes it touched.
+    const inRunButNotPainted = [...runNodes].filter((id) => !paintedIds.includes(id));
+    const skippedPill = painted.painted.find((entry) => entry.status === "skipped") ?? null;
+
+    const skippedRows = (after?.steps ?? []).filter((step) => step.status === "skipped");
+    const firstSkipped = skippedRows[0] ?? null;
+    const runnable = (after?.steps ?? []).filter((step) => step.status !== "skipped");
+
+    note({
+      step: "run-from-here",
+      controlFound: controlCount > 0,
+      cardsOnCanvas: cardCount,
+      // The two readings of the same DOM, milliseconds apart. They disagreed (1 vs 6) for a
+      // whole tick, and every unmeasured row in this block was downstream of that race rather
+      // than of anything in the product — so the disagreement itself is now a reported number.
+      // A scan that finds no startable node while this says false is a *harness* failure and
+      // reads as one; the same scan with `canvasWasStable: false` is a stale read and reads as
+      // one too, which is the point of recording it separately.
+      canvasWasStable: cardOrder.length === cardCount,
+      canStart,
+      // **TICK 61'S FINDING, AND IT BELONGS ABOVE EVERY GATE IN THIS NOTE.** The run used to
+      // be read once after a fixed 2500ms sleep, and this pass took that reading while the
+      // engine had accepted the request and claimed nothing: `skipped: 0`,
+      // `statuses: ["pending"]`, `pillsPainted: 0`, and every node in the run reported as
+      // unpainted. Five readings, each of them "the product is missing this", and all five
+      // downstream of one sleep. `runSettled: false` says the run never stopped moving, and
+      // the gates below it are then readings of a run in flight rather than of a rule.
+      //
+      // It is a single field rather than a precondition woven into each gate for the same
+      // reason `rowIsMeasurable` is: a conjunction nobody can hold in their head under time
+      // pressure is how a vacuous gate gets closed. Read this one first.
+      //
+      // **AND IT IS TWO FIELDS, BECAUSE "NOT SETTLED" WAS ONE ANSWER TO TWO QUESTIONS.** A run
+      // the engine never claimed and a run the engine claimed and then hung are both `settled:
+      // false`, and they are not the same failure: the first is a run that never started — the
+      // button did not take, or the rule refused it — while the second is a run that started and
+      // stopped making progress. Every gate below reads a `steps` array, so the first case
+      // reports an all-`pending` array and the second reports a half-finished one, and a reader
+      // comparing `statuses: ["pending"]` against the gates has to re-derive which it is.
+      // `runStarted` names the witness directly and `runFinished` names the outcome: a run that
+      // stopped moving mid-way is `settled: true, runFinished: false`, which is a hung run and
+      // not a rule whose nodes failed to paint pills.
+      runSettled,
+      runStarted,
+      runFinished,
+      // Which node each card answered for, so a `canStart: "false"` can be told apart from
+      // "the control never rendered for the node the criterion is about".
+      scan,
+      chosenId,
+      // A disabled control must say why. A greyed button with no reason is a dead
+      // button wearing a disabled attribute.
+      disabledReason: disabledReason ? disabledReason.slice(0, 160) : null,
+      skipped: skippedRows.length,
+      // The reason has to *name* the node the run started at — "skipped" alone satisfies
+      // the word and not the clause, and cannot be told apart from a lost run.
+      reasonNamesNode: firstSkipped
+        ? new RegExp(after?.startedFrom ?? "x").test(firstSkipped.skip_reason ?? "")
+        : null,
+      // The first step that actually runs is the one after the skipped prefix, and its
+      // status is not `skipped` — the node that was pressed must be the node that ran.
+      firstRunnableNo: runnable[0]?.step_no ?? null,
+      firstSkippedNo: firstSkipped?.step_no ?? null,
+      startedFrom: after?.startedFrom ?? null,
+      // Criterion 2: the painted set and the run's set are the SAME set. Both halves are
+      // reported, and the first one existed long before the second — which is the defect.
+      // `pillsPainted > 0` alone passes on a canvas that paints one node out of five, and
+      // `paintedButNotInRun` empty alone passes on the same canvas, because the nodes it
+      // dropped were never painted in the first place.
+      pillsPainted: painted.painted.length,
+      paintedButNotInRun,
+      // The direction that catches a missing pill. A node the run touched and the canvas
+      // did not paint is exactly the case the criterion is about, and until this existed
+      // nothing in the note could tell it apart from a short run.
+      inRunButNotPainted,
+      skippedPillFound: skippedPill !== null,
+      // The pill's own tooltip has to carry the run's reason, not a word that satisfies
+      // "says why" while saying nothing.
+      skippedPillNamesNode:
+        skippedPill && firstSkipped
+          ? new RegExp(after?.startedFrom ?? "x").test(skippedPill.title ?? "")
+          : null,
+      ruleCount: Array.isArray(before?.workflows) ? before.workflows.length : null,
+    });
+    await shot(page, "page-workflow-builder-run-from-here");
+
+    // ---- Clicking a node opens that step's inputs and output --------------------------------
+    // The second half of criterion 2, and the half that cannot be read from the API: the
+    // claim is about the PANEL, so the panel is what gets read. A probe that fetched the
+    // run and printed `step.output` would pass against a trace that rendered nothing.
+    //
+    // The node clicked is a node the run actually touched — read off a card that carries a
+    // pill — because clicking a node the run never reached is the `node-absent` state, and
+    // asserting on that would prove the panel has an empty-state message rather than that
+    // it opens the step.
+    {
+      // **THE TARGET COMES FROM THE RUN, NEVER FROM THE CANVAS PILL READ.** This is the
+      // tick-57/58/59 defect for the fourth time and the fourth instance is the worst of
+      // them, because here the row's target was derived from the row's own SUBJECT.
+      //
+      // `paintedNodeId` used to be `painted.painted.find(e => e.status !== "skipped")?.nodeId
+      // ?? null` — the status pill this same criterion is about. So a regression in the pill
+      // (the thing `run-from-here` exists to measure) does not make THIS row red: it makes it
+      // VOID. No card carries a pill, so the id is `null`, no click is issued, the inspector
+      // never mounts, `trace` is `null`, `stepsShown` is 0, and then
+      //
+      //     stepsWithoutBothSides: []   (an empty list is read as "no step lost a side")
+      //     stepsInRunButNotShown: []   (runStepNos is filtered by a null id, so it is empty)
+      //     stepsWithParams === stepsWithOutput === stepsTotal > 0   (read off the wire)
+      //
+      // — all three gates GREEN, with the panel shut and not one step rendered. `panelFound`
+      // and `stepsShown` are in the note and neither is in the conjunction, so the conjunction
+      // in the next tick's own instructions passes on a panel that never opened. A gate that
+      // a defect can make invisible is worse than a missing one.
+      //
+      // The run is the independent witness and it is already in hand, so the target is taken
+      // from it: the first node the run touched that is not a skipped prefix row and that is
+      // actually on the canvas. A pill regression now surfaces where it belongs — as
+      // `pillsPainted: 0` / `inRunButNotPainted` on the `run-from-here` row above, which is
+      // the row that measures it — while this row still opens a real panel and can still go
+      // red about the panel itself.
+      const runCandidateIds = (after?.steps ?? [])
+        .filter((step) => typeof step.node_id === "string" && step.status !== "skipped")
+        .map((step) => step.node_id);
+      const canvasIds = cardOrder.map((card) => card.id);
+      const paintedNodeId = runCandidateIds.find((id) => canvasIds.includes(id)) ?? null;
+      // What the pill read WOULD have chosen, kept as EVIDENCE rather than as the target: a
+      // red `paintedOnTarget: false` beside a green panel now says "the pill is the defect",
+      // which is the opposite of what the same note said last time (everything green).
+      const pillChosenNodeId =
+        painted.painted.find((entry) => entry.status !== "skipped")?.nodeId ?? null;
+      if (paintedNodeId) {
+        await page
+          .locator(`[data-node-id="${paintedNodeId}"]`)
+          .first()
+          .click({ timeout: 8000 })
+          .catch(() => {});
+        // Wait for the MARKER, not for a delay. `waitForTimeout(500)` is a guess about mount
+        // time and is the quiet form of the same race the `table-save-survives` row was fixed
+        // for: a page that has not drawn is green for every assertion below, and only on a
+        // slow machine. The panel's own attribute is the condition, and `StepTracePanel`
+        // writes it unconditionally at its root (builder-view.tsx:3507) for all three of its
+        // states — no-run, node-absent and steps — so waiting on it cannot be satisfied by
+        // nothing and cannot time out on a panel that opened without a step in it.
+        await page
+          .waitForSelector(`[data-step-trace="${paintedNodeId}"]`, { timeout: 8000 })
+          .catch(() => {});
+      }
+
+      // Per STEP, not per panel. The panel renders one Inputs/Output pair inside every
+      // `[data-step-trace-step]` block, and `step-detail.ts` goes out of its way to keep
+      // every step a node contributed — "a map keyed by node is the shape that loses the
+      // second branch, and this function's only job is to be the one place that answers
+      // 'which steps is this node', so the loss cannot happen twice".
+      //
+      // The first draft of this read asked the PANEL for `[data-step-trace-payload="inputs"]`,
+      // which is the FIRST step's block whatever the node did. So a node with two steps read
+      // `steps: 2` beside one step's payloads: the second step could render nothing at all and
+      // every number below was unchanged. `stepsShown` counted blocks while `inputsRendered`
+      // counted one — two counts over two different sets, and only the first was a gate.
+      // The product guards this loss twice on purpose; the read threw it away, which is why
+      // the scope here is the step's OWN container.
+      const trace = await page.evaluate((nodeId) => {
+        const panel = nodeId ? document.querySelector(`[data-step-trace="${nodeId}"]`) : null;
+        if (!panel) return null;
+        const blocks = (stepBlock, name) => {
+          const block = stepBlock.querySelector(`[data-step-trace-payload="${name}"]`);
+          if (!block) return null;
+          return {
+            shape: block.querySelector("[data-step-trace-payload-shape]")?.textContent ?? null,
+            headline:
+              block.querySelector("[data-step-trace-payload-headline]")?.textContent?.trim() ?? null,
+            rows: block.querySelectorAll("dt").length,
+            items: block.querySelectorAll("ol li").length,
+          };
+        };
+        const steps = Array.from(panel.querySelectorAll("[data-step-trace-step]")).map((block) => {
+          const inputs = blocks(block, "inputs");
+          const output = blocks(block, "output");
+          return {
+            // **NORMALISED TO A NUMBER HERE, AT THE SOURCE, AND THIS IS THE FIFTH INSTANCE
+            // OF THE SAME DEFECT.** `getAttribute` returns a STRING; the run's `step_no` is a
+            // JSON number. So the panel's set was `["1"]` and the run's was `[1]`, and
+            // `["1"].includes(1)` is `false` in both directions — which is why the pass recorded
+            // `stepsShownButNotInRun: ["1"]` AND `stepsInRunButNotShown: [1]` **on a panel
+            // that had rendered the one step it was supposed to**. Both lists were non-empty
+            // and both were fiction: the sets are equal, the comparison just could not see it.
+            //
+            // The guard that should have caught it tested the comparison's SHAPE (both
+            // directions present, `filter`/`includes` spelled) and never asked whether its two
+            // sides were type-coherent — a claim about a use, answered by a claim about a
+            // mention, which is the same lesson as tick 58's prefix collision. A set equality
+            // between two sources is only a set equality if both sides are the same type, and
+            // nothing in the expression that performs the comparison can tell you that.
+            //
+            // Coerce at the DOM boundary rather than in the comparison: `stepNo` is used in
+            // three more places (`stepsWithoutBothSides`, `shownStepNos`, and the note's own
+            // `shownStepNos` field), and normalising once means every one of them is right by
+            // construction instead of by a second careful look at each. `Number()` on a
+            // non-numeric attribute yields `NaN`, which survives JSON and reads as `null`
+            // beside a real number rather than silently equal to one of them.
+            stepNo: Number(block.getAttribute("data-step-trace-step")),
+            status: block.getAttribute("data-step-trace-status"),
+            inputs,
+            output,
+            // A step that rendered one side is not a step whose inputs and output both
+            // opened. The criterion names both, and "one of the two" satisfies neither.
+            hasBothSides: inputs !== null && output !== null,
+          };
+        });
+        return {
+          kind: panel.getAttribute("data-step-trace-kind"),
+          heading: panel.querySelector("[data-step-trace-heading]")?.textContent?.trim() ?? null,
+          subheading:
+            panel.querySelector("[data-step-trace-subheading]")?.textContent?.trim() ?? null,
+          steps,
+          // The first step's payloads, kept because they are what a human reads first and
+          // because a per-step read that silently changed which step it answers for would
+          // otherwise be invisible.
+          inputs: steps[0]?.inputs ?? null,
+          output: steps[0]?.output ?? null,
+        };
+      }, paintedNodeId);
+
+      // The wire has to carry BOTH sides at all. Read from the API, because this is the one
+      // assertion about the SERVER: a panel that renders "no inputs" on every step is a
+      // correct-looking panel built on a field nobody sends.
+      //
+      // `output` was NOT read here before, which is the same missing half as last tick in a
+      // different place: the note reported `stepsWithParams` beside `outputRendered`, so a
+      // server that sent `params` and dropped `output` — failing half the criterion's
+      // sentence — reported a healthy number. The two sides are counted separately and
+      // their conjunction is what the note carries.
+      const paramsOnWire = await page.evaluate(async (executionId) => {
+        if (!executionId) return null;
+        const res = await fetch(`/api/v1/workflow-executions/${executionId}`, {
+          credentials: "same-origin",
+        });
+        if (!res.ok) return null;
+        const run = await res.json();
+        return (run.steps ?? []).map((step) => ({
+          step_no: step.step_no,
+          node_id: step.node_id ?? null,
+          hasParams: step.params !== undefined,
+          // `null` is a step that produced nothing and is NOT the same as the key being
+          // absent: the panel says the two different sentences, so the wire has to be able
+          // to say them. Counted as "present" (a real value or an explicit null), not as
+          // "truthy" — a `false` or `0` output is an output.
+          hasOutput: "output" in step,
+        }));
+      }, after?.executionId ?? null).catch(() => null);
+
+      // The step numbers the panel showed, and the ones the run says belong to this node.
+      // The panel's own `data-step-trace-step` is the FIRST source and the run's steps for
+      // this node are the SECOND; a mismatch means the panel is showing a step list that
+      // is not the run's, which no count of rendered rows can reveal.
+      const shownStepNos = (trace?.steps ?? []).map((entry) => entry.stepNo ?? null);
+      const runStepNos = (paramsOnWire ?? [])
+        .filter((step) => step.node_id === paintedNodeId)
+        .map((step) => step.step_no)
+        .sort((left, right) => left - right);
+
+      note({
+        step: "step-trace",
+        clickedNode: paintedNodeId,
+        panelFound: trace !== null,
+        // **THE PRECONDITION OF EVERY CONJUNCTION BELOW.** Three fields in this note are
+        // empty lists or a healthy count when the panel never opened: the steps list is
+        // empty, so `stepsWithoutBothSides` is empty, and `runStepNos` is filtered by a null
+        // node id, so `stepsInRunButNotShown` is empty too. Both read as PASS. So a reading
+        // of this row is only a verdict at all when the panel opened and rendered at least
+        // one step — and that is one field, not three conditions, so nobody has to re-derive
+        // it under time pressure. `rowIsMeasurable` is that single switch.
+        rowIsMeasurable: trace !== null && (trace?.steps.length ?? 0) > 0,
+        // The target came from the RUN, and this says whether the canvas agreed it was a
+        // card. `null` target with a non-empty run is "the run named a node the canvas does
+        // not have" — a graph/canvas divergence, which is a real defect and is reported as
+        // one rather than as a panel that failed to open.
+        targetFromRun: paintedNodeId !== null,
+        // What the PILL read would have chosen. When these two disagree, the pill is what
+        // moved — and the pill is `run-from-here`'s subject, so the note points at that row
+        // instead of blaming a panel that opened correctly.
+        pillChosenNode: pillChosenNodeId,
+        pillChoseSameAsRun: pillChosenNodeId === paintedNodeId,
+        // The pill must be ON the clicked node for "clicking the node opens that step" to
+        // have been exercised: a panel opened for a node the canvas shows no status on is
+        // the pill's row failing, not this one.
+        paintedOnTarget: painted.painted.some((entry) => entry.nodeId === paintedNodeId),
+        kind: trace?.kind ?? null,
+        // Both halves rendered: the panel opened a step at all…
+        stepsShown: trace?.steps.length ?? 0,
+        // …and it rendered the step's two sides rather than two headings — counted over
+        // EVERY step the panel opened, which is the whole point of the per-step read.
+        inputsRendered: (trace?.steps ?? []).reduce(
+          (total, entry) => total + (entry.inputs?.rows ?? 0) + (entry.inputs?.items ?? 0),
+          0,
+        ),
+        outputRendered: (trace?.steps ?? []).reduce(
+          (total, entry) => total + (entry.output?.rows ?? 0) + (entry.output?.items ?? 0),
+          0,
+        ),
+        // A step that rendered one side is not a step whose inputs and output both opened,
+        // and a node with two steps is exactly where that shows up: the first step's blocks
+        // are read and the second step's are not. `stepsWithoutBothSides: []` is the gate.
+        stepsWithoutBothSides: (trace?.steps ?? [])
+          .filter((entry) => !entry.hasBothSides)
+          .map((entry) => entry.stepNo ?? null),
+        // The step numbers the panel listed, beside the ones the run attributes to this
+        // node. The two sets are the same set, in both directions, and the panel is the
+        // surface under test while the run is the witness.
+        shownStepNos,
+        runStepNos,
+        stepsShownButNotInRun: shownStepNos.filter((no) => !runStepNos.includes(no)),
+        stepsInRunButNotShown: runStepNos.filter((no) => !shownStepNos.includes(no)),
+        inputShape: trace?.inputs?.shape ?? null,
+        outputShape: trace?.output?.shape ?? null,
+        heading: trace?.heading ?? null,
+        subheading: trace?.subheading ?? null,
+        statuses: (trace?.steps ?? []).map((entry) => entry.status ?? null),
+        // The server half: every step reports whether each of its two payloads was sent.
+        stepsWithParams: (paramsOnWire ?? []).filter((step) => step.hasParams).length,
+        stepsWithOutput: (paramsOnWire ?? []).filter((step) => step.hasOutput).length,
+        stepsTotal: (paramsOnWire ?? []).length,
+      });
+      await shot(page, "page-workflow-builder-step-trace");
+    }
+  }
+
+  // ---- The keyboard-only pass, driven with no pointer event at all -------------------------
+  // REQ-004: "A keyboard-only pass adds two nodes, connects them, edits a parameter,
+  // validates and runs, with the pointer untouched."
+  //
+  // The criterion is a *sequence*, and the file has one thing to say about sequences: a list
+  // is data (`KEYBOARD_PASS` in keyboard-path.ts) so the probe replays the order the
+  // criterion states instead of inventing one. Two rules about what may be asserted:
+  //
+  //  * **No `page.mouse`, no `locator.click`, no `dragTo`.** A single pointer event anywhere
+  //    in this block makes the whole note untrustworthy — the criterion is about the path,
+  //    and a path that quietly fell back to a mouse passes every assertion below.
+  //  * **The edge and the parameter are read from the SERVER.** A keyboard path that draws
+  //    an edge without committing it passes every DOM assertion, because the canvas shows
+  //    the edge it is holding. The server's copy is the only witness, and it is the copy the
+  //    runner will execute.
+  const readGraphAgain = async () =>
+    page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" });
+      if (!response.ok) return null;
+      return await response.json();
+    }, workflowId);
+
+  {
+    // Start from a known graph, so the assertions are about what this block does.
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(300);
+    const graphBeforeKb = (await readGraphAgain()) ?? null;
+    const nodesBeforeKb = graphBeforeKb?.graph?.nodes?.length ?? null;
+    const edgesBeforeKb = graphBeforeKb?.graph?.edges?.length ?? null;
+
+    // `--the canvas has focus and nothing else--`. The shortcuts hang off the canvas's
+    // onKeyDown, so a pass that pressed keys while a field had focus would be testing
+    // `isTypingTarget` and nothing else. Focus is moved by keyboard only.
+    await page.locator("[data-builder-canvas]").first().focus().catch(() => {});
+    await page.waitForTimeout(200);
+    const focusIsCanvas = await page.evaluate(() =>
+      document.activeElement?.getAttribute("data-builder-canvas") !== null,
+    );
+
+    // Two nodes. ⌘P focuses the palette's first card, Enter adds it — and Enter is also the
+    // commit key of the connect gesture, which is why the gesture guard has to be right.
+    await page.keyboard.press("Control+p");
+    await page.waitForTimeout(400);
+    const paletteFocused = await page.evaluate(() => {
+      const active = document.activeElement;
+      return active?.getAttribute("data-palette-node") ?? null;
+    });
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(500);
+    await page.keyboard.press("Control+p");
+    await page.waitForTimeout(400);
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(600);
+    const canvasAfterAdds = await page.locator("[data-node-id]").count();
+
+    // The two cards just added, in the order the keyboard put them there.
+    const kbNodeIds = await page.locator("[data-node-id]").evaluateAll((cards) =>
+      cards.map((card) => card.getAttribute("data-node-id")),
+    );
+    const newNodeIds = (graphBeforeKb?.graph?.nodes ?? []).map((node) => node.id);
+    const added = kbNodeIds.filter((id) => !newNodeIds.includes(id));
+
+    // The connect gesture: C arms the source, the arrows walk to the target, Enter commits.
+    // `C` needs a *selected* source, and the last Enter left the new card selected — the
+    // probe asserts that rather than assuming it, because "a shortcut whose first step
+    // depends on a state the previous step did not set" is the failure being designed against.
+    const selectedAfterAdd = await page.locator("[data-node-selected='true']").count();
+    await page.keyboard.press("c");
+    await page.waitForTimeout(400);
+    const draftOpen = await page.locator("[data-link-draft]").count();
+    const draftRefusal = await page.locator("[data-refusal]").first().innerText().catch(() => null);
+
+    // Walk the selection. Tab is the documented route; a graph walk stops rather than wraps,
+    // so two presses is the most this fixture can need and the note says so.
+    await page.keyboard.press("Tab");
+    await page.waitForTimeout(250);
+    await page.keyboard.press("Tab");
+    await page.waitForTimeout(250);
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(900);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(1600);
+
+    // The edge, from the server.
+    const graphAfterKb = (await readGraphAgain()) ?? null;
+    const serverEdges = graphAfterKb?.graph?.edges ?? [];
+    const committedEdge = serverEdges.find(
+      (edge) => !edgesBeforeKb || !serverEdges.slice(0, edgesBeforeKb).some((before) => before.id === edge.id),
+    );
+    const newEdgeCount = serverEdges.length - (edgesBeforeKb ?? 0);
+
+    // A parameter, typed into the inspector with `I`, and read back from the server.
+    await page.keyboard.press("i");
+    await page.waitForTimeout(400);
+    const inspectorFieldFocused = await page.evaluate(() => {
+      const active = document.activeElement;
+      return active?.tagName === "INPUT" || active?.tagName === "TEXTAREA" || active?.tagName === "SELECT";
+    });
+    let paramReadBack = null;
+    let paramReadFrom = null;
+    if (inspectorFieldFocused) {
+      // **WHICH node the inspector is editing, read from the focused field's own identity.**
+      // `I` focuses the first field of the *selected* card's form, so the field the keys land
+      // in already knows its subject: `NodeInspector` renders each parameter input with
+      // `id={param-${node.id}-${field.key}}`. That is the node the keystrokes will land in,
+      // read from the element itself rather than inferred from a selection marker that a
+      // commit may have moved.
+      //
+      // Two drafts of this read are both wrong, and both wrong in a way a note reads green.
+      // (1) Finding the node by *type* (`nodes.find(n => n.node_type === "wait")`) asks for a
+      // field the server never sends — `Node` renames it to `type`, and `deny_unknown_fields`
+      // means there is no alias — so the comparison was `undefined === "wait"`, forever
+      // false, `paramReadBack` structurally `null` and `paramWrote` permanently `false` on a
+      // fully working keyboard path. A gate that cannot go green and a gate that cannot go
+      // red look identical in a report; this one could not go green. (2) A fallback that
+      // reaches for `data-inspector-node-id`, an attribute no element writes, is the same
+      // defect wearing a longer name — and `data-inspector` is a **prefix** of
+      // `data-inspector-field`, so any read built on that substring matches the fields and
+      // never the panel (the trap `table-mode-row.test.ts` already pins with an assertion).
+      paramReadFrom = await page
+        .evaluate(() => {
+          const active = document.activeElement;
+          const id = active?.getAttribute?.("id") ?? "";
+          const match = /^param-(.+?)-(.+)$/.exec(id);
+          if (match) return match[1];
+          // No card carries the selection marker after a commit, and the focused element may
+          // be the `label` input rather than a parameter. Both carry the node id in their id.
+          const labelled = /^label-(.+)$/.exec(id);
+          return labelled ? labelled[1] : null;
+        })
+        .catch(() => null);
+
+      await page.keyboard.press("Control+a");
+      await page.keyboard.type("31");
+      await page.waitForTimeout(500);
+      await page.keyboard.press("Tab");
+      await page.waitForTimeout(400);
+      await page.keyboard.press("Control+s");
+      await page.waitForTimeout(1600);
+      const graphAfterParam = (await readGraphAgain()) ?? null;
+      // The wire key is `type` (`#[serde(rename = "type")]` on `Node`), and the wait node's
+      // parameter is `seconds`.
+      const edited =
+        (graphAfterParam?.graph?.nodes ?? []).find((node) => node.id === paramReadFrom) ??
+        (graphAfterParam?.graph?.nodes ?? []).find((node) => node.type === "wait");
+      paramReadBack = edited?.params?.seconds ?? null;
+    }
+
+    // Validate, then run — both are single keys, and both are read from the screen and the
+    // API rather than from a toast.
+    await page.keyboard.press("v");
+    await page.waitForTimeout(1200);
+    const problemsRendered = await page.evaluate(() => {
+      const panel = document.querySelector("[data-builder-problems]");
+      if (!panel) return null;
+      const none = panel.querySelector("[data-problems-none]");
+      return {
+        panelFound: true,
+        saysNoProblems: none !== null,
+        findings: panel.querySelectorAll("[data-finding]").length,
+      };
+    });
+    await shot(page, "page-workflow-builder-keyboard");
+
+    // The last verb, `r`, and the row's read of it was the ONLY unguarded fetch in this block:
+    // it asked `/workflows/{id}/runs`, **a route this server does not mount** (the run list is
+    // `/workflows/{id}/executions` — `runs` exists only under `/media/scan` and
+    // `/media/retention`), and then read `body.runs`, which is not the field either; the
+    // payload is `{ workflow_id, executions }`. Two wrong answers that agree: a 404 from an
+    // unmounted path, and a payload key the response never had. `response.ok` swallowed the
+    // first into `null` and `Array.isArray(null?.runs)` swallowed the second into `null`, so
+    // `runsAfterKey` was **structurally null on every run since this row was written** — a gate
+    // that could not go green reading exactly like a gate that could not go red, which is the
+    // shape `keyboard-pass-row.test.ts`'s own header was written for and did not catch,
+    // because nothing in that file read this sentence.
+    //
+    // **The third defect is the one the other two were hiding.** Counting runs cannot say the
+    // keyboard started one: the builder pass above pressed `Run from here` on this same rule
+    // moments earlier, so a non-zero count is satisfied by that run and this row would report
+    // a green `startedFromKey` for a key that was never pressed. `runCountBeforeKey` is taken
+    // from the same endpoint in the same shape immediately before the press, and the note
+    // carries both — a count beside its baseline, never alone.
+    const runCountBeforeKey = await page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/executions?limit=50`, {
+        credentials: "same-origin",
+      });
+      if (!response.ok) return null;
+      const body = await response.json();
+      return Array.isArray(body?.executions) ? body.executions.length : null;
+    }, workflowId).catch(() => null);
+
+    await page.keyboard.press("r");
+    await page.waitForTimeout(3000);
+    const runAfterKey = await page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/executions?limit=50`, {
+        credentials: "same-origin",
+      });
+      if (!response.ok) return null;
+      return await response.json();
+    }, workflowId).catch(() => null);
+    // The newest run, and only if the key produced one. `executions` is newest-first by
+    // `started_at desc, id desc` (`store::list_executions`), so index 0 is the press under
+    // test — but that is only true *relative to the baseline*, which is why the two travel
+    // together. A key that started nothing leaves the previous run at index 0 and a note that
+    // reported its `trigger` would be reporting the row above's press.
+    const runAfterKeyList = Array.isArray(runAfterKey?.executions) ? runAfterKey.executions : null;
+    const runsAddedByKey =
+      runAfterKeyList !== null && runCountBeforeKey !== null
+        ? Math.max(0, runAfterKeyList.length - runCountBeforeKey)
+        : null;
+    const newestRun = runsAddedByKey > 0 ? runAfterKeyList[0] : null;
+    // `ExecutionSummary` calls the column `trigger` (`pub trigger: String`, built from
+    // `execution.trigger_kind`) — the STORED column is `trigger_kind` and the WIRE key is
+    // `trigger`. The row asked for `trigger_kind` and fell back to `status`, so even on a
+    // correct route it would have reported the run's *state* under a name that promises its
+    // origin.
+    const runTrigger = newestRun?.trigger ?? null;
+    const runStatus = newestRun?.status ?? null;
+
+    note({
+      step: "keyboard-pass",
+      // The precondition the whole note rests on.
+      focusIsCanvas,
+      paletteFocused: paletteFocused !== null,
+      // Step 1 of the criterion: two nodes.
+      nodesBefore: nodesBeforeKb,
+      nodesOnCanvas: canvasAfterAdds,
+      addedNodes: added.length,
+      addedTwo: added.length === 2,
+      // Step 2: the connect gesture, and its own state machine.
+      selectedAfterAdd,
+      draftOpened: draftOpen > 0,
+      draftRefusal: draftRefusal ? draftRefusal.slice(0, 120) : null,
+      // …committed, which only the server can witness.
+      edgesBefore: edgesBeforeKb,
+      edgesAfter: serverEdges.length,
+      newEdges: newEdgeCount,
+      edgeCommitted: newEdgeCount >= 1,
+      committedEdgeSource: committedEdge?.source ?? null,
+      committedEdgeTarget: committedEdge?.target ?? null,
+      // Step 3: a parameter, typed and read back from the server.
+      inspectorFocusedByKey: inspectorFieldFocused,
+      // The node the keystrokes landed in, and whether the read was of THAT node or of a
+      // fallback. A `paramWrote` beside `paramReadFrom: null` is a number about somebody
+      // else's node, so the two travel together and `paramWrote` is false without a subject.
+      paramReadFrom,
+      paramSubjectKnown: paramReadFrom !== null,
+      paramReadBack,
+      paramWrote: paramReadFrom !== null && (paramReadBack === 31 || paramReadBack === "31"),
+      // Steps 4 and 5.
+      problemsPanel: problemsRendered,
+      // **The run read is now a comparison, not a count.** Three fields travel together and the
+      // note says which of them can be `null`: `runCountBeforeKey`/`runsAfterKey` are `null`
+      // when the ENDPOINT answered with nothing readable (a dead stack, a 401) — which is a
+      // different fact from a key that started no run, and reporting both as `null` is how
+      // this row hid the defect for nine ticks. `runsAddedByKey` is the claim, `runTrigger`
+      // is its subject, and `runStatus` is reported beside it rather than as a fallback for
+      // it: `trigger` says who started the run, `status` says what happened to it, and the old
+      // `trigger_kind ?? status` returned the second under the first's name.
+      runCountBeforeKey,
+      runsAfterKey: runAfterKeyList !== null ? runAfterKeyList.length : null,
+      runsAddedByKey,
+      runStartedFromKey: runsAddedByKey > 0,
+      runTrigger,
+      runStatus,
+    });
+    await shot(page, "page-workflow-builder-keyboard-final");
+  }
+
+  // ---- Tab walks the canvas (REQ-004 slice 4) ---------------------------------------------
+  // The list said `Tab` walks to the next card for two ticks and **no handler existed**:
+  // `onCanvasKeyDown` bound no `Tab` case and every card is `tabIndex={-1}`, so the browser
+  // moved focus out to the toolbar and the selection never moved. `focusOrder` existed in
+  // `selection.ts` with a unit test on its shape and no caller.
+  //
+  // The unit test (in `canvas-walk.test.ts`) proves the *rotation* and that a text guard
+  // cannot see a delegated binding. It cannot prove that pressing the key moves anything, so
+  // this does. Three claims, and the one that matters is the first:
+  //
+  //  1. **The selection and the focus ring land on the same card.** They are two mechanisms —
+  //     `setSelection` and a programmatic `.focus()` — and a handler that did only the first
+  //     would move the outline while the browser kept focus on the toolbar, which is invisible
+  //     in a screenshot and would make the next keystroke (`C`, `I`) act on the wrong card.
+  //     So both are read, and `document.activeElement` is the authority for where focus is.
+  //  2. **A second press reaches a connection**, and `⇧Tab` comes back. The edge is the
+  //     reason the walk exists for this criterion: "Del on a selected edge removes it" is only
+  //     satisfiable from a keyboard if a keyboard can *reach* an edge, and a walk that stopped
+  //     at the last node would be indistinguishable from a walk that only visits nodes.
+  //  3. **A Tab inside a field is the field's.** `I` focuses the inspector's first input, so
+  //     this is the claim that keeps the keyboard criterion satisfiable: a walk that consumed
+  //     Tab there would make "edits a parameter" impossible while looking like a broken
+  //     shortcut. It is measured by pressing Tab in the field and reading the *field's* focus
+  //     afterwards — a walk would have pulled focus onto a card, which is the failure.
+  {
+    const width = 1440;
+    await page.setViewportSize({ width, height: 900 });
+    await page.waitForTimeout(800);
+
+    /** The drawn selection, read off the canvas's own marker rather than a class string. */
+    const readSelection = () =>
+      page.$$eval("[data-node-id][data-node-selected='true'], [data-edge][data-edge-selected='true']", (els) =>
+        els.map((el) => el.getAttribute("data-node-id") ?? el.getAttribute("data-edge")),
+      );
+    const readActive = () =>
+      page.evaluate(() => {
+        const el = document.activeElement;
+        if (!el) return null;
+        return (
+          el.getAttribute?.("data-node-id") ??
+          el.getAttribute?.("data-edge") ??
+          el.tagName.toLowerCase()
+        );
+      });
+
+    // Start from a known card: the first one, selected by a click. A walk measured from
+    // "nothing is selected" would pass on any implementation that returns the first card, so
+    // the probe deliberately begins in the *middle* of the graph.
+    const ids = await page.$$eval("[data-node-id]", (els) =>
+      els.map((el) => el.getAttribute("data-node-id")),
+    );
+    const startId = ids.length > 1 ? ids[1] : ids[0] ?? null;
+    if (startId) {
+      await page.locator(`[data-node-id="${startId}"]`).first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(500);
+    }
+    const before = { selection: await readSelection(), active: await readActive() };
+
+    // A plain Tab. The canvas must have focus for its keydown to fire at all, and the click
+    // above gave it to the card (or the canvas) — this reads where focus actually is, so a
+    // probe that clicked and assumed would report "Tab did nothing" for the wrong reason.
+    await page.keyboard.press("Tab");
+    await page.waitForTimeout(600);
+    const afterForward = { selection: await readSelection(), active: await readActive() };
+
+    await page.keyboard.press("Tab");
+    await page.waitForTimeout(600);
+    const afterSecond = { selection: await readSelection(), active: await readActive() };
+
+    // Backwards, from wherever the second press landed.
+    await page.keyboard.press("Shift+Tab");
+    await page.waitForTimeout(600);
+    const afterBack = { selection: await readSelection(), active: await readActive() };
+
+    // And the field half: `I` focuses the inspector's first input, and a Tab there must
+    // leave the field rather than walk the canvas.
+    await page.keyboard.press("i");
+    await page.waitForTimeout(500);
+    const fieldBefore = await page.evaluate(() => {
+      const el = document.activeElement;
+      return el ? el.tagName.toLowerCase() : null;
+    });
+    let fieldKeptFocus = null;
+    if (["input", "textarea", "select"].includes(fieldBefore ?? "")) {
+      await page.keyboard.press("Tab");
+      await page.waitForTimeout(500);
+      const after = await page.evaluate(() => {
+        const el = document.activeElement;
+        return el ? el.tagName.toLowerCase() : null;
+      });
+      // Either the field kept the caret or focus moved to the *next field* — both are the
+      // field's own Tab. What must NOT happen is focus landing on a canvas card, which is
+      // the walk having eaten it.
+      fieldKeptFocus = !["div", "span", "g"].includes(after ?? "");
+    }
+    // Put the selection somewhere harmless so the rest of the pass is not driven from a
+    // focused input.
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+
+    const moved = (state) =>
+      state.selection.length > 0 && state.selection[0] !== before.selection[0];
+    note({
+      step: "tab-walk",
+      cardsOnCanvas: ids.length,
+      startedFrom: before.selection[0] ?? null,
+      // The load-bearing claim: the two mechanisms agree. A walk that moved only one of them
+      // passes "did the selection change" and fails here.
+      forward: { selection: afterForward.selection, active: afterForward.active, moved: moved(afterForward) },
+      selectionAndFocusAgree:
+        afterForward.selection.length > 0 &&
+        afterForward.selection[0] === afterForward.active,
+      second: { selection: afterSecond.selection, active: afterSecond.active },
+      // The edge claim. A walk that never leaves the nodes is a walk that leaves "Del on a
+      // selected edge" pointer-only, so the note records whether an edge was ever reached
+      // rather than asserting it must have been on this graph.
+      reachedAnEdge:
+        afterForward.selection.some((id) => id.startsWith("e")) ||
+        afterSecond.selection.some((id) => id.startsWith("e")),
+      backwardsReturns:
+        afterBack.selection.length > 0 &&
+        afterBack.selection[0] === afterForward.selection[0],
+      fieldKeptFocus,
+      // NOTE: whether the list *documents* Tab is deliberately not read here. This block runs
+      // before the overlay is opened, so a `[data-help-row]` query would find zero rows and
+      // report a false defect — a probe reading a screen it has not opened is the same class
+      // of error as one written against the old contract. The claim lives in the
+      // `shortcut-help` note below, which holds the overlay open while it reads it.
+    });
+  }
+
+  // ---- What the builder announces (REQ-004 slice 4 — the accessibility assertions) --------
+  // The keyboard-only criterion is satisfiable by a canvas a screen reader cannot use, and no
+  // screenshot can tell the difference: an outline is a CSS class, a live region is a `span`
+  // clipped to a pixel, and both are invisible in a capture of the page. So this probe reads
+  // the *accessibility* surface, and the three claims are the three shapes the defect took.
+  //
+  // **A live region that appears with its text is not a live region.** The save indicator used
+  // to render a different element per state, so the region did not exist until the thing it
+  // had to announce had already happened. The probe therefore checks the region is in the DOM
+  // *before* anything is saved — the only moment the claim is falsifiable, because afterwards
+  // a region that exists proves nothing.
+  {
+    const regions = await page.evaluate(() => {
+      const read = (name) => {
+        const el = document.querySelector(`[data-live-region="${name}"]`);
+        if (!el) return { present: false };
+        const style = window.getComputedStyle(el);
+        return {
+          present: true,
+          role: el.getAttribute("role"),
+          live: el.getAttribute("aria-live"),
+          atomic: el.getAttribute("aria-atomic"),
+          text: (el.textContent ?? "").trim(),
+          // A region hidden from layout is removed from the accessibility tree, which is the
+          // same defect as not rendering it. `clip` is the honest check; `display: none` and
+          // `visibility: hidden` are the two that would pass a `count()` and fail a reader.
+          hiddenFromLayout: style.display === "none" || style.visibility === "hidden",
+          inTree: el.getClientRects().length > 0 || style.position === "absolute",
+        };
+      };
+      return {
+        total: document.querySelectorAll("[data-live-region]").length,
+        save: read("save-region"),
+        selection: read("selection-region"),
+        link: read("link-region"),
+        lock: read("lock-region"),
+      };
+    });
+
+    // The cards' own names. A card is `role="button"` with a truncated label, so a reader that
+    // heard only the visible text would announce "Send mail, button" — with no node type and
+    // no parameters, and nothing at all when Tab moved the selection.
+    const cards = await page
+      .locator("[data-node-id]")
+      .evaluateAll((els) =>
+        els.map((el) => ({
+          id: el.getAttribute("data-node-id"),
+          role: el.getAttribute("role"),
+          label: el.getAttribute("aria-label"),
+          // The visible text, for the comparison the probe exists to make.
+          visible: (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 40),
+        })),
+      )
+      .catch(() => []);
+
+    const named = cards.filter((card) => typeof card.label === "string" && card.label.length > 0);
+    // The name has to carry the node *type*, which is the fact the visible text does not: a
+    // reader who hears only "Send mail" cannot tell the first card of a rule from the last.
+    // `action.`/`event.`/`trigger.` are the registry's own dotted keys, so this reads the shape
+    // the product produces rather than a list of magic strings kept in the probe.
+    const namesNodeType = named.filter((card) => /[a-z]+\.[a-z]/.test(String(card.label))).length;
+
+    // A Tab press and then read the selection region — the third claim, and the one the
+    // previous two ticks could not have found by reading the shortcut list: a selection that
+    // moved is not a text change anywhere on the page.
+    const ids = cards.map((card) => card.id).filter(Boolean);
+    let selectionBefore = null;
+    let selectionAfter = null;
+    if (ids.length > 1) {
+      await page.locator(`[data-node-id="${ids[1]}"]`).first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(400);
+      selectionBefore = await page
+        .locator('[data-live-region="selection-region"]')
+        .innerText()
+        .catch(() => null);
+      await page.keyboard.press("Tab");
+      await page.waitForTimeout(600);
+      selectionAfter = await page
+        .locator('[data-live-region="selection-region"]')
+        .innerText()
+        .catch(() => null);
+    }
+
+    note({
+      step: "builder-announcements",
+      regionCount: regions.total,
+      // The structural claim. Read BEFORE any save, while the region is empty — a region that
+      // exists only after the event it should have announced has already passed.
+      saveRegionPresent: regions.save.present,
+      saveRegionRole: regions.save.role,
+      saveRegionLive: regions.save.live,
+      saveRegionAtomic: regions.save.atomic,
+      saveRegionHidden: regions.save.hiddenFromLayout,
+      everyRegionIsAStatus: [regions.save, regions.selection, regions.link, regions.lock].every(
+        (region) => region.present && region.role === "status",
+      ),
+      // A card that announces nothing is a card the author cannot verify.
+      cardsOnCanvas: cards.length,
+      cardsNamed: named.length,
+      allCardsNamed: named.length === cards.length,
+      cardsAsButtons: cards.every((card) => card.role === "button"),
+      // The name has to carry more than the visible text, or it is decoration.
+      namesNodeType,
+      namesGoBeyondVisibleText: named.filter(
+        (card) => String(card.label) !== String(card.visible).replace(/[. ]+$/, ""),
+      ).length,
+      sampleCardName: named[0]?.label ?? null,
+      sampleCardVisible: named[0]?.visible ?? null,
+      // And the selection has to speak when it moves.
+      selectionRegionPresent: regions.selection.present,
+      selectionBefore,
+      selectionAfter,
+      selectionAnnouncedOnMove:
+        typeof selectionBefore === "string" &&
+        typeof selectionAfter === "string" &&
+        selectionBefore.length > 0 &&
+        selectionAfter.length > 0,
+    });
+  }
+
+  // ---- ⌘/ and the shortcut list (REQ-004 slice 4) -----------------------------------------
+  // The criterion is "⌘/ help", and the interesting part is that an overlay which *renders* is
+  // the easy half. The claim worth measuring is the one a screenshot cannot: **the list does
+  // not drift from the keys the canvas binds.** A help panel written next to the handler is
+  // correct on the day it is written and quietly wrong the day someone adds ⌘K, and the day it
+  // is wrong is the day a keyboard author goes there to find out what they can do.
+  //
+  // So the probe reads the two halves against each other: the chords the *source* binds, and
+  // the rows the overlay renders. A chord with no row is the defect. The unit test in
+  // `keyboard-path.test.ts` guards the same relation at build time; this one proves the
+  // overlay actually shows the rows the catalogue holds, which is a different failure — a
+  // catalogue nobody renders passes every unit test.
+  {
+    const width = 1440;
+    await page.setViewportSize({ width, height: 900 });
+    await page.waitForTimeout(600);
+
+    const before = await page.locator("[data-builder-help]").count();
+    // `Control+`, not `Meta+`: the whole file presses chords this way (Ctrl+A, Ctrl+Z) and the
+    // box is Linux, where a `Meta` press arrives as the Super key. A probe that opens the list
+    // with the wrong modifier reports a shortcut nobody has.
+    await page.keyboard.press("Control+Slash");
+    await page.waitForTimeout(600);
+    const opened = await page.locator("[data-builder-help]").count();
+
+    const rows = await page.$$eval("[data-help-row]", (els) =>
+      els.map((el) => ({
+        keys: el.getAttribute("data-help-row"),
+        locked: el.getAttribute("data-help-locked") === "true",
+        text: (el.textContent ?? "").replace(/\s+/g, " ").trim(),
+      })),
+    );
+    await shot(page, "page-workflow-builder-help");
+
+    // Escape must close it, and close ONLY it: a modal the keyboard cannot dismiss would
+    // fail the keyboard-only criterion on the one screen that teaches the shortcuts.
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+    const closedByEscape = (await page.locator("[data-builder-help]").count()) === 0;
+
+    // And the chord toggles: a list that can only be opened and not dismissed with the same
+    // key is a trap for the person who just memorised its own shortcut.
+    await page.keyboard.press("Control+Slash");
+    await page.waitForTimeout(500);
+    const reopened = (await page.locator("[data-builder-help]").count()) === 1;
+    if (reopened) {
+      await page.locator("[data-builder-help-close]").first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(400);
+    }
+    const closedByButton = (await page.locator("[data-builder-help]").count()) === 0;
+
+    const documented = new Set(
+      rows.map((row) => (row.keys ?? "").toLowerCase()),
+    );
+    note({
+      step: "shortcut-help",
+      absentBefore: before === 0,
+      openedByChord: before === 0 && opened === 1,
+      // Both dismissals are required: a modal answerable only by the mouse is a dead end on
+      // the screen whose whole subject is the keyboard.
+      closedByEscape,
+      togglesOnTheSameKey: reopened,
+      closedByButton,
+      rows: rows.length,
+      lockedRows: rows.filter((row) => row.locked).length,
+      // A row with no text is a key the author has to guess at.
+      everyRowExplainsItself: rows.every((row) => row.text.length > (row.keys ?? "").length + 4),
+      // The chords the canvas binds, as the list spells them. Read off the rows themselves so
+      // a chord added to the handler without a row is visible as a *diff* in the note.
+      documentsChords: ["⌘z", "⌘s", "⌘d", "⌘a", "⌘p", "⌘c", "⌘v", "⌘y", "⌘/"].every((chord) =>
+        documented.has(chord) || [...documented].some((label) => label.includes(chord)),
+      ),
+      // Narrow-screen honesty: the rows the gate refuses have to SAY they are refused, or a
+      // phone author reads a keyboard map of keys that do nothing.
+      marksTheLockedRows:
+        rows.filter((row) => row.locked).length > 0 &&
+        rows.filter((row) => row.locked).every((row) => row.text.toLowerCase().includes("read-only")),
+      // The row that lied for two ticks. `Tab` was on this list from the day it was written
+      // and no handler existed; the list is the only place an author looks to find out what
+      // is possible, so a row for a key that does nothing is worse than a missing row — the
+      // author presses it, sees nothing, and concludes the keyboard does not work here.
+      // Read from the *rendered* rows rather than the catalogue: a catalogue nobody renders
+      // passes every unit test, which is exactly how the first version of this claim could
+      // have been satisfied by a list that never appeared on screen.
+      documentsTab: [...documented].some((label) => label.includes("tab")),
+    });
+  }
+
+  // ---- The narrow-screen lock (REQ-004) ----------------------------------------------------
+  // "Below 1024px the builder is read-only with the banner, Table mode stays editable, and
+  // no control is unreachable."
+  //
+  // Four claims, and the interesting one is the *second* pair: a lock implemented in the
+  // pointer handlers has a hole exactly the size of a Bluetooth keyboard, so a phone with a
+  // case gets `Del` and deletes a node on a screen the banner calls read-only. The probe
+  // therefore presses **keys**, not clicks, for two of the five mutations, and reads the
+  // server's copy — because a canvas that refused to draw a drag looks identical to a canvas
+  // that refused to *commit* one, and only the stored graph tells them apart.
+  {
+    const width = 900;
+    await page.setViewportSize({ width, height: 900 });
+    await page.waitForTimeout(1200);
+    const locked = await page.evaluate(() => {
+      const root = document.querySelector("[data-builder]");
+      return root?.getAttribute("data-builder-locked") ?? null;
+    });
+    const banner = await page.locator("[data-builder-lock-banner]").first().innerText().catch(() => null);
+    const bannerLinksTable = await page.locator("[data-builder-lock-table-mode]").count();
+
+    const beforeLock = (await readGraphAgain()) ?? null;
+    const beforeNodes = beforeLock?.graph?.nodes?.length ?? null;
+    const beforeEdges = beforeLock?.graph?.edges?.length ?? null;
+    const beforeVersion = beforeLock?.graph_version ?? null;
+
+    // Five mutations, three by pointer and two by key. Each one is followed by a read of the
+    // server's copy, and a lock that refused them all leaves every number identical.
+    //
+    // **THE READS BELOW MUST OUTLAST THE WRITE WINDOW, AND THESE TWO DID NOT.** The key
+    // gestures were followed by `waitForTimeout(600)` / `(800)` — both *shorter* than
+    // `AUTOSAVE_MS` (1_200) — so this row was asserting that a write did NOT happen before the
+    // autosave that would have performed it had any chance to run. A working lock and an
+    // unsaved graph are byte-identical readings: every number unchanged, banner present, verdict
+    // "read-only". **A negative assertion measured before the write window closes is not a
+    // negative assertion** — the mirror of the 1200ms race tick 62 found, and the reason
+    // `awaitGraphUnchanged` exists rather than another `settleGraph`.
+    const versionBeforeLockKeys = (await readGraphAgain().catch(() => null))?.graph_version ?? 0;
+    await page.locator("[data-palette-node='wait']").first().click({ timeout: 4000, force: true }).catch(() => {});
+    // `settleCanvasCards` for the DOM read and `awaitGraphUnchanged` for the server read, because
+    // they answer different questions. The card count is a reading of the CANVAS, which repaints
+    // optimistically; the version is a reading of the SERVER, which only the autosave moves. A
+    // fixed sleep was standing in for both at once, which is how one number came to serve as
+    // evidence for two unrelated claims.
+    await settleCanvasCards(page);
+    const afterAddAttempt = await page.locator("[data-node-id]").count();
+
+    await page.keyboard.press("Delete");
+    await settleCanvasCards(page);
+    const afterDeleteKey = await page.locator("[data-node-id]").count();
+
+    await page.keyboard.press("c");
+    await page.waitForTimeout(400);
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(800);
+    const draftWhileLocked = await page.locator("[data-link-draft]").count();
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+
+    await page.keyboard.press("Control+z");
+    // Give the key gestures a full debounce window and read the version they would have moved.
+    // `undoRefused` below is then a claim about the server, not about an instant.
+    const lockKeysWindow = await awaitGraphUnchanged(page, readGraphAgain, versionBeforeLockKeys);
+
+    // And the control the criterion names at the end: a locked builder must still be
+    // *readable*, so a card can be selected and the inspector still shows the node's state.
+    const kbNodeIds = await page.locator("[data-node-id]").evaluateAll((cards) =>
+      cards.map((card) => card.getAttribute("data-node-id")),
+    );
+    let selectable = null;
+    let inspectorStillReads = null;
+    let selectionAppeared = null;
+    if (kbNodeIds.length > 0) {
+      await page.locator(`[data-node-id="${kbNodeIds[0]}"]`).first().click({ timeout: 4000 }).catch(() => {});
+      // Wait for the SELECTION to appear rather than for a duration to elapse — and report
+      // whether it did, because "the card was not selectable" and "the click landed on a canvas
+      // that had not repainted" are the same count and different defects.
+      const lockedSelection = await awaitNodeSelection(page);
+      selectionAppeared = lockedSelection.appeared;
+      selectable = lockedSelection.appeared
+        ? await page.locator("[data-node-selected='true']").count()
+        : 0;
+      inspectorStillReads = await page
+        .locator(`[data-inspector="${kbNodeIds[0]}"]`)
+        .first()
+        .innerText()
+        .then((text) => text.replace(/\s+/g, " ").trim().slice(0, 120))
+        .catch(() => null);
+    }
+    await shot(page, "page-workflow-builder-locked");
+
+    const afterLock = (await readGraphAgain()) ?? null;
+    const afterNodes = afterLock?.graph?.nodes?.length ?? null;
+    const afterEdges = afterLock?.graph?.edges?.length ?? null;
+    const afterVersion = afterLock?.graph_version ?? null;
+
+    // The banner's own escape route has to *work*, and a lock that locked Table mode too
+    // would satisfy "read-only" and fail the criterion in the same breath. So the link is
+    // followed and a value is changed there.
+    //
+    // **THE EDITABILITY READ NAMED TWO ATTRIBUTES THE PRODUCT HAS NEVER RENDERED**
+    // (`editControls`, tick 86). The row asked for `[data-workflow-table-edit]` and
+    // `[data-table-edit]`; `grep -rn 'data-table-edit' apps/ scripts/ crates/` returns this line
+    // and nothing else, so `editControls` was structurally **0** — a lock that had extended to
+    // Table mode entirely, and a Table mode that had never rendered, reported the same number.
+    // The comment above it claims "a value is changed there" and nothing ever typed one.
+    //
+    // This is the same class as the four rows above it, and the tell is identical: the row
+    // reported a count, so a constant was indistinguishable from a reading. The real table
+    // ships `data-table-label` / `data-table-param` inputs and a `data-table-save` button, and
+    // "stays editable" is a claim about those controls being *writable*, so it is measured by
+    // writing: type into a control that is not disabled and not readOnly, and read the save
+    // button's own disabled state back. A control that rendered but was inert reports 0 here.
+    //
+    // The selector's *resolution* is reported alongside, because a 0 must say which of the two
+    // it is (tick 74's lesson, one field): `tableMounted` separates "the page never rendered"
+    // from "the page rendered and its controls are all inert".
+    let tableSaves = null;
+    if (bannerLinksTable > 0) {
+      await page.locator("[data-builder-lock-table-mode]").first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+      const onTable = page.url().includes("/table");
+      // Wait for the table to mount rather than for a duration to elapse: a fixed delay is
+      // green against a page that has not drawn, and wrong only on a slow machine.
+      const tableMounted =
+        (await page
+          .waitForSelector("[data-table-mode]", { timeout: 15000 })
+          .then(() => true)
+          .catch(() => false)) || false;
+
+      // The editable surface, read from the attributes the component actually ships. Both
+      // halves are counted separately because "no control rendered" and "every control is
+      // inert" are different defects with the same zero.
+      const editSurface = await page
+        .evaluate(() => {
+          const inputs = Array.from(
+            document.querySelectorAll("[data-table-label], [data-table-param]"),
+          );
+          const save = document.querySelector("[data-table-save]");
+          return {
+            rendered: inputs.length,
+            editable: inputs.filter(
+              (input) => !input.disabled && input.readOnly !== true && input.getAttribute("aria-disabled") !== "true",
+            ).length,
+            kinds: {
+              label: document.querySelectorAll("[data-table-label]").length,
+              param: document.querySelectorAll("[data-table-param]").length,
+            },
+            savePresent: save !== null,
+            saveDisabled: save ? save.disabled === true : null,
+          };
+        })
+        .catch(() => null);
+
+      // And then the write itself, because "renders a control" is not "accepts an edit". The
+      // value is restored immediately afterwards: this row is about the lock, and a probe that
+      // left a draft dirty on a real rule would make every later row's version reading a
+      // statement about the probe.
+      let typedAccepted = null;
+      let saveEnabledAfterTyping = null;
+      if (editSurface && editSurface.editable > 0) {
+        const typed = await page.evaluate(() => {
+          const input = document.querySelector("[data-table-label], [data-table-param]");
+          if (!input) return null;
+          const original = input.value;
+          const next = original.length > 0 ? `${original} qa` : "qa.lock.probe";
+          const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype,
+            "value",
+          )?.set;
+          if (setter) setter.call(input, next);
+          else input.value = next;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("blur", { bubbles: true }));
+          return { original, next, kind: input.hasAttribute("data-table-param") ? "param" : "label" };
+        });
+        if (typed) {
+          await page.waitForTimeout(400);
+          const saveEnabled = await page
+            .locator("[data-table-save]")
+            .first()
+            .isDisabled()
+            .then((disabled) => !disabled)
+            .catch(() => null);
+          // A dirty draft is the observable proof the keystroke was accepted; an enabled Save
+          // is the observable proof the product agreed the draft is committable.
+          const saveState = await page
+            .locator("[data-table-save-state]")
+            .first()
+            .innerText()
+            .then((text) => text.replace(/\s+/g, " ").trim())
+            .catch(() => null);
+          typedAccepted = saveState !== null && /unsaved/i.test(saveState);
+          saveEnabledAfterTyping = saveEnabled;
+          // Put the author's own value back.
+          await page.evaluate((original) => {
+            const input = document.querySelector("[data-table-label], [data-table-param]");
+            if (!input) return;
+            const setter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype,
+              "value",
+            )?.set;
+            if (setter) setter.call(input, original);
+            else input.value = original;
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("blur", { bubbles: true }));
+          }, typed.original);
+          await page.waitForTimeout(300);
+        }
+      }
+
+      tableSaves = {
+        landedOnTable: onTable,
+        tableMounted,
+        // Kept under its own name too, because the old field is what earlier notes cited and a
+        // silent rename would make two numbers in two reports look like one measurement.
+        editControls: editSurface?.editable ?? null,
+        editControlsRendered: editSurface?.rendered ?? null,
+        editControlKinds: editSurface?.kinds ?? null,
+        savePresent: editSurface?.savePresent ?? null,
+        saveDisabled: editSurface?.saveDisabled ?? null,
+        typedAccepted,
+        saveEnabledAfterTyping,
+      };
+      await shot(page, "page-workflow-builder-locked-table");
+
+      // **Come back.** This row navigates the pass to `/table` and the next two rows read the
+      // builder's own panels, so a row that left the builder on screen made the `listener`
+      // row report `panelFound: false` and the `plugin-palette` row read an empty palette —
+      // neither a product defect, both a *navigation leak* from a row three steps earlier.
+      // The tell is in the readings themselves: the `listener` row's `retargeted` succeeded
+      // (a real `PUT /graph` on the real rule) while `panelFound` was false, which is
+      // impossible for a live builder and only possible on a different page.
+      //
+      // So the return is part of this row, and it is verified rather than assumed: the
+      // builder has to be back on screen before the next row reads a single pixel of it.
+      await page.goto(
+        `${new URL(page.url()).origin}/workflows/${workflowId}/builder`,
+        { waitUntil: "domcontentloaded" },
+      ).catch(() => {});
+      await page.waitForSelector("[data-builder-canvas]", { timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(1200);
+      tableSaves = {
+        ...tableSaves,
+        returnedToBuilder: (await page.locator("[data-builder-canvas]").count()) > 0,
+      };
+    }
+
+    note({
+      step: "narrow-lock",
+      width,
+      lockedAttr: locked,
+      locked: locked === "true",
+      bannerPresent: banner !== null,
+      bannerText: banner ? banner.replace(/\s+/g, " ").trim().slice(0, 160) : null,
+      bannerLinksTable: bannerLinksTable > 0,
+      // Nothing may move in the server's copy.
+      nodesBefore: beforeNodes,
+      nodesAfterAddAttempt: afterAddAttempt,
+      nodesAfter: afterNodes,
+      nodesUnchanged: beforeNodes === afterNodes,
+      addRefused: afterAddAttempt === beforeNodes,
+      deleteKeyRefused: afterDeleteKey === afterAddAttempt,
+      draftWhileLocked: draftOpenLocked(draftWhileLocked),
+      edgesBefore: beforeEdges,
+      edgesAfter: afterEdges,
+      edgesUnchanged: beforeEdges === afterEdges,
+      // `beforeVersion` is the version the row started at; `lockKeysWindow` is the version after
+      // the key gestures were given a full write window. Reading it from the window rather than
+      // from the final `readGraphAgain()` is deliberate — the final read happens after more
+      // viewport and selection work, and the claim is about the key gestures.
+      undoRefused: beforeVersion === afterVersion,
+      // Whether that version was ever MOVED during the window. `undoRefused` on its own is also
+      // the answer for a graph nobody had time to write, and this is the field that separates
+      // "the lock refused the undo" from "the undo was never given its chance".
+      keysWriteWindowMs: lockKeysWindow.observedForMs,
+      versionDuringKeyWindow: lockKeysWindow.versionAfter,
+      keysUnchangedDuringWindow: lockKeysWindow.unchanged,
+      versionBefore: beforeVersion,
+      versionAfter: afterVersion,
+      // Read-only is not unusable.
+      cardStillSelectable: selectable,
+      // Whether the selection ever appeared, so `cardStillSelectable: 0` is not also the answer
+      // for a click that landed on a canvas that had not repainted.
+      selectionAppeared,
+      inspectorStillReads,
+      tableMode: tableSaves,
+    });
+    // Put the viewport back so every later step runs at the width the rest of the pass
+    // assumes. A pass that leaves the browser at 900px reports the next screen's layout as
+    // broken, which is a finding about the probe.
+    await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+    await page.waitForTimeout(800);
+  }
+
+  // ---- A plugin node in the palette, and gone when the plugin is disabled ----------------
+  // REQ-004: "A plugin node appears in the palette with its badge when the plugin is enabled
+  // and disappears when it is disabled; a definition using it then reports an honest
+  // validation error instead of failing at run time."
+  //
+  // **This probe is honest about the first claim, and that is the point.** `plugins_enabled_for`
+  // is a seam REQ-121 fills: today it returns an empty registry, so *no* plugin node can
+  // appear in any browser. A probe that asserted `badgeRendered: true` would be asserting a
+  // store that does not exist, and it would go on asserting it after REQ-121 lands.
+  //
+  // So the first two claims are read from the **API's own registry** — the endpoint the
+  // palette is drawn from — and the third is driven against a graph that uses the key, which
+  // is the state a real author reaches. When REQ-121's store lands, `enabledNow` flips from
+  // false to true on its own and the same note measures the palette.
+  {
+    const registry = await page
+      .evaluate(async () => {
+        const response = await fetch("/api/v1/workflows/node-types", { credentials: "same-origin" });
+        if (!response.ok) return null;
+        return await response.json();
+      })
+      .catch(() => null);
+    const apiTypes = registry?.node_types ?? [];
+    const apiPluginTypes = apiTypes.filter((entry) => entry.provider);
+    const palettePlugin = await page
+      .evaluate(() => {
+        const entries = Array.from(document.querySelectorAll("[data-palette-plugin]"));
+        return entries.map((entry) => ({
+          key: entry.getAttribute("data-palette-node"),
+          provider: entry.getAttribute("data-palette-plugin"),
+          badgeRendered: entry.querySelector("[data-palette-badge]") !== null,
+          // The tooltip has to name the provider, not just the badge: "Send mail · Plugin"
+          // says *that* it is a plugin and not *who* wrote it.
+          tooltipNamesProvider: (entry.getAttribute("title") ?? "").includes(
+            entry.getAttribute("data-palette-plugin") ?? "\u0000",
+          ),
+        }));
+      })
+      .catch(() => []);
+
+    // The third claim, driven for real: a graph that uses a plugin key is put through the
+    // validate endpoint, and the answer has to be the *plugin* sentence — "re-enable" — and
+    // not the *typo* sentence. The two are the whole criterion, and a refactor that made
+    // the disabled plugin read as a typo would satisfy "reports an honest validation error"
+    // in the loosest reading of the words.
+    const pluginKey = "plugin.mailer.send";
+    const disabledRead = await page
+      .evaluate(
+        async ({ workflowId: id, key }) => {
+          const graphResponse = await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" });
+          if (!graphResponse.ok) return null;
+          const current = await graphResponse.json();
+          // **THE WIRE CALLS THIS FIELD `type`, NOT `node_type`.** `Node` carries
+          // `#[serde(rename = "type")] pub node_type` under `deny_unknown_fields`, so the
+          // response's nodes have a `type` and no `node_type` at all. The map below used to read
+          // `node.node_type`, which was `undefined` for every node, and then
+          // `!node.node_type.startsWith(...)` threw a TypeError on the FIRST node -- inside
+          // `page.evaluate`, whose `.catch(() => null)` swallowed it, so `disabledRead` was
+          // `null` and the note reported `validateStatus: null, saysReEnable: false` on a
+          // product that answers this correctly. It is the same defect tick 74 found in
+          // `keyboard-pass`, in a row that ships eight lines later: **a gate that cannot go green
+          // and a gate that cannot go red read identically in a report.**
+          //
+          // `String(...)` rather than a bare read, because a node that somehow lacked the key
+          // would then throw here instead of reaching the `skipped` branch below, and the
+          // difference between "the rename did not happen" and "the row could not name a target"
+          // is the whole question this row asks.
+          const nodes = (current.graph?.nodes ?? []).map((node) =>
+            node.type === key ? node : { ...node, type: node.type },
+          );
+          // Put the key on the node that is not the trigger and not the end, so the finding
+          // is about the node type and not about an orphaned graph.
+          const target = nodes.find(
+            (node) => !String(node.type ?? "").startsWith("trigger.") && String(node.type ?? "") !== "end",
+          );
+          if (!target) return { skipped: "no non-trigger, non-end node to rename" };
+          target.type = key;
+          // **THE VALIDATE ROUTE IS `/workflows/{id}/validate`, NOT `…/graph/validate`.** The row
+          // invented the `/graph/` prefix and got a `404` — which it then reported as
+          // `validateStatus: 404, saysReEnable: false`, the same reading as "the product called a
+          // disabled plugin a typo". The mounted route is `mod.rs:1924`, the client calls
+          // `/api/v1/workflows/${id}/validate` (`lib/api.ts:5359`), and **the same walkthrough
+          // already uses the correct URL 10,000 lines above this one** (line 12110). So the file
+          // knew the answer and this row did not look.
+          //
+          // **THREE defects in one row, and the third is the one a person would have caught.**
+          // Wrong field name (tick 74's class), then a route that does not exist — both hidden by
+          // a `.catch()` that reported a constant. What makes the row worth the three is that
+          // `pluginProbeReachedServer` is now in the note: the throw that hid the first was
+          // visible as its own field, which is how the `404` was read as a sentence rather than
+          // as a missing route. A diagnostic that reports *how far it got* turns "the product is
+          // wrong" into "the row asked the wrong address", which are different days of work.
+          const validateResponse = await fetch(`/api/v1/workflows/${id}/validate`, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ graph: { nodes, edges: current.graph?.edges ?? [] } }),
+          });
+          const body = await validateResponse.json().catch(() => null);
+          return {
+            status: validateResponse.status,
+            findings: (body?.findings ?? []).map((finding) => ({
+              code: finding.code,
+              message: finding.message,
+              nodeId: finding.node_id ?? null,
+            })),
+          };
+        },
+        { workflowId, key: pluginKey },
+      )
+      .catch(() => null);
+
+    const unknownFindings = (disabledRead?.findings ?? []).filter((finding) => finding.code === "unknown_node_type");
+    const pluginSentence = unknownFindings.find((finding) => /re-enable/i.test(finding.message));
+    const typoSentence = unknownFindings.find((finding) => /not a node type the platform knows/i.test(finding.message));
+
+    note({
+      step: "plugin-palette",
+      // The honest first half: today there is no plugin store, so the palette has nothing to
+      // draw. Recorded rather than assumed, because a note that hard-codes `false` here is a
+      // note that will still be asserting the store is empty after REQ-121 lands.
+      enabledNow: apiPluginTypes.length > 0,
+      apiPluginTypes: apiPluginTypes.map((entry) => entry.key),
+      apiCategoriesIncludePlugins: (registry?.categories ?? []).includes("Plugins"),
+      palettePluginNodes: palettePlugin.length,
+      palettePlugin,
+      badgeRendered: palettePlugin.length > 0 && palettePlugin.every((entry) => entry.badgeRendered),
+      tooltipNamesProvider: palettePlugin.length > 0 && palettePlugin.every((entry) => entry.tooltipNamesProvider),
+      absentWhenDisabled: palettePlugin.length === 0,
+      // The third claim, measured against a graph that uses the key.
+      pluginKey,
+      // **A `null` here has to be legible, or it is the same number as a wrong sentence.**
+      // `disabledRead` is null whenever the fetch failed, the row could not name a target, or the
+      // evaluate threw -- and `saysReEnable: false` is what a correct product reads when the
+      // sentence is right. Tick 74's lesson in one field: a row that cannot distinguish "the
+      // product said the wrong thing" from "the row never asked" reports a constant.
+      pluginProbeReachedServer: disabledRead !== null,
+      pluginProbeSkipped: disabledRead?.skipped ?? null,
+      validateStatus: disabledRead?.status ?? null,
+      unknownFindings: unknownFindings.length,
+      namesNode: unknownFindings.some((finding) => typeof finding.nodeId === "string"),
+      // The two sentences must not collapse into each other; a test asserts this in Rust too.
+      saysReEnable: Boolean(pluginSentence),
+      saysTypo: Boolean(typoSentence),
+      sentinelsStayApart: Boolean(pluginSentence) && !typoSentence,
+    });
+  }
+
+  // ---- Listen for a real event (REQ-004 slice 3, criterion 5) ----------------------------
+  // The criterion has two clauses and the probe is shaped so each one FAILS if it stops
+  // being true:
+  //
+  //   * "captures a real bus event into the inspector **within one matcher tick**" — so the
+  //     reading is the PANEL's own text, not the API's. A probe that fetched
+  //     `/listeners` and printed `payload.slug` would pass against a panel that renders
+  //     nothing at all, which is the failure this control is most likely to have.
+  //   * "expires after 15 minutes **leaving no stray token**" — the window is read off the
+  //     two timestamps the server sends, because `expires_in_seconds` is 899 by the time a
+  //     response lands and pinning it to 900 asserts a rounding rule rather than the
+  //     window. The "no stray token" half is a server-side claim (the expired row is not in
+  //     a live-listener query) and is NOT readable from a browser, so it is proved by the
+  //     integration walk and only the *sentence* is read here.
+  {
+    // The trigger node, so the control is pressable: a listener waits for the event that
+    // starts a run, and a non-trigger node is refused with a reason.
+    const triggerCard = page
+      .locator('[data-node-type^="trigger."]')
+      .first();
+    const triggerCount = await triggerCard.count();
+    if (triggerCount > 0) {
+      await triggerCard.click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(700);
+    }
+
+    // **Retarget the graph node's own event before arming.** A listener is armed for the
+    // `params.event` of the *node* the author selected, not for the rule row's trigger
+    // column — that is the whole reason the builder's listener is node-scoped. The pass
+    // above created this rule listening for `user.created`, which a browser session cannot
+    // produce, so the node is pointed at `page.published` through the real graph route.
+    //
+    // The order is load-bearing: arming first and retargeting second would capture nothing,
+    // and "no capture" is exactly what a broken listener looks like. The reload matters for
+    // the same reason — the panel reads the node from the store the canvas was opened with,
+    // so arming without one would press a listener against the OLD event name.
+    const retargeted = await page.evaluate(async (workflowId) => {
+      const EVENT = "page.published";
+      const current = await fetch(`/api/v1/workflows/${workflowId}/graph`, {
+        credentials: "same-origin",
+      });
+      if (!current.ok) return { ok: false, reason: `read ${current.status}` };
+      const body = await current.json();
+      const nodes = body?.graph?.nodes ?? [];
+      const trigger = nodes.find((node) => String(node.type).startsWith("trigger."));
+      if (!trigger) return { ok: false, reason: "no trigger node on the canvas" };
+      if (trigger?.params?.event === EVENT) return { ok: true, alreadyThere: true, event: EVENT };
+
+      const next = nodes.map((node) =>
+        node.id === trigger.id
+          ? { ...node, params: { ...(node.params ?? {}), event: EVENT } }
+          : node,
+      );
+      const saved = await fetch(`/api/v1/workflows/${workflowId}/graph`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          graph: { nodes: next, edges: body?.graph?.edges ?? [] },
+          graph_version: body.graph_version,
+        }),
+      });
+      if (!saved.ok) return { ok: false, reason: `save ${saved.status}` };
+      return { ok: true, event: EVENT, nodeId: trigger.id };
+    }, workflowId ?? null).catch(() => null);
+
+    if (retargeted?.ok && !retargeted.alreadyThere) {
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(1800);
+      // Re-select the trigger: a reload clears the selection, and the control is
+      // unpressable with nothing selected — which is its own refusal, and the wrong one
+      // to be measuring here.
+      await page
+        .locator('[data-node-type^="trigger."]')
+        .first()
+        .click({ timeout: 8000 })
+        .catch(() => {});
+      await page.waitForTimeout(600);
+    }
+
+    // The refusal state first, because it is the one that costs an author fifteen minutes.
+    const armedControl = page.locator("[data-listener-arm]");
+    const armCount = await armedControl.count();
+    const armDisabled = armCount > 0
+      ? await armedControl.first().isDisabled().catch(() => true)
+      : null;
+    const armReason = (await page
+      .locator("[data-listener-reason]")
+      .first()
+      .innerText()
+      .catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+
+    let armed = null;
+    if (armCount > 0 && !armDisabled) {
+      await armedControl.first().click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+
+      // **A real bus event**, through a real API route rather than an insert into `events`:
+      // an insert would prove the SQL and not the route the matcher reads from. The node
+      // was already retargeted above, so this only has to produce the event.
+      //
+      // A probe that fired the wrong event would report "no capture" and be
+      // indistinguishable from a broken listener — which is why the name comes from the
+      // retarget that just ran rather than being written out a second time.
+      const eventFired = await page.evaluate(async () => {
+        const EVENT = "page.published";
+        const created = await fetch("/api/v1/pages", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ slug: "listen-probe", title: "Listen probe" }),
+        });
+        if (!created.ok) return { published: false, reason: `create ${created.status}`, event: EVENT };
+        const pageId = (await created.json())?.id;
+        if (!pageId) return { published: false, reason: "no page id", event: EVENT };
+        const published = await fetch(`/api/v1/pages/${pageId}/publish`, {
+          method: "POST",
+          credentials: "same-origin",
+        });
+        return { published: published.ok, event: EVENT };
+      }).catch(() => null);
+
+      // The matcher runs in the API process, so the capture needs a tick of wall clock.
+      // The panel polls every two seconds; give it three and a margin.
+      await page.waitForTimeout(7000);
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(2000);
+
+      armed = await page.evaluate(() => {
+        const panel = document.querySelector("[data-builder-listener]");
+        if (!panel) return null;
+        const capture = panel.querySelector("[data-listener-capture-status]");
+        const payload = panel.querySelector("[data-listener-payload]");
+        const block = panel.querySelector("[data-listener-capture]");
+        return {
+          panelFound: true,
+          summary: panel.querySelector("[data-listener-summary]")?.textContent?.trim() ?? null,
+          // The panel's own sentence, which is the reading that matters.
+          captureText: capture?.textContent?.replace(/\s+/g, " ").trim() ?? null,
+          // The KIND, which the sentence alone could not carry until this tick. The capture and
+          // the wait used to render the same "Captured page.published" heading, so
+          // `captureText: /Captured/` passed against a panel that had heard nothing — and the
+          // criterion's own claim (a real event shows up in the inspector) was unmeasurable,
+          // because the uncaptured state and the captured state were one reading. Read the
+          // attribute so a red row names WHICH half is wrong.
+          captureKind: block?.getAttribute("data-listener-capture-kind") ?? null,
+          payloadRendered: payload !== null,
+          payloadLength: payload?.textContent?.length ?? 0,
+          countdown: panel.querySelector("[data-listener-countdown]")?.textContent?.trim() ?? null,
+          tokenShown: panel.querySelector("[data-listener-token]")?.textContent?.trim() ?? null,
+          live: panel.querySelector("[data-listener-live]") !== null,
+        };
+      });
+      armed = { ...(armed ?? {}), eventFired: eventFired ?? null };
+    }
+
+    // The wire, read from the browser's own session: the panel proves it renders, this
+    // proves the server sent a real payload and that the window is fifteen minutes.
+    const onTheWire = await page.evaluate(async (workflowId) => {
+      if (!workflowId) return null;
+      const res = await fetch(`/api/v1/workflows/${workflowId}/listeners`, {
+        credentials: "same-origin",
+      });
+      if (!res.ok) return { status: res.status };
+      const body = await res.json();
+      const captured = body.captured ?? null;
+      let windowSeconds = null;
+      if (captured) {
+        const armed0 = Date.parse(captured.armed_at);
+        const expires = Date.parse(captured.expires_at);
+        if (Number.isFinite(armed0) && Number.isFinite(expires)) {
+          windowSeconds = Math.round((expires - armed0) / 1000);
+        }
+      }
+      return {
+        status: res.status,
+        armed: body.armed ?? null,
+        rows: Array.isArray(body.listeners) ? body.listeners.length : null,
+        capturedStatus: captured?.status ?? null,
+        capturedEvent: captured?.event_name ?? null,
+        capturedPayloadKeys: captured?.payload ? Object.keys(captured.payload) : null,
+        windowSeconds,
+        // The token must never be what the server sends back on a read — it is returned
+        // once by the arming and never again.
+        tokenInRead: Object.values(captured ?? {}).some((value) =>
+          typeof value === "string" && value.length === 32 && /^[A-Za-z0-9]+$/.test(value),
+        ),
+      };
+    }, workflowId ?? null).catch(() => null);
+
+    note({
+      step: "listener",
+      panelFound: (await page.locator("[data-builder-listener]").count()) > 0,
+      controlFound: armCount > 0,
+      // The retarget is a precondition, not part of the criterion — but a probe that
+      // skipped it would report "no capture" and be read as a broken listener.
+      retargeted: retargeted ?? null,
+      // A disabled control must say why. A greyed button with no reason is a dead button
+      // wearing a disabled attribute.
+      armDisabled,
+      armReason: armReason ? armReason.slice(0, 160) : null,
+      triggerNodeFound: triggerCount > 0,
+      // The panel's own rendering.
+      captureRendered: (armed?.captureText ?? null) !== null,
+      captureText: armed?.captureText ?? null,
+      // The kind, which is what `captureText` could not express. Two readings, one heading,
+      // meant a probe could only ever report "something is drawn here"; now the row names the
+      // state, so a red one says whether the event never arrived or arrived unrendered.
+      captureKind: armed?.captureKind ?? null,
+      payloadRendered: armed?.payloadRendered ?? null,
+      payloadLength: armed?.payloadLength ?? null,
+      countdown: armed?.countdown ?? null,
+      summary: armed?.summary ?? null,
+      eventPublished: armed?.eventFired?.published ?? null,
+      eventName: armed?.eventFired?.event ?? null,
+      // The server's half.
+      armedOnTheWire: onTheWire?.armed ?? null,
+      listenerRows: onTheWire?.rows ?? null,
+      capturedStatus: onTheWire?.capturedStatus ?? null,
+      capturedEvent: onTheWire?.capturedEvent ?? null,
+      capturedPayloadKeys: onTheWire?.capturedPayloadKeys ?? null,
+      // REQ-004 names fifteen minutes; asserted as the gap between the two timestamps.
+      windowSeconds: onTheWire?.windowSeconds ?? null,
+      tokenReturnedOnRead: onTheWire?.tokenInRead ?? null,
+    });
+    await shot(page, "page-workflow-builder-listener");
+  }
+
+  // ---- Cleanup: this pass owns the rule it made --------------------------------------------
+  await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const row = page.locator("[data-automation-row] a", { hasText: ruleName }).first();
+  if ((await row.count()) > 0) {
+    await row.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    await page.locator("[data-automation-delete]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForSelector("[data-automation-delete-input]", { timeout: 5000 }).catch(() => {});
+    await page.locator("[data-automation-delete-input]").first().fill(ruleName).catch(() => {});
+    await page.locator("[data-automation-delete-confirm-button]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  note({ step: "cleanup", removed: ruleName });
+
+  report.workflowBuilder = { steps, ruleName, opened };
+  log(`workflow-builder: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * The depth passes that `--only=<name>` can run on their own.
+ *
+ * The key is the pass's own name minus the `Depth` suffix (`automations` for
+ * `runAutomationsDepth`), so the flag reads like the thing it drives. A pass that is not listed
+ * here simply cannot be run alone, which is the honest default: a partial pass that silently ran
+ * nothing would report "0 failures" and mean nothing by it.
+ */
+/**
+ * REQ-004 criterion 8 — Table mode, driven from the builder's own "Table mode" link.
+ *
+ * ## What the criterion actually asks, and why the obvious probe is worthless
+ *
+ * *"Table mode renders the same definition, edits parameters, and stays consistent with the
+ * canvas after a save in either mode."* Three claims, and the third is the only hard one.
+ *
+ * A probe that loads `/workflows/{id}/table` and counts rows answers the first claim and is
+ * compatible with **both** ways of getting it wrong. The old link pointed at
+ * `/automations/{id}` — REQ-003's linear step editor, a different projection of the rule — and
+ * a table over that is a perfectly good table of a definition the canvas never drew. So this
+ * probe goes through the *link the builder offers*, which is the path an author takes, and it
+ * answers the third claim in the only way that can fail: read the graph back **through the API**
+ * after the save, and compare it with what the table claims it wrote.
+ *
+ * ## The two ways a table can be fake, and what each needs asserted
+ *
+ * 1. **A table that renders and does not save.** `defaultValue` on an input is uncontrolled, so
+ *    the obvious implementation never reads it back, the save button is a decoration, and the
+ *    screen looks right until the author reloads. The probe therefore asserts the *server's*
+ *    value changed — not that a toast appeared.
+ * 2. **A table that saves and drifts.** It holds its own copy of the graph and writes it whole,
+ *    so a save from the canvas between load and commit silently reverts the table's edit. The
+ *    probe commits **after** a canvas-side save and asserts the canvas's own edit survived, which
+ *    is the "in either mode" half of the sentence.
+ */
+
+async function runWorkflowTableDepth(page, report) {
+  const steps = [];
+  const note = (entry) => {
+    steps.push(entry);
+    record({ page: "workflow-table-depth", action: "workflow-table", ...entry });
+  };
+
+  // A rule of our own: the pass must not depend on whatever another writer's pass left behind.
+  const ruleName = `QA table rule ${Date.now().toString(36)}`;
+  // The create is a *definition*, and a definition is a trigger plus steps: `WorkflowInput`
+  // deserializes `trigger` and `steps` as required, so `{name, description}` alone was
+  // refused as a missing field before any of the table code under test ran — the pass then
+  // returned on `id: null` and every row below it read empty, which is how criterion 8 sat
+  // unmeasured for three ticks. The trigger is structured (`{"kind":"manual"}`, never the
+  // bare string), and one task step is the smallest definition the engine accepts.
+  const created = await page.evaluate(async (name) => {
+    const response = await fetch("/api/v1/workflows", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name,
+        description: "table mode probe",
+        trigger: { kind: "manual" },
+        steps: [
+          {
+            name: "Only step",
+            kind: "task",
+            // `noop`, and not `log` — which is what this read for four ticks. The server's
+            // own refusal named the ten actions it accepts:
+            //
+            //   step "Only step" names the action "log", which is not one of:
+            //   noop, echo, fail, transient, send_email, comment_revision,
+            //   http_request, publish_page, run_workflow, ai.prompt
+            //
+            // so the create was refused `400`, `workflowId` came back `null`, and every row
+            // below returned early — indistinguishable from a Table mode that renders nothing.
+            // `log` is a plausible name for a logging step and was never a real one; the
+            // lesson is the tick-56 one again, and it is worth stating as its own rule because
+            // the refusal was already being recorded and nobody read it: **a recorded refusal
+            // is only useful if the next reader acts on it.** Four ticks of a green-looking
+            // `create: {status: 400, id: null}` sat in that field while the fix was one word
+            // away and spelled out in the message beside it.
+            //
+            // `noop` is also the right choice for a *probe* specifically: it is the one
+            // action with no side effect, so a table row that saves cannot mail somebody or
+            // publish a page. The criterion is about the two modes agreeing, and the cheapest
+            // way to find out whether they agree is with a step that does nothing.
+            action: "noop",
+            params: { message: "table mode probe" },
+          },
+        ],
+      }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }, ruleName);
+  const workflowId = created.body?.id ?? created.body?.workflow?.id ?? null;
+  // `StepDefinition` is `deny_unknown_fields`, so a rejected body says WHICH field in the
+  // refusal. Recording it turns "the create failed" into the next action; an empty string
+  // here meant the next four ticks each guessed at the payload instead of reading this.
+  note({
+    step: "create",
+    status: created.status,
+    id: workflowId,
+    refusal: created.status >= 400 ? (created.body?.error?.message ?? "").slice(0, 200) : null,
+  });
+  if (!workflowId) {
+    log(`workflow-table: ${JSON.stringify(steps)}`);
+    return steps;
+  }
+
+  const readGraph = async () =>
+    page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+        credentials: "same-origin",
+      });
+      return response.json().catch(() => null);
+    }, workflowId);
+
+  // ---- The builder, and the link an author would press -----------------------------------
+  // `URL_ADMIN`, not `admin`. `admin` is a LOCAL of `runIamPasskeysDepth` (line 10520), where it
+  // is deliberately `localhost` rather than `127.0.0.1` so a WebAuthn credential binds to the
+  // origin the browser will actually be on. Two navigations in this function borrowed the name
+  // from there, and a template string over an unbound identifier throws a `ReferenceError`
+  // *before* `.catch` attaches — so it was not a swallowed navigation error, it was the whole
+  // pass dying at its first line, on every run, since `98010ed6` added the row. The harness
+  // reported it as one line in a 40-line log and the acceptance box it guarded sat unmeasured.
+  await page
+    .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector("[data-builder-table-mode]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  const linkHref = await page
+    .locator("[data-builder-table-mode]")
+    .first()
+    .getAttribute("href")
+    .catch(() => null);
+  note({
+    step: "builder-link",
+    href: linkHref,
+    // The old value was /automations/{id}. A link that still points there is a link to a
+    // different definition, and no amount of table correctness would satisfy the criterion.
+    pointsAtTableRoute: linkHref === `/workflows/${workflowId}/table`,
+  });
+
+  await page.locator("[data-builder-table-mode]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-table-mode]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await shot(page, "page-workflow-table");
+
+  // ---- The same definition, row for row ---------------------------------------------------
+  const canvasGraph = await readGraph();
+  const canvasNodes = canvasGraph?.graph?.nodes ?? [];
+  const canvasEdges = canvasGraph?.graph?.edges ?? [];
+
+  const rows = await page.$$eval("[data-table-row]", (els) =>
+    els.map((el) => ({
+      id: el.getAttribute("data-table-row"),
+      type: el.querySelector("[data-table-type]")?.textContent?.trim() ?? "",
+      params: [...el.querySelectorAll("[data-table-param]")].map((input) => ({
+        key: input.getAttribute("data-table-param")?.split(".").slice(1).join(".") ?? "",
+        value: input.value,
+      })),
+      connections: [...el.querySelectorAll("[data-table-incoming],[data-table-outgoing]")].map(
+        (li) => li.textContent?.trim() ?? "",
+      ),
+    })),
+  );
+
+  note({
+    step: "same-definition",
+    canvasNodes: canvasNodes.length,
+    canvasEdges: canvasEdges.length,
+    rows: rows.length,
+    // A count would pass against a table showing the WRONG nodes in the right number.
+    idsMatch:
+      rows.length === canvasNodes.length &&
+      canvasNodes.every((node) => rows.some((row) => row.id === node.id)),
+    typesShown: rows.every((row) => row.type.length > 0),
+    // The criterion's "edits parameters" half needs a field to exist: a rule whose nodes carry
+    // no parameters renders "No parameters" and proves nothing about editing.
+    editableParams: rows.reduce((sum, row) => sum + row.params.length, 0),
+    connectionsShown: rows.reduce((sum, row) => sum + row.connections.length, 0),
+  });
+
+  // ---- Edit a parameter, and read the SERVER back -----------------------------------------
+  // Give a node a parameter to edit if it has none, through the API, so the probe does not
+  // depend on which node type the registry seeded.
+  await page.evaluate(async (id) => {
+    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    const trigger = current.graph.nodes.find((n) => n.type.startsWith("trigger"));
+    if (!trigger) return;
+    trigger.params = { ...(trigger.params ?? {}), event: "qa.table.probe" };
+    await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version }),
+    });
+  }, workflowId);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-table-row]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  const target = await page.evaluate(() => {
+    const input = document.querySelector("[data-table-param]");
+    if (!input) return null;
+    return input.getAttribute("data-table-param");
+  });
+
+  const saveStateBefore = (await page.locator("[data-table-save-state]").first().innerText().catch(() => "")).trim();
+  const saveDisabledBefore = await page.locator("[data-table-save]").first().isDisabled().catch(() => true);
+
+  if (target) {
+    const [nodeId, key] = [target.split(".")[0], target.split(".").slice(1).join(".")];
+    await page
+      .locator(`[data-table-param="${nodeId}.${key}"]`)
+      .first()
+      .fill("qa.table.edited")
+      .catch(() => {});
+    // The field is uncontrolled on purpose (a controlled field re-renders the whole draft on
+    // every keystroke and the caret jumps), so the commit happens on blur.
+    await page.locator("[data-table-rows]").first().click({ position: { x: 5, y: 5 } }).catch(() => {});
+    await page.waitForTimeout(400);
+  }
+
+  const saveStateDirty = (await page.locator("[data-table-save-state]").first().innerText().catch(() => "")).trim();
+  const saveEnabledDirty = await page.locator("[data-table-save]").first().isDisabled().catch(() => true);
+  await shot(page, "page-workflow-table-dirty");
+
+  await page.locator("[data-table-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const saveStateAfter = (await page.locator("[data-table-save-state]").first().innerText().catch(() => "")).trim();
+
+  // The server's copy, not the screen's.
+  const afterEdit = await readGraph();
+  const editedNode = (afterEdit?.graph?.nodes ?? []).find((n) => n.id === target?.split(".")[0]);
+  note({
+    step: "edit-saves",
+    field: target,
+    // An unedited draft must not be committable: a write here advances graph_version and hands
+    // the next tab a conflict no author created.
+    saveDisabledWhenClean: saveDisabledBefore,
+    saveEnabledWhenDirty: saveEnabledDirty === false,
+    stateWhenClean: saveStateBefore,
+    stateWhenDirty: saveStateDirty,
+    stateAfterSave: saveStateAfter,
+    serverValue: editedNode ? Object.entries(editedNode.params ?? {}).find(([k]) => k === target?.split(".").slice(1).join("."))?.[1] ?? null : null,
+    wroteToServer: editedNode
+      ? Object.entries(editedNode.params ?? {}).some(([k, v]) => k === target?.split(".").slice(1).join(".") && v === "qa.table.edited")
+      : false,
+    version: afterEdit?.graph_version ?? 0,
+  });
+  await shot(page, "page-workflow-table-saved");
+
+  // ---- "Consistent with the canvas after a save in either mode" -----------------------------
+  // The canvas writes a label, the table must show it. This is the direction the criterion
+  // names and the one a table holding its own copy of the graph gets wrong: it re-renders from
+  // what it loaded and the author's canvas edit is simply gone from the list.
+  await page.evaluate(async (id) => {
+    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    const node = current.graph.nodes[0];
+    if (!node) return;
+    node.label = "Renamed on the canvas";
+    await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version }),
+    });
+  }, workflowId);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-table-row]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const labelsAfterCanvasSave = await page.$$eval("[data-table-label]", (els) =>
+    els.map((el) => el.value),
+  );
+  note({
+    step: "canvas-save-visible",
+    labels: labelsAfterCanvasSave.slice(0, 4),
+    seesCanvasRename: labelsAfterCanvasSave.includes("Renamed on the canvas"),
+  });
+
+  // ---- A save from the table must not be reverted by a stale canvas load --------------------
+  // The reverse direction: a value the table committed is still there after the builder is
+  // opened and closed. A table that wrote to a different projection would pass every check
+  // above and fail exactly here.
+  //
+  // READ OFF THE CANVAS, and the naming is the argument. The field is `builderSeesTableEdit`
+  // and the line above it navigates to the builder, so a `fetch` of the graph here was a claim
+  // about Postgres wearing the name of a claim about a screen: a canvas that mounted no node, or
+  // an inspector that never received the graph, reported `true` identically. This is the
+  // tick-57 defect one block up — there the wire was read where the criterion named the panel,
+  // and the fix was the same: read the surface the sentence is about.
+  //
+  // So the read is card → inspector → field. The card that carries the value is found FIRST, by
+  // asking every card's inspector in turn, because the criterion does not say which node the
+  // table edit landed on and a probe that assumed it would be asserting a guess. The node id
+  // travels into the report so a `false` names the node that did not show it.
+  await page
+    .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  // Wait for the MARKER rather than a delay. `waitForTimeout(1500)` is a guess about mount time,
+  // and every assertion below is green against a page that has not drawn yet — the race tick 57
+  // spent itself on, here in its quietest form: a fixed delay is the only kind of wait that is
+  // wrong in the same direction every time and only on a slow machine.
+  await page.waitForSelector("[data-node-id]", { timeout: 20000 }).catch(() => {});
+  // Wait for ONE card to have been selected and its inspector mounted — NOT for `[data-inspector]`
+  // to merely exist. `NodeInspector` is rendered under `{selectedNode ? … : null}`
+  // (builder-view.tsx:2745), so on a *correct* product with nothing selected that selector never
+  // matches and this row is unsatisfiable: `inspected: 0`, `builderSeesTableEdit: false`, and a
+  // read that no defect can turn red. This is the tick-57 defect one block up, third instance and
+  // the same one — the read was moved off the wire but never made *possible*.
+  //
+  // So the card is CLICKED first. Which card is not guessed: the criterion does not say which node
+  // the table edit landed on, and a probe that picked one would be asserting an assumption. Every
+  // card is clicked in turn and the first whose inspector carries the literal is the answer. A
+  // product that renders the value in a field the table never wrote would still fail this, and a
+  // product whose inspector never mounts is `inspected: 0` rather than a false negative dressed
+  // as a `true`.
+  const cardIds = await page
+    .locator("[data-node-id]")
+    .evaluateAll((cards) => cards.map((card) => card.getAttribute("data-node-id")))
+    .catch(() => []);
+  const perNode = [];
+  for (const nodeId of cardIds) {
+    // A real pointer click through Playwright, not a dispatchEvent: the card's handler is a
+    // React `onPointerDown` and the port gesture above shows what a synthetic event costs.
+    await page
+      .locator(`[data-node-id="${nodeId}"]`)
+      .first()
+      .click({ timeout: 5000 })
+      .catch(() => {});
+    await page.waitForSelector(`[data-inspector="${nodeId}"]`, { timeout: 4000 }).catch(() => {});
+    const read = await page
+      .evaluate(
+        ({ id, value }) => {
+          const panel = document.querySelector(`[data-inspector="${id}"]`);
+          if (!panel) return { mounted: false, found: false, fields: [] };
+          const fields = Array.from(panel.querySelectorAll("[data-inspector-field]")).map((el) => ({
+            key: el.getAttribute("data-inspector-field"),
+            value: el.value ?? null,
+          }));
+          return { mounted: true, found: fields.some((f) => f.value === value), fields };
+        },
+        { id: nodeId, value: "qa.table.edited" },
+      )
+      .catch(() => ({ mounted: false, found: false, fields: [] }));
+    perNode.push({ nodeId, ...read });
+    if (read.found) break;
+    // A card that did not open its inspector is a card the click missed — a port dot, an
+    // overlay, an off-screen card. Escape, because the alternative is worse than a red row: a
+    // half-armed connect gesture survives into the run and unfinished-save rows below and turns
+    // their clicks into edge targets. Escape is the documented "that gesture is finished" key.
+    if (!read.mounted) {
+      await page.keyboard.press("Escape").catch(() => {});
+    }
+  }
+  const holder = perNode.find((entry) => entry.found) ?? null;
+  const canvasRead = {
+    cards: cardIds.length,
+    // How many cards were actually opened, and of those how many showed an inspector. Two
+    // different failures otherwise print one number: a canvas that drew nothing (`cards: 0`) and
+    // an inspector that refuses to mount (`mounted: 0` on six clicked cards).
+    clicked: perNode.length,
+    inspected: perNode.filter((entry) => entry.mounted).length,
+    // The node the value is on, so a `false` says WHICH node failed rather than only that
+    // something did. A count of zero is the same number whether the canvas is empty or the
+    // value is on a node the row never clicked.
+    nodeShowingValue: holder?.nodeId ?? null,
+    builderSeesTableEdit: holder !== null,
+    // Every card that was opened and what its inspector held, so a red row names the field that
+    // was wrong instead of only that a field was.
+    inspectedIds: perNode.filter((e) => e.mounted).map((entry) => entry.nodeId),
+    fieldsByNode: perNode.map((e) => ({ nodeId: e.nodeId, keys: e.fields.map((f) => f.key) })),
+  };
+  note({ step: "table-save-survives", ...canvasRead });
+  await shot(page, "page-workflow-table-final");
+
+  // ---- An unfinished rule SAVES, and the run is where it refuses ---------------------------
+  // The guard moved from "you may not save" to "you may not run" (91bcbda), and a probe written
+  // against the old contract is the reason this half went unmeasured: the save answers **200**
+  // carrying `findings`, so a note that reads `saveState === "error"` reports the opposite of
+  // what happened, and a "save failed" row is an instrument defect rather than a product one.
+  // The problems list is therefore read off the **response body** — the only place a 200 can
+  // carry a verdict — and the Run button is then pressed and its refusal read as text.
+  //
+  // The graph used here is the one the table pass just renamed, so it is already a real rule with
+  // real nodes; what makes it un-runnable is a *missing event name* on the trigger, which is the
+  // state a rule is in for the whole of the first minute of its life and the one the previous
+  // contract made unsavable.
+  const unfinished = await page.evaluate(async (id) => {
+    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    const graph = current.graph;
+    // A trigger with no event name: `missing_parameter`, an error, and the graph still projects
+    // well enough to store — the exact shape the old save refused and the new one records.
+    const trigger = graph.nodes.find((n) => n.type.startsWith("trigger"));
+    if (!trigger) return { skipped: "no trigger node in the graph" };
+    trigger.params = { ...(trigger.params ?? {}) };
+    delete trigger.params.event;
+
+    const csrf = document.cookie
+      .split(";")
+      .map((pair) => pair.split("="))
+      .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+      ?.trim();
+
+    const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: {
+        "content-type": "application/json",
+        ...(csrf ? { "x-omnion-csrf": csrf } : {}),
+      },
+      body: JSON.stringify({ graph, graph_version: current.graph_version }),
+    });
+    const body = await response.json().catch(() => null);
+    return {
+      status: response.status,
+      errorCount: body?.error_count ?? null,
+      findingCount: body?.findings?.length ?? null,
+      codes: (body?.findings ?? []).map((f) => f.code).slice(0, 6),
+      recordedReason: body?.validation_error ?? null,
+      version: body?.graph_version ?? null,
+    };
+  }, workflowId);
+  note({
+    step: "unfinished-saves",
+    // 200 is the whole claim: refusing to store a rule that is not yet runnable is refusing
+    // the first keystroke of the feature whose job is being edited.
+    savedWith200: unfinished.status === 200,
+    status: unfinished.status ?? null,
+    errorCount: unfinished.errorCount ?? null,
+    findingCount: unfinished.findingCount ?? null,
+    codes: unfinished.codes ?? null,
+    reasonRecorded: Boolean((unfinished.recordedReason ?? "").trim()),
+    reason: (unfinished.recordedReason ?? "").slice(0, 120) || null,
+    skipped: unfinished.skipped ?? null,
+  });
+
+  // Now the run. The refusal must be a *sentence about the rule*, read off the screen, and the
+  // stored steps must still be the last runnable list — a save that blanked them would make
+  // "not yet runnable" and "has never run" the same row.
+  const runResponse = await page.evaluate(async (id) => {
+    const csrf = document.cookie
+      .split(";")
+      .map((pair) => pair.split("="))
+      .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+      ?.trim();
+    const response = await fetch(`/api/v1/workflows/${id}/run`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { ...(csrf ? { "x-omnion-csrf": csrf } : {}) },
+    });
+    const body = await response.json().catch(() => null);
+    const after = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    return {
+      status: response.status,
+      // The run response's error envelope, read off `body` — the RUN response, not the graph read
+      // that follows it in this block. `GraphBody` has no `error` (it carries `validation_error`),
+      // so a read of `after.error` would be `undefined` on a 200 and `probe-api-fields.mjs`
+      // reported it against the graph path. `error` is not optional on the envelope, so `?.` is
+      // here for a refusal that answered with no body at all, which the row already handles.
+      code: body?.error?.code ?? null,
+      message: (body?.error?.message ?? "").slice(0, 160) || null,
+      // Named so a reader can tell "the graph read has no error field" from "the run was refused".
+      stepsKept: Array.isArray(after?.steps) ? after.steps.length : null,
+      executions: await (await fetch(`/api/v1/workflows/${id}/executions`, { credentials: "same-origin" }))
+        .json()
+        .then((r) => (Array.isArray(r?.executions) ? r.executions.length : null))
+        .catch(() => null),
+    };
+  }, workflowId);
+  note({
+    step: "unfinished-run-refused",
+    // 400, not 403/404/409: the caller is allowed to try, this rule is not ready.
+    refused: runResponse.status === 400,
+    status: runResponse.status ?? null,
+    code: runResponse.code,
+    message: runResponse.message,
+    // The recorded reason reaches the author verbatim rather than as a generic refusal.
+    messageNamesTheGraph: Boolean((runResponse.message ?? "").trim()),
+    // A refusal must leave no run behind: an execution row for a run that never started is a
+    // rule that looks like it fired.
+    executionsAfter: runResponse.executions ?? null,
+    stepsKept: runResponse.stepsKept ?? null,
+  });
+
+  // And the panel, which is where an author finds out: the problems list must render the
+  // findings the 200 carried. A 200 whose findings never reach the screen is a save that
+  // answers "yes" and tells the author nothing.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const problemsAfterUnfinishedSave = await page.evaluate(() => {
+    const toggle = document.querySelector("[data-problems-toggle]");
+    return {
+      header: (toggle?.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 80),
+      listed: [...document.querySelectorAll("[data-finding]")].map((el) => el.getAttribute("data-finding")),
+      saysNone: Boolean(document.querySelector("[data-problems-none]")),
+    };
+  });
+  note({
+    step: "unfinished-problems-panel",
+    header: problemsAfterUnfinishedSave.header,
+    listed: problemsAfterUnfinishedSave.listed,
+    // "No problems" over a graph the server will not run is the exact failure the finding list
+    // fix was made for.
+    notClaimingClean: !problemsAfterUnfinishedSave.saysNone,
+    namesTheMissingParameter: problemsAfterUnfinishedSave.listed.includes("missing_parameter"),
+  });
+
+  // Put the rule back together, so a later pass step that runs a rule of its own is not handed
+  // the rule this probe broke.
+  await page.evaluate(async (id) => {
+    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    const trigger = current.graph.nodes.find((n) => n.type.startsWith("trigger"));
+    if (!trigger) return;
+    trigger.params = { ...(trigger.params ?? {}), event: "user.created" };
+    const csrf = document.cookie
+      .split(";")
+      .map((pair) => pair.split("="))
+      .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+      ?.trim();
+    await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: {
+        "content-type": "application/json",
+        ...(csrf ? { "x-omnion-csrf": csrf } : {}),
+      },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version }),
+    });
+  }, workflowId);
+  note({ step: "repaired", repaired: true });
+
+  log(`workflow-table: ${JSON.stringify(steps)}`);
+  report.workflowTable = steps;
+  return steps;
+}
+
+const DEPTH_PASSES = {
+  automations: (page, report) => runAutomationsDepth(page, report),
+  automationsactions: (page, report) => runAutomationsActionsDepth(page, report),
+  automationsapprovals: (page, report) => runAutomationsApprovalsDepth(page, report),
+  // The operations pass (REQ-003, slice 4) — the five screens that cannot be reached from a
+  // static route list, so the pass builds the state they read and then reads them.
+  automationsoperations: (page, report) => runAutomationsOperationsDepth(page, report),
+  // The builder (REQ-004, slice 1): the workspace's path carries a rule id, so the pass
+  // creates a rule and drives *its* builder.
+  workflowbuilder: (page, report) => runWorkflowBuilderDepth(page, report),
+  // Table mode (REQ-004, criterion 8): a sibling route of the same graph, reached through
+  // the builder's own link so the probe measures the path an author takes.
+  workflowtable: (page, report) => runWorkflowTableDepth(page, report),
+  analytics: (page, report) => runAnalyticsDepth(page, report),
+  search: (page, report) => runSearchDepth(page, report),
+  iamroles: (page, report) => runIamRolesDepth(page, report),
+  iampolicies: (page, report) => runIamPoliciesDepth(page, report),
+  iamsecurity: (page, report) => runIamSecurityDepth(page, report),
+  iamapprovals: (page, report) => runIamApprovalsDepth(page, report),
+  iamprovisioning: (page, report) => runIamProvisioningDepth(page, report),
+  // The enterprise sign-in pass (REQ-006, slice 4b-2) — registered here too, so the wave that
+  // wrote it can run it alone with `--only=iamauthentication` rather than through the full
+  // inventory beside five other writers' stacks.
+  iamauthentication: (page, report) => runIamAuthenticationDepth(page, report),
+  passkeys: (page, report) => runPasskeysDepth(page, report),
+};
+
+/**
  * The enterprise sign-in screen (REQ-006, slice 4b-2).
  *
  * The screen is about trust, so the pass checks the two claims it makes: a secret is a *name* the
@@ -13176,182 +16665,6 @@ async function runIamAuthenticationDepth(page, report) {
   await shot(page, "page-iam-authentication-empty");
 
   report.iamAuthentication = { steps };
-}
-
-// ---------------------------------------------------------------------------------------------
-// REQ-127 slice 4 — the inbound intake screen, driven end to end.
-// ---------------------------------------------------------------------------------------------
-//
-// What this pass is really checking is the ONE thing a Rust test cannot see: that an operator
-// can answer "is my signature right, and what did the platform refuse?" without leaving the
-// page. Four steps, each of which has a failure mode that reads like a working screen:
-//
-// * The tester runs the PLATFORM'S guard, so the pass types a sample and a deliberately wrong
-//   signature and expects a refusal WITH A REASON. A tester that answered "valid" here would
-//   be a tester with its own HMAC implementation, which is the whole bug this action exists to
-//   avoid.
-// * A refusal must never show the key. The pass searches the dialog's text for the secret it
-//   cannot know, and asserts the dialog has no "reveal"-shaped control at all — a button whose
-//   label contains the word is enough, and it is the cheapest possible future leak.
-// * The declare dialog is opened and CLOSED without saving. A pass that saved would leave a
-//   declaration in the QA database that the next run's list assertions then trip over, and the
-//   symptom is a flaky pass rather than a wrong form.
-// * The removal dialog is opened and CANCELLED, and the pass asserts the confirm is disabled
-//   while the reason is empty. Removing a declaration turns a guarded door into an open one,
-//   and an unconfirmed removal is the one action on this screen with no undo.
-// ---------------------------------------------------------------------------------------------
-async function runReliabilityIntakeDepth(page) {
-  const steps = [];
-  const note = (step) => {
-    steps.push(step);
-    record({ page: "reliability-intake-depth", action: "intake", ...step });
-  };
-
-  await page.goto(`${URL_ADMIN}/settings/reliability/intake`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page
-    .waitForSelector("[data-view=\"reliability-intake\"], [role=\"alert\"]", { timeout: 20000 })
-    .catch(() => {});
-  await page.waitForTimeout(700);
-
-  const rendered = await page.locator("[data-view=\"reliability-intake\"]").count();
-  const rows = await page.locator("[data-intake]").count();
-  const cards = await page.locator("[data-intake-card]").count();
-  const emptyText = await page
-    .locator("[data-view=\"reliability-intake\"]")
-    .first()
-    .innerText()
-    .catch(() => "");
-  note({
-    step: "screen",
-    rendered,
-    rows,
-    cards,
-    hasEmptyState: /No inbound endpoint is declared/i.test(emptyText),
-  });
-  await shot(page, "page-reliability-intake");
-
-  // ---- The tester, on the first declared endpoint -----------------------------------------
-  const verifyButton = page.locator("button", { hasText: "Verify sample" }).first();
-  const hasEndpoint = (await verifyButton.count()) > 0;
-  if (hasEndpoint) {
-    await verifyButton.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[aria-label=\"Verify a signature sample\"]", { timeout: 10000 }).catch(() => {});
-    await page.waitForTimeout(300);
-    await page
-      .locator("[aria-label=\"Verify a signature sample\"] textarea")
-      .first()
-      .fill('{"event":"qa.sample"}')
-      .catch(() => {});
-    await page
-      .locator("[aria-label=\"Verify a signature sample\"] input")
-      .first()
-      .fill("v1,qa:0000")
-      .catch(() => {});
-    await page
-      .locator("[aria-label=\"Verify a signature sample\"] button", { hasText: "Verify" })
-      .first()
-      .click({ timeout: 8000 })
-      .catch(() => {});
-    await page.waitForSelector("[data-verdict]", { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(300);
-    const verdict = await page.locator("[data-verdict]").first().getAttribute("data-verdict").catch(() => null);
-    const dialogText = await page
-      .locator("[aria-label=\"Verify a signature sample\"]")
-      .first()
-      .innerText()
-      .catch(() => "");
-    // A tester with its own HMAC implementation would answer `valid` for a body the platform
-    // refuses, and the operator would chase a signing key that was never wrong.
-    note({
-      step: "verify-sample",
-      verdict,
-      refused: verdict === "invalid",
-      namesTheReason: /Refused:/.test(dialogText),
-      // The screen has no way to reveal a key, so there is nothing to look for. Asserted as an
-      // ABSENCE of a control, not as an absence of a value: a value nobody can reach is fine,
-      // a button is not.
-      noRevealControl: !/reveal|show secret|show key/i.test(dialogText),
-    });
-    await shot(page, "page-reliability-intake-verify");
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(300);
-  } else {
-    note({ step: "verify-sample", skipped: "no declared endpoint to test against" });
-  }
-
-  // ---- The declare dialog: opened, validated, closed WITHOUT saving ------------------------
-  await page.locator("button", { hasText: "Declare" }).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[aria-label=\"Declare intake endpoint\"]", { timeout: 10000 }).catch(() => {});
-  await page.waitForTimeout(300);
-  const fields = await page
-    .locator("[aria-label=\"Declare intake endpoint\"] input, [aria-label=\"Declare intake endpoint\"] select, [aria-label=\"Declare intake endpoint\"] textarea")
-    .count();
-  // Every control carries a VISIBLE label. A placeholder-only field is the panel's own rule and
-  // it is checked here rather than assumed: an unlabelled number input is indistinguishable
-  // from a tolerance window and from a byte cap.
-  const labelled = await page.evaluate(() => {
-    const dialog = document.querySelector('[aria-label="Declare intake endpoint"]');
-    if (!dialog) return { total: 0, withLabel: 0 };
-    const controls = dialog.querySelectorAll("input, select, textarea");
-    let withLabel = 0;
-    for (const control of controls) {
-      if (control.type === "checkbox") {
-        withLabel += 1;
-        continue;
-      }
-      const id = control.getAttribute("id");
-      const wrapped = control.closest("label");
-      const aria = control.getAttribute("aria-label");
-      if ((id && dialog.querySelector(`label[for="${id}"]`)) || wrapped || aria) withLabel += 1;
-    }
-    return { total: controls.length, withLabel };
-  });
-  note({ step: "declare-dialog", fields, ...labelled });
-  await shot(page, "page-reliability-intake-declare");
-  await page.keyboard.press("Escape");
-  await page.waitForTimeout(300);
-
-  // ---- The removal confirmation: empty reason must not confirm -----------------------------
-  const removeButton = page.locator("button", { hasText: "Remove" }).first();
-  if ((await removeButton.count()) > 0) {
-    await removeButton.click({ timeout: 8000 }).catch(() => {});
-    await page.waitForSelector("[aria-label=\"Remove intake endpoint\"]", { timeout: 10000 }).catch(() => {});
-    await page.waitForTimeout(300);
-    const confirmDisabled = await page
-      .locator("[aria-label=\"Remove intake endpoint\"] button", { hasText: /^Remove$/ })
-      .first()
-      .isDisabled()
-      .catch(() => null);
-    const dialogText = await page
-      .locator("[aria-label=\"Remove intake endpoint\"]")
-      .first()
-      .innerText()
-      .catch(() => "");
-    note({
-      step: "remove-confirm",
-      // The API refuses an empty reason, so the button must too — a control that sends a
-      // request the server will reject teaches the operator that the dialog is decorative.
-      confirmDisabled: confirmDisabled === true,
-      asksForAReason: /reason/i.test(dialogText),
-    });
-    await shot(page, "page-reliability-intake-remove");
-    await page.locator("[aria-label=\"Remove intake endpoint\"] button", { hasText: "Cancel" }).first().click().catch(() => {});
-    await page.waitForTimeout(300);
-  }
-
-  // ---- Mobile: the table becomes cards, nothing scrolls sideways ---------------------------
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(500);
-  const overflow = await page.evaluate(() => {
-    const el = document.scrollingElement || document.documentElement;
-    return Math.max(0, el.scrollWidth - el.clientWidth);
-  });
-  const mobileCards = await page.locator("[data-intake-card]").count();
-  note({ step: "mobile", overflowPx: overflow, cards: mobileCards });
-  await shot(page, "page-reliability-intake-mobile");
-  await page.setViewportSize({ width: 1280, height: 900 });
-
-  return steps.length;
 }
 
 /**

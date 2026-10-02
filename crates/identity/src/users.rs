@@ -172,27 +172,29 @@ pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<
         .map_err(IdentityError::from)
 }
 
-/// Set an account's **primary organization** and answer the updated row.
+/// Attach an account to a tenant, and answer the updated row.
 ///
-/// ## Why this exists, and why onboarding needs it
+/// **This is the column tenancy is read from.** `onboarding_state` is a single global row
+/// (`where id = 1`) recording that a first run happened; it is a setup marker, not a
+/// membership. `apps/api::scope` resolves every request's organization from
+/// `users.organization_id`, so a tenant that exists but was never attached to its owner leaves
+/// every organization-scoped route answering `400 organization_required` — a wizard that
+/// reports "organization: done" while the account still has no tenant.
 ///
-/// `User.organization_id` is the primary organization, and `scope::resolve_organization` reads it
-/// on every org-scoped route: an account with `None` and no requested organization is answered
-/// `400 organization_required`. The first-run flow wrote the new organization to **`onboarding_state`
-/// only** — `onboarding::state::set_organization` updates the singleton row and nothing else — so
-/// the owner's account kept `organization_id = NULL` for the entire life of the installation.
+/// The onboarding step is the only caller today, and it is exactly the place the write was
+/// missing: the step created the organization, recorded it in the setup state, audited it, and
+/// stopped. Attaching the actor is the same transaction's business — the two must not be able
+/// to disagree.
 ///
-/// That is invisible in the first-run UI, which reads `onboarding_state`, and fatal everywhere
-/// else: the wizard finished "successfully", and then `GET /api/v1/sites`, `GET /api/v1/deployment/
-/// artifacts` and every other org-scoped read answered 400. `onboarding_state` is a progress
-/// record; `users.organization_id` is tenancy. Writing only the first is a setup that reports
-/// itself complete and hands the operator an installation they cannot use.
-///
-/// `None` means no such account, matching `set_status`.
-pub async fn set_organization(pool: &PgPool, id: Uuid, organization_id: Option<Uuid>) -> Result<Option<User>> {
-    let sql = format!(
-        "update users set organization_id = $2 where id = $1 returning {USER_COLUMNS}"
-    );
+/// `None` means no such account; the caller is a setup step acting on itself, so that is a bug
+/// rather than a state to handle, and the caller says so.
+pub async fn set_organization(
+    pool: &PgPool,
+    id: Uuid,
+    organization_id: Option<Uuid>,
+) -> Result<Option<User>> {
+    let sql =
+        format!("update users set organization_id = $2, updated_at = now() where id = $1 returning {USER_COLUMNS}");
     sqlx::query_as::<_, User>(&sql)
         .bind(id)
         .bind(organization_id)

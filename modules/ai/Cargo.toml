@@ -1,0 +1,19 @@
+[package]
+name = "omnion-module-ai"
+description = "Omnion AI: the pieces that turn a sentence into a workflow draft and the draft into a reviewed rule (docs/requests/REQ-046)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+omnion-ai-hub = { path = "../../crates/ai-hub" }
+omnion-audit = { path = "../../crates/audit" }
+omnion-workflows = { path = "../../crates/workflows" }

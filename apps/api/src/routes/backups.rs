@@ -2650,17 +2650,20 @@ pub(crate) async fn record(
     target: String,
     metadata: serde_json::Value,
 ) {
-    // Built through the constructor rather than a struct literal: `NewAuditEntry` has grown
-    // fields as the audit trail learned what an actor can be (a credential lease, a deployment
-    // key, a pipeline identity), and a literal here would name every one of them again each time.
-    // That is how this call site ended up failing to compile against a struct it had never heard
-    // of — the constructor absorbs new fields for free.
-    let entry = NewAuditEntry::by_user(actor, action)
-        .organization(organization_id)
-        .target("backup", target)
-        .metadata(metadata)
-        .ip_address(ip);
-    let result = omnion_audit::record(pool, entry).await;
+    let result = omnion_audit::record(
+        pool,
+        NewAuditEntry {
+            organization_id,
+            actor_user_id: Some(actor),
+            actor_type: omnion_audit::ActorType::User,
+            action,
+            target_type: Some("backup"),
+            target_id: Some(target),
+            metadata,
+            ip_address: ip,
+        },
+    )
+    .await;
     if let Err(error) = result {
         tracing::warn!(%error, action, "the action happened; its audit entry did not");
     }

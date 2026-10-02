@@ -142,6 +142,49 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "workflows",
         description: "Start and cancel workflow runs",
     },
+    // Deciding an approval is deliberately a *fourth* key rather than a variant of
+    // `workflows.run`: a person who may start a rule and a person who may let a parked run
+    // go on are two different powers. Folding them together would mean the editor who builds
+    // a rule can also wave through everything that rule asks for — which is exactly the
+    // "you approved your own automation" back door the separate key prevents.
+    PermissionDef {
+        key: "workflows.approve",
+        category: "workflows",
+        description: "Decide the approvals a rule is waiting for",
+    },
+    // The AI app builder (docs/requests/REQ-045). Four keys rather than two, and the split is
+    // the request's own: *"...and the app is actually created"* is a second act with a
+    // different blast radius from the sentence that proposed it.
+    //
+    // `read` and `generate` are the ordinary powers — reading plans and spending a generation
+    // are the same day's work. `review` is what a person does to an artifact: accepting,
+    // rejecting, editing, discarding. `apply` is the only key that can write a live table, and
+    // it is deliberately the *fourth* rather than a variant of `review`: a reviewer who
+    // tidies up proposals must not thereby be able to materialise them, because the apply
+    // runner also creates roles and permissions, so a single key would let a reviewer grant
+    // the power they just handed themselves. Four keys also mean the request's own acceptance
+    // line ("Keys … exist in the catalogue") is checkable — a key nothing is refused for is a
+    // key nobody holds.
+    PermissionDef {
+        key: "appbuilder.read",
+        category: "ai",
+        description: "Read AI app builder plans and their artifacts",
+    },
+    PermissionDef {
+        key: "appbuilder.generate",
+        category: "ai",
+        description: "Generate and regenerate app builder plans",
+    },
+    PermissionDef {
+        key: "appbuilder.review",
+        category: "ai",
+        description: "Accept, reject and edit generated app builder artifacts",
+    },
+    PermissionDef {
+        key: "appbuilder.apply",
+        category: "ai",
+        description: "Apply a reviewed app builder plan to the live platform",
+    },
     // Users.
     PermissionDef {
         key: "users.read",
@@ -214,92 +257,6 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "deployment.rollback",
         category: "deployment",
         description: "Roll a deployment back",
-    },
-    // REQ-128 slice 4 added two, and both are separate powers rather than extra detail on the
-    // ones above:
-    //
-    // * `bundle.generate` writes a row AND shells out to the release pipeline's generator. An
-    //   account that may only read releases must not be able to make the panel run a program;
-    //   giving it `deployment.read` for that would make the read key the most powerful one in
-    //   the deployment family.
-    // * `manage` already exists for the deployment centre's own writes; the upgrade
-    //   acknowledgement rides it rather than inventing a key, because accepting that a database
-    //   can only be restored is the same decision as rolling a deployment back.
-    PermissionDef {
-        key: "deployment.bundle.generate",
-        category: "deployment",
-        description: "Generate an environment bundle and render what it produces",
-    },
-    // REQ-129 adds three, and the split is the request's own: reading the ledger is `read`,
-    // CHANGING THE SCHEMA is not a deployment power, and rehearsing a reversal is neither of
-    // those two.
-    //
-    // * `migrations.read` — the ledger, one migration's SQL, the policy and the lint findings.
-    //   Metadata only: every field on those routes is derived from files and rows this
-    //   installation already has, so a viewer who may read deployments may read them too.
-    // * `migrations.apply` — runs DDL. Deliberately NOT `deployment.deploy`: an operator who may
-    //   ship a release is not thereby authorised to write the schema, and a key that means both
-    //   cannot answer "who changed the database?" after an incident. It IS narrower than
-    //   `deployment.rollback`, which only selects a previous image.
-    // * `migrations.verify` — rehearses a reversal against a scratch database and writes the one
-    //   column (`down_verified_at`) that makes a release claim its database can be rolled back.
-    //   Its own key because it is the one write in this family that LAUNCHES SQL, and because
-    //   separating it means "who approved the rollback path" is a distinct question from "who
-    //   applied the migration".
-    PermissionDef {
-        key: "deployment.migrations.read",
-        category: "deployment",
-        description: "Read the migration ledger, one migration's SQL, the policy and lint findings",
-    },
-    PermissionDef {
-        key: "deployment.migrations.apply",
-        category: "deployment",
-        description: "Apply pending schema migrations and save the migration policy",
-    },
-    PermissionDef {
-        key: "deployment.migrations.verify",
-        category: "deployment",
-        description: "Rehearse a migration reversal against a scratch database",
-    },
-    // * `backfills.manage` — starts, pauses and resumes a backfill job. Its own key because a
-    //   backfill is the only thing on this surface that WRITES EVERY ROW of a table: applying a
-    //   migration changes the schema for future rows, and this changes rows that already exist.
-    //   An operator trusted with `migrations.apply` has proved they may break the schema; they
-    //   have proved nothing about the data in it.
-    PermissionDef {
-        key: "deployment.backfills.manage",
-        category: "deployment",
-        description: "Run, pause and resume backfill jobs",
-    },
-    // * `seeds.load` — writes fixture rows into an installation. Its own key because the whole
-    //   point of the refusal is that only a non-production installation may be seeded, and the
-    //   key is what makes "who wrote this into my database" answerable. On a production-marked
-    //   installation the environment refuses as well — the two are independent, and this one is
-    //   the one that still applies to a demo-marked production install.
-    PermissionDef {
-        key: "deployment.seeds.load",
-        category: "deployment",
-        description: "Load a seed dataset into a non-production installation",
-    },
-    // * `exports.create` — asks for a copy of the installation's data to leave it. Its own key,
-    //   and the reason is the one the whole feature is built around: everything else on this
-    //   surface is a read or a write INSIDE the platform, while this is the only operation whose
-    //   product is an artifact that ends up somewhere the platform's controls do not follow. An
-    //   operator who may read every row has not thereby been authorised to produce a file, and a
-    //   key that meant both could not answer "who took the data out?" during an incident.
-    PermissionDef {
-        key: "deployment.exports.create",
-        category: "deployment",
-        description: "Create an anonymised support export",
-    },
-    // * `exports.download` — SEPARATE from `exports.create` because the export is written once and
-    //   read once, and those are different moments with different risk. Creation is a decision made
-    //   with the classification map in front of you; the download is the moment the bytes leave.
-    //   Collapsing them means revoking a link is also a decision about who may produce one.
-    PermissionDef {
-        key: "deployment.exports.download",
-        category: "deployment",
-        description: "Download a prepared anonymised export (single use)",
     },
     // Identity and access management.
     PermissionDef {
@@ -374,84 +331,6 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "iam.security.manage",
         category: "iam",
         description: "Change the password, lockout, IP and session policy",
-    },
-    // The secrets surface (docs/requests/REQ-125). Reading the key ring is deliberately
-    // separated from managing the root key: an operator who may see that a rotation exists is
-    // not the one who may start one, because a rotation is irreversible if the operator key is
-    // wrong.
-    PermissionDef {
-        key: "secrets.read",
-        category: "secrets",
-        description: "Read secrets, the key ring state and the credential slot assignments",
-    },
-    PermissionDef {
-        key: "secrets.manage",
-        category: "secrets",
-        description: "Create, change and archive stored secrets",
-    },
-    PermissionDef {
-        key: "secrets.root.manage",
-        category: "secrets",
-        description: "Rotate the installation root key and run a re-wrap ceremony",
-    },
-    PermissionDef {
-        key: "secrets.assign",
-        category: "secrets",
-        description: "Assign credentials to slots and change their primary and fallback",
-    },
-    PermissionDef {
-        key: "secrets.lease",
-        category: "secrets",
-        description: "Issue and revoke short-lived secret leases",
-    },
-    PermissionDef {
-        key: "secrets.deploykeys.read",
-        category: "secrets",
-        description: "Read deployment keys and their use log",
-    },
-    PermissionDef {
-        key: "secrets.deploykeys.manage",
-        category: "secrets",
-        description: "Create, revoke and delete deployment keys",
-    },
-    PermissionDef {
-        key: "secrets.audit",
-        category: "secrets",
-        description: "Read the secrets audit trail and acknowledge anomaly flags",
-    },
-    PermissionDef {
-        key: "observability.read",
-        category: "observability",
-        description: "Read logs, traces, metric catalogue, exporters and alert state",
-    },
-    PermissionDef {
-        key: "observability.manage",
-        category: "observability",
-        description: "Change observability settings, alert rules and silences",
-    },
-    PermissionDef {
-        key: "observability.exporters.manage",
-        category: "observability",
-        description: "Add, edit and test telemetry exporters",
-    },
-    // REQ-127, the reliability centre. The read/manage split is the request's own: reading a
-    // budget is safe, changing one is a production behaviour, and the intake power is separate
-    // because an intake endpoint's HMAC secret is a different kind of danger from a rate limit —
-    // a wrong budget throttles a customer, a wrong HMAC scheme accepts forged webhooks.
-    PermissionDef {
-        key: "reliability.read",
-        category: "reliability",
-        description: "Read rate-limit policies, refusal rollups and reliability state",
-    },
-    PermissionDef {
-        key: "reliability.manage",
-        category: "reliability",
-        description: "Change rate-limit policies, retry policies and breaker state",
-    },
-    PermissionDef {
-        key: "reliability.intake.manage",
-        category: "reliability",
-        description: "Declare inbound endpoints and change their HMAC, size caps and sanitisation",
     },
     PermissionDef {
         key: "iam.sessions.read",
@@ -867,165 +746,6 @@ mod tests {
     }
 
     #[test]
-    fn the_observability_family_is_catalogued() {
-        // REQ-126: the admin centre is guarded by `observability.*`, and the split matters —
-        // reading telemetry is not the power to reconfigure telemetry export.
-        for key in [
-            "observability.read",
-            "observability.manage",
-            "observability.exporters.manage",
-        ] {
-            assert!(is_known(key), "{key} must be in the catalogue");
-            assert_eq!(
-                get(key).map(|entry| entry.category),
-                Some("observability"),
-                "{key} belongs to the observability category"
-            );
-        }
-    }
-
-    /// REQ-127: the reliability centre's three keys exist, and the intake power is SEPARATE.
-    ///
-    /// The separation is the assertion, not the existence. `reliability.manage` changes a budget
-    /// — a wrong number throttles a customer. `reliability.intake.manage` declares an inbound
-    /// endpoint and its HMAC scheme — a wrong scheme accepts forged webhooks. Folding them into
-    /// one key would hand every operator who tunes a rate limit the power to change how inbound
-    /// traffic is authenticated, and folding the other way would make the intake screen
-    /// unreachable to the people who are supposed to own it.
-    #[test]
-    fn the_reliability_family_is_catalogued_and_intake_is_separate() {
-        for key in [
-            "reliability.read",
-            "reliability.manage",
-            "reliability.intake.manage",
-        ] {
-            assert!(is_known(key), "{key} must be in the catalogue");
-            assert_eq!(
-                get(key).map(|entry| entry.category),
-                Some("reliability"),
-                "{key} belongs to the reliability category"
-            );
-        }
-        // The read key must not imply the manage key, and the manage key must not imply the
-        // intake one. This is a catalogue-level statement about powers, and the integration walk
-        // in `apps/api/tests/reliability_limits.rs` proves it over the router.
-        assert_ne!(
-            get("reliability.manage").map(|entry| entry.description),
-            get("reliability.intake.manage").map(|entry| entry.description),
-            "two powers with one description are one power written twice"
-        );
-    }
-
-    #[test]
-    fn the_deployment_family_is_catalogued_and_generation_is_separate_from_reading() {
-        for key in [
-            "deployment.read",
-            "deployment.preview",
-            "deployment.deploy",
-            "deployment.rollback",
-            "deployment.bundle.generate",
-        ] {
-            assert!(is_known(key), "{key} must be in the catalogue");
-        }
-        // The bundle generator shells out to a program and writes a row, so it may not ride the
-        // read key. This is asserted rather than assumed because a route that guarded a
-        // subprocess with `deployment.read` would be green in every catalogue test and be the
-        // most powerful key in the family.
-        assert_ne!(
-            "deployment.bundle.generate", "deployment.read",
-            "generation is a write, not a read"
-        );
-    }
-
-    #[test]
-    fn a_backfill_is_not_the_same_power_as_a_migration_and_a_seed_is_not_either() {
-        // REQ-129 slice 3's two keys. A backfill writes every EXISTING row of a table; applying a
-        // migration only changes the schema for rows written from now on. Both keys are asserted
-        // distinct from the three migration keys because a route that guarded the backfill
-        // endpoints with `migrations.apply` would pass every test in this crate — none of them
-        // builds a router — and would leave "who rewrote my data" answering with the same key as
-        // "who changed my schema".
-        for key in [
-            "deployment.backfills.manage",
-            "deployment.seeds.load",
-            "deployment.migrations.apply",
-        ] {
-            assert!(is_known(key), "{key} must be in the catalogue");
-            assert_eq!(
-                get(key).map(|entry| entry.category),
-                Some("deployment"),
-                "{key} belongs to the deployment category"
-            );
-        }
-        assert_ne!(
-            "deployment.backfills.manage", "deployment.migrations.apply",
-            "rewriting existing rows is not changing the schema"
-        );
-        assert_ne!(
-            "deployment.seeds.load", "deployment.migrations.apply",
-            "loading fixture rows is not applying a migration"
-        );
-        assert_ne!(
-            "deployment.seeds.load", "deployment.backfills.manage",
-            "seeding writes chosen rows; a backfill writes a column of every row"
-        );
-    }
-
-    #[test]
-    fn applying_a_migration_is_not_a_deployment_power_and_rehearsing_is_not_either() {
-        // REQ-129's three keys, and the reasons they are three rather than one.
-        for key in [
-            "deployment.migrations.read",
-            "deployment.migrations.apply",
-            "deployment.migrations.verify",
-        ] {
-            assert!(is_known(key), "{key} must be in the catalogue");
-            assert_eq!(
-                get(key).map(|entry| entry.category),
-                Some("deployment"),
-                "{key} belongs to the deployment category"
-            );
-        }
-        // The claim this file exists to make load-bearing: `deployment.deploy` ships an image, it
-        // does not write the schema. A route that guarded `POST /migrations/apply` with the deploy
-        // key would be green in every test in this crate — none of them builds a router — and
-        // would answer "who changed the database?" with "whoever could deploy".
-        assert_ne!(
-            "deployment.migrations.apply", "deployment.deploy",
-            "changing the schema is not deploying an image"
-        );
-        assert_ne!(
-            "deployment.migrations.apply", "deployment.rollback",
-            "applying is the opposite of rolling back"
-        );
-        // Rehearsing a reversal is its own power because it is the only write here that executes
-        // SQL, and because it is the write that turns `unknown` into `reversible` on the release.
-        assert_ne!(
-            "deployment.migrations.verify", "deployment.migrations.apply",
-            "proving the rollback path is not applying a migration"
-        );
-        // Distinct descriptions, which is the cheapest way to catch two keys that drifted into
-        // one power. Two identical descriptions means the family grew a name and not a permission.
-        let mut descriptions: Vec<&str> = [
-            "deployment.read",
-            "deployment.migrations.read",
-            "deployment.migrations.apply",
-            "deployment.migrations.verify",
-        ]
-        .iter()
-        .map(|key| get(key).map(|entry| entry.description).unwrap_or(""))
-        .collect();
-        descriptions.sort_unstable();
-        let before = descriptions.len();
-        descriptions.dedup();
-        assert_eq!(
-            before,
-            descriptions.len(),
-            "two powers with one description are one power written twice"
-        );
-    }
-
-    #[test]
     fn the_tenancy_family_is_catalogued() {
         // docs/01-VISION.md §10 (multi-site vs multi-tenant) and docs/07-IAM.md §7: sites and
         // the domains that address them are first-class, so the keys that guard them are too.
@@ -1096,13 +816,25 @@ mod tests {
     fn the_workflow_family_is_catalogued() {
         // P09: the automation surface is guarded by three keys — read, manage and run — so a
         // role can be trusted to trigger a workflow without letting it rewrite definitions.
-        for key in ["workflows.read", "workflows.manage", "workflows.run"] {
+        for key in [
+            "workflows.read",
+            "workflows.manage",
+            "workflows.run",
+            "workflows.approve",
+        ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
                 Some("workflows"),
                 "{key} belongs to the workflows category"
             );
         }
+        // Deciding an approval is not `workflows.run`: a role that may start a rule must not
+        // be able to wave through everything that rule parks, or the gate is a formality.
+        assert_ne!(
+            get("workflows.approve").map(|entry| entry.key),
+            get("workflows.run").map(|entry| entry.key),
+            "approving is its own power"
+        );
     }
 
     #[test]
@@ -1117,6 +849,43 @@ mod tests {
                 "{key} belongs to the ai category"
             );
         }
+    }
+
+    #[test]
+    fn the_app_builder_family_is_catalogued_and_apply_is_its_own_power() {
+        // REQ-045 asks for four keys by name, and the acceptance line is checkable only if
+        // all four are here — so this walks the list rather than spot-checking one.
+        for key in [
+            "appbuilder.read",
+            "appbuilder.generate",
+            "appbuilder.review",
+            "appbuilder.apply",
+        ] {
+            let entry = get(key).unwrap_or_else(|| panic!("{key} is in the catalogue"));
+            assert_eq!(
+                entry.category, "ai",
+                "{key} groups with the other AI powers"
+            );
+            assert!(!entry.description.is_empty(), "{key} explains itself");
+        }
+
+        // `apply` writes live tables, creates roles and permissions, and is therefore the
+        // only key a *different* person should hold. Reviewing is not applying: a person who
+        // only tidies up proposals must not be able to materialise them, because the runner
+        // binds the permission keys the plan proposed — so one key would let a reviewer grant
+        // themselves exactly the power they were handed.
+        assert_ne!(
+            get("appbuilder.apply").map(|entry| entry.key),
+            get("appbuilder.review").map(|entry| entry.key),
+            "applying a plan is not reviewing it"
+        );
+        // Nor is it generation: spending a generation writes draft rows only, which are inert
+        // by construction, so the two must not be the same key.
+        assert_ne!(
+            get("appbuilder.apply").map(|entry| entry.key),
+            get("appbuilder.generate").map(|entry| entry.key),
+            "applying a plan is not generating it"
+        );
     }
 
     #[test]

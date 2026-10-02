@@ -461,88 +461,6 @@ impl Default for SearchConfig {
     }
 }
 
-/// Secret key-ring knobs (docs/requests/REQ-125).
-///
-/// The re-wrap walk is the one long-running writer in the secrets store, so its batch is small
-/// and its poll is bounded below by the runner itself. Both default to values that finish a
-/// small installation's rotation in seconds without ever holding a lock a lease redemption
-/// needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecretsConfig {
-    /// Whether this process walks a live re-wrap job (`OMNION_SECRETS_RUNNER`).
-    pub runner_enabled: bool,
-    /// Delay between two re-wrap ticks (`OMNION_SECRETS_POLL_MS`).
-    pub rewrap_poll_ms: u64,
-    /// Versions one tick may re-seal (`OMNION_SECRETS_REWRAP`).
-    pub rewrap_batch: usize,
-}
-
-impl Default for SecretsConfig {
-    fn default() -> Self {
-        Self {
-            runner_enabled: true,
-            rewrap_poll_ms: DEFAULT_SECRETS_POLL_MS,
-            rewrap_batch: DEFAULT_SECRETS_REWRAP_BATCH,
-        }
-    }
-}
-
-/// Default re-wrap poll interval: a small ring finishes in seconds, a large one never blocks.
-const DEFAULT_SECRETS_POLL_MS: u64 = 2_000;
-
-/// Default versions per re-wrap batch — a write window a redemption can queue behind.
-const DEFAULT_SECRETS_REWRAP_BATCH: usize = 25;
-
-/// The telemetry exporter loop (docs/requests/REQ-126).
-///
-/// The loop is the half of the exporter pipeline that MOVES data: it drains each configured
-/// exporter's bounded buffer on that row's `batch_ms` and sends it. It is a flag rather than a
-/// constant because an operator who wants telemetry to stop leaving the instance should be able
-/// to say so in the deployment rather than deleting every exporter row — the rows are the
-/// configuration, and the switch is the temporary decision.
-///
-/// Note what the flag does NOT control: the fan-out. Turning the loop off stops sending; the
-/// request path still fills the buffers, and their drop counter still rises, which is exactly
-/// what an operator wants to see before turning it back on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TelemetryConfig {
-    /// Whether this process drains exporter buffers (`OMNION_EXPORTER_FLUSH`).
-    pub exporter_flush_enabled: bool,
-    /// Whether this process evaluates the alert rules (`OMNION_ALERTS_EVALUATOR`).
-    ///
-    /// The switch an operator uses when the same rules run in Prometheus — the bundle ships them
-    /// as `alerts.yml` so Alertmanager's routing and silences can own the notification. Running
-    /// both is how an operator gets two pages for one incident, and the flag is the documented way
-    /// to avoid that rather than deleting the bundled rules.
-    pub alerts_evaluator_enabled: bool,
-    /// Whether this process prunes telemetry past its retention window
-    /// (`OMNION_RETENTION_SWEEP`).
-    ///
-    /// The switch an operator uses when they would rather run the same deletion from their own
-    /// cron. Two jobs deleting the same rows is harmless — every prune is `delete where ts <
-    /// cutoff` — but two jobs holding *different* retention values is not, and the flag is the
-    /// documented way to make that impossible rather than a comment asking people to remember.
-    pub retention_sweep_enabled: bool,
-    /// How long a drain waits for in-flight requests, in milliseconds
-    /// (`OMNION_DRAIN_TIMEOUT_MS`).
-    ///
-    /// It has to fit inside the deployment's termination grace period with room for the telemetry
-    /// flush that follows, which is why it is configuration rather than a constant: the number
-    /// that is right for a 30-second Kubernetes grace period is wrong for a 5-second one.
-    pub drain_timeout_ms: u64,
-}
-
-impl Default for TelemetryConfig {
-    fn default() -> Self {
-        Self {
-            exporter_flush_enabled: true,
-            alerts_evaluator_enabled: true,
-            retention_sweep_enabled: true,
-            drain_timeout_ms: 10_000,
-        }
-    }
-}
-
 /// Analytics collection and rollup knobs (docs/requests/REQ-007).
 ///
 /// The rollup worker of `apps/api` reads these: it rebuilds the recent hourly and daily buckets
@@ -936,13 +854,8 @@ pub struct Config {
     pub automation: AutomationConfig,
     /// Search indexer knobs (REQ-002).
     pub search: SearchConfig,
-    /// The secret re-wrap walk (docs/requests/REQ-125).
-    pub secrets: SecretsConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
-    /// The telemetry exporter flush loop (REQ-126).
-    pub telemetry: TelemetryConfig,
-
     /// Retention worker knobs (REQ-010, slice 4).
     pub retention: RetentionConfig,
     /// Email settings of the `send_email` action (P13).
@@ -1119,29 +1032,6 @@ impl Config {
             batch: read_count(&read, "OMNION_SEARCH_BATCH", DEFAULT_SEARCH_BATCH)?,
         };
 
-        // The re-wrap walk (docs/requests/REQ-125): a small batch by default, because a batch is
-        // a write window a lease redemption has to queue behind.
-        let secrets = SecretsConfig {
-            runner_enabled: read_flag(&read, "OMNION_SECRETS_RUNNER", true)?,
-            rewrap_poll_ms: read_positive(
-                &read,
-                "OMNION_SECRETS_POLL_MS",
-                DEFAULT_SECRETS_POLL_MS,
-            )?,
-            rewrap_batch: read_count(&read, "OMNION_SECRETS_REWRAP", DEFAULT_SECRETS_REWRAP_BATCH)?,
-        };
-
-        let telemetry = TelemetryConfig {
-            exporter_flush_enabled: read_flag(&read, "OMNION_EXPORTER_FLUSH", true)?,
-            alerts_evaluator_enabled: read_flag(&read, "OMNION_ALERTS_EVALUATOR", true)?,
-            retention_sweep_enabled: read_flag(&read, "OMNION_RETENTION_SWEEP", true)?,
-            // Clamped rather than refused: a drain timeout of zero would skip every in-flight
-            // request, and a hand-typed negative would be a `u64` parse error at boot — neither is
-            // a useful way to learn the setting exists. The floor is one second, which is the
-            // smallest wait that can drain a real request.
-            drain_timeout_ms: read_positive(&read, "OMNION_DRAIN_TIMEOUT_MS", 10_000)?.max(1_000),
-        };
-
         // Read here so a malformed value is a configuration error at boot rather than a
         // worker that silently keeps its default — the same treatment every other knob gets.
         let retention = RetentionConfig {
@@ -1216,7 +1106,6 @@ impl Config {
         let csrf = CsrfSecret::new(read("OMNION_CSRF_SECRET"));
 
         let config = Self {
-            secrets,
             env,
             http: HttpConfig { host, port },
             database,
@@ -1227,7 +1116,6 @@ impl Config {
             automation,
             search,
             analytics,
-            telemetry,
             retention,
             mail,
             push,
@@ -1268,10 +1156,7 @@ impl Default for Config {
             events: EventsConfig::default(),
             automation: AutomationConfig::default(),
             search: SearchConfig::default(),
-            secrets: SecretsConfig::default(),
             analytics: AnalyticsConfig::default(),
-            telemetry: TelemetryConfig::default(),
-
             retention: RetentionConfig::default(),
             mail: MailConfig::default(),
             push: PushConfig::default(),
@@ -1572,26 +1457,6 @@ mod tests {
         let error = config_from(&[("OMNION_EVENTS_RUNNER", "maybe")])
             .expect_err("an unknown boolean is refused");
         assert_eq!(error.key, "OMNION_EVENTS_RUNNER");
-    }
-
-    #[test]
-    fn the_exporter_flush_loop_runs_by_default_and_can_be_switched_off() {
-        // The loop is ON by default: an exporter row an operator configured should start working
-        // without a second environment change, and "telemetry is configured but nothing arrives"
-        // is the failure the request names. The switch exists for the opposite decision — stop
-        // sending, keep the rows — and it must parse strictly, like every other boolean here, so a
-        // typo in a compose file is an error at boot rather than a loop that silently keeps going.
-        let config = config_from(&[]).expect("defaults must load");
-        assert!(config.telemetry.exporter_flush_enabled);
-
-        let off = config_from(&[("OMNION_EXPORTER_FLUSH", "false")]).expect("the switch loads");
-        assert!(!off.telemetry.exporter_flush_enabled);
-
-        // "yes" is deliberately NOT the fixture: the platform's boolean reader accepts it, so a
-        // test that used it would assert the opposite of what it claims to check.
-        let error = config_from(&[("OMNION_EXPORTER_FLUSH", "maybe")])
-            .expect_err("an unknown boolean is refused");
-        assert_eq!(error.key, "OMNION_EXPORTER_FLUSH");
     }
 
     #[test]

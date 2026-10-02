@@ -1,1072 +1,3218 @@
-//! The visual graph of a workflow, and the compiler that turns it into the engine's steps.
+//! The graph a visual builder draws, and the projection the runner executes (REQ-004 slice 1).
 //!
-//! The editor (REQ-086) authors a *graph* — nodes with stable keys and connections between their
-//! ports — but the engine runs *steps*. Slice 1 is the bridge: one document, two representations,
-//! written together in one transaction, with a deterministic compiler between them so the two can
-//! never silently disagree.
+//! # Two representations, one definition
 //!
-//! Three properties are the reason this file exists rather than a `serde_json` round trip:
+//! REQ-003 gave the engine an ordered list of steps, and that list is still what runs: the
+//! engine materialises `workflows.steps` into rows and advances them. The builder needs
+//! something the list cannot express — two nodes fed by one condition — so the graph arrives
+//! as a second representation of the *same* definition, with one rule that keeps them from
+//! drifting:
 //!
-//! 1. **A node key is a stable editor string** (`http_1`, `if_2`), not the step's display name.
-//!    Renaming a node on the canvas must not break the connection that points at it, so the
-//!    compiler resolves *keys* and only then names a step.
-//! 2. **Validation is a set of codes, not a boolean.** The canvas lists issues per node so a
-//!    person can jump to one; a single `Err` would make the badge and the panel the same thing.
-//! 3. **Compilation is deterministic.** The same graph always produces the same steps, in the
-//!    same order, so "graph and steps disagree" is detectable rather than a thing you discover
-//!    when a run does the wrong thing three weeks later.
+//! * the **graph** is authoritative for the builder (`workflows.graph`);
+//! * the **steps projection** is generated and never hand-edited;
+//! * every save re-derives the projection from the graph, and
+//!   [`project`] is the only function that does it, so a rule cannot be projected two ways.
 //!
-//! A disabled node is kept, not dropped: it stays in the graph with its connections intact and
-//! compiles to a step the engine skips, because a person who turns a node off expects to turn it
-//! back on without rewiring. A *sticky note* is not a node at all and never compiles.
+//! The engine needs no change: it reads `steps`, which is what the projection wrote.
+//!
+//! # Why the projection is a linearisation and not a second evaluator
+//!
+//! A graph can express branching, and the v0 engine has exactly one branching step: a `branch`
+//! step ends the run when its comparison does not hold. So the projection turns each `condition`
+//! node into a [`StepDefinition::branch`] carrying the same comparison, and the run stops there
+//! when the comparison is false — the "false" branch is an *end*, not a second path. Every
+//! node reachable only through a false edge is simply absent from the projection, and the run
+//! stops. A node on the true edge follows. This is honest for a v1 and it is testable: the
+//! acceptance criterion is that the existing runner executes a saved graph end to end with no
+//! engine change, and this is what makes that true.
+//!
+//! # What validation refuses
+//!
+//! A graph that cannot be projected must not be stored as if it could: [`validate`] returns
+//! findings (not an error) naming the node, so the panel can offer a jump link. A graph that
+//! *can* be projected but is a bad idea — an orphan, a second trigger — is still refused at
+//! write time, because the alternative is a definition that runs and does nothing.
+//!
+//! [`StepDefinition::branch`]: crate::definition::StepDefinition::branch
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
+use uuid::Uuid;
 
-use crate::actions;
-use crate::definition::StepDefinition;
+use crate::branch::{MAX_FIELD, OPERATORS};
+use crate::definition::{MAX_STEPS, StepDefinition};
 use crate::error::{Result, WorkflowError};
-use crate::model::StepKind;
-use crate::registry::{self, PortKind};
+use crate::plugin_nodes::Resolution;
 
-/// Most nodes one graph may carry.
-///
-/// Above this the canvas is unusable long before the compiler is slow, so the limit is a product
-/// decision stated once here rather than a number re-guessed per layer.
-pub const MAX_NODES: usize = 200;
+/// Most nodes one graph may carry (the projection cannot exceed [`MAX_STEPS`]).
+pub const MAX_NODES: usize = MAX_STEPS + 2;
 
-/// Most connections one graph may carry.
-pub const MAX_CONNECTIONS: usize = 400;
+/// Most edges one graph may carry.
+pub const MAX_EDGES: usize = 400;
 
-/// Longest a node key may be.
-pub const MAX_NODE_KEY: usize = 48;
+/// Longest a node id may be.
+pub const MAX_NODE_ID: usize = 64;
 
 /// Longest a node label may be.
 pub const MAX_NODE_LABEL: usize = 80;
 
-// ---------------------------------------------------------------------------------------------
-// The document
-// ---------------------------------------------------------------------------------------------
+/// Smallest a canvas coordinate may be. A node dragged a million pixels to the left is a
+/// coordinate, not a layout, and it makes the minimap and the auto-layout useless.
+pub const MIN_COORD: f64 = -20_000.0;
 
-/// One node of the graph, exactly as the editor stores it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GraphNode {
-    /// Stable editor key. Connections name this, not the label.
-    pub key: String,
-    /// Registry key of the node type, e.g. `http_request`.
-    #[serde(rename = "type")]
-    pub node_type: String,
-    /// Label shown on the canvas.
-    pub label: String,
-    /// Canvas position; floats, and the editor snaps them on its own side.
-    pub position: Position,
-    /// Node parameters, as the inspector leaves them.
-    #[serde(default, skip_serializing_if = "Map::is_empty")]
-    pub params: Map<String, Value>,
-    /// A disabled node stays in the graph and compiles to a step the engine skips.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub disabled: bool,
+/// Largest a canvas coordinate may be.
+pub const MAX_COORD: f64 = 20_000.0;
+
+/// How far one zoom step moves the viewport.
+pub const ZOOM_STEP: f64 = 0.1;
+
+/// Smallest zoom the viewport may hold (REQ-004: 0.25×–2×).
+pub const MIN_ZOOM: f64 = 0.25;
+
+/// Largest zoom the viewport may hold.
+pub const MAX_ZOOM: f64 = 2.0;
+
+/// The severity of one validation finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// The graph cannot be stored or run as it is.
+    Error,
+    /// The graph runs, but something about it is worth saying out loud.
+    Warning,
 }
 
-impl GraphNode {
-    /// A positioned node with no parameters.
+impl Severity {
+    /// Canonical name stored in JSON.
     #[must_use]
-    pub fn new(key: impl Into<String>, node_type: impl Into<String>, x: f64, y: f64) -> Self {
-        let key = key.into();
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+/// One thing validation has to say about a graph.
+///
+/// Every finding names the node it is about (`node_id` is `None` only for a finding about the
+/// graph as a whole) because the panel turns it into a jump link, and a message without a
+/// destination is a message the reader has to go and find the subject of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    /// `error` or `warning`.
+    pub severity: Severity,
+    /// Stable machine-readable code, e.g. `graph_cycle`.
+    pub code: String,
+    /// Human-readable explanation, naming the node or nodes involved.
+    pub message: String,
+    /// The node the finding is about, when there is one.
+    pub node_id: Option<String>,
+    /// The other end of a two-node finding (a cycle names where it closes).
+    pub related_node_id: Option<String>,
+}
+
+impl Finding {
+    /// An error-level finding.
+    #[must_use]
+    pub fn error(code: &str, message: impl Into<String>, node_id: Option<&str>) -> Self {
         Self {
-            label: key.clone(),
-            key,
-            node_type: node_type.into(),
-            position: Position { x, y },
-            params: Map::new(),
-            disabled: false,
+            severity: Severity::Error,
+            code: code.to_owned(),
+            message: message.into(),
+            node_id: node_id.map(str::to_owned),
+            related_node_id: None,
         }
     }
 
-    /// Set the label.
+    /// A warning-level finding.
     #[must_use]
-    pub fn labelled(mut self, label: impl Into<String>) -> Self {
-        self.label = label.into();
+    pub fn warning(code: &str, message: impl Into<String>, node_id: Option<&str>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            code: code.to_owned(),
+            message: message.into(),
+            node_id: node_id.map(str::to_owned),
+            related_node_id: None,
+        }
+    }
+
+    /// Name a second node — the other end of the connection this finding is about.
+    #[must_use]
+    pub fn related(mut self, other: Option<&str>) -> Self {
+        self.related_node_id = other.map(str::to_owned);
         self
     }
 
-    /// Set one parameter.
+    /// `true` when the finding stops the graph from being stored.
     #[must_use]
-    pub fn with_param(mut self, name: impl Into<String>, value: Value) -> Self {
-        self.params.insert(name.into(), value);
-        self
-    }
-
-    /// The registry definition of this node's type, when the type is known.
-    #[must_use]
-    pub fn definition(&self) -> Option<&'static registry::NodeDefinition> {
-        registry::find_node(&self.node_type)
-    }
-
-    /// Parameters as a plain JSON value, never `null`.
-    #[must_use]
-    pub fn params_value(&self) -> Value {
-        Value::Object(self.params.clone())
+    pub const fn is_error(&self) -> bool {
+        matches!(self.severity, Severity::Error)
     }
 }
 
 /// Where a node sits on the canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Position {
-    /// Horizontal coordinate in canvas units.
+    /// Horizontal offset, snapped to the 8px grid by the builder.
     pub x: f64,
-    /// Vertical coordinate in canvas units.
+    /// Vertical offset.
     pub y: f64,
 }
 
 impl Default for Position {
     fn default() -> Self {
-        Self { x: 0.0, y: 0.0 }
+        Self { x: 40.0, y: 40.0 }
     }
 }
 
-impl Position {
-    /// A position.
-    #[must_use]
-    pub const fn new(x: f64, y: f64) -> Self {
-        Self { x, y }
-    }
-}
-
-/// One connection between two ports.
+/// One node of a graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Connection {
-    /// Node key the edge leaves.
-    pub from: String,
-    /// Output port on that node.
-    pub from_port: String,
-    /// Node key the edge enters.
-    pub to: String,
-    /// Input port on that node.
-    pub to_port: String,
-    /// Optional branch label — `true`, `false`, `case A`, `error`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-}
-
-impl Connection {
-    /// A connection without a branch label.
-    #[must_use]
-    pub fn new(
-        from: impl Into<String>,
-        from_port: impl Into<String>,
-        to: impl Into<String>,
-        to_port: impl Into<String>,
-    ) -> Self {
-        Self {
-            from: from.into(),
-            from_port: from_port.into(),
-            to: to.into(),
-            to_port: to_port.into(),
-            label: None,
-        }
-    }
-
-    /// Give the connection a branch label.
-    #[must_use]
-    pub fn labelled(mut self, label: impl Into<String>) -> Self {
-        self.label = Some(label.into());
-        self
-    }
-
-    /// The two endpoints, ordered, so a reversed duplicate is recognisable as the same edge.
-    #[must_use]
-    pub fn endpoints(&self) -> (String, String, String, String) {
-        (
-            self.from.clone(),
-            self.from_port.clone(),
-            self.to.clone(),
-            self.to_port.clone(),
-        )
-    }
-}
-
-/// A sticky note: a comment on the canvas that is never executed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StickyNote {
-    /// Editor-stable id, so a note can be selected and moved.
+pub struct Node {
+    /// Stable id within the graph: what edges and `workflow_steps.node_id` refer to.
     pub id: String,
+    /// A registry key — `trigger.event`, `condition`, `action`, … (see [`node_types`]).
+    #[serde(rename = "type")]
+    pub node_type: String,
+    /// What the canvas draws on the card.
+    pub label: String,
+    /// The node's parameters, in the shape the registry's parameter schema describes.
+    #[serde(default)]
+    pub params: Value,
     /// Where it sits.
+    #[serde(default)]
     pub position: Position,
-    /// Canvas colour, e.g. `amber` or `slate`.
-    #[serde(default = "default_note_color")]
-    pub color: String,
-    /// How wide the note is, in canvas units.
-    #[serde(default = "default_note_width")]
-    pub width: f64,
-    /// How tall the note is, in canvas units.
-    #[serde(default = "default_note_height")]
-    pub height: f64,
-    /// The text a person wrote.
-    pub text: String,
 }
 
-/// Serde default for [`StickyNote::color`]: amber is the palette's first note colour.
-fn default_note_color() -> String {
-    "amber".to_string()
-}
-
-/// Serde default for [`StickyNote::width`].
-fn default_note_width() -> f64 {
-    240.0
-}
-
-/// Serde default for [`StickyNote::height`].
-fn default_note_height() -> f64 {
-    140.0
-}
-
-impl StickyNote {
-    /// A note at a position.
-    #[must_use]
-    pub fn new(id: impl Into<String>, text: impl Into<String>, x: f64, y: f64) -> Self {
-        Self {
-            id: id.into(),
-            position: Position::new(x, y),
-            color: default_note_color(),
-            width: default_note_width(),
-            height: default_note_height(),
-            text: text.into(),
-        }
-    }
-}
-
-/// The whole graph document, as stored in `workflows.graph`.
+/// One connection between two nodes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Edge {
+    /// Stable id within the graph.
+    pub id: String,
+    /// Node the edge leaves.
+    pub source: String,
+    /// Output port it leaves from (`out`, `true`, `false`, `default`, a switch case).
+    #[serde(default = "default_source_port")]
+    pub source_port: String,
+    /// Node it arrives at.
+    pub target: String,
+}
+
+fn default_source_port() -> String {
+    "out".to_owned()
+}
+
+/// A whole definition as the builder draws it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
-    /// Nodes, in editor order.
-    pub nodes: Vec<GraphNode>,
-    /// Connections, in editor order.
-    pub connections: Vec<Connection>,
-    /// Sticky notes. Never compiled, never executed.
+    /// The nodes, in draw order.
     #[serde(default)]
-    pub notes: Vec<StickyNote>,
+    pub nodes: Vec<Node>,
+    /// The connections.
+    #[serde(default)]
+    pub edges: Vec<Edge>,
 }
 
 impl Default for Graph {
     fn default() -> Self {
         Self {
             nodes: Vec::new(),
-            connections: Vec::new(),
-            notes: Vec::new(),
+            edges: Vec::new(),
         }
     }
 }
 
 impl Graph {
-    /// An empty graph.
+    /// The node with this id, if the graph has one.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn node(&self, id: &str) -> Option<&Node> {
+        self.nodes.iter().find(|node| node.id == id)
     }
 
-    /// Read a stored graph, tolerating the column's default.
+    /// Edges leaving a node, in draw order.
+    #[must_use]
+    pub fn edges_from(&self, id: &str) -> Vec<&Edge> {
+        self.edges.iter().filter(|edge| edge.source == id).collect()
+    }
+
+    /// `true` when no node of this type exists.
+    #[must_use]
+    pub fn has_type(&self, node_type: &str) -> bool {
+        self.nodes.iter().any(|node| node.node_type == node_type)
+    }
+
+    /// The graph a new definition starts from: a trigger, an end, and one edge between them.
     ///
-    /// A graph that cannot be read is an *empty* graph rather than a refused request: the row
-    /// still has whatever `steps` it always had, and the editor opening an unreadable document
-    /// must show an empty canvas with a reason, not a 500 that hides the workflow entirely.
-    pub fn from_stored(raw: &Value) -> Self {
-        serde_json::from_value(raw.clone()).unwrap_or_default()
-    }
-
-    /// The stored JSON shape of this graph.
-    #[must_use]
-    pub fn to_value(&self) -> Value {
-        json!({
-            "nodes": self.nodes,
-            "connections": self.connections,
-            "notes": self.notes,
-        })
-    }
-
-    /// One node by key.
-    #[must_use]
-    pub fn node(&self, key: &str) -> Option<&GraphNode> {
-        self.nodes.iter().find(|node| node.key == key)
-    }
-
-    /// How many nodes a run would actually execute.
-    #[must_use]
-    pub fn enabled_nodes(&self) -> usize {
-        self.nodes.iter().filter(|node| !node.disabled).count()
-    }
-
-    /// The keys of the nodes nothing connects to, ignoring disabled nodes.
+    /// A definition that is born valid is the cheapest way to make "a workflow created before
+    /// this tick opens in the builder" true for every future row too — there is no shape an
+    /// author has to repair.
     ///
-    /// "Unreachable" is a graph property, not a type property: a node with no incoming edge can
-    /// only run if something starts it, and a node whose only edges leave it is dead weight. A
-    /// trigger legitimately has no incoming edge, so it is never reported.
-    #[must_use]
-    pub fn unreachable_keys(&self) -> Vec<String> {
-        let targets: HashSet<&str> = self
-            .connections
-            .iter()
-            .map(|edge| edge.to.as_str())
-            .collect();
-
-        self.nodes
-            .iter()
-            .filter(|node| {
-                if node.disabled {
-                    return false;
-                }
-                let is_trigger = node
-                    .definition()
-                    .is_some_and(registry::NodeDefinition::is_trigger);
-                !is_trigger && !targets.contains(node.key.as_str())
-            })
-            .map(|node| node.key.clone())
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------------------------
-
-/// One problem with a graph, addressed at a node when it has one.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Issue {
-    /// Stable code — the REQ's list, so the panel can group and the editor can badge.
-    pub code: &'static str,
-    /// Node the problem is on, when there is one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_key: Option<String>,
-    /// The **parameter** the problem is on, when the issue is about one.
+    /// **The starter's params come from the REGISTRY, never from a literal here.** The builder's
+    /// inspector renders `nodeType.params` — the schema, not whatever the node happens to carry —
+    /// so a param the registry does not declare is invisible on the canvas while Table mode
+    /// renders `Object.keys(row.params)` and shows it as an editable field. This function used to
+    /// seed `{ "kind": kind }` on every starter node, and `trigger.manual` declares **no** params
+    /// at all, so every manual rule shipped with a field the canvas could not display and the
+    /// other mode could edit: `table-save-survives` read `cards: 2, clicked: 2, inspected: 2,
+    /// builderSeesTableEdit: false`, which is *unsatisfiable* — no product defect could turn it
+    /// green, because the row was checking a value on a screen whose renderer never had a field
+    /// to put it in. A starter that writes a param the schema does not declare makes the two
+    /// modes disagree about the same rule, and "consistent after a save in either mode" is the
+    /// criterion that names it.
     ///
-    /// Additive rather than something the client has to parse out of `message`. The code
-    /// editor's gutter needs to mark the *line* a problem is on, and the message is prose
-    /// written for a person — `"url" must be a URL` carries the name in quotes today, which
-    /// is a convention, not a contract, and every consumer that scraped it would break the
-    /// first time a sentence was reworded. Skipped when absent, so an issue with no
-    /// parameter serialises exactly as it did before.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub param: Option<String>,
-    /// Connection index, for the connection codes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub connection_index: Option<usize>,
-    /// A sentence a person can act on.
-    pub message: String,
-}
-
-impl Issue {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            node_key: None,
-            param: None,
-            connection_index: None,
-            message: message.into(),
+    /// The trigger *kind* is not lost by dropping it: it lives on the workflow row
+    /// (`trigger_kind`), which is where the engine reads it from. It was never a node parameter.
+    #[must_use]
+    pub fn starter(kind: &str, event: Option<&str>) -> Self {
+        let node_type = match kind {
+            "schedule" => "trigger.schedule",
+            "manual" => "trigger.manual",
+            _ => "trigger.event",
+        };
+        // Only the params this node type DECLARES, so the two modes are rendering the same set.
+        // `event` is the one the starter can legitimately fill, and only for the type that
+        // declares it — writing it onto `trigger.schedule` would be the same defect one key over.
+        let mut params = Value::Object(serde_json::Map::new());
+        if event.is_some() && declares_param(node_type, "event") {
+            params["event"] = json!(event.unwrap_or_default());
         }
-    }
-
-    fn at_node(
-        code: &'static str,
-        node_key: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
         Self {
-            code,
-            node_key: Some(node_key.into()),
-            param: None,
-            connection_index: None,
-            message: message.into(),
-        }
-    }
-
-    /// An issue about one parameter of one node.
-    ///
-    /// The `at_node` constructor with the parameter name attached, so the ~17 call sites in
-    /// this module that report a parameter problem cannot forget to say which one — and the
-    /// code editor's gutter has something to point at.
-    fn at_param(
-        code: &'static str,
-        node_key: impl Into<String>,
-        param: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            code,
-            node_key: Some(node_key.into()),
-            param: Some(param.into()),
-            connection_index: None,
-            message: message.into(),
-        }
-    }
-
-    fn at_connection(code: &'static str, index: usize, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            node_key: None,
-            param: None,
-            connection_index: Some(index),
-            message: message.into(),
+            nodes: vec![
+                Node {
+                    id: "trigger".to_owned(),
+                    node_type: node_type.to_owned(),
+                    label: "Trigger".to_owned(),
+                    params,
+                    position: Position { x: 40.0, y: 40.0 },
+                },
+                Node {
+                    id: "end".to_owned(),
+                    node_type: "end".to_owned(),
+                    label: "End".to_owned(),
+                    params: Value::Object(serde_json::Map::new()),
+                    position: Position { x: 340.0, y: 40.0 },
+                },
+            ],
+            edges: vec![Edge {
+                id: "e0".to_owned(),
+                source: "trigger".to_owned(),
+                source_port: "out".to_owned(),
+                target: "end".to_owned(),
+            }],
         }
     }
 }
 
-/// Every problem a graph has, in a stable order.
+/// One output port of a node type.
 ///
-/// Not a `Result`: the canvas shows a badge *and* a list, and a validation call that returned
-/// only the first problem could not build either.
+/// `Serialize` only: the registry is a compiled-in constant, so nothing ever reads a port
+/// back from JSON — the API *writes* it into the palette response and the client draws it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Port {
+    /// The port's name — what an edge's `source_port` refers to.
+    pub key: &'static str,
+    /// What leaving through this port means, in the palette's words.
+    pub label: &'static str,
+    /// `true` when leaving on this port ends the run (a stop port).
+    pub terminal: bool,
+}
+
+impl Port {
+    const fn new(key: &'static str, label: &'static str, terminal: bool) -> Self {
+        Self {
+            key,
+            label,
+            terminal,
+        }
+    }
+}
+
+/// One kind of node the palette offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct NodeType {
+    /// Registry key, stored on the node as `type`.
+    pub key: &'static str,
+    /// What the palette calls it.
+    pub label: &'static str,
+    /// Which group of the palette rail it sits in: Trigger / Logic / Actions / Data / Plugins.
+    pub category: &'static str,
+    /// One line under the card — what it does, without the word "node".
+    pub summary: &'static str,
+    /// Output ports, in draw order.
+    pub outputs: &'static [Port],
+    /// The parameter fields, as `{"field": {"type": …, "label": …, "required": …}}`.
+    ///
+    /// A schema rather than a form, because the palette, the inspector and the server's
+    /// validator all read the same object: REQ-003 already had a rule that "the action the
+    /// matcher could not run is refused when it is written", and a schema the server ignores is
+    /// a form that lies.
+    pub params: &'static [ParamField],
+    /// `true` when the node is decoration the engine never runs.
+    pub inert: bool,
+}
+
+/// One field of a node's parameter form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ParamField {
+    /// Key in the node's `params` object.
+    pub key: &'static str,
+    /// Label above the input.
+    pub label: &'static str,
+    /// `text`, `textarea`, `number`, `select` or `boolean`.
+    pub kind: &'static str,
+    /// `true` when the node is refused without it.
+    pub required: bool,
+    /// The legal values of a `select`, in palette order.
+    pub options: &'static [&'static str],
+    /// Help text under the input.
+    pub help: &'static str,
+}
+
+impl ParamField {
+    const fn text(key: &'static str, label: &'static str, help: &'static str) -> Self {
+        Self {
+            key,
+            label,
+            kind: "text",
+            required: false,
+            options: &[],
+            help,
+        }
+    }
+
+    const fn required_text(key: &'static str, label: &'static str, help: &'static str) -> Self {
+        Self {
+            key,
+            label,
+            kind: "text",
+            required: true,
+            options: &[],
+            help,
+        }
+    }
+
+    const fn select(
+        key: &'static str,
+        label: &'static str,
+        options: &'static [&'static str],
+        help: &'static str,
+    ) -> Self {
+        Self {
+            key,
+            label,
+            kind: "select",
+            required: true,
+            options,
+            help,
+        }
+    }
+}
+
+const OUT: &[Port] = &[Port::new("out", "Next", false)];
+const BRANCH_PORTS: &[Port] = &[
+    Port::new("true", "True", false),
+    Port::new("false", "False", true),
+];
+const TASK_PORTS: &[Port] = &[
+    Port::new("success", "Succeeded", false),
+    Port::new("error", "Failed", true),
+];
+const SWITCH_PORTS: &[Port] = &[
+    Port::new("case_1", "Case 1", false),
+    Port::new("default", "Default", false),
+];
+const NOTE_PORTS: &[Port] = &[];
+
+const ACTION_FIELD: ParamField = ParamField::required_text(
+    "action",
+    "Action",
+    "The action key this node runs. GET /api/v1/automations/catalogue lists every legal one.",
+);
+const WAIT_FIELD: ParamField = ParamField {
+    key: "seconds",
+    label: "Seconds",
+    kind: "number",
+    required: true,
+    options: &[],
+    help: "How long the run parks here, 1 to 86400.",
+};
+const CONDITION_FIELD: ParamField = ParamField::required_text(
+    "field",
+    "Field",
+    "What the comparison reads, e.g. {{event.payload.role}}.",
+);
+const CONDITION_OP: ParamField = ParamField::select(
+    "operator",
+    "Operator",
+    OPERATORS,
+    "How the field is compared against the value.",
+);
+
+/// Every node type the palette offers, in rail order.
+///
+/// A closed set, like the action catalogue: the engine knows what a node *is* without a
+/// plugin, and a plugin node (REQ-004 slice 4) is added beside these rather than in place of
+/// them, so a plugin upgrade cannot leave a rule that the core cannot explain.
+pub const NODE_TYPES: &[NodeType] = &[
+    NodeType {
+        key: "trigger.event",
+        label: "Event",
+        category: "Trigger",
+        summary: "Runs when the platform records an event.",
+        outputs: OUT,
+        params: &[
+            ParamField::required_text(
+                "event",
+                "Event name",
+                "A lower-case dotted name, e.g. page.published.",
+            ),
+            ParamField {
+                key: "conditions",
+                label: "Conditions",
+                kind: "textarea",
+                required: false,
+                options: &[],
+                help: "The comparisons an event payload must satisfy, as the rule's own group tree.",
+            },
+        ],
+        inert: false,
+    },
+    NodeType {
+        key: "trigger.schedule",
+        label: "Schedule",
+        category: "Trigger",
+        summary: "Runs on a cron expression, in UTC.",
+        outputs: OUT,
+        params: &[ParamField::required_text(
+            "cron",
+            "Cron expression",
+            "Five fields in UTC, e.g. 0 9 * * 1-5.",
+        )],
+        inert: false,
+    },
+    NodeType {
+        key: "trigger.manual",
+        label: "Manual",
+        category: "Trigger",
+        summary: "Starts only when a person presses Run.",
+        outputs: OUT,
+        params: &[],
+        inert: false,
+    },
+    NodeType {
+        key: "condition",
+        label: "If / else",
+        category: "Logic",
+        summary: "Continues on true, ends the run on false.",
+        outputs: BRANCH_PORTS,
+        params: &[
+            CONDITION_FIELD,
+            CONDITION_OP,
+            ParamField::required_text("value", "Value", "What the field is compared against."),
+        ],
+        inert: false,
+    },
+    NodeType {
+        key: "switch",
+        label: "Switch",
+        category: "Logic",
+        // **The summary is a promise, and this one used to make one the engine cannot keep.**
+        // The palette draws this sentence under the card, the inspector shows it above the
+        // node editor, and the author decides whether a card is worth dragging onto a canvas
+        // from exactly this text. "One branch per case, plus a default" describes a node that
+        // runs; the v0 engine runs one `condition` step and has no multi-arm step at all, so
+        // this card saves, validates and then refuses to project. Said here, the same sentence
+        // is also what keeps the card honest while the engine catches up.
+        summary: "One branch per case, plus a default — not executed yet: the engine runs one Condition per step. Chain Conditions for now.",
+        outputs: SWITCH_PORTS,
+        params: &[ParamField::required_text(
+            "cases",
+            "Cases",
+            "One \"value → label\" per line; the last port is the default.",
+        )],
+        inert: false,
+    },
+    NodeType {
+        key: "action",
+        label: "Action",
+        category: "Actions",
+        summary: "Runs one action from the catalogue.",
+        outputs: TASK_PORTS,
+        params: &[
+            ACTION_FIELD,
+            ParamField::text(
+                "parameters",
+                "Parameters",
+                "The action's own parameters as JSON.",
+            ),
+        ],
+        inert: false,
+    },
+    NodeType {
+        key: "wait",
+        label: "Wait",
+        category: "Logic",
+        summary: "Parks the run, then continues.",
+        outputs: OUT,
+        params: &[WAIT_FIELD],
+        inert: false,
+    },
+    NodeType {
+        key: "approval",
+        label: "Approval",
+        category: "Logic",
+        summary: "Parks the run until a person decides.",
+        outputs: TASK_PORTS,
+        params: &[
+            ParamField::required_text(
+                "permission",
+                "Permission",
+                "Who may let the run go on, e.g. workflows.approve.",
+            ),
+            ParamField::text("message", "Message", "What the approver is asked."),
+            ParamField {
+                key: "expires_in_hours",
+                label: "Expires after (hours)",
+                kind: "number",
+                required: false,
+                options: &[],
+                help: "How long the gate waits before it gives up. 1 to 720.",
+            },
+        ],
+        inert: false,
+    },
+    NodeType {
+        key: "http_request",
+        label: "HTTP request",
+        category: "Data",
+        summary: "Calls an allowed host, signed with the rule's key.",
+        outputs: TASK_PORTS,
+        params: &[
+            ParamField::required_text("url", "URL", "The host to call; allow-listed on write."),
+            ParamField::select(
+                "method",
+                "Method",
+                crate::actions::OUTBOUND_METHODS,
+                "The HTTP method.",
+            ),
+            ParamField::text("body", "Body", "The request body as JSON."),
+            ParamField {
+                key: "timeout_ms",
+                label: "Timeout (ms)",
+                kind: "number",
+                required: false,
+                options: &[],
+                help: "How long the call may block. Capped by the rule's bound.",
+            },
+        ],
+        inert: false,
+    },
+    NodeType {
+        key: "transform",
+        label: "Transform",
+        category: "Data",
+        summary: "Builds fields from a template.",
+        outputs: OUT,
+        params: &[ParamField::required_text(
+            "template",
+            "Template",
+            "The fields to build, as a JSON object of {{ }} expressions.",
+        )],
+        inert: false,
+    },
+    NodeType {
+        key: "sub_workflow",
+        label: "Sub-workflow",
+        category: "Actions",
+        summary: "Runs another rule, then continues.",
+        outputs: TASK_PORTS,
+        params: &[ParamField::required_text(
+            "workflow_id",
+            "Rule",
+            "The rule to run, by id.",
+        )],
+        inert: false,
+    },
+    NodeType {
+        key: "end",
+        label: "End",
+        category: "Logic",
+        summary: "Ends the run, optionally with a reason.",
+        outputs: &[],
+        params: &[ParamField::text(
+            "reason",
+            "Reason",
+            "What the trace shows when the run stops here.",
+        )],
+        inert: false,
+    },
+    NodeType {
+        key: "note",
+        label: "Note",
+        category: "Logic",
+        summary: "A sticky comment the engine never runs.",
+        outputs: NOTE_PORTS,
+        params: &[ParamField::required_text(
+            "text",
+            "Note",
+            "What the note says on the canvas.",
+        )],
+        // Decoration: it is not reachable, not an orphan, and projects to nothing.
+        inert: true,
+    },
+];
+
+/// The node type with this key.
 #[must_use]
-pub fn validate(graph: &Graph) -> Vec<Issue> {
-    let mut issues = Vec::new();
-
-    if graph.nodes.len() > MAX_NODES {
-        issues.push(Issue::new(
-            "graph_too_large",
-            format!(
-                "a graph carries at most {MAX_NODES} nodes, this one has {}",
-                graph.nodes.len()
-            ),
-        ));
-    }
-    if graph.connections.len() > MAX_CONNECTIONS {
-        issues.push(Issue::new(
-            "graph_too_large",
-            format!(
-                "a graph carries at most {MAX_CONNECTIONS} connections, this one has {}",
-                graph.connections.len()
-            ),
-        ));
-    }
-
-    // Node keys: shape, then uniqueness. A duplicate key is reported against the *second* node
-    // so the panel can point at one place rather than two.
-    let mut keys: BTreeMap<&str, usize> = BTreeMap::new();
-    for node in &graph.nodes {
-        let key = node.key.trim();
-        if key.is_empty() {
-            issues.push(Issue::at_node(
-                "node_key_invalid",
-                &node.key,
-                "every node needs a key, because connections name it",
-            ));
-            continue;
-        }
-        if key.len() > MAX_NODE_KEY {
-            issues.push(Issue::at_node(
-                "node_key_invalid",
-                &node.key,
-                format!("a node key is at most {MAX_NODE_KEY} characters"),
-            ));
-        }
-        match keys.get(key) {
-            Some(first) => issues.push(Issue::at_node(
-                "node_duplicate_key",
-                &node.key,
-                format!(
-                    "the key \"{key}\" is already used by node {} of the graph",
-                    *first + 1
-                ),
-            )),
-            None => {
-                keys.insert(
-                    key,
-                    graph.nodes.iter().position(|n| n.key == key).unwrap_or(0),
-                );
-            }
-        }
-    }
-
-    if graph.nodes.iter().all(|node| {
-        node.definition()
-            .is_none_or(|definition| !definition.is_trigger())
-    }) {
-        issues.push(Issue::new(
-            "graph_no_trigger",
-            "a graph needs a trigger node to start a run",
-        ));
-    }
-
-    // Per-node type, parameters and retry policy.
-    for node in &graph.nodes {
-        let Some(definition) = node.definition() else {
-            issues.push(Issue::at_node(
-                "node_unknown_type",
-                &node.key,
-                format!(
-                    "\"{}\" is not a node this platform knows; install a node package that \
-                     provides it, or pick another",
-                    node.node_type
-                ),
-            ));
-            continue;
-        };
-        if definition.deprecated {
-            issues.push(Issue::at_node(
-                "node_type_deprecated",
-                &node.key,
-                match definition.superseded_by {
-                    Some(replacement) => {
-                        format!(
-                            "\"{}\" is deprecated; use \"{replacement}\" instead",
-                            node.node_type
-                        )
-                    }
-                    None => format!("\"{}\" is deprecated", node.node_type),
-                },
-            ));
-        }
-        for problem in check_params(node, definition) {
-            issues.push(problem);
-        }
-    }
-
-    // Connections: existence, then the port contract, then duplicates, then cycles.
-    let mut seen: BTreeSet<(String, String, String, String)> = BTreeSet::new();
-    for (index, edge) in graph.connections.iter().enumerate() {
-        let (from, from_port, to, to_port) = edge.endpoints();
-
-        if !seen.insert((from.clone(), from_port.clone(), to.clone(), to_port.clone())) {
-            issues.push(Issue::at_connection(
-                "connection_duplicate",
-                index,
-                format!("the same connection is already drawn once"),
-            ));
-            continue;
-        }
-        if from == to {
-            issues.push(Issue::at_connection(
-                "connection_cycle",
-                index,
-                format!("node \"{from}\" cannot feed itself"),
-            ));
-            continue;
-        }
-
-        let source = graph.node(&from);
-        let target = graph.node(&to);
-        if source.is_none() || target.is_none() {
-            issues.push(Issue::at_connection(
-                "connection_node_unknown",
-                index,
-                match (source.is_none(), target.is_none()) {
-                    (true, true) => {
-                        format!("neither \"{from}\" nor \"{to}\" is a node of this graph")
-                    }
-                    (true, false) => format!("\"{from}\" is not a node of this graph"),
-                    _ => format!("\"{to}\" is not a node of this graph"),
-                },
-            ));
-            continue;
-        }
-
-        // Both ends must be *definitions* for the port contract to be checked at all. A node
-        // whose type the registry does not know was already reported as `node_unknown_type`,
-        // and a second, vaguer complaint about its edges helps nobody — so skip the edge rather
-        // than inventing a verdict about ports that do not exist.
-        let (Some(source), Some(target)) = (
-            source.and_then(GraphNode::definition),
-            target.and_then(GraphNode::definition),
-        ) else {
-            continue;
-        };
-
-        if let Err(error) = source.check_connection(&from_port, target, &to_port) {
-            issues.push(Issue::at_connection(
-                leak_code(error.code()),
-                index,
-                error.message().to_string(),
-            ));
-        }
-    }
-
-    issues.extend(cycle_issues(graph));
-    issues.extend(unreachable_issues(graph));
-    issues.extend(terminal_issues(graph));
-
-    // Stable order: by node then by code, so the panel does not reshuffle between two calls on
-    // the same graph and the badge count stays comparable.
-    issues.sort_by(|a, b| {
-        a.node_key
-            .as_deref()
-            .unwrap_or("")
-            .cmp(b.node_key.as_deref().unwrap_or(""))
-            .then(a.code.cmp(b.code))
-            .then(a.connection_index.cmp(&b.connection_index))
-    });
-    issues.dedup_by(|a, b| a.code == b.code && a.node_key == b.node_key && a.message == b.message);
-    issues
+pub fn find_node_type(key: &str) -> Option<&'static NodeType> {
+    NODE_TYPES.iter().find(|node_type| node_type.key == key)
 }
 
-/// The codes the registry can answer with, as the `&'static str` an [`Issue`] carries.
+/// Whether this node type's form DECLARES a parameter with this key.
 ///
-/// A refused connection is reported with the *registry's* code, not a new one, so the canvas and
-/// the installer lint speak the same vocabulary. The fallback exists so a code the registry grows
-/// later is reported as `connection_invalid` — visibly generic — rather than panicking or, worse,
-/// being dropped from the list the panel shows. The four arms are the registry's whole set today
-/// (`grep -oE '"connection_[a-z_]+"' crates/workflows/src/registry.rs`), and the test below pins
-/// that claim so the next person to add one is told here rather than discovering a lie in a
-/// message a person reads.
-fn leak_code(code: &str) -> &'static str {
-    match code {
-        "connection_port_unknown" => "connection_port_unknown",
-        "connection_port_closed" => "connection_port_closed",
-        "connection_type_mismatch" => "connection_type_mismatch",
-        other => {
-            debug_assert!(false, "the registry grew a connection code: {other}");
-            "connection_invalid"
-        }
-    }
-}
-
-/// Parameters against the node's own schema.
-fn check_params(node: &GraphNode, definition: &'static registry::NodeDefinition) -> Vec<Issue> {
-    let mut issues = Vec::new();
-
-    for param in &definition.params {
-        let value = node.params.get(&param.name);
-        if param.required && value.is_none() {
-            issues.push(Issue::at_param(
-                "node_param_required",
-                &node.key,
-                &param.name,
-                format!("{} needs \"{}\"", definition.label, param.name),
-            ));
-            continue;
-        }
-        let Some(value) = value else { continue };
-
-        if matches!(value, Value::Null) {
-            issues.push(Issue::at_param(
-                "node_param_invalid",
-                &node.key,
-                &param.name,
-                format!("\"{}\" is empty", param.name),
-            ));
-            continue;
-        }
-        // A blank string is not a value, and this is the exact shape a browser submits for a
-        // field a person opened and then left alone. `required` only asks whether the *key* is
-        // present, so without this the run would mail nobody and report success. Whitespace
-        // counts: `"  "` is what a field holding a space produces, and trimming it first is
-        // what makes the check catch that rather than only the visibly-empty case.
-        if value.as_str().is_some_and(|raw| raw.trim().is_empty()) {
-            issues.push(Issue::at_param(
-                "node_param_invalid",
-                &node.key,
-                &param.name,
-                format!("\"{}\" is empty", param.name),
-            ));
-            continue;
-        }
-        if let Some(problem) = json_type_mismatch(&param.kind, value) {
-            issues.push(Issue::at_param(
-                "node_param_invalid",
-                &node.key,
-                &param.name,
-                format!("\"{}\" {problem}", param.name),
-            ));
-            continue;
-        }
-        if !param.options.is_empty() {
-            let options: Vec<&str> = param.options.iter().map(String::as_str).collect();
-            let chosen = value.as_str().unwrap_or_default();
-            if !options.contains(&chosen) {
-                issues.push(Issue::at_param(
-                    "node_param_invalid",
-                    &node.key,
-                    &param.name,
-                    format!(
-                        "\"{}\" must be one of {}, got \"{chosen}\"",
-                        param.name,
-                        options.join(", ")
-                    ),
-                ));
-                continue;
-            }
-        }
-        // A secret field is a *reference* to a credential, never a secret. A literal in a box
-        // that says "Credential" is either a pasted key or a mis-typed credential id, and both
-        // are worth refusing before a run tries it.
-        //
-        // The field to look for is `options_source == "credentials"`, NOT `secret_field` on its
-        // own and NOT a non-empty `options`. The registry declares `http_request`'s
-        // `credential_key` as `ui: Select` + `options_source: Some("credentials")` + an *empty*
-        // `options` list — the options come from the caller's credential catalogue at render
-        // time, which is the whole point of a reference. Checking `!options.is_empty()` therefore
-        // never fires for any credential field in the registry today, and the guard silently did
-        // nothing: the first version of this function was a length check on a condition that is
-        // false everywhere, which is worse than having no guard because the test that named it
-        // passed for the wrong reason.
-        if param.options_source.as_deref() == Some("credentials")
-            && value
-                .as_str()
-                .is_some_and(|raw| raw.len() > MAX_CREDENTIAL_REFERENCE)
-        {
-            issues.push(Issue::at_param(
-                "node_param_invalid",
-                &node.key,
-                &param.name,
-                format!(
-                    "\"{}\" names a credential by its key, not by its secret; a value this long \
-                     is a secret pasted into a reference field",
-                    param.name
-                ),
-            ));
-        }
-    }
-
-    issues
-}
-
-/// Longest a credential *reference* may be. A key is a short name; a secret is not.
-///
-/// Public because the test that proves the guard has to know the threshold it is proving: a
-/// fixture that asserts "this is refused" without stating what the boundary *is* would keep
-/// passing if the constant were quietly raised to a size no secret reaches, which is the
-/// direction that silently disables a security check.
-pub const MAX_CREDENTIAL_REFERENCE: usize = 64;
-
-/// Compare a value against the JSON Schema type the palette declared.
-///
-/// Returns `None` when the value is acceptable, or a sentence naming what was expected.
-fn json_type_mismatch(kind: &str, value: &Value) -> Option<String> {
-    let ok = match kind {
-        "string" => value.is_string(),
-        "number" | "integer" => value.is_number(),
-        "boolean" => value.is_boolean(),
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        // An unknown type keyword is the schema's business, not a value's.
-        _ => return None,
-    };
-    if ok {
-        None
-    } else {
-        Some(format!("must be {kind}, got {}", describe(value)))
-    }
-}
-
-/// A short name for a value's JSON type, for a sentence a person can act on.
-fn describe(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "nothing",
-        Value::Bool(_) => "a yes/no value",
-        Value::Number(_) => "a number",
-        Value::String(_) => "text",
-        Value::Array(_) => "a list",
-        Value::Object(_) => "an object",
-    }
-}
-
-/// A control-flow cycle, reported once on the node that closes it.
-fn cycle_issues(graph: &Graph) -> Vec<Issue> {
-    // Only *control* edges can cycle: a data edge back into an earlier node is a real pattern
-    // (a loop over items), while control flow that returns to a node it already left would run
-    // that node forever. Error edges count as control: they are the third way out of a node.
-    let mut control: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for edge in &graph.connections {
-        let is_control = graph
-            .node(&edge.from)
-            .and_then(GraphNode::definition)
-            .and_then(|definition| {
-                definition
-                    .outputs
-                    .iter()
-                    .find(|port| port.name == edge.from_port)
-            })
-            .is_none_or(|port| port.kind != PortKind::Main || edge.label.is_some());
-        if is_control {
-            control.entry(&edge.from).or_default().push(&edge.to);
-        }
-    }
-
-    let mut issues = Vec::new();
-    let mut state: BTreeMap<&str, u8> = BTreeMap::new(); // 0 unvisited, 1 on stack, 2 done
-    let mut keys: Vec<&str> = graph.nodes.iter().map(|node| node.key.as_str()).collect();
-    keys.sort_unstable();
-
-    for start in keys {
-        if state.get(start).is_some_and(|s| *s != 0) {
-            continue;
-        }
-        // Iterative depth-first with an explicit stack: a 200-node graph is allowed, and
-        // recursion here would be a stack overflow on a document the validator is meant to
-        // describe rather than crash on.
-        let mut stack: Vec<(&str, usize)> = vec![(start, 0)];
-        let mut path: Vec<&str> = vec![start];
-        state.insert(start, 1);
-
-        while let Some((node, index)) = stack.pop() {
-            let Some(edges) = control.get(node) else {
-                state.insert(node, 2);
-                path.retain(|key| *key != node);
-                continue;
-            };
-            if index < edges.len() {
-                stack.push((node, index + 1));
-                let next = edges[index];
-                match state.get(next) {
-                    Some(1) => {
-                        issues.push(Issue::at_node(
-                            "connection_cycle",
-                            next,
-                            format!(
-                                "the control path loops back to \"{next}\"; a run would enter it \
-                                 again and never finish"
-                            ),
-                        ));
-                    }
-                    Some(2) => {}
-                    _ => {
-                        state.insert(next, 1);
-                        stack.push((next, 0));
-                        path.push(next);
-                    }
-                }
-            } else {
-                state.insert(node, 2);
-                path.retain(|key| *key != node);
-            }
-        }
-    }
-    issues
-}
-
-/// Nodes nothing reaches, reported once each.
-fn unreachable_issues(graph: &Graph) -> Vec<Issue> {
-    graph
-        .unreachable_keys()
-        .into_iter()
-        .map(|key| {
-            Issue::at_node(
-                "graph_unreachable_node",
-                &key,
-                format!("nothing connects to \"{key}\", so a run would never reach it"),
-            )
-        })
-        .collect()
-}
-
-/// A trigger that leads nowhere, reported on the trigger.
-fn terminal_issues(graph: &Graph) -> Vec<Issue> {
-    let mut issues = Vec::new();
-    for node in &graph.nodes {
-        if node.disabled || node.definition().is_none_or(|d| !d.is_trigger()) {
-            continue;
-        }
-        let starts_something = graph.connections.iter().any(|edge| edge.from == node.key);
-        if !starts_something {
-            issues.push(Issue::at_node(
-                "graph_terminal_missing",
-                &node.key,
-                format!(
-                    "the trigger \"{}\" has no outgoing connection, so the run would end here",
-                    node.key
-                ),
-            ));
-        }
-    }
-    issues
-}
-
-// ---------------------------------------------------------------------------------------------
-// Compilation
-// ---------------------------------------------------------------------------------------------
-
-/// A compiled graph: the steps the engine runs, and the issues that stopped it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Compiled {
-    /// Steps in execution order, named after the node labels.
-    pub steps: Vec<StepDefinition>,
-    /// Which node produced which step, 1-based, in step order.
-    pub node_order: Vec<String>,
-    /// Every issue found; a graph with any issue does not compile.
-    pub issues: Vec<Issue>,
-}
-
-impl Compiled {
-    /// `true` when the graph is clean.
-    #[must_use]
-    pub fn is_clean(&self) -> bool {
-        self.issues.is_empty()
-    }
-}
-
-/// The engine action a registry node compiles to.
-///
-/// The registry (`omnion_workflows::registry`) is the *palette* contract — what a node looks like
-/// to a person. The engine's action set (`crate::actions`) is a closed list of six built-ins, and
-/// only two of them are things a person would call a node. So this mapping is deliberately tiny:
-///
-/// * a trigger compiles to `noop`, because a run's first step exists to say "the run started" and
-///   the engine materialises steps in order — the trigger *is* the start of that order;
-/// * `send_email` compiles to the engine's own `send_email` host action.
-///
-/// Everything else is refused. That looks like a thin slice, and it is the honest state of the
-/// platform: `http_request`, `if`, `filter`, `code`, `date_time`, `s3_upload` and `stop_and_error`
-/// are all real registry nodes that REQ-087's palette shipped, and **none of them has an engine
-/// action yet** — REQ-088 (core node families) is the request that owes them. Compiling them to
-/// `echo` would produce a definition that validates, saves, shows five green nodes on the canvas
-/// and then does nothing at run time, which is the worst outcome available: a workflow that looks
-/// finished and is not.
-fn action_for(node_type: &str) -> Option<&'static str> {
-    Some(match node_type {
-        "manual_trigger" | "schedule_trigger" => "noop",
-        "send_email" => "send_email",
-        _ => return None,
+/// The registry is the single answer to "which fields does this node have", because the two
+/// projections of a rule read it from opposite places and disagree when they can: the builder's
+/// inspector maps over `nodeType.params` (so an undeclared key has no input to render into),
+/// while Table mode maps over `Object.keys(node.params)` (so it renders whatever the node happens
+/// to carry). Anything that SEEDS a node — [`Graph::starter`] most of all — has to ask here
+/// first, or it can hand the two modes different field sets for the same rule.
+#[must_use]
+pub fn declares_param(node_type: &str, key: &str) -> bool {
+    find_node_type(node_type).is_some_and(|found| {
+        found.params.iter().any(|field| field.key == key)
     })
 }
 
-/// Turn a graph into the engine's steps.
+/// The node type that projects onto this step kind, for the SQL backfill's mapping.
+#[must_use]
+pub const fn node_type_for_step(kind: &str) -> &'static str {
+    match kind.as_bytes() {
+        b"wait" => "wait",
+        b"branch" => "condition",
+        b"stop" => "end",
+        b"approval" => "approval",
+        _ => "action",
+    }
+}
+
+/// `true` when a node type is a trigger — the graph may carry exactly one.
+#[must_use]
+pub fn is_trigger_type(key: &str) -> bool {
+    key.starts_with("trigger.")
+}
+
+/// The ports a node of this type exports, or an empty slice for an unknown type.
+#[must_use]
+pub fn ports_of(key: &str) -> &'static [Port] {
+    find_node_type(key).map_or(&[], |node_type| node_type.outputs)
+}
+
+/// Does this key have the shape a plugin node key is namespaced into?
 ///
-/// Deterministic: nodes are ordered by their position on the canvas (left to right, then top to
-/// bottom), so the same graph always compiles to the same steps and a run's step numbers are
-/// stable across saves. Ties — two nodes at the same point — fall back to the key, so the order
-/// is total even then.
-pub fn compile(graph: &Graph) -> Compiled {
-    let issues = validate(graph);
-    if !issues.is_empty() {
-        return Compiled {
-            steps: Vec::new(),
-            node_order: Vec::new(),
-            issues,
-        };
+/// Only used to choose between two sentences for the *same* finding, and that is the whole
+/// of its job: a key that looks like `plugin.<x>.<y>` and did not resolve means the plugin
+/// was disabled, which is a different problem from a typo and needs a different instruction
+/// ("re-enable it" rather than "pick a legal one"). It is deliberately not a lookup — a
+/// lookup would make the message depend on whether the plugin is *installed*, so disabling and
+/// uninstalling would say different things about the same broken rule.
+#[must_use]
+fn looks_like_plugin_key(key: &str) -> bool {
+    let mut parts = key.split('.');
+    matches!(parts.next(), Some("plugin")) && parts.next().is_some() && parts.next().is_some()
+}
+
+/// Check the graph and answer what is wrong with it.
+///
+/// Findings, not an error: the panel shows all of them at once with a jump link each, and a
+/// save is refused only when at least one is an error. A warning is something a person may
+/// legitimately accept — a `note` with no connection, say.
+///
+/// This is the **core-only** check. An organization with plugins enabled must use
+/// [`validate_with_plugins`], or a rule using a plugin node is reported as an
+/// `unknown_node_type` — which is a false accusation against the author, and the kind that
+/// teaches people to ignore the problems panel.
+#[must_use]
+pub fn validate(graph: &Graph) -> Vec<Finding> {
+    validate_with_plugins(graph, &crate::plugin_nodes::PluginRegistry::empty())
+}
+
+/// [`validate`], against the node types this organization has enabled.
+///
+/// The plugin registry is a **parameter of the check, not of the core's knowledge**. That
+/// direction is the whole design and it is what keeps the criterion's third clause honest: a
+/// plugin node the organization has *disabled* resolves to `Unknown`, and therefore produces
+/// the same `unknown_node_type` finding a typo does — an error at edit time, with the node
+/// named, instead of a run that dies when the plugin's runner is not there.
+///
+/// Note what this function does **not** do: it does not learn to *run* a plugin node. The
+/// engine projects only core node types onto steps, so a graph that validates with a plugin
+/// node is still refused by `project` — and `project` says so in its own finding rather than
+/// this one, because a rule that validates and then cannot project would be worse than one
+/// that never validated.
+#[must_use]
+pub fn validate_with_plugins(
+    graph: &Graph,
+    plugins: &crate::plugin_nodes::PluginRegistry,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    if graph.nodes.is_empty() {
+        findings.push(Finding::error(
+            "graph_empty",
+            "the graph has no nodes — a definition needs at least a trigger",
+            None,
+        ));
+        return findings;
+    }
+    if graph.nodes.len() > MAX_NODES {
+        findings.push(Finding::error(
+            "too_many_nodes",
+            format!(
+                "a graph may carry at most {MAX_NODES} nodes, this one has {}",
+                graph.nodes.len()
+            ),
+            None,
+        ));
+    }
+    if graph.edges.len() > MAX_EDGES {
+        findings.push(Finding::error(
+            "too_many_edges",
+            format!(
+                "a graph may carry at most {MAX_EDGES} connections, this one has {}",
+                graph.edges.len()
+            ),
+            None,
+        ));
     }
 
-    let mut ordered: Vec<&GraphNode> = graph.nodes.iter().collect();
-    ordered.sort_by(|a, b| {
-        a.position
-            .x
-            .partial_cmp(&b.position.x)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                a.position
-                    .y
-                    .partial_cmp(&b.position.y)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-            .then_with(|| a.key.cmp(&b.key))
-    });
-
-    let mut steps = Vec::with_capacity(ordered.len());
-    let mut node_order = Vec::with_capacity(ordered.len());
-    let mut compile_issues = Vec::new();
-
-    for node in ordered {
-        // A disabled node compiles to *nothing*. Two reasons, and the second is the important
-        // one: the engine has no "skip this step" state a compiled definition can express
-        // (`workflow_steps` statuses describe a run, not a definition), and — more seriously —
-        // the first version of this function compiled disabled nodes like any other, so a node
-        // somebody had deliberately switched off still produced a step that still ran. The
-        // graph keeps the node and its edges, so turning it back on is one click and no rewiring;
-        // what it must not do is appear in the run.
-        if node.disabled {
-            continue;
+    // Node identity. A duplicate id is the failure every other check then mis-reports, so it
+    // comes first and names the id twice.
+    let mut ids: BTreeMap<&str, usize> = BTreeMap::new();
+    for node in &graph.nodes {
+        *ids.entry(node.id.as_str()).or_insert(0) += 1;
+    }
+    for (id, count) in &ids {
+        if *count > 1 {
+            findings.push(Finding::error(
+                "duplicate_node_id",
+                format!("{count} nodes are called {id:?} — every node needs its own id"),
+                Some(id),
+            ));
         }
-
-        if let Some(action) = action_for(&node.node_type) {
-            // The engine reads the action's own parameter names, so a node's palette params are
-            // passed through verbatim. `actions::validate_params` is the authority on whether the
-            // combination is usable, and its refusal is the graph's refusal.
-            let params = node.params_value();
-            if let Err(error) = actions::validate_params(action, &params) {
-                compile_issues.push(Issue::at_node(
-                    "node_param_invalid",
-                    &node.key,
-                    error.message().to_string(),
-                ));
-                continue;
+    }
+    for node in &graph.nodes {
+        if node.id.is_empty() || node.id.len() > MAX_NODE_ID {
+            findings.push(Finding::error(
+                "invalid_node_id",
+                format!(
+                    "a node id is 1 to {MAX_NODE_ID} characters, got {:?}",
+                    truncate(&node.id)
+                ),
+                Some(&node.id),
+            ));
+        }
+        if node.label.trim().is_empty() {
+            findings.push(Finding::error(
+                "node_label_required",
+                "a node needs a label — the canvas draws this card by it",
+                Some(&node.id),
+            ));
+        } else if node.label.len() > MAX_NODE_LABEL {
+            findings.push(Finding::warning(
+                "node_label_truncated",
+                format!(
+                    "the label is {} characters and the card draws {} of them",
+                    node.label.len(),
+                    MAX_NODE_LABEL
+                ),
+                Some(&node.id),
+            ));
+        }
+        if !node.position.x.is_finite()
+            || !node.position.y.is_finite()
+            || node.position.x < MIN_COORD
+            || node.position.x > MAX_COORD
+            || node.position.y < MIN_COORD
+            || node.position.y > MAX_COORD
+        {
+            findings.push(Finding::error(
+                "invalid_position",
+                format!(
+                    "a node sits at ({}, {}) and the canvas only draws between {MIN_COORD} and {MAX_COORD}",
+                    node.position.x, node.position.y
+                ),
+                Some(&node.id),
+            ));
+        }
+        // Resolution, not a lookup: a plugin node is resolved through the registry and a
+        // core node through the `const` list, and a key that is neither is the finding. The
+        // message differs per arm on purpose — "not a node type the platform knows" is right
+        // for a typo and *wrong* for a plugin this organization has disabled, and telling an
+        // author their working rule is nonsense because an admin disabled something is the
+        // fastest way to make them stop reading the panel.
+        match plugins.resolve(&node.node_type) {
+            Resolution::Core => {
+                if let Some(node_type) = find_node_type(&node.node_type) {
+                    findings.extend(validate_params(node, node_type));
+                }
             }
-            let attempts = node
-                .definition()
-                .map_or(1, |definition| definition.default_max_attempts)
-                .max(1)
-                .min(crate::definition::MAX_ATTEMPTS);
-            steps.push(StepDefinition::task(&node.label, action, params).retrying(attempts));
-            node_order.push(node.key.clone());
+            Resolution::Plugin(plugin_node) => {
+                findings.extend(validate_plugin_params(node, plugin_node));
+            }
+            Resolution::Unknown => {
+                let disabled = looks_like_plugin_key(&node.node_type);
+                findings.push(Finding::error(
+                    "unknown_node_type",
+                    if disabled {
+                        format!(
+                            "{:?} came from a plugin node type this organization no longer has enabled — \
+                             re-enable the plugin, or replace the node with a core one",
+                            node.node_type
+                        )
+                    } else {
+                        format!(
+                            "{:?} is not a node type the platform knows — the palette lists the legal ones",
+                            node.node_type
+                        )
+                    },
+                    Some(&node.id),
+                ));
+            }
+        }
+    }
+
+    // Exactly one trigger. Zero means nothing can start the definition; two means the author
+    // cannot say which one fires.
+    let triggers: Vec<&Node> = graph
+        .nodes
+        .iter()
+        .filter(|node| is_trigger_type(&node.node_type))
+        .collect();
+    match triggers.as_slice() {
+        [] => findings.push(Finding::error(
+            "no_trigger",
+            "the graph has no trigger — a definition cannot start itself",
+            None,
+        )),
+        [one] => {
+            if !graph.edges.iter().any(|edge| edge.source == one.id) {
+                findings.push(Finding::error(
+                    "trigger_not_connected",
+                    format!("the trigger {:?} goes nowhere", one.label),
+                    Some(&one.id),
+                ));
+            }
+        }
+        many => {
+            for trigger in many {
+                findings.push(Finding::error(
+                    "multiple_triggers",
+                    format!(
+                        "{:?} is a second trigger — a definition starts from exactly one",
+                        trigger.label
+                    ),
+                    Some(&trigger.id),
+                ));
+            }
+        }
+    }
+
+    // Edges: endpoints must exist, the port must be one the source exports, and the same
+    // pair of ports may be connected once.
+    let mut seen: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
+    for edge in &graph.edges {
+        let source = graph.node(&edge.source);
+        let target = graph.node(&edge.target);
+        let (Some(source), Some(target)) = (source, target) else {
+            findings.push(Finding::error(
+                "edge_dangling",
+                format!(
+                    "the connection {:?} → {:?} names a node the graph does not have",
+                    edge.source, edge.target
+                ),
+                graph.node(&edge.source).map(|node| node.id.as_str()),
+            ));
+            continue;
+        };
+        // Port validation resolves through the registry, because a plugin node's ports are
+        // the only thing that knows what they are. Note what is *not* here: no finding is
+        // added when the source type cannot be resolved at all. That case is already reported
+        // once per node by the `unknown_node_type` check, and saying it again per edge turns
+        // one mistake into N findings — the problems panel would show the same sentence eight
+        // times and the author would read it as noise.
+        let source_ports: Vec<String> = match plugins.resolve(&source.node_type) {
+            Resolution::Core => find_node_type(&source.node_type)
+                .map(|node_type| {
+                    node_type
+                        .outputs
+                        .iter()
+                        .map(|port| port.key.to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Resolution::Plugin(plugin_node) => plugin_node
+                .outputs
+                .iter()
+                .map(|port| port.key.clone())
+                .collect(),
+            Resolution::Unknown => Vec::new(),
+        };
+        if source_ports.is_empty() {
+            // Only a *resolved* type with no ports is a finding; an unresolved one is the
+            // node's own `unknown_node_type`, already counted.
+            if !matches!(plugins.resolve(&source.node_type), Resolution::Unknown) {
+                findings.push(Finding::error(
+                    "port_missing",
+                    format!("{:?} exports no port, so nothing can leave it", source.label),
+                    Some(&source.id),
+                ));
+            }
+        } else if !source_ports.contains(&edge.source_port) {
+            findings.push(Finding::error(
+                "unknown_source_port",
+                format!(
+                    "{:?} has no {:?} port — it exports {}",
+                    source.label,
+                    edge.source_port,
+                    source_ports
+                        .iter()
+                        .map(|key| format!("{key:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some(&source.id),
+            ));
+        }
+        if edge.source == edge.target {
+            findings.push(Finding::error(
+                "edge_self_loop",
+                format!("{:?} is connected to itself", source.label),
+                Some(&source.id),
+            ));
+        }
+        let key = (
+            edge.source.as_str(),
+            edge.source_port.as_str(),
+            edge.target.as_str(),
+        );
+        if !seen.insert(key) {
+            findings.push(Finding::error(
+                "duplicate_edge",
+                format!(
+                    "{:?} → {:?} is connected twice on the same port",
+                    source.label, target.label
+                ),
+                Some(&source.id),
+            ));
+        }
+    }
+
+    // **The count is over EDGES, not over distinct port keys, and the tick-39 version got
+    // that wrong.** The check first counted how many *ports* a node left on, which refused a
+    // switch with `case_1` and `default` both wired — and stayed quiet about the same node
+    // carrying two edges on **one** of those ports. Every other check was quiet about it too:
+    // `duplicate_edge` keys on the `(source, port, target)` triple, and two different targets
+    // are two different triples.
+    //
+    // So a node with `case_1` wired to two targets validated CLEAN and then walked to
+    // whichever target came first in the saved array. That is the same wrong-run bug the
+    // port version was written for, one shape narrower, and it was introduced by the fix —
+    // which is the reason the invariant is stated as "two followed edges out of one node"
+    // rather than "two followed ports". The traversal picks an *edge*; a check that counts
+    // ports is counting the wrong collection.
+    //
+    // A target repeated on the *same* port is `duplicate_edge`'s job and stays there: it is a
+    // different mistake with a different sentence, and folding it in here would report the
+    // same drawing twice for one cause.
+    let mut walked: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+    for edge in &graph.edges {
+        if followed_port(edge.source_port.as_str()) {
+            walked
+                .entry(edge.source.as_str())
+                .or_default()
+                .push((edge.source_port.as_str(), edge.target.as_str()));
+        }
+    }
+    for (source_id, out) in &walked {
+        // Distinct (port, target) pairs: two edges on one port pointing at the SAME target
+        // are a duplicate edge, not a choice, and are reported by the check above.
+        let mut choices: Vec<&str> = out.iter().map(|(port, _)| *port).collect();
+        choices.sort_unstable();
+        choices.dedup();
+        let ambiguous = choices.len() >= 2 || out.len() >= 2 && distinct_targets(out) >= 2;
+        if !ambiguous {
             continue;
         }
+        let label = graph
+            .node(source_id)
+            .map_or(*source_id, |node| node.label.as_str());
+        let ports: Vec<&str> = choices.clone();
+        findings.push(Finding::error(
+            "ambiguous_branch",
+            format!(
+                "{:?} leaves on more than one connection the run follows ({}), so the engine \
+                 cannot tell which one to take — connect one of them to something else, or route \
+                 the other through a condition",
+                label,
+                ports.join(", ")
+            ),
+            Some(source_id),
+        ));
+    }
 
-        // A wait node is the one non-task kind the graph can hold: the palette offers it and the
-        // engine has had it since v0.
-        if node.node_type == "wait" {
-            let seconds = node
+    // Reachability from the trigger, and orphans.
+    let trigger_id = triggers.first().map(|node| node.id.as_str());
+    let reachable = trigger_id
+        .map(|id| reachable_from(graph, id))
+        .unwrap_or_default();
+    for node in &graph.nodes {
+        if is_trigger_type(&node.node_type)
+            || find_node_type(&node.node_type).is_some_and(|t| t.inert)
+        {
+            continue;
+        }
+        if !reachable.contains(node.id.as_str()) {
+            findings.push(Finding::error(
+                "orphan_node",
+                format!(
+                    "{:?} is not reachable from the trigger — it would never run",
+                    node.label
+                ),
+                Some(&node.id),
+            ));
+        }
+    }
+
+    // A cycle. The engine executes an ordered list, so a graph that loops has no projection
+    // at all; this is refused at write time rather than at run time.
+    if let Some(cycle) = find_cycle(graph) {
+        let names: Vec<&str> = cycle
+            .iter()
+            .map(|id| {
+                graph
+                    .node(id)
+                    .map_or(id.as_str(), |node| node.label.as_str())
+            })
+            .collect();
+        findings.push(
+            Finding::error(
+                "graph_cycle",
+                format!(
+                    "the connections form a loop ({} → {}), and a run has no way to leave it",
+                    names.join(" → "),
+                    names.first().copied().unwrap_or_default()
+                ),
+                cycle.first().map(String::as_str),
+            )
+            .related(cycle.get(1).map(String::as_str)),
+        );
+    }
+
+    // Every non-terminal node needs a way out, or the run stops in the middle with nothing
+    // to say about it.
+    for node in &graph.nodes {
+        // A plugin node is checked here too, and its `inert` answer is `false` — a plugin
+        // declares no behaviour, so nothing it declares can make it decoration. The port list
+        // is what decides: a plugin node with ports must be wired onward, exactly like a core
+        // one, and skipping the check would let a graph validate whose last plugin node has
+        // nowhere to go and fail mid-run instead.
+        let (inert, output_count) = match plugins.resolve(&node.node_type) {
+            Resolution::Core => find_node_type(&node.node_type)
+                .map(|node_type| (node_type.inert, node_type.outputs.len()))
+                .unwrap_or((true, 0)),
+            Resolution::Plugin(plugin_node) => (false, plugin_node.outputs.len()),
+            Resolution::Unknown => continue,
+        };
+        if inert || output_count == 0 {
+            continue;
+        }
+        if reachable.contains(node.id.as_str()) && !graph.edges.iter().any(|e| e.source == node.id)
+        {
+            findings.push(Finding::error(
+                "dangling_output",
+                format!(
+                    "{:?} has no connection leaving it — the run would stop here",
+                    node.label
+                ),
+                Some(&node.id),
+            ));
+        }
+    }
+
+    findings
+}
+
+/// A node's own parameters against the registry's schema.
+///
+/// The core registry's `options` is `&'static [&'static str]`, so its iterator yields
+/// `&&str` and every one needs a deref. Written out rather than shared, because the two
+/// schemas arrive in different shapes and a clever coercion here is a `&&str` that compiles
+/// once and reads as noise forever after.
+fn validate_params(node: &Node, node_type: &NodeType) -> Vec<Finding> {
+    validate_declared_params(
+        node,
+        node_type.params.iter().map(|field| ParamCheck {
+            key: field.key,
+            label: field.label,
+            required: field.required,
+            options: field.options.iter().map(|option| *option).collect(),
+        }),
+    )
+}
+
+/// The same check for a plugin node's declared fields.
+///
+/// A second caller of one function rather than a copy of `validate_params`: the two schemas
+/// are different *types* (one is a `const` slice, one is owned strings from a manifest) but
+/// the same *question*, and a copy is where the two would start disagreeing. A plugin node
+/// that skipped the `select` check would accept a value the inspector cannot draw, and the
+/// author's only symptom would be a rule that saves and then does nothing.
+fn validate_plugin_params(
+    node: &Node,
+    node_type: &crate::plugin_nodes::ResolvedPluginNode,
+) -> Vec<Finding> {
+    validate_declared_params(
+        node,
+        node_type.params.iter().map(|field| ParamCheck {
+            key: field.key.as_str(),
+            label: field.label.as_str(),
+            required: field.required,
+            options: field.options.iter().map(String::as_str).collect(),
+        }),
+    )
+}
+
+/// One field, borrowed from either schema.
+struct ParamCheck<'a> {
+    key: &'a str,
+    label: &'a str,
+    required: bool,
+    options: Vec<&'a str>,
+}
+
+/// The shared body: a required field must be present and non-empty, a `select` must hold one
+/// of its declared values, and a field the schema does not declare at all is reported.
+///
+/// **The last clause is the one that was missing, and it is the one the two projections
+/// disagree on.** The builder's inspector maps over the *schema* (`nodeType.params`), so a param
+/// the node type never declared has no input to render into; Table mode maps over the *data*
+/// (`Object.keys(row.params)`), so it renders whatever the node happens to carry — as an
+/// editable field. A rule written by the API, by the table, or by an older build therefore
+/// presents an author with a field one screen lets them edit and the other silently drops on
+/// the next save, and the round trip loses the value. "Consistent after a save in either mode"
+/// is exactly that, and until this check existed a node could carry a key the inspector could
+/// never show: `validate` only ever asked whether the *declared* fields were satisfied, so the
+/// defect it should have named was invisible to all of the tests.
+///
+/// Reported as an **error**, not a warning, and deliberately not a refusal: `replace_graph`
+/// validates to *tell* the author rather than to reject the save (a rule is built by being
+/// incomplete), so the finding reaches the problems panel and the author decides.
+fn validate_declared_params<'a>(
+    node: &Node,
+    fields: impl Iterator<Item = ParamCheck<'a>>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    // Collected first because the undeclared-key sweep below has to ask "did the schema mention
+    // this one?" — a second pass over a consumed iterator would report every param as extra.
+    let fields: Vec<ParamCheck<'a>> = fields.collect();
+    let declared: BTreeSet<&str> = fields.iter().map(|field| field.key).collect();
+    for field in fields {
+        if field.required {
+            let present = node
                 .params
+                .get(field.key)
+                .is_some_and(|value| !value.is_null() && value.as_str() != Some(""));
+            if !present {
+                findings.push(Finding::error(
+                    "missing_parameter",
+                    format!("{:?} needs {} ({})", node.label, field.label, field.key),
+                    Some(&node.id),
+                ));
+            }
+        }
+        if !field.options.is_empty() {
+            if let Some(Value::String(chosen)) = node.params.get(field.key) {
+                if !field.options.contains(&chosen.as_str()) {
+                    findings.push(Finding::error(
+                        "invalid_parameter",
+                        format!(
+                            "{:?} has {chosen:?} for {}, which is one of {}",
+                            node.label,
+                            field.key,
+                            field.options.join(", ")
+                        ),
+                        Some(&node.id),
+                    ));
+                }
+            }
+        }
+    }
+    // The undeclared-key sweep. BTreeMap is ordered, so the findings come out in a stable
+    // order and two saves of the same graph report the same list.
+    for key in node.params.as_object().map(|map| map.keys()).into_iter().flatten() {
+        if declared.contains(key.as_str()) {
+            continue;
+        }
+        findings.push(Finding::error(
+            "unknown_parameter",
+            format!(
+                "{:?} carries {:?}, which {} does not declare — the canvas has no field for it \
+                 and the next save from there would drop it",
+                node.label,
+                key,
+                node.node_type,
+            ),
+            Some(&node.id),
+        ));
+    }
+    // The rest of the core checks read the *node type's* identity — a `condition` bounds its
+    // field path, a `wait` bounds its seconds — and a plugin node has neither identity, so
+    // there is nothing to apply. The generic check above is the whole of what a plugin node
+    // is validated against, and that is not an oversight: it is the boundary of what the core
+    // is willing to promise about code it does not run.
+    let Some(node_type) = find_node_type(&node.node_type) else {
+        return findings;
+    };
+    // A condition node's field path is the one thing the engine will read literally, so it is
+    // bounded here rather than at run time.
+    if node_type.key == "condition" {
+        if let Some(Value::String(field)) = node.params.get("field") {
+            if field.len() > MAX_FIELD {
+                findings.push(Finding::error(
+                    "invalid_parameter",
+                    format!(
+                        "{:?} reads a field path of {} characters; the engine reads up to {MAX_FIELD}",
+                        node.label,
+                        field.len()
+                    ),
+                    Some(&node.id),
+                ));
+            }
+        }
+    }
+    if node_type.key == "wait" {
+        if let Some(Value::Number(seconds)) = node.params.get("seconds") {
+            if let Some(seconds) = seconds.as_i64() {
+                if !(1..=crate::definition::MAX_WAIT_SECONDS).contains(&seconds) {
+                    findings.push(Finding::error(
+                        "invalid_parameter",
+                        format!(
+                            "{:?} parks for {seconds} seconds; a wait holds a run for 1 to {}",
+                            node.label,
+                            crate::definition::MAX_WAIT_SECONDS
+                        ),
+                        Some(&node.id),
+                    ));
+                }
+            }
+        }
+    }
+    findings
+}
+
+/// Every node the trigger can reach, following connections only.
+#[must_use]
+pub fn reachable_from<'a>(graph: &'a Graph, start: &'a str) -> BTreeSet<&'a str> {
+    let mut seen = BTreeSet::new();
+    let mut queue = vec![start];
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        for edge in graph.edges.iter().filter(|edge| edge.source == id) {
+            queue.push(edge.target.as_str());
+        }
+    }
+    seen
+}
+
+/// The first cycle in the graph, as the node ids along it.
+///
+/// Iterative depth-first search with an explicit stack: a 200-node graph is fine, and a
+/// recursive walk on a graph that is *allowed* to be a cycle is a stack overflow waiting for
+/// the one definition an author drew by accident.
+///
+/// **Every outgoing edge is followed, not the first one.** The previous version resolved a
+/// single `next` per node with `find_map`, which is a correct walk of a *list* and a broken
+/// walk of a *graph*: any node with two leaves — a condition, a switch, an action with an
+/// `error` branch — was only ever followed one way, so a loop closing on the other port was
+/// invisible to validation and to the projection. That is not a rare shape; it is what
+/// "retry until done" looks like, and the rule would have been stored, shown as valid, and
+/// hung the first time the retry branch fired.
+///
+/// The stack therefore holds a *cursor* per node rather than a node id, so a node stays on
+/// the path while its remaining edges are still to be tried — which is also what makes the
+/// reported ring the one that actually closes, instead of the first ring a left-to-right
+/// scan happened to touch.
+#[must_use]
+pub fn find_cycle(graph: &Graph) -> Option<Vec<String>> {
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for (position, node) in graph.nodes.iter().enumerate() {
+        index.insert(node.id.as_str(), position);
+    }
+    // Edges out of each node, as positions in `graph.edges`. Resolved once so the walk is not
+    // re-filtering the whole edge list at every step of every path.
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
+    for (edge_position, edge) in graph.edges.iter().enumerate() {
+        if let Some(&source) = index.get(edge.source.as_str()) {
+            outgoing[source].push(edge_position);
+        }
+    }
+
+    // 0 = unvisited, 1 = on the current path, 2 = done.
+    let mut state = vec![0u8; graph.nodes.len()];
+    for start in 0..graph.nodes.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        // (node, how many of its edges have been tried) — the cursor is what lets a node with
+        // several children be visited once and then *resumed*, rather than restarted from each
+        // child and never reaching the sibling that closes the loop.
+        let mut path: Vec<(usize, usize)> = vec![(start, 0)];
+        let mut positions: HashMap<usize, usize> = HashMap::new();
+        positions.insert(start, 0);
+        state[start] = 1;
+
+        while let Some(&mut (current, ref mut cursor)) = path.last_mut() {
+            // The next untried edge out of this node, or None when they are all used up.
+            let target = outgoing[current]
+                .get(*cursor)
+                .and_then(|edge_position| {
+                    index.get(graph.edges[*edge_position].target.as_str()).copied()
+                });
+            match target {
+                Some(target) => {
+                    *cursor += 1;
+                    match state[target] {
+                        // Back onto the path: everything from where that node was entered to
+                        // the node holding this edge is the loop.
+                        1 => {
+                            let start_at = positions[&target];
+                            let cycle: Vec<String> = path[start_at..]
+                                .iter()
+                                .map(|(node, _)| graph.nodes[*node].id.clone())
+                                .collect();
+                            return Some(cycle);
+                        }
+                        0 => {
+                            state[target] = 1;
+                            positions.insert(target, path.len());
+                            path.push((target, 0));
+                        }
+                        // Already finished elsewhere: this edge goes nowhere, try the next one.
+                        _ => {}
+                    }
+                }
+                None => {
+                    // Every edge out of this node has been tried, so it is finished.
+                    let (node, _) = path.pop().expect("the frame came off the stack");
+                    state[node] = 2;
+                    positions.remove(&node);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Turn a graph into the ordered step list the runner executes.
+///
+/// This is the single place the projection happens; every save goes through it, so a rule
+/// cannot be projected two different ways. It returns the steps *and* the node id that
+/// produced each, because `workflow_steps.node_id` is what paints the canvas after a run.
+///
+/// A node the projection cannot express is refused here, not skipped: silently dropping a
+/// node would leave a rule that runs and does not do what its canvas shows.
+///
+/// **This is the core-only wrapper**, for the same reason [`project_walk`] is one: the
+/// registry the caller validated against must be the registry the projection walks, or the
+/// two answer different things about one graph.
+pub fn project(graph: &Graph) -> Result<Vec<(String, StepDefinition)>> {
+    project_with_plugins(graph, &crate::plugin_nodes::PluginRegistry::empty())
+}
+
+/// [`project`], against the node types this organization has enabled.
+#[must_use]
+pub fn project_with_plugins(
+    graph: &Graph,
+    plugins: &crate::plugin_nodes::PluginRegistry,
+) -> Result<Vec<(String, StepDefinition)>> {
+    project_walk_with_plugins(graph, plugins).map(|walk| walk.steps)
+}
+
+/// One node of a graph, and what it contributes to a run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WalkedNode {
+    /// The node's id, as the canvas draws it.
+    pub node_id: String,
+    /// The step this node contributes, or `None` when it contributes none.
+    ///
+    /// `None` for a trigger (the run starts there rather than stepping through it), for a
+    /// note, and for any node type the registry marks inert. The distinction matters to
+    /// *Run from here*: a node with no step is not an error, it is a position.
+    pub step: Option<StepDefinition>,
+    /// The position this node's step occupies in the run, or `None` with no step.
+    ///
+    /// Counted over the *steps*, not over the nodes, and that is the point: a run's
+    /// `step_no` is dense (1, 2, 3…) while the walk has holes in it, and a planner that
+    /// numbered by node position would hand the engine a step list the stored numbering
+    /// disagrees with. Reading the number off the walk is what lets a skipped prefix keep
+    /// the position it would have had in a full run.
+    pub step_no: Option<i32>,
+}
+
+/// A whole graph walked in run order, with the runnable steps taken out of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Walk {
+    /// Every node the walk visited, in the order it was reached, triggers included.
+    pub nodes: Vec<WalkedNode>,
+    /// The runnable steps, in order, each with the node that produced it.
+    pub steps: Vec<(String, StepDefinition)>,
+}
+
+/// The graph's walk order, and the steps it projects to, against the core registry alone.
+///
+/// One traversal, two answers. *Run from here* needs the walk order because the node an
+/// operator clicks is often one that projects to no step — the end node, a note, a second
+/// trigger — and "start here" is a position in the walk, not a row in the step list.
+/// Deriving that from `project` alone is what would make those nodes unstartable, and
+/// deriving it from a second walk is what would let the two disagree about order.
+///
+/// **This is the core-only wrapper.** An organization with a plugin node must use
+/// [`project_walk_with_plugins`], for the same reason `validate` is a wrapper around
+/// `validate_with_plugins`: the registry is a parameter of the *check*, and a check that
+/// silently uses a different one than the caller is a check that can answer two different
+/// things about one graph.
+pub fn project_walk(graph: &Graph) -> Result<Walk> {
+    project_walk_with_plugins(graph, &crate::plugin_nodes::PluginRegistry::empty())
+}
+
+/// [`project_walk`], against the node types this organization has enabled.
+///
+/// **This function exists because the core-only wrapper was not enough, and the reason is
+/// worth writing down because it is the same reason `validate_with_plugins` exists, seen
+/// from the other side.** The save path validates with the organization's registry and then
+/// calls the store, which projects with the *core* registry. So a graph the route accepted
+/// was refused one function later with a different sentence — and the two sentences were
+/// exactly backwards:
+///
+/// * the route said "that node type is fine" (it resolved through the plugin registry), and
+/// * the store said `"plugin.mailer.send" does not project onto a step`, which reads as
+///   *"you configured a node type that does not exist"* rather than *"the core cannot
+///   execute what you drew"*.
+///
+/// The author is right either way — a rule whose node the core cannot project is a rule
+/// that does not run — but the *fix* differs: one is "re-enable the plugin", the other is
+/// "replace the node". A save that says the wrong one costs the author a round trip
+/// through a problems panel that has just told them their working rule is nonsense.
+///
+/// So the projection resolves through the same registry the palette was drawn from, and a
+/// plugin node is refused **with the sentence that names the actual reason**: the core does
+/// not execute plugin nodes, and no manifest makes that change. That is a product decision
+/// REQ-121 revises when a sandboxed runner exists (docs/09 §13, lesson 14); until then the
+/// honest answer is a refusal at save time, not a run that dies at 03:00.
+pub fn project_walk_with_plugins(
+    graph: &Graph,
+    plugins: &crate::plugin_nodes::PluginRegistry,
+) -> Result<Walk> {
+    let findings: Vec<Finding> = validate_with_plugins(graph, plugins)
+        .into_iter()
+        .filter(Finding::is_error)
+        .collect();
+    if let Some(first) = findings.first() {
+        return Err(WorkflowError::invalid(
+            "graph_invalid",
+            format!("{} ({} finding(s) in total)", first.message, findings.len()),
+        ));
+    }
+
+    let trigger = graph
+        .nodes
+        .iter()
+        .find(|node| is_trigger_type(&node.node_type))
+        .ok_or_else(|| WorkflowError::invalid("graph_invalid", "the graph has no trigger"))?;
+
+    let mut nodes: Vec<WalkedNode> = Vec::new();
+    let mut steps: Vec<(String, StepDefinition)> = Vec::new();
+    // The position the *next* step will take, counted over steps only. A trigger and an
+    // inert node hold no position, which is why `WalkedNode.step_no` is `Option`: the
+    // walk has holes in it and the run does not.
+    let mut step_no: i32 = 0;
+    let mut current = trigger.id.clone();
+    // The v0 engine has one branching step, so a graph walk follows the *true* edge and stops
+    // at a false one. `visited` is what turns a loop the validator refused into a bounded
+    // walk rather than a hang, should one ever be stored by hand.
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+
+    while visited.insert(current.clone()) {
+        if steps.len() >= MAX_STEPS {
+            return Err(WorkflowError::invalid(
+                "too_many_steps",
+                format!("the graph projects to more than {MAX_STEPS} steps"),
+            ));
+        }
+        let node = graph.node(&current).ok_or_else(|| {
+            WorkflowError::invalid(
+                "graph_invalid",
+                format!("the graph has no node {current:?}"),
+            )
+        })?;
+
+        match plugins.resolve(&node.node_type) {
+            Resolution::Core => {
+                let node_type = find_node_type(&node.node_type).ok_or_else(|| {
+                    // `is_reserved_key` is what produced this arm, so a core key with no
+                    // `NodeType` would mean the two disagree about the registry. Saying so
+                    // beats a `None` that reads like a typo.
+                    WorkflowError::invalid(
+                        "unknown_node_type",
+                        format!(
+                            "{:?} is listed as a core node type but the registry has no \
+                             definition for it — this is a platform defect, not your rule",
+                            node.node_type
+                        ),
+                    )
+                })?;
+                // A trigger is where the run starts, not something the runner steps through,
+                // and a note is decoration. Neither contributes a step.
+                if node_type.inert || is_trigger_type(&node.node_type) {
+                    nodes.push(WalkedNode {
+                        node_id: node.id.clone(),
+                        step: None,
+                        step_no: None,
+                    });
+                } else {
+                    let step = step_for(node, node_type, graph)?;
+                    step_no += 1;
+                    nodes.push(WalkedNode {
+                        node_id: node.id.clone(),
+                        step: Some(step.clone()),
+                        step_no: Some(step_no),
+                    });
+                    steps.push((node.id.clone(), step));
+                }
+            }
+            // **The clause the criterion's third state is actually about, seen from the run
+            // side.** `validate_with_plugins` above already refused everything the registry
+            // cannot resolve *at all* (a typo, a plugin that is not enabled), so reaching
+            // here with a plugin key means the plugin IS enabled and the node still cannot
+            // run. The sentence has to say that, because the reader who just installed the
+            // plugin will otherwise go looking for a typo that is not there.
+            Resolution::Plugin(plugin_node) => {
+                return Err(WorkflowError::invalid(
+                    "plugin_node_not_executable",
+                    format!(
+                        "{:?} is a {} node and the platform does not execute plugin nodes yet — \
+                         the core engine runs core node types only. Replace it with a core node, \
+                         or wait for a sandboxed plugin runner.",
+                        node.label, plugin_node.badge,
+                    ),
+                ));
+            }
+            // Unreachable in practice: the error findings above return before the walk
+            // starts. Kept so a future refactor that drops the early return gets a sentence
+            // rather than a panic.
+            Resolution::Unknown => {
+                return Err(WorkflowError::invalid(
+                    "unknown_node_type",
+                    format!("{:?} is not a node type the platform knows", node.node_type),
+                ));
+            }
+        }
+
+        // **Invariant: `validate` above has already refused a node with two walkable ports,
+        // so exactly one of these edges can exist here.** The `find` is not a choice between
+        // branches — it is the only edge on a followed port, and the guarantee is the
+        // `ambiguous_branch` finding rather than anything this loop could check itself.
+        //
+        // That guarantee is why the two pieces of code must stay together: if the check above
+        // is ever relaxed to a warning, this silently becomes the first-edge-wins guess it
+        // used to be, and a rule that runs the wrong branch still validates clean.
+        let next = graph
+            .edges
+            .iter()
+            .find(|edge| edge.source == node.id && followed_port(edge.source_port.as_str()));
+        let Some(next) = next else { break };
+        current = next.target.clone();
+    }
+
+    if steps.is_empty() {
+        return Err(WorkflowError::invalid(
+            "graph_invalid",
+            "the graph projects to no steps — nothing would run",
+        ));
+    }
+    Ok(Walk { nodes, steps })
+}
+
+/// Which output port the linear walk follows.
+///
+/// **It is `!terminal`, and the identity is asserted over the whole registry in
+/// `run_from.rs` rather than trusted.** The list this replaced (`"out" | "true" |
+/// "success" | "case_1" | "default"`) was a *second* hand-maintained copy of a fact the
+/// port table already carries: `Port::terminal` is declared next to every port, and the
+/// panels already render it. Two lists over the same fact is the drift this branch has
+/// now hit three times — the node type registry, the trigger prefix, and this.
+///
+/// It is public because the *client* has to answer the same question (which nodes can
+/// start a run) and it cannot compile Rust. Copying the five strings into TypeScript
+/// would make it four; deriving it from `terminal`, which the palette already ships to
+/// the browser, means the browser reads the registry's own answer rather than a guess
+/// about it. The test that keeps the two honest lives with the feature that depends on it.
+#[must_use]
+pub fn followed_port(port: &str) -> bool {
+    // Ports that leave the run cannot be walked *onto* — there is nothing after them.
+    !find_port(port).map_or(false, |spec| spec.terminal)
+}
+
+/// The terminal flag of a port of a core node type, or `false` for an unknown one.
+///
+/// An unknown port is answered *not* terminal on purpose: the registry refuses an edge on
+/// a port a node does not export at save time, so this is only ever asked about a port
+/// that exists, and answering "unknown ports end the run" would silently truncate a
+/// walk on a graph that has not been validated yet.
+fn find_port(port: &str) -> Option<&'static Port> {
+    NODE_TYPES
+        .iter()
+        .flat_map(|node_type| node_type.outputs.iter())
+        .find(|spec| spec.key == port)
+}
+
+/// How many different nodes a node's followed edges point at.
+///
+/// The ambiguous-branch check needs both numbers and they mean different things: the number
+/// of *ports* answers "could the walk have chosen a different arm", and the number of
+/// *targets* answers "did the author wire the same arm twice". A duplicate on one port
+/// pointing at one node is `duplicate_edge`'s finding — a re-drawn line, not a choice — so
+/// it must not also be reported as a branch the engine cannot pick.
+fn distinct_targets(out: &[(&str, &str)]) -> usize {
+    let mut targets: Vec<&str> = out.iter().map(|(_, target)| *target).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    targets.len()
+}
+
+/// The step one node projects onto.
+fn step_for(node: &Node, node_type: &NodeType, graph: &Graph) -> Result<StepDefinition> {
+    let name = node.label.clone();
+    let params = &node.params;
+    match node_type.key {
+        "end" => Ok(StepDefinition::stop(
+            name,
+            params
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the definition ends here"),
+        )),
+        "wait" => {
+            let seconds = params
                 .get("seconds")
                 .and_then(Value::as_i64)
-                .unwrap_or(60);
-            match StepDefinition::wait(&node.label, seconds).wait_seconds() {
-                Ok(_) => {
-                    steps.push(StepDefinition::wait(&node.label, seconds));
-                    node_order.push(node.key.clone());
-                }
-                Err(error) => compile_issues.push(Issue::at_node(
-                    "node_param_invalid",
-                    &node.key,
-                    error.message().to_string(),
-                )),
+                .ok_or_else(|| {
+                    WorkflowError::invalid(
+                        "invalid_parameter",
+                        format!("{name:?} parks the run but says for how long"),
+                    )
+                })?;
+            // Read through the engine's own reader, so a projection can never store a wait
+            // the engine would refuse to resume.
+            crate::definition::wait_seconds_from(&json!({ "seconds": seconds }))?;
+            Ok(StepDefinition::wait(name, seconds))
+        }
+        "condition" => {
+            let field = params
+                .get("field")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let operator = params
+                .get("operator")
+                .and_then(Value::as_str)
+                .unwrap_or("equals")
+                .to_owned();
+            let value = params.get("value").cloned().unwrap_or(Value::Null);
+            // The false edge ends the run, and the projection says so on the step itself: a
+            // trace that stops here can then show *which* comparison stopped it, instead of
+            // the run simply running out of steps.
+            let false_target = graph
+                .edges
+                .iter()
+                .find(|edge| edge.source == node.id && edge.source_port == "false")
+                .map(|edge| edge.target.as_str());
+            let reason = false_target
+                .and_then(|id| graph.node(id))
+                .map(|target| target.label.clone());
+            let mut step = StepDefinition::branch(name.clone(), field, operator, value);
+            if let Some(reason) = reason {
+                step.params["false_label"] = json!(reason);
             }
-            continue;
+            Ok(step)
+        }
+        "approval" => {
+            let permission = params.get("permission").and_then(Value::as_str);
+            let message = params.get("message").and_then(Value::as_str);
+            let expires = params
+                .get("expires_in_hours")
+                .and_then(Value::as_i64)
+                .and_then(|hours| i32::try_from(hours).ok());
+            Ok(StepDefinition::approval(name, permission, message, expires))
+        }
+        "http_request" => {
+            // An outbound call is a task step whose action is `http_request`; the engine
+            // checks the method and the host against its own lists at run time.
+            let url = params
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let method = params
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("POST")
+                .to_uppercase();
+            let mut call = json!({ "url": url, "method": method });
+            if let Some(body) = params.get("body") {
+                call["body"] = body.clone();
+            }
+            if let Some(timeout) = params.get("timeout_ms").and_then(Value::as_i64) {
+                call["timeout_ms"] = json!(timeout);
+            }
+            Ok(StepDefinition::task(name, "http_request", call))
+        }
+        "transform" => {
+            let template = params.get("template").cloned().unwrap_or_else(|| json!({}));
+            Ok(StepDefinition::task(name, "echo", template))
+        }
+        "sub_workflow" => {
+            let target = params
+                .get("workflow_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    WorkflowError::invalid(
+                        "invalid_parameter",
+                        format!("{name:?} names no rule to run"),
+                    )
+                })?;
+            let parsed = Uuid::parse_str(target).map_err(|_| {
+                WorkflowError::invalid(
+                    "invalid_parameter",
+                    format!("{name:?} names {target:?}, which is not a rule id"),
+                )
+            })?;
+            Ok(StepDefinition::task(
+                name,
+                "run_workflow",
+                json!({ "workflow_id": parsed }),
+            ))
+        }
+        "action" => {
+            let action = params
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    WorkflowError::invalid(
+                        "invalid_parameter",
+                        format!("{name:?} names no action to run"),
+                    )
+                })?;
+            let action_params = match params.get("parameters") {
+                Some(Value::String(raw)) if !raw.trim().is_empty() => serde_json::from_str(raw)
+                    .map_err(|error| {
+                        WorkflowError::invalid(
+                            "invalid_parameter",
+                            format!("{name:?} has parameters that are not JSON: {error}"),
+                        )
+                    })?,
+                Some(value @ Value::Object(_)) => value.clone(),
+                _ => Value::Object(serde_json::Map::new()),
+            };
+            Ok(StepDefinition::task(name, action, action_params))
+        }
+        // **The switch is refused here, with its own code and its own sentence.** It has no
+        // arm in `step_for` and never had: the v0 engine executes ONE branch step, and a
+        // switch declares one arm *per case*. So a switch is a registry type the projection
+        // has no step for, and it used to fall into `other =>` — whose sentence reads
+        // `"switch" does not project onto a step`, an `unknown_node_type` error for a type
+        // the palette itself offered and the author had just dragged onto the canvas.
+        //
+        // The palette offers it because the registry advertises it, and the criteria in this
+        // REQ put a switch in the node-types v1 list (docs/requests/REQ-004, "one branch per
+        // case + default"). So this is not a card to delete from the palette — it is a card
+        // whose limitation has to be **said**, at save time, with words the author can act on.
+        // The panel already renders `finding.message` and tags `data-finding={code}`, so the
+        // finding carries this all the way to the problems panel.
+        //
+        // What it must never be is `unknown_node_type`: that code means "I have no such
+        // type", and for a key the palette just handed the author it is always false. The
+        // sentence names the real limit and the real alternative — a condition, which the
+        // engine does run — because "not supported yet" with no next step is the answer
+        // that teaches people to ignore the problems panel.
+        "switch" => Err(WorkflowError::invalid(
+            "switch_not_executable",
+            format!(
+                "{:?} is a switch and the engine runs one condition per step, not one arm per \
+                 case — put a Condition on the canvas and chain them, or wait for the \
+                 multi-arm step.",
+                name
+            ),
+        )),
+        other => Err(WorkflowError::invalid(
+            "unknown_node_type",
+            format!("{other:?} does not project onto a step"),
+        )),
+    }
+}
+
+/// A viewport inside [`MIN_ZOOM`]`..=`[`MAX_ZOOM`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Viewport {
+    /// Horizontal pan.
+    pub x: f64,
+    /// Vertical pan.
+    pub y: f64,
+    /// Zoom factor, clamped on read.
+    pub zoom: f64,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            zoom: 1.0,
+        }
+    }
+}
+
+impl Viewport {
+    /// Clamp a viewport a client posted: a zoom of 0 or 40 is a client bug, and refusing the
+    /// whole save over it would lose the author's real edit.
+    #[must_use]
+    pub fn clamped(mut self) -> Self {
+        if !self.x.is_finite() {
+            self.x = 0.0;
+        }
+        if !self.y.is_finite() {
+            self.y = 0.0;
+        }
+        if !self.zoom.is_finite() {
+            self.zoom = 1.0;
+        }
+        self.x = self.x.clamp(MIN_COORD, MAX_COORD);
+        self.y = self.y.clamp(MIN_COORD, MAX_COORD);
+        self.zoom = self.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        self
+    }
+
+    /// Zoom one step in, staying inside the bounds.
+    #[must_use]
+    pub fn zoomed(self, direction: Zoom) -> Self {
+        let zoom = (self.zoom + direction.delta() * ZOOM_STEP).clamp(MIN_ZOOM, MAX_ZOOM);
+        Self { zoom, ..self }
+    }
+}
+
+/// Which way a zoom key moves the viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zoom {
+    /// Closer.
+    In,
+    /// Further away.
+    Out,
+}
+
+impl Zoom {
+    const fn delta(self) -> f64 {
+        match self {
+            Self::In => 1.0,
+            Self::Out => -1.0,
+        }
+    }
+}
+
+/// The layout half of `workflows.ui_state`: never read by the engine.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UiState {
+    /// Where the canvas is looking.
+    #[serde(default)]
+    pub viewport: Viewport,
+    /// Explicit positions, when the client keeps them outside the nodes.
+    ///
+    /// `None` for a save that carries no layout change — which is the case that must not bump
+    /// `graph_version`, so the builder can pan and zoom all day without a single version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions: Option<serde_json::Map<String, Value>>,
+}
+
+/// Snap a coordinate to the 8px grid the builder draws.
+#[must_use]
+pub fn snap(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    (value / 8.0).round() * 8.0
+}
+
+fn truncate(value: &str) -> String {
+    if value.chars().count() <= 40 {
+        return value.to_owned();
+    }
+    value.chars().take(37).collect::<String>() + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: &str, node_type: &str) -> Node {
+        Node {
+            id: id.to_owned(),
+            node_type: node_type.to_owned(),
+            label: id.to_owned(),
+            params: Value::Object(serde_json::Map::new()),
+            position: Position::default(),
+        }
+    }
+
+    fn action(id: &str) -> Node {
+        let mut node = node(id, "action");
+        node.params = json!({ "action": "echo", "parameters": { "value": 1 } });
+        node
+    }
+
+    /// trigger → one action → end
+    fn linear() -> Graph {
+        Graph {
+            nodes: vec![
+                node("trigger", "trigger.manual"),
+                action("a1"),
+                node("end", "end"),
+            ],
+            edges: vec![
+                Edge {
+                    id: "e0".to_owned(),
+                    source: "trigger".to_owned(),
+                    source_port: "out".to_owned(),
+                    target: "a1".to_owned(),
+                },
+                Edge {
+                    id: "e1".to_owned(),
+                    source: "a1".to_owned(),
+                    source_port: "success".to_owned(),
+                    target: "end".to_owned(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_starter_graph_carries_only_params_the_registry_declares() {
+        // **This is the invariant two modes disagree on, and it is checked over EVERY kind
+        // rather than the one that happened to be measured.** The browser row that found the
+        // defect read `builderSeesTableEdit: false` with `clicked: 2, inspected: 2` on a manual
+        // rule — the canvas rendered, every card opened, and the value was simply not there,
+        // because the inspector draws `nodeType.params` and `trigger.manual` declares none while
+        // the starter had written one. Checking only `manual` would let `schedule` (which
+        // declares `cron`) keep a stray `kind`, and Table mode renders `Object.keys(params)` so
+        // any of them shows a field the canvas has no input for.
+        //
+        // The assertion is over the KEYS, not over emptiness: a starter that seeds a param the
+        // type does not declare is invisible to `validate()`, which only checks that required
+        // params are PRESENT, never that extras are absent. That asymmetry is why this could
+        // ship with 157 green tests.
+        for kind in ["manual", "schedule", "event"] {
+            let graph = Graph::starter(kind, Some("qa.starter.probe"));
+            for node in &graph.nodes {
+                let declared = find_node_type(&node.node_type)
+                    .map(|found| found.params.iter().map(|field| field.key).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                for key in node.params.as_object().map(|map| map.keys()).into_iter().flatten() {
+                    assert!(
+                        declared.contains(&key.as_str()),
+                        "the starter seeds `{kind}`'s {} node with `{key}`, which its form does \
+                         not declare — Table mode would show an editable field the canvas \
+                         inspector has no input for",
+                        node.node_type,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_starter_still_carries_the_event_the_author_chose() {
+        // The other direction of the fix: dropping the invented key must not drop the real one.
+        // `trigger.event` declares `event` and requires it, so a starter that stopped seeding it
+        // would leave every event rule born invalid — the defect the same fix was written to
+        // avoid, in the opposite direction.
+        let with_event = Graph::starter("event", Some("page.published"));
+        assert_eq!(with_event.nodes[0].params["event"], json!("page.published"));
+        // And it is seeded ONLY where it is declared: `trigger.schedule` wants `cron`, and an
+        // `event` key on it is the same class of stray.
+        let schedule = Graph::starter("schedule", Some("page.published"));
+        assert!(
+            !schedule.nodes[0].params.as_object().is_some_and(|map| map.contains_key("event")),
+            "a schedule trigger declares `cron`, not `event`",
+        );
+    }
+
+    /// The half of the same defect that the starter fix could not reach: `validate()` used to ask
+    /// only whether the *declared* fields were satisfied, so a key the node type never declared
+    /// was invisible to all of the suite. Anything that writes a graph can seed one — the API,
+    /// the table, an older build — and the inspector renders the SCHEMA, so the field has no
+    /// input there while Table mode renders the DATA and offers it as editable. The round trip
+    /// then loses whatever the author typed.
+    #[test]
+    fn a_parameter_the_node_type_does_not_declare_is_reported() {
+        let mut trigger = node("t1", "trigger.manual");
+        // The exact shape the QA pass produced: `event` on a trigger whose form declares none.
+        trigger.params = json!({ "event": "qa.table.edited" });
+        let graph = Graph {
+            nodes: vec![trigger, node("e1", "end")],
+            edges: vec![Edge {
+                id: "e0".into(),
+                source: "t1".into(),
+                source_port: "out".into(),
+                target: "e1".into(),
+            }],
+        };
+        let found = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "unknown_parameter")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a trigger carrying `event`, which trigger.manual does not declare, must be \
+                     reported: the canvas inspector renders the schema and has no field for it"
+                )
+            });
+        // The sentence has to name the node AND the key, because "something on this node is
+        // wrong" is what an author already gets from three other findings.
+        assert!(
+            found.message.contains("event") && found.message.contains("trigger.manual"),
+            "the finding names the key and the node type: {}",
+            found.message
+        );
+        assert_eq!(found.node_id.as_deref(), Some("t1"));
+        // Severity is part of the claim, not decoration: `replace_graph` counts errors and hands
+        // that count to the client, and a warning is exactly how "this field will disappear the
+        // next time you save from the canvas" turns into a note nobody reads.
+        assert_eq!(
+            found.severity,
+            Severity::Error,
+            "a parameter the inspector has no field for is an error, not a warning"
+        );
+    }
+
+    /// The two directions, or the sweep is a filter that deletes everything.
+    #[test]
+    fn a_declared_parameter_is_never_reported_as_undeclared() {
+        // Sweeping on the node TYPE instead of on the field list would flag a rule the author
+        // just filled in correctly, and an error that fires on valid rules is a finding nobody
+        // reads — the fastest way to make the problems panel noise.
+        for node_type in ["trigger.event", "trigger.schedule", "wait", "condition"] {
+            let declared = find_node_type(node_type).expect("a core node type");
+            let mut probe = node("n1", node_type);
+            probe.params = Value::Object(
+                declared
+                    .params
+                    .iter()
+                    .map(|field| (field.key.to_owned(), json!("qa.probe")))
+                    .collect(),
+            );
+            let graph = Graph {
+                nodes: vec![probe, node("e1", "end")],
+                edges: vec![Edge {
+                    id: "e0".into(),
+                    source: "n1".into(),
+                    source_port: "out".into(),
+                    target: "e1".into(),
+                }],
+            };
+            let findings = validate(&graph);
+            let codes: Vec<&str> = findings.iter().map(|finding| finding.code.as_str()).collect();
+            assert!(
+                !codes.contains(&"unknown_parameter"),
+                "{node_type} filled in exactly as its form declares must raise no unknown_parameter: \
+                 {codes:?}"
+            );
+        }
+    }
+
+    /// Every finding the sweep emits has to be nameable, or it is a symptom nobody can act on.
+    #[test]
+    fn the_undeclared_sweep_reports_one_finding_per_stray_key_in_a_stable_order() {
+        let mut trigger = node("t1", "trigger.manual");
+        // Deliberately not alphabetical in construction order; BTreeMap is the order in the JSON,
+        // so the report is stable regardless of how the keys were typed.
+        trigger.params = json!({ "zeta": "1", "alpha": "2" });
+        let graph = Graph {
+            nodes: vec![trigger, node("e1", "end")],
+            edges: vec![Edge {
+                id: "e0".into(),
+                source: "t1".into(),
+                source_port: "out".into(),
+                target: "e1".into(),
+            }],
+        };
+        let messages: Vec<String> = validate(&graph)
+            .into_iter()
+            .filter(|finding| finding.code == "unknown_parameter")
+            .map(|finding| finding.message)
+            .collect();
+        assert_eq!(
+            messages.len(),
+            2,
+            "one finding per stray key, not one per node: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("alpha") && messages[1].contains("zeta"),
+            "the keys come out in a stable order so two saves report the same list: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn declares_param_answers_from_the_registry_and_nothing_else() {
+        assert!(declares_param("trigger.event", "event"));
+        assert!(!declares_param("trigger.manual", "event"));
+        assert!(!declares_param("trigger.manual", "kind"));
+        assert!(declares_param("end", "reason"));
+        // An unknown type declares nothing, so seeding it can never invent a field.
+        assert!(!declares_param("plugin.nope.action", "anything"));
+    }
+
+    #[test]
+    fn a_starter_graph_is_valid_and_projects_to_one_step() {
+        let graph = Graph::starter("manual", None);
+        let all = validate(&graph);
+        let codes: Vec<&str> = all.iter().map(|finding| finding.code.as_str()).collect();
+        assert!(
+            codes.is_empty(),
+            "a new definition must be born valid: {codes:?}"
+        );
+
+        let steps = project(&graph).expect("a starter graph projects");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].0, "end");
+        assert_eq!(steps[0].1.kind, crate::model::StepKind::Stop);
+    }
+
+    #[test]
+    fn a_linear_graph_projects_to_the_steps_the_runner_expects() {
+        let steps = project(&linear()).expect("a linear graph projects");
+        let names: Vec<&str> = steps.iter().map(|(_, step)| step.name.as_str()).collect();
+        assert_eq!(names, vec!["a1", "end"]);
+
+        // The projection is the engine's own type, and the runner needs no change to read it.
+        let encoded = serde_json::to_value(&steps[0].1).expect("a step serialises");
+        assert_eq!(encoded["name"], "a1");
+        assert_eq!(encoded["kind"], "task");
+        assert_eq!(encoded["action"], "echo");
+    }
+
+    #[test]
+    fn a_condition_projects_to_a_branch_and_the_false_edge_ends_the_run() {
+        let mut graph = linear();
+        let mut condition = node("c1", "condition");
+        condition.params =
+            json!({ "field": "{{event.role}}", "operator": "equals", "value": "admin" });
+        graph.nodes.insert(1, condition);
+        // trigger → c1, c1 true → a1, a1 success → end; the false edge goes nowhere.
+        graph.edges = vec![
+            Edge {
+                id: "e0".to_owned(),
+                source: "trigger".to_owned(),
+                source_port: "out".to_owned(),
+                target: "c1".to_owned(),
+            },
+            Edge {
+                id: "e1".to_owned(),
+                source: "c1".to_owned(),
+                source_port: "true".to_owned(),
+                target: "a1".to_owned(),
+            },
+            Edge {
+                id: "e2".to_owned(),
+                source: "a1".to_owned(),
+                source_port: "success".to_owned(),
+                target: "end".to_owned(),
+            },
+        ];
+
+        let steps = project(&graph).expect("a condition projects");
+        let branch = &steps[0].1;
+        assert_eq!(branch.name, "c1");
+        assert_eq!(branch.kind, crate::model::StepKind::Branch);
+        assert_eq!(branch.params["operator"], "equals");
+        assert_eq!(branch.params["value"], "admin");
+        // The false edge is a stop, not a second path: the projection walks the true edge.
+        let names: Vec<&str> = steps.iter().map(|(_, step)| step.name.as_str()).collect();
+        assert_eq!(names, vec!["c1", "a1", "end"]);
+    }
+
+    #[test]
+    fn a_cycle_is_refused_and_names_the_loop() {
+        let mut graph = linear();
+        graph.edges.push(Edge {
+            id: "e2".to_owned(),
+            source: "end".to_owned(),
+            source_port: "default".to_owned(),
+            target: "a1".to_owned(),
+        });
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "graph_cycle")
+            .expect("a loop is found");
+        assert!(
+            finding.message.contains("a1"),
+            "names the node: {}",
+            finding.message
+        );
+
+        // And a graph with a cycle cannot be stored, rather than stored and hanging at run time.
+        let error = project(&graph).expect_err("a cycle does not project");
+        assert_eq!(error.code(), "graph_invalid");
+    }
+
+    #[test]
+    fn a_loop_that_closes_on_a_branch_is_still_a_loop() {
+        // The reported case: the walk takes the FIRST outgoing edge of each node, so a node
+        // with two leaves is only ever followed one way. A condition whose `false` branch
+        // points back up the graph — the shape a "retry until done" rule has — closed a ring
+        // the validator could not see, because `false` is never the edge it followed.
+        let mut graph = Graph {
+            nodes: vec![
+                node("trigger", "trigger.manual"),
+                node("cond", "condition.if"),
+                action("a1"),
+                node("end", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e0".to_owned(), source: "trigger".to_owned(), source_port: "out".to_owned(), target: "cond".to_owned() },
+                // Drawn first, so the walk reaches `a1` — and then stops there.
+                Edge { id: "e1".to_owned(), source: "cond".to_owned(), source_port: "true".to_owned(), target: "a1".to_owned() },
+                Edge { id: "e2".to_owned(), source: "a1".to_owned(), source_port: "success".to_owned(), target: "end".to_owned() },
+                // The loop closes on the port nobody looks at twice.
+                Edge { id: "e3".to_owned(), source: "cond".to_owned(), source_port: "false".to_owned(), target: "trigger".to_owned() },
+            ],
+        };
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "graph_cycle")
+            .expect("a branch-closing loop is a loop");
+        // The finding must name the node the author can jump to, and the other end of the ring.
+        assert!(
+            finding.node_id.is_some(),
+            "the finding is addressable: {:?}",
+            finding.node_id
+        );
+        assert!(
+            finding.related_node_id.is_some(),
+            "the finding names where it closes: {:?}",
+            finding.related_node_id
+        );
+        assert!(
+            project(&graph).is_err(),
+            "and a graph that loops cannot be stored, rather than stored and hanging at run time"
+        );
+    }
+
+    #[test]
+    fn a_node_with_two_followed_ports_is_refused_rather_than_guessed() {
+        // The sibling of `a_loop_that_closes_on_a_branch_is_still_a_loop`, one level down.
+        // `find_cycle` was fixed to follow every edge; the projection still resolves the
+        // *next* node with `find(|edge| … followed_port(port))`, so a node carrying two edges on
+        // ports the linear walk follows (`case_1` and `default` on a switch, or two `out`
+        // edges) resolves to whichever one sits earlier in the saved array.
+        //
+        // The consequence is worse than the cycle bug in one way and better in another: a
+        // rule whose author drew the *default* branch second would run it as if it were the
+        // case, silently, on every run — while validating clean. And the array order is not
+        // the author's intent: it is the order the client happened to PUT, so the same
+        // drawing can project to two different rules depending on how it was saved.
+        //
+        // The v0 engine walks ONE linear path, so two followed ports on one node is not a
+        // shape it can execute. It must be refused at write time with the ports named —
+        // never resolved by array position.
+        let graph = Graph {
+            nodes: vec![
+                node("trigger", "trigger.manual"),
+                {
+                    let mut sw = node("sw", "switch");
+                    sw.params = json!({ "cases": "a\nb" });
+                    sw
+                },
+                action("taken"),
+                node("end", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e0".to_owned(), source: "trigger".to_owned(), source_port: "out".to_owned(), target: "sw".to_owned() },
+                // `case_1` first in the array, so the old walk followed THIS one.
+                Edge { id: "e1".to_owned(), source: "sw".to_owned(), source_port: "case_1".to_owned(), target: "taken".to_owned() },
+                Edge { id: "e2".to_owned(), source: "sw".to_owned(), source_port: "default".to_owned(), target: "end".to_owned() },
+                Edge { id: "e3".to_owned(), source: "taken".to_owned(), source_port: "success".to_owned(), target: "end".to_owned() },
+            ],
+        };
+
+        let err = project(&graph).expect_err("a switch with two walkable ports is not walkable");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("case_1") && rendered.contains("default"),
+            "the refusal names BOTH ports rather than picking one: {rendered}"
+        );
+
+        // And the array order must not decide: reversing it has to produce the SAME
+        // sentence, or the rule still depends on how the client saved it.
+        let mut reversed = graph.clone();
+        reversed.edges.swap(1, 2);
+        let err2 = project(&reversed).expect_err("order must not change the verdict");
+        assert_eq!(
+            err2.code(),
+            err.code(),
+            "the verdict is a property of the drawing, not of the saved array order"
+        );
+    }
+
+    #[test]
+    fn a_node_with_two_edges_on_one_walked_port_is_refused_rather_than_guessed() {
+        // **The tick-39 fix counted PORTS; the traversal picks an EDGE.** The sibling of
+        // `a_node_with_two_followed_ports_is_refused_rather_than_guessed`, one step down,
+        // and it is the same failure the whole pair is about — a rule that validates clean
+        // and then runs whichever target the client serialised first.
+        //
+        // The shape: `case_1` wired to *two* different targets. There is one walkable port
+        // here, so `ambiguous_branch` sees a set of size one and stays quiet, and the
+        // `duplicate_edge` check keys on the `(source, port, target)` triple — two different
+        // targets are two different triples, so it is quiet too. Every check says the
+        // drawing is fine.
+        //
+        // And the run is not fine. `project` resolves the next node with a `find` over the
+        // saved array, so this walks to whichever of the two `case_1` edges comes first. An
+        // author who wired a second case arm "just to be safe" gets a rule that silently
+        // ignores it, in the order they happened to save it.
+        //
+        // So the count has to be over **edges out of a node on a walked port**, not over
+        // distinct port keys — a node with two followed edges is un-walkable whatever the
+        // port keys are, and `duplicate_edge` already owns the case where the two agree on
+        // the target as well.
+        let mut sw = node("sw", "switch");
+        sw.params = json!({ "cases": "a\nb" });
+        let graph = Graph {
+            nodes: vec![
+                node("trigger", "trigger.manual"),
+                sw,
+                action("first"),
+                action("second"),
+                node("end", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e0".to_owned(), source: "trigger".to_owned(), source_port: "out".to_owned(), target: "sw".to_owned() },
+                // Two edges, ONE port, two targets.
+                Edge { id: "e1".to_owned(), source: "sw".to_owned(), source_port: "case_1".to_owned(), target: "first".to_owned() },
+                Edge { id: "e2".to_owned(), source: "sw".to_owned(), source_port: "case_1".to_owned(), target: "second".to_owned() },
+                Edge { id: "e3".to_owned(), source: "first".to_owned(), source_port: "success".to_owned(), target: "end".to_owned() },
+                Edge { id: "e4".to_owned(), source: "second".to_owned(), source_port: "success".to_owned(), target: "end".to_owned() },
+            ],
+        };
+
+        let findings = validate(&graph);
+        let codes: Vec<&str> = findings
+            .iter()
+            .map(|finding| finding.code.as_str())
+            .collect();
+        assert!(
+            codes.contains(&"ambiguous_branch"),
+            "two edges on one walked port is the same un-walkable node as two walked ports: {codes:?}"
+        );
+
+        // And the projection must refuse it rather than picking one. This is the assertion
+        // that was GREEN before the fix: `project` returned a step list, because `find`
+        // found the first `case_1` edge and the graph was never in question.
+        let err = project(&graph).expect_err("two edges on one walked port is not walkable");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("case_1"),
+            "the refusal names the port rather than picking a target: {rendered}"
+        );
+
+        // Order independence again — the property the old `find` got wrong.
+        let mut reversed = graph.clone();
+        reversed.edges.swap(1, 2);
+        let err2 = project(&reversed).expect_err("order must not change the verdict");
+        assert_eq!(err2.code(), err.code());
+    }
+
+
+    #[test]
+    fn every_node_type_the_palette_offers_projects_onto_a_step() {
+        // **The registry and the projection are two hand-maintained lists, and nothing
+        // checked that they agree.** `step_for` has arms for `end`, `wait`, `condition`,
+        // `approval`, `http_request`, `transform`, `sub_workflow` and `action` — and
+        // `switch`, the one branching node an author reaches for when a condition is not
+        // enough, is in neither `step_for`'s match nor its `other =>` refusal list that the
+        // registry advertises.
+        //
+        // The consequence is a card the palette and the canvas both offer, which validates
+        // clean, saves, shows up in the list as a working rule — and is refused the moment
+        // it is projected, with a sentence about a *node type* that is plainly on screen.
+        // `unknown_node_type` reads like a typo, so the author's first thought is that the
+        // platform lost it.
+        //
+        // This asserts the two lists are equal in the direction that matters: every type the
+        // registry offers (minus the inert decoration and the triggers, which correctly
+        // contribute no step) reaches an arm in `step_for`. It is written as a loop over the
+        // registry rather than as a list of names, because a list is exactly what let the two
+        // drift.
+        // **`end` is excluded too, and for a reason that is the whole point of this test.** `end`
+        // exports NO output port — that is what makes it the end. So it cannot be the middle
+        // node of a two-node spine, and a fixture that tries wires an edge off a port the
+        // type does not have, which `validate` reports as `unknown_source_port` *before*
+        // the projection is reached. The assertion would then be measuring the port check
+        // rather than the thing it was written for. `end` is not a gap: it projects to a
+        // `stop` step, and `Graph::starter`'s own test already covers it.
+        let projecting: Vec<&str> = NODE_TYPES
+            .iter()
+            .map(|node_type| node_type.key)
+            .filter(|key| {
+                // `key` is `&&str` inside a filter over a `&str` iterator, and every one of
+                // these comparisons needs the deref. Writing it once at the top is cheaper
+                // than three call sites that each have to be right about their own depth.
+                let key = *key;
+                !find_node_type(key).is_some_and(|node_type| node_type.inert)
+                    && !is_trigger_type(key)
+                    && !key.ends_with(".end")
+                    && key != "end"
+            })
+            .collect();
+        assert!(
+            projecting.contains(&"switch"),
+            "the fixture must exercise the type this test is about"
+        );
+
+        let mut refused: Vec<&str> = Vec::new();
+        for key in projecting {
+            let graph = Graph {
+                nodes: vec![node("trigger", "trigger.manual"), sample_node(key), node("end", "end")],
+                edges: vec![
+                    Edge { id: "e0".to_owned(), source: "trigger".to_owned(), source_port: "out".to_owned(), target: "n1".to_owned() },
+                    Edge { id: "e1".to_owned(), source: "n1".to_owned(), source_port: first_followed_port(key), target: "end".to_owned() },
+                ],
+            };
+            match project(&graph) {
+                Ok(_) => {}
+                Err(error) => {
+                    // The claim: a type the palette offers is never refused as a type the
+                    // platform does not know. It has two ways to be refused legitimately —
+                    // a parameter the fixture could not fill, or a type the v0 engine has no
+                    // step for — and both have to carry their own code, so the panel can say
+                    // which. `unknown_node_type` is the code that reads like a typo, and for
+                    // a card the author just dropped on the canvas it is always wrong.
+                    assert_ne!(
+                        error.code(),
+                        "unknown_node_type",
+                        "{key:?} is offered by the palette and refused as a type the platform \
+                         does not know. Write its arm in `step_for`, or refuse it with its own \
+                         code and its own sentence — a palette card that cannot run is not a \
+                         thing the panel may offer."
+                    );
+                    refused.push(key);
+                }
+            }
         }
 
-        compile_issues.push(Issue::at_node(
-            "node_action_unavailable",
-            &node.key,
-            format!(
-                "the \"{}\" node has no engine action yet; this is the node-families slice \
-                 (REQ-088), not a graph the editor may save",
-                node.node_type
-            ),
-        ));
+        // **The list is asserted as a list, because "no type is refused as unknown" is a
+        // weaker claim than "I know which types the engine cannot run".** If a future
+        // release teaches the engine a second branch, `refused` grows and this assertion
+        // is what says whether that was intended or accidental. `switch` is in it because
+        // the v0 engine executes ONE branch step and a switch declares one arm per case —
+        // there is no projection for it, and there never was.
+        assert_eq!(
+            refused,
+            vec!["switch"],
+            "the set of registry types the engine cannot project is a product decision, not \
+             an accident: every entry needs an arm in `step_for` or a named refusal. {refused:?}"
+        );
     }
 
-    Compiled {
-        steps,
-        node_order,
-        issues: compile_issues,
+    /// The first port out of `key` that the linear walk follows, so a generated fixture
+    /// wires itself the way the palette would.
+    fn first_followed_port(key: &str) -> String {
+        find_node_type(key)
+            .expect("a registry type")
+            .outputs
+            .iter()
+            .map(|port| port.key)
+            .find(|key| followed_port(key))
+            .unwrap_or_else(|| panic!("{key:?} exports no walked port"))
+            .to_owned()
     }
-}
 
-/// Compile and refuse, for the caller that wants a `Result` rather than a report.
-pub fn compile_or_refuse(graph: &Graph) -> Result<Vec<StepDefinition>> {
-    let compiled = compile(graph);
-    if let Some(first) = compiled.issues.first() {
-        return Err(WorkflowError::invalid(
-            first.code,
-            format!(
-                "{} ({} issue{} in total)",
-                first.message,
-                compiled.issues.len(),
-                if compiled.issues.len() == 1 { "" } else { "s" }
-            ),
-        ));
+    /// A registry node type with every required parameter filled, so the assertion is about
+    /// the projection and not about the parameter check that runs beside it.
+    fn sample_node(key: &str) -> Node {
+        let mut node = node("n1", key);
+        node.params = find_node_type(key)
+            .expect("a registry type")
+            .params
+            .iter()
+            .map(|field| (field.key.to_owned(), sample_param(field)))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        node
     }
-    if compiled.steps.is_empty() {
-        return Err(WorkflowError::invalid(
-            "graph_no_trigger",
-            "a graph needs at least one node that can run",
-        ));
+
+    /// A legal value **for the field's declared kind**, not for its name.
+    ///
+    /// The first draft filled every free-text field with `"sample"`, which is the shape that
+    /// broke the test three ways at once: `wait` wants a *number* of seconds, `action` wants
+    /// its `parameters` to parse as JSON, and `sub_workflow` wants a rule id that exists.
+    /// All three then answered `invalid_parameter`, so the note would have read "three more
+    /// types the engine cannot run" when the truth was that the fixture could not fill them.
+    ///
+    /// The rule is the general one: **a fixture that cannot satisfy its own assertions is
+    /// indistinguishable from a defect, so the fixture has to be built from the schema the
+    /// code under test reads** — the registry's own `kind`, which is the same field the
+    /// inspector's input element is chosen from.
+    fn sample_param(field: &ParamField) -> Value {
+        if !field.options.is_empty() {
+            return Value::String(field.options[0].to_owned());
+        }
+        match field.kind {
+            "number" => json!(1),
+            "boolean" => Value::Bool(false),
+            // The two that parse or resolve. A JSON body for anything that reads one, and a
+            // rule id for the node that names another rule.
+            "json" | "code" | "textarea_json" => json!({}),
+            _ => match field.key {
+                "parameters" => json!({}),
+                "workflow_id" | "rule_id" => Value::String(uuid::Uuid::nil().to_string()),
+                _ => Value::String("sample".to_owned()),
+            },
+        }
     }
-    Ok(compiled.steps)
-}
 
-/// Reverse a compiled step list back onto node keys, for the canvas's step-to-node mapping.
-///
-/// Best effort by label: the compiler named each step after the node label, so a definition
-/// written by hand (no graph at all) simply yields nothing rather than an error — the canvas
-/// then shows the steps as "not on the canvas", which is true.
-#[must_use]
-pub fn node_order_for(steps: &[StepDefinition]) -> Vec<String> {
-    steps.iter().map(|step| step.name.clone()).collect()
-}
+    #[test]
+    fn a_second_trigger_is_refused_by_name() {
+        let mut graph = linear();
+        graph.nodes.push(node("trigger2", "trigger.schedule"));
+        let findings = validate(&graph);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.code == "multiple_triggers")
+                .count(),
+            2,
+            "both triggers are told, not just the second"
+        );
+    }
 
-/// The engine kinds a step can take, so a caller building a graph knows what it is aiming at.
-#[must_use]
-pub fn compilable_kinds() -> &'static [StepKind] {
-    &[StepKind::Task, StepKind::Wait]
+    #[test]
+    fn an_orphan_is_refused_by_name() {
+        let mut graph = linear();
+        graph.nodes.push(action("a2"));
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "orphan_node")
+            .expect("an unconnected action is an orphan");
+        assert_eq!(finding.node_id.as_deref(), Some("a2"));
+        assert!(finding.message.contains("a2"));
+    }
+
+    #[test]
+    fn a_duplicate_edge_is_refused() {
+        let mut graph = linear();
+        graph.edges.push(Edge {
+            id: "e-dup".to_owned(),
+            source: "a1".to_owned(),
+            source_port: "success".to_owned(),
+            target: "end".to_owned(),
+        });
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "duplicate_edge")
+            .expect("the same port may be connected once");
+        assert_eq!(finding.node_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn an_incompatible_port_is_refused_with_the_legal_ports() {
+        let mut graph = linear();
+        // `manual` triggers export one port called `out`; there is no `true`.
+        graph.edges[0].source_port = "true".to_owned();
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "unknown_source_port")
+            .expect("a port the source does not export is refused");
+        assert!(
+            finding.message.contains("out"),
+            "the message lists the legal port"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_way_out_is_refused() {
+        let mut graph = linear();
+        graph.edges.retain(|edge| edge.source != "a1");
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "dangling_output")
+            .expect("a reachable node that goes nowhere stops the run in the middle");
+        assert_eq!(finding.node_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn a_missing_required_parameter_names_the_field() {
+        let mut graph = linear();
+        graph.nodes[1].params = json!({});
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "missing_parameter")
+            .expect("an action without an action is refused");
+        assert!(finding.message.contains("action"), "{}", finding.message);
+    }
+
+    #[test]
+    fn a_duplicate_node_id_is_refused_before_anything_else_misreports_it() {
+        let mut graph = linear();
+        graph.nodes.push(action("a1"));
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "duplicate_node_id")
+            .expect("two nodes may not share an id");
+        assert!(finding.message.contains("a1"));
+    }
+
+    #[test]
+    fn a_clean_graph_reports_no_problems() {
+        let all = validate(&linear());
+        let codes: Vec<&str> = all.iter().map(|finding| finding.code.as_str()).collect();
+        assert!(
+            codes.is_empty(),
+            "the problems panel must be able to say nothing: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_note_is_decoration_and_never_projects() {
+        let mut graph = linear();
+        let mut note = node("n1", "note");
+        note.params = json!({ "text": "remember to check the bounce list" });
+        graph.nodes.insert(1, note);
+        // A note is not required to be reachable, and it contributes no step.
+        let steps = project(&graph).expect("a note does not break the projection");
+        assert_eq!(steps.len(), 2);
+        assert!(validate(&graph).is_empty(), "{:?}", validate(&graph));
+    }
+
+    #[test]
+    fn the_registry_has_a_legend_for_every_node_type() {
+        for node_type in NODE_TYPES {
+            assert!(!node_type.key.is_empty(), "a node type needs a key");
+            assert!(
+                !node_type.summary.is_empty(),
+                "{} has no summary",
+                node_type.key
+            );
+            assert!(
+                !node_type.category.is_empty(),
+                "{} has no palette group",
+                node_type.key
+            );
+            if is_trigger_type(node_type.key) {
+                assert_eq!(node_type.category, "Trigger");
+            }
+        }
+        // Node types the SQL backfill writes must exist in the registry, or a backfilled rule
+        // opens in the builder already invalid.
+        for kind in ["task", "wait", "branch", "stop", "approval"] {
+            assert!(
+                find_node_type(node_type_for_step(kind)).is_some(),
+                "the backfill can write {kind:?} and the registry must know it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zoom_stays_inside_the_canvas_bounds() {
+        let start = Viewport {
+            x: 0.0,
+            y: 0.0,
+            zoom: MAX_ZOOM,
+        };
+        assert_eq!(start.zoomed(Zoom::In).zoom, MAX_ZOOM);
+        let tiny = Viewport {
+            x: 0.0,
+            y: 0.0,
+            zoom: MIN_ZOOM,
+        }
+        .zoomed(Zoom::Out);
+        assert_eq!(tiny.zoom, MIN_ZOOM);
+
+        // A client that posts a zoom of 0 or NaN gets a usable viewport, not a refused save.
+        let nonsense = Viewport {
+            x: 0.0,
+            y: 0.0,
+            zoom: f64::NAN,
+        }
+        .clamped();
+        assert!((nonsense.zoom - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn positions_snap_to_the_grid() {
+        assert!((snap(13.0) - 16.0).abs() < f64::EPSILON);
+        assert!((snap(7.0) - 8.0).abs() < f64::EPSILON);
+        // A tie rounds away from zero, so a node dragged to exactly 12 lands on 16 and not on
+        // 8 — pinned because the two halves must not disagree between two clients.
+        assert!((snap(12.0) - 16.0).abs() < f64::EPSILON);
+        assert!((snap(f64::NAN) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_graph_survives_a_json_round_trip() {
+        let graph = linear();
+        let encoded = serde_json::to_string(&graph).expect("a graph serialises");
+        let decoded: Graph = serde_json::from_str(&encoded).expect("a graph deserialises");
+        assert_eq!(graph, decoded);
+    }
+
+    #[test]
+    fn a_wait_outside_the_engine_bound_is_refused_by_the_engine_reader() {
+        let mut graph = linear();
+        graph.nodes[1] = node("w1", "wait");
+        graph.nodes[1].params = json!({ "seconds": 999_999 });
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "invalid_parameter")
+            .expect("a wait the engine would refuse is refused here");
+        assert!(finding.message.contains("86400"), "{}", finding.message);
+    }
+
+    #[test]
+    fn a_sub_workflow_naming_a_non_uuid_is_refused() {
+        let mut graph = linear();
+        // Same id as the node it replaces, so the connections still point at it — a test that
+        // also broke the edges would fail for the wrong reason.
+        graph.nodes[1] = node("a1", "sub_workflow");
+        graph.nodes[1].params = json!({ "workflow_id": "not-a-uuid" });
+        let error = project(&graph).expect_err("a sub-workflow node needs a rule id");
+        // The specific code, not the graph-level one: a client renders the message under the
+        // field that caused it, and a generic code would put it under the whole node.
+        assert_eq!(error.code(), "invalid_parameter");
+        assert!(error.to_string().contains("not-a-uuid"), "{error}");
+    }
+
+    /// The QA walkthrough's `validate-classes` table builds its graphs in JavaScript, from
+    /// node types and port names typed out by hand in `scripts/qa/walkthrough.cjs`. Nothing
+    /// connected those literals to this registry, so two of its rows had been measuring a
+    /// case the server never sees:
+    ///
+    /// * `cycle_on_a_branch` built `condition.if`. The key is `condition` and
+    ///   `find_node_type` is exact, so the row answered `unknown_node_type` and reported
+    ///   that sentence as the cycle's `names` — while `found: true` stayed green off the
+    ///   codes, which did contain `graph_cycle`.
+    /// * `cycle` closed its ring from the node that already carried the spine's `success`
+    ///   edge, leaving TWO edges on one walked port. `ambiguous_branch` sorted ahead of
+    ///   `graph_cycle`, and the row reported the wrong class for three ticks.
+    ///
+    /// So the graphs themselves are built here, from the same literals the probe uses, and
+    /// asserted to carry **exactly one** defect class. A probe row that measures a graph no
+    /// author can draw is a green test of a fiction, and the row that nobody re-reads is the
+    /// one that rots — so the assertion is on the SET of codes, not on "is my code in there".
+    #[test]
+    fn the_qa_validation_class_graphs_each_carry_exactly_one_defect() {
+        // `cycle`: t1 → a1 → a2 → e1, with a2's `error` port closing the ring back to t1.
+        // The ring leaves a SECOND node, so `a1` keeps the spine's single `success` edge.
+        // The trigger carries its required `event` parameter. Without it the graph has a
+        // SECOND defect (`missing_parameter`), which is the failure this test caught on its
+        // first run -- and the same rule the walkthrough's own trigger helper follows.
+        let mut trigger_node = node("t1", "trigger.event");
+        trigger_node.params = json!({ "event": "qa.cycle.probe" });
+        let cycle = Graph {
+            nodes: vec![
+                trigger_node,
+                action("a1"),
+                action("a2"),
+                node("e1", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e1".into(), source: "t1".into(), source_port: "out".into(), target: "a1".into() },
+                Edge { id: "e2".into(), source: "a1".into(), source_port: "success".into(), target: "a2".into() },
+                Edge { id: "e3".into(), source: "a2".into(), source_port: "success".into(), target: "e1".into() },
+                Edge { id: "e4".into(), source: "a2".into(), source_port: "error".into(), target: "t1".into() },
+            ],
+        };
+        // Owned strings: `Finding::code` is a `&'static str` reached through the Vec, and
+        // binding the vector of references to the temporary keeps the whole thing borrowed.
+        let codes: Vec<String> = validate(&cycle)
+            .iter()
+            .map(|f| f.code.to_string())
+            .collect();
+        assert!(
+            codes.iter().any(|c| c == "graph_cycle"),
+            "the ring is found: {codes:?}"
+        );
+        assert_eq!(
+            codes, vec!["graph_cycle".to_string()],
+            "a cycle case that also carries another defect measures whichever class sorts \
+             first -- that is how this row reported `found: true` off an ambiguous_branch"
+        );
+
+        // `cycle_on_a_branch`: the same loop closing on a condition's `false` port — the port
+        // the walk never follows, which is why the old traversal missed it.
+        let mut trigger_node = node("t1", "trigger.event");
+        trigger_node.params = json!({ "event": "qa.cycle.on_branch.probe" });
+        // The condition carries the three fields its own schema requires. `node()` starts
+        // with empty params, which is a third defect — `missing_parameter` — and the first
+        // run of this test caught exactly that, which is why it is written against the real
+        // registry instead of a hand-drawn sketch of it.
+        let mut condition = node("c1", "condition");
+        condition.params = json!({ "field": "user.role", "operator": "equals", "value": "admin" });
+        let on_a_branch = Graph {
+            nodes: vec![
+                trigger_node,
+                condition,
+                action("a1"),
+                node("e1", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e1".into(), source: "t1".into(), source_port: "out".into(), target: "c1".into() },
+                Edge { id: "e2".into(), source: "c1".into(), source_port: "true".into(), target: "a1".into() },
+                Edge { id: "e3".into(), source: "a1".into(), source_port: "success".into(), target: "e1".into() },
+                Edge { id: "e4".into(), source: "c1".into(), source_port: "false".into(), target: "t1".into() },
+            ],
+        };
+        let codes: Vec<String> = validate(&on_a_branch)
+            .iter()
+            .map(|f| f.code.to_string())
+            .collect();
+        // The condition is spelled `condition`. Asserted here rather than in a comment, because
+        // `condition.if` compiles and validates happily as an unknown type: the only evidence
+        // it was wrong is the sentence the panel then showed the author.
+        assert_eq!(
+            codes, vec!["graph_cycle".to_string()],
+            "the branch-closing ring is found and the node type is real: {codes:?}"
+        );
+    }
+
+    /// The QA walkthrough decides "is this the trigger?" with its own copy of the rule, in
+    /// another language, in a file nothing compiles. It compared `type !== "trigger"`, and the
+    /// registry has **never** had a bare `trigger` type — the trigger types are
+    /// `trigger.event` / `trigger.manual` / `trigger.cron`. So the comparison was true for
+    /// every card on the canvas, including the trigger, and the "skip the trigger" half of the
+    /// `run-from-here` scan was dead code shaped like a filter.
+    ///
+    /// It stayed invisible for the obvious reason: the wrong answer *looks right*. The
+    /// trigger's `canStart` is genuinely `"true"` (re-running a rule from the top is a real
+    /// thing an operator wants), so choosing it produced a run — a whole run, with nothing
+    /// skipped — rather than a crash. Every row underneath then read `skipped: 0`,
+    /// `pillsPainted: 0`, `panelFound: false`, and all of them pointed at the product.
+    ///
+    /// This test reads the walkthrough's source and fails if it compares a node type against a
+    /// bare `trigger` literal again. A guard is only worth its weight once you have seen it
+    /// bite, and the generalisable lesson is the one from the fixture above: **a rule copied
+    /// into a probe is a rule with no compiler** — the type registry, the port names and now
+    /// the trigger prefix each have a home in this file, and every JavaScript literal that
+    /// stands in for one is a place the two can drift apart silently.
+    #[test]
+    fn the_qa_run_from_here_scan_uses_the_real_trigger_prefix() {
+        // `cargo test` runs with the CWD at the *package* root, not the workspace root, so
+        // `scripts/qa/walkthrough.cjs` does not resolve from here. `CARGO_MANIFEST_DIR` is
+        // `crates/workflows`, and the path is walked up from it — written out rather than
+        // discovered, because a test that silently reads a *different* file than the one the
+        // pass runs is worse than no test at all.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above crates/workflows");
+        let source = std::fs::read_to_string(repo_root.join("scripts/qa/walkthrough.cjs"))
+            .unwrap_or_else(|e| panic!("the walkthrough is the thing being guarded: {e}"));
+
+        // The bare-literal comparison is the defect itself: `!== "trigger"` can never be
+        // false for a real node type, so it never excluded anything.
+        assert!(
+            !source.contains(r#"card.type !== "trigger""#)
+                && !source.contains(r#"card.type != "trigger""#),
+            "the run-from-here scan is comparing a node type against a bare `trigger` literal; \
+             the registry's trigger types are `trigger.*`, so this excludes nothing"
+        );
+
+        // And the prefix rule must be spelled the way the product spells it, so the two sides
+        // of the same question cannot drift into different answers.
+        assert!(
+            source.contains(r#"card.type.startsWith("trigger.")"#),
+            "the scan should recognise the trigger by the same `trigger.` prefix \
+             `run-from-here.ts` uses; if the product's rule moves, move this with it"
+        );
+
+        // A trigger node really is one of these keys, and none of them is a bare `trigger`.
+        // Derived from the registry rather than listed by hand: the first draft of this
+        // assertion listed `trigger.event` / `trigger.manual` / `trigger.cron`, and `cron` is
+        // not a key — the real third one is `trigger.schedule`. A hand-written list of the
+        // other language's literals is the same defect as the one this test exists to catch,
+        // one level up, so the list is read rather than typed. Only the *absence* of a bare
+        // `trigger` is asserted directly, because that is the property the probe's comparison
+        // depended on, and it is the one that cannot be satisfied by adding a type.
+        let trigger_keys: Vec<&str> = NODE_TYPES
+            .iter()
+            .map(|spec| spec.key)
+            .filter(|key| key.starts_with("trigger"))
+            .collect();
+        assert!(
+            !trigger_keys.is_empty(),
+            "the canvas offers trigger types; a registry with none would make every assertion \
+             in this test vacuous"
+        );
+        assert!(
+            !NODE_TYPES.iter().any(|spec| spec.key == "trigger"),
+            "a bare `trigger` node type does not exist — which is why the probe's comparison \
+             excluded nothing, and why the run-from-here scan chose the trigger every time. \
+             The trigger types that do exist are {trigger_keys:?}"
+        );
+    }
+
+    /// The browser answers "which nodes can start a run" too, and it must reach the same
+    /// answer by the same rule rather than by a fourth copy of the facts.
+    ///
+    /// Two copies now exist outside Rust, and both were written as literals:
+    ///
+    /// * `scripts/qa/walkthrough.cjs` decides `isTriggerType` from `card.type`, and
+    /// * `apps/admin/features/workflows/reachability.ts` decided which port the walk
+    ///   follows, from a name that does not exist — `portWalksThrough` was given
+    ///   `follows` by hand until this tick, which is the third instance on this branch
+    ///   after the type registry and the port names.
+    ///
+    /// A guard that only checks one of them is a guard that reports "clean" while the
+    /// other drifts, and the drift is silent by construction: both files compile, both
+    /// run, and the disagreement shows up as a **refusal the author cannot explain** —
+    /// a live button the server will not honour, or a walk the client thinks is shorter
+    /// than the engine's. Neither shape crashes.
+    ///
+    /// So both are asserted here, and the assertions are about the *shape* of the code:
+    /// no port-name list to re-derive the walk, and no bare `trigger` literal. The one
+    /// thing that is deliberately NOT asserted is that the client walks correctly — a text
+    /// guard cannot execute TypeScript, and pretending otherwise is how the reachability
+    /// test above came to exist without its port rule being checked at all.
+    #[test]
+    fn the_javascript_side_of_the_walk_reads_the_registry_rather_than_restating_it() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above crates/workflows");
+        let walkthrough =
+            std::fs::read_to_string(repo_root.join("scripts/qa/walkthrough.cjs"))
+                .unwrap_or_else(|e| panic!("the walkthrough is the thing being guarded: {e}"));
+        let client = std::fs::read_to_string(
+            repo_root.join("apps/admin/features/workflows/reachability.ts"),
+        )
+        .unwrap_or_else(|e| panic!("the client's walk is the thing being guarded: {e}"));
+
+        // The client must not name the port the walk follows. It reads `terminal` off the
+        // palette instead, and `the_walk_follows_every_port_that_is_not_terminal_and_no_
+        // terminal_one` is what makes that reading equal to this side.
+        for port in ["out", "true", "success", "case_1", "default"] {
+            assert!(
+                !client.contains(&format!("\"{port}\"")),
+                "`reachability.ts` names the port {port:?} in a comparison, which is a copy \
+                 of the walk rule in a file nothing compiles. Read `port.terminal` instead."
+            );
+        }
+        assert!(
+            client.contains("terminal"),
+            "the client has to read the flag the palette already ships, or the refusal it \
+             added is a guess about which connections the engine follows"
+        );
+
+        // And the same shape on the walkthrough's side of the trigger question, which is
+        // the third time this exact check has been needed.
+        assert!(
+            !walkthrough.contains(r#"card.type !== "trigger""#)
+                && !walkthrough.contains(r#"card.type != "trigger""#),
+            "the run-from-here scan is comparing a node type against a bare `trigger` literal \
+             again; the registry's trigger types are `trigger.*`"
+        );
+    }
+
+    /// The sign-out step must not be able to end the walk.
+    ///
+    /// Pass `20261001-012121` died at `walkthrough.cjs:8307` — `locator.count: Target page, context
+    /// or browser has been closed` — with `pages: 55`, `mobile: 0` and **no `workflowBuilder` key
+    /// at all**. The crash site is the only unguarded statement left in `main`, and it sits
+    /// between the route loop and the automation/builder passes, so the one thing the box killed
+    /// the run for was the reason none of this REQ's criteria could be measured. Two ticks were
+    /// then spent arguing about *why* the tab died (memory, shared Chrome, the queue) when the
+    /// harness had already decided the outcome: a cleanup step that throws ends the walk.
+    ///
+    /// The comment at that site said "Sign-out is exercised last so it cannot break the walk",
+    /// and EIGHT passes follow it — the three automation passes and the builder among them. The
+    /// comment described an intention the ordering had stopped implementing, which is the shape
+    /// that keeps recurring on this branch: the code says one thing, the note says another, and
+    /// only a run can tell you which one the product had.
+    ///
+    /// So both halves are asserted here. `signOut` is *wrapped* — a `try` that catches and records
+    /// — and `runWorkflowBuilderDepth` is called *after* it in the source, which is the ordering
+    /// that decides whether a box event can cost the builder its measurement. Asserting the text
+    /// would be theatre; asserting the ORDER is the claim.
+    #[test]
+    fn the_sign_out_step_cannot_end_the_walk() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above crates/workflows");
+        let source = std::fs::read_to_string(repo_root.join("scripts/qa/walkthrough.cjs"))
+            .unwrap_or_else(|e| panic!("the walkthrough is the thing being guarded: {e}"));
+
+        let sign_out = source
+            .find("const signOut = page.locator")
+            .expect("the sign-out step is gone from the pass; this guard would pass vacuously");
+        let guarded = source[..sign_out]
+            .rfind("try {")
+            .expect("the sign-out step is no longer inside a try block — a cleanup step that throws ends the walk");
+        // The nearest `try` must belong to this block, not to some earlier one in `main`: the
+        // distance is what proves the `catch` was written for the sign-out and not inherited.
+        assert!(
+            sign_out - guarded < 400,
+            "the nearest `try` before the sign-out is {guarded_len} lines up; the recovery that \
+             was added for this failure has stopped being attached to it",
+            guarded_len = sign_out - guarded
+        );
+        let after = &source[sign_out..];
+        assert!(
+            after.contains("signout-failed"),
+            "the sign-out `catch` records nothing, so a dead browser during cleanup leaves no \
+             trace in `clicks.jsonl` and the next reader sees only the missing measurements"
+        );
+
+        // The ordering is the claim that costs the measurements.
+        let builder = source
+            .find("runWorkflowBuilderDepth(page, report)")
+            .expect("the builder pass is gone from the walkthrough");
+        assert!(
+            builder > sign_out,
+            "the builder pass runs BEFORE the sign-out step, so a browser that dies during \
+             cleanup is measured before it happens — which is how `20261001-012121` reported 55 \
+             routes and no builder at all"
+        );
+
+        // And the box-level guard the recovery depends on must exist, because a dead tab and a
+        // dead process raise the SAME string (`context.newPage` answers it for either) and only
+        // one of the two can be recovered by opening another tab.
+        assert!(
+            source.contains("browserIsGone") && source.contains("skippedForDeadBrowser"),
+            "the dead-browser flag and its distinct reason string are gone; without them every \
+             pass after a dead browser reports a defect on a screen it never reached"
+        );
+        assert!(
+            source.contains(r#""browser-died""#),
+            "the roll-up names no single finding for a dead browser, so one machine event is \
+             reported once per pass and reads as dozens of screen defects"
+        );
+    }
+
+    /// The disk guard must not delete the cache of a dev server that is serving a pass.
+    ///
+    /// Observed on 2026-10-01, and the failure is a case where the harness was GREEN and the
+    /// reason was in a log nobody read. `scripts/qa/disk-guard.sh` runs from a Hermes cron every
+    /// six minutes. Its step 2 deletes any `apps/*/.next` over `NEXT_MAX_MB`, and it was the
+    /// only reclaim step with no liveness test. At 03:54 on the wave-3 stack it removed
+    /// `omnion-w3/apps/admin/.next`; the admin server logged
+    /// `The directory at "..." was deleted. Restarting the server to recover...`, and the
+    /// walkthrough walked on into a server that was restarting.
+    ///
+    /// **It did not throw.** The pass completed, wrote `pages: 55` and no findings on the
+    /// builder, and three ticks of notes attributed the shortfall to a tired box. But every
+    /// screen after `/analytics/downloads` came back `chrome-error://chromewebdata/` — and a
+    /// page that never loaded reports NO problems, so the harness recorded an unmeasured
+    /// remainder as a clean one. That is why this guard is about the DELETION and not about the
+    /// reporting: the reporting was working exactly as written.
+    ///
+    /// So the claims are about SHAPE rather than about a string. The liveness call exists, it is
+    /// asked about a DIRECTORY (the worktree that owns the app, not the `.next` itself — no
+    /// process ever has a cache as its cwd), and the test it uses is a prefix test that accepts
+    /// the directory itself. An equality test IS the defect: a live admin server's cwd is
+    /// `<worktree>/apps/admin`, so an equality against the worktree root answered "nobody is
+    /// working here" on every pass ever run.
+    #[test]
+    fn the_disk_guard_asks_before_deleting_a_next_cache() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above crates/workflows");
+        let source = std::fs::read_to_string(repo_root.join("scripts/qa/disk-guard.sh"))
+            .unwrap_or_else(|e| panic!("the disk guard is the thing being guarded: {e}"));
+
+        // 1. The liveness test itself must accept the directory AND its children. The first
+        //    draft of the fix matched children only, so asking about the one directory a dev
+        //    server actually sits in answered "idle" — the guard was proven against the wrong
+        //    argument and came back green.
+        assert!(
+            source.contains(r#""$wt"|"$wt"/*"#),
+            "`worktree_under` no longer matches the directory itself, so the one cwd a dev \
+             server really has (`<worktree>/apps/admin`) reads as idle and the cache is deleted \
+             from under a running server"
+        );
+
+        // 2. The `.next` loop must consult it. Without this the helper is dead code and check 1
+        //    passes against a guard that still deletes.
+        let next_loop = source
+            .find("for nx in")
+            .expect("the Next.js cache step is gone from the guard; this test would pass vacuously");
+        let next_end = source[next_loop..]
+            .find("\ndone")
+            .map(|i| next_loop + i)
+            .expect("the Next.js cache loop is unterminated");
+        let next_body = &source[next_loop..next_end];
+        assert!(
+            next_body.contains("worktree_under"),
+            "the `.next` step deletes without asking whether a live process is working in that \
+             worktree — the one reclaim step that removes a directory a RUNNING SERVER is using, \
+             which is what ended pass 20261001-021909 with 20 screens of `chrome-error://`"
+        );
+        // ...and a spared cache must SAY so, or the next reader of a full disk cannot tell
+        // "kept because in use" from "the guard never ran".
+        assert!(
+            next_body.contains("keep next cache"),
+            "the guard silently skips a live cache; a full disk with nothing freed and no line to \
+             explain it is the state this file was written to avoid"
+        );
+
+        // 3. The other reclaim steps already had this test. A rule that holds in three places
+        //    and not the fourth is the shape that produced this: the asymmetry was invisible
+        //    because every step next to the broken one was correct.
+        //
+        //    Anchored on `reclaimable` rather than on the loop headers: the header is where the
+        //    FIRST draft of this assertion looked and found nothing — it searched for a glob
+        //    written twice with a different suffix, and a needle that does not exist is a test
+        //    that either fails for the wrong reason or, once someone "fixes" it to match
+        //    anything, asserts nothing at all.
+        assert!(
+            source.matches("reclaimable").count() >= 3,
+            "the target-reclaim steps no longer consult `reclaimable`; the `.next` step is \
+             guarded and the cargo ones are not, which is the asymmetry that deleted a live dev \
+             server's cache"
+        );
+
+        // 4. The ORDER inside the `.next` loop is the claim, and the deletion text alone is
+        //    not. `rm -rf "$nx"` must SURVIVE — it is the correct answer for a cache nobody is
+        //    using — so an assertion that the line is absent would fail against a correct guard
+        //    and pass against one that never deletes anything. What has to hold is that the
+        //    liveness question is asked BEFORE the deletion and can skip it, which is the same
+        //    ordering claim the sign-out guard makes.
+        let ask = next_body
+            .find("worktree_under")
+            .expect("the `.next` step does not ask about liveness");
+        let keep = next_body
+            .find("keep next cache")
+            .expect("a spared cache is not announced");
+        let delete = next_body
+            .find(r#"rm -rf "$nx""#)
+            .expect("the `.next` cache is never deleted, which means the guard freed nothing");
+        assert!(
+            ask < keep && keep < delete,
+            "the liveness check must come before the deletion ({ask}, {keep}, {delete}); a guard \
+             that deletes first and asks afterwards has the shape of the one that broke"
+        );
+    }
 }

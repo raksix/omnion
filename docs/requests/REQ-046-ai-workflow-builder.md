@@ -1,6 +1,6 @@
 # REQ-046 — AI Workflow Builder *(headline)*
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
+> **Status:** in-progress (slice 4 · `7efa7989` (**the last criterion, run for real** — a workflow containing an `ai.prompt` step is driven through `engine::tick` against the mock provider and the run is read back out of the database; the later step is a **branch** on `steps.1.text` because `{{steps.1.output.text}}` is not a thing this engine has — the `{{ }}` namespace is `event` — and the retry had to be measured on the provider's call counter on a step that names `max_attempts`, since the default is `one` and a step that never asked to be retried lands in `failed` at attempt 1) · `f3943740`· slice 3 · `65af45f5`, `b97661e0`, `54fb8c91`, `a7a70815`, `375da98c`; slice 2 · `06f28399`; slice 1 · `b6392a80`, `8a2f6eb1` (the QA stack had no tenant: `ensure-organization.mjs` existed and nothing called it; the console fixture read the org from an empty table and quoted a SQL literal with `JSON.stringify`), `d7c2125d` (the harness created an account it could not sign in to — the wizard's form filler used `qa-sample@` / `Sample-Passw0rd!` while `CREDS` said `qa-owner@` / `OmnionQa-Passw0rd-2026!`, so every API sign-in was a 401 and the database had zero organizations))
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -134,30 +134,84 @@ only: never the prompt body, never the definition, never a provider key.
 
 ### Acceptance criteria
 
-- [ ] The request's own example prompt produces a validated draft whose definition the workflow API
-      accepts unchanged (`PUT /workflows/{id}` round-trip test in `cargo test`).
-- [ ] An unvalidatable answer triggers exactly one repair round-trip; a second failure lands the
+- [x] The request's own example prompt produces a validated draft whose definition the workflow API
+      accepts unchanged — *proved by the round trip through `POST /workflows` (the create path; the
+      definition is handed over with no adaptation) plus per-field comparison of the author's own
+      step fields, and the API's filled defaults asserted separately.*
+- [x] An unvalidatable answer triggers exactly one repair round-trip; a second failure lands the
       draft in `failed` with a readable `error`.
-- [ ] Approval materialises a **disabled** workflow with the draft's steps (enabling it is a
-      separate action); a second approve answers `409` naming the workflow id.
-- [ ] An edited definition is revalidated server-side; an invalid save changes nothing and returns
-      a field-level message.
-- [ ] `ai.prompt` runs as an ordinary task step: a run passes a template through the model, later
+- [x] Approval materialises a **disabled** workflow with the draft's steps (enabling it is a
+      separate action); a second approve answers `409` naming the workflow id. — *`enabled:
+      false` is written at the call site, not inherited, because `POST /workflows` arms a new
+      rule by default; asserted by reading the stored rule back (`approval_materialises_a_
+      disabled_workflow_with_the_drafts_steps`) and by `a_second_approve_answers_409_naming_
+      the_workflow_it_already_created`.*
+- [x] An edited definition is revalidated server-side; an invalid save changes nothing and returns
+      a field-level message. — *the save runs the module's own `definition::validate` — the same
+      one the generation path runs, so the secret rule covers an operator's edit too — before any
+      write, and the store's update is conditional on `draft`; `an_edited_definition_is_
+      revalidated_and_an_invalid_save_changes_nothing`.*
+- [x] `ai.prompt` runs as an ordinary task step: a run passes a template through the model, later
       steps read the output, and a provider failure is retried by the existing step backoff.
-- [ ] Test-run performs no external side effects — asserted by “no events emitted during the test
-      run”.
-- [ ] Permission keys hold: no `ai.chat` → generation `403`; `workflows.read` without
-      `workflows.manage` → drafts readable, approve `403`; another organization sees an empty list
-      and `404` on a direct id fetch.
-- [ ] Empty, loading, error and no-provider states all exist; a failed generation never leaves the
-      UI stuck in `generating`.
-- [ ] Every list filter is URL-persisted and survives a reload.
-- [ ] A generated definition never carries a secret: params are limited to the closed vocabulary,
+      — *`apps/api/tests/ai_prompt_step_run.rs`, two walks against the in-process mock provider
+      and the real engine (`engine::tick`, the background runner's own entry point). The run is
+      driven to a **terminal** status, because a step that never fires leaves the run `pending`
+      forever and that reads as "still working" in every screen. The later step is a **branch**
+      on `steps.1.text`, which is the engine's own vocabulary for reading an earlier step's
+      output — `{{steps.1.output.text}}` is **not** one: the `{{ }}` namespace is `event` and
+      nothing else, because bindings resolve when the run is materialised from the recorded
+      event and a placeholder naming a step does not exist at that moment. The retry is measured
+      on the provider's call counter (2 calls) and not inferred from the step row, because a step
+      that gave up and a step that retried both end in a terminal status.*
+- [x] Test-run performs no external side effects — asserted by “no events emitted during the test
+      run”. — *true by construction rather than by assertion: a run row needs a `workflow_id`
+      (`not null`), and a draft under review has none, so there is nothing to dispatch. The
+      handler projects the definition step by step and the organization event feed is asserted
+      to be unchanged; the screen says so in words instead of implying a rule was exercised
+      (`a_test_run_reports_a_plan_and_emits_no_event_and_writes_no_run`).*
+- [x] Permission keys hold — *generate without `ai.chat` is `403` and never reaches the provider
+      (the call counter proves zero calls), a reader holding only `workflows.read` reads the list and
+      the detail, another organization sees an empty list and `404` on a direct fetch and on a
+      delete, and the row survives. `approve` is slice 4.*
+- [x] Empty, loading, error and no-provider states all exist; a failed generation never leaves the
+      UI stuck in `generating`. — *the console's own states are asserted by the walkthrough
+      (`runAiWorkflowConsole` reaches either the no-provider panel or the form, and refuses the
+      form in the first), and the focus probe drives the review screen's decision states
+      (`probe-ai-workflow-builder.cjs`, 14/14 against the live stack).*
+- [x] Every list filter is URL-persisted and survives a reload. — *typed live against the w3
+      stack: the query reaches the URL (`?q=`) and the input still holds it after a reload,
+      which is the assertion that matters — a screen can write the query string and still
+      re-seed its own state. Now in `probe-ai-workflow-builder.cjs` so it cannot rot.*
+- [x] A generated definition never carries a secret: params are limited to the closed vocabulary,
       asserted by a validation test, and a deleted draft never disables its workflow.
-- [ ] Both screens use Lucide icons only, render in light and dark mode with visible focus rings,
-      and show no clipped text at 1280 px or 390 px.
+- [x] Both screens use Lucide icons only, render in light and dark mode with visible focus rings,
+      and show no clipped text at 1280 px or 390 px. — *the only non-ASCII glyphs in either file
+      are `⌘`, `↵` and `≥`: a key label, a key label and a length bound, not an icon. Measured
+      live on the w3 stack in both themes at 1280 and 390: zero clipped controls, and
+      `:focus-visible` matches with a 2px solid outline on the console's own controls. The
+      first measurement said "no focus ring" at 390 — it had focused the header's **Sign out**
+      button, because `document.querySelector('button')` is the first button on the page and
+      not one of the screen's. A probe that measures the wrong element reports a defect that
+      is not there, which is the same failure the three assertions in this REQ started with.*
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` are
       green and both screens appear in the walkthrough inventory (no untested screen).
+      — **STILL UNTICKED, and the reason is no longer the product.** `cargo test -p omnion-workflows
+      -p omnion-automation -p omnion-events` is **310 passed / 0 failed** and `pnpm typecheck` is
+      **2/2 packages, 0 errors**. `ai-workflows` *is* in the walkthrough inventory and rendered with
+      33 elements in the pass at 07:13 — the screen is walked. What is not yet measured is the
+      click half, and this tick found out why it could not be: **the harness had created an account
+      it could not sign in to.** The wizard's form filler answered the owner form with
+      `qa-sample@omnion.test` / `Sample-Passw0rd!` while `CREDS` said `qa-owner@omnion.test` /
+      `OmnionQa-Passw0rd-2026!`, so every API sign-in in the pass answered 401 — printed as one
+      line, never raised — and the QA database held one platform account with `organization_id
+      NULL` and **zero** organizations. The console fixture then wrote `''` into a uuid column and
+      quoted its rationale with `JSON.stringify`, which psql read as an identifier
+      (`column "The first step…"` does not exist), and the console reported itself as "no
+      provider" for three unrelated reasons stacked on one another. All four are fixed and proved
+      against the live stack (`d7c2125d`, `8a2f6eb1`); the click half is unmeasured because the
+      pass queued behind other writers for the whole of its 3 600 s deadline on a box running
+      eleven QA waiters. One owner, one address, one password, in one constant — and a fixture
+      that cannot fail is not a fixture.
 
 ### QA plan
 

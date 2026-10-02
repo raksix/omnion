@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Blocks, Bot, Boxes, CalendarClock, ClipboardCheck, Code2, Database, FileCode2, FileDown, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Waypoints, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Code2, FileText, Fingerprint, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, WandSparkles, Workflow, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -20,6 +20,7 @@ const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/pages", label: "Pages", icon: FileText },
   { href: "/media", label: "Media", icon: Images },
+  { href: "/automations", label: "Automations", icon: Workflow },
   // Backups sit beside Media rather than under Settings: an operator asking "where are my
   // files and can I get them back" is one question, and burying half of it under a
   // settings sub-path is what makes somebody believe the platform has no restore point.
@@ -43,50 +44,15 @@ const NAV = [
   { href: "/webhooks", label: "Webhooks", icon: Webhook },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
-  // The observability centre (REQ-126) and its six areas. It sits beside Events rather than
-  // under Settings: Events answers "what does the platform think happened", this answers "what
-  // is it doing right now and what did it drop" — and both are read during the same incident.
-  // The parent links to the overview rather than to any one area, because the landing screen is
-  // the one that knows which area holds the answer; deep-linking an operator into the log
-  // explorer when they asked "is anything wrong" is the wrong default.
-  { href: "/observability", label: "Observability", icon: Gauge },
-  { href: "/observability/logs", label: "Observability logs", icon: ScrollText },
-  { href: "/observability/traces", label: "Traces", icon: Route },
-  { href: "/observability/metrics", label: "Metric catalogue", icon: BarChart3 },
-  { href: "/observability/exporters", label: "Exporters", icon: Radio },
-  { href: "/observability/alerts", label: "Alert rules", icon: BellRing },
-  { href: "/observability/settings", label: "Observability settings", icon: SlidersHorizontal },
-  // The deployment centre's release surface (REQ-128, slice 4). It sits beside System Health
-  // rather than under Settings because the three answers are the same operator question asked at
-  // three moments: "what am I running" (artifacts), "how do I install this somewhere else"
-  // (install) and "how do I get to the next version, and what does it cost me if I have to go
-  // back" (upgrade). An upgrade helper filed under a settings sub-path is a helper nobody opens
-  // at 2am, which is exactly when it is needed.
-  { href: "/deployment/artifacts", label: "Release artifacts", icon: Package },
-  { href: "/deployment/install", label: "Install bundle", icon: Boxes },
-  { href: "/deployment/upgrade", label: "Upgrade helper", icon: ArrowUpCircle },
-  // The migration ledger (REQ-129, slice 1) belongs beside them, not under Settings: an operator
-  // asking "what changed my database" is mid-deploy, and the answer they need is the pending set
-  // and the rehearsed/unrehearsed column — the same three questions the other two answer.
-  { href: "/deployment/migrations", label: "Migration ledger", icon: Database },
-  // Anonymised exports sit with the ledger rather than under Settings: a support dump is asked
-  // for in the middle of an incident, and the two questions beside it are the same one — "what
-  // does this installation know, and what may it hand over".
-  { href: "/deployment/exports", label: "Anonymised exports", icon: FileDown },
-  // The developer portal's GraphQL surface (REQ-130, slice 2). It sits beside the deployment
-  // release surface rather than under a settings sub-path because both answer the same integrator
-  // question — "what can a client of this installation do, and what does it cost me" — and an
-  // integrator never goes looking under Settings for it. The playground is the entry, the registry
-  // beside it, and the schema explorer under it because those two are read together.
-  { href: "/developer/graphql", label: "GraphQL playground", icon: Waypoints },
-  { href: "/developer/graphql/documents", label: "Persisted documents", icon: FileCode2 },
-  { href: "/developer/graphql/schema", label: "GraphQL schema", icon: Blocks },
-  { href: "/developer/graphql/settings", label: "GraphQL settings", icon: SlidersHorizontal },
-  // The versioned API policy (REQ-130, slice 4). Beside the GraphQL settings rather than
-  // under them: a sunset is a DATE an integrator reads, and Settings is where nobody goes
-  // looking for a deadline. The screen and the response headers read the same rows, so an
-  // operator who changes a date here has changed what the API says.
-  { href: "/developer/api/deprecations", label: "API deprecations", icon: CalendarClock },
+  // The draft console (REQ-046). It sits directly UNDER the AI Hub rather than beside it:
+  // an operator who asked a model to write a rule is answering a question the Hub started,
+  // and burying the console under Automations would make it look like a separate product.
+  { href: "/ai/workflows", label: "AI workflows", icon: WandSparkles },
+  // The app builder (REQ-045) sits under the AI Hub too, for the same reason and one more:
+  // it is the Hub's question taken to its conclusion — a sentence becomes a plan here, where
+  // every artifact is reviewed before anything is created. It is a separate screen from
+  // Automations because nothing automates until a person has accepted it.
+  { href: "/app-builder", label: "App builder", icon: WandSparkles },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

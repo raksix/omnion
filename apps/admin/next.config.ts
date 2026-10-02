@@ -11,14 +11,6 @@ const apiOrigin = process.env.OMNION_API_URL ?? "http://127.0.0.1:8080";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   /**
-   * Standalone output (REQ-128, slice 1).
-   *
-   * Without it the production image has to ship the whole workspace and `node_modules`, and the
-   * documented 250 MB budget is unreachable. It is a build-output decision with no effect on
-   * development: `next dev` ignores it.
-   */
-  output: "standalone",
-  /**
    * The floating Next.js badge is a framework artifact, not part of the product: it sits in the
    * bottom-left corner on every development screen and covers the start of the sidebar's
    * “Sign out” label, so it both hides a real control and lands in every QA screenshot.

@@ -206,33 +206,14 @@ where
 
             let response = match decision {
                 Ok(Caller::Session(session)) => {
-                    // The actor is bound into the request-scoped observability context HERE, and
-                    // not left to the edge middleware to discover: this layer is the only one
-                    // holding the `Request` whose extensions the session was just written into,
-                    // and a mutation made this deep never propagates back up to an outer layer.
-                    // Without this call every line's `user_id` is structurally null.
-                    omnion_telemetry::LogContext::bind_actor(
-                        Some(session.user.id),
-                        session.user.organization_id,
-                    );
                     request.extensions_mut().insert(*session);
                     inner.call(request).await
                 }
                 Ok(Caller::Machine(machine)) => {
-                    // A machine key is an actor too; it has no user, and its organization is the
-                    // scope it works in.
-                    omnion_telemetry::LogContext::bind_actor(None, Some(machine.organization_id));
                     request.extensions_mut().insert(machine);
                     inner.call(request).await
                 }
-                Err((error, _)) => {
-                    // A refusal binds no actor. The line still exists, and its null `user_id` is
-                    // the honest record — the audit trail is where a refused attempt is attributed.
-                    let response = error.into_response();
-                    let status = response.status();
-                    omnion_telemetry::LogContext::bind_outcome(None, Some(status.as_u16()), None);
-                    Ok(response)
-                }
+                Err((error, _)) => Ok(error.into_response()),
             };
 
             // **On the response, not the request, and not in a task-local.** The request log's
