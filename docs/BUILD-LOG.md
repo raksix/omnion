@@ -11212,3 +11212,95 @@ discipline the tick was not spent blocked: it queued the pass and took the code 
 **Next:** the browser pass with `--only=security` on a free slot and room on the disk, which closes
 the rendering half of the posture box and REQ-012's walkthrough box; then REQ-012's locked-account
 screen box (a fixture-locked account unlocked through the panel's own button).
+
+## Tick 84 (wave3) — a row that could never be green, and a filter that ran wide with a banner saying otherwise
+
+Two defects, both in the acceptance apparatus rather than in a screen, and both found by finally
+getting a **live reading** of the row ticks 78–83 could not measure.
+
+### 1. `table-save-survives` was unsatisfiable, and the unsatisfiable row was pointing at a real defect
+
+The focused pass ran for the first time with the builder actually rendering (tick 83's hook-order
+fix, `5a99a3e1`) and read:
+
+```
+create                    {status: 201, id: 4369ae44…}
+builder-link              {href: /workflows/4369ae44…/table, pointsAtTableRoute: true}
+same-definition           {canvasNodes: 2, canvasEdges: 1, rows: 2, idsMatch: true, editableParams: 1}
+edit-saves                {wroteToServer: true, serverValue: "qa.table.edited", version: 3}
+canvas-save-visible       {seesCanvasRename: true}
+table-save-survives       {cards: 2, clicked: 2, inspected: 2, nodeShowingValue: null,
+                           builderSeesTableEdit: false, fieldsByNode: [{trigger, ["label"]},
+                                                                    {end, ["label","reason"]}]}
+```
+
+`clicked: 2, inspected: 2` is the tick-83 fix confirmed end to end: the canvas draws, the cards open,
+the inspectors mount. **The last field is the finding.** The probe looks for the literal
+`qa.table.edited` in an inspector field — and the trigger's inspector held only `label`. That row
+was **unsatisfiable**: no defect could turn it green, because the value it looked for had nowhere to
+be rendered.
+
+`Graph::starter` seeded `{ "kind": kind }` on every starter node, and `trigger.manual` declares
+`params: &[]`. The two projections of a rule answer "which fields does this node have" from
+**opposite places**:
+
+| mode | reads | consequence |
+|---|---|---|
+| builder inspector | `nodeType.params` — the **schema** | an undeclared key has no input at all |
+| Table mode | `Object.keys(node.params)` — the **data** | an undeclared key renders as an editable field |
+
+So every manual rule shipped with a parameter one mode could edit and the other could not display —
+which is precisely the criterion this row exists for ("stays consistent with the canvas after a save
+in either mode"). It shipped green because **`validate()` only checks that required params are
+PRESENT and never that extras are absent**, so an undeclared key was invisible to all 157 tests.
+
+The starter now asks the registry (`declares_param`) instead of hardcoding a key, and seeds `event`
+only for the type that declares it — onto `trigger.schedule`, which wants `cron`, is the same defect
+one key over. The trigger *kind* is not lost: it lives on the workflow row (`trigger_kind`), where
+the engine reads it from, and was never a node parameter.
+
+### 2. `--only=a,b` resolved as one string, so a two-name filter walked the whole inventory
+
+Found while auditing the row above, and the same "fails wide" shape tick 83 just fixed for the
+single-name spelling. `ONLY` is parsed as a **list** (`--only=a,b` is what `run.sh` documents) but
+the focused exit de-hyphenated the **raw** `--only=` value as a scalar: `"workflow-table,workflow-builder"`
+became the key `"workflowtable,workflowbuilder"`, matched nothing, and the pass walked all 77 routes
+while the banner named the filter. The row echo was the second half and had failed on its own — it
+matched one name against the joined string, a substring of no page name, so a two-name filter printed
+**no rows at all**.
+
+Fixed (`936db627`): resolution iterates `ONLY`'s entries; the echo matches per asked name (not the
+de-hyphenated keys — `workflowtable` is not a substring of `workflow-table-depth` either). A name
+resolving to no depth pass still falls through to the route list, which is what `--only=<route>` is for.
+
+### Proof
+
+| what | command | result |
+|---|---|---|
+| rust | `cargo test -p omnion-workflows --lib` | **160 passed** (157 + 3) |
+| frontend | `node --test --experimental-strip-types features/workflows/*.test.ts` | **376 passed**, 0 failed |
+| types | `npx tsc --noEmit` | exit 0 |
+| harness gate | `node scripts/qa/probe-only-filter.cjs` | **33/33** (24 → 33) |
+| browser | `QA_STACK=w3 … bash scripts/qa/run.sh --only=workflow-table` | 10 rows, `NET_FAILURES=0` |
+
+**The new gates were proven against the defect before being trusted**, per tick 83's lesson:
+
+- `probe-only-filter.cjs` run against `git show HEAD:scripts/qa/walkthrough.cjs` names both new
+  defects. Two of its own rules were wrong about the fix's shape first: a source window that ended
+  before the row echo (so the echo rule read red on a file containing it), and a mutation that
+  stripped only one of the two normalisation sites — which left the rule **green on a source whose
+  lookup can never match**, a mutation that passes for the wrong reason.
+- The three starter tests, run against the restored pre-fix `starter()`: 2 of 3 panic naming it —
+  *"the starter seeds `manual`'s trigger.manual node with `event`, which its form does not declare"*.
+  File restored byte-exact afterwards; the third (`declares_param`) is a unit, not a proof.
+
+**Not ticked:** the `table-save-survives` box stays open. The fix removes the defect the row was
+blind to, and a row that was *unsatisfiable* cannot be ticked by the fix that made it satisfiable —
+it needs a reading off a rebuilt API. The re-run is queued. Every other box in this entry's row
+group is a harness fix, which by its own nature ticks nothing.
+
+**Commits:** `936db627` (the filter), `cc90c56a` (the starter), pushed.
+
+**Next:** the re-run's `table-save-survives` reading — `clicked > 0` AND `inspected > 0` AND
+`builderSeesTableEdit: true`, the conjunction the criterion needs — then `edge-delete.removed` /
+`edge-delete-undo.restored` off the `eec3ad5d` label fix, which still has no live reading.
