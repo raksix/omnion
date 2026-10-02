@@ -88,6 +88,7 @@ pub mod iam_approvals;
 pub mod iam_policy;
 pub mod iam_providers;
 pub mod iam_provisioning;
+pub mod developer;
 pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
@@ -1278,6 +1279,60 @@ pub fn router(state: AppState) -> Router {
     // gets its own `let ... = Router::new()` and its own `merge`, or it inherits a key that has
     // nothing to do with it. Nesting routers is how the security centre ended up behind a key
     // named for a different feature.
+    // The developer portal (REQ-022, slice 1) is its own router for the same reason the
+    // security centre is (see the comment above): every one of its routes declares the key it
+    // actually needs, so nesting it under a broader builder would add a permission the route
+    // never asked for. The guards are split by blast radius — reading a key list is not
+    // issuing a credential, and neither is reading the traffic record.
+    let developer_routes = Router::new()
+        // The scope catalogue is what the create-key picker is built from, so it is the one
+        // read a key author needs before they have a key.
+        .route(
+            "/developer/scopes",
+            get(developer::list_scopes).layer(guards::require(&state, "developer.read")),
+        )
+        .route(
+            "/developer/api-keys",
+            get(developer::list_keys).layer(guards::require(&state, "developer.keys.read")),
+        )
+        .route(
+            "/developer/api-keys",
+            post(developer::create_key).layer(guards::require(&state, "developer.keys.manage")),
+        )
+        .route(
+            "/developer/api-keys/{id}",
+            get(developer::get_key).layer(guards::require(&state, "developer.keys.read")),
+        )
+        .route(
+            "/developer/api-keys/{id}",
+            delete(developer::revoke_key).layer(guards::require(&state, "developer.keys.manage")),
+        )
+        .route(
+            "/developer/api-keys/{id}/rotate",
+            post(developer::rotate_key).layer(guards::require(&state, "developer.keys.manage")),
+        )
+        .route(
+            "/developer/logs",
+            get(developer::list_logs).layer(guards::require(&state, "developer.logs.read")),
+        )
+        .route(
+            "/developer/logs/{id}",
+            get(developer::get_log).layer(guards::require(&state, "developer.logs.read")),
+        );
+    // One guarded route deliberately accepts a developer key, because the REQ's own acceptance
+    // criterion is "a key authenticates on a guarded endpoint and is rejected after
+    // revocation" — and a criterion with no route behind it is a criterion about nothing. The
+    // permission chosen is `content.pages.read` because it is a real, catalogued read that a
+    // publisher's integration genuinely needs, so the walk exercises the production shape
+    // rather than a purpose-made one.
+    let developer_guarded = Router::new().route(
+        "/developer/sandbox/probe",
+        get(developer::sandbox_probe).layer(guards::require_or_developer_key(
+            &state,
+            "content.pages.read",
+        )),
+    );
+
     let security_reports = Router::new()
         // Security centre (docs/requests/REQ-012, slice 1). The split is by *power*, not by
         // verb: `security.read` sees the posture and the findings, `security.scan` re-runs the
@@ -1812,6 +1867,8 @@ pub fn router(state: AppState) -> Router {
             analytics_settings_read.merge(analytics_settings_write),
         )
         .route("/analytics/snippet", analytics_snippet)
+        .merge(developer_routes)
+        .merge(developer_guarded)
         .merge(security_reports)
         .merge(analytics_reports)
         .route("/analytics/export", analytics_export)
