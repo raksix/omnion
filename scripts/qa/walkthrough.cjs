@@ -11912,6 +11912,137 @@ async function lastCreatedAppId(page, name) {
   }, name);
 }
 
+/**
+ * The region registry's depth pass (REQ-035, slice 1).
+ *
+ * The route walk visits `/platform/regions` only. That is not an oversight and it is not a
+ * shortcut: the second screen, `/platform/regions/{code}`, takes its identifier from the path,
+ * so a walk with a placeholder code proves that the not-found state renders and nothing else.
+ * This pass opens a REAL region's screen by following the list's own `Open` link, which is also
+ * the only way the detail screen is reachable in the product -- nothing else links to it.
+ *
+ * What each claim is aimed at:
+ *
+ * 1. `theSeededRegionsAllRender` — the brief names three regions and the seed inserts three. A
+ *    seed that lost a row to a later `on conflict` clause would render two and pass a count of
+ *    "at least one".
+ * 2. `aServiceWithNoCheckIsNotGreen` — the screen's central rule. An unchecked service is
+ *    `unknown`, and a badge that renders unknown as green is the one defect this screen exists
+ *    to prevent: an operator reads a green matrix and assumes a check ran.
+ * 3. `theMatrixShowsNumbersAndAMeasuredAt` — the latency grid is never colour-only and never
+ *    undated; a stale matrix that looks current is worse than no matrix.
+ * 4. `theDetailScreenOpensForARealRegion` — reached by clicking, not by typing a URL, so a
+ *    detail screen whose link is wrong fails here instead of shipping unreachable.
+ * 5. `theDetailNamesItsOwnRegion` — the detail screen must show the code it was asked about. A
+ *    route parameter read once and never applied renders the default region for every URL.
+ */
+async function runRegionsDepth(page, report) {
+  const steps = {};
+  const failures = [];
+  const check = (claim, ok) => {
+    steps[claim] = Boolean(ok);
+    if (!ok) failures.push(claim);
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/platform/regions`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector("[data-testid=regions-list]", { timeout: 15000 }).catch(() => {});
+
+  const rows = page.locator("[data-testid^=regions-row-]");
+  const rowCount = await rows.count();
+  check("theSeededRegionsAllRender", rowCount === 3);
+  await shot(page, "page-regions");
+
+  // Read the three region codes off the DOM instead of assuming them. A hardcoded list here
+  // would assert against a seed the migration no longer produces.
+  const codes = await page
+    .evaluate(() =>
+      Array.from(document.querySelectorAll("[data-testid^=regions-row-]")).map((n) =>
+        (n.getAttribute("data-testid") || "").replace("regions-row-", ""),
+      ),
+    )
+    .catch(() => []);
+
+  check("everyRowCarriesACode", codes.length === rowCount && codes.every((c) => c.length > 2));
+
+  // Claim 2. Every service badge must resolve to a word, and no unchecked service may be
+  // dressed as healthy. The words are read from the badge's own text so a screen that renders
+  // an empty span -- which reads as "nothing to report" -- fails rather than passes.
+  const badges = await page
+    .evaluate(() =>
+      Array.from(document.querySelectorAll("[data-testid^=regions-badges-]")).map((n) => ({
+        code: (n.getAttribute("data-testid") || "").replace("regions-badges-", ""),
+        words: Array.from(n.querySelectorAll("[data-testid^=regions-service-]"))
+          .map((b) => (b.textContent || "").trim())
+          .filter((t) => t.length > 0),
+      })),
+    )
+    .catch(() => []);
+
+  const WORDS = ["healthy", "degraded", "down", "maintenance", "unknown"];
+  check(
+    "everyServiceBadgeRendersAWord",
+    badges.length > 0 &&
+      badges.every(
+        (b) =>
+          b.words.length > 0 &&
+          b.words.every((w) => WORDS.some((word) => w.toLowerCase().includes(word))),
+      ),
+  );
+
+  // Claim 3. The matrix is either absent on a fresh database or carries both a measured-at
+  // stamp and numbers. What it may never be is a grid of cells with neither -- that is a chart
+  // that looks current while measuring nothing.
+  const matrix = page.locator("[data-testid=regions-latency-matrix]");
+  const matrixCount = await matrix.count();
+  if (matrixCount > 0) {
+    const measured = await page.locator("[data-testid=regions-latency-measured]").count();
+    check("aMatrixThatRendersAlsoSaysWhenItMeasured", measured > 0);
+  } else {
+    check("anAbsentMatrixShowsItsOwnEmptyState", (await page
+      .locator("[data-testid=regions-latency-empty]")
+      .count()) > 0);
+  }
+
+  // Claim 4. Follow the list's own link. The click is what makes this a navigation test rather
+  // than a second URL load.
+  const first = codes[0];
+  if (first) {
+    await page.locator(`[data-testid=regions-open-${first}]`).click().catch(() => {});
+    await page.waitForSelector("[data-testid=region-detail-title]", { timeout: 15000 }).catch(() => {});
+    check("theDetailScreenOpensForARealRegion", page.url().includes(`/platform/regions/${first}`));
+
+    // Claim 5. The detail screen names the region it was asked for. Reading the heading is what
+    // distinguishes "the route parameter is applied" from "the screen always renders region one".
+    const title = (
+      await page.locator("[data-testid=region-detail-title]").first().innerText().catch(() => "")
+    ).trim();
+    check("theDetailNamesItsOwnRegion", title.toLowerCase().includes(first.toLowerCase()));
+
+    const services = await page.locator("[data-testid=region-detail-services]").count();
+    check("theDetailListsItsServices", services > 0);
+
+    // No credential may appear on a screen that lists endpoints. The migration refuses blank
+    // endpoints precisely because a blank one renders as a region that routes nothing.
+    const body = await page.evaluate(() => document.body.innerText || "");
+    check("theDetailShowsNoCredential", !/(secret|token|password|api[_-]?key)\s*[:=]\s*\S/i.test(body));
+
+    await shot(page, "page-region-detail");
+  }
+
+  if (failures.length > 0) {
+    throw new Error(
+      `${failures.length} region(s) claim(s) did not hold: ${failures.join(", ")}`,
+    );
+  }
+
+  return { ok: true, claims: Object.keys(steps).length, ...steps };
+}
+
+module.exports = { runRegionsDepth };
+
+
 async function runRetentionDepth(page, report) {
   const steps = {};
   const before = await page
@@ -12407,6 +12538,13 @@ async function main() {
     // the URI the terminal prints — a deep link that lands on a working page is invisible here.
     { path: "/developer/sdks", name: "developer-sdks" },
     { path: "/developer/sdks?tab=cli", name: "developer-sdks-cli" },
+    // The region registry (REQ-035, slice 1). Two screens, and only the list one is walked:
+    // `/platform/regions/{code}` carries a region code in its path, and a route walked with a
+    // placeholder code proves exactly one thing -- that the not-found state renders. Listing
+    // the bare prefix produced that screenshot. The depth pass below opens a REAL region's
+    // screen from its own row instead, which is also the only way to reach the detail screen
+    // at all: nothing else links to it.
+    { path: "/platform/regions", name: "platform-regions" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -12686,6 +12824,12 @@ async function main() {
   // card drawn from a stale cache would agree with them by luck.
   report.devOverview = await runDepthPass("dev-overview", () => runDevOverviewDepth(page, report));
   log(`dev-overview: ${JSON.stringify(report.devOverview)}`);
+
+  // The region registry (REQ-035, slice 1). Registered right after the developer block because
+  // its detail screen is only reachable by following the list's own link -- see the comment on
+  // the route entry above for why that screen is not in the route list.
+  report.regions = await runDepthPass("regions", () => runRegionsDepth(page, report));
+  log(`regions: ${JSON.stringify(report.regions)}`);
 
   // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
   // because a scan counts the findings those passes have already written, and a scan that ran
