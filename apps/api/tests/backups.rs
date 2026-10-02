@@ -3866,6 +3866,34 @@ async fn a_strangers_schedule_is_a_404_and_running_one_needs_the_take_a_backup_k
     assert_eq!(ran.status, StatusCode::CREATED, "body: {}", ran.body);
     assert_eq!(run_count(&fixture, fixture.org).await, before + 1);
 
+    // And the schedule says so. This is the assertion the whole route was missing: the run
+    // is tied to the schedule, carries its scopes and appears in the list beside it — and the
+    // schedule's own "last run" column said **"never"** because the only writer of
+    // `last_run_at` was the unattended worker. Read out of the database rather than out of the
+    // response, because a response can carry a computed value that was never stored, which is
+    // the defect this loop has now found in three different tables.
+    let (last_run_at, last_backup_id): (Option<time::OffsetDateTime>, Option<Uuid>) =
+        sqlx::query_as("select last_run_at, last_backup_id from backup_schedules where id = $1")
+            .bind(id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the schedule must read");
+    assert!(
+        last_run_at.is_some(),
+        "a manual run of this schedule left its last_run_at null, so the panel's last-run \
+         column reads 'never' beside a run it just produced"
+    );
+    let produced_id = ran.body["backup"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .parse::<Uuid>()
+        .unwrap_or(Uuid::nil());
+    assert_eq!(
+        last_backup_id,
+        Some(produced_id),
+        "the schedule does not point at the run it just took"
+    );
+
     // And a manual run does NOT consume the next slot. An operator testing a 03:00 schedule
     // at 09:00 must not have silently skipped tomorrow's 03:00.
     let next: Option<time::OffsetDateTime> =
@@ -5088,5 +5116,297 @@ async fn the_destination_card_reports_room_against_this_tenants_own_biggest_back
         json!(true),
         "a destination that takes a write still says so; headroom is an additional fact, not a \
          replacement"
+    );
+}
+
+// --------------------------------------------------------------------------------------------
+// The four frequencies
+// --------------------------------------------------------------------------------------------
+
+/// Every cadence the schema allows must save, compute a **different** next run, and fire.
+///
+/// The existing schedule walk created exactly one schedule and it was `daily`, so three of the
+/// four frequencies had never been through the router at all. The pure cadence tests cover all
+/// four and are strong — they are the reason the DST round-tripping exists — but they never
+/// touch `upsert_schedule`, and that function is where a frequency's own fields are written:
+///
+/// * **`weekly` with no `day_of_week`** is refused by `0157`'s `(frequency = 'weekly') =
+///   (day_of_week is not null)`. That is the database, not the API, and a `500` from a
+///   constraint is not the sentence the panel shows next to the input.
+/// * **`hourly` has no time of day**, and the panel sends `null` for it — so the hourly path
+///   through `cadence_of` is one the walk had never taken, and it is the branch that returns
+///   *before* the day search entirely.
+/// * **`monthly` on the 28th** is the only legal day a month of February has. A `day_of_month`
+///   that produced February 29th would be a schedule that exists for eleven months of the year
+///   and then either fires twice or not at all.
+///
+/// The load-bearing assertion is the **column, not the response**: `set_schedule_next_run` is
+/// a separate statement from `upsert_schedule`, so a route that computed a correct next run and
+/// failed to store it would answer perfectly and the schedule would never fire — which is the
+/// exact defect the previous slice of this criterion was about.
+#[tokio::test]
+async fn all_four_frequencies_save_and_compute_a_next_run_of_their_own_shape() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+    let now = time::OffsetDateTime::now_utc();
+
+    // The four rows the acceptance box names. `weekly` is Wednesday and `monthly` the 28th on
+    // purpose: both are fields the other three frequencies do not have, so a route that wrote
+    // them into the wrong column, or dropped one, still answers `200`.
+    let cases = [
+        // (label, body, expected weekday of the next run, expected day-of-month)
+        (
+            "hourly",
+            json!({
+                "name": "QA every hour",
+                "frequency": "hourly",
+                "timezone": "UTC",
+                "scopes": ["configuration"],
+            }),
+            None,
+            None,
+        ),
+        (
+            "daily",
+            json!({
+                "name": "QA every day",
+                "frequency": "daily",
+                "at_time": "02:30",
+                "timezone": "UTC",
+                "scopes": ["configuration"],
+            }),
+            None,
+            None,
+        ),
+        (
+            "weekly",
+            json!({
+                "name": "QA every week",
+                "frequency": "weekly",
+                "at_time": "03:15",
+                "day_of_week": 3,
+                "timezone": "UTC",
+                "scopes": ["configuration"],
+            }),
+            Some(time::Weekday::Wednesday),
+            None,
+        ),
+        (
+            "monthly",
+            json!({
+                "name": "QA every month",
+                "frequency": "monthly",
+                "at_time": "04:45",
+                "day_of_month": 28,
+                "timezone": "UTC",
+                "scopes": ["configuration"],
+            }),
+            None,
+            Some(28),
+        ),
+    ];
+
+    let mut ids = Vec::new();
+    let mut computed: Vec<(String, time::OffsetDateTime)> = Vec::new();
+    for (label, body, weekday, day_of_month) in cases {
+        let created = call(
+            &fixture.state,
+            request(
+                Method::POST,
+                &schedules_uri(),
+                Some(&token),
+                Some(&csrf),
+                Some(body),
+            ),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            StatusCode::OK,
+            "a {label} schedule must save: {}",
+            created.body
+        );
+        let id: Uuid = created.body["id"].as_str().expect("an id").parse().unwrap();
+
+        // The stored next run, not the response's. `upsert_schedule` and
+        // `set_schedule_next_run` are two statements, and the worker reads the column.
+        let next: Option<time::OffsetDateTime> =
+            sqlx::query_scalar("select next_run_at from backup_schedules where id = $1")
+                .bind(id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("the schedule must read");
+        let next = next.unwrap_or_else(|| {
+            panic!("a {label} schedule stored no next run, so the worker will never claim it")
+        });
+        assert!(
+            next > now,
+            "a {label} schedule's next run is in the past: {next}"
+        );
+
+        // **The shape of the answer, per frequency.** This is the assertion the four unit
+        // tests in `cadence.rs` cannot make on the API's behalf, because they never go through
+        // the write: a route that stored `weekly` as `daily` and `monthly` as `daily` would
+        // answer every one of these four calls with a plausible future instant.
+        match label {
+            // Top of the next hour, minute and second both zero. "Every hour" that means
+            // "every hour at :37, whenever the schedule was saved" is not the cadence the
+            // schema allows.
+            "hourly" => {
+                assert_eq!(
+                    (next.minute(), next.second()),
+                    (0, 0),
+                    "an hourly schedule must land on the top of the hour, not on the minute the \
+                     schedule was created: {next}"
+                );
+            }
+            "weekly" => {
+                assert_eq!(
+                    next.weekday(),
+                    weekday.expect("the weekly case names a weekday"),
+                    "a weekly schedule with day_of_week = 3 (Wednesday) computed a {label} run for \
+                     the wrong day: {next}"
+                );
+                assert_eq!(
+                    next.hour(),
+                    3,
+                    "a weekly schedule at 03:15 must be at hour 3 in UTC: {next}"
+                );
+            }
+            "monthly" => {
+                assert_eq!(
+                    next.day(),
+                    day_of_month.expect("the monthly case names a day"),
+                    "a monthly schedule on the 28th computed a run for another day: {next}"
+                );
+                assert_eq!(next.hour(), 4, "at 04:45 UTC: {next}");
+            }
+            _ => {
+                assert_eq!(next.hour(), 2, "a daily schedule at 02:30 must be at hour 2: {next}");
+            }
+        }
+
+        // And the frequency's own fields are on the row, so an edit dialog opens on the values
+        // the operator chose rather than on defaults.
+        let (frequency, stored_weekday, stored_day): (String, Option<i16>, Option<i16>) =
+            sqlx::query_as(
+                "select frequency, day_of_week, day_of_month from backup_schedules where id = $1",
+            )
+            .bind(id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the schedule must read");
+        assert_eq!(frequency, label);
+        assert_eq!(
+            stored_weekday.is_some(),
+            label == "weekly",
+            "day_of_week belongs to weekly alone; {label} stored {stored_weekday:?}"
+        );
+        assert_eq!(
+            stored_day.is_some(),
+            label == "monthly",
+            "day_of_month belongs to monthly alone; {label} stored {stored_day:?}"
+        );
+
+        ids.push((label.to_owned(), id));
+        computed.push((label.to_owned(), next));
+    }
+
+    // --- the four are genuinely four ---------------------------------------------------------
+    // Four schedules on four different cadences that all happen to share one instant would be
+    // four identical answers wearing four names, and the per-shape assertions above can each
+    // pass while the schedule is really only running daily. Distinctness is the cheap check
+    // that catches it.
+    let distinct: std::collections::BTreeSet<_> =
+        computed.iter().map(|(_, at)| at.minute()).collect();
+    assert!(
+        distinct.len() >= 3,
+        "four frequencies that all land on the same minute are one frequency with four labels: \
+         {computed:?}"
+    );
+
+    // --- each one fires -------------------------------------------------------------------------
+    // One tick, four schedules: the worker's query is `enabled and next_run_at <= now limit
+    // 20`, so backdating all four and calling `tick` once must produce **four** runs. A worker
+    // that stopped after the first, or that claimed one per tick, would pass a walk that tested
+    // a single schedule — which is exactly what the previous version of this criterion did.
+    for (_, id) in &ids {
+        sqlx::query(
+            "update backup_schedules set next_run_at = now() - interval '1 second' where id = $1",
+        )
+        .bind(id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the schedule must be backdated");
+    }
+
+    let before = run_count(&fixture, fixture.org).await;
+    let started = omnion_api::backup_schedule_runner::tick(&fixture.state)
+        .await
+        .expect("the schedule tick must answer");
+    assert_eq!(
+        started,
+        4,
+        "one tick claimed four due schedules and started {started}"
+    );
+    let after = run_count(&fixture, fixture.org).await;
+    assert_eq!(
+        after,
+        before + 4,
+        "four schedules fired in one tick and produced {} runs",
+        after - before
+    );
+
+    // Each schedule's run carries **its own** scope, and each run is tied to the schedule that
+    // produced it. A worker that walked `PARTS` would produce five artifacts per schedule; a
+    // worker that tied every run to the last schedule it read would point all four schedules at
+    // one backup. Both are invisible in the counts above.
+    for (label, id) in &ids {
+        let tied: i64 = sqlx::query_scalar(
+            "select count(*) from backups where schedule_id = $1 and organization_id = $2",
+        )
+        .bind(id)
+        .bind(fixture.org)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the schedule's runs must read");
+        assert_eq!(tied, 1, "{label} did not produce exactly one run of its own");
+
+        let pointed: Option<Uuid> =
+            sqlx::query_scalar("select last_backup_id from backup_schedules where id = $1")
+                .bind(id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("the schedule must read");
+        assert!(
+            pointed.is_some(),
+            "{label} fired and its last-run column still says never"
+        );
+        let run_id: Uuid = sqlx::query_scalar("select id from backups where schedule_id = $1")
+            .bind(id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the run must read");
+        assert_eq!(
+            pointed,
+            Some(run_id),
+            "{label}'s last-run column points at a backup it did not produce"
+        );
+    }
+
+    // --- and none of them fires twice ------------------------------------------------------------
+    // One tick claimed all four and rearmed all four; a worker that left the column in the past
+    // would take four more backups on the next tick, and a nightly schedule that quietly runs
+    // every minute is a destination filled by morning.
+    let second = omnion_api::backup_schedule_runner::tick(&fixture.state)
+        .await
+        .expect("the second tick must answer");
+    assert_eq!(second, 0, "a rearmed schedule fired again immediately");
+    assert_eq!(
+        run_count(&fixture, fixture.org).await,
+        after,
+        "the second tick took more backups"
     );
 }
