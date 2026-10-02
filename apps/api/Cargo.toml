@@ -55,6 +55,7 @@ omnion-identity = { path = "../../crates/identity" }
 omnion-backup = { path = "../../crates/backup" }
 omnion-media = { path = "../../crates/media" }
 omnion-notifications = { path = "../../crates/notifications" }
+omnion-regions = { path = "../../crates/regions", features = ["store"] }
 omnion-security = { path = "../../crates/security" }
 omnion-module-analytics = { path = "../../modules/analytics" }
 omnion-onboarding = { path = "../../crates/onboarding" }
