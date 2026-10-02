@@ -17072,3 +17072,63 @@ orphan reservation starves a live lead: does the batch limit count rows READ or 
 `--only=crm-intake` to observe the skip note. Then REQ-133's unticked boxes are screen
 observations at 390 px plus two criteria naming resources this branch does not have (no
 `credentials` table; schedules are columns).
+
+## Tick 86 — REQ-133 slice 19: the destructive half was documented since the module shipped
+
+**What.** `DELETE /api/v1/projects/{id}` has been in REQ-133's API table with "typed confirmation,
+dependency check" since slice 1; the settings screen's row has read "Name, key, description, colour,
+archive, export, delete" just as long; and migration `0164` chose `on delete restrict` for the
+resource → project foreign keys *because* "deletion is a deliberate act with its own dependency
+check (slice 4)". Slice 4 shipped the caps, the ownership transfer and the archive guards and
+never wrote the function its own migration comment names. No `delete_project` in the store, no
+handler, no route, no button, and `automation.project.deleted` an event nothing emitted — an
+installation could create projects for ever and never remove one.
+
+**This is the branch's signature defect in its most complete form, and the gates say why.** The
+green gates here were limits 14/14, write-guard 5/5 and move 13/13; each one measures the clause
+that had been implemented. Five ticks on this REQ have now written the rule down, and this is the
+one instance where the *entire* missing half is a single destructive verb.
+
+**Two functions, and the split is the design.** `projects::project_delete_checks` decides —
+default project, then typed confirmation, then dependency count, each naming the remedy that works
+and in that order because the default is the one refusal no cleanup fixes — and
+`projects::commit_project_delete` writes. The project row is held `for update` across both, so a
+workflow created between the count and the delete cannot slip into the row being removed.
+
+**The split exists because the database said so, and my first version was wrong.**
+`audit_log.project_id` is a foreign key with `on delete set null` and the constraint is checked when
+the row is inserted — so a trail row naming the project is legal only while the project is still
+there. A single function that checked and deleted forced the caller to write the audit row AFTER a
+delete that had already happened, and the gate answered `23503 audit_log_project_id_fkey` on its
+first run. The audit row now goes in first, inside the same transaction:
+`omnion_audit::record_for_project_in` is the transaction-scoped writer that makes the order
+possible. **A `set null` foreign key does not apply to rows inserted after the delete — it applies
+to rows that are already there.** That is the whole lesson, and it is invisible until a real
+database refuses it.
+
+**The confirmation is the project KEY, and `.trim()` made it a lie.** `PAY` against `PAYROLL`
+fails, which is the entire purpose of typing it — and a check that is *nearly* exact is not exact.
+"Nearly" is where muscle memory lives: a pasted `"OPS "` satisfied the first version, and the
+panel (which compares `typed === key`) would have refused what the store accepted. The near-miss
+list in the test now includes the trailing space so it cannot come back. Same family as this
+branch's "the message is not the negation": a check that is almost the promise is not the promise.
+
+**Proof.** `scripts/qa/run-project-delete.sh` **6/6** and **PROVEN TO FAIL at 5/6** with the
+dependency refusal removed — the one assertion that names it fails, the five that do not stay
+green, which is what shows the gate names this defect and not its neighbourhood. Module lib builds;
+`cargo build -p omnion-api --bin omnion-api` exit 0; admin `tsc --noEmit` exit 0;
+`node --check scripts/qa/walkthrough.cjs` clean. Three fixture defects of mine were caught before
+any product defect: `create_execution` takes `&Workflow` and a step slice, `ActorType` has no sqlx
+`Decode`, and `world()`'s fourth slot is already a `Uuid` so `project.id` is a `Uuid` with no field
+`id`.
+
+**Browser pass NOT run and NOT claimed.** The QA slot is held by a live w3 pass (holder pid alive,
+`cwd=/mnt/apopic/omnion-w3`), 1440 chrome processes, load 18.5, `/mnt/apopic` 89%. The walkthrough
+block — which creates its own throwaway project, reads the confirm button disabled on an empty
+field and on a wrong key and enabled on the right one, then asserts the API answers 404 afterwards —
+is written and UNEXECUTED. Acceptance 16's screen half stays unticked until a `summary.json` carries
+`deleteProjectGone`.
+
+**Next.** Reclaim the slot and run `--only=projects` on the private stack (`QA_STACK=w8`, ports
+18087/3107/3207). Then project **export** — the other half of that same settings row, and the
+last name on the screen that nothing implements. Then the unticked 390 px criterion.
