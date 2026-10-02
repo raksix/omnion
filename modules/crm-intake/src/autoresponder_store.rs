@@ -832,7 +832,15 @@ pub async fn due_reservations(
                     &lead,
                     &source,
                     other.reason(),
-                    serde_json::json!({ "reserved": true }),
+                    // The verdict's own payload again, and for the same reason as the capture
+                    // path: an `InvalidTemplate` here means the source was **edited to be
+                    // broken during its own delay** — an operator emptied the body while a reply
+                    // was waiting — and the sweep is the only thing that ever sees it, because
+                    // the row was reserved before the edit. `json!({ "reserved": true })` said
+                    // "there was a reservation", which is true of every row in this arm and says
+                    // nothing about why it is being dropped. The two keys are different facts and
+                    // both are kept: the reservation is context, the verdict explains.
+                    other.skip_payload_merge(serde_json::json!({ "reserved": true })),
                 )
                 .await?;
                 release_claim(pool, lead_id, &claimed_to).await?;

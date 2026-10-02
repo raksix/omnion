@@ -267,7 +267,9 @@ async fn a_delivered_claim_is_neither_released_nor_completed_again() {
         .await
         .expect("the slot is claimed");
     assert!(
-        ar_store::mark_sent(&pool, lead.id, now).await.expect("the send completed"),
+        ar_store::mark_sent(&pool, lead.id, now)
+            .await
+            .expect("the send completed"),
         "the mailer returned, so the completion wins the row"
     );
 
@@ -275,7 +277,10 @@ async fn a_delivered_claim_is_neither_released_nor_completed_again() {
         .await
         .expect("reading the claim")
         .expect("a claim exists");
-    assert!(ar_store::was_sent(&stored), "a delivered claim reads as sent");
+    assert!(
+        ar_store::was_sent(&stored),
+        "a delivered claim reads as sent"
+    );
     assert!(
         stored["delivered_at"].as_str().is_some(),
         "the delivery instant is recorded, which is the fact an immediate send used to lose"
@@ -492,6 +497,201 @@ async fn the_shipped_templates_are_usable_as_the_column_stores_them() {
     assert!(!omnion_module_crm_intake::autoresponder::template_names().is_empty());
 }
 
+/// Rewrite a source's autoresponder body, then hand back the row **as re-read**.
+///
+/// ## Why the re-read is the point, and not tidiness
+///
+/// `prepare` believes the `&IntakeSource` it is handed — it does not re-read the column,
+/// because its caller read it milliseconds earlier and a second read would be a second answer
+/// to a question already answered. The **sweep** is the opposite: `due_reservations` calls
+/// `source_of` per row, because the row was reserved *before* whatever happened next and the
+/// question it must answer is what the source looks like **now**.
+///
+/// So "an operator emptied the body while a reply was waiting" is observable on exactly one
+/// path, and a fixture that edits the column and keeps handing over the stale struct proves
+/// nothing: the first version of this test set `template_body` to whitespace, passed the
+/// pre-edit `source`, and measured a verdict of `sent` — the fixture was wrong, and it read
+/// like the product being wrong.
+///
+/// Returning the re-read row makes the helper usable from both, and a caller that wants the
+/// stale struct simply keeps its own copy.
+async fn set_body_and_reread(pool: &PgPool, source: &IntakeSource, body: &str) -> IntakeSource {
+    let mut column: serde_json::Value =
+        sqlx::query_scalar("select autoresponder from crm_intake_sources where id = $1")
+            .bind(source.id)
+            .fetch_one(pool)
+            .await
+            .expect("reading the source's autoresponder column");
+    column["template_body"] = serde_json::json!(body);
+    sqlx::query("update crm_intake_sources set autoresponder = $2 where id = $1")
+        .bind(source.id)
+        .bind(&column)
+        .execute(pool)
+        .await
+        .expect("the body is written back");
+    sqlx::query_as::<_, IntakeSource>(&format!(
+        "select {} from crm_intake_sources where id = $1",
+        store::SOURCE_COLUMNS
+    ))
+    .bind(source.id)
+    .fetch_one(pool)
+    .await
+    .expect("the source is re-read")
+}
+
+#[tokio::test]
+async fn a_misconfigured_autoresponder_records_which_half_of_its_configuration_is_broken() {
+    // THE ASSERTION. The unit test proves `skip_payload()` keeps the diagnosis; this one
+    // proves the sentence reaches the **stored row**, because that is the only place a human
+    // will ever read it — the panel renders the trail, and the panel cannot render a sentence
+    // that was never written.
+    //
+    // Before this slice `spawn_autoresponder` passed `json!({})` to `record_skip` for every
+    // verdict, so an autoresponder that is switched on, has a subject and has an EMPTY body
+    // wrote exactly one word — `invalid_template` — onto the lead's timeline and nowhere else.
+    // It is the one autoresponder misconfiguration an operator can fix, and the trail could
+    // not say which half was wrong.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder diagnosis").await;
+    let source = source_with_autoresponder(&pool, org, 0).await;
+
+    // **Both** of the variant's two sentences, driven one after the other.
+    //
+    // `deliver` checks `subject.is_empty() || body.is_empty()` BEFORE it renders, so a blank
+    // body is a *missing* body; only a body that is present but renders to nothing reaches
+    // the later check. One case would have proved the sentence survives, and would have left
+    // the second one as an unreachable string nobody could check — the same thing this crate
+    // has already done to `Delivery::NotYet`. Both are also the reason the stored value is
+    // asserted rather than merely "some non-empty explanation": a writer that wrote a
+    // constant passes one case and fails the other.
+    //
+    // The two cases are NOT the same state either, which is why each declares its own
+    // `configured` expectation. A blank body is not configured at all; an unknown placeholder
+    // renders to an empty string and **is** configured, because `is_configured` asks whether
+    // there is a body to send and there is one. Asserting `!is_configured()` for both was
+    // wrong for the second case, and it failed as a *fixture* defect rather than a product one
+    // — the same distinction `the_shipped_templates_are_usable_as_the_column_stores_them`
+    // draws when it says a template must be usable as shipped.
+    for (index, (body, expected, configured)) in [
+        ("   ", "the autoresponder has no subject or no body", false),
+        (
+            "{{no_such_placeholder}}",
+            "the template renders to nothing",
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lead =
+            accepted_lead(&pool, org, &source, &format!("diagnose{index}@example.com")).await;
+        let now = time::OffsetDateTime::now_utc();
+
+        // The configuration the editor can produce and the panel warns about: on, with a
+        // subject, with a body that cannot produce a message.
+        let broken = set_body_and_reread(&pool, &source, body).await;
+        // `is_configured` lives on the PARSED autoresponder, not on the row — the column is a
+        // `serde_json::Value` and the parser is what turns it into an answer. Asking the row
+        // the question would ask a string whether it is configured.
+        assert_eq!(
+            Autoresponder::from_json(&broken.autoresponder).is_configured(),
+            configured,
+            "a body of {body:?} is not {configured} as a configured autoresponder — the fixture \
+did not create the state it claims to create"
+        );
+
+        let outcome = ar_store::prepare(&pool, &lead, &broken, now)
+            .await
+            .expect("prepare");
+        assert_eq!(
+            outcome.verdict.reason(),
+            "invalid_template",
+            "a body of {body:?} is an invalid template, whatever else is true"
+        );
+        // The caller is the route's arm, and it now writes the verdict's own payload.
+        // Replaying the route's exact call keeps this test measuring production behaviour
+        // rather than a fixture that passes the payload the route does not.
+        ar_store::record_skip(
+            &pool,
+            &lead,
+            &broken,
+            outcome.verdict.reason(),
+            outcome.verdict.skip_payload(),
+        )
+        .await
+        .expect("the skip is recorded");
+
+        let detail: serde_json::Value = sqlx::query_scalar(
+            "select detail from crm_lead_events \
+             where lead_id = $1 and kind = $2 and detail ? 'reason' \
+             order by id desc limit 1",
+        )
+        .bind(lead.id)
+        .bind(ar_store::SENT_KIND)
+        .fetch_one(&pool)
+        .await
+        .expect("a line was written");
+        assert_eq!(detail["reason"], "invalid_template");
+        assert!(
+            detail
+                .get("explanation")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "the row carries the word and no sentence — the one fixable autoresponder failure is \
+             recorded as a token, and the panel has nothing to render"
+        );
+        assert_eq!(
+            detail["explanation"], expected,
+            "the diagnosis must be the one the verdict was constructed with, not a paraphrase"
+        );
+    }
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
+async fn a_skip_with_nothing_to_explain_records_no_explanation() {
+    // The negative control, and it is load-bearing: an assertion suite with only the positive
+    // case above is satisfied by a writer that invents a sentence for every verdict, which is
+    // a trail line making a claim it has no evidence for. `NotAccepted` already carries its
+    // own reason *in the word*, so a second copy under `explanation` would be a duplicate.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder no diagnosis").await;
+    let source = source_with_autoresponder(&pool, org, 0).await;
+    let lead = accepted_lead(&pool, org, &source, "quiet-reason@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    let outcome = ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("prepare");
+    ar_store::record_skip(
+        &pool,
+        &lead,
+        &source,
+        outcome.verdict.reason(),
+        outcome.verdict.skip_payload(),
+    )
+    .await
+    .expect("the skip is recorded");
+
+    let detail: serde_json::Value = sqlx::query_scalar(
+        "select detail from crm_lead_events \
+         where lead_id = $1 and kind = $2 and detail ? 'reason' \
+         order by id desc limit 1",
+    )
+    .bind(lead.id)
+    .bind(ar_store::SENT_KIND)
+    .fetch_one(&pool)
+    .await
+    .expect("a line was written");
+    assert!(
+        detail.get("explanation").is_none(),
+        "a verdict with nothing to explain wrote an explanation anyway: {detail}"
+    );
+
+    drop_org(&pool, org).await;
+}
+
 /// Rewrite a source's autoresponder delay, through the real column.
 ///
 /// The gate has to move a reservation's due instant into the past without waiting for a real
@@ -543,7 +743,10 @@ async fn a_delayed_autoresponder_is_sent_when_its_time_comes() {
     // first line** — the name is what the next reader trusts, and this one is why a delayed lead
     // was logged as answered for 45 minutes.
     assert_eq!(outcome.verdict.reason(), "delayed");
-    assert!(!outcome.verdict.is_sendable(), "a reserved message is not in the mailer");
+    assert!(
+        !outcome.verdict.is_sendable(),
+        "a reserved message is not in the mailer"
+    );
 
     // Before the delay, the sweep finds nothing. This is the half that says "not early",
     // and it is the half a "just send it" implementation passes by accident.
@@ -634,14 +837,17 @@ async fn a_reservation_whose_source_was_deleted_is_released_rather_than_retried_
 
     // The panel's own delete button: the lead keeps its row and loses its source.
     assert!(
-        store::delete_source(&pool, org, source.id).await.expect("the delete runs"),
+        store::delete_source(&pool, org, source.id)
+            .await
+            .expect("the delete runs"),
         "the source is deleted the way the panel deletes one"
     );
-    let source_id: Option<Uuid> = sqlx::query_scalar("select source_id from crm_leads where id = $1")
-        .bind(lead.id)
-        .fetch_one(&pool)
-        .await
-        .expect("reading the lead");
+    let source_id: Option<Uuid> =
+        sqlx::query_scalar("select source_id from crm_leads where id = $1")
+            .bind(lead.id)
+            .fetch_one(&pool)
+            .await
+            .expect("reading the lead");
     assert_eq!(
         source_id, None,
         "the fixture must reproduce the shape this test is about: a lead whose source is gone"
@@ -649,13 +855,9 @@ async fn a_reservation_whose_source_was_deleted_is_released_rather_than_retried_
 
     // Two passes, one minute apart — the worker's own cadence.
     for minute in [31_i64, 32] {
-        let due = ar_store::due_reservations(
-            &pool,
-            now + time::Duration::minutes(minute),
-            50,
-        )
-        .await
-        .expect("the sweep runs");
+        let due = ar_store::due_reservations(&pool, now + time::Duration::minutes(minute), 50)
+            .await
+            .expect("the sweep runs");
         assert!(
             !due.iter().any(|r| r.lead.id == lead.id),
             "there is no source left to answer it (pass at +{minute})"
@@ -879,11 +1081,13 @@ async fn a_delay_shortened_to_zero_is_due_at_once() {
     ar_store::prepare(&pool, &lead, &source, now)
         .await
         .expect("the slot is reserved for two hours");
-    assert!(ar_store::due_reservations(&pool, now + time::Duration::minutes(119), 50)
-        .await
-        .expect("the sweep runs")
-        .iter()
-        .all(|r| r.lead.id != lead.id));
+    assert!(
+        ar_store::due_reservations(&pool, now + time::Duration::minutes(119), 50)
+            .await
+            .expect("the sweep runs")
+            .iter()
+            .all(|r| r.lead.id != lead.id)
+    );
 
     set_delay(&pool, &source, 0).await;
     let due = ar_store::due_reservations(&pool, now + time::Duration::minutes(121), 50)
@@ -933,13 +1137,9 @@ async fn a_reservation_the_sweep_declines_is_released_rather_than_left_forever_d
 
     // Two passes, one minute apart — the worker's own cadence.
     for minute in [31_i64, 32] {
-        let due = ar_store::due_reservations(
-            &pool,
-            now + time::Duration::minutes(minute),
-            50,
-        )
-        .await
-        .expect("the sweep runs");
+        let due = ar_store::due_reservations(&pool, now + time::Duration::minutes(minute), 50)
+            .await
+            .expect("the sweep runs");
         assert!(
             !due.iter().any(|r| r.lead.id == lead.id),
             "a lead that turned to spam is not answered (pass at +{minute})"
@@ -1294,7 +1494,6 @@ async fn a_delivered_claim_is_not_offered_again() {
     drop_org(&pool, org).await;
 }
 
-
 // -------------------------------------------------------------------------------------------
 // SLICE 48 — `delivered_at` is asked for by VALUE, not by key existence
 // -------------------------------------------------------------------------------------------
@@ -1367,7 +1566,9 @@ async fn a_0202_shaped_claim_can_still_be_completed() {
 
     // THE ASSERTION.
     assert!(
-        ar_store::mark_sent(&pool, lead.id, now).await.expect("the completion runs"),
+        ar_store::mark_sent(&pool, lead.id, now)
+            .await
+            .expect("the completion runs"),
         "an installation upgrading mid-flight must be able to complete a claim the old code \
          claimed but never recorded — that is 0202's stated purpose, in its own words"
     );

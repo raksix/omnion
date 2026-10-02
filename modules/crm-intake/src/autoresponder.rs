@@ -145,6 +145,95 @@ impl Delivery {
             Self::InvalidTemplate(_) => "invalid_template",
         }
     }
+
+    /// The explanation this verdict carries, for the skip note's own payload.
+    ///
+    /// ## Why a skip note was not enough on its own
+    ///
+    /// `reason()` answers *which case* — one machine word, deliberately shared by two readers
+    /// (the API's own vocabulary and the panel's), and the panel renders it verbatim because
+    /// **there is no owner for those words anywhere in the client**. That is the reader half of
+    /// this slice; this method is the writer half, and it is the same shape seen from the other
+    /// side.
+    ///
+    /// [`Self::InvalidTemplate`] carries a `String` that says *what is wrong with the
+    /// operator's own configuration* — "the autoresponder has no subject or no body", "the
+    /// template renders to nothing" — and both call sites threw it away:
+    /// `crm_intake.rs` passed `json!({})`, and the sweep's decline arm passed
+    /// `json!({ "reserved": true })`. So the one autoresponder failure an operator can actually
+    /// fix wrote `invalid_template` onto the trail and nothing else: a machine word, no
+    /// sentence, on the one line whose whole job is to explain a silence.
+    ///
+    /// **A payload the writer drops is data the platform had and threw away**, and this is the
+    /// crate's second instance of it after the batch limit that discarded the rows it filled —
+    /// there the rows were read and dropped, here the sentence is read and dropped. The variant
+    /// was constructed with the diagnosis attached; nothing attached it to anything.
+    ///
+    /// Every other variant answers `{}`: `NoRecipient` already carries its own reason *in the
+    /// word* (`spam`, `rejected`, `duplicate` — `prepare` builds the context from the lead's
+    /// status), and adding a second copy of it under another key would be the duplicate the
+    /// REQ's own trail discipline warns about.
+    #[must_use]
+    pub fn skip_payload(&self) -> Value {
+        match self {
+            Self::InvalidTemplate(diagnosis) => serde_json::json!({
+                "explanation": truncate_explanation(diagnosis),
+            }),
+            _ => serde_json::json!({}),
+        }
+    }
+
+    /// [`Self::skip_payload`] with a caller's own context keys, on top.
+    ///
+    /// ## Why the merge is a named method and not a `serde_json` merge at the call site
+    ///
+    /// The sweep's decline arm has a fact of its own to record (`reserved: true`) and the
+    /// verdict's explanation to keep, so *something* has to combine them — and if that
+    /// combination is written at the call site it is a **second spelling of what a verdict
+    /// carries**, written in a language (`json!` + object insert) that silently lets the later
+    /// literal win. That is the shape that produced the defect: `record_skip`'s own parameter
+    /// is called `detail`, so a caller writing `{"explanation": "..."}` looks correct and is
+    /// erased.
+    ///
+    /// **The verdict is applied first and the context second**, which is the direction that
+    /// matters: a context key may *add* to what the verdict said, never replace it. A verdict
+    /// that answers a case carries an explanation; no caller's context has any business
+    /// overwriting one.
+    #[must_use]
+    pub fn skip_payload_merge(&self, context: Value) -> Value {
+        let mut payload = self.skip_payload();
+        if let (Some(target), Some(extra)) = (payload.as_object_mut(), context.as_object()) {
+            for (key, value) in extra {
+                target.insert(key.clone(), value.clone());
+            }
+        } else if !context.is_null() && context.as_object().is_none() {
+            // A non-object context cannot be merged, and silently dropping it would be a
+            // writer that loses data it accepted — the same class as the dropped payload.
+            // Keeping it under one key keeps the row self-describing instead.
+            if let Some(target) = payload.as_object_mut() {
+                target.insert("context".to_string(), context);
+            }
+        }
+        payload
+    }
+}
+
+/// The longest explanation a skip note stores.
+///
+/// A skip note is a **trail line**, and this crate's PII discipline is that a trail line carries
+/// ids, keys and timings — never a rendered body and never a submitter's words. A misconfigured
+/// template is operator-authored rather than visitor-authored, so its diagnosis is safe to keep;
+/// the bound is here because "safe to keep" is a judgement about what the *current* callers pass,
+/// and the next caller of `skip_payload` should not have to remember it.
+fn truncate_explanation(diagnosis: &str) -> String {
+    const MAX: usize = 200;
+    let trimmed = diagnosis.trim();
+    if trimmed.chars().count() <= MAX {
+        return trimmed.to_string();
+    }
+    let mut out: String = diagnosis.chars().take(MAX).collect();
+    out.push('…');
+    out
 }
 
 /// The message, fully rendered and ready for the mailer.
@@ -599,6 +688,107 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "two variants share a name");
         assert!(names.iter().all(|name| !name.is_empty()));
+    }
+
+    // THE ASSERTION: the diagnosis survives to the row. `InvalidTemplate` is the only variant
+    // that carries a sentence, and it is the only autoresponder failure an operator can fix
+    // ("the autoresponder has no subject or no body") — so it is the one where dropping the
+    // payload costs the platform a fact it already had.
+    #[test]
+    fn the_skip_note_keeps_the_diagnosis_the_verdict_carried() {
+        let verdict =
+            Delivery::InvalidTemplate("the autoresponder has no subject or no body".into());
+        let payload = verdict.skip_payload();
+        assert_eq!(
+            payload["explanation"], "the autoresponder has no subject or no body",
+            "the sentence the verdict was constructed with is dropped before it reaches the trail"
+        );
+        assert_eq!(
+            verdict.reason(),
+            "invalid_template",
+            "the word still names the case; the sentence says which"
+        );
+    }
+
+    // The other direction, and the reason the first assertion cannot be satisfied by a map that
+    // answers everything: a variant with no sentence must add no key. `NoRecipient` already
+    // carries its reason *in the word* (`spam` / `rejected` / `duplicate`), so a payload here
+    // would be a second copy of a fact already stored.
+    #[test]
+    fn a_verdict_with_nothing_to_explain_adds_no_key() {
+        for verdict in [
+            Delivery::Disabled,
+            Delivery::NoRecipient("spam"),
+            Delivery::NoAddress,
+            Delivery::AlreadySent,
+            Delivery::NotYet(MORNING),
+            ready(false),
+            ready(true),
+        ] {
+            let payload = verdict.skip_payload();
+            assert_eq!(
+                payload,
+                serde_json::json!({}),
+                "{:?} added an explanation it does not have — a trail line is a fact, not a guess",
+                verdict.verdict_name()
+            );
+        }
+    }
+
+    // A trail line is bounded, because this crate's PII discipline is that one carries ids and
+    // timings and never a body. The bound is measured on characters rather than bytes so a
+    // multi-byte diagnosis cannot be cut mid-character into invalid UTF-8.
+    #[test]
+    fn an_explanation_is_bounded_but_never_cut_mid_character() {
+        let long = "é".repeat(400);
+        let verdict = Delivery::InvalidTemplate(long);
+        let explanation = verdict.skip_payload()["explanation"]
+            .as_str()
+            .expect("an explanation string")
+            .to_string();
+        assert!(
+            explanation.chars().count() <= 201,
+            "the bound is 200 characters plus its ellipsis, got {}",
+            explanation.chars().count()
+        );
+        assert!(
+            explanation.ends_with('…'),
+            "a truncated note says it was truncated"
+        );
+    }
+
+    // The merge direction is the whole point, and it is the direction a caller writing it
+    // inline would get backwards. A context key may ADD to what a verdict said; none may
+    // replace an explanation, because the verdict is the thing that knows it. The second
+    // assertion states that order explicitly so a later refactor that flips it is red here
+    // rather than silently re-introducing the class of defect this slice is about.
+    #[test]
+    fn a_caller_adds_context_to_a_verdict_and_never_overwrites_it() {
+        let verdict = Delivery::InvalidTemplate("the template renders to nothing".into());
+        let merged = verdict.skip_payload_merge(serde_json::json!({ "reserved": true }));
+        assert_eq!(
+            merged["reserved"], true,
+            "the sweep's own fact must survive the merge"
+        );
+        assert_eq!(
+            merged["explanation"], "the template renders to nothing",
+            "the verdict's diagnosis must survive the merge"
+        );
+    }
+
+    // The degenerate input, stated because it is what a caller passes by accident rather than
+    // on purpose: a non-object context is kept, not dropped. `record_skip`'s parameter is a
+    // `Value`, so `json!("reserved")` type-checks, and a writer that discards it would be the
+    // same defect this slice exists to remove — one layer down.
+    #[test]
+    fn a_non_object_context_is_kept_rather_than_silently_dropped() {
+        let merged =
+            Delivery::NoAddress.skip_payload_merge(serde_json::json!("a bare string context"));
+        assert_eq!(
+            merged["context"], "a bare string context",
+            "a context that cannot be merged is lost, and a writer that loses data it accepted \
+             is the defect this whole slice is about"
+        );
     }
 
     fn accepted() -> Recipient<'static> {

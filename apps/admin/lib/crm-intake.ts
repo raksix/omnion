@@ -352,6 +352,52 @@ export const AUTORESPONDER_STATE_LABEL = {
 } satisfies Record<AutoresponderState, string>;
 
 /**
+ * The words an autoresponder *skip* note is read as.
+ *
+ * ## The gap this closes, and why it is not the map above's twin
+ *
+ * `ClaimState::of` answers `None` for a skip note — deliberately, because a skip line carries
+ * no `sent` key and the panel must not render a claim chip for a row that never claimed
+ * anything. That decision is right, and it left the line with **no words at all**: the
+ * timeline rendered `event.detail.reason` verbatim, and every value in it is a machine word
+ * the server invented — `not_accepted`, `no_address`, `invalid_template`, `source_disabled`,
+ * `delayed`, `not_configured`, `already_sent`. An operator opening a lead to ask "why did
+ * nobody email this person?" read `not_accepted`, which is a token, not a sentence.
+ *
+ * **This map is keyed on the same word `ClaimState` is keyed on**, and the two maps answer
+ * different questions on purpose: the state says what happened to a *message*, this says why a
+ * *decision* went the way it did. A skip has no message, so there is no state; without this the
+ * line falls through to raw text, and a line with no owner is a line the platform renders in
+ * whatever the server happened to call it.
+ *
+ * Open, not `satisfies`, and deliberately the opposite of `AUTORESPONDER_STATE_LABEL` above:
+ * these words are a *growing* vocabulary — every `Delivery` variant has a `reason()`, and the
+ * server may add one — so an unknown word must fall through to the raw value rather than
+ * become a type error at a distance from the variant that caused it. `skipLabel` is where that
+ * fallback is written, once.
+ */
+export const AUTORESPONDER_SKIP_LABEL: Record<string, string> = {
+  not_configured: "This source has no autoresponder, so nothing was sent",
+  not_accepted: "The submission was never accepted (spam, rejected or a duplicate)",
+  no_address: "The mapping produced no e-mail address for this lead",
+  invalid_template: "The autoresponder has a subject or body that renders to nothing",
+  delayed: "Reserved — it is waiting out the configured send delay",
+  already_sent: "This lead had already been answered",
+  source_disabled: "The autoresponder was switched off while this reply was waiting",
+};
+
+/**
+ * A skip note's sentence, falling through to the raw word when the server invents a new one.
+ *
+ * The fallback is the point and not a placeholder: an unmapped word is *better* shown raw
+ * than shown as nothing, because a human can read `brand_new_verdict` and infer it is a case
+ * the panel has not been taught, whereas a blank line reads as "no reason recorded".
+ */
+export function skipLabel(reason: string): string {
+  return AUTORESPONDER_SKIP_LABEL[reason] ?? reason;
+}
+
+/**
  * How an owner reads in a row: their name when the roster knows them, and a short id when it
  * does not.
  *

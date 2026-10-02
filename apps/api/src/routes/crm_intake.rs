@@ -1007,7 +1007,17 @@ fn spawn_autoresponder(
                     &lead,
                     &source,
                     outcome.verdict.reason(),
-                    serde_json::json!({}),
+                    // **The verdict's own payload, not a literal.** This arm used to write
+                    // `json!({})`, which threw away the one thing this line exists for: an
+                    // `InvalidTemplate` verdict carries the diagnosis — "the autoresponder has
+                    // no subject or no body" — and a source whose autoresponder is on, empty
+                    // and misconfigured writes `invalid_template` onto its own lead's timeline
+                    // with no sentence anywhere in the installation. It is the one autoresponder
+                    // failure an operator can fix, and the panel says which one it was in words
+                    // it cannot choose without a payload. The accessor is the single owner of
+                    // what a verdict carries, so a variant added tomorrow is either carried or
+                    // deliberately empty rather than silently dropped here.
+                    outcome.verdict.skip_payload(),
                 )
                 .await
                 {

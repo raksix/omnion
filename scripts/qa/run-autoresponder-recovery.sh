@@ -172,9 +172,30 @@ notes "the bound is what makes this recovery rather than a second race"
 # leg 3: a delivered row is still out of the sweep's reach
 # ------------------------------------------------------------------------------------------------
 advance "a delivered row is still out of the sweep's reach"
+# The predicate is a question about the **VALUE**, not the key's existence — and this check was
+# the stale half of slice 48. It asserted `not (e.detail ? 'delivered_at')`, which the fix had
+# deliberately replaced, so the gate had been red against correct code for a tick: jsonb's `?`
+# is true for a key holding JSON null, and migration `0202` writes exactly that shape. It read
+# as "a delivered message would be offered again and mailed twice" — which is the opposite of
+# what was true.
+#
+# **A gate that asserts the old spelling of a rule is worse than a gate that asserts nothing:**
+# it trains the reader to expect red and to look past it, and the next writer who re-introduces
+# the defect finds the gate is already failing for another reason. The leg now names the value
+# predicate that ships, and leg 3's positive control (`detail->>'sent' = 'false'`) is what
+# keeps it from being satisfied by a predicate that excludes everything.
 check "a completed claim is excluded" \
-  "$(yes grep -qF "not (e.detail ? 'delivered_at')" <<<"$SWEEP_SQL")" \
+  "$(yes grep -qF "e.detail->>'delivered_at' is null" <<<"$SWEEP_SQL")" \
   "a delivered message would be offered again and mailed twice - the duplicate the whole claim design exists to prevent"
+# `no`, not `check`: the pass is the ABSENCE of the key-existence spelling, which is what the
+# first version of this leg got wrong — it used `check`, so it failed against correct code and
+# passed against the defect, i.e. it asserted the bug in place. That is the assertion-inverting
+# twin of the gate that counts its own prose, and both are the same lesson: state which side of
+# the predicate is the pass BEFORE writing the helper.
+no "the exclusion is a value test, not a key-existence test" \
+  "$(yes grep -qF "not (e.detail ? 'delivered_at')" <<<"$SWEEP_SQL")" \
+  "the sweep is key-testing 'delivered_at' again: ? is true for a null-valued key, so a 0202 \
+row (delivered_at: null) is excluded from recovery - the exact defect slice 48 repaired"
 check "a released row is out of reach too" \
   "$(yes grep -qF "detail->>'sent' = 'false'" <<<"$SWEEP_SQL")" \
   "the sweep would offer a row the send path deliberately released"

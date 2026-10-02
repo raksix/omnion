@@ -54,6 +54,7 @@ import {
   absoluteInstant,
   countdown,
   ownerLabel,
+  skipLabel,
   slaState,
 } from "@/lib/crm-intake";
 import {
@@ -911,7 +912,42 @@ export function LeadDetail() {
                         with it. */}
                     {typeof event.detail?.reason === "string" &&
                     !event.autoresponder_state ? (
-                      <span className="text-[11.5px] text-muted">{event.detail.reason}</span>
+                      <span
+                        className="text-[11.5px] text-muted"
+                        data-lead-trail-reason
+                        data-skip-reason={
+                          event.kind === "autoresponder_sent"
+                            ? String(event.detail.reason)
+                            : undefined
+                        }
+                      >
+                        {/* A skip note's `reason` is a machine word the server invented, and
+                            until this slice nothing in the client owned it — so the panel
+                            rendered `not_accepted` as if it were a sentence. The guard is on
+                            the KIND, not on the word: `status_changed` and `assigned` also
+                            carry a `reason` key, and those are operator-authored free text that
+                            must be shown verbatim. Only `autoresponder_sent` holds a verdict
+                            from the closed vocabulary. */}
+                        {event.kind === "autoresponder_sent"
+                          ? skipLabel(String(event.detail.reason))
+                          : event.detail.reason}
+                      </span>
+                    ) : null}
+                    {/* The explanation an autoresponder verdict carried and the note keeps —
+                        "the autoresponder has no subject or no body". It is a separate line
+                        from the reason because it is a different fact: the reason names which
+                        case, the sentence says what to fix. It was dropped by both writers of
+                        this trail line until now, so the one autoresponder misconfiguration an
+                        operator can actually fix was recorded as a bare token and nothing
+                        else. */}
+                    {event.kind === "autoresponder_sent" &&
+                    typeof event.detail?.explanation === "string" ? (
+                      <span
+                        className="text-[11.5px] text-caution"
+                        data-lead-trail-autoresponder-explanation
+                      >
+                        {event.detail.explanation}
+                      </span>
                     ) : null}
                     {typeof event.detail?.status === "string" ? (
                       <span className="text-[11.5px] text-muted">
