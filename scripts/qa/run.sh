@@ -182,9 +182,24 @@ step "API binary: $API_BIN"
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
 # than the newest migration, which is cheap when nothing changed and correct when something did.
+#
+# The second half of that condition is the one this guard got wrong, and it cost a tick: it watched
+# `database/migrations` only, so a change to a **.rs** file left the binary stale and the pass
+# measured the previous build. Symptom, exactly: the device-code fix was committed, `cargo test`
+# passed on it, and the browser pass still reported `invalid device code` — because the API
+# under test was 30 minutes older than the fix.
+#
+# A migration is a special case of "the source is newer than the binary", not a separate concern:
+# sqlx embeds the SQL at compile time, so watching the Rust sources covers it too, and watching
+# both keeps the comment's warning intact for anyone who wonders why a `.sql` shows up here.
+#
+# The cost is one `find` over the workspace's source dirs, and the payoff is that a pass can no
+# longer report a verdict about code it did not run. `crates/` is included because every route and
+# store in this platform lives there; `apps/` because that is where the binary's own crate is.
 if [ ! -x "$API_BIN" ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ]; then
-  step "building the API (first pass, or a migration changed since the last build)"
+   || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ] \
+   || [ -n "$(find crates apps/api -name '*.rs' -newer "$API_BIN" -print -quit)" ]; then
+  step "building the API (first pass, or a source or migration changed since the last build)"
   # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
   # compiling at once instead of every pass grabbing all six threads for itself.
   "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
