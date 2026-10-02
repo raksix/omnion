@@ -13935,9 +13935,29 @@ async function runCrmStateSweep(page, report) {
       { timeout: 20000 },
     )
     .catch(() => {});
+  // **What "recovered" means is the screen's own body, so the markers must be the screen's own.**
+  //
+  // This assertion read `[data-qa='crm-row'], [data-qa='crm-contacts-empty']` and **neither
+  // exists in the module**: the contacts table draws its rows through `CrmRow`, which emits
+  // `data-qa-crm-cursor` (true/false) and no `data-qa` at all, and `EmptyState` renders a bare
+  // `<div>` with no hook. So the second clause was permanently `0 > 0` and the step could only ever
+  // be `false` — a working retry reported as broken, on the one step whose whole purpose is to
+  // prove a wired button rather than a decorative one. A gate that cannot pass is not a gate; it is
+  // a permanent `false` that looks like evidence.
+  //
+  // Recovery is asserted against the two things this screen genuinely renders once the list
+  // arrives: cursor rows (`CrmRow`'s marker — any, since the list need not be non-empty in a fresh
+  // database) or the table's own header row. Both are real states of this screen; neither is a
+  // marker invented by the harness.
+  const recoveredRows = await page.locator("[data-qa-crm-cursor]").count();
+  const recoveredTable = await page.locator("table thead th").count();
   steps.theRetryRecoversTheScreen =
     (await page.locator("[data-qa='crm-contacts-error']").count()) === 0 &&
-    (await page.locator("[data-qa='crm-row'], [data-qa='crm-contacts-empty']").count()) > 0;
+    // A fresh database has no contacts, so "recovered" is legitimately an empty state rather than
+    // a table. Both count; what must not happen is the refusal staying on screen.
+    (recoveredRows > 0 || recoveredTable > 0);
+  steps.theRetryRecoveredRows = recoveredRows;
+  steps.theRetryRecoveredColumns = recoveredTable;
   await shot(page, "page-crm-contacts-after-retry");
 
   // ---- and a refusal with no id invents none --------------------------------------------------
