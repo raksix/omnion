@@ -10708,3 +10708,76 @@ my own tree (1.0 G, `lsof` showed no holder) which took it to 1.8 G, and stopped
 unrelated functions — eight files, ~200 lines of churn that had nothing to do with this tick.
 Reverted with `git checkout --` and the export line re-applied by hand. Format the file you
 touched, not the crate.
+
+
+## 2026-10-02 · REQ-107 slice 4 · the roll-up had a passing test and no writer
+
+**The store was complete and the feature did not exist.** Last tick shipped
+`ai_tool_stats_daily`, `tool_stats::refresh_day`, the window reader, the costliest-failing ranking,
+and a walk asserting the roll-up reconciles with the `ai_tool_calls` rows it summarises. Every
+one of those is green. `refresh_day`'s only caller was the walk. Nothing in `main.rs` rolled a day
+up, so the table the `/ai/telemetry` screen is supposed to render was empty, and would have stayed
+empty for the lifetime of the installation — while the screen itself read as a healthy, entirely
+correct "this tool has never been called."
+
+**The store's walk is structurally incapable of seeing that**, and the reason generalises past this
+REQ: it calls `refresh_day` itself, so the fixture supplies the rows and the assertion checks the
+aggregate. That is a test of the aggregation, not of whether anything runs it. **A gate that proves
+a function works is not a gate that proves the function is called** — and the store had the first
+kind and was about to be screensed on the strength of it. So the writer ships before the screen, and
+`apps/api/tests/ai_telemetry_runner.rs` proves the two claims only the runner can establish: that
+the tick writes the roll-up from real call rows, and that the degradation alert fires only on a real
+regression.
+
+**The tick re-rolls a window, newest first.** A runner that walks one day leaves every skipped day
+permanently blank — and the screen's range picker offers exactly those days, so the gap shows up as
+"nothing happened" rather than as "we were down". The order is today first because an interrupted
+tick would otherwise leave the row an operator is reading stale for another hour. Re-rolling is
+safe because the write is an `upsert`, which the walk asserts by rolling one day three times and
+counting the rows.
+
+**`ai.telemetry.tool.degraded` is the spec's alert that nothing emitted.** It goes through
+`omnion_events::bus` rather than a raw insert, for three reasons that are each a silent failure if
+skipped: the bus validates the name, it runs the webhook fan-out in the same transaction, and
+`events` is not this module's table. A hand-rolled insert would satisfy every other assertion and
+still deliver nothing to a subscriber.
+
+**The comparison is a tool against its own trailing week, and `day < today` is what keeps it from
+being a tautology.** A baseline including the day under test pulls its own mean toward the value
+being tested, so a tool that collapses from 100% to 0% reads as "no meaningful drop" once the
+collapse is inside the window. Four refusals, each a way the scan could announce something false,
+and each asserted by name: no traffic today (not a fall, not a degradation), under ten calls (one
+day is not a trend), under five points (alerting here trains an operator to ignore the row), and
+unchanged. The load-bearing one is the control: `stayed_well` is the same tool under the same 100%
+baseline as the one that collapsed, one variable apart. A tool that has been broken for eight days
+has not *degraded* — its trailing rate is equally broken — and alerting on it daily is how the real
+alert gets switched off too.
+
+**The unit test caught an off-by-one in the code on the first run**, which is the whole argument
+for pinning a helper rather than trusting it: `span.max(1)` followed by `0..=span` reads like a
+floor and is not one, so a lookback of zero rolled *two* days instead of today alone. The fix is a
+floor on the day count rather than on the lookback, and the comment now says why the obvious form
+is wrong.
+
+**Proof.** `cargo test -p omnion-api --test ai_telemetry_runner` **5 passed, 0 failed** (65.2s);
+`--lib ai_telemetry` **6 passed, 0 failed**; `cargo build -p omnion-api` exit 0; `pnpm typecheck`
+2/2. All against `127.0.0.1:5433/omnion_qa_w7` with `CARGO_TARGET_DIR=/dev/shm/w7-target`. The
+three failures in `apps/api/tests/events.rs` are **not this change's**: with this work stashed, the
+same three fail on the same ten names (`ai.tool.registered`, `ai.approval.decided`,
+`ai.guard.exemption.expired`, `ai.airgap.*` …), all emitted by waves this branch has not merged.
+My own name is absent from every failure block.
+
+**Next.** The `/ai/telemetry` screen is now the whole of what slice 4 owes: the tool table (calls,
+success %, denial %, p50/p95/p99, ranked error codes), the step-count histogram, the cost-per-solved
+scatter, the costliest-failing-per-day table under it, and a link from each row into `/ai/logs`
+pre-filtered by that tool — plus the page in `scripts/qa/walkthrough.cjs`, because a screen outside
+the inventory is not accepted. Then the two event rows nothing asserts (`ai.eval.gate.blocked`,
+`ai.eval.regression.detected`), the `eval:judge` rubric cost, `no_pii` at the run level, and the
+`ai.evals.run` permission row.
+
+**Box.** `/mnt/apopic` 85 % (8.7 G free), `/dev/shm` 72 %, RAM 19/32 G. Build and test with
+`CARGO_TARGET_DIR=/dev/shm/w7-target CARGO_INCREMENTAL=0`. Walks need
+`OMNION_DATABASE_URL=postgres://omnion:***@127.0.0.1:5433/omnion_qa_w7` **and `--test-threads=1`**
+— each walk opens a throwaway database. The QA slot's holder file carried two pids and both were
+dead (the known reaper case), so the slot is free; **no acceptance box is ticked on a pass that has
+not executed**, and the browser pass is still owed before this slice closes.

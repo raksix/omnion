@@ -13,8 +13,10 @@
 > behind its own `ai.telemetry.read` — `7e7ec6ec`. Seven of thirteen acceptance rows are ticked,
 > each naming its walk. Slice 4's route split: the boot panic from a duplicate `GET
 > `/ai/telemetry/tools` — `cf1c80cb` — and the uniqueness tripwire that catches the class, after
-> its own first version was proven blind — `c525d9d5`. The closing browser pass and the
-> `/ai/telemetry` screen are still owed) ·
+> its own first version was proven blind — `c525d9d5`. **Then the writer the roll-up never
+> had, and the `ai.telemetry.tool.degraded` alert nothing emitted — `ab029fe9`: `refresh_day`'s only
+> caller was its own walk, so the table this slice's screen reads was empty and would have stayed
+> empty forever.** The `/ai/telemetry` screen and the closing browser pass are still owed) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
@@ -165,7 +167,7 @@ cases execute with a bounded concurrency, results are written in batches, and a 
 - [x] A scheduled suite runs on its schedule without an open browser session (verified by advancing the clock in a test harness), and a second run is not started while one is `running`.  <!-- proved: ai_eval_runner.rs: a_schedule_fires_on_its_minute_and_only_once_inside_it + a_suite_with_a_run_in_flight_is_not_queued_again -->
 - [x] A run stuck beyond the timeout is failed by the runner with a reason and a `status = 'failed'` row, not left `running`.  <!-- proved: ai_eval_runner.rs: a_stale_run_is_failed_by_the_reaper_with_a_reason -->
 - [x] Cancelling a running suite stops remaining cases and marks the run `cancelled` with the partial results kept.  <!-- proved: ai_eval_runner.rs: a_cancelled_run_keeps_the_results_it_already_wrote + ai_eval_runs.rs: a_cancel_keeps_the_partial_results_and_a_second_cancel_is_a_conflict -->
-- [x] `/ai/telemetry` tool stats match the underlying run steps for the same range (asserted against SQL for successes and denials).  <!-- proved: tool_stats.rs: the_rollup_reconciles_with_the_calls_it_summarises (counts taken from ai_tool_calls by a separate query) -->
+- [x] `/ai/telemetry` tool stats match the underlying run steps for the same range (asserted against SQL for successes and denials).  <!-- proved: tool_stats.rs: the_rollup_reconciles_with_the_calls_it_summarises (counts taken from ai_tool_calls by a separate query); and, from ab029fe9, ai_telemetry_runner.rs: the_tick_writes_the_roll_up_and_re_rolling_it_does_not_double_count -- the store's walk calls refresh_day itself, so it could not see that nothing in production called it -->
 - [x] Organization A cannot read organization B's suites, runs or results (404 on a direct id).  <!-- proved: ai_evals.rs: another_tenants_suite_is_not_found_and_never_forbidden + ai_eval_runs.rs: another_tenants_settled_run_is_not_found_and_a_cancel_never_confirms_it_exists + tool_stats.rs: a_tenant_reads_only_its_own_tool_numbers -->
 - [ ] A caller without `ai.evals.run` sees Run now disabled with the permission named; the API answers 403 for the same call.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
@@ -206,6 +208,13 @@ over the suite list, the case editor, a run and the telemetry panels.
 4. **Telemetry and polish** — `ai_tool_stats_daily`, the roll-up runner, `/ai/telemetry`, degraded
    tool events, empty/loading/error states, mobile layouts.
    *Done when:* tool stats reconcile with the log table and both widths pass the visual check.
+   *Progress:* the table, the roll-up and the window reader are done; the **writer** is
+   `ab029fe9`, and finding it late is the slice's one lesson — `refresh_day` had a passing
+   reconciliation walk and no production caller, so the whole of what this slice owes a screen
+   was a table nothing would ever write to. `ai.telemetry.tool.degraded` ships with it. Left: the
+   `/ai/telemetry` screen itself (tool table, step histogram, cost-per-solved scatter, the
+   costliest-failing-per-day table, a link per row into `/ai/logs`), its page in the walkthrough
+   routes, and the closing browser pass.
 
 ### Risks / notes
 
