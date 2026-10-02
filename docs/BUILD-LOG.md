@@ -9350,3 +9350,41 @@ their 390 px behaviour and their depth-pass claims are not.** The fourth run is 
 
 **Next.** Read that run's `clicks.jsonl` for the GraphQL depth pass's claims, tick box 16 only if
 the pass measured the screens, then slice 3 — the OpenAPI emission and drift CI.
+
+### tick 69, continued — the focused pass, and what it found
+
+**The full pass is unmeasurable on this box, and saying so is part of the result.** Load average 909,
+`/mnt/apopic` at 99% with 771 M free, and the remaining space held by three sibling cargo targets
+(`w7` 9.6 G, `w3` 5.5 G, `w8` 3.2 G in `/dev/shm`) that are not mine to delete. Three full passes ran
+and each measured a DIFFERENT handful of screens as "the session was lost" — the session guard
+working exactly as designed against a producer that was the box rather than the code. `QA_OUT_ROOT` is
+also not honoured by the harness: it writes `qa-artifacts/<timestamp>/` regardless, so an artifact path
+under `/dev/shm` lands on the full loop image.
+
+**The focused pass is the way around it** — `--only=graphql-depth`, ~4 minutes, **27 of 29 claims green
+over the real router.** The two failures were races, and the run's own screenshots are what said so:
+`graphql-revoke-dialog.png` shows the dialog fully open with its warning quoting "0 executions in the
+last day", and `graphql-playground-over-depth.png` shows the Run button greyed with `depth 13 / 10`.
+Two consecutive runs failed two DIFFERENT claims over identical code, which is the signature of a race
+and not of a defect. Both are now selector waits and both are asserted by the gate.
+
+**Four real defects, all in the code this slice shipped or touched:**
+
+| # | Defect | Found by | Held by |
+|---|---|---|---|
+| 1 | `GET /graphql/schema/diff` answered `400` to `roleId` — the field's doc comment named the spelling and the field had no `serde(rename)` | the walk, as a `request-failed` beside the diff's verdict | a unit test that deserialises the screen's spelling verbatim — which then caught a second missing rename it had just introduced |
+| 2 | Three of the settings screen's six number inputs rejected the platform's own defaults: `<input type=number min=1 step=10>` calls `1000` invalid, and the walk refused a legal save with the browser's own tooltip naming `991` and `1001` | the walk | `settings-grid.test.cjs`, 15 checks / 6 proven-to-fail |
+| 3 | `cost_budget`'s `max` was `200`, BELOW its own default of `1000`, so a fresh install marked the shipped default out of range | the gate written for defect 2 | the same gate |
+| 4 | The generic `interact()` pass had been spending the sign-in limiter's per-PROCESS budget — twice, the second fix's predicate matching a `name` a submit button does not have | the run's `clicks.jsonl`, in one line | `auth-form-exclusion.test.cjs`, 9 checks / 2 proven-to-fail |
+
+**Two gates failed on themselves before they were worth anything**, and that is the finding worth
+keeping. `settings-grid.test.cjs` invented a defect on its first run — a cross-field regex paired
+`cost_budget`'s `min` with `max_aliases`' `max` — and its `gridRed` checker then had a `[, key, …]`
+destructuring hole, so `defaults[key]` was `defaults[1]`, every field hit the `continue`, and the clean
+file and all five mutations went green through it. Only the five main checks caught it, because they
+shared the reporting loop's fixed destructuring. **A gate that invents a defect teaches the reader to
+distrust the gate; a gate that cannot fail teaches them nothing happened.**
+
+Final gate state: `graphql-surface.test.cjs` 30 checks / 9 mutations · `auth-form-exclusion.test.cjs`
+9 / 2 · `settings-grid.test.cjs` 15 / 6 · the ten pre-existing gates all pass · `cargo test -p
+omnion-api --lib graphql` 26/26 · `pnpm typecheck` 2/2.
