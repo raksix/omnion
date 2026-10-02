@@ -273,8 +273,21 @@ pub struct RequestLog {
     pub organization_id: Uuid,
     /// Key that authenticated it, or `None` for a session-authenticated call.
     pub api_key_id: Option<Uuid>,
+    /// That key's displayable prefix, **copied in** (migration `0243`).
+    ///
+    /// Copied for the same reason the actor's name is: the log's retention window outlives some
+    /// of its subjects, and a row that cannot be matched to a key is a row nobody can act on.
+    /// Never a token — this is the value the key list already prints.
+    pub api_key_prefix: Option<String>,
     /// User behind it, when a human was.
     pub actor_user_id: Option<Uuid>,
+    /// Their display name, copied in, so a deleted user leaves a name rather than a blank.
+    pub actor_name: String,
+    /// The permission the guard resolved when it decided this request.
+    ///
+    /// The column that makes a `403` explainable: a row recording only "403" leaves an operator
+    /// to guess between a missing scope, a wrong tenant and a route that is simply not public.
+    pub permission: Option<String>,
     /// HTTP method.
     pub method: String,
     /// Path, without the query string.
@@ -313,6 +326,12 @@ impl RequestLog {
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageDay {
     /// The day.
+    ///
+    /// **Serialised as a string by the route that publishes it**, not by an attribute here: the
+    /// workspace enables `serde-well-known` but not `serde-human-readable`, so a bare
+    /// `time::Date` would cross the wire as a three-element array — and this field is the React
+    /// `key` of every bar in the usage chart, so an array there is not a cosmetic fault. `time`
+    /// exposes no `Date` codec under the features this crate enables, so the route formats it.
     pub day: Date,
     /// Requests that day.
     pub requests: i32,
@@ -618,7 +637,10 @@ mod tests {
             id: 0,
             organization_id: Uuid::nil(),
             api_key_id: None,
+            api_key_prefix: None,
             actor_user_id: None,
+            actor_name: String::new(),
+            permission: None,
             method: "GET".to_owned(),
             path: "/x".to_owned(),
             status,

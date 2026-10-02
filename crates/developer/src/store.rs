@@ -415,22 +415,129 @@ pub fn path_without_query(path: &str) -> String {
 /// put in the path.
 ///
 /// The query string is stripped **here**, at the last point where the raw path still exists, and
-/// not in the caller. A query string is caller-controlled and routinely carries a token or an
-/// e-mail address in a filter, and this is the table an operator exports to CSV. Stripping it in
-/// `developer_auth::record_key_use` worked and was still the wrong place: it left a writer that
-/// binds `entry.path` verbatim, so the next caller — the CSV exporter, a replay, a future
-/// middleware — writes the secret unless it remembers a rule that is not on its signature. The
-/// strip is a property of the table, so it belongs in the only function that inserts into it.
+/// Who made a request, in the only form the log may keep.
+///
+/// A struct rather than eight parameters because the caller (the request-log middleware) has
+/// already resolved all of this by the time it writes, and a parameter list that long is a
+/// parameter list that gets two entries the wrong way round at 2am. `client_fingerprint` is
+/// computed here and **not** persisted — see migration `0243` for why: a nullable privacy field
+/// that nothing writes is a privacy field with no policy attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientIdentity {
+    /// A signed-in person, when there was one.
+    pub user_id: Option<Uuid>,
+    /// Their display name, copied in so a deleted user does not leave a blank column.
+    pub user_name: String,
+    /// The developer key's id, when a key authenticated it.
+    pub api_key_id: Option<Uuid>,
+    /// That key's displayable prefix, copied in for the same reason the name is.
+    pub api_key_prefix: Option<String>,
+    /// Where the key belongs.
+    pub organization_id: Option<Uuid>,
+    /// The permission the guard resolved, which is what makes a `403` explainable.
+    pub permission: Option<String>,
+    /// The keyed client fingerprint. Never an address, and never stored by default.
+    pub client_fingerprint: Option<String>,
+}
+
+impl ClientIdentity {
+    /// Assemble the identity, refusing to fingerprint without a pepper.
+    ///
+    /// # Errors
+    ///
+    /// [`DeveloperError::Misconfigured`] when an address is present and `OMNION_LOG_PEPPER` is
+    /// not. The refusal is deliberate: an HMAC with an empty key is a hash anybody can
+    /// reproduce, which would make the stored "fingerprint" a reversible lookup table of the
+    /// addresses that called the platform. This is a `5xx` naming the variable rather than a
+    /// `400`, because no request the caller can change fixes it.
+    pub fn new(
+        user_id: Option<Uuid>,
+        user_name: Option<&str>,
+        api_key_id: Option<Uuid>,
+        api_key_prefix: Option<&str>,
+        organization_id: Option<Uuid>,
+        permission: Option<&str>,
+        client_address: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<Self> {
+        Ok(Self {
+            user_id,
+            user_name: user_name.unwrap_or_default().to_owned(),
+            api_key_id,
+            api_key_prefix: api_key_prefix.map(str::to_owned),
+            organization_id,
+            permission: permission.map(str::to_owned),
+            client_fingerprint: fingerprint(client_address, user_agent)?,
+        })
+    }
+
+    /// `true` when neither a person nor a key is behind the request.
+    #[must_use]
+    pub fn is_anonymous(&self) -> bool {
+        self.user_id.is_none() && self.api_key_id.is_none()
+    }
+}
+
+/// Hash the client address into something that is not the address.
+///
+/// The agent is mixed in so two clients behind one NAT share a fingerprint. Length-prefixing
+/// both fields matters: without it `1.2.3.4` + `5.6.7.8` and `1.2.3.45` + `6.7.8` would hash
+/// the same bytes, which is a collision an attacker can construct for free.
+fn fingerprint(address: Option<&str>, user_agent: Option<&str>) -> Result<Option<String>> {
+    let Some(address) = address else {
+        // No address to fingerprint is not a reason to fail; an internal call has none.
+        return Ok(None);
+    };
+    let address = address.trim();
+    if address.is_empty() {
+        return Ok(None);
+    }
+
+    let pepper = std::env::var("OMNION_LOG_PEPPER").unwrap_or_default();
+    if pepper.trim().is_empty() {
+        return Err(DeveloperError::Misconfigured(
+            "OMNION_LOG_PEPPER is not set, so client addresses cannot be fingerprinted safely"
+                .into(),
+        ));
+    }
+
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(pepper.as_bytes())
+        .map_err(|_| DeveloperError::Misconfigured("OMNION_LOG_PEPPER is unusable as an HMAC key".into()))?;
+    mac.update(&(address.len() as u64).to_be_bytes());
+    mac.update(address.as_bytes());
+    let agent = user_agent.unwrap_or_default();
+    mac.update(&(agent.len() as u64).to_be_bytes());
+    mac.update(agent.as_bytes());
+
+    Ok(Some(hex::encode(mac.finalize().into_bytes())))
+}
+
+/// Write one request-log row.
+///
+/// The path is stripped **here**, not by the caller. This function is the last point at which
+/// the raw path exists and the point at which the value becomes permanent: a query string is
+/// caller-controlled and routinely carries a token or an e-mail address in a filter, and this is
+/// the table an operator exports to CSV. Stripping it in `developer_auth::record_key_use` worked
+/// and was still the wrong place — it left a writer that binds `entry.path` verbatim, so the
+/// next caller (the CSV exporter, a replay, `request_log_middleware`) writes the secret unless it
+/// remembers a rule that is not on its signature. The strip is a property of the table, so it
+/// belongs in the only function that inserts into it.
 pub async fn log_request(pool: &PgPool, entry: &RequestLog) -> Result<i64> {
     let path = path_without_query(&entry.path);
     let row = sqlx::query(
-        "insert into api_request_logs (organization_id, api_key_id, actor_user_id, method, path, \
-         status, duration_ms, request_id, bytes_in, bytes_out, error_code) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning id",
+        "insert into api_request_logs (organization_id, api_key_id, api_key_prefix, \
+         actor_user_id, actor_name, method, path, status, duration_ms, request_id, bytes_in, \
+         bytes_out, error_code, permission) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) returning id",
     )
     .bind(entry.organization_id)
     .bind(entry.api_key_id)
+    .bind(entry.api_key_prefix.as_deref())
     .bind(entry.actor_user_id)
+    .bind(&entry.actor_name)
     .bind(&entry.method)
     .bind(&path)
     .bind(entry.status)
@@ -439,6 +546,7 @@ pub async fn log_request(pool: &PgPool, entry: &RequestLog) -> Result<i64> {
     .bind(entry.bytes_in)
     .bind(entry.bytes_out)
     .bind(entry.error_code.as_deref())
+    .bind(entry.permission.as_deref())
     .fetch_one(pool)
     .await?;
 

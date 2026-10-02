@@ -15,6 +15,13 @@ export const metadata = { title: "Developer · Overview" };
  * No `Suspense` boundary, deliberately. Nothing here reads `?`, so `useSearchParams` would buy a
  * build-time requirement for nothing — the trap documented on `/developer/sdks`, which needed the
  * boundary because the CLI hands out a `?tab=cli` deep link and this screen has no deep link.
+ *
+ * **`origin/main` built this route too** (REQ-022 slice 2, `developer-overview.tsx`, reading the
+ * single-snapshot `GET /api/v1/developer/overview`). That endpoint and the crate module behind it
+ * are kept — one statement that counts keys, requests and refusals together is worth having — but
+ * it is not what renders here, and the difference is the claim: a snapshot counts a moment, while
+ * each card below reads the same list the destination itself renders, so the card and the screen
+ * it opens cannot drift apart. The screen main shipped would have made the two disagreeable.
  */
 export default function DeveloperOverviewPage() {
   return (

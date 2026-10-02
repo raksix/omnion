@@ -219,9 +219,17 @@ pub async fn record_key_use(
         id: 0,
         organization_id: principal.organization_id,
         api_key_id: Some(principal.key_id),
+        // The prefix, copied in beside the id so an operator can match this row to a key from
+        // the list without a second query. Never a token — this is the value the list prints.
+        api_key_prefix: Some(principal.prefix.clone()),
         // A key has no user behind it. `None` is the honest answer; a fabricated id would put a
         // person's name on a request they did not make.
         actor_user_id: None,
+        actor_name: String::new(),
+        // A key is authorized by its scopes, not by a permission a person held, so there is no
+        // single permission to record here. The request log middleware fills this column for
+        // every request; the key recorder is the one writer that genuinely has nothing to say.
+        permission: None,
         method: method.to_owned(),
         // The path *without* the query string: a query string is caller-controlled and routinely
         // carries an email address or a token in a filter, and this table is the one an operator

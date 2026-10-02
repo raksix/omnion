@@ -23,7 +23,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 # `macros` is for `datetime!` in the tests below: the expiry boundary is a *boundary*, and a
 # test that wrote `now + Duration::from_secs(3600)` inline would have to be read carefully to
-# see it was testing the instant on either side of it.
+# see it was testing the instant on either side of it. The workspace default is `serde-well-known`
+# only, so `time.workspace = true` alone gives a crate that cannot write a timestamp in a test —
+# and the failure reads as `invalid component: day was 02T00`, which looks like a malformed literal
+# rather than a missing feature.
 time = { workspace = true, features = ["macros"] }
 tracing.workspace = true
 uuid.workspace = true
@@ -36,5 +39,9 @@ rand.workspace = true
 # Constant-time comparison, so a caller cannot learn a valid secret one byte at a time by
 # timing a stream of 401s. Small crate, and the alternative is a hand-rolled `==` on the one
 # comparison in the system where timing leaks.
+# The client fingerprint in `store::ClientIdentity` is an HMAC, not a hash: the same address
+# behind the same agent must produce the same value across restarts and a reader must not be
+# able to enumerate addresses from the table.
+hmac.workspace = true
 subtle = "2"
 sqlx = { workspace = true, optional = true }

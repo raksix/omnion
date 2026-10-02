@@ -31,11 +31,25 @@ pub mod archive;
 pub mod authn;
 pub mod cli;
 pub mod error;
+/// The request log's two rules, as a module of its own (see the file for why it is not the
+/// 415-line `logs.rs` `origin/main` carries).
+pub mod log_vocab;
 pub mod model;
 pub mod model_oauth;
 pub mod oauth;
 pub mod oauth_flow;
 pub mod openapi;
+/// The `/developer` overview's numbers, in one snapshot (REQ-022 slice 2, `origin/main`).
+///
+/// This branch independently built the same section root for REQ-033 slice 4, so this module
+/// arrives from a merge rather than from a decision here. It is kept — it is the only reader
+/// that counts keys, requests and refusals in **one** statement, and the section root is better
+/// served by that than by a row of queries — but it is gated on the `store` feature and it is
+/// **not** the screen this branch ships: see `apps/admin/app/developer/page.tsx`, where the
+/// six cards read the lists their own destinations render, which is a claim this module's single
+/// row cannot make (it counts a snapshot, not the screen a person is looking at).
+#[cfg(feature = "store")]
+pub mod overview;
 pub mod scaffold;
 pub mod secret;
 #[cfg(feature = "store")]
@@ -58,6 +72,8 @@ pub use model_oauth::{
     AppEdit, AppStatus, AuthorizationRequest, ConsentRequest, MintedApp, NewApp, OAuthApp,
     app_rules, authorize,
 };
+#[cfg(feature = "store")]
+pub use overview::{FailureLine, Overview, RECENT_FAILURES, start_of_day};
 pub use secret::{MintedKey, mint};
 
 /// The label the API uses for this surface in the permission catalogue and the event bus.

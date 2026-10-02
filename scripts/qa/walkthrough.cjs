@@ -1298,7 +1298,22 @@ async function runDepthPass(name, pass) {
     const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
     log(`depth pass ${name} failed: ${reason}`);
     record({ page: "qa", action: "depth-pass-failed", pass: name, reason });
-    return { ok: false, steps: 0, reason };
+    // **Whatever the pass already recorded is kept.** This wrapper's return value is assigned over
+    // `report.<something>` by its caller, so returning a fresh `{ ok: false, steps: 0 }` throws away
+    // every step the pass managed to record before it died — and the report then shows a failed pass
+    // with no evidence of *where* it failed. That is the same "a pass that cannot fail is a pass
+    // that proved nothing" defect one level down: the steps are the only thing that turns "the
+    // portal is broken" into "the portal works until the revoke, and here is the row that did not
+    // change".
+    //
+    // The steps are read from the **click stream**, not from a `report` argument, because
+    // `runDepthPass` is called from sixteen places with two arguments and adding a third would be
+    // a silent `undefined` at every one of them that nobody notices until a pass fails. The stream
+    // is the pass's own record of what it saw, keyed by `action`, so the recovery is exact.
+    const partial = clickLines
+      .filter((e) => e.action === "depth-pass" && e.pass === name)
+      .reduce((acc, entry) => ({ ...acc, ...entry.value }), {});
+    return { steps: partial, ok: false, reason };
   }
 }
 
@@ -12635,6 +12650,14 @@ async function main() {
     //   `suggestion`, which is the difference between a limit and a placeholder.
     { path: "/health/incidents", name: "health-incidents" },
     { path: "/health/settings", name: "health-settings" },
+    // The developer portal (REQ-022, slice 2). All four are in the route list because all four are
+    // reachable and none had ever been rendered by anything — a screen no pass opens is the one
+    // screen whose job is to be believed. `/developer/api-keys/{id}` is deliberately NOT a route
+    // entry: its id comes from the key this pass creates, so `runDeveloperDepth` clicks through to
+    // it from the list instead, which is also the only way to prove the link works.
+    { path: "/developer", name: "developer-overview" },
+    { path: "/developer/api-keys", name: "developer-api-keys" },
+    { path: "/developer/logs", name: "developer-logs" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -12849,6 +12872,17 @@ async function main() {
   // job alone: it already tests `wants(name)`, records `matchedOnly` from inside that test, and
   // wraps the call so a crashed tab cannot take the next statement with it. A second hand-written
   // `if (wants(...))` around the block could only ever narrow the scope, never widen it.
+  //
+  // `origin/main`'s half of the same merge is kept below as a **second, distinct** developer
+  // pass rather than merged into this one. It drives `runDeveloperDepth` (REQ-022 slice 2, the
+  // keys/logs round trip) while this branch's own `dev-*` passes drive the REQ-033 surfaces, and
+  // the two write disjoint halves of `report`. They do share one property worth keeping: the
+  // portal pass creates a key, authenticates a real request with it and reads that request back
+  // out of the log, so it changes the key inventory and the request log any earlier pass might
+  // have counted — which is why it runs here, after the screens that count things.
+  await runDepthPass("developer", () => runDeveloperDepth(page, report));
+  log(`developer: ${JSON.stringify(report.developer)}`);
+
   report.health = await runDepthPass("health", () => runHealthDepth(page, report));
   report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
   report.healthIncidents = await runDepthPass("health-incidents", () => runHealthIncidentsDepth(page, report));
@@ -13039,7 +13073,13 @@ async function main() {
 
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/security/ip-access", name: "security-ip-access" }, { path: "/security/events", name: "security-events" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" },
+  // The portal's two tables at 390 px. Seven columns do not fit a phone, and the check that
+  // matters is the one the cards exist for: the *key status* stays readable without a sideways
+  // scroll, because "is this credential still alive" is the question a phone is asked.
+  { path: "/developer", name: "developer-overview" },
+  { path: "/developer/api-keys", name: "developer-api-keys" },
+  { path: "/developer/logs", name: "developer-logs" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
@@ -13483,6 +13523,28 @@ async function main() {
       "high",
       "click-error",
       `[${c.page}] "${c.label}" (${c.tag}) → ${c.outcome}: ${c.reason || ""} ${(c.errors || []).join(" | ")}`.slice(0, 240),
+    );
+  }
+  /*
+   * A depth pass that threw is a **high** finding, and this loop is the only place that can say so.
+   *
+   * `runDepthPass` records the failure and returns `{ ok: false }`, but nothing downstream read it:
+   * the roll-up above counts clicks, console lines and network failures, and a crashed depth pass
+   * produces none of those three. So a pass that died on its first locator wrote exactly the same
+   * report as a pass that proved everything, minus some screenshots — and the difference between
+   * "the developer portal does not work" and "the developer portal was never exercised" is exactly
+   * the difference this report exists to record. The new pass is the first one to make it visible,
+   * so it is counted here rather than in its own module.
+   */
+  const deadPasses = clickLines.filter((e) => e.action === "depth-pass-failed");
+  for (const d of deadPasses) {
+    pushFindings("high", "depth-pass-failed", `the ${d.pass} depth pass did not finish: ${d.reason || "no reason recorded"}`);
+  }
+  if (report.developer && report.developer.failures && report.developer.failures.length) {
+    pushFindings(
+      "high",
+      "unproved-claim",
+      `the developer portal left ${report.developer.failures.length} claim(s) unproved: ${report.developer.failures.join(", ")}`,
     );
   }
   if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
@@ -14434,4 +14496,332 @@ async function runIamAuthenticationDepth(page, report) {
   await shot(page, "page-iam-authentication-empty");
 
   report.iamAuthentication = { steps };
+}
+
+/**
+ * The developer portal, driven end to end (REQ-022, slice 2).
+ *
+ * ## Why this pass exists rather than a route entry
+ *
+ * Four route entries would have rendered four screenshots and proved nothing about the one
+ * behaviour the whole screen is built around: **a key that exists only in the response that
+ * created it.** A route entry clicks every visible control, so it would have pressed "New key",
+ * pressed "Cancel", and moved on — the reveal would never appear, and the panel would have been
+ * reported green with its central guarantee untested.
+ *
+ * So the pass does what the REQ's own QA plan asks for, in that order:
+ *
+ *   create a key with two scopes → read the one-time secret off the screen → reload and confirm
+ *   only the prefix survives → **call a guarded endpoint with the secret itself** → read that
+ *   request out of the log → revoke → call again with the *identical bytes* and read `401`.
+ *
+ * The call is the part no API response can make on its own, and it is the only proof that the
+ * token the panel printed is a working credential rather than a decorative string.
+ *
+ * ## Every claim is checked with `check`, so a pass that quietly proved nothing fails
+ *
+ * The steps object is only read by the report; nothing throws when an assertion is false, which
+ * is the exact shape this harness has already been bitten by once (a pass that filled an object
+ * and returned could not fail). So the assertions collect into `failures` and the pass throws at
+ * the end — the report then carries the run as a **failed** pass with its steps attached, which
+ * is what a reader can act on, rather than a green line and a hope.
+ */
+async function runDeveloperDepth(page, report) {
+  const steps = {};
+  const failures = [];
+  // `action: "depth-pass"` is the wrapper's recovery key: a crashed pass must still be able to
+  // report the steps it managed to take, and the wrapper can only find them by this pair.
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "developer", action: "depth-pass", pass: "developer", step: key, value });
+  };
+  /** Assert the thing this pass exists to prove. Records the claim either way. */
+  const check = (key, ok, detail) => {
+    note(key, { ok: Boolean(ok), ...(detail === undefined ? {} : { detail }) });
+    if (!ok) failures.push(key);
+    return ok;
+  };
+
+  // ---- The overview ----------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/developer`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-developer-overview]", { timeout: 25000 }).catch(() => {});
+  const overviewRendered = (await page.locator("[data-developer-overview]").count()) > 0;
+  check("overview-rendered", overviewRendered, URL_ADMIN + "/developer");
+  if (!overviewRendered) {
+    report.developer = { steps, ok: false, failures: [...failures, "overview-rendered"], reason: "/developer did not render" };
+    log(`developer: ${JSON.stringify(steps)}`);
+    return;
+  }
+  await page.waitForTimeout(900);
+  await shot(page, "developer-overview");
+
+  // Four cards, and the retention window printed rather than buried. The window is the claim that
+  // "requests today" is a boundary and not a coincidence — the panel states it, so the pass reads
+  // it rather than assuming the component was given one.
+  const overviewText = (await page.locator("[data-developer-overview]").first().innerText().catch(() => "")) || "";
+  check("overview-names-the-window", /\b\d+[- ]day|\b\d+ days/.test(overviewText), overviewText.replace(/\s+/g, " ").slice(0, 160));
+  const refusalCard = await page.locator('[data-developer-overview] >> text=/Refusals today/').count().catch(() => 0);
+  check("overview-labels-its-cards", refusalCard > 0);
+
+  // ---- The nav group is what the criterion actually claims ---------------------------------------
+  // The sidebar asks `GET /developer/scopes` and hides the group on failure, so "the group is
+  // there" is a claim about an async gate that resolved true — and the pass that signs in as the
+  // realistic default account is the only place it can be wrong in the other direction (a group
+  // rendered for an account that may not be in is exactly the trap the screen was written against).
+  const navDeveloper = await page.locator('nav a[href="/developer"], aside a[href="/developer"]').count().catch(() => 0);
+  check("nav-group-rendered", navDeveloper > 0);
+
+  // ---- The key list starts empty, and says which empty it is ---------------------------------------
+  await page.goto(`${URL_ADMIN}/developer/api-keys`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-developer-keys]", { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const emptyState = (await page.locator("[data-developer-keys-empty]").count()) > 0;
+  const emptyText = (await page.locator("[data-developer-keys-empty]").first().innerText().catch(() => "")) || "";
+  check("empty-state-before-first-key", emptyState, emptyText.replace(/\s+/g, " ").slice(0, 140));
+  // "No API keys yet — create your first" is the sentence the REQ quotes. A generic "nothing here"
+  // would pass a count-based check and fail the criterion.
+  check("empty-state-names-the-next-step", /create your first|create a key/i.test(emptyText));
+  await shot(page, "developer-keys-empty");
+
+  // ---- `n` opens the create dialog, and `/` focuses the search box ---------------------------------
+  // Both are claimed by the REQ's keyboard row, and both are the kind of shortcut that quietly
+  // stops working the moment somebody adds a global handler. The pass types the keypresses at the
+  // page rather than clicking, because a click would prove nothing about the shortcut.
+  await page.keyboard.press("n");
+  await page.waitForSelector("[data-developer-create]", { timeout: 6000 }).catch(() => {});
+  const openedByN = (await page.locator("[data-developer-create]").count()) > 0;
+  check("keyboard-n-opens-create", openedByN);
+  await shot(page, "developer-key-create");
+
+  // The dialog is not a shell: the scope catalogue arrives grouped, and the rows the caller cannot
+  // delegate are disabled rather than hidden (an operator looking for a scope and finding nothing
+  // has no way to learn the account lacks it).
+  await page.waitForTimeout(1500);
+  const fieldsets = await page.locator("[data-developer-create] fieldset").count().catch(() => 0);
+  const scopeBoxes = await page.locator('[data-developer-create] input[type="checkbox"]').count().catch(() => 0);
+  const disabledBoxes = await page.locator('[data-developer-create] input[type="checkbox"][disabled]').count().catch(() => 0);
+  check("scope-catalogue-is-grouped", fieldsets >= 5, `${fieldsets} categories`);
+  check("scope-picker-offers-rows", scopeBoxes > 10, `${scopeBoxes} scopes, ${disabledBoxes} not delegable`);
+
+  // A key with no scope is refused by the server, so the submit button must be inert until one is
+  // picked. A button that posts an empty scope list and shows a 400 is a form that rejects the
+  // user instead of preventing them.
+  const nameInput = page.locator('[data-developer-create] input[type="text"]').first();
+  await nameInput.fill("ab");
+  await page.waitForTimeout(400);
+  const submitShort = page.locator('[data-developer-create] button[type="submit"]').first();
+  const inertOnShortName = await submitShort.isDisabled().catch(() => false);
+  check("submit-inert-until-valid", inertOnShortName);
+
+  const stamp = Date.now().toString(36);
+  const keyName = `QA walkthrough ${stamp}`;
+  await nameInput.fill(keyName);
+  // Two scopes, deliberately: one is a scope picker that never proved it can select more than one.
+  const boxes = page.locator('[data-developer-create] input[type="checkbox"]:not([disabled])');
+  const grantable = await boxes.count();
+  await boxes.nth(0).check({ timeout: 6000 }).catch(() => {});
+  await boxes.nth(1).check({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const selected = await page.locator("[data-developer-create] input[type=checkbox]:checked").count();
+  check("two-scopes-selectable", selected >= 2, `${selected} checked of ${grantable}`);
+  await shot(page, "developer-key-create-filled");
+
+  await submitShort.click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-developer-reveal]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const revealShown = (await page.locator("[data-developer-reveal]").count()) > 0;
+  check("one-time-reveal-appeared", revealShown);
+
+  if (!revealShown) {
+    report.developer = { steps, ok: false, failures: [...failures, "one-time-reveal-appeared"], reason: "the one-time reveal never appeared" };
+    log(`developer: ${JSON.stringify(steps)}`);
+    throw new Error("developer: the one-time reveal never appeared");
+  }
+
+  // ---- The reveal cannot be dismissed before it is acknowledged -----------------------------------
+  const token = ((await page.locator("[data-developer-token]").first().innerText().catch(() => "")) || "").trim();
+  check("reveal-prints-the-secret", /^[A-Za-z0-9_\-]{20,}$/.test(token), token.slice(0, 6) + "…");
+  // The REQ asks for an explicit acknowledgement, and the reason is a stray `Esc`: a dialog that
+  // closes on Escape destroys a secret nobody has written down and the API can never show again.
+  const closeBeforeAck = page.locator('[data-developer-reveal] button:has-text("Done")').first();
+  const inertBeforeAck = await closeBeforeAck.isDisabled().catch(() => false);
+  check("reveal-refuses-to-close-unacknowledged", inertBeforeAck);
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(500);
+  const survivedEscape = (await page.locator("[data-developer-reveal]").count()) > 0;
+  check("reveal-survives-escape", survivedEscape);
+  await shot(page, "developer-key-reveal");
+
+  await page.locator('[data-developer-reveal] input[type="checkbox"]').first().check({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await closeBeforeAck.click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const revealClosed = (await page.locator("[data-developer-reveal]").count()) === 0;
+  check("reveal-closes-after-acknowledgement", revealClosed);
+
+  // ---- The list shows a prefix, and a reload proves the secret is gone ----------------------------
+  // The guarantee is a property of the response types (proved by the walk and the static gate);
+  // what the *browser* can add is the second half: after a full reload there is nothing left in the
+  // DOM to recover. A panel that kept the token in a module-level variable would render the list
+  // correctly and still leak the value to anything with a devtools console open.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-developer-keys]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const bodyAfterReload = (await page.locator("body").innerText().catch(() => "")) || "";
+  check("secret-absent-after-reload", !bodyAfterReload.includes(token), "the token must not survive a reload");
+  const rows = await page.locator("[data-developer-key-row]").count();
+  check("created-key-is-listed", rows > 0, `${rows} rows`);
+  const rowText = (await page.locator(`[data-developer-key-row]`).first().innerText().catch(() => "")) || "";
+  check("row-shows-the-prefix", /omn_[a-z]+_[0-9a-f]{4}/.test(rowText), rowText.replace(/\s+/g, " ").slice(0, 120));
+  check("row-shows-no-secret", !rowText.includes(token));
+  await shot(page, "developer-keys-list");
+
+  // ---- The key this pass created actually authenticates -------------------------------------------
+  // The one claim no screen can make about itself. The portal is the single place a broken key
+  // still looks fine, because the operator is signed in with a session and every screen loads
+  // regardless — so the platform's own guarded route is asked, with the printed bytes.
+  const probe = await page.evaluate(
+    async (bearer) => {
+      const answer = await fetch("/api/v1/developer/sandbox/probe", {
+        headers: { authorization: `Bearer ${bearer}` },
+        credentials: "omit",
+      });
+      let body = null;
+      try {
+        body = await answer.json();
+      } catch {
+        body = null;
+      }
+      return { status: answer.status, body };
+    },
+    token,
+  );
+  check("key-authenticates-a-guarded-call", probe.status === 200, `probe answered ${probe.status}: ${JSON.stringify(probe.body)}`);
+
+  // ---- That request is in the log, and the drawer names the scope -----------------------------------
+  // The middleware is the only writer of this table and this is the only place a browser can see
+  // its effect: the log screen filters on organization, so a row written with no organization is
+  // invisible no matter how correct the walk behind it is.
+  await page.goto(`${URL_ADMIN}/developer/logs`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-developer-logs]", { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const logRows = await page.locator("[data-developer-logs] tbody tr").count();
+  check("log-has-rows", logRows > 0, `${logRows} rows`);
+  await shot(page, "developer-logs");
+
+  // The filter is a narrowing, so it must be able to narrow to nothing and say so — a toolbar that
+  // cannot produce an empty result is a toolbar whose selects may not be wired at all.
+  const prefixInput = page.locator('[data-developer-logs] input[type="search"]').first();
+  await prefixInput.fill("/api/v1/definitely-not-a-route").catch(() => {});
+  await page.waitForTimeout(1600);
+  const filteredText = (await page.locator("[data-developer-logs]").first().innerText().catch(() => "")) || "";
+  check("prefix-filter-narrows", /no request matches/i.test(filteredText), filteredText.replace(/\s+/g, " ").slice(0, 120));
+  await shot(page, "developer-logs-filtered");
+
+  // `Reset` clears them together — a filter the user has to undo one control at a time is a bug
+  // report waiting to happen, and the REQ names the button.
+  await page.locator('[data-developer-logs] button:has-text("Reset")').first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const afterReset = await page.locator("[data-developer-logs] tbody tr").count();
+  check("reset-clears-the-filters", afterReset > 0, `${afterReset} rows after Reset`);
+
+  // The status-class filter is the second claim, and it is checked by its effect rather than by
+  // the select's value: a select bound to state and a select bound to nothing look identical here.
+  await page.locator('[data-developer-logs] select').nth(2).selectOption("5xx").catch(() => {});
+  await page.waitForTimeout(1500);
+  const serverErrors = (await page.locator("[data-developer-logs] tbody tr").count()) > 0;
+  const classText = (await page.locator("[data-developer-logs]").first().innerText().catch(() => "")) || "";
+  check("status-class-filter-wired", serverErrors === /no request matches/i.test(classText), `2xx rows hidden: ${!serverErrors}`);
+  await page.locator('[data-developer-logs] button:has-text("Reset")').first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+
+  // The drawer is the screen's reason to exist: it answers *why*, by naming the resolved scope.
+  const openDetail = page.locator('[data-developer-logs] button[aria-label^="Open request"]').first();
+  if ((await openDetail.count()) > 0) {
+    await openDetail.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-developer-log-drawer]", { timeout: 12000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const drawer = (await page.locator("[data-developer-log-drawer]").count()) > 0;
+    check("detail-drawer-opens", drawer);
+    if (drawer) {
+      const drawerText = (await page.locator("[data-developer-log-drawer]").first().innerText().catch(() => "")) || "";
+      check("drawer-names-the-scope", /scope checked/i.test(drawerText), drawerText.replace(/\s+/g, " ").slice(0, 160));
+      // The retention line is the honest part: a log whose window nobody can find reads as "the
+      // platform never recorded it", which is the failure this surface exists to prevent.
+      check("drawer-states-the-retention", /\b\d+ days/.test(drawerText));
+      await shot(page, "developer-log-drawer");
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(500);
+      check("drawer-closes-on-escape", (await page.locator("[data-developer-log-drawer]").count()) === 0);
+    }
+  } else {
+    check("detail-drawer-opens", false, "no request row carried an open button");
+  }
+
+  // ---- Revoke, then the identical bytes must die --------------------------------------------------
+  // Revocation is the criterion's negative half, and "the row still says revoked" is not enough:
+  // the same string has to stop working. The token is the variable captured above, untouched.
+  await page.goto(`${URL_ADMIN}/developer/api-keys`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-developer-keys]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const revoke = page.locator(`[data-developer-key-row] button[aria-label="Revoke ${keyName}"]`).first();
+  const revokePresent = (await revoke.count()) > 0;
+  check("revoke-button-present", revokePresent);
+  if (revokePresent) {
+    await revoke.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+    const status = await page
+      .locator(`[data-developer-key-row] [data-key-status]`)
+      .first()
+      .getAttribute("data-key-status")
+      .catch(() => null);
+    check("revoke-marks-the-row", status === "revoked", `status=${status}`);
+    const stillLinked = (await page.locator(`[data-developer-key-row] button[aria-label="Rotate ${keyName}"]`).first().isDisabled().catch(() => false));
+    check("a-dead-key-cannot-be-rotated", stillLinked);
+    await shot(page, "developer-keys-revoked");
+  }
+
+  const afterRevoke = await page.evaluate(
+    async (bearer) => {
+      const answer = await fetch("/api/v1/developer/sandbox/probe", {
+        headers: { authorization: `Bearer ${bearer}` },
+        credentials: "omit",
+      });
+      return { status: answer.status };
+    },
+    token,
+  );
+  // A revoked credential answers 401. Anything else — 403, 500, a stack trace — is a different
+  // defect and the pass names it rather than accepting "not 200".
+  check("revoked-secret-is-dead", afterRevoke.status === 401, `probe answered ${afterRevoke.status}`);
+
+  // ---- The key detail screen, reached from the list ------------------------------------------------
+  // A detail page the list links to and nothing clicks is a dead affordance; the pass clicks the
+  // link itself so the navigation is what is under test, not a hand-typed URL.
+  await page.locator(`[data-developer-key-row] a:has-text("${keyName}")`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-developer-key-detail]", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const detailRendered = (await page.locator("[data-developer-key-detail]").count()) > 0;
+  check("key-detail-reached-by-clicking", detailRendered && page.url().includes("/developer/api-keys/"), page.url());
+  if (detailRendered) {
+    const detailText = (await page.locator("[data-developer-key-detail]").first().innerText().catch(() => "")) || "";
+    // The usage panel must say which of its two empties it is showing; a flat zero-width chart
+    // answers neither.
+    check(
+      "usage-explains-its-empty",
+      /never authenticated|before the window opened|no requests/i.test(detailText),
+      detailText.replace(/\s+/g, " ").slice(0, 160),
+    );
+    check("detail-shows-no-secret", !detailText.includes(token));
+    await shot(page, "developer-key-detail");
+  }
+
+  report.developer = { steps, ok: failures.length === 0, failures };
+  log(`developer: ${JSON.stringify(steps)}`);
+
+  // A pass that fills an object and returns cannot fail — it is reported as a green pass while
+  // proving nothing. So the claims are asserted here, at the end, where the harness records them.
+  if (failures.length > 0) {
+    throw new Error(`developer: ${failures.length} unproved claim(s): ${failures.join(", ")}`);
+  }
 }

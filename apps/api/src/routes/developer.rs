@@ -413,8 +413,9 @@ pub async fn get_request_log(
     let organization_id = organization_of(&current)?;
 
     let row = sqlx::query(
-        "select id, organization_id, api_key_id, actor_user_id, method, path, status, duration_ms, \
-         request_id, bytes_in, bytes_out, error_code, created_at \
+        "select id, organization_id, api_key_id, api_key_prefix, actor_user_id, actor_name, permission, \
+         method, path, status, duration_ms, request_id, bytes_in, bytes_out, error_code, \
+         created_at \
          from api_request_logs where id = $1 and organization_id = $2",
     )
     .bind(log_id)
@@ -455,6 +456,50 @@ pub(crate) fn organization_of(current: &CurrentSession) -> Result<Uuid, ApiError
             "an API key belongs to an organization; a platform account has no key to manage",
         )
     })
+}
+
+/// `GET /api/v1/developer/overview` — the card row and the recent failures.
+///
+/// Arrived from `origin/main` (REQ-022 slice 2) with a merge. It is **not** what the `/developer`
+/// screen renders: that screen's six cards each read the list their own destination already lists
+/// (`apps/admin/features/developer/developer-overview-view.tsx`), so a card cannot disagree with
+/// the screen it opens. This endpoint is the *snapshot* version of the same question and it is
+/// kept for two reasons that are both about honesty rather than use:
+///
+/// * it is the only reader that counts keys, requests and refusals in **one** statement, so a
+///   caller who needs a consistent moment (a status page, a webhook payload) gets one;
+/// * the walk `the_overview_counts_the_same_keys_and_requests_the_tables_show` came with it, and
+///   that walk is the thing that would catch the two views drifting apart.
+///
+/// The retention field it reports comes from the same window the log screen filters with, so a
+/// card cannot quote a window the table does not honour.
+pub async fn overview(
+    State(state): State<AppState>,
+    current: CurrentSession,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let organization_id = organization_of(&current)?;
+    let read = omnion_developer::overview::read(
+        state.db().pool(),
+        organization_id,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "keys": {
+            "active": read.active_keys,
+            "expired": read.expired_keys,
+            "revoked": read.revoked_keys,
+        },
+        "requests_today": read.requests_today,
+        "errors_today": read.errors_today,
+        "recent_failures": read.recent_failures,
+        // From the same constant the log screen and the CSV export read, so a card cannot quote
+        // a window the table does not honour. Main's version called `logs_store::window_days()`,
+        // which this branch does not have; the number is the same one, written down once.
+        "log_retention_days": omnion_developer::log_vocab::RETENTION_DAYS,
+    })))
 }
 
 /// Refuse a key that carries a scope its issuer does not hold.
@@ -592,7 +637,13 @@ fn log_from_row(row: &sqlx::postgres::PgRow) -> Result<RequestLog, ApiError> {
         id: row.try_get("id").map_err(decode_error)?,
         organization_id: row.try_get("organization_id").map_err(decode_error)?,
         api_key_id: row.try_get("api_key_id").map_err(decode_error)?,
+        // The three attribution columns migration `0243` added. Read as `Option`/defaulted
+        // because they are nullable by design — a session-authenticated request has no key
+        // prefix, and a row written before this branch shipped has no recorded permission.
+        api_key_prefix: row.try_get("api_key_prefix").map_err(decode_error)?,
         actor_user_id: row.try_get("actor_user_id").map_err(decode_error)?,
+        actor_name: row.try_get("actor_name").unwrap_or_default(),
+        permission: row.try_get("permission").map_err(decode_error)?,
         method: row.try_get("method").map_err(decode_error)?,
         path: row.try_get("path").map_err(decode_error)?,
         status,

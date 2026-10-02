@@ -56,15 +56,31 @@ import { NotificationBell } from "@/components/notification-bell";
 import { EnvironmentChip, StagingEnvironmentBanner } from "@/components/environment-chip";
 import { MaintenanceWindowBanner } from "@/components/maintenance-window-banner";
 import { TenantStatusBanner } from "@/components/tenant-status-banner";
+import { useDeveloperAccess } from "@/lib/developer-access";
 import { useSession } from "@/lib/session";
 import { useTenantStatus } from "@/lib/tenant-status";
 
-/** One sidebar entry. `module` is the switch that hides it (REQ-005, slice 4). */
+/**
+ * One sidebar entry.
+ *
+ * Two independent reasons an entry can be absent, and both are properties **on the entry**
+ * rather than in a filter somewhere else, so "which entries are conditional" is one list a
+ * reader can scan instead of a second list that has to be kept in step with it:
+ *
+ * * `module` — the tenant switched it off (REQ-005 slice 4), and the API answers the module's
+ *   routes with `403 organization.module.disabled` either way.
+ * * `needsDeveloper` — this account may not open the developer portal. Resolved against a route
+ *   the API guards for `developer.read`; the answer is `null` while it is in flight, which
+ *   means the group is hidden for that first paint and appears a moment later. A group that
+ *   appears, then vanishes, then reappears is a flicker; one that briefly shows an account who
+ *   will be refused is a lie. See `lib/developer-access.tsx` for why the sidebar asks at all.
+ */
 type NavItem = {
   href: string;
   label: string;
   icon: LucideIcon;
   module?: string;
+  needsDeveloper?: boolean;
 };
 
 const NAV: readonly NavItem[] = [
@@ -162,7 +178,31 @@ const NAV: readonly NavItem[] = [
   { href: "/settings/iam/sessions", label: "Sessions", icon: Timer },
   { href: "/settings/iam/devices", label: "Devices", icon: Fingerprint },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
-];
+  // The developer portal (REQ-022 slice 2 / REQ-033). Three entries rather than eight: the brief
+  // lists eight, but the OAuth app registry, the event catalogue, the SDK scaffolds and the CLI
+  // are REQ-033 slices 3 and 4, and a nav link to a screen that does not exist is the dead
+  // control the definition of done forbids. These three are the whole of what ships in the nav;
+  // the deeper surfaces are reached from the section root they hang off.
+  { href: "/developer", label: "Developer", icon: Code2, needsDeveloper: true },
+  { href: "/developer/api-keys", label: "API keys", icon: KeyRound, needsDeveloper: true },
+  { href: "/developer/logs", label: "Request log", icon: ScrollText, needsDeveloper: true },
+] as const;
+
+/**
+ * Whether an entry is shown to this account.
+ *
+ * `needsDeveloper` is resolved against a route the API guards for `developer.read`, and the
+ * answer is `null` while it is in flight — which means the group is hidden for that first paint
+ * and appears a moment later. That is the right trade: a group that appears, then vanishes, then
+ * reappears as the answer lands is a flicker, and a group that briefly shows an account who will
+ * be refused is a lie. See `lib/developer-access.tsx` for why the sidebar asks at all.
+ */
+function visible(item: NavItem, canOpen: boolean | null): boolean {
+  if (!("needsDeveloper" in item) || item.needsDeveloper !== true) {
+    return true;
+  }
+  return canOpen === true;
+}
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
 /// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
@@ -208,6 +248,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
   const router = useRouter();
   const { user, signOut } = useSession();
   const { disabledModules, modulesLoaded } = useTenantStatus();
+  const { canOpen: canOpenDeveloper } = useDeveloperAccess();
   const [navOpen, setNavOpen] = useState(false);
 
   // A module switched off for this tenant takes its sidebar entry with it. The API refuses the
@@ -222,9 +263,19 @@ export function AppShell({ title, description, children }: AppShellProps) {
     () => (modulesLoaded ? new Set(disabledModules) : new Set<string>()),
     [disabledModules, modulesLoaded],
   );
+  // Two independent gates, both applied here so the list is a single filtered answer:
+  // a module switched off for this tenant takes its entry, and an account that cannot open the
+  // developer portal does not see the developer group at all. The second one is a `null` while
+  // its route is in flight, and `visible` treats that as "not yet" — a group that appears, then
+  // vanishes, then reappears is a flicker, and one that briefly shows an account who will be
+  // refused is a lie.
   const navItems = useMemo(
-    () => NAV.filter((item) => !item.module || !hiddenModules.has(item.module)),
-    [hiddenModules],
+    () =>
+      NAV.filter(
+        (item) =>
+          (!item.module || !hiddenModules.has(item.module)) && visible(item, canOpenDeveloper),
+      ),
+    [hiddenModules, canOpenDeveloper],
   );
 
   // A person who was already inside a module when it was switched off is left on a screen whose

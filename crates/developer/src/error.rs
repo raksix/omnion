@@ -302,6 +302,22 @@ pub enum DeveloperError {
     #[error("approving a CLI login needs developer.keys.manage")]
     DeviceCodeApprovalRefused,
 
+    /// The platform is not configured for something it needs in order to be safe.
+    ///
+    /// Its own variant, and deliberately **not** a client error: every other variant in this
+    /// enum is a request that has to change before it can be accepted, and this one is an
+    /// operator who has to set an environment variable. Answering `400` to a missing
+    /// `OMNION_LOG_PEPPER` would tell the caller to fix their request — and there is no request
+    /// that fixes it. `is_client_error` therefore excludes it, so it surfaces as a `5xx` naming
+    /// the variable, which is the only answer that points at the person who can resolve it.
+    ///
+    /// It arrived with `origin/main`'s request-log recorder (REQ-022 slice 2): the client
+    /// fingerprint is an HMAC keyed by that variable, and a fingerprint computed with an empty
+    /// key is a hash anyone can reproduce, so the recorder refuses rather than storing one.
+    #[cfg(feature = "store")]
+    #[error("{0}")]
+    Misconfigured(String),
+
     /// The database said no, and the message is one we wrote.
     #[cfg(feature = "store")]
     #[error("database error: {0}")]
@@ -495,6 +511,10 @@ impl DeveloperError {
             Self::InvalidKey => "invalid_api_key",
             Self::HighTierRefused => "high_tier_refused",
             Self::KeyNotActive(_) => "api_key_not_active",
+            // A misconfiguration, not a bad request: the code says so in the same word the
+            // status does, so an operator reading a log line sees `misconfigured` rather than
+            // `invalid_*` and goes looking for a request to fix instead of a variable to set.
+            Self::Misconfigured(_) => "developer_misconfigured",
             Self::UnknownAppStatus(_) => "unknown_app_status",
             Self::AppNameTaken(_) => "oauth_app_name_taken",
             Self::AppDescriptionTooLong { .. } => "oauth_app_description_too_long",
