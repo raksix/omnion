@@ -13120,3 +13120,94 @@ you why.
 
 **Next:** take the slot and run `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash
 scripts/qa/run.sh --only=crm`, which closes the three browser-only boxes and REQ-051 itself.
+
+## Tick 74 — wave 4 / REQ-053 · the route four screens linked to, and a parameter nobody read
+
+**Why this tick did not start with REQ-051.** Tick 73's `next_hint` named the job exactly: take
+the QA slot and run `--only=crm` to close the three browser-only boxes. The slot was held all the
+first half of this tick by a genuinely live pass — `kill -0` **and** `readlink /proc/<pid>/cwd` on
+each pid in the holder file, never `kill -0` on the raw file content, because that content listed
+two pids and reported DEAD for both. The pass was **queued** (`QA_SLOT_WAIT=2400`) rather than
+abandoned, and it took the slot mid-tick and ran. The rest of the tick was the discipline the slot
+discipline prescribes: no slot required, do the code work instead.
+
+**What.** A reader clicking an item's name in the stock list hit a 404. `apps/admin/app/inventory/`
+shipped `alerts`, `approvals`, `movements`, `reports`, `stock`, `stocktake` and `transfers` — and
+**no `items` directory** — while four screens render that name as a `Link` to
+`/inventory/items/{id}` (the stock list's table *and* its cards, the movements ledger, the approvals
+inbox). The API had been complete the entire time: `GET /items/{id}` answered the position, the
+per-location rows, the totals and the history. This is the missing half of a feature that already
+worked.
+
+**Three defects, found in the order they would have bitten a user:**
+
+1. **The dead route** — `0535d130` ships `apps/admin/app/inventory/items/[id]/page.tsx` and
+   `features/inventory/item-detail-view.tsx`. The header reads the module's own `StockPosition`
+   (`on_hand`/`reserved`/`available`/`status`), the same struct the stock list's rows are built from,
+   so the header and a row of that table cannot disagree about the same item. The SKU is shown and
+   **not** editable: it is a check constraint in the schema and a printed label in the aisle.
+2. **`fetchItem`'s type contradicted the server** — it declared `item`, `locations`, `on_hand` …
+   at the top level beside `history`, while `ItemDetail` in the route nests the position under its
+   own name *precisely so two fields cannot collide*. Nothing caught the disagreement because **no
+   caller existed**: a type nothing calls is a comment. TypeScript caught it the moment the screen
+   that calls it was written.
+3. **`history_limit` was never read** — `fetchItem(id, historyLimit = 25)` has always sent it and
+   `get_item` took no query parameter at all, asking for a hard-coded `200`. A phone asking for 25 to
+   keep its first paint small got 200. A parameter a server ignores is a claim the API is making that
+   it is not keeping. `1f72c108` honours it and clamps it, because the ledger is the one read in this
+   module where an unbounded page never finishes.
+
+**Proof:**
+
+| gate | command | result |
+|---|---|---|
+| walks | `run-walks.sh` against `omnion_qa_w4` on 5444 | **13 passed · 0 failed · 0 skipped** |
+| proven to fail | `item_history(…, 200)` restored | walk **FAILS**: `left: 7, right: 3` — the symptom, not an unrelated error |
+| compile | `cargo build -p omnion-api` | exit 0 |
+| types | `pnpm typecheck` (apps/admin) | exit 0 |
+| shape | the answer's top-level keys | exactly `["history", "position"]` |
+
+**The suite was red for a reason that was not a defect in the module.** Every walk that created an
+item failed with `csrf_unavailable` — including the seven that had never run. Sign-in answers with
+the session cookie and the CSRF cookie as **two** `Set-Cookie` headers, `headers().get()` reads the
+first, so this suite held a session with no token and could not write a row. The code names the
+*deployment's* configuration, so the suite's own loss of the token read as a broken server and the
+red survived. `crm.rs` was migrated for exactly this on an earlier tick; `inventory.rs` predated the
+CSRF layer and had not been. Seven walks were unrunnable, not failing.
+
+**Two stale expectations, found by the run rather than by reading.** The seeded `MAIN` warehouse
+owns `TRANSIT` since migration `0138` (REQ-053 slice 3, where a dispatched transfer sits between two
+locations), and both list assertions still said two. The product was right and the tests were two
+migrations behind — the shape a *never-run* suite is in.
+
+**Not claimed: no CRM acceptance box ticked, and the pass's red is not a verdict.** The pass took
+the slot mid-tick and is running, but its CRM steps report `boardColumns: 0`, `dealCreated: false`
+and `export: 400 organization_ambiguous` — and that red is **this tick's own fault**, proven rather
+than assumed. `run-walks.sh` creates one throwaway database per walk, and the gate I ran
+deliberately pointed it at `omnion_qa_w4` — the very database the queued pass had just reset, because
+that was where the fixture and the walks were already configured. The query is unambiguous:
+
+```
+select count(*) from organizations                                   → 3
+select count(*) from organizations where slug like 'inventory-fix-%'  → 2
+select email, organization_id is null from users order by created_at → qa-owner@… plus five inventory-* accounts
+```
+
+The walk's fixture creates **two** organizations per run and binds five accounts to them; the panel's
+`qa-owner` holds a role in none of them, so `organization_of` reached its `many` arm and correctly
+refused to guess a tenant — *"a guess would hand one tenant's records to another"*. **The product is
+right and the harness is contaminated**, which is the opposite of what a red in the log says.
+
+The lesson is the one this repository keeps re-learning in a new costume: **the gate's database and
+the pass's database are the same string until you make them different ones.** `run-walks.sh` builds
+`omnion_w4_x_<slug>_<ts>_<pid>` on port 5433 and is meant to be pointed wherever; the tick's habit
+of running it against the stack's own `omnion_qa_w4` is what made it destructive. The next tick runs
+the gate against a throwaway database and the pass against the stack, never the reverse.
+
+**Commits:** `0535d130`, `1f72c108`, pushed. Tree clean.
+
+**Next:** re-run the CRM pass on a **freshly reset** stack (the current one's fixture was
+contaminated by this tick's gate) and close REQ-051's three boxes, or name the leg that broke. Then
+REQ-053's own three — global search for items, the state sweep and the phone layout — which are the
+same four-site registration trap the sales providers documented: the registry, the panel, the
+vocabulary and a **data row**, and a provider missing from any one of the four produces no error.

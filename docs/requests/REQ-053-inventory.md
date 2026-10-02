@@ -1,6 +1,21 @@
 # REQ-053 — Inventory & Warehouse
 
-> **Status:** in-progress (slice 4b — the reports screen, the global search and the export: `8eec4e1`, `9ed1b31`, `ea41a85`, `c58ba90`; slice 1 — items, warehouses, locations + the stock rollup: `27c3e7b`, `37bf572`; slice 2 — the over-threshold approval path, the CSV exports and the first three `/inventory/*` screens: `fdc04e4`, `e8328a5`; slice 3 — transfers, the low-stock alert inbox, `0138` and the `inventory.transfers.manage` key: `0d8785b`, `c69b54e`, `3e89399`, `e57fff4`, `268485e`; slice 4 — the stocktake session, the counting sheet, the variance report, `0143` and `inventory.stocktake.manage`: `2064bab`, `798cb7d`, `7642713`, `16268df`, `b02db0d`; slice 5 — the sales-order reservation, the confirm/cancel wiring, `0146`'s `order_line_id` and a `replay` that can see a hold: `7dbd1ae`, `f623ba4`) · **Captured:** 2026-09-26 · **Layer:** module (`modules/inventory`)
+> **Status:** in-progress (tick 74 — the item detail route four screens already linked to, and a
+> parameter the server had always ignored. `/inventory/items/{id}` had **no route**: the stock list
+> (table and cards), the movements ledger and the approvals inbox all render the item's name as a
+> link to it, and `apps/admin/app/inventory/` shipped seven directories without an `items` one, so
+> every one of those links was a dead destination. The API was complete throughout — `GET /items/{id}`
+> answered the position, the per-location rows, the totals and the history — so this is the missing
+> half of a feature that already worked. `0535d130` ships the screen and corrects `fetchItem`'s type,
+> which claimed a **flattened** shape while the route nests the position under its own name; nothing
+> caught the disagreement because no caller existed. `1f72c108` makes `get_item` honour the
+> `history_limit` `fetchItem` has always sent (it asked for a hard-coded 200, so a phone asking for 25
+> got 200), and migrates this suite to the CSRF layer it predates — sign-in sets **two** `Set-Cookie`
+> headers and `headers().get()` read the first, so **seven walks could not write a single row** and
+> every red was `csrf_unavailable`, a code that names the deployment rather than the helper. Two
+> stale expectations fixed: the seeded `MAIN` warehouse owns `TRANSIT` since migration `0138`. **13
+> passed / 0 failed / 0 skipped**, and the bound walk is proven to fail against the reverted call
+> (`left: 7, right: 3`). · slice 4b — the reports screen, the global search and the export: `8eec4e1`, `9ed1b31`, `ea41a85`, `c58ba90`; slice 1 — items, warehouses, locations + the stock rollup: `27c3e7b`, `37bf572`; slice 2 — the over-threshold approval path, the CSV exports and the first three `/inventory/*` screens: `fdc04e4`, `e8328a5`; slice 3 — transfers, the low-stock alert inbox, `0138` and the `inventory.transfers.manage` key: `0d8785b`, `c69b54e`, `3e89399`, `e57fff4`, `268485e`; slice 4 — the stocktake session, the counting sheet, the variance report, `0143` and `inventory.stocktake.manage`: `2064bab`, `798cb7d`, `7642713`, `16268df`, `b02db0d`; slice 5 — the sales-order reservation, the confirm/cancel wiring, `0146`'s `order_line_id` and a `replay` that can see a hold: `7dbd1ae`, `f623ba4`) · **Captured:** 2026-09-26 · **Layer:** module (`modules/inventory`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
