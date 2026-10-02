@@ -15503,3 +15503,69 @@ it either.
 `organizations.notification_retention_days`. Nothing reads that column back yet — no
 organizations screen shows the window and no route changes it, so the sweep is correct and
 invisible. Ask whether that is slice 3 of this screen or another tick's.
+
+## 2026-10-02 · REQ-021 slice 7 (delivery-log retention) — the code that was written and never committed
+
+**What.** Found the branch at `ea294241` with three commits for slice 7 and a **dirty tree**:
+the commits carried the migration's integration test, the gate and the build log, while every
+*product* file — the retention module, the route wiring, the admin screen, the runner flag and
+the walkthrough registration — sat uncommitted. Slice 7 was half-landed by the tick that wrote it.
+
+**The first two hours were not the REQ.** `/` was at **100 % (75 M free)**, which is the state
+where a write can land as a zero-byte file and still report success. Reclaimed rebuildable caches
+only (`/root/.cache/typescript`, the v8 and node compile caches) for 235 M; `pnpm store prune`
+and no docker reclaim were available. Then `target -> /mnt/apopic/w8build` was a **broken
+symlink** — the target directory had been deleted by a cleanup, so every cargo invocation failed
+with `failed to create directory … Not a directory`, and `target` itself reported 0 bytes. A
+build directory that does not exist and a build directory that is empty look identical from
+`du`, which is why the earlier check read as "no target to reclaim".
+
+**The corrupted request file, and the check that is now in the repository.** `REQ-117`'s leading
+block had been replaced by `REQ-021`'s prose: the file began with a blockquote about an outbox and
+had **no `# REQ-117` title and no `## Request` heading**. Everything below — the specification,
+the slices, the acceptance list — was intact, so the file still parsed as markdown and still read
+like a request; only the two lines saying *which* request it is were gone. Restored from
+`8d93424b`, the newest ancestor that still carries the anchors, with the current status text
+re-attached under the title rather than taken from that commit — copying the whole leading block
+from an older commit would have discarded every slice recorded since, which is the part a reader
+needs. `scripts/qa/repair-req-status-line.py` makes the failure non-silent: nothing in the build
+reads these files, so nothing goes red when a status write eats a title. `--check` exits 1 on the
+damaged copy and 0 after, byte-identical on a second run.
+
+**The two red walks, and where the fault actually was.** The retention target failed 2/18 with
+`left: 0, right: 2` and `left: 0, right: 1` on two count assertions. The messages point at the
+product: a tenant's 30-day window "not reaching" its rows, and a 90-day-old row "not due" at 45
+days. **The product was right.** `backdate()`'s parameter is days in the past, added to `now()`
+inside a `make_interval`, and three call sites passed a **negative** number — `Some(-45)`,
+`Some(-45)`, `Some(-90)` — directly under comments saying "45 days old" and "90-day-old". A row
+settled 45 days into the future is on the far side of every window predicate, so `due = 0` is
+correct and the walks were measuring nothing: the clock they claim to test was never in the past.
+Every other call site in the file passes a non-negative value, which is what made the three an
+outlier rather than a convention.
+
+**"Fix the count" was the available wrong answer.** The sweep's clock, the tenant window and the
+count that renders them are all real and all correct, so making the walks green was one edit away
+from changing working product code to satisfy a fixture that had never moved time. The guard now
+sits in the fixture and names itself: `backdate()` refuses a negative day count, because a
+fixture that moves time *forward* is not a weaker fixture — it is one that makes the guard it was
+written to test untestable, and the error it produces points at the sweep rather than at the line
+that wrote it. Proven to fail: with `Some(-90)` reinstated the walk panics on the fixture's own
+assertion, carrying the message.
+
+**Proof.** `omnion-notifications` lib **140** (was 117), `omnion-api` lib **327**,
+`notification_retention` **18/18** over a real PostgreSQL, `run-notification-retention.sh`
+**PASS**, admin `tsc --noEmit` exit 0. The gate's own summary printed `PASS` with a shell exit of
+0 while the walks beneath it were failing — the `| tail` in the invocation was eating the status —
+so the count in this entry is read from the cargo line, not from the wrapper.
+
+**No browser pass and none claimed.** No screen changed in this tick. `/` is at **100 %**
+(310 M free) and `/mnt/apopic` at **91 %** (5.7 G free), with a live sibling pass on the box; a
+walkthrough started now would measure a box under pressure rather than this change.
+
+**Commits.** `eb4dc370` the restored request file and its check · `95d06b3a` the fixture guard ·
+`41d45ff3` slice 7's product code, which is what the previous tick left behind.
+
+**Next.** `push::OutboxScope` scopes the outbox's reads and `organizations.notification_retention_days`
+scopes the sweep, and **nothing reads the window back yet**: no route returns it and no screen
+shows it, so the sweep is correct and invisible. The next slice is the write and read side of
+that one column.
