@@ -17012,3 +17012,63 @@ the log table and its detail drawer, the nav entry, all three states per screen,
 mobile behaviour the REQ names. The request-log **middleware** that writes rows on every API call also
 belongs to it: `omnion-developer::logs_store::record` exists and is walked, but nothing calls it on the
 request path yet, which is the same "described but inert" shape this REQ's predecessors shipped.
+
+## Tick 85 — REQ-117 slice 50: the pass proved the silence was absent, not explained
+
+**What.** Five slices of autoresponder work (45–49) had never been rendered by a browser pass,
+and the assertions that stood in for them could not have caught a broken screen. The CRM intake
+pass creates its QA source *without* an autoresponder — deliberately, since a claim needs a real
+database — so every autoresponder assertion had the shape `count === 0 || <the real check>`:
+`autoresponderStateLines === 0 || …`, `abandonedExplained = count === 0 || …`. Both are vacuously
+true on a source that never produces the line. A renderer that dropped the skip sentence, the
+state chip or the explanation would have passed all of them, and the "zero high findings" reading
+would have meant "nothing was rendered, so nothing was wrong".
+
+**The fixture.** A second source with its autoresponder switched ON and an empty subject and body
+— the one misconfiguration an operator can fix, which `prepare` answers `InvalidTemplate` for,
+and which mails nothing. So the state exists in a QA database with no SMTP conversation, the same
+trick the abandoned-claim slice used.
+
+**The skip line is written from a spawned task.** The capture route fires the autoresponder after
+it has answered `202`, so the trail lags the page by a beat; a single read after a fixed sleep is a
+race that reports "no line" on a healthy product. The pass polls for the element and records
+`skipLineWaitMs`: a line that never appears and a line that appeared late are different answers,
+and the wait is what tells them apart.
+
+**Three assertions recorded as findings, not observations.** Only `record()` becomes a finding in
+`run.sh`, so a `steps.*` key that nothing reads is the "recorded and never judged" defect this
+branch has hit before. The line exists; it is a sentence and not the raw `invalid_template` token;
+the explanation beside it is present. The fixture earns its own assertion because without "a lead
+with a misconfigured autoresponder says why it went quiet" the other three would all be read from
+an empty string and pass.
+
+**Inserting the block broke three assertions before it, silently.** The first draft went in before
+`stepsAfter`, which reads the conversion stepper from the *current* page — and the block navigates
+to a different lead. `stepperAfter`, `convertOutcomeHonest` and `blockedStepsNameTheirModule`
+would all have become `[]` and passed. `node --check` cannot see that: the file parses. A block
+that navigates has to be placed after every read of the page it leaves, and the ordering is worth
+asserting.
+
+**Credentials, fourth repeat.** A bare `cargo test -p omnion-module-crm-intake` reported **10
+failed in 0.00 s** — `DATABASE_URL: NotPresent`. The elapsed time is the tell, and the intended
+route is `scripts/qa/run-crm-address-ceiling.sh`, which derives its own URL. It is 10/10. A DB
+walk run outside its gate measures the harness.
+
+**Proof.** `run-crm-address-ceiling.sh` **10/10** (+ `crm_lead_delete` 4/4); module lib **212/212**;
+`cargo build -p omnion-api` exit 0; admin `tsc --noEmit` **exit 0**; `node --check walkthrough.cjs`
+clean. Merged `origin/main` first (5 commits; BUILD-LOG conflict resolved with
+`merge-build-log.py` and verified as a multiset — 0 entries missing from base, ours or main).
+Commit `82bc6509`.
+
+**Browser pass NOT run and NOT claimed.** The QA slot is held by a live w4 pass (holder pid alive,
+`cwd=/mnt/apopic/omnion-w4`), 1285 chrome processes, load 16.8, `/mnt/apopic` 91 %. The three
+assertions are written and unexecuted; acceptance 14 stays unticked until a `summary.json` carries
+`skipLineAppeared` / `skipReasonIsSentence` / `skipExplanationIsSentence`.
+
+**Still open for the owner.** `due_reservations` fills its batch with rows it then discards, so one
+orphan reservation starves a live lead: does the batch limit count rows READ or rows RETURNED?
+
+**Next.** Reclaim the slot and run the private stack (`QA_STACK=w8`, ports 18087/3107/3207) with
+`--only=crm-intake` to observe the skip note. Then REQ-133's unticked boxes are screen
+observations at 390 px plus two criteria naming resources this branch does not have (no
+`credentials` table; schedules are columns).
