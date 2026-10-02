@@ -11872,3 +11872,46 @@ forced pass on a box with 0 free RAM measures the machine.
 must be read with `runStarted` / `runFinished` beside `runSettled` — `settled: true, finished: false` is a
 wedged engine and not a rule whose nodes fail to paint pills. That single distinction is what four
 unticked rows have been reading as a product defect since tick 61.
+
+
+---
+
+**Tick 89 — the keyboard criterion's run read was a 404, and the class is now swept.**
+`keyboard-pass` reads `r` as the last of the criterion's five verbs. Its fetch asked
+`/api/v1/workflows/{id}/runs`, which **no route in this server answers** — the run list is
+`/executions`, and `runs` exists only under `/media/scan` and `/media/retention`. The 404 was
+swallowed by `if (!response.ok) return null`; the payload key `body.runs` is not a field
+(`ExecutionListResponse` sends `executions`); `trigger_kind` is the stored column while
+`ExecutionSummary` renames it `trigger` on the wire, so the `?? status` fallback returned a run's
+*state* under a name promising its *origin*; and with no baseline, the *Run from here* press from
+the pass above satisfied the count. `runsAfterKey` and `startedFromKey` were structurally `null`
+on every run since the row was written.
+
+**Proof.** `node --test 'features/workflows/*.test.ts'` → **393/393** (389 → 393) ·
+`node scripts/qa/mutate-keyboard-run-row.sh` → **8/8 red**, each naming its own rule, walkthrough
+restored byte-exact · `node --check scripts/qa/walkthrough.cjs` clean ·
+`pnpm typecheck` → **2/2** clean · `cargo test -p omnion-workflows --lib` → **163 passed**,
+unchanged (a harness defect, not an engine one) · `node scripts/qa/probe-api-routes.mjs` → **30
+resolved, 7 deferred, 0 unresolved** out of 37, and `--self-test` → **5/5 PASS**.
+
+**Two of the four new guards were holes first, and both are recorded in the file.** A field
+asserted "inside the note" was satisfied by the `const runCountBeforeKey` declaration directly above
+`step:` (M7 survived), then — after the window was narrowed to the object literal — by the note's
+own comment naming the three fields (M7 survived again), so the window is stripped code. And the
+difference's guard was asserted as a substring, which `&& false` satisfies while changing nothing
+the note reports (M4 survived): it is now asserted on reachability, tick 85's rule. The sweep's
+`--self-test` caught two of its own bugs before shipping, one of which asserted `/workflows` is
+NOT mounted — which is false.
+
+**Slot.** Checked first and held throughout: w8's live pass (holder 2878882,
+`/proc/2878882/cwd` = `/mnt/apopic/omnion-w8`). The focused pass is **queued**, not forced —
+`--only=workflow-table,workflow-builder` waits on the slot itself (`QA_SLOT_WAIT=2700`) and will
+run the moment the place frees.
+
+**Commits:** `e179a98f`, `972175da`, pushed.
+
+**Next:** read the `keyboard-pass` note with `runStartedFromKey` — beside `runCountBeforeKey`, not
+instead of it — and the run-from-here note with `runStarted` / `runFinished` beside `runSettled`.
+Then continue the sweep for the other two shapes this REQ keeps finding: a field read from a
+payload the server does not send (this tick), and a field read from an attribute that is written as
+a *value* rather than a name (tick 87).
