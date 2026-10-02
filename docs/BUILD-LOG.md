@@ -16645,3 +16645,120 @@ discipline the tick was not spent blocked: it queued the pass and took the code 
 **Next:** the browser pass with `--only=security` on a free slot and room on the disk, which closes
 the rendering half of the posture box and REQ-012's walkthrough box; then REQ-012's locked-account
 screen box (a fixture-locked account unlocked through the panel's own button).
+
+## Tick 84 — a skip note said which case and never why (REQ-117 slice 49)
+
+**The trail line whose entire job is to explain a silence explained nothing, and the two halves
+of that failure were both wrong in opposite directions.**
+
+*Writer.* `Delivery::InvalidTemplate` is **constructed with the diagnosis** — "the autoresponder
+has no subject or no body", "the template renders to nothing" — and both writers of the skip line
+dropped it: `spawn_autoresponder` passed `json!({})`, the sweep's decline arm passed
+`json!({ "reserved": true })`. So a source whose autoresponder is switched on and cannot produce a
+message wrote the single word `invalid_template` onto its own lead's timeline and nowhere else.
+That is the one autoresponder failure an operator can actually fix, and the trail could not say
+which half was wrong. **A payload the writer drops is data the platform had and threw away** —
+the crate's second instance after the batch limit that filled a batch with rows it discarded
+(there the *rows* were dropped, here the *sentence* is).
+
+*Reader.* The panel had decided a skip line gets no claim chip — correct, and the reason is good:
+a note never claimed anything — and had given that line no words either. The timeline rendered
+`event.detail.reason` verbatim and every value in it is a token the server invented:
+`not_accepted`, `no_address`, `source_disabled`, `invalid_template`, `delayed`. An operator
+opening a lead to ask "why did nobody email this person?" read a token.
+
+### What shipped
+
+`Delivery::skip_payload()` is the single owner of what a verdict carries;
+`skip_payload_merge()` lets the sweep add its own context key **after**, so a caller can add to a
+verdict and never overwrite one. On the client, `AUTORESPONDER_SKIP_LABEL` + `skipLabel()` give
+the trail a sentence, with a raw-word fallback for a verdict the panel has not been taught — open
+on purpose, the opposite of `AUTORESPONDER_STATE_LABEL`'s `satisfies`, because reasons grow and a
+new word must fall through rather than become a type error far from the variant that caused it.
+The render guard is on the **kind**, not on the word: `status_changed` and `assigned` also carry
+a `reason`, that one operator-authored free text, and a string-keyed guard would have mangled a
+rejection reason into an autoresponder sentence.
+
+### Proof
+
+```text
+crm_autoresponder.rs                          22 passed; 0 failed   (was 20)
+  … PROVEN TO FAIL at 1 … replaying the route's pre-fix call →
+  the row carries the word and no sentence — the one fixable autoresponder
+  failure is recorded as a token, and the panel has nothing to render
+scripts/qa/run-autoresponder-skip-words.sh    6 legs, 21 assertions
+  writer halves reverted → 3/6 legs failed
+  reader halves reverted → 7/6 legs failed
+scripts/qa/run-autoresponder-recovery.sh      7 legs, 18 passed, 0 failed   (was 17/1 failed)
+  … PROVEN TO FAIL at 17 … with the sweep predicate re-broken
+run-autoresponder-reason.sh                   PASS 7 legs, 17 assertions
+run-crm-autoresponder-claim.sh                10 passed; 0 failed
+cargo test -p omnion-module-crm-intake --lib  212 passed; 0 failed   (was 207)
+cargo test -p omnion-api --lib                327 passed; 0 failed
+cargo clippy -p omnion-module-crm-intake      0 warnings
+tsc -p apps/admin/tsconfig.json --noEmit      exit 0
+```
+
+**The two halves were proven to fail separately, and that is the part worth keeping.** A single
+revert that broke both at once would have been satisfied by a gate measuring either one. Writer
+alone: 3 of 6 legs red, every reader leg green. Reader alone: 7 of 6 red, the writer legs green.
+The gate names two subjects, and the evidence says so.
+
+### The test was wrong twice, and both times as a FIXTURE, not as the product
+
+Both were caught by running it rather than by reading it:
+
+1. It handed `prepare` the **pre-edit** source. `prepare` believes the `&IntakeSource` it is
+   given; the **sweep** re-reads the column, because the row was reserved before whatever
+   happened next. The test therefore measured `sent` and looked like a product defect. The helper
+   now re-reads, and says why the difference is the point.
+2. It asserted `!is_configured()` for a body of `{{no_such_placeholder}}`. That body **is**
+   configured — `is_configured` asks whether there is a body to send, and there is one; it renders
+   to an empty string and fails *later*. Each case now declares its own expectation.
+
+A fixture that creates a state it does not create is the most expensive kind of red, because it
+points at the product. The helper's doc records the shape so the next writer does not repeat it.
+
+### A gate the previous slice left red against correct code
+
+`run-autoresponder-recovery.sh` asserted `not (e.detail ? 'delivered_at')` — the key-existence
+spelling slice 48 had *deliberately replaced*, in a slice whose entire finding was that `?` cannot
+see a null. It had been red for a tick against correct code. **Verified pre-existing on both
+sides of this change** (`git stash` on a clean tree fails identically), not caused by this work.
+
+**A gate that asserts the old spelling of a rule is worse than one that asserts nothing**: it
+teaches the reader to expect red and look past it, and it means the next writer who re-introduces
+the defect finds the gate already failing for another reason. Now `18 passed`, and PROVEN TO FAIL
+at 17 when the predicate is re-broken.
+
+The new leg needed `no`, not `check`. Its first version used `check` against the *absence* of the
+key-existence spelling, so it failed on correct code and passed on the defect — **it asserted the
+bug in place.** That is the assertion-inverting twin of the sibling gate that counts its own doc
+comment, and the rule is the same one in both cases: say which side of the predicate is the pass
+before writing the helper, not after reading the failure.
+
+### No browser pass, and none claimed
+
+No screen changed its layout, and the walkthrough could not have observed this anyway: its QA
+source is created **without** an autoresponder, so no skip line is ever produced on screen — the
+comment at `walkthrough.cjs:6139` says so. The QA slot is held by a live w5 pass. A pass not
+executed is a hypothesis; nothing here is claimed to be walked.
+
+### Lessons
+
+* **A payload the writer drops is data the platform had and threw away.** Two instances in one
+  crate: a batch limit that discarded rows it had filled, and a verdict carrying a sentence that
+  two call sites replaced with `{}`. Ask of every literal at a call site: what did the caller have
+  that this throws away?
+* **Two halves, proven separately.** Reverting writer and reader in one step produces a gate that
+  cannot say which it measured. Each was reverted on its own and the counts differ.
+* **`prepare` believes its source; the sweep re-reads it.** "An operator edited the source during
+  the delay" is observable on exactly one path, and a fixture that edits the column while handing
+  over the stale struct measures nothing at all.
+* **A fixture that does not create the state it claims is the expensive kind of red** — it points
+  at the product. Two such defects in one test, both found by running it.
+* **A gate asserting a rule's old spelling is worse than no gate.** It reddens on correct code,
+  trains the reader to look past red, and hides the next real regression behind an existing one.
+  Check that a repaired rule's gate was repaired too — the fix and its gate are one change.
+* **Say which side of a predicate is the pass before writing the helper.** A `check` written
+  against an absence asserts the bug in place, and it is green exactly when the defect is present.
