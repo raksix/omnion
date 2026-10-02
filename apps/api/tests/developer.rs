@@ -57,6 +57,14 @@ const PROBE_SCOPE: &str = "content.pages.read";
 /// A scope an operator can hold but a *reader* must not be able to delegate.
 const UNDELEGATABLE: &str = "iam.users.manage";
 
+/// The scope the narrow key in the middleware walk carries, and is **denied** the probe by.
+///
+/// It has to be a real catalogued scope rather than a made-up one, and it has to be a scope the
+/// minting account holds — the delegation rule refuses a key whose scopes its issuer does not
+/// hold, so a fixture that invents its own "wrong" scope gets `400 you do not hold it yourself`
+/// and never reaches the `403` it was written to observe.
+const NARROW_SCOPE: &str = "analytics.read";
+
 // --------------------------------------------------------------------------------------------
 // Harness
 // --------------------------------------------------------------------------------------------
@@ -806,6 +814,357 @@ async fn the_request_log_records_the_matched_permission_and_never_the_query_stri
         !listed.text.contains("super-secret-value"),
         "the log screen must not re-introduce what the store stripped"
     );
+
+    harness.dispose().await;
+}
+
+/// The criterion the whole request log rests on: **a request the platform served writes a row
+/// because the platform served it.** (REQ-022, slice 2.)
+///
+/// The walk above proves the recorder works. It cannot prove the recorder is *called*, because
+/// it is the thing calling it — which is exactly how slice 1 shipped a complete, tested, empty
+/// request log: every store, filter, screen and walk in place, and no request in the platform
+/// ever recorded by anything the platform did. A debugging surface that is silently blank is
+/// the failure this table exists to catch, and it was the platform's own state.
+///
+/// So this walk never touches `logs_store::record`. It makes real requests through the real
+/// router and reads the answer back out of PostgreSQL, in the shapes the middleware has to get
+/// right separately: a **session** request (a person, and the permission the guard resolved), a
+/// **key** request (the key's id, and the scope the guard checked), and a **refusal** (the row
+/// an integrator most often needs, and the one a log that records only successes cannot make).
+///
+/// Two negative claims too, because a log layer is exactly the thing that can be wrong in both
+/// directions at once: the platform's own probes must **not** be recorded, and a query string
+/// must not survive into the table.
+#[tokio::test]
+async fn a_request_writes_its_own_log_row_and_nothing_else_does() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let organization_id = create_organization_row(&harness.db).await;
+    let (user, credential) = account(&harness, Some(organization_id)).await;
+    grant(
+        &harness,
+        user,
+        organization_id,
+        &[
+            "developer.read",
+            "developer.keys.read",
+            "developer.keys.manage",
+            "developer.logs.read",
+            PROBE_SCOPE,
+            // The delegation rule at work on this walk's own fixture: a key may only be
+            // created with a scope its issuer holds, so the account that mints the *narrow*
+            // key below has to hold the scope the narrow key is denied. A walk that forgot
+            // this got `400 you do not hold it yourself` — the rule working, the fixture not
+            // having noticed it exists.
+            NARROW_SCOPE,
+        ],
+    )
+    .await;
+
+    let (key_id, token) = create_key(&harness, &credential, "Middlewared", &[PROBE_SCOPE]).await;
+
+    // 1. A session request — the most common row this table will ever hold.
+    let ok = harness
+        .call(get("/api/v1/developer/api-keys", Some(&credential)))
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "the list must answer: {}", ok.text);
+
+    // 2. A key request, on the one route that accepts one.
+    let probe = harness
+        .call(with_key("/api/v1/developer/sandbox/probe", &token))
+        .await;
+    assert_eq!(probe.status, StatusCode::OK, "the probe must answer: {}", probe.text);
+
+    // 3. A refusal. `/developer/sandbox/probe` is the only route that accepts a key, and it is
+    //    guarded for `content.pages.read`, so a key carrying only `analytics.read` is refused
+    //    with `403 scope_missing` — and the row has to exist, because a log that cannot show a
+    //    403 cannot answer "why is my integration being refused".
+    //
+    //    The first attempt at this walk asked a key for `/developer/logs` and got `401
+    //    unauthenticated` — which was the **product being right and the fixture being wrong**:
+    //    that route is session-only, so a bearer token there is not a key with the wrong scope,
+    //    it is an unauthenticated caller. The fixture now asks the route that actually accepts
+    //    keys, and the refusal it produces is a real scope gap.
+    let (narrow_id, narrow_token) =
+        create_key(&harness, &credential, "Narrow", &[NARROW_SCOPE]).await;
+    let refused = harness
+        .call(with_key("/api/v1/developer/sandbox/probe", &narrow_token))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "the key lacks the scope, so the guard must refuse: {}",
+        refused.text
+    );
+    assert_eq!(
+        refused.body["error"]["code"].as_str(),
+        Some("scope_missing"),
+        "the refusal must name the gap rather than say the caller is anonymous: {}",
+        refused.text
+    );
+
+    // ---- read it back out of PostgreSQL, not out of a response body ----
+    let session_row: (String, Option<uuid::Uuid>, Option<String>, i16) = sqlx::query_as(
+        "select path, api_key_id, permission, status
+           from api_request_logs
+          where organization_id = $1 and actor_user_id = $2 and path = $3",
+    )
+    .bind(organization_id)
+    .bind(user)
+    .bind("/api/v1/developer/api-keys")
+    .fetch_one(harness.db.pool())
+    .await
+    .expect(
+        "a request the platform served must have logged itself. If this fails, the layer is not \
+         installed, or it sits outside the guards, or the guard is not publishing what it resolved.",
+    );
+    assert_eq!(
+        session_row.0, "/api/v1/developer/api-keys",
+        "the row must name the request the operator made"
+    );
+    assert_eq!(
+        session_row.1, None,
+        "a session is not a key: a key id here would be the log claiming a session authenticated \
+         as something it did not"
+    );
+    assert_eq!(
+        session_row.2.as_deref(),
+        Some("developer.keys.read"),
+        "the permission column is what makes a 403 explainable, and it must be the one the guard \
+         actually resolved — not the route's own name, and not nothing"
+    );
+    assert_eq!(session_row.3, 200);
+
+    // The key's own request, named by its id and the scope that was checked.
+    let key_row: (i16, Option<String>) = sqlx::query_as(
+        "select status, permission from api_request_logs where api_key_id = $1",
+    )
+    .bind(key_id)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("a key-authenticated request must have logged itself");
+    assert_eq!(key_row.0, 200);
+    assert_eq!(
+        key_row.1.as_deref(),
+        Some(PROBE_SCOPE),
+        "for a key, the matched scope *is* the authorization — the single most useful column in \
+         the table for somebody debugging a broken integration"
+    );
+
+    // And the refusal, with the scope the guard asked for rather than the one it resolved. The
+    // path is the probe's, because that is the route a key can reach — see the note on the
+    // fixture above.
+    let denied_row: (i16, Option<String>, Option<uuid::Uuid>) = sqlx::query_as(
+        "select status, permission, api_key_id
+           from api_request_logs
+          where organization_id = $1
+            and path = '/api/v1/developer/sandbox/probe'
+            and status >= 400",
+    )
+    .bind(organization_id)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect(
+        "a refusal must be logged too: the guard publishes what it asked for on the error path, \
+         which is why a 403 row names the scope to add instead of being anonymous",
+    );
+    assert_eq!(denied_row.0, 403);
+    assert_eq!(
+        denied_row.1.as_deref(),
+        Some(PROBE_SCOPE),
+        "the refusal names the scope the caller should have carried"
+    );
+    assert_eq!(
+        denied_row.2, Some(narrow_id),
+        "the refusal is attributed to the key that caused it, and to *that* key — a log that \
+         attributes it to another key is worse than one that attributes it to nobody"
+    );
+
+    // The negative: the platform's own probes must never be logged. A probe that both reads and
+    // writes is a probe that reports the platform down when the log table is unavailable, which
+    // is why `should_log_path` refuses it — and this is what holds that decision to the wire.
+    let before_probe: (i64,) =
+        sqlx::query_as("select count(*) from api_request_logs where path like '/readyz%'")
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the probe count must be readable");
+    let _ = harness.call(get("/readyz", None)).await;
+    let _ = harness.call(get("/healthz", None)).await;
+    let after_probe: (i64,) =
+        sqlx::query_as("select count(*) from api_request_logs where path like '/readyz%'")
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the probe count must be readable");
+    assert_eq!(
+        before_probe.0, after_probe.0,
+        "a readiness probe must never write a row: the log is a debugging surface, and a probe \
+         that depends on it is a probe that takes the platform down with its own table"
+    );
+
+    // And the query string, on a real request through the real layer with a token on it.
+    let leaky = harness
+        .call(get(
+            "/api/v1/developer/logs?status_class=4xx&access_token=super-secret-value",
+            Some(&credential),
+        ))
+        .await;
+    assert_eq!(leaky.status, StatusCode::OK);
+    let leaked: (i64,) = sqlx::query_as(
+        "select count(*) from api_request_logs where path like '%super-secret-value%'",
+    )
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the leak count must be readable");
+    assert_eq!(
+        leaked.0, 0,
+        "a token in a query string is a credential, and this table has a CSV export. The \
+         middleware passes `uri().path()` and the recorder strips again; this asserts the result \
+         rather than trusting either of them."
+    );
+
+    // The screener's own state must be intact — a key that is still live, still un-revoked.
+    let still_live: (Option<time::OffsetDateTime>,) =
+        sqlx::query_as("select revoked_at from api_keys where id = $1")
+            .bind(key_id)
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the key row must still be there: revocation is a soft delete");
+    assert_eq!(
+        still_live.0, None,
+        "logging a request must not touch the key itself"
+    );
+
+    harness.dispose().await;
+}
+
+/// The overview's numbers come from one snapshot and agree with the tables beside them.
+///
+/// The card row and the key list are two screens about one moment; a count read a second apart
+/// from the list it sits above is a screen an operator cannot reason about. So the walk reads
+/// both and compares, taking the database as the only third party.
+#[tokio::test]
+async fn the_overview_counts_the_same_keys_and_requests_the_tables_show() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let organization_id = create_organization_row(&harness.db).await;
+    let (user, credential) = account(&harness, Some(organization_id)).await;
+    grant(
+        &harness,
+        user,
+        organization_id,
+        &[
+            "developer.read",
+            "developer.keys.read",
+            "developer.keys.manage",
+            "developer.logs.read",
+            PROBE_SCOPE,
+        ],
+    )
+    .await;
+
+    let (_first, _token) = create_key(&harness, &credential, "Counted", &[PROBE_SCOPE]).await;
+
+    // One more session request, so the count the card reports is not dominated by the create
+    // call above. (The create call was itself logged, which is the point: this count cannot be
+    // zero on a screen sitting above a list the platform just wrote to.)
+    let listed = harness
+        .call(get("/api/v1/developer/api-keys", Some(&credential)))
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "the list must answer: {}", listed.text);
+
+    let overview = harness
+        .call(get("/api/v1/developer/overview", Some(&credential)))
+        .await;
+    assert_eq!(
+        overview.status,
+        StatusCode::OK,
+        "the overview must answer: {}",
+        overview.text
+    );
+
+    let counted: (i64, i64) = sqlx::query_as(
+        "select
+             (select count(*) from api_keys
+               where organization_id = $1 and revoked_at is null
+                 and (expires_at is null or expires_at > now())),
+             (select count(*) from api_keys where organization_id = $1 and revoked_at is not null)",
+    )
+    .bind(organization_id)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the counts must be readable");
+
+    assert_eq!(
+        overview.body["keys"]["active"].as_i64(),
+        Some(counted.0),
+        "the card must agree with the key table: {}",
+        overview.text
+    );
+    assert_eq!(
+        overview.body["keys"]["revoked"].as_i64(),
+        Some(counted.1),
+        "the card must agree with the key table: {}",
+        overview.text
+    );
+    assert_eq!(
+        overview.body["keys"]["expired"].as_i64(),
+        Some(0),
+        "no key in this walk carries an expiry, so the expired card reads zero rather than \
+         being absent"
+    );
+
+    let logged: (i64,) =
+        sqlx::query_as("select count(*) from api_request_logs where organization_id = $1")
+            .bind(organization_id)
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the request count must be readable");
+    assert!(
+        logged.0 > 0,
+        "the middleware must have logged the requests this walk made; a zero here means the layer \
+         is not installed, and every number on the card is then a confident lie"
+    );
+    // **The card is exactly one row behind the table, and that is not a bug.** The overview
+    // counts the rows that exist when its query runs; its *own* request is only written by the
+    // middleware after the handler has answered. So a strict equality here fails by one on
+    // every run — and "fixing" it by making the card add one to itself would be a lie that only
+    // shows up when something else changed. Asserting the difference is the honest form: it says
+    // the card counts *prior* traffic, which is the only thing a card can mean.
+    assert_eq!(
+        overview.body["requests_today"].as_i64(),
+        Some(logged.0 - 1),
+        "the card must count every row except its own: {}",
+        overview.text
+    );
+    assert!(
+        overview.body["errors_today"].as_i64().is_some(),
+        "the error counter must be present even at zero — an absent field reads as a broken card"
+    );
+
+    // The retention window the screen prints is the one the log honours, and the failure list
+    // carries no query string on its way out either.
+    assert_eq!(
+        overview.body["log_retention_days"].as_u64(),
+        Some(u64::from(omnion_developer::logs_store::window_days())),
+        "the screen must publish the window the table actually keeps"
+    );
+    let failures = overview.body["recent_failures"]
+        .as_array()
+        .expect("the failure list must be an array, not absent");
+    assert!(
+        failures.len() <= omnion_developer::RECENT_FAILURES,
+        "the list is bounded so the overview stays glanceable"
+    );
+    for line in failures {
+        let path = line["path"].as_str().unwrap_or_default();
+        assert!(
+            !path.contains('?'),
+            "a failure line must never carry a query string, even on the way out: {path}"
+        );
+    }
 
     harness.dispose().await;
 }
