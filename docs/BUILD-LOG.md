@@ -12198,3 +12198,380 @@ ticked: the three open ones are browser-only and the QA slot was live-held by **
 frees, run it **first** and alone —
 `QA_STACK=w4 OMNION_DATABASE_URL=postgres://…@127.0.0.1:5444/omnion_qa_w4 cargo test -p omnion-api --test crm -- --test-threads=1`
 — unbuffered to a file, and treat one completed run as the only thing that makes it green.
+
+
+---
+
+## Tick 100 — the twenty-tick bug was a missing key, and the excuse was load on the box
+
+**The headline: REQ-010's browser pass has been failing to reach its own screen since it was
+written, and last tick's log blamed the weather.**
+
+Last tick's entry ended with this: *"a pass that cannot land an upload cannot measure anything
+downstream — with 36 Chrome from other writers and load 12, three media depth passes failed on
+their own uploads … box contention, not a product defect."* That diagnosis was **wrong**, and the
+artifact it was based on contradicts it directly:
+
+```json
+"mediaUpload":  { "uploaded": true, "file": "upload-sample.png", "listed": 2 },
+"mediaGrants":  { … "step": "upload", "uploaded": true, "file": "upload-sample.png", "listed": 10 } }
+```
+
+Ten rows. The upload worked, twice, through the same helper, in the same run. What the summary
+also said was `"mediaFileDetail": { "ok": false, "reason": "no file to open — the upload step did
+not succeed" }` — a *reason* naming a step that demonstrably succeeded.
+
+The reason that reason is written is three characters long:
+
+```js
+// the helper writes `uploaded`, `file`, `listed` — and never `ok`
+if (!uploaded || !uploaded.ok) { return { ok: false, reason: "…" }; }
+```
+
+`uploaded.ok` is `undefined`. Falsy. **Always true.** `runMediaFileDetail` and `runMediaShares`
+returned before their first assertion on *every run since the passes were written*, and the pair
+states tick 99 added were therefore "in the harness and unrun" for a reason that had nothing to
+do with slots, siblings or load. A crowded box is a plausible story; the artifact in the same
+directory said `listed: 10`.
+
+**A guard that reads a key its helper never writes is silently always true.** No error, no stack,
+no warning — the pass simply returns early and the summary names something else. That is why
+twenty ticks of gate time bought nothing: `cargo test` does not read `walkthrough.cjs`, `tsc` does
+not read it, and the browser pass was the only instrument that noticed, and it noticed by
+bailing.
+
+### Fixed — three assertions, one defect class
+
+| # | What | Why the old one lied |
+|---|---|---|
+| 1 | `uploadMediaSample` returns `ok`, and `ok` means **the file is in the listing** — polled, not read once at 1.6 s | "the bytes reached an input" is not "the server kept the file"; a rejected upload leaves no row |
+| 2 | grant removal waits on the row disappearing (`waitForFunction`, 15 s) | `onRemove` does DELETE + notice + a full reload; the third is a network round trip, so a fixed 2500 ms asserted against whichever finished first — `afterRemove: 1` read as a failed removal |
+| 3 | the preset probe content-type-guards and try-catches every `res.json()` | `await res.json()` on a proxy's HTML page threw `SyntaxError` out of `page.evaluate` → `steps: 0`, and the report blamed the *screen* for the harness's own throw |
+
+### A gate, because twenty ticks of QA bought nothing
+
+`scripts/qa/probe-helper-contract.cjs` reads the harness's own source and holds the invariant:
+**every key a call site branches on is a key the helper's body can return.** Milliseconds, no
+browser, no database, no slot.
+
+One correction worth recording, because the gate caught my own reasoning: its first version
+asserted "the guards must no longer read `uploaded.ok`". That is wrong — the defect was a
+*mismatch*, and the fix could go either way (drop the read, or write the key). This went the second
+way, so a check forbidding the read fails on the fix. It did; it was wrong. The invariant is the
+real thing, and it is asserted in both directions instead.
+
+**Proven to fail, both directions:** helper restored to its original shape → **9/15**, naming both
+broken call sites by line; guard changed to read `uploaded.landedInLibrary` → **13/15**. Restored
+to 15/15 after each.
+
+### Gates
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **243 passed**, 0 failed |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| syntax | `node --check scripts/qa/walkthrough.cjs` | clean |
+| contract | `node scripts/qa/probe-helper-contract.cjs` | **15/15** |
+
+**Browser pass: still has not run**, and the slot is still held live by `w7`
+(`pid 1200667`, `cwd=/mnt/apopic/omnion-w7`, verified with `kill -0` and `/proc/<pid>/cwd`; load
+16.6, 25 Chrome). So the six pair states and the whole file-detail screen remain **unproven by a
+browser** — but for the first time the reason is a slot rather than a guard that could never pass.
+The screen-states box stays open, and REQ-010 stays open.
+
+**Next:** re-run `--only=media` on a free slot and read `mediaFileDetail` out of `summary.json` —
+it should now be `ok: true` with the pair steps present. Then REQ-010's last open code item, the
+CDN purge hook to REQ-011 (the `media.version_created` emitter it subscribes to shipped in slice 2;
+REQ-011 itself is a wave-5 REQ and out of my waves, so this stays a note).
+
+
+## 2026-10-01 · tick 101 · REQ-010 — the five filters the store had and the toolbar did not
+
+**What.** The acceptance box for the browser listing carried, in its own words, that *"size,
+uploader and date-range filters are in the API and the store but not yet on the toolbar"*. That
+was true of `min_bytes`, `max_bytes`, `uploaded_by`, `created_after`, `created_before` **and**
+`tag` — six filters implemented in `ListQuery::filters` with SQL clauses, accepted by
+`FileQuery`, and reachable only by hand-editing a URL. Nothing was broken: the enum compiled, the
+unit tests asserted the statements, the API answered, the columns existed, the walk passed. The
+panel simply could not say any of it.
+
+The class is tick 100's, one module over: a value **handled** on one side of a boundary and
+**offered** on the other. `cargo` cannot see the toolbar; `tsc` cannot see the filter list; the
+browser pass only finds it if somebody opens the filter bar. A half-wired feature is invisible to
+every instrument in the repository.
+
+**Also fixed, found while writing the controls:** `text-danger` / `border-danger` are used by
+`scanning-view.tsx` and defined **nowhere** in `globals.css` — the theme's palette is
+`canvas/surface/ink/muted/line/accent/accent-strong/accent-soft/positive/caution/quiet-soft`. Those
+messages were rendering in the inherited colour. My own first draft of the new controls used them
+too; the new gate caught it on the second read.
+
+**Decisions worth keeping.**
+
+* **The uploader list comes from the library, not from IAM.** `GET /api/v1/iam/users` is guarded by
+  `users.read`. A media operator holds `media.read` and five media keys, not that one — so a
+  toolbar sourced from IAM renders its filter behind a `403` for precisely the people who run the
+  library: a control that is present, enabled and always empty. `list_uploaders` groups the
+  library's own `created_by` and left-joins `users`, so a row whose account has been deleted still
+  appears (its files are still there) and `display_name` falls back to the address, because the
+  column is `not null default ''` and an empty dropdown label is worse than an email.
+* **A contradictory range is refused by name.** `min_bytes` above `max_bytes` is two adjacent
+  boxes an operator can type into disagreement. PostgreSQL answers zero rows; the panel renders
+  zero rows as *"no files match these filters"* — a claim about the library, printed for a form
+  that disagrees with itself. `MediaError::InvalidFilter { field, reason }` → `400 invalid_filter`
+  with `details.field`, and the toolbar puts the sentence under that input. A one-sided range and
+  a negative size stay legal, because "at most 1 MB" and "from 0 bytes" are both filters somebody
+  means.
+* **The date window is drawn in the browser.** `new Date("2026-10-03")` on a server is midnight
+  **UTC**, so a server-side expansion of a date filter shifts the window by the server's offset
+  from the operator's and a file uploaded at 23:00 becomes invisible. `mediaQuery` expands it
+  client-side, and `created_before` is the start of the **following** day, because the store's
+  clause is `created_at <` — sending the start of the picked day would empty the window's last
+  day silently.
+
+**Two PostgreSQL traps, found by the walk rather than by reading.** `list_uploaders` answered
+`500: column "label" does not exist` and stayed that way through the first fix, because **two**
+rules were in play: an output alias is visible to `order by` only when it is the *whole*
+expression (wrap it in `lower(...)` and the lookup falls through to the input columns), and
+`group by` never sees an alias at all. The fixes are not symmetric — the group is positional
+(`group by 1, 2`, which also keeps two accounts sharing a display name as two rows instead of
+collapsing their counts), and the order repeats the `coalesce` expression, because the positional
+escape for *that* is `lower(2)`, which is `lower(integer)` and whose hint names a missing function
+rather than a missing column.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **248 passed** (243 → 248) |
+| api | `cargo test -p omnion-api --lib --quiet` | **284 passed** |
+| walk | `cargo test -p omnion-api --test media` | +2 walks over the real router, live PostgreSQL |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| syntax | `node --check scripts/qa/walkthrough.cjs` | clean |
+| contract | `node scripts/qa/probe-helper-contract.cjs` | 15/15 |
+| **wiring** | `node scripts/qa/probe-media-filter-wiring.cjs` | **36/36**, proven to fail **34/36** and **35/36** |
+
+**Browser pass: not run.** The slot is held live by `w3` (`pid 2044970`, `cwd=/mnt/apopic/omnion-w3`),
+25 Chrome, load 7.8. The walkthrough gained the new controls as steps
+(`media-filter-controls`, `media-range-refusal`, `media-filters-cleared`, `media-uploader-filter`)
+so a free slot measures them on the next pass; the screen-states box stays open.
+
+**Disk, for whoever runs next:** `/mnt/apopic` is at **98 % (1.3 G free)**. `omnion-w2-target`
+(6.0 G) has **11 live processes** and `w8build` (3.7 G) is referenced by the `omnion-w8` cron job
+which ran ok six minutes before this check — **neither is reclaimable**, and the disk guard's globs
+(`omnion*/target`, `/dev/shm/*-target`) do not match either name, so it will not rescue them
+either. Only 220 M was reclaimable inside my own worktree. A `CARGO_TARGET_DIR` under `/dev/shm`
+is the lever that actually works.
+
+**Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps
+out of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+## 2026-10-01 · tick 102 · REQ-010 — every purge was leaving storage behind
+
+**What.** Three interactive purge paths — the single file, the bulk bar and empty-trash — read
+`media.storage_key`, deleted that one object and then removed the row. But `media_versions` and
+`media_derivatives` are both `on delete cascade` from `media`, so **the row delete that made the
+purge look complete also destroyed the only remaining record of where every superseded version and
+every preset-cache object lives.** They stayed in the bucket with nothing able to name them again.
+
+Nothing was red. The crates compiled, `omnion-media --lib` was green, the API answered, the
+retention sweep's own walk passed. A purge's tests assert the *row* is gone — and it is. The class is
+ticks 100 and 101's again: a value handled on one side of a boundary and not offered on the other,
+here a key that exists in three tables and is read from one.
+
+**Second defect, found by the walk written to measure the first.** `POST /media/{id}/versions` was
+mounted as a bare `post(…)` with no `DefaultBodyLimit`, so axum's **2 MB framework default** applied.
+Every replacement above it was refused `413` before `create_version` was ever entered — while the
+handler carries its own check against `MAX_UPLOAD_BYTES` (25 MB) and *names that number* in its
+error message. So the panel could store a 20 MB file through `/media` and then be unable to replace
+it, with an error saying "larger than the 26214400 byte limit" on a 2 MB body. Two limits for one
+operation, the smaller one undocumented and unintentional.
+
+**Decisions worth keeping.**
+
+* **One question, one function.** `owned_object_keys` is the union over all three tables;
+  `retention::all_keys_of` is now a **delegate** rather than a second query, and the uncalled third
+  copy (`preset_store::derivative_keys`) is deleted. The two survivors had *already drifted* — the
+  sweep unioned only two of three tables, so the nightly purge that exists to reclaim storage
+  nothing else will left every preset object behind. That is the class named in one line: three
+  implementations of one answer is how the interactive paths came to read one key.
+* **The gate counts, because duplication is the failure mode.** It fails when a fourth answer
+  appears and when the delegate is rewritten into a query. It cannot tell whether a query is
+  *correct* — the sibling walk answers that, against a real database. Its first version counted the
+  whole file and got 2, because the assertion message contains the string it counts: a gate that
+  reads its own explanation cannot fail. It now counts the function body only.
+* **A fixture is not a product.** Three of the four failures on the way here were the test's, and
+  each looked exactly like a product defect. A synthetic PNG header stores, lists and reorders fine
+  and answers `422 not_transformable` the first time anything *opens* it. A site row inserted after
+  `db.migrate()` has no `standard` preset, and an unknown preset deliberately serves the original
+  with a `200` — so the walk read two owned keys where it expected three. And the derivative cache
+  is keyed by `sha256(checksum | preset body)` and looked up **by cache key, not by `media_id`**,
+  so a repeated fixture was served *another file's* cached derivative and had none of its own. The
+  walk now asserts `image/webp` rather than `200`, because a `200` is not proof the preset ran.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **250 passed** (248 → 250) |
+| gate | the new `one_answer_to_what_a_file_owns_not_three` | proven to fail by rewriting the delegate into a query |
+| walk | `cargo test -p omnion-api --test media -- …purge… …replacement_may…` | **2 passed** over the real router, live PostgreSQL and MinIO |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| fmt | `rustfmt --edition 2024` on the touched files | clean; the ~40 files `cargo fmt --all` still lists are **pre-existing** and untouched here |
+
+**Browser pass: not run.** The slot is held live by `w3` (`pid 2914377`,
+`cwd=/mnt/apopic/omnion-w3`). The screen-states box stays open for that reason alone.
+
+**Disk:** `/mnt/apopic` is at **93 % (4.1 G free)** — up from 98 % last tick. `CARGO_INCREMENTAL=0`
+was used after a sibling deleted `target/` mid-build (`failed to copy … .o: No such file or
+directory`), which is the harness, not the code.
+
+**Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps out
+of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+### …and the suite that could not have found it
+
+While proving the walks above I ran `apps/api/tests/media_transform.rs` and got **0 passed, 5
+failed** — and it was not my change. The suite built its state from `Config::from_env()` and never
+set a CSRF secret, so every write it attempts is refused `403 csrf_unavailable`; `media.rs` has
+carried the same fix since its own suite hit that wall. All five walks had therefore **never run a
+single write** — they stopped at their first request, which is why nobody saw it: a suite that
+cannot write cannot fail in an interesting way.
+
+Three layers had to be fixed, and each revealed the next one:
+
+1. the secret on the **config**, not through the environment (`csrf_unavailable` → `csrf_failed`);
+2. the token on a write — `set_cookie` is only the **first** `Set-Cookie` and sign-in sends two, so
+   reading it alone yields a session with no token, which from the write path is indistinguishable
+   from a deployment that issued none (`csrf_failed` → a wrong cookie value);
+3. the multipart builder, which had the same gap and produced a *misleading* failure: it passed the
+   whole credential as the cookie value, `\x1f` is not a legal cookie byte, so the builder refused
+   the header and the panic read **`request must build`** — naming the builder instead of the
+   credential that was wrong.
+
+**5 passed** afterwards, over the real router, live PostgreSQL and MinIO. The lesson is the one
+below: *a suite that cannot exercise its subject reports the same number as a suite that is broken*,
+so "5 failed" and "5 never ran" are the same line and only the panic message tells them apart.
+
+### tick 103 — the third direction: the specs were never held against the event catalogue
+
+REQ-010's last open code item was "the CDN purge hook to REQ-011", so I read what that hook
+actually consumes. `media.replaced` is a name nothing emits under any spelling. The file manager
+records `media.version_created` — in REQ-010's own Events list and in the comment on the emitter
+— and REQ-011's spec subscribes to something else. The hook was not merely unbuilt: **built to
+that spec it would have subscribed to a name the bus never publishes**, and because `reconcile`
+deliberately keeps an unknown concrete name (a plugin may own names the table has never heard of)
+the subscription would have been accepted. The picker would have offered nothing, and a replaced
+file would have kept serving the previous version from the edge for ever — the one case the purge
+exists for.
+
+The interesting part is why every gate in this repo called the platform correct. Two drift gates
+already close that seam: `every_emitted_name_is_in_the_catalogue` (an emitter cannot name a
+missing row) and `every_live_name_has_an_emitter` (a `Live` row cannot lack an emitter). Both
+hold *emitters* against the catalogue. **Neither can see the third participant**, which is a
+request file writing down a name it expects to receive. The specs are hand-written, the
+catalogue is hand-written, and nothing in the repository ever compared them.
+
+`every_consumed_name_in_a_live_area_is_deliverable` (`apps/api/tests/events.rs`) walks
+`docs/requests/` and checks that direction. Two decisions make it a measurement rather than a
+guess:
+
+* **The name's *stem*, not its catalogue area.** My first probe compared against the area label
+  (`backups`) and found 9 violations; the Rust gate groups on the stem (`backup`), which is what
+  wildcards group on, and finds 25. The probe was measuring the wrong thing and the gate is the
+  accurate one — a subscriber writes `backup.*`, not `backups.*`.
+* **Only names whose area already emits.** Fifty-nine names across the specs belong to areas
+  nothing emits yet (`order.paid`, `crm.deal.won`, `chat.notify`). A module that has not been
+  built is *expected* to consume its neighbour's names; demanding a row for each would be the
+  registry lying in the direction this crate exists to prevent.
+
+**A gate that is red when it is written is a gate people stop reading**, and twenty-five names
+are unpayable today — every one owed by an unbuilt wave-5b module. So the debt is written down
+with its owner in `OWED_BY_AN_UNBUILT_MODULE`, and the assertion fails on anything *not* there
+and on any entry that has become redundant. Twenty-seven names, two specs, and every one of the
+`iam.*` entries belongs to REQ-065…074, all `pending`.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| gate | `cargo test -p omnion-api --test events -- …every_emitted …every_live …every_consumed` | **3 passed** — the seam now has three directions |
+| crate | `cargo test -p omnion-events --lib --quiet` | **49 passed**, unchanged |
+| proven to fail (1) | planting `media.shadow_copy` in REQ-010's own `Consumed:` line | **FAILED** — `1 name(s) cannot be delivered and nothing owes them`, naming file and line |
+| proven to fail (2) | adding a `Reserved` row for the owed `backup.completed` | **FAILED** — `1 entr(ies) … have become redundant`, so the list cannot rot |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| fmt | `rustfmt --edition 2024` on the one touched file | clean; `git status` shows the two files and nothing else |
+
+**Browser pass: not run.** The slot is held live by `w6` (`pid 1420424`,
+`cwd=/mnt/apopic/omnion-w6`). No screen changed this tick, so nothing is blocked behind it.
+
+**Disk:** `/mnt/apopic` is at **98 % (1.6 G free)**. `omnion-w2-target` (6.9 G) is in use by a
+live sibling test binary and was left alone; I reclaimed `target/debug/{build,.fingerprint}` from
+my own tree, which `lsof` showed held by nothing.
+
+**Next:** the browser pass on a free slot (`--only=media`, reading `mediaFileDetail` and the four
+filter steps out of `summary.json`), which closes REQ-010's screen-states box. The remaining half
+of the purge hook — `crates/cdn` itself — is REQ-011's slice 2.
+
+### tick 104 — the two halves of "the message", and why one test could never have seen either
+
+REQ-013's `partial`-run criterion asks for the failing part's message to be *visible in the
+UI*. Reading it as two claims rather than one produced two defects, and they are not the same
+defect.
+
+**The store kept one failure out of several.** `finish_run` wrote the run's `error` column from
+`find(...)` over the failed parts. `find` returns the first match, so a run whose media copy
+and whose database export both failed recorded one of them. The sharp part is *which* shape
+gets truncated: `partial` is only reachable when at least one part succeeded and at least one
+failed (`summarise`: `done == 0` → `Failed`, `failed == 0` → `Succeeded`). **The discarded
+shape is the shape the state exists for.** An operator with two broken parts was handed one
+reason, fixed it, watched the run stay red, and had no sentence left for the second.
+`summarise_failure` now sits beside `summarise` — the state and the reason, two pure functions
+side by side — keeps every message, joins in `PARTS` order so two runs with the same failures
+produce the same sentence, and clamps through the existing `truncate_error` because the column
+is `text` and a producer's message is unbounded before it arrives here.
+
+**The list had never drawn the reason at all.** `run.error` has been on every row of
+`GET /api/v1/backups` since slice 1 and `backups-view.tsx` never referenced it. The detail
+panel draws it, which is exactly why this survived: the defect reads as "the reason is one
+click away" on a screen whose whole job is to tell an operator which run to click. A red run
+was a coloured pill and nothing else.
+
+**Why every existing assertion was green.** `summarise` reports the *state*, and the state was
+right at every commit in this module's history. A test on the state cannot see a sentence that
+lost a message, and a screenshot of a healthy stack cannot either — the drawer's create button
+always asks for all five parts, so nothing on this screen ever failed. The six new tests assert
+the sentence itself, and the old state assertions are untouched and still green.
+
+The walkthrough grows the step that could have caught it. It does not rewrite `backups.status`:
+it points a live `media` row at a key nobody wrote, so the copy loop misses it through the real
+`Storage` exactly as it would in production, then requires the list to show a reason naming the
+failing part *and* the detail panel to show the per-part message, and puts the key back
+afterwards so the stack is not left poisoned.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-backup --lib --quiet` | **159 passed** (was 150), 0 failed |
+| proven to fail | regressing `summarise_failure` to `.take(1)` | **FAILED** — `the plugins failure is missing from "object store refused"` |
+| restored | same command after `cp` back | 159 passed |
+| build | `cargo build -p omnion-api` | exit 0 (13 pre-existing warnings) |
+| types | `bun x tsc --noEmit` (apps/admin) | exit 0 |
+| harness | `node --check scripts/qa/walkthrough.cjs` | clean |
+
+**Browser pass: not run.** The single QA place is held live by `w3` (`pid 2724189`,
+`cwd=/mnt/apopic/omnion-w3`), verified with `kill -0` and `/proc/<pid>/cwd` — a genuinely live
+pass, not a stale holder, so it was left alone. `/mnt/apopic` was at **98 % (1.4 G free)**;
+`run.sh` deletes `apps/{admin,web}/.next` and Turbopack needs ~1.5 G to rebuild, so a pass
+would have died on the disk rather than reported. I reclaimed `target/debug/incremental` from
+my own tree (1.0 G, `lsof` showed no holder) which took it to 1.8 G, and stopped there.
+
+**Next:** the browser pass on a free slot with `--only=backups`, reading `partial-run` and
+`partial-detail` out of `summary.json` — that is what closes this criterion. Slice 4
+(encryption at rest) is the last code slice this REQ owns.
+
+**A note on `rustfmt`:** running it on a crate reorders every `pub use` block and reflows
+unrelated functions — eight files, ~200 lines of churn that had nothing to do with this tick.
+Reverted with `git checkout --` and the export line re-applied by hand. Format the file you
+touched, not the crate.

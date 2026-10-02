@@ -26,6 +26,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod support;
+
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
@@ -508,11 +510,20 @@ impl Fixture {
     /// replace moves that column to the new key and the old one is named only by the history —
     /// a cleanup that misses them turns a test run into a slow leak.
     async fn cleanup(&self) {
+        // Three tables, not two — the same trap `owned_object_keys` exists for. `media_versions`
+        // and `media_derivatives` both cascade from `media`, so deleting the rows below removes
+        // the only record of where those objects live, and the bytes stay in the bucket for ever
+        // across every future run of this suite. A cleanup that leaks is a cleanup that makes the
+        // *next* run's storage assertions meaningless: `storage.get(key).is_err()` eventually passes
+        // for the wrong reason, or the derivative cache answers from a row the walk did not create.
         let keys: Vec<String> = sqlx::query_scalar(
             "select storage_key from media where site_id = any($1) \
              union \
              select v.storage_key from media_versions v \
-               join media m on m.id = v.media_id where m.site_id = any($1)",
+               join media m on m.id = v.media_id where m.site_id = any($1) \
+             union \
+             select d.storage_key from media_derivatives d \
+               join media m on m.id = d.media_id where m.site_id = any($1)",
         )
         .bind(&self.sites)
         .fetch_all(self.db.pool())
@@ -1809,6 +1820,20 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
     // A unique tail so two "same size, different bytes" versions really do differ.
     bytes.extend_from_slice(b"omnion-version-walk");
     bytes
+}
+
+/// A real PNG whose checksum differs on every call, so a walk measures *its* file.
+///
+/// The derivative cache is keyed by `sha256(checksum | preset body)` and looked up **by cache key**,
+/// not by `media_id` (`find_derivative`). Two files with identical bytes therefore share one
+/// derivative row, and a walk that uploads the same picture twice gets a `200 image/webp` from the
+/// *other* file's row — with no derivative of its own. The walk then reads two keys where it expects
+/// three and fails on "the derivative was not created", which is a fixture problem reported as a
+/// product one. The tint is the honest lever: it changes the pixels, and the encoder recomputes the
+/// CRC and the Adler-32 so the image stays decodable.
+fn unique_png(width: u32, height: u32) -> Vec<u8> {
+    let tint = (Uuid::new_v4().as_u128() % 251) as u8 + 4;
+    support::image_bytes::quadrant_png_tinted(width, height, tint)
 }
 
 /// Post a replacement to a file's version route, with a note beside the file.
@@ -3294,7 +3319,6 @@ async fn a_range_request_answers_a_window_and_says_what_it_sent() {
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
 }
 
-
 /// The custom pairs on a file are stored, filtered on, and refused by name.
 ///
 /// The column this walk reads has existed since `0025` with a GIN index over it, and until this
@@ -3352,8 +3376,12 @@ async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
     // A file nobody touched carries no pairs at all — not `null`, and not a pair with an empty
     // value. `{}` is what every pre-existing row holds, so this is the state the platform ships.
     assert_eq!(
-        media_column(&fixture.state, Uuid::parse_str(&autumn_id).expect("an id"), "metadata")
-            .await,
+        media_column(
+            &fixture.state,
+            Uuid::parse_str(&autumn_id).expect("an id"),
+            "metadata"
+        )
+        .await,
         Some(json!({})),
         "an untouched file carries no pairs"
     );
@@ -3510,7 +3538,11 @@ async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
             json!({ "shoot": { "lens": "50mm" } }),
             "metadata.shoot",
         ),
-        ("a list", json!({ "colours": ["red", "blue"] }), "metadata.colours"),
+        (
+            "a list",
+            json!({ "colours": ["red", "blue"] }),
+            "metadata.colours",
+        ),
         (
             "an over-long value",
             json!({ "licence": "C".repeat(600) }),
@@ -3622,7 +3654,12 @@ async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
         ),
     )
     .await;
-    assert_eq!(caption_only.status, StatusCode::OK, "body: {}", caption_only.body);
+    assert_eq!(
+        caption_only.status,
+        StatusCode::OK,
+        "body: {}",
+        caption_only.body
+    );
     assert_eq!(
         media_column(
             &fixture.state,
@@ -3689,7 +3726,12 @@ async fn a_custom_pair_is_stored_filtered_and_refused_by_its_own_name() {
         request(Method::GET, &browser, Some(&editor), None),
     )
     .await;
-    assert_eq!(read_pairs.status, StatusCode::OK, "body: {}", read_pairs.body);
+    assert_eq!(
+        read_pairs.status,
+        StatusCode::OK,
+        "body: {}",
+        read_pairs.body
+    );
     let shown = read_pairs.body["files"]
         .as_array()
         .expect("rows")
@@ -3795,6 +3837,649 @@ async fn the_pair_filter_and_editor_hold_the_line_a_tenant_does_not_cross() {
         StatusCode::UNAUTHORIZED,
         "no session, no listing: {}",
         anonymous.body
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_size_uploader_and_date_filters_narrow_a_live_listing() {
+    // The five filters this tick moved onto the toolbar. Until now they existed only in the
+    // store's `Filter` enum and the route's query struct, with a walk that asserted the SQL
+    // string and nothing that ever ran them against rows: `min_bytes` was proved to *build a
+    // clause* and never to *select anything*. This is that proof.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let upload = format!("/api/v1/media?site_id={site}");
+    let browser = format!("/api/v1/media/files?site_id={site}");
+    let other_site = fixture.site_b;
+    let other_library = format!("/api/v1/media?site_id={other_site}");
+
+    // Two different sizes, and one of them in the other organization so the filter cannot pass by
+    // matching everything in the database.
+    let small = b"x".repeat(64);
+    let large = b"y".repeat(4096);
+    for (name, bytes) in [("filters-small.txt", &small), ("filters-large.bin", &large)] {
+        let response = call(
+            &fixture.state,
+            upload_request(
+                &upload,
+                Some(&editor),
+                name,
+                "application/octet-stream",
+                bytes,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "{name}: {}",
+            response.body
+        );
+    }
+    let neighbour = call(
+        &fixture.state,
+        upload_request(
+            &other_library,
+            Some(&editor),
+            "filters-neighbour.bin",
+            "application/octet-stream",
+            &large,
+        ),
+    )
+    .await;
+    // The editor holds no key in the second organization, so this is refused. That is the point:
+    // the neighbour cannot appear, and the walk does not depend on it appearing.
+    assert!(
+        neighbour.status.is_client_error(),
+        "a file of another site must not be reachable: {}",
+        neighbour.body
+    );
+
+    // The size range selects the large one and not the small one, and the total agrees with the
+    // rows — the count and the page come from one filter list, so a disagreement is impossible.
+    let ranged = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "{browser}&min_bytes={}&max_bytes={}",
+                large.len(),
+                large.len() + 1
+            ),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(ranged.status, StatusCode::OK, "body: {}", ranged.body);
+    let names: Vec<&str> = ranged.body["files"]
+        .as_array()
+        .expect("files is an array")
+        .iter()
+        .filter_map(|file| file["filename"].as_str())
+        .collect();
+    assert_eq!(
+        ranged.body["total"].as_i64(),
+        Some(1),
+        "one file is 4096 bytes: {}",
+        ranged.body
+    );
+    assert_eq!(names, vec!["filters-large.bin"], "{names:?}");
+
+    // The other half of the range excludes it. A filter that ignored its bound would answer the
+    // same thing here, so the pair is the assertion — one direction is not a filter.
+    let narrow = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&max_bytes={}", small.len()),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(narrow.status, StatusCode::OK, "body: {}", narrow.body);
+    assert_eq!(narrow.body["total"].as_i64(), Some(1), "{}", narrow.body);
+    assert_eq!(narrow.body["files"][0]["filename"], "filters-small.txt");
+
+    // The uploader filter: only the editor uploaded here, so it selects both, and a member who
+    // never uploaded is not offered by the list at all.
+    let mine = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&uploaded_by={}", Uuid::nil()),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        mine.status,
+        StatusCode::OK,
+        "a stranger's id is a filter, not an error: {}",
+        mine.body
+    );
+    assert_eq!(mine.body["total"].as_i64(), Some(0), "{}", mine.body);
+
+    let uploaders = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/uploaders?site_id={site}"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(uploaders.status, StatusCode::OK, "body: {}", uploaders.body);
+    let listed = uploaders.body["uploaders"]
+        .as_array()
+        .expect("uploaders is an array");
+    assert_eq!(
+        listed.len(),
+        1,
+        "one account uploaded into this library: {listed:?}"
+    );
+    assert_eq!(
+        listed[0]["files"].as_i64(),
+        Some(2),
+        "both files: {listed:?}"
+    );
+    let label = listed[0]["label"].as_str().expect("a label");
+    assert!(
+        !label.trim().is_empty(),
+        "an empty dropdown label is worse than an address: {label:?}"
+    );
+    // The account that uploaded is the only candidate, and filtering by it returns both files —
+    // the list and the filter agree, which is the pair that makes a dropdown trustworthy.
+    let by_uploader = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!(
+                "{browser}&uploaded_by={}",
+                listed[0]["id"].as_str().expect("an id")
+            ),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        by_uploader.status,
+        StatusCode::OK,
+        "body: {}",
+        by_uploader.body
+    );
+    assert_eq!(
+        by_uploader.body["total"].as_i64(),
+        Some(2),
+        "{}",
+        by_uploader.body
+    );
+
+    // A member holding no media key gets no uploader list — the route reads with `media.read`,
+    // so the control can only be fed by somebody who may use the filter.
+    let member = fixture.member_token().await;
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/uploaders?site_id={site}"),
+            Some(&member),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "an account without media.read must not read the uploader list: {}",
+        refused.body
+    );
+
+    // A library nobody has uploaded into offers nobody. The panel shows that as its own sentence
+    // rather than as a dropdown with one blank option that silently filters everything out.
+    let platform = fixture.platform_token().await;
+    let empty = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/uploaders?site_id={other_site}"),
+            Some(&platform),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::OK, "body: {}", empty.body);
+    assert_eq!(
+        empty.body["uploaders"].as_array().map(Vec::len),
+        Some(0),
+        "an empty library has no uploaders: {}",
+        empty.body
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_range_typed_the_wrong_way_round_is_refused_by_name() {
+    // PostgreSQL's own answer to `min_bytes` above `max_bytes` is zero rows, and the panel renders
+    // zero rows as "no files match these filters" — a sentence about the library, printed for a
+    // form that is simply self-contradictory. The refusal has to name the box instead.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let browser = format!("/api/v1/media/files?site_id={site}");
+
+    for (query, field) in [
+        ("min_bytes=4096&max_bytes=1024", "min_bytes"),
+        (
+            "created_after=2030-01-02T00:00:00Z&created_before=2030-01-01T00:00:00Z",
+            "created_after",
+        ),
+    ] {
+        let response = call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("{browser}&{query}"),
+                Some(&editor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{query} must be refused: {}",
+            response.body
+        );
+        assert_eq!(
+            response.body["error"]["code"], "invalid_filter",
+            "{}",
+            response.body
+        );
+        assert_eq!(
+            response.body["error"]["details"]["field"], field,
+            "the message must name the field, so it can land under that input: {}",
+            response.body
+        );
+        assert!(
+            response.body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "the refusal carries a sentence: {}",
+            response.body
+        );
+    }
+
+    // A one-sided range and a negative size are not contradictions. Rejecting them would refuse a
+    // form a person can obviously mean: "at most 1 MB" and "from 0 bytes" are both valid.
+    for query in ["min_bytes=1", "max_bytes=1024", "min_bytes=-5&max_bytes=3"] {
+        let response = call(
+            &fixture.state,
+            request(
+                Method::GET,
+                &format!("{browser}&{query}"),
+                Some(&editor),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{query} is a valid range, not a contradiction: {}",
+            response.body
+        );
+    }
+
+    // A malformed date is refused by the store, not turned into a `500`.
+    let bad = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{browser}&created_after=not-a-date"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{}", bad.body);
+
+    fixture.cleanup().await;
+}
+
+/// A purge takes the bytes a file owns, not just the one its row names today.
+///
+/// The defect this walk is written against: every interactive purge read `media.storage_key`,
+/// deleted that single object and then removed the row. But `media_versions` and
+/// `media_derivatives` are both `on delete cascade` from `media`, so the row delete that made
+/// the purge *look* complete also destroyed the only remaining record of where the superseded
+/// versions and the preset cache live. Every one of those objects stayed in the bucket with no
+/// row that could ever name it again — storage that grows for ever and can only be cleared by a
+/// human with bucket access.
+///
+/// Nothing else in the suite can see this. The nightly sweep already unions the history
+/// (`retention::all_keys_of`), so its walk passes with a leaked-key implementation of the
+/// interactive paths; the existing media walks assert the *row* is gone, which it is. Only a
+/// walk that keeps the keys in hand and reads the object store after the purge can tell the two
+/// apart, so that is what this does.
+#[tokio::test]
+async fn a_purge_removes_every_object_the_file_ever_owned() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+
+    // A file with three owners of bytes: the current version, a superseded one, and a preset
+    // cache entry. All three are reachable by id, and the cache entry is the one a purge that
+    // reads only `media.storage_key` can never know about.
+    //
+    // The upload is a **real** PNG, not the synthetic header `png_bytes` writes. That helper is
+    // fine for a walk that only stores bytes — the library hashes what arrived, so the row is
+    // honest — but `?preset=standard` really decodes the image, and the synthetic header answers
+    // `422 not_transformable` with a CRC error. The preset is the whole point of this walk (it is
+    // the one object a single-key purge cannot name), so it has to be reachable.
+    // Both images are real, and the sizes are not arbitrary. `support::image_bytes` writes
+    // **stored** (uncompressed) deflate blocks, so a truecolour PNG costs `width * height * 3`
+    // bytes — the sizes are chosen so the walk stays small while satisfying a real product rule:
+    // the preset asks for a 1200px box, and the transform engine refuses to *enlarge* a source
+    // (`transform_would_enlarge`), so the bytes the preset actually reads — the **current** ones,
+    // which a replace moves forward — must be at least 1200 wide.
+    //
+    // That is why the order is what it is: the first upload is small and the replacement is the
+    // large one. Reading it the other way round fails on a rule that is the product being right.
+    let uploaded = call(
+        &fixture.state,
+        upload_request(
+            &library,
+            Some(&editor),
+            "hero.png",
+            "image/png",
+            &support::image_bytes::quadrant_png(320, 180),
+        ),
+    )
+    .await;
+    assert_eq!(
+        uploaded.status,
+        StatusCode::CREATED,
+        "body: {}",
+        uploaded.body
+    );
+    let file_id = id_of(&uploaded.body);
+
+    // The replacement also needs real bytes. A replace moves `media.storage_key` forward, so this
+    // is the object the preset URL decodes — a synthetic header here would answer `422` for the
+    // same reason the original did, and the walk would look like a transform defect rather than
+    // the fixture problem it is.
+    //
+    // Both images are small on purpose. `support::image_bytes` writes **stored** (uncompressed)
+    // deflate blocks, so a truecolour PNG costs `width * height * 3` bytes: 1920×1080 is 6.2 MB,
+    // which is inside the 25 MB limit but not by much, and what this walk needs is a second
+    // object that *differs* from the first — two different pictures of any size do that. Bigger
+    // would only make the walk slower and closer to the ceiling it is not testing.
+    let replaced = call(
+        &fixture.state,
+        replace_request(
+            &format!("/api/v1/media/{file_id}/versions"),
+            &editor,
+            "hero.png",
+            "image/png",
+            &unique_png(1200, 630),
+            "the campaign crop",
+        ),
+    )
+    .await;
+    assert_eq!(
+        replaced.status,
+        StatusCode::CREATED,
+        "a replace is what creates the second object: {}",
+        replaced.body
+    );
+
+    // The default `standard` preset is created with the site, so the preset URL is a read an
+    // operator makes without setting anything up.
+    //
+    // …created *with the site*. The migration's seed only covers sites that existed when it ran,
+    // so a row this fixture inserts afterwards has no preset — and an unknown preset does not
+    // answer `404`, it falls back to serving the original with a `200` (a renamed preset must not
+    // break a live page). A missing preset therefore fails this walk at `owned.len() >= 3` with a
+    // list of two keys, which reads as "the derivative was not created" and not as "the site has
+    // no preset". The site's own creation path seeds it; this does the same thing, and the walk
+    // asserts below that the preset is really there before it measures anything.
+    omnion_media::ensure_default_presets(fixture.db.pool(), site)
+        .await
+        .expect("the default presets must be seedable");
+    let preset: (i64,) =
+        sqlx::query_as("select count(*) from media_transformation_presets where site_id = $1")
+            .bind(site)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the presets must be queryable");
+    assert_eq!(
+        preset.0, 1,
+        "a site created after the migration carries no preset, and an unknown preset silently \
+         serves the original — so this count is what makes the rest of the walk mean anything"
+    );
+
+    let derivative = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/media/{file_id}/raw?preset=standard"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        derivative.status,
+        StatusCode::OK,
+        "the preset URL must answer before the purge can be measured: {}",
+        derivative.body
+    );
+    // A `200` is not proof the preset was honoured: an unknown preset serves the original with a
+    // `200` on purpose. The tell is the format — the preset emits `webp` and the source is a
+    // `png`, so a request that came back as `image/png` never went through the transform.
+    assert_eq!(
+        derivative.content_type.as_deref(),
+        Some("image/webp"),
+        "the preset was not applied — an unknown preset serves the original, which is a 200 with \
+         the source's own content type"
+    );
+
+    // Every key, read out of PostgreSQL before anything is deleted — the same answer the
+    // route is expected to arrive at, asserted independently of it.
+    let mut owned: Vec<String> = sqlx::query_scalar(
+        "select storage_key from media where id = $1 \
+         union \
+         select storage_key from media_versions where media_id = $1 \
+         union \
+         select storage_key from media_derivatives where media_id = $1",
+    )
+    .bind(Uuid::parse_str(&file_id).expect("an id"))
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the keys must read");
+    owned.sort();
+    owned.dedup();
+    assert!(
+        owned.len() >= 3,
+        "a replaced, preset-cached file owns at least three objects, not {}: {owned:?}",
+        owned.len()
+    );
+    for key in &owned {
+        assert!(
+            fixture.storage.get(key).await.is_ok(),
+            "{key} must be in the store before the purge"
+        );
+    }
+
+    // Trash, then purge the one file.
+    let trashed = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/media/files/{file_id}"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    // `200` with the trashed row, not `204`: the route hands back the file so the panel can show
+    // what it just trashed (the `restore` affordance needs the row it came from). Asserting a
+    // `204` here would have "caught" a route that was right all along.
+    assert_eq!(
+        trashed.status,
+        StatusCode::OK,
+        "the trash step must answer with the trashed file: {}",
+        trashed.body
+    );
+    assert_eq!(
+        trashed.body["version_count"], 2,
+        "the trashed row still owns its version history: {}",
+        trashed.body
+    );
+    let purged = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/media/files/{file_id}/purge"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(purged.status, StatusCode::NO_CONTENT, "{}", purged.body);
+
+    // The row is gone, and every cascade table went with it — so nothing can name these keys.
+    // `media` is keyed by `id` and the other two by `media_id`, so the column is named per
+    // table rather than shared: a `where media_id = $1` against `media` is a `42703` the
+    // walk would have reported as a product failure.
+    let id = Uuid::parse_str(&file_id).expect("an id");
+    for (table, column) in [
+        ("media", "id"),
+        ("media_versions", "media_id"),
+        ("media_derivatives", "media_id"),
+    ] {
+        let rows: (i64,) =
+            sqlx::query_as(&format!("select count(*) from {table} where {column} = $1"))
+                .bind(id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap_or_else(|err| panic!("{table} must still be queryable: {err}"));
+        assert_eq!(rows.0, 0, "{table} kept a row for a purged file");
+    }
+
+    // The assertion that fails on the old code: the objects are in the bucket with no row left
+    // to name them. Checked against the store, not against a length.
+    for key in &owned {
+        assert!(
+            fixture.storage.get(key).await.is_err(),
+            "{key} survived the purge: an object no row can name again is storage for ever"
+        );
+    }
+
+    fixture.cleanup().await;
+}
+
+/// A replacement as large as the library allows must be accepted, because an upload of that size
+/// is.
+///
+/// The defect: `POST /api/v1/media/{id}/versions` was mounted as a bare `post(…)` with no
+/// `DefaultBodyLimit` layer, so axum's framework default of **2 MB** applied. The handler carries
+/// its own check against `MAX_UPLOAD_BYTES` (25 MB) and names that number in its error message — and
+/// for any file over 2 MB that check was unreachable, because the body was refused on the way in.
+/// The visible result was a panel that could store a 20 MB file through `/media` and then refuse to
+/// replace it, with an error naming a 25 MB limit and a body that is 2 MB.
+///
+/// Why it survived: no walk replaced a file larger than a few hundred bytes, so the two limits never
+/// disagreed in front of a test. The number to assert is therefore the *library's*, not a size the
+/// fixture can afford to build twice — this walks just past the old 2 MB ceiling, which is where the
+/// two implementations of "the limit" first part company.
+#[tokio::test]
+async fn a_replacement_may_be_as_large_as_an_upload_may_be() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+
+    // Over the old framework ceiling (2 MB) and over the *uncompressed* size of any picture big
+    // enough to be interesting — so the walk does not depend on an encoder's output size.
+    let big = vec![b'x'; 3 * 1024 * 1024];
+
+    let uploaded = call(
+        &fixture.state,
+        upload_request(
+            &library,
+            Some(&editor),
+            "big.bin",
+            "application/octet-stream",
+            &big,
+        ),
+    )
+    .await;
+    assert_eq!(
+        uploaded.status,
+        StatusCode::CREATED,
+        "the upload of the same size must be accepted, or this walk proves nothing: {}",
+        uploaded.body
+    );
+    let file_id = id_of(&uploaded.body);
+
+    let replaced = call(
+        &fixture.state,
+        replace_request(
+            &format!("/api/v1/media/{file_id}/versions"),
+            &editor,
+            "big.bin",
+            "application/octet-stream",
+            &big,
+            "same size again",
+        ),
+    )
+    .await;
+    assert_eq!(
+        replaced.status,
+        StatusCode::CREATED,
+        "a replacement the upload would have accepted was refused: {}",
+        replaced.body
+    );
+
+    // And the ceiling that does exist is still enforced, by the handler, with its own message —
+    // otherwise "raise the limit" and "remove the limit" would be indistinguishable.
+    let over = vec![b'x'; omnion_media::MAX_UPLOAD_BYTES as usize + 1024];
+    let refused = call(
+        &fixture.state,
+        replace_request(
+            &format!("/api/v1/media/{file_id}/versions"),
+            &editor,
+            "big.bin",
+            "application/octet-stream",
+            &over,
+            "past the ceiling",
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a file past the library's own limit must still be refused: {}",
+        refused.body
     );
 
     fixture.cleanup().await;

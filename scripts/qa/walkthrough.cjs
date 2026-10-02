@@ -1160,20 +1160,43 @@ async function interact(page, pageName, report) {
  * only reaches visible controls — so this is the one place the pass sets a file on an input
  * directly, which is exactly what the browser does when a person picks a file. Without it the
  * library stays empty, and an empty library means the search index has no media to answer with.
+ *
+ * `ok` is the only field a caller should branch on, and it means **the file is in the listing** —
+ * not "the bytes were handed to an input". Two of this pass's guards used to read `uploaded.ok`,
+ * a key this never wrote, so `uploaded.ok` was `undefined`, falsy, and `runMediaFileDetail` and
+ * `runMediaShares` bailed with "the upload step did not succeed" on *every* run, including runs
+ * whose artifact showed `uploaded: true, listed: 2`. The report read that as a crowded box; the
+ * file was there the whole time and the guard was reading the wrong key. So: one answer, and the
+ * answer has to be about the library rather than about the act of setting an input.
  */
 async function uploadMediaSample(page, source) {
   const file = source || ensureSamplePng();
 
   const input = page.locator('input[type="file"]').first();
   if ((await input.count()) === 0) {
-    return { uploaded: false, note: "no file input on this screen" };
+    return { ok: false, uploaded: false, listed: 0, note: "no file input on this screen" };
   }
-  await input.setInputFiles(file).catch(() => {});
+  const setOnInput = await input
+    .setInputFiles(file)
+    .then(() => true)
+    .catch((err) => `setInputFiles failed: ${err.message}`);
   await page.waitForTimeout(1600);
+
+  // The listing is the proof, and it is asynchronous: an upload that the server rejected leaves
+  // no row, and a row the server did not accept is what every caller downstream actually needs.
+  let listed = 0;
+  for (let attempt = 0; attempt < 6 && listed === 0; attempt += 1) {
+    listed = await page.locator(`text=${path.basename(file)}`).count().catch(() => 0);
+    if (listed === 0) await page.waitForTimeout(700);
+  }
+
   return {
-    uploaded: true,
+    ok: listed > 0 && setOnInput === true,
+    uploaded: listed > 0,
     file: path.basename(file),
-    listed: await page.locator(`text=${path.basename(file)}`).count(),
+    listed,
+    setOnInput,
+    ...(listed === 0 ? { note: "the file never appeared in the library listing" } : {}),
   };
 }
 
@@ -4437,6 +4460,99 @@ async function runBackups(page, report) {
   const states = await page.locator('[data-testid="backup-state"]').allInnerTexts();
   note({ step: "list", rows, states: states.slice(0, 6) });
 
+  // ---- A `partial` run, and the reason the list shows for it (REQ-013) ------------------
+  //
+  // Every assertion above this line runs against a healthy run, because the drawer's create
+  // button always asks for all five parts and this stack's store answers. So the one state
+  // the screen exists to warn about — `partial`, and the sentence saying which part failed —
+  // was never exercised: not by the Rust walks (they assert the store's verdict) and not
+  // here (nothing on this screen fails). A screen that renders a green run perfectly and
+  // cannot say why a red one is red passes everything above.
+  //
+  // The fault is injected the way the platform itself would produce one, not by editing a
+  // run's status: a `media` row whose object is absent from the store. The media part's copy
+  // loop reads through the real `Storage`, gets a miss, records the failure and carries on —
+  // which is the documented behaviour (one bad object must not cost the other 4 998), and
+  // makes the run `partial` because the other four parts still succeed. Pointing a live row
+  // at a key nobody wrote is a one-line statement; rewriting `backups.status` would prove the
+  // list renders a word and nothing about why.
+  // `qaSql` is `execFileSync` — synchronous. It is not awaited anywhere else in this file for
+  // that reason, and an `await` on a non-promise here would read as though it were.
+  const partialProbe = qaSql(
+    `update media set storage_key = storage_key || '.absent-from-the-store' \
+     where id in (select id from media where deleted_at is null and purged_at is null limit 1)`,
+  );
+  note({ step: "partial-fault-injected", rows: partialProbe });
+
+  if (partialProbe === "UPDATE 1") {
+    await page.click('[data-testid="backup-create"]').catch(() => {});
+    await page
+      .waitForSelector('[data-testid="backup-create-drawer"]', { timeout: 5000 })
+      .catch(() => {});
+    await page.click('[data-testid="backup-create-confirm"]').catch(() => {});
+    await page.waitForTimeout(9000);
+
+    // Reload rather than trusting the current DOM: the run was created by the API after the
+    // panel had already drawn its table, and a panel that only refetches on a filter change
+    // would leave the new row invisible here — which is itself worth recording.
+    await page.goto(`${URL_ADMIN}/backups`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page
+      .waitForSelector('[data-testid="backups-overview"]', { timeout: 8000 })
+      .catch(() => {});
+    await page.waitForTimeout(1500);
+
+    const partialStates = await page
+      .locator('[data-testid="backup-state"]')
+      .allInnerTexts()
+      .catch(() => []);
+    // The reason is drawn on the ROW, not only in the detail panel. That is the whole claim:
+    // `run.error` has been on every list row since slice 1 and the table never drew it, so a
+    // red run was a coloured pill and the sentence an operator needs was one click away on a
+    // screen whose job is to tell them which run to click.
+    const reasons = await page
+      .locator('[data-testid="backup-row-reason"]')
+      .allInnerTexts()
+      .catch(() => []);
+    const reasonText = reasons.join(" | ").trim();
+    const sawPartial = partialStates.some((state) => /partial/i.test(state));
+    note({
+      step: "partial-run",
+      sawPartial,
+      states: partialStates.slice(0, 6),
+      reasonsRendered: reasons.length,
+      // A reason that names the failing part, in the operator's own words.
+      reasonNamesAFailingPart: /media/i.test(reasonText),
+      reason: reasonText.slice(0, 300),
+    });
+
+    // Open it, so the detail panel's own per-part messages are read too: the list sentence is
+    // a summary and the parts table is the record, and this pass is what proves both exist.
+    await page.locator('[data-testid="backup-row"]').first().click().catch(() => {});
+    await page.waitForTimeout(1500);
+    const detailRows = await page
+      .locator('[data-testid="backup-part-row"]')
+      .allInnerTexts()
+      .catch(() => []);
+    const failedPart = detailRows.find((text) => /failed/i.test(text)) ?? "";
+    note({
+      step: "partial-detail",
+      rows: detailRows.length,
+      failedPartShown: failedPart.trim().length > 0,
+      failedPart: failedPart.trim().slice(0, 240),
+    });
+
+    // Put the object back so the run this stack takes later is not permanently poisoned.
+    qaSql(
+      `update media set storage_key = replace(storage_key, '.absent-from-the-store', '') \
+       where storage_key like '%.absent-from-the-store'`,
+    );
+  } else {
+    note({
+      step: "partial-run",
+      reason: "this stack has no live media row to point at a missing object",
+    });
+  }
+
   // Filter chips carry the counts the endpoint sent, so a chip cannot disagree with the table.
   const chips = await page.locator('[data-testid^="backup-filter-"]').allInnerTexts();
   note({ step: "filters", chips: chips.slice(0, 6) });
@@ -4732,6 +4848,85 @@ async function runMediaFileManager(page, report) {
   await page.click('button[aria-label="Filters"]');
   await page.waitForTimeout(600);
 
+  // The size, uploader, date and tag filters (REQ-010, tick 101). They existed in the store and
+  // on the API for the whole life of the request with no control on the toolbar, so nothing in
+  // the tree could ever click them. This step is what makes them an *interaction* rather than
+  // markup: each is filled, the listing must react, and the contradictory range must produce a
+  // message under its own field rather than an empty listing.
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(300);
+  const filterIds = [
+    "media-min-size",
+    "media-max-size",
+    "media-uploader",
+    "media-created-after",
+    "media-created-before",
+    "media-tag",
+  ];
+  const present = [];
+  for (const id of filterIds) {
+    if ((await page.locator(`#${id}`).count()) > 0) {
+      present.push(id);
+    }
+  }
+  note({ step: "media-filter-controls", present, expected: filterIds.length });
+  await shot(page, "media-filter-bar");
+
+  // A min/max pair that contradicts itself must be refused *by name*. A zero-row listing would
+  // be the product looking healthy, so the assertion is on the alert text, not on the row count.
+  await page.fill("#media-min-size", "999999999");
+  await page.fill("#media-max-size", "1");
+  await page.waitForTimeout(1200);
+  const rangeAlert = await page
+    .locator("#media-min-size-error")
+    .innerText()
+    .catch(() => null);
+  const stillRendered = (await page.locator("#media-min-size").count()) > 0;
+  note({ step: "media-range-refusal", rangeAlert, stillRendered });
+  await shot(page, "media-range-refusal");
+
+  // Clear filters has to clear *all* of them, including the five this step added. A Clear that
+  // left the size boxes populated would make every later assertion in this pass read a filtered
+  // listing and blame the screen for it.
+  if ((await page.locator("#media-clear-filters").count()) > 0) {
+    await page.click("#media-clear-filters");
+  } else {
+    await page.fill("#media-min-size", "");
+    await page.fill("#media-max-size", "");
+  }
+  await page.waitForTimeout(900);
+  const cleared = {
+    min: await page.inputValue("#media-min-size").catch(() => null),
+    max: await page.inputValue("#media-max-size").catch(() => null),
+  };
+  note({ step: "media-filters-cleared", cleared });
+
+  // A real uploader selection must narrow, and the dropdown must be fed by the route that shares
+  // the listing's permission key rather than by the IAM one a media operator does not hold.
+  const uploaderOptions = await page
+    .locator("#media-uploader option")
+    .allTextContents()
+    .catch(() => []);
+  let uploaderNarrowed = null;
+  if (uploaderOptions.length > 1) {
+    const value = await page
+      .locator("#media-uploader option")
+      .nth(1)
+      .getAttribute("value")
+      .catch(() => null);
+    if (value) {
+      await page.selectOption("#media-uploader", value);
+      await page.waitForTimeout(1100);
+      const rows = await page.locator("tbody tr").count();
+      uploaderNarrowed = { value, rows };
+      await page.selectOption("#media-uploader", "");
+    }
+  }
+  note({ step: "media-uploader-filter", options: uploaderOptions.length, uploaderNarrowed });
+  await page.waitForTimeout(400);
+  await page.click('button[aria-label="Filters"]');
+  await page.waitForTimeout(500);
+
   // A delete is a trash, not a purge.
   const firstRow = page.locator("tbody tr").first();
   if ((await firstRow.count()) > 0) {
@@ -4851,12 +5046,39 @@ async function runMediaPresets(page, report) {
   const served = await page.evaluate(async (query) => {
     // The library is where a real file id lives; asking for the listing keeps this in the page
     // with the session cookie, so the bytes come from the real API.
+    //
+    // Every `res.json()` is guarded by a content-type check and a `try`. A body that is not
+    // JSON is the *expected* answer when the request never reached the API — a proxy's HTML
+    // error page, or the `Failed to …` string the server answers a crashed upstream with — and
+    // `await res.json()` on it throws `SyntaxError`, which escaped `page.evaluate` and took the
+    // whole depth pass down with it. The last run reported
+    // `page.evaluate: SyntaxError: Unexpected token 'F', "Failed to"... is not valid JSON` and
+    // `steps: 0`, so the preset pass asserted nothing at all and the report called it a failure
+    // of the *screen*. A measurement that cannot survive an error is not a measurement.
+    const readJson = async (res) => {
+      const type = res.headers.get("content-type") || "";
+      if (!type.includes("json")) {
+        const text = (await res.text().catch(() => "")).slice(0, 120);
+        return { __notJson: true, status: res.status, type, text };
+      }
+      try {
+        return await res.json();
+      } catch (err) {
+        return { __notJson: true, status: res.status, type, error: String(err) };
+      }
+    };
+
     const listed = await fetch("/api/v1/media/files?limit=1", { credentials: "same-origin" });
-    const page1 = await listed.json();
+    const page1 = await readJson(listed);
+    if (page1.__notJson) return { ok: false, reason: `listing: ${page1.text || page1.error}` };
     const file = page1.files && page1.files[0];
     if (!file || !query) return { ok: false, reason: "no file or no preset query" };
     const url = `/api/v1/media/${file.id}/raw${query}`;
     const response = await fetch(url, { credentials: "same-origin" });
+    if ((response.headers.get("content-type") || "").includes("json")) {
+      const text = (await response.text().catch(() => "")).slice(0, 120);
+      return { ok: false, reason: `the bytes came back as json: ${text}` };
+    }
     const buffer = new Uint8Array(await response.arrayBuffer());
     return {
       ok: response.ok,
@@ -5481,6 +5703,7 @@ async function uploadDuplicateSample(page) {
   await input.setInputFiles(second).catch(() => {});
   await page.waitForTimeout(1800);
   return {
+    ok: true,
     uploaded: true,
     first: path.basename(file),
     second: path.basename(second),
@@ -5727,8 +5950,21 @@ async function runMediaGrants(page, report) {
   // Removing it is immediate, and the empty state comes back. The confirmation is a
   // `window.confirm` and the harness accepts dialogs globally, so this is one click: a second
   // one would remove a grant that no longer exists and turn a passing check into a 404.
+  //
+  // The wait is on the *condition*, not on a stopwatch. `onRemove` does three things after the
+  // click — the DELETE, the notice, and a full `load()` of the tab — and the last of those is a
+  // network round trip. A fixed 2500 ms asserts against whichever of those three happened to
+  // finish first, so under load the row was still on screen and the pass reported
+  // `afterRemove: 1` as though the remove had failed. That is the same mistake as reading
+  // `uploaded.ok`: the assertion is measuring the clock instead of the thing.
   await page.click('[data-testid="media-grant-remove"]').catch(() => {});
-  await page.waitForTimeout(2500);
+  await page
+    .waitForFunction(
+      () => document.querySelectorAll('[data-testid="media-grant-row"]').length === 0,
+      undefined,
+      { timeout: 15000 },
+    )
+    .catch(() => {});
   const afterRemove = await page.locator('[data-testid="media-grant-row"]').count();
   const afterNotices = await page.locator('[data-testid="media-grants-notice"]').count();
   note({ step: "removed", afterRemove, afterNotices });
