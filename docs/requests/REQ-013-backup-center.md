@@ -1,6 +1,6 @@
 # REQ-013 — Backup Center
 
-> **Status:** in-progress (slices 1, 3 (retention sweep), 2a (restore preview), 2b (the destructive restore) and **2c (the queued, abortable restore)** shipped — 2c closes the last of slice 2's acceptance criteria, so slice 2 is now whole; the browser pass is the only thing still open on it. **The `partial`-run criterion's code half closed this tick (`151f732a`), and it was two defects rather than one: `finish_run` kept only the FIRST failed part's message — so a `partial` run, which exists precisely because parts failed in twos, reported one of them — and the runs list has never drawn `run.error` at all, though the API has returned it on every row since slice 1. `summarise_failure` and `backup-row-reason` are the two fixes; six unit tests assert the sentence, proven to fail with `the plugins failure is missing from "object store refused"`.** Remaining open: the browser pass (slot held live by `w3`), the status-card browser tick, slice 4 (encryption) and the walkthrough criterion. *(The date cells on this screen were empty for a second, unrelated reason, now fixed: every instant crossed the wire as a nine-element array rather than a timestamp — see `8322d753`.)* · **Captured:** 2026-09-25 · **Layer:** core (`crates/backup`) + admin UI
+> **Status:** in-progress (slices 1, 3 (retention sweep), 2a/2b/2c (the whole restore path) and **slice 4's encryption** shipped — slice 4's code half is done and walked end to end: the `encryption` column that migration `0157` introduced in tick 32 is now read by the producer and by the verifier, an artifact is AES-256-GCM with a per-artifact salt, `PUT /backup-settings` refuses a passphrase mode whose variable this process cannot see, and a configured-but-unresolvable key fails the run instead of writing plain JSON under a row that claims otherwise. The walk `an_encrypted_archive_verifies_with_its_passphrase_and_fails_cleanly_without_one` proves it over the real router and is proven to fail on the pre-slice-4 build.** Remaining: the browser pass (its only blocker is the shared slot), the status-card browser tick, slice 4's status-depth half (destination health card + the security/health cross-links) and the walkthrough criterion. *(Two environment notes: a `--only` pass on a box at load 21 dies with `Target crashed` and writes a `summary.json` containing only `{fatal}` — no report at all, which is evidence for nothing; and `cargo test -p omnion-api --test backups` **skips** rather than fails when its database does not exist, reporting `ok` — always run these walks against a freshly created database and read `--nocapture`.)* · **Captured:** 2026-09-25 · **Layer:** core (`crates/backup`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -149,7 +149,40 @@ Webhook relevance: `backup.completed` and `backup.failed` are prime subscriber e
   **The worker's query is unscoped, and that was a bug this slice found in its own first draft.** It called the tenant-scoped reader with `None`, and `is not distinct from null` matches rows whose `organization_id` **is** null — the platform's own jobs. Every tenant's restore would have sat `queued` for ever while the tick reported a clean pass: the same silence as the uncalled `next_due_schedules` one feature over, with the added sting that a background worker is *supposed* to cross tenants and the scoping that protects a request is exactly what hides a tenant's work from the thing that has to do it. `all_queued_restore_jobs` and `queued_restore_jobs` are now different functions with different names, so the unsafe form cannot be reached by passing the wrong argument.
   **Three decisions that keep the queue from lying about itself.** (1) A job nobody claims after an hour is **`aborted`, not `failed`** — `failed` requires a start by the schema's own constraint, and loosening that would stop `failed` meaning what it says; the state that already meant "stopped before the first write" is the honest one. (2) The job **carries the price the operator read** rather than re-deriving it, because a queued restore re-priced at execution time would restore against today's library while the operator agreed to yesterday's number. (3) The confirmation phrase is **re-checked at execution time**, since it is a hash of the run id and a job that outlived a re-created run would otherwise restore on a phrase that never belonged to it.
   Proved by two walks over the real router, and the first of them found the constraint contradiction above on its first cancel: the refusals (**five** of them, each by name, and a refused queue writes **no row at all** — a destructive route that minted an undeletable row every time somebody fat-fingered a phrase would be its own denial of service); the `202` with the job and its `cancellable: true`; **instants as strings, never nine-element arrays** (the wire-format defect of tick 72, re-asserted here because a new body is a new chance to reintroduce it); the price carried from the preview; a second restore refused while one is live; the Stop landing as `aborted` with `started_at IS NULL`; and then the assertions that make it an abort rather than a rename — **the run count unchanged (no safety backup), the library row count unchanged, and the live object still holding its own bytes**. A stranger's cancel, list and queue are each a `404` whose message does not name the tenancy rule; `backup.read` may list a job it may not stop, and an operator holding every *other* key cannot press Stop. The second walk proves the worker: a job flagged *without* going through the route — the exact state a cancel that lost the race leaves behind — is aborted and not restored, a fresh job for the same run then runs and the object is read back **out of the live store as bytes**, a stranded job is stopped rather than left spinning, and a job whose phrase is not this run's fails with a reason naming the rule.
-- [ ] Schedules for all four frequencies save, show a computed next run and fire within one tick of it. — **the cadence and the worker both shipped this tick; the four-frequency form and the browser pass are still open.** The defect this criterion was hiding is the same class as the uncalled `prune_candidates` one layer up: `backup_schedules` shipped in slice 1 with a `next_run_at` column and `next_due_schedules` shipped with it, and **nothing ever wrote the column or called the query** — so a schedule could be created, listed, and rendered with a cadence sentence beside an empty next-run cell for ever. A table with a column, a query that reads it, and no writer is a feature that looks complete in every screenshot and does nothing. Three things closed it:
+- [x] An encrypted archive verifies with the stored passphrase and fails cleanly with a wrong one. — **shipped this tick in two commits (`4586277e`, `abb1e101`), and the criterion was narrower than it looks.** The settings row has carried `encryption in ('none','passphrase')` since migration `0157`, and *nothing read it*: an operator could select passphrase mode, the screen would save it, and every artifact would still be written as plain JSON on the destination. The constraint was the whole feature.
+
+  **The cipher (`crates/backup/src/crypto.rs`).** An artifact is `OMN1 ‖ salt(16) ‖ nonce(12) ‖ AES-256-GCM`, keyed by `HKDF-SHA256(salt, passphrase, info="omnion-backup/artifact/v1")`. The magic is authenticated **as AAD**, so a ciphertext cannot be relabelled as plaintext or the reverse — and it is what lets a wrong passphrase answer *a dirty key is not corruption*: `open` checks the framing from the bytes alone and reports `NotEncrypted` separately from `Undecryptable`. Two decisions are the reason this is not a base64 blob: the salt is **per artifact**, so two archives of identical content do not share a key; and the `info` label namespaces the derivation, so an S3 credential that happens to be the same string cannot decrypt an archive.
+
+  **The seam.** `resolve_passphrase(ref, reader)` is the only place that touches the secret store, and it takes a reference plus a closure — this module has no store dependency and no way to invent a passphrase. The migration's own comment says the table has no column a value could be written into, and nothing here changes that.
+
+  **The producer and the verifier now agree on what a part *is*.** One rule, applied to two fields: the manifest describes the **document** (its checksum *and* its size), while the bytes that land are `document + framing + GCM tag`. `observe` opens the artifact before hashing. Recording either field from the sealed bytes made a correctly-encrypted archive report *"checksum differs for 1 part"* on its very first verification — the new walk found it, not reasoning: right passphrase, right bytes, one number describing something else.
+
+  **A configured-but-unresolvable passphrase fails the run rather than falling back to plaintext.** `PUT /backup-settings` refuses the mode by name (naming the variable to set) when the reference does not resolve, and stores nothing; the producer fails every part with the sentence that says why. The panel's own *"archives are stored unencrypted"* line is the reporting half; this is the enforcement half, and it is in the API because the mode can also be chosen by anyone editing the row.
+
+  **A sealed artifact with no key is skipped, not reported as corrupt.** It is not unreadable (the bytes are there) and it is not a mismatch; the verdict stays `clean: false` because something was not checked. Reporting a mismatch would send an operator to restore a perfectly intact backup.
+
+  **Proof.**
+
+  | Gate | Command | Result |
+  |---|---|---|
+  | crate | `cargo test -p omnion-backup --lib --quiet` | **174 passed** (was 159), 0 failed |
+  | proven to fail | regressing `seal` to the pre-slice-4 identity | **FAILED** — `the artifact on the destination is not sealed: 6542 bytes starting [123, 10, 32, 32, 34, …]` |
+  | proven to fail | regressing `salt` to a fixed vector | **FAILED** (see the lesson below) |
+  | walk | `cargo test -p omnion-api --test backups an_encrypted_archive` | **1 passed** in 19 s against a fresh database |
+  | build | `cargo build -p omnion-api` | exit 0 (pre-existing warnings only) |
+  | types | `bun x tsc --noEmit` (apps/admin) | exit 0 |
+
+  **One test in that set exists because the first draft of it was false.** `two_seals_of_the_same_plaintext_differ` asserted `assert_ne!(a, b)` and passed — but regressing **only** `salt` to a fixed vector left all 172 tests green, because the *nonce* alone satisfied it. The salt was therefore untested while the comment beside it claimed the salt was the property that stopped two identical archives from matching. The claim needed the nonce held fixed, and the salt now has two assertions that say so (`the_salt_alone_changes_the_key_of_an_otherwise_identical_artifact`, `the_nonce_is_fresh_per_artifact_and_is_not_the_salt`); that regression fails as it should. This is the "a test that cannot fail is worse than no test" class, found by *regressing the thing the comment claimed* rather than by reading the test.
+
+- [x] Schedules for all four frequencies save, show a computed next run and fire within one tick of it. — **the code half shipped in tick 105, and the four frequencies are now walked — the half the previous version of this box claimed and did not prove.** The criterion has read "all four frequencies" since it was written, and the walk behind it created **exactly one schedule, and it was `daily`** — `hourly`, `weekly` and `monthly` had never been through the router at all. Eighteen unit tests in `cadence.rs` cover all four and are strong (they are the reason the DST round-tripping exists), but they never touch `upsert_schedule`, and that function is where a frequency's own fields are written: `weekly` with no `day_of_week` is refused by `0157`'s `(frequency = 'weekly') = (day_of_week is not null)` — a `500` from a constraint is not the sentence the panel shows next to an input — and `hourly` is the one cadence that reaches `next_after` **before** the day search, on the branch no walk had taken.
+
+  **The load-bearing assertion is the column, not the response.** `upsert_schedule` and `set_schedule_next_run` are two statements, so a route that computed a correct next run and failed to store it would answer perfectly and the schedule would never fire — which is the exact defect the previous half of this criterion was about. Every read below is out of PostgreSQL.
+
+  **What the walk asserts per frequency, and why a green cadence test cannot see it:** `hourly` lands on `(minute, second) == (0, 0)` — "every hour at :37, whenever the schedule was saved" is not the cadence the schema allows, and it is invisible unless you look at the minute; `weekly` with `day_of_week = 3` lands on a **Wednesday**; `monthly` on the 28th lands on the **28th**, which is the only legal day a February has. A route that stored `weekly` as `daily` and `monthly` as `daily` answers all four calls with a plausible future instant and every one of these assertions turns red. It also requires each frequency's own column to be populated **only** where the schema says it belongs (`day_of_week` for weekly, `day_of_month` for monthly, null for the other two), so the editor opens on what the operator chose instead of on defaults.
+
+  **Four schedules, one tick, four runs — and each tied to its own schedule.** The previous walk could not have caught a worker that claimed one schedule per tick, because it only ever had one due. Now all four are backdated and `tick` is called once, and it must start **four**; each schedule must then have exactly one run of its own (`where schedule_id = $1 and organization_id = $2`, because a worker that tied every run to the last row it read would point all four at one backup while the counts still read four), and its `last_backup_id` must equal that run's id — **which is the manual-run bookkeeping defect from this morning's other slice, reappearing on the unattended path**: without it the panel's last-run column reads "never" beside a run it just produced. A second tick must start **zero**: a worker that left the column in the past would take four more backups a minute later, and a nightly schedule that quietly runs every minute is a destination full by morning.
+
+  **Proof.** `all_four_frequencies_save_and_compute_a_next_run_of_their_own_shape` **1 passed** in 9.4 s over the real router against a freshly created database, read with `--nocapture`. **Proven to fail:** regressing `fires_on`'s `weekly` arm to `true` (i.e. a weekly schedule silently behaving as a daily one) turns it red with `left: Saturday, right: Wednesday` — the exact class the criterion was asking about, and one no amount of green unit tests in the cadence module would have surfaced. Also in this tick: the manual-run route's missing `record_schedule_run` call (`record_schedule_run` now takes `Option<OffsetDateTime>` and writes `next_run_at = coalesce($3, next_run_at)`, so the unattended worker rearms and an operator's "run now" does not consume tomorrow's slot) — **and a syntax error in that walk's own assertion message, `\\"` inside a Rust string, which the interrupted previous run had left in the tree and which no compiler had been run against.** Gates: `omnion-backup --lib` **185 passed**, `cargo test -p omnion-api --test backups --no-run` exit 0, walk 1 passed, regression 1 failed. **Still open: the browser pass** (the shared QA slot was held live by `w4` at the start of this tick) and therefore the walkthrough criterion. The defect this criterion was hiding is the same class as the uncalled `prune_candidates` one layer up: `backup_schedules` shipped in slice 1 with a `next_run_at` column and `next_due_schedules` shipped with it, and **nothing ever wrote the column or called the query** — so a schedule could be created, listed, and rendered with a cadence sentence beside an empty next-run cell for ever. A table with a column, a query that reads it, and no writer is a feature that looks complete in every screenshot and does nothing. Three things closed it:
   1. **`crates/backup/src/cadence.rs` — `Cadence::next_after`, pure, 18 unit tests.** The wall clock is local and the stored instant is UTC: Istanbul 02:00 is `23:00Z` the day before, and the test asserts exactly that, because a scheduler that conflates the two is consistently wrong by hours and a test that only checks "the hour field is 02:00" cannot see it. The next run is **strictly after** now, so a schedule created at 02:00:30 with a time of day of 02:00 does not answer a moment in the past and get claimed on every tick. An unknown zone is refused by name rather than defaulted to UTC — "every day at 02:00 (Europe/Istanbool)" is not a fallback, it is a wrong answer delivered confidently.
   2. **Daylight saving is decided by round-tripping, not by asking the zone table.** `get_offset_local` answers `Some` for `02:30` on a spring-forward morning — a reading that never happened — and never answers `Ambiguous` for the hour that happens twice in autumn. Both were found by three zone tests failing against a version that trusted it. So each candidate offset is proposed and then re-checked: an offset that survives its own trip back to the wall clock is real. A gap moves the run forward by the gap (the same reading once the clocks have jumped — dropping it loses a backup, rejecting it stops the schedule for a year); a fold runs **once, at the earlier** of its two readings, because running on both would produce two runs an hour apart for one instruction and `retention_count` would hold two of the same backup.
   3. **`apps/api/src/backup_schedule_runner.rs` + the four write routes.** `POST`/`PUT`/`backup-schedules/{id}`, `DELETE`, and `/{id}/run`. The worker polls every **minute** — the sweep's six hours comes from the feature (retention is measured in days), while a schedule's is measured in minutes, and an hourly schedule that fires at :37 because the worker happened to wake at :37 is one the operator did not write. The worker calls the **same** `produce_all` the create route calls; a second producer loop would be a second definition of "what a part is" on the path that runs unattended at 02:00 on every installation that set up a schedule. A schedule whose cadence cannot be computed is **disabled** rather than retried for ever, because an unknown timezone is a configuration mistake and logging it every minute for a decade is not a repair.
@@ -209,6 +242,83 @@ Webhook relevance: `backup.completed` and `backup.failed` are prime subscriber e
   finished row turns the walk red, and the fix turns it green again.
   Gates: `omnion-backup --lib` **153/0**, `omnion-api --lib` **220/0**, `apps/api --test backups`
   **26/26** over a live database, `apps/admin` `tsc --noEmit` clean.
+- [x] The destination card says whether the **next backup fits**, which is not the same fact as
+  whether the destination is writable. — **shipped this tick; the criterion was implied by slice 4's
+  "destination health card" and nothing implemented it.** The status card had exactly one fact about
+  the destination — `writable` — and `writable` is *a 31-byte write succeeding*. A destination with
+  4 MB free passes the probe on every status load and every settings save, the card reads green, and
+  the next real run dies partway through the media part: which comes back as `partial` naming an
+  **object**, with the disk never named anywhere in the product. An operator reads "writable",
+  believes their backups fit, and discovers otherwise at 02:00 from a restore that failed.
+  **The two facts are separate cards, not one card with two lines**, because the failure modes are
+  different and the reassuring word must not sit where the alarming one belongs.
+
+  **The verdict is pure, and it is judged against this tenant's own history.**
+  `classify_headroom(free, largest) -> Headroom` takes two numbers and touches nothing, so a test can
+  hand it a 4 MB volume and a 40 GB one and read the answer without a filesystem — a function that
+  both *measured* and *judged* could only have its `Full` branch proven by filling a real disk, which
+  nobody does on a shared build box. Four verdicts, and the two that are **not** a pass are the point:
+  `Tight` (room is running short) and `Full` (less than one run needs) are distinct words, and the
+  message says **"may not fit"** for `Tight` and only **"will not fit"** for `Full`. A card that says
+  "will not" where it means "may not" teaches operators to ignore the word.
+
+  **The margin is 2×, and that number is a product decision, not a tuning value.** The retention sweep
+  deliberately keeps `retention` archives, so a volume sized for **one** archive is full *by design*
+  from the second day of a normal installation — a 1× comparison would send operators to enlarge disks
+  that are working exactly as configured, and would have been a red card on a healthy deployment.
+
+  **Three states that are refused rather than guessed, each with a test:**
+  * **Unmeasured is `unknown`, not zero.** `None` in, `Unknown` out. The tempting `unwrap_or(0)` turns
+    "the kernel would not say" into "the disk is full" and pages someone at 03:00 for a filesystem that
+    is fine.
+  * **No backup on record is `unknown`, not `healthy`.** A fresh installation has a free-space figure
+    and no yardstick. "Healthy" is a claim the function cannot support (4 MB free is not healthy) and
+    "full" sends an operator to a disk that is fine; both are worse than saying the question is open.
+  * **A zero-byte run is not a yardstick.** A run that produced no artifact compared against free space
+    would call every destination healthy.
+
+  **The measurement, and the two boundaries it respects.** `omnion-health` already holds the **single
+  sanctioned `unsafe` block in the entire workspace** — a `statvfs` with a written argument for why it
+  beats shelling out to `df` on a host that has already had a `coreutils` corruption incident where
+  binaries silently returned no output. `crates/backup` is `#![forbid(unsafe_code)]`, so the first
+  draft's own `statvfs` did not compile. Rather than weaken a crate-level promise for one function, the
+  read is `omnion_health::probes::free_bytes`: one syscall, one `unsafe` in the workspace, and a second
+  feature needing a filesystem fact **cannot become a second exception** — which is the way a workspace
+  that starts with one sanctioned block ends with thirty. The dependency is the price of the promise and
+  it is a path dependency inside the same workspace. `f_bavail`, not `f_bfree`: available blocks are what
+  an unprivileged process may actually use, and counting root-reserved blocks reports room a backup run
+  will not have.
+
+  **The bug the first draft shipped, and the test that found it.** It measured
+  `DestinationReport::probed_path` — which names the probe's marker **file**, and a probe that succeeds
+  has just deleted it (that is the whole reason it removes what it writes). `statvfs` on a deleted path
+  returns `ENOENT`, so the card would have read *"could not be measured"* on **every healthy
+  destination** — the pure half correct, the wiring measuring something that is not there. This is the
+  same producer/verifier disagreement this REQ keeps finding in a new costume (tick 105's checksum), and
+  only the wiring test could see it: every pure-classification test stayed green. Fixed to measure the
+  marker file's **parent**, and the regression is proven — reverting that one line turns
+  `headroom_is_measured_where_the_probe_actually_wrote` red with `the probe's own directory is measurable`.
+
+  **The yardstick is tenant-scoped, and the walk proves it rather than asserting it.** A global
+  `max(size_bytes)` would let one tenant's backup set another tenant's card red with a number neither
+  can see — the cross-tenant leak the media part had, one layer up, on the number that decides whether
+  an operator enlarges a disk. Proven by regression: removing the `organization_id` scope turns the walk
+  red with a stranger's row at 500 GB rendering this tenant's card as
+  *"1.5 GB free, less than the largest backup on record (500.0 GB). The next backup will not fit here."*
+  — a verdict about another company's data, on a card the operator's own history cannot justify.
+
+  **The walk also corrected one of its own assertions.** It first required the two free-space readings to
+  be *identical*; they differed by 12 KB, because the stranger's run really did write to the same
+  filesystem. An equality there asserts that the platform writes nothing, which is false — the walk would
+  have been red for a reason unrelated to the boundary it exists to prove. It is now a 1 MB tolerance
+  against a 1.6 GB reading: far larger than any bookkeeping difference, five orders of magnitude smaller
+  than the 500 GB a leaked maximum would inject, so a regression still fails it loudly.
+
+  **Gates.** `omnion-backup --lib` **185** (was 174), `omnion-health --lib` **70**, `cargo build
+  -p omnion-api` exit 0, `bun x tsc --noEmit` (apps/admin) exit 0, and the walk
+  `the_destination_card_reports_room_against_this_tenants_own_biggest_backup` **1 passed** over the real
+  router against a freshly created database, proven to fail in two directions (classification regressed
+  to writability-only → 3 unit tests red; yardstick scope removed → walk red).
 - [ ] Walkthrough passes with zero high findings.
 
 ### QA plan

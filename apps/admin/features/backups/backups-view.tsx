@@ -391,7 +391,16 @@ export function BackupsOverviewScreen() {
         </p>
       ) : null}
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      {/*
+        Five cards, and the grid says five at `xl` rather than wrapping a fifth onto a second
+        row: an odd card count in a four-column grid puts the headroom card alone on row two,
+        full-width, which reads as a different kind of thing from the four above it — and it is
+        exactly the card an operator needs compared against "On the destination" beside it. At
+        `sm` it is two columns, so the pairs are (last successful, next scheduled) and (on the
+        destination, destination) with the fifth starting row three; at `xl` all five fit one
+        row and the two that must be read together are adjacent.
+      */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
         <Card
           label="Last successful backup"
           value={age(status?.last_successful_at ?? null)}
@@ -421,6 +430,35 @@ export function BackupsOverviewScreen() {
           value={status?.destination.writable ? "writable" : "not writable"}
           tone={status?.destination.writable ? "ok" : "bad"}
           hint={status?.destination.message ?? "Reading the destination…"}
+        />
+        {/*
+          The headroom card is a FIFTH card and not a second line on the destination one,
+          and the reason is the thing the two facts disagree about. "Writable" is a 31-byte
+          write succeeding; "will hold an archive" is a different question with a different
+          failure — a destination with four megabytes free passes the probe on every settings
+          save and dies halfway through the next media part, which the run reports as `partial`
+          naming an object and never names the disk. Collapsing them onto one card would put
+          the reassuring word in the position where the alarming one belongs.
+
+          `null` is rendered as the word, never as a number. An unmeasured destination showing
+          "0 B free" is a number an operator enlarges a disk over, and the server-side message
+          already says the measurement could not be made.
+        */}
+        <Card
+          label="Room for the next run"
+          value={
+            status?.destination.headroom.free_bytes != null
+              ? formatBytes(status.destination.headroom.free_bytes)
+              : "not measured"
+          }
+          tone={
+            status?.destination.headroom.level === "healthy"
+              ? "ok"
+              : status?.destination.headroom.level === "unknown"
+                ? undefined
+                : "bad"
+          }
+          hint={status?.destination.headroom.message ?? "Measuring the destination…"}
         />
       </div>
 

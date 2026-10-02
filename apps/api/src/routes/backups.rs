@@ -231,6 +231,44 @@ pub struct DestinationBody {
     pub message: String,
     /// Whether archives are encrypted. The screen states this plainly when they are not.
     pub encryption: String,
+    /// How much room is left on the destination, and whether the next run fits.
+    pub headroom: HeadroomBody,
+}
+
+/// A destination's room, which is a different fact from whether it accepts a write.
+///
+/// The split exists because the card that used to read "writable" was the only answer, and
+/// writability is a 31-byte write succeeding. Every one of these fields is `null`-able on
+/// purpose: a card that renders `0 B` for a destination it could not measure invents a number,
+/// and an invented number on this particular card is one an operator enlarges a disk over.
+#[derive(Debug, Serialize)]
+pub struct HeadroomBody {
+    /// `healthy`, `tight`, `full` or `unknown`.
+    pub level: String,
+    /// Free bytes on the destination's filesystem, or `null` when the kernel would not say.
+    pub free_bytes: Option<u64>,
+    /// The largest backup this tenant holds there — the yardstick `level` was judged against.
+    pub largest_backup_bytes: Option<u64>,
+    /// The sentence the card shows under the numbers.
+    pub message: String,
+}
+
+impl HeadroomBody {
+    /// Build the body from a verdict and the two numbers it came from.
+    fn new(verdict: omnion_backup::Headroom, free: Option<u64>, largest: Option<u64>) -> Self {
+        Self {
+            level: match verdict {
+                omnion_backup::Headroom::Healthy => "healthy",
+                omnion_backup::Headroom::Tight => "tight",
+                omnion_backup::Headroom::Full => "full",
+                omnion_backup::Headroom::Unknown => "unknown",
+            }
+            .to_owned(),
+            free_bytes: free,
+            largest_backup_bytes: largest,
+            message: verdict.message(free, largest),
+        }
+    }
 }
 
 /// Settings, as the settings screen reads them.
@@ -500,6 +538,13 @@ pub async fn status(
     // `message()` borrows the report, so it is computed before `reason` is moved out of it.
     let probe_message = probe.message();
 
+    // The yardstick, and the reading. Both are asked for here rather than in the crate because
+    // one is a database question (what this tenant's biggest run was) and one is a filesystem
+    // question (how much room is left) — and because the verdict is meaningless without the
+    // first, so a caller that wants a level has to have had the opportunity to fetch both.
+    let largest = omnion_backup::largest_backup_bytes(pool, org).await?;
+    let (verdict, free) = omnion_backup::headroom_for(&probe, largest);
+
     Ok(Json(StatusBody {
         last_successful_at: last_at,
         last_successful_id: last_id,
@@ -517,6 +562,7 @@ pub async fn status(
             reason: probe.reason,
             message: probe_message,
             encryption: settings.encryption,
+            headroom: HeadroomBody::new(verdict, free, largest),
         },
     }))
 }
@@ -1080,6 +1126,21 @@ pub async fn run_schedule_now(
     let finished = omnion_backup::finish_run(pool, row.id, &stored, &now_string()).await?;
     let _ = settings;
 
+    // The schedule's own bookkeeping, which is what this route was missing. A manual run is a
+    // run **of this schedule** — it is tied to it, it carries its scopes and its retention, and
+    // it appears in the list as a scheduled run — so `last_run_at` and `last_backup_id` must
+    // move or the panel lies: an operator presses "Run now", watches the run appear in the
+    // list, and the schedule beside it still says **"never"** in the last-run column and
+    // "—" for the run it produced. The button's own doc comment promised that column would
+    // have something real in it, and the only writer of those two columns was the unattended
+    // worker, so the promise held for 02:00 and failed for a person.
+    //
+    // **`None` for the next run, and that is the load-bearing part.** The worker rearms; this
+    // route does not. An operator testing a 03:00 schedule at 09:00 has not consumed
+    // tomorrow's 03:00, and `coalesce` inside the store leaves the existing slot exactly as
+    // the schedule had it rather than recomputing one this path has no business computing.
+    omnion_backup::record_schedule_run(pool, schedule.id, finished.id, None).await?;
+
     record(
         pool,
         org,
@@ -1188,6 +1249,41 @@ pub async fn write_settings(
         }
     }
 
+    // Encryption mode `passphrase` is refused unless the reference it names resolves **right
+    // now**. The check is here, at the only point where an operator can still be told, because
+    // the alternative is a settings screen that saves "encrypted" and an archive writer that
+    // writes plaintext — with nothing between the two that would notice. The REQ says the panel
+    // "states clearly that archives are stored unencrypted" when the secret store is absent,
+    // and this is the enforcement half of that sentence: it is not enough for the panel to
+    // *say* so, because the setting can also be chosen by anyone editing the row.
+    //
+    // Two different situations, deliberately folded into one refusal because the remedy is the
+    // same sentence: a reference the process cannot see is a *deployment* problem, and an
+    // absent one is a *configuration* problem. Both name the variable to set, because
+    // "encryption failed" without a remedy is the sentence this whole check exists to replace.
+    if body.encryption == "passphrase" {
+        let passphrase = omnion_backup::resolve_passphrase(
+            body.credential_ref.as_deref(),
+            &|name| std::env::var(name).ok(),
+        );
+        if let Err(omnion_backup::CryptoError::EmptyPassphrase) = passphrase {
+            let missing = match body.credential_ref.as_deref().map(str::trim) {
+                Some(name) if !name.is_empty() => format!(
+                    "the passphrase variable `{name}` is not set in this process's environment"
+                ),
+                _ => "no credential reference names a passphrase variable".to_owned(),
+            };
+            return Err(ApiError::bad_request(
+                "encryption_passphrase_unavailable",
+                format!(
+                    "encryption is set to `passphrase` but {missing}. Set the variable in the \
+                     API process's environment, or choose `none` — with `none` this platform \
+                     states in plain words that archives are stored unencrypted."
+                ),
+            ));
+        }
+    }
+
     let saved = omnion_backup::save_settings(
         pool,
         &NewSettings {
@@ -1258,10 +1354,139 @@ pub(crate) async fn produce_for_worker(state: &AppState, run: &omnion_backup::Ba
         .count() as i32
 }
 
+/// How a run's artifacts are written: the encryption mode, and the passphrase when there is
+/// one.
+///
+/// Resolved once per run by [`artifact_sealer`]. Holding the passphrase here — never in a
+/// struct field that outlives the call — is deliberate: this value is the one thing in the
+/// backup centre that must not reach a log line, an error string or a debug struct.
+struct ArtifactSealer {
+    passphrase: Option<String>,
+}
+
+impl ArtifactSealer {
+    /// The bytes that actually land on the destination.
+    fn seal(&self, plaintext: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        match self.passphrase.as_deref() {
+            None => Ok(plaintext.to_vec()),
+            Some(passphrase) => omnion_backup::seal_archive(passphrase.as_bytes(), plaintext)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// The bytes verification compares a checksum over.
+    ///
+    /// A sealed artifact is checked **over its plaintext**, not over its ciphertext: the
+    /// manifest is the run's own account of itself and it records the checksum of the
+    /// document, so an operator can verify the same archive with an off-platform tool. The
+    /// alternative — checksumming the framed bytes — would make every part fail verification
+    /// the moment the mode changed, or make the checksum depend on a random salt that is
+    /// stored with the ciphertext.
+    fn open(&self, bytes: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        if !omnion_backup::is_sealed(bytes) {
+            return Ok(bytes.to_vec());
+        }
+        match self.passphrase.as_deref() {
+            None => Err(
+                "this artifact is encrypted and no passphrase is available in this process"
+                    .to_owned(),
+            ),
+            Some(passphrase) => omnion_backup::open_archive(passphrase.as_bytes(), bytes)
+                .map_err(|error| error.to_string()),
+        }
+    }
+}
+
+/// Resolve the encryption mode for a run, or the sentence that says why it cannot be.
+///
+/// `none` is an identity sealer and never fails. `passphrase` resolves through the reference
+/// the settings row names, read from this process's environment — the same seam
+/// `media_scan` uses for its `secret_env`, and the reason this function takes a pool rather
+/// than a string.
+async fn artifact_sealer(pool: &sqlx::PgPool) -> std::result::Result<ArtifactSealer, String> {
+    let settings = omnion_backup::load_settings(pool)
+        .await
+        .map_err(|error| format!("the backup settings could not be read: {error}"))?;
+    match omnion_backup::EncryptionMode::parse(&settings.encryption) {
+        Ok(omnion_backup::EncryptionMode::None) => Ok(ArtifactSealer { passphrase: None }),
+        Ok(omnion_backup::EncryptionMode::Passphrase) => {
+            let reference = settings.credential_ref.as_deref().unwrap_or_default();
+            let passphrase = omnion_backup::resolve_passphrase(
+                Some(reference),
+                &|name| std::env::var(name).ok(),
+            )
+            .map_err(|_| {
+                format!(
+                    "encryption is set to `passphrase` but the passphrase it references is not \
+                     available in this process, so this run would be stored unencrypted. It was \
+                     refused rather than written in plain text; set the variable or choose \
+                     `none` in the backup settings."
+                )
+            })?;
+            Ok(ArtifactSealer {
+                passphrase: Some(passphrase),
+            })
+        }
+        // The migration's check constraint admits only two values, so this arm is unreachable
+        // through the API — but `parse` refuses rather than assuming, because "assume `none`"
+        // is the one failure mode here that would write plaintext while the row claims a mode.
+        Err(_) => Err(format!(
+            "encryption is set to `{}`, which is neither `none` nor `passphrase`; this run was \
+             not written rather than written unencrypted",
+            settings.encryption
+        )),
+    }
+}
+
+/// Whether the settings row currently describes encrypted archives, for the panel's own
+/// statement. Never resolves a passphrase and never returns one — it answers "may archives be
+/// encrypted", not "how".
+pub(crate) async fn encryption_is_configured(
+    pool: &sqlx::PgPool,
+) -> std::result::Result<bool, ApiError> {
+    let settings = omnion_backup::load_settings(pool).await?;
+    Ok(settings.encryption == "passphrase")
+}
+
 async fn produce_all(state: &AppState, run: &omnion_backup::Backup) -> Vec<Part> {
     let pool = state.db().pool();
     let prefix = run.storage_prefix.clone();
     let mut produced = Vec::new();
+    // One resolution for the whole run, at the top. Every part of a run must be sealed under
+    // the *same* configuration: a run whose database part is encrypted and whose themes part
+    // is not is an archive whose restore depends on which part failed, and the operator learns
+    // that only on the day they need it. Resolving per part would also make the answer depend
+    // on the order the loop happened to take, which is the difference between a setting and a
+    // coin.
+    let sealer = match artifact_sealer(pool).await {
+        Ok(sealer) => sealer,
+        // A configured-but-unresolvable passphrase does **not** silently fall back to plain
+        // bytes. It fails every part, and the failure sentence says the archive is stored
+        // unencrypted — because that is what is about to be true, and a run that reports
+        // `succeeded` with plaintext on the destination is the outcome this refuses to produce.
+        Err(reason) => {
+            let mut parts = Vec::new();
+            for name in run.scopes.iter().filter(|s| omnion_backup::PARTS.contains(&s.as_str())) {
+                let part = Part::failed(name, &reason);
+                let _ = omnion_backup::save_part(
+                    pool,
+                    run.id,
+                    &NewPart {
+                        part: part.part.clone(),
+                        status: part.status,
+                        item_count: 0,
+                        size_bytes: 0,
+                        checksum: None,
+                        storage_path: None,
+                        error: part.error.clone(),
+                    },
+                )
+                .await;
+                parts.push(part);
+            }
+            return parts;
+        }
+    };
     // Only the scopes the run asked for. This loop used to walk all five `PARTS`
     // unconditionally, so a backup requested for `["database"]` produced five artifacts and
     // the scope selector in the drawer was a dead control: the scopes were validated,
@@ -1321,6 +1546,37 @@ async fn produce_all(state: &AppState, run: &omnion_backup::Backup) -> Vec<Part>
         };
         let bytes = serde_json::to_vec_pretty(&document).unwrap_or_default();
         let key = storage_key(&prefix, name);
+
+        // The document's own length, kept separately from the sealed length. The manifest
+        // describes the *document* — its checksum and its size — while the bytes that land on
+        // the destination are `document + framing + GCM tag`. `verify` opens the artifact and
+        // compares over the document, so recording the sealed length here would make every
+        // encrypted part report a mismatch on its very first verification: right passphrase,
+        // wrong size, and the sentence would be "the file is corrupt".
+        let document_bytes = bytes.clone();
+        let bytes = match sealer.seal(&bytes) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                let part = Part::failed(name, format!("{name} could not be encrypted: {reason}"));
+                let _ = omnion_backup::save_part(
+                    pool,
+                    run.id,
+                    &NewPart {
+                        part: part.part.clone(),
+                        status: part.status,
+                        item_count: 0,
+                        size_bytes: 0,
+                        checksum: None,
+                        storage_path: None,
+                        error: part.error.clone(),
+                    },
+                )
+                .await;
+                produced.push(part);
+                continue;
+            }
+        };
+        let checksum = omnion_backup::bytes_checksum(&document_bytes);
 
         // The bytes have to actually LAND before the part is recorded as done. Computing a
         // checksum over a document nobody wrote is how a run reaches `succeeded` with five
@@ -1394,11 +1650,17 @@ async fn produce_all(state: &AppState, run: &omnion_backup::Backup) -> Vec<Part>
             continue;
         }
 
+        // The size recorded is the **document's**, not the artifact's — the same rule the
+        // checksum follows, and it is one rule applied to two fields. `verify` opens the
+        // artifact and compares the document's size against this, so recording the sealed
+        // length here would make a correctly-encrypted archive report "checksum differs" on
+        // its first verification: the passphrase is right, the bytes are right, and only the
+        // number is describing something else.
         let part = Part::done(
             name,
             items,
-            bytes.len() as i64,
-            omnion_backup::bytes_checksum(&bytes),
+            document_bytes.len() as i64,
+            checksum,
             key,
         );
         let _ = omnion_backup::save_part(
@@ -1775,6 +2037,9 @@ async fn observe(
         Ok(settings) => settings.local_root,
         Err(_) => return Vec::new(),
     };
+    // One resolution for the whole verification, for the same reason the producer resolves it
+    // once per run: a verdict that depends on which part was read first is not a verdict.
+    let sealer = artifact_sealer(pool).await.ok();
     let mut observed = Vec::new();
     for part in &manifest.parts {
         let Some(relative) = part.storage_path.as_deref() else {
@@ -1785,10 +2050,26 @@ async fn observe(
         // as a mismatch: "the file is gone" and "the file is different" are different
         // answers and an operator acts on them differently.
         if let Ok(bytes) = tokio::fs::read(&path).await {
+            // A sealed artifact is opened **before** it is hashed, and the checksum compared is
+            // the plaintext's — which is what the manifest recorded when the part was written.
+            // Hashing the framed bytes instead would make every encrypted archive report a
+            // mismatch on its very first verification, and the sentence would be "the file is
+            // corrupt" when the truth is "this is what encrypted looks like".
+            //
+            // A sealed artifact with no passphrase available is skipped rather than hashed:
+            // it is not unreadable (the bytes are right there) and it is not a mismatch. The
+            // run's own error column is where that gets said, and inventing a mismatch here
+            // would send an operator to restore a backup that is perfectly intact.
+            let plaintext = match sealer.as_ref().map(|sealer| sealer.open(&bytes)) {
+                Some(Ok(opened)) => opened,
+                Some(Err(_)) if omnion_backup::is_sealed(&bytes) => continue,
+                None if omnion_backup::is_sealed(&bytes) => continue,
+                _ => bytes,
+            };
             observed.push(omnion_backup::ObservedPart {
                 part: part.part.clone(),
-                checksum: omnion_backup::bytes_checksum(&bytes),
-                size_bytes: bytes.len() as i64,
+                checksum: omnion_backup::bytes_checksum(&plaintext),
+                size_bytes: plaintext.len() as i64,
             });
         }
     }
