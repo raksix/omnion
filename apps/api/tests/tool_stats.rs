@@ -41,7 +41,7 @@ use std::sync::Mutex;
 use omnion_ai_hub::tool_stats::{self, Window};
 use omnion_core::config::{Config, DatabaseConfig};
 use omnion_core::Db;
-use time::Date;
+use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 /// One tool call, as the loop would have written it.
@@ -245,6 +245,77 @@ impl Stats {
         .await
         .expect("the truth query must succeed");
         row
+    }
+
+    /// One settled agent run on the fixed day: a status, a stop reason and a cost.
+    ///
+    /// A run is written by hand rather than by the runtime because the runtime needs a model, a
+    /// provider and a step loop to get to the state — and a walk whose fixture has to stand up
+    /// an inference stack to prove a `count(*) filter` is a walk that breaks the week someone
+    /// moves that column. Every column written here is one the schema requires, not one a
+    /// summary reads: `goal` is the run's own text, `stop_reason` is the closed vocabulary the
+    /// run list renders, and the cost is the run's own total.
+    ///
+    /// `stop_reason` is `Option` and `finished_at` is derived from the status, because the schema
+    /// will not accept the alternative: `ai_runs_finished_has_stamp` refuses a stamp on an
+    /// unsettled run and `ai_runs_reason_implies_finished` refuses a reason on one either. A
+    /// helper that wrote both unconditionally would be writing rows the runtime never produces —
+    /// and it would do it *silently*, because the failure shows up as a constraint violation in
+    /// whatever walk happens to seed an in-flight run first.
+    async fn seed_run(
+        &self,
+        status: &str,
+        stop_reason: Option<&str>,
+        cost_micros: i64,
+        steps: i32,
+    ) {
+        let agent = Uuid::new_v4();
+        sqlx::query("insert into ai_agents (id, organization_id, name, key) values ($1, $2, $3, $4)")
+            .bind(agent)
+            .bind(self.organization)
+            .bind(format!("run agent {agent}"))
+            .bind(format!("run-agent-{agent}"))
+            .execute(&self.pool)
+            .await
+            .expect("the run's agent must be created");
+
+        // A run is settled or it is not, and the two shapes differ in the columns the schema
+        // demands: an unsettled run has no finish stamp and no reason, a settled one has both.
+        let settled = matches!(status, "completed" | "failed" | "cancelled");
+        let finished_at = settled.then(|| format!("{} 09:30:00+00", self.day));
+        let stop_reason = settled.then_some(stop_reason).flatten();
+
+        let run = Uuid::new_v4();
+        sqlx::query(
+            "insert into ai_runs (id, organization_id, agent_id, status, stop_reason, goal, \
+             cost_micros, started_at, finished_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::timestamptz)",
+        )
+        .bind(run)
+        .bind(self.organization)
+        .bind(agent)
+        .bind(status)
+        .bind(stop_reason)
+        .bind("telemetry run fixture")
+        .bind(cost_micros)
+        .bind(format!("{} 09:00:00+00", self.day))
+        .bind(finished_at)
+        .execute(&self.pool)
+        .await
+        .expect("the run must be created");
+
+        for index in 0..steps {
+            sqlx::query(
+                "insert into ai_run_steps (run_id, step_no, kind, tool, status) \
+                 values ($1, $2, 'tool_call', $3, 'completed')",
+            )
+            .bind(run)
+            .bind(index + 1)
+            .bind(format!("step_tool_{index}"))
+            .execute(&self.pool)
+            .await
+            .expect("the run's step must be created");
+        }
     }
 
     async fn dispose(mut self) {
@@ -546,6 +617,235 @@ async fn the_costliest_failing_tool_ignores_a_tool_that_never_failed() {
     assert_eq!(*day, fx.day);
     assert_eq!(tool, "flaky", "the expensive but healthy tool must not be ranked");
     assert_eq!(*cost, 10);
+
+    fx.dispose().await;
+}
+
+/// **The step histogram counts settled runs, files a stepless one under zero, and ignores the
+/// ones still in flight.**
+///
+/// Three claims, each of which the chart gets wrong in a way no count elsewhere would notice:
+///
+/// 1. **A run with no steps is a bar, not a gap.** `inner join` would drop it, and "the agent
+///    answered without calling a single tool" is the row that explains a flat histogram.
+/// 2. **A run still in flight is not counted.** Its step count is a prefix, so including it makes
+///    the shape of the chart depend on when the page was loaded — the one property a
+///    distribution must not have.
+/// 3. **A queued run is not counted either**, and not merely for symmetry: `started_at` is null
+///    for it, so there is no day to file it under. A reader that bucketed it anyway would be
+///    inventing a timestamp.
+#[tokio::test]
+async fn the_step_histogram_files_a_stepless_run_and_ignores_one_still_going() {
+    let fx = stats!();
+
+    // 0 steps — answered from nothing.
+    fx.seed_run("completed", Some("final_answer"), 100, 0).await;
+    // 1 step.
+    fx.seed_run("completed", Some("final_answer"), 200, 1).await;
+    // 3 steps, twice — the bar has to accumulate rather than overwrite.
+    fx.seed_run("completed", Some("final_answer"), 300, 3).await;
+    fx.seed_run("completed", Some("max_steps"), 400, 3).await;
+
+    // Two runs the histogram must not see. `running` has a step count that is still growing, and
+    // `queued` has no `started_at` at all — the schema's own "never began" marker.
+    fx.seed_run("running", None, 900, 5).await;
+    let queued_started_at: Option<OffsetDateTime> =
+        sqlx::query_scalar("insert into ai_runs (organization_id, status, goal, cost_micros) \
+         values ($1, 'queued', 'queued fixture', 999) returning started_at")
+            .bind(fx.organization)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("the queued run must be created");
+    // The reason the reader may exclude it rather than having to guess: a queued run has no day
+    // at all. Asserted here so the walk states the fact it depends on rather than trusting it.
+    assert_eq!(
+        queued_started_at, None,
+        "a queued run has no started_at — the reader must not be inventing one for it"
+    );
+
+    let buckets = tool_stats::step_histogram(&fx.pool, fx.organization, fx.window())
+        .await
+        .expect("the histogram must read");
+    let seen: std::collections::BTreeMap<i32, i64> = buckets
+        .iter()
+        .map(|bucket| (bucket.steps, bucket.runs))
+        .collect();
+
+    assert_eq!(seen.get(&0), Some(&1), "a run with no steps is a bar of one, not a gap");
+    assert_eq!(seen.get(&1), Some(&1));
+    assert_eq!(seen.get(&3), Some(&2), "two three-step runs are one bar of two");
+    assert!(
+        !seen.contains_key(&5),
+        "a running run has a step count that is a prefix; the chart must not include it ({seen:?})"
+    );
+    assert_eq!(
+        seen.values().sum::<i64>(),
+        4,
+        "exactly the four settled runs count: {seen:?}"
+    );
+
+    fx.dispose().await;
+}
+
+/// **Cost per solved task divides by the successes, and a run that hit `max_steps` is not one.**
+///
+/// The fixture is three runs on one day: one that answered, one that ran out of steps, one that
+/// failed. The ratio is asserted against the arithmetic a reader would do by hand, and the trap
+/// is explicit — `completed` **alone** is not "solved". A runaway that burned its whole budget is
+/// recorded `completed`, so a reader that counted statuses instead of stop reasons would halve
+/// this denominator and double the reported price of every success while calling a loop "a win".
+#[tokio::test]
+async fn cost_per_solved_counts_only_runs_that_reached_an_answer() {
+    let fx = stats!();
+
+    fx.seed_run("completed", Some("final_answer"), 200_000, 2).await;
+    fx.seed_run("completed", Some("max_steps"), 600_000, 9).await;
+    fx.seed_run("failed", Some("error"), 200_000, 4).await;
+
+    let days = tool_stats::cost_per_solved(&fx.pool, fx.organization, fx.window())
+        .await
+        .expect("the scatter's source must read");
+    assert_eq!(days.len(), 1, "one day of runs is one point: {days:?}");
+
+    let day = &days[0];
+    assert_eq!(day.day, fx.day);
+    assert_eq!(
+        day.runs, 3,
+        "every settled run is counted — the failures cost money too"
+    );
+    assert_eq!(
+        day.solved, 1,
+        "only `completed` with `final_answer` answered; `max_steps` and `error` did not"
+    );
+    assert_eq!(day.cost_micros, 1_000_000);
+    assert_eq!(
+        day.cost_per_solved(),
+        Some(1_000_000),
+        "the whole day's cost over the one run that answered"
+    );
+
+    fx.dispose().await;
+}
+
+/// **A day where every run failed has no cost per solved — and does not read as a free day.**
+///
+/// The `None` matters more than the number: `Some(0)` would put the worst day on this screen at
+/// the bottom of the y-axis as the cheapest day, which is the one inversion a cost chart can make
+/// that actively inverts its own meaning.
+#[tokio::test]
+async fn a_day_that_solved_nothing_reports_no_cost_and_keeps_the_spend_it_made() {
+    let fx = stats!();
+
+    fx.seed_run("failed", Some("error"), 400_000, 3).await;
+    fx.seed_run("failed", Some("error"), 350_000, 2).await;
+
+    let days = tool_stats::cost_per_solved(&fx.pool, fx.organization, fx.window())
+        .await
+        .expect("the scatter's source must read");
+    let day = &days[0];
+    assert_eq!(day.runs, 2);
+    assert_eq!(day.solved, 0);
+    assert_eq!(day.cost_micros, 750_000, "the spend is real even though nothing was solved");
+    assert_eq!(
+        day.cost_per_solved(),
+        None,
+        "a day that bought nothing has no cost per success, not a cost of zero"
+    );
+
+    fx.dispose().await;
+}
+
+/// **The run-shaped panels are scoped to a tenant, like the tool table.**
+///
+/// Without this, a silent tenant's `/ai/telemetry` would show another tenant's run shapes — the
+/// cross-tenant leak the tool read above already guards, applied to the two panels the screen
+/// renders next to it.
+#[tokio::test]
+async fn the_run_panels_never_show_another_tenants_runs() {
+    let fx = stats!();
+    fx.seed_run("completed", Some("final_answer"), 100_000, 2).await;
+
+    let other = Uuid::new_v4();
+    sqlx::query("insert into organizations (id, name, slug) values ($1, $2, $3)")
+        .bind(other)
+        .bind("other tenant runs")
+        .bind(format!("other-runs-{other}"))
+        .execute(&fx.pool)
+        .await
+        .expect("the second tenant must be created");
+
+    let histogram = tool_stats::step_histogram(&fx.pool, other, fx.window())
+        .await
+        .expect("the histogram must read");
+    assert!(
+        histogram.is_empty(),
+        "tenant B saw tenant A's run shapes: {histogram:?}"
+    );
+
+    let scatter = tool_stats::cost_per_solved(&fx.pool, other, fx.window())
+        .await
+        .expect("the scatter must read");
+    assert!(
+        scatter.is_empty(),
+        "tenant B saw tenant A's cost per solved: {scatter:?}"
+    );
+
+    fx.dispose().await;
+}
+
+/// **A window really excludes the runs from outside it.**
+///
+/// The histogram and the scatter both read live `ai_runs` rather than a roll-up, so the window
+/// filter is the only thing keeping last month's traffic out of a 7-day chart. The window is
+/// narrowed to the fixture's own day, so a reader that ignored `$2`/`$3` would return the same
+/// rows and the assertion would pass — the fixture has to be able to *fail* the reader, and the
+/// only way to arrange that is to place a run on a day the window excludes.
+#[tokio::test]
+async fn the_run_panels_exclude_runs_outside_the_window() {
+    let fx = stats!();
+
+    // One run on the fixture's day…
+    fx.seed_run("completed", Some("final_answer"), 100_000, 2).await;
+    // …and one two days later, which the narrow window must not see.
+    let narrow = Window {
+        from: fx.day,
+        to: fx.day,
+    };
+    let agent = Uuid::new_v4();
+    sqlx::query("insert into ai_agents (id, organization_id, name, key) values ($1, $2, $3, $4)")
+        .bind(agent)
+        .bind(fx.organization)
+        .bind(format!("later agent {agent}"))
+        .bind(format!("later-{agent}"))
+        .execute(&fx.pool)
+        .await
+        .expect("the later agent must be created");
+    sqlx::query(
+        "insert into ai_runs (organization_id, agent_id, status, stop_reason, goal, cost_micros, \
+         started_at, finished_at) values ($1, $2, 'completed', 'final_answer', $3, 900_000, $4::timestamptz, $4::timestamptz)",
+    )
+    .bind(fx.organization)
+    .bind(agent)
+    .bind("a later run")
+    .bind(format!("{} 09:00:00+00", fx.day + time::Duration::days(2)))
+    .execute(&fx.pool)
+    .await
+    .expect("the later run must be created");
+
+    let scatter = tool_stats::cost_per_solved(&fx.pool, fx.organization, narrow)
+        .await
+        .expect("the scatter must read");
+    assert_eq!(scatter.len(), 1, "only the in-window day belongs in the chart");
+    assert_eq!(scatter[0].cost_micros, 100_000);
+
+    let histogram = tool_stats::step_histogram(&fx.pool, fx.organization, narrow)
+        .await
+        .expect("the histogram must read");
+    assert_eq!(
+        histogram.iter().map(|bucket| bucket.runs).sum::<i64>(),
+        1,
+        "the two-step in-window run and nothing else"
+    );
 
     fx.dispose().await;
 }

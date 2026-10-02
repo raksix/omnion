@@ -46,7 +46,7 @@ use omnion_ai_hub::eval_store::{
 };
 use omnion_ai_hub::run_store;
 use omnion_ai_hub::store;
-use omnion_ai_hub::tool_stats::{self, ToolAggregate};
+use omnion_ai_hub::tool_stats::{self, SolvedDay, StepBucket, ToolAggregate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{Date, Duration, OffsetDateTime};
@@ -2203,6 +2203,10 @@ pub struct ToolTelemetry {
     pub tools: Vec<ToolTelemetryRow>,
     /// The most expensive failing tool per day — the table under the scatter.
     pub costliest_failing: Vec<CostliestFailing>,
+    /// How many steps the window's settled runs took, as a histogram.
+    pub step_histogram: Vec<StepBucket>,
+    /// Cost per solved task, per day — the scatter.
+    pub cost_per_solved: Vec<SolvedDay>,
 }
 
 /// The window's headline numbers.
@@ -2308,6 +2312,14 @@ pub async fn tool_telemetry(
         })
         .collect();
 
+    // The two run-shaped panels the spec's screen asks for beside the tool table. Both read
+    // `ai_runs` rather than the roll-up, and both are scoped to the same `organization` and the
+    // same clamped `window` as the table — a screen whose three panels disagree about its range
+    // is three screens, and an operator comparing a bar against a row would be comparing
+    // different timeframes.
+    let step_histogram = tool_stats::step_histogram(pool, organization, window).await?;
+    let cost_per_solved = tool_stats::cost_per_solved(pool, organization, window).await?;
+
     Ok(Json(ToolTelemetry {
         from,
         to,
@@ -2317,5 +2329,7 @@ pub async fn tool_telemetry(
         totals,
         tools: rows,
         costliest_failing,
+        step_histogram,
+        cost_per_solved,
     }))
 }

@@ -443,6 +443,123 @@ pub async fn costliest_failing_per_day(
     Ok(best.into_values().collect())
 }
 
+/// One bar of the step-count histogram: runs that took exactly `steps` steps.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct StepBucket {
+    /// How many steps those runs took, exactly — not a bucket edge, so the screen can label it.
+    pub steps: i32,
+    /// How many runs took exactly that many.
+    pub runs: i64,
+}
+
+/// How many steps each finished run took, collapsed into a histogram.
+///
+/// **Only settled runs, and only runs that started.** A run still in flight has a step count that
+/// is a prefix rather than a length, so including it would drag the whole distribution towards
+/// "one step" every time the pass happens to be looking — and a histogram whose shape depends on
+/// when you loaded it is not a measurement. `queued` runs are excluded for the stronger version of
+/// the same reason: `started_at` is null, so they have no day to be filed under at all.
+///
+/// The count is `count(s.id)` per run, so a run with **no** steps lands in the zero bar rather
+/// than being dropped: "a run that answered without calling anything" is a real and interesting
+/// row, and `inner join` would hide exactly the runs an operator most wants to see.
+pub async fn step_histogram(
+    pool: &PgPool,
+    organization_id: Uuid,
+    window: Window,
+) -> Result<Vec<StepBucket>> {
+    let rows = sqlx::query_as::<_, StepBucket>(
+        r#"
+        select per_run.steps::int as steps, count(*)::bigint as runs
+        from (
+            select count(s.id)::int as steps
+            from ai_runs r
+            left join ai_run_steps s on s.run_id = r.id
+            where r.organization_id = $1
+              and r.started_at is not null
+              and r.status in ('completed', 'failed', 'cancelled')
+              and (r.started_at at time zone 'utc')::date between $2 and $3
+            group by r.id
+        ) per_run
+        group by per_run.steps
+        order by per_run.steps asc
+        "#,
+    )
+    .bind(organization_id)
+    .bind(window.from)
+    .bind(window.to)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// One point of the cost-per-solved scatter: a day's runs and what they cost.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct SolvedDay {
+    pub day: Date,
+    /// Every settled run that started that day, solved or not.
+    pub runs: i64,
+    /// How many of them actually answered.
+    pub solved: i64,
+    pub cost_micros: i64,
+}
+
+impl SolvedDay {
+    /// What a solved run cost, in micros — or `None` when nothing was solved that day.
+    ///
+    /// **`None`, never `Some(0)`, for a day with no solved runs.** The same distinction
+    /// `ToolAggregate::success_percent` makes: a day where every run failed cost a great deal and
+    /// solved nothing, which is the *worst* point on this chart, not a point at zero. Rendering it
+    /// as `0` puts the worst day at the best end of the axis — the one inversion this screen can
+    /// make that actively misleads. `solved` is in the denominator for the days that do have
+    /// solved runs, so the number is "what a success cost", not "what a day cost".
+    pub fn cost_per_solved(&self) -> Option<i64> {
+        (self.solved > 0).then(|| self.cost_micros / self.solved)
+    }
+}
+
+/// Cost per solved task, per day.
+///
+/// **A run counts as solved only when it `completed` with `stop_reason = 'final_answer'`** — it
+/// reached an answer and stopped because it had one. `completed` alone is not enough: a run that
+/// hit `max_steps` is recorded `completed` too, and calling that solved would score a runaway as a
+/// success while charging its full cost to the same denominator. `failed` and `cancelled` runs are
+/// in `runs` (they cost money) and not in `solved` (they produced nothing), which is the whole
+/// point of the ratio.
+///
+/// Days with no run at all are absent rather than zero, for the reason the module header gives: a
+/// gap the writer has not reached yet is not a day that cost nothing.
+pub async fn cost_per_solved(
+    pool: &PgPool,
+    organization_id: Uuid,
+    window: Window,
+) -> Result<Vec<SolvedDay>> {
+    let rows = sqlx::query_as::<_, SolvedDay>(
+        r#"
+        select
+            (r.started_at at time zone 'utc')::date       as day,
+            count(*)::bigint                              as runs,
+            count(*) filter (
+                where r.status = 'completed' and r.stop_reason = 'final_answer'
+            )::bigint                                    as solved,
+            coalesce(sum(r.cost_micros), 0)::bigint      as cost_micros
+        from ai_runs r
+        where r.organization_id = $1
+          and r.started_at is not null
+          and r.status in ('completed', 'failed', 'cancelled')
+          and (r.started_at at time zone 'utc')::date between $2 and $3
+        group by 1
+        order by 1 asc
+        "#,
+    )
+    .bind(organization_id)
+    .bind(window.from)
+    .bind(window.to)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +586,33 @@ mod tests {
         // is a tool nobody invoked, the second is one that was invoked and never worked.
         assert_eq!(aggregate(0, 0, 0).success_percent(), None);
         assert_eq!(aggregate(0, 0, 0).denial_percent(), None);
+    }
+
+    fn solved(runs: i64, solved_count: i64, cost_micros: i64) -> SolvedDay {
+        SolvedDay {
+            day: Date::from_calendar_date(2026, time::Month::March, 3).unwrap(),
+            runs,
+            solved: solved_count,
+            cost_micros,
+        }
+    }
+
+    #[test]
+    fn a_day_that_solved_nothing_has_no_cost_per_solved_and_not_a_zero() {
+        // Five runs, every one of them failed, and they cost a seventh of a cent between them.
+        // The honest reading is "this day bought nothing". The tempting one is `0`, which sorts to
+        // the good end of the scatter's y-axis — the exact day an operator most needs to see
+        // painted at the best point on the chart.
+        assert_eq!(solved(5, 0, 700_000).cost_per_solved(), None);
+        assert_eq!(solved(0, 0, 0).cost_per_solved(), None);
+    }
+
+    #[test]
+    fn the_cost_per_solved_is_divided_by_the_successes_and_not_by_the_runs() {
+        // Ten runs, two answered, and the whole 1.00 went into them. "What did a success cost"
+        // is 500,000; "what did a day cost divided by a run" is 100,000, which is a number about
+        // nothing. The failures are in the cost, not in the denominator.
+        assert_eq!(solved(10, 2, 1_000_000).cost_per_solved(), Some(500_000));
     }
 
     #[test]
