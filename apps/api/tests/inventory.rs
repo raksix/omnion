@@ -29,6 +29,19 @@
 //!   than as "read the last movement's `on_hand_after`" for a reason the comment repeats: a ledger
 //!   whose middle was corrupted still ends at the right number if the last row was honest.
 
+mod support {
+    //! The CSRF/session helper the walks sign in with.
+    //!
+    //! **This suite predated the CSRF layer and had not been migrated** — the same defect the CRM
+    //! suite closed, in the same shape: sign-in answers with the session cookie and the CSRF cookie
+    //! as **two** `Set-Cookie` headers, `headers().get()` reads the first one only, so every walk
+    //! held a session with no token and every write was refused with `csrf_unavailable` — a code
+    //! whose message names the *deployment's* configuration, so the suite's own loss of the token
+    //! read as a broken server. Every walk in this file that created an item was red for that
+    //! reason and nothing else.
+    pub mod walk_auth;
+}
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
@@ -40,6 +53,8 @@ use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope as PermScope};
 use omnion_permissions::{roles as role_store, seed};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
+use support::walk_auth::{self, Session};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -95,7 +110,12 @@ const OTHER_WRITER_PERMISSIONS: [&str; 5] = [
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
     status: StatusCode,
-    set_cookie: Option<String>,
+    /// **Every** `Set-Cookie` on the response, in order.
+    ///
+    /// `headers().get()` answers with the first one only, and sign-in sets two — the session and
+    /// the CSRF token beside it. Reading the first is how this suite ended up holding a session
+    /// that could not write.
+    set_cookie: Vec<String>,
     body: Value,
 }
 
@@ -107,11 +127,14 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .expect("router must answer");
 
     let status = response.status();
+    // `get_all`, not `get`: see `TestResponse::set_cookie`.
     let set_cookie = response
         .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let bytes = response
         .into_body()
         .collect()
@@ -136,8 +159,11 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 /// Build a JSON request; `token` becomes the session cookie and `body` the payload.
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
+    // `apply_credential` is the ONLY place that sends the session cookie *and* the CSRF header
+    // together. Building the cookie by hand here is what produced a session that could not write:
+    // the token was never sent, so every mutation was refused before its handler ran.
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(token) => walk_auth::apply_credential(token, builder),
         None => builder,
     };
 
@@ -174,7 +200,12 @@ async fn live_db(config: &Config) -> Option<Db> {
 
 /// A state whose database has all migrations applied and the IAM seed loaded.
 async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    // Installed ON THE CONFIG, not exported into the environment, so the suite does not depend on
+    // a shell having remembered to set it. Without it sign-in issues no token at all and every
+    // write is refused with `csrf_unavailable` — the product working correctly on a deployment
+    // that never configured a secret.
+    walk_auth::with_csrf_secret(&mut config);
     let db = live_db(&config).await?;
     db.migrate().await.expect("migrations must apply");
 
@@ -187,6 +218,27 @@ async fn live_state() -> Option<(AppState, Db)> {
         omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
             .expect("the default storage configuration is valid"),
     );
+    // The shipped `sign_in` budget is ten requests per five minutes and the cell is process-wide.
+    // This file signs in five accounts for its fixture plus more inside individual walks, so
+    // without a larger ceiling the suite is refused at the eleventh sign-in and every walk after
+    // that dies on a line that has nothing to do with what it was testing. Only `sign_in` is
+    // raised — the other ceilings stay as a deployment ships them, so this suite can never be the
+    // reason a genuinely over-budget request stops being refused.
+    walk_auth::give_the_process_its_own_sign_in_budget(|| {
+        let policies: Vec<omnion_security::RatePolicy> =
+            omnion_security::RatePolicy::defaults()
+                .into_iter()
+                .map(|mut policy| {
+                    if policy.scope == "sign_in" {
+                        policy.limit = 10_000;
+                    }
+                    policy
+                })
+                .collect();
+        omnion_api::rate_limit_middleware::install(omnion_api::rate_limit_middleware::RateLimiter::new(
+            &state, policies,
+        ));
+    });
     Some((state, db))
 }
 
@@ -361,17 +413,11 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
-        .set_cookie
-        .clone()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("cookie has a value")
-        .split_once('=')
-        .expect("cookie has a name")
-        .1
-        .to_owned()
+    // **Every** `Set-Cookie`, not the first, and packed into the credential `apply_credential`
+    // sends back. This used to take the first `Set-Cookie`, keep its session value and drop the
+    // CSRF token beside it — so every walk signed in successfully and then could not write a
+    // single row. `Session::pack` is what makes the credential carry both halves.
+    Session::from_set_cookies(&response.set_cookie).pack()
 }
 
 /// The audit rows of one action, newest first.
@@ -521,8 +567,12 @@ async fn a_new_organization_is_seeded_with_a_warehouse_and_two_locations() {
     .expect("the locations must read");
     assert_eq!(
         locations,
-        vec!["RETURNS".to_string(), "STOCK".to_string()],
-        "and somewhere to put stock and somewhere to put a customer's return"
+        vec!["RETURNS".to_string(), "STOCK".to_string(), "TRANSIT".to_string()],
+        "stock somewhere, a customer's return somewhere, and transit somewhere — the third added \
+         by REQ-053 slice 3 (migration 0138), where a dispatched transfer sits between two \
+         locations. This list was written when there were two and was simply never revisited: \
+         the assertion is about the TRIGGER, and it stays an assertion about the trigger whichever \
+         number of children the seed installs."
     );
 
     // The settings row too, because the movement path reads it and a missing row would make the
@@ -1507,7 +1557,13 @@ async fn the_warehouse_tree_refuses_a_duplicate_code_and_a_location_that_holds_s
         .iter()
         .map(|row| row["code"].as_str().expect("a code"))
         .collect();
-    assert_eq!(codes, vec!["RETURNS", "STOCK"], "the tree comes back with its children");
+    // `TRANSIT` rides along: the seeded warehouse owns three locations since `0138`, and a tree
+    // that hid one of them would be a tree the stock list (which sums over them) cannot explain.
+    assert_eq!(
+        codes,
+        vec!["RETURNS", "STOCK", "TRANSIT"],
+        "the tree comes back with every seeded location"
+    );
 
     // A second warehouse with the same code is a 409, not a 500 on the unique index.
     let duplicate = call(
@@ -1801,4 +1857,162 @@ async fn the_stock_list_filters_and_the_vocabulary_answer_the_forms_questions() 
         .find(|reason| reason["value"] == "damage")
         .expect("the damage reason");
     assert_eq!(damage["may_go_negative"], false);
+}
+
+/// The item detail's history is bounded by the parameter the caller sent.
+///
+/// **What this walk exists to prove.** `fetchItem(id, historyLimit = 25)` has always put
+/// `history_limit` in the query string, and `get_item` took no query parameter at all — it asked
+/// `item_history` for a hard-coded 200. So a screen that asked for 25 to keep a phone's first paint
+/// small received 200 rows, and no assertion anywhere noticed: a parameter a server ignores is a
+/// claim the API is making that it is not keeping.
+///
+/// Two numbers and a cap, asserted in that order, because each one fails for its own reason:
+///
+/// * **the default is the default.** No parameter at all must answer the *same* number as an
+///   explicit request for the default, which is what makes the default a default rather than an
+///   accident of whichever constant the handler was edited with last.
+/// * **the parameter is honoured, both directions.** Asking for less than the ledger holds returns
+///   fewer rows; asking for more returns what there is rather than padding it. A handler that
+///   clamps to a fixed 200 passes the second and fails the first.
+/// * **the cap holds.** `history_limit=100000` must not return everything the ledger has. The
+///   bound is the reason this parameter is safe to expose at all.
+///
+/// Revert `history.limit()` to the literal `200` and the second group fails: the walk's whole
+/// subject is one call the handler makes.
+#[tokio::test]
+async fn the_item_detail_bounds_its_history_by_the_parameter_the_caller_sent() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let token = fixture.token(&fixture.operator).await;
+    let location = fixture.stock_location().await;
+    let item = create_item(state, &token, item_body("bounded")).await;
+
+    // More movements than any of the limits below ask for, so "fewer rows" is a real answer and
+    // not an artifact of an item that happens to have a short history. Seven is deliberate: it
+    // is above every limit this walk asks for except the cap.
+    for index in 0..7 {
+        let recorded = record(
+            state,
+            &token,
+            item,
+            location,
+            json!({ "quantity": "1", "reason": "purchase_receipt", "note": format!("leg {index}") }),
+        )
+        .await;
+        assert_eq!(recorded.status, StatusCode::CREATED, "{}", recorded.body);
+    }
+
+    let detail = |asked: Option<i32>| {
+        let suffix = asked.map(|limit| format!("?history_limit={limit}")).unwrap_or_default();
+        format!("/api/v1/inventory/items/{item}{suffix}")
+    };
+
+    // 1. The default. No parameter is the same call as the screen's own default, so the two cannot
+    // drift: a handler that read `unwrap_or(200)` and a client that assumed 25 would answer
+    // different numbers to the same record on different days.
+    let implicit = call(
+        state,
+        request(Method::GET, &detail(None), Some(&token), None),
+    )
+    .await;
+    assert_eq!(implicit.status, StatusCode::OK, "{}", implicit.body);
+    assert_eq!(
+        implicit.body["history"].as_array().map(Vec::len),
+        Some(7),
+        "the item has seven movements and asking for nothing must return all of them"
+    );
+
+    // 2. The parameter, both directions.
+    let three = call(
+        state,
+        request(Method::GET, &detail(Some(3)), Some(&token), None),
+    )
+    .await;
+    assert_eq!(three.status, StatusCode::OK, "{}", three.body);
+    let three_rows = three.body["history"].as_array().map(Vec::len).unwrap_or(0);
+    assert_eq!(
+        three_rows, 3,
+        "asking for three must return three — the handler ignored history_limit"
+    );
+
+    let more = call(
+        state,
+        request(Method::GET, &detail(Some(50)), Some(&token), None),
+    )
+    .await;
+    assert_eq!(more.status, StatusCode::OK, "{}", more.body);
+    assert_eq!(
+        more.body["history"].as_array().map(Vec::len),
+        Some(7),
+        "asking for more than the ledger holds returns what is there, not a padded page"
+    );
+
+    // 3. The cap. This is the assertion that makes the parameter safe to expose: without a bound,
+    // an item with four years of movements would return every row on a phone's first paint.
+    let huge = call(
+        state,
+        request(Method::GET, &detail(Some(100_000)), Some(&token), None),
+    )
+    .await;
+    assert_eq!(huge.status, StatusCode::OK, "{}", huge.body);
+    assert_eq!(
+        huge.body["history"].as_array().map(Vec::len),
+        Some(7),
+        "a hundred thousand is clamped to the cap; this item only has seven rows either way"
+    );
+
+    // And the position still travels beside the history, because the screen's header is drawn from
+    // the same response — a change to the history bound must not disturb the rollup next to it.
+    assert_eq!(three.body["position"]["item"]["id"], json!(item.to_string()));
+    assert_eq!(three.body["position"]["on_hand"], "7.000");
+}
+
+/// The detail's two halves are named, not flattened.
+///
+/// `ItemDetail` nests the position under `position` rather than spreading it beside `history`, and
+/// this asserts the **actual JSON keys** rather than "the id is in there somewhere": a `flatten`
+/// would still carry the id, and the screen would still read it, while two fields of
+/// `StockPosition` colliding with `history` would silently keep one. The point of a named key is
+/// that it cannot collide, and a walk that only checks for the value cannot tell a named key from
+/// a flattened one that happened not to collide.
+#[tokio::test]
+async fn the_item_detail_answers_the_position_under_its_own_key() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let state = &fixture.state;
+    let token = fixture.token(&fixture.operator).await;
+    let item = create_item(state, &token, item_body("shape")).await;
+
+    let response = call(
+        state,
+        request(
+            Method::GET,
+            &format!("/api/v1/inventory/items/{item}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    let keys: Vec<&str> = response
+        .body
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys.iter().copied().collect::<BTreeSet<_>>(),
+        ["history", "position"].into_iter().collect::<BTreeSet<_>>(),
+        "the detail carries exactly two keys; anything at the top level means the position was \
+         flattened"
+    );
+    assert!(
+        response.body["position"].get("item").is_some(),
+        "the position keeps its own shape under its own name"
+    );
 }

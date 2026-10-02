@@ -557,17 +557,55 @@ pub async fn list_items(
 /// The detail is **one call**, not "the item, then its positions": a screen that has to join two
 /// responses can draw a header from one and a table from the other that disagree about the same
 /// item, and the stock list is a rollup of the same numbers either way.
+///
+/// **`history_limit` is honoured, and it used to be ignored.** The client has always sent it
+/// (`fetchItem(id, historyLimit = 25)`), and the route took no query parameter at all and asked
+/// for 200 rows. So the detail screen always rendered the same 200 movements whatever it asked
+/// for, and a caller asking for 25 to keep a phone's first paint small got 200. A parameter a
+/// server ignores is worse than one it refuses: it is a claim the API is making that it is not
+/// keeping. The bound is clamped rather than trusted — the ledger table is the one place in this
+/// module where an unbounded read is a page that never finishes.
 pub async fn get_item(
     State(state): State<AppState>,
     current: CurrentSession,
     Query(organization): Query<OrganizationParam>,
+    Query(history): Query<ItemDetailParams>,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<ItemDetail>, ApiError> {
     let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
     let position = store::item_position(pool, organization_id, item_id).await?;
-    let history = ledger::item_history(pool, organization_id, item_id, 200).await?;
+    let history = ledger::item_history(pool, organization_id, item_id, history.limit()).await?;
     Ok(Json(ItemDetail { position, history }))
+}
+
+/// The item detail's own parameters. Separate from [`ItemListParams`] so `limit` can mean "how
+/// many movements" here and "page size" there — one struct reused for both would answer a
+/// question with the wrong number.
+#[derive(Debug, serde::Deserialize)]
+pub struct ItemDetailParams {
+    /// How many movements to return.
+    #[serde(default)]
+    pub history_limit: Option<i64>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+impl ItemDetailParams {
+    /// The clamped history limit: a missing value is the screen's own default, and anything
+    /// outside the range is pulled back to it rather than refused, because a caller asking for
+    /// ten thousand rows has not made a mistake worth a 422.
+    const DEFAULT_LIMIT: i64 = 25;
+    const MAX_LIMIT: i64 = 200;
+
+    fn limit(&self) -> i64 {
+        match self.history_limit {
+            Some(asked) if asked > 0 => asked.min(Self::MAX_LIMIT),
+            Some(_) => Self::DEFAULT_LIMIT,
+            None => Self::DEFAULT_LIMIT,
+        }
+    }
 }
 
 /// The item detail: the position plus the movement history the screen's second tab draws.
