@@ -9228,11 +9228,37 @@ async function main() {
   // So the requested name is normalised, and the log line says which spelling was ACCEPTED rather
   // than only which was asked for. Normalising in one place is the point: a second convention has to
   // have exactly one crossing point, or the next table added next month reopens this.
-  const onlyKey = only ? only.replace(/-/g, "") : "";
-  if (only && DEPTH_PASSES[onlyKey]) {
+  //
+  // **`--only=a,b` matched nothing, and the way it matched nothing was the expensive way.**
+  // `only` is the raw `--only=` value, so a two-name filter arrives here as the single string
+  // `"workflow-table,workflow-builder"`; de-hyphenating that yields `"workflowtable,workflowbuilder"`,
+  // which is not a key, so the branch was skipped and the pass walked the WHOLE inventory. The
+  // single-name spelling had just been fixed for exactly this reason (`a3a0bf27`), and the fix
+  // left the comma spelling in the same shape it had complained about: `ONLY` is parsed as a LIST
+  // forty lines up and used as a scalar here, so the one argument the file already supports is
+  // the one this branch cannot accept.
+  //
+  // So the filter is resolved over `ONLY`, not over the raw string, and the two cases are kept
+  // apart deliberately. `ONLY` is authoritative because the route filter and the roll-up's matched
+  // set both speak it; `only` is only what the caller typed, kept for the report's own `only` field.
+  // A name that resolves to no depth pass falls through to the route list, which is what
+  // `--only=<a route name>` is FOR — so this must not become an error, only a resolved list.
+  //
+  // The log line names what was ACCEPTED rather than only what was asked for, which is the whole
+  // lesson of the four ticks that read a wide pass as a busy box: a banner about intent is not a
+  // coverage claim, and `clicks.jsonl` naming a different screen is the only symptom a reader sees.
+  const onlyResolved = ONLY.filter((name) => Object.prototype.hasOwnProperty.call(DEPTH_PASSES, name.replace(/-/g, "")))
+    .map((name) => ({ asked: name, key: name.replace(/-/g, "") }));
+  if (onlyResolved.length > 0) {
     await ensureSignedIn(page, report);
-    log(`focused depth pass: requested ${only} → resolved ${onlyKey}`);
-    await DEPTH_PASSES[onlyKey](page, report);
+    log(
+      `focused depth pass: requested ${only || "(none)"} → resolved ${onlyResolved
+        .map((entry) => `${entry.asked}=${entry.key}`)
+        .join(", ")}`,
+    );
+    for (const entry of onlyResolved) {
+      await DEPTH_PASSES[entry.key](page, report);
+    }
     // The depth passes are the ones a REQ close depends on, so the stack check matters most
     // here: a pass that lost its stack halfway through a depth pass produces a *confident*
     // report (`rows: 0`, `listsTheCreate: false`) that reads exactly like a broken screen.
@@ -9250,7 +9276,15 @@ async function main() {
       JSON.stringify({ only, ...report, netFailures, netExpected, onboardingFailures: netFailures.filter((f) => String(f.url || "").includes("/onboarding/")) }, null, 2),
     );
     console.log(`ONLY_PASS=${only} NET_FAILURES=${netFailures.length}`);
-    for (const line of report.steps.filter((step) => String(step.page || "").includes(only.replace(/Depth$/, "")))) {
+    // One line per focused pass, matched on the name the CALLER typed. `only` used to be tested
+    // with a single `includes()`, so a two-name filter echoed nothing at all: the string
+    // `"workflow-table,workflow-builder"` is a substring of no page name, so the one place a
+    // reader sees the rows this pass just produced went silent on exactly the input the filter
+    // documents as supported. The ASKED name is the right one to match on, not the de-hyphenated
+    // key — the keys are `workflowtable` and the pages are `workflow-table-depth`, so a key match
+    // would find nothing even with one name.
+    const onlyNames = onlyResolved.map((entry) => entry.asked);
+    for (const line of report.steps.filter((step) => onlyNames.some((name) => String(step.page || "").includes(name)))) {
       console.log(`  ${JSON.stringify(line)}`);
     }
     await browser.close();

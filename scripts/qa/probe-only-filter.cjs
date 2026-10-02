@@ -113,8 +113,11 @@ check("the file registers depth passes at call sites", callSites.length > 0, `fo
 const exitStart = src.indexOf("const only = (process.argv.find");
 // The window has to hold the lookup AND the comment above it. 1400 was not enough once the fix
 // landed: the comment is 20 lines of *why*, and a window that stops short of the code it exists
-// to explain reports a defect that is not there. The end anchor is the next top-level statement.
-const exitEnd = exitStart < 0 ? -1 : src.indexOf("if (await stackGone())", exitStart);
+// to explain reports a defect that is not there. The end anchor is the exit the branch ends on —
+// which is AFTER the summary write and the row echo, because the rules below check the echo too,
+// and a window that stopped at the stack check would have reported the echo rule red on a
+// source that contains it (which is what happened the first time this ran after the list fix).
+const exitEnd = exitStart < 0 ? -1 : src.indexOf("process.exit(netFailures.length === 0 ? 0 : 1);", exitStart);
 const exitBlock = exitStart < 0 ? "" : src.slice(exitStart, exitEnd > exitStart ? exitEnd : exitStart + 2600);
 check("the focused depth-pass exit exists", exitStart >= 0);
 check("the exit consults DEPTH_PASSES", /DEPTH_PASSES\[/.test(exitBlock));
@@ -122,6 +125,25 @@ check(
   "the exit normalises the requested name before looking it up",
   /replace\(\s*\/\-\/g\s*,\s*""\s*\)/.test(exitBlock) || /replaceAll\(\s*"-"\s*,\s*""\s*\)/.test(exitBlock),
   "the lookup compares a hyphenated name against de-hyphenated keys, so it can never match",
+);
+// **A comma filter is the same defect one level up, and normalising a scalar does not cover it.**
+// `ONLY` is parsed as a LIST above and `run.sh` documents `--only=a,b`; resolving over the raw
+// `--only=` value de-hyphenates `"workflow-table,workflow-builder"` into a string that is not a
+// key, the branch is skipped and the pass walks the whole inventory while the banner names the
+// filter. So the resolution has to iterate `ONLY`'s entries rather than de-hyphenate one string,
+// and the rule has to read the LIST to keep saying so — a gate written against the scalar it
+// happened to be shipped with is a gate that goes stale the moment the argument is fixed.
+check(
+  "the exit resolves the filter over ONLY's entries, not over the raw --only= string",
+  /ONLY\.filter\(/.test(exitBlock) || /ONLY\.(map|forEach)\(/.test(exitBlock),
+  "a `--only=a,b` filter de-hyphenates to a string that is not a key, so it matches nothing and the pass runs wide",
+);
+// And the step echo has to follow it: matching one name against `"workflow-table,workflow-builder"`
+// finds nothing, so the rows the pass just produced are printed for no input the filter accepts.
+check(
+  "the focused pass echoes rows for every name it resolved, not one joined string",
+  /onlyNames\.some\(/.test(exitBlock) || /some\(\(name\)\s*=>/.test(exitBlock),
+  "a two-name filter echoes no rows at all, because the joined string is a substring of no page name",
 );
 
 // ---- 2. Every key names a pass that actually runs ------------------------------------------------
@@ -387,14 +409,47 @@ if (!IS_MUTANT) {
       // Two replacements, because the shipped defect is the PAIR: a key that is not normalised and
       // a lookup that uses the un-normalised name. Patching only the declaration would leave the
       // rule green on a source whose lookup can still never match.
+      //
+      // Anchored on the RESOLUTION rather than on the old scalar, so this mutation keeps working
+      // when the fix changes shape — a mutation that anchors on the code it was written beside is
+      // a mutation that reports "this gate is stale" the moment that code is legitimately
+      // rewritten, which is what happened the first time this rule ran after the list fix.
       apply: (s) =>
         s
           .replace(
-            'const onlyKey = only ? only.replace(/-/g, "") : "";',
-            'const onlyKey = only ? only : "";',
+            /ONLY\.filter\(\(name\) => Object\.prototype\.hasOwnProperty\.call\(DEPTH_PASSES, name\.replace\(\/-\/g, ""\)\)\)/,
+            'ONLY.filter((name) => Object.prototype.hasOwnProperty.call(DEPTH_PASSES, name))',
           )
-          .replace("DEPTH_PASSES[onlyKey]", "DEPTH_PASSES[only]"),
+          // BOTH sites, because the resolution normalises twice — once to test membership and once
+          // to build the key. Stripping only the lookup leaves the `.map` still calling
+          // `.replace(/-/g, "")`, so the normalisation rule stays GREEN on a source whose lookup
+          // can never match — a mutation that passes for the wrong reason, which is worse than a
+          // mutation that does not apply at all.
+          .replace(/key: name\.replace\(\/-\/g, ""\)/, "key: name"),
       expectRule: /exit normalises the requested name/,
+    },
+    {
+      name: "a comma filter resolved as one string, so two names match nothing",
+      why: "`--only=workflow-table,workflow-builder` walks the whole inventory while the banner names the filter",
+      // The list half of the same defect, and it is the one a single-name mutation cannot reach:
+      // normalisation is still present, it is simply applied to a JOINED string instead of to each
+      // entry, so the key it builds is `"workflowtable,workflowbuilder"` and no lookup matches.
+      apply: (s) =>
+        s.replace(
+          /const onlyResolved = ONLY\.filter[\s\S]*?\.map\(\(name\) => \(\{ asked: name, key: name\.replace\(\/-\/g, ""\) \}\)\);/,
+          'const onlyResolved = [{ asked: only, key: only.replace(/-/g, "") }].filter((entry) => DEPTH_PASSES[entry.key]);',
+        ),
+      expectRule: /resolves the filter over ONLY's entries/,
+    },
+    {
+      name: "rows echoed for the joined filter instead of per name",
+      why: "a two-name filter prints no rows, because the joined string is a substring of no page name",
+      apply: (s) =>
+        s.replace(
+          /report\.steps\.filter\(\(step\) => onlyNames\.some\(\(name\) => String\(step\.page \|\| ""\)\.includes\(name\)\)\)/,
+          'report.steps.filter((step) => String(step.page || "").includes(only.replace(/Depth$/, "")))',
+        ),
+      expectRule: /echoes rows for every name it resolved/,
     },
     {
       name: "a key that names a pass nobody runs",
