@@ -32,6 +32,8 @@
 //! The harness is the throwaway-database pattern the sibling walks use, and it **panics** rather
 //! than skipping when PostgreSQL is unreachable — a skipped walk proves nothing.
 
+use std::collections::{BTreeSet, HashMap};
+
 use omnion_ai_hub::eval_run::{self, NewCaseResult, NewRun};
 use omnion_ai_hub::eval_store::{self, NewCase, NewSuite};
 use omnion_core::Db;
@@ -1011,6 +1013,147 @@ async fn the_telemetry_route_is_mounted_behind_its_own_key() {
     assert!(
         !window.contains("\"ai.evals.read\""),
         "telemetry must not be readable with the eval read key"
+    );
+}
+
+/// **No two routes in `routes/mod.rs` may register the same method on the same path — the
+/// defect that made the whole API refuse to boot while every other gate stayed green.**
+///
+/// ## What happened
+///
+/// Slice 4's commit mounted `GET /ai/telemetry/tools` on a path REQ-099's slice 4 already owned
+/// with a `GET` of its own. `axum` rejects that when the router is **constructed**
+/// (`PathRouter::route` → `merge_for_path` → `merge_inner`), so:
+///
+/// - `cargo build` stayed green — the panic is at runtime, not compile time;
+/// - the handler tests stayed green — neither handler is wrong on its own;
+/// - the REQ-107 mount assertion *in this file* stayed green — it asserted **presence**
+///   (`routes.contains("/ai/telemetry/tools")`) and never **uniqueness**, so a route registered
+///   twice satisfied it.
+///
+/// The only thing that caught it was an unrelated suite (`ai_catalog`, 11 tests) that happens to
+/// construct the router. That is luck, not a gate: a suite that touches the router for another
+/// reason would have caught it a month later, and a suite that does not would never.
+///
+/// ## Why this test is worth its existence
+///
+/// It needs no database, no session and no server — it reads the router's own source, which is
+/// the same trick the mount assertions above use for the same reason: **the registration table is
+/// data, and data can be checked.** The route table is assembled from ~380 `.route()` calls whose
+/// `let` bindings are defined far from where they are mounted, so the compiler sees no relation
+/// between them and a human reading one hunk sees neither the other half nor the collision.
+///
+/// A duplicate *path* is not automatically a bug — `.route("/x", get(..)).route("/x", post(..))`
+/// is the documented way to add a second method. The invariant is duplicate **path + method**.
+#[test]
+fn no_two_routes_register_the_same_method_on_the_same_path() {
+    let source = include_str!("../src/routes/mod.rs");
+
+    // Resolve `let NAME = get(..) | post(..) | put(..) | patch(..) | delete(..)` bindings, plus any
+    // `.merge(...)` inside the statement, so a binding declared as a chain reports every method
+    // it carries. A binding whose statement spans several lines is collected until parentheses
+    // balance — rustfmt wraps these constantly, and a single-line search both misses real bindings
+    // and matches the wrong ones.
+    // Owned keys throughout: the `statement` buffer is reused every iteration, so a borrowed
+    // name would still be alive when the buffer is cleared.
+    //
+    // **Comments must be skipped before the buffer is grown, not after.** A `//` line never
+    // closes a statement, so a comment block in front of a binding gets glued onto the front of
+    // it and `strip_prefix("let ")` no longer matches — the binding silently vanishes from the
+    // map and every route that mounts it is then skipped as "not a `let` binding". That is the
+    // worst possible failure for this test: the collision it exists to catch is *precisely* the
+    // one sitting behind the skipped binding. `mod.rs` puts a ten-line comment in front of
+    // `let ai_telemetry_tools = …` for exactly this reason — the proof run injected a second
+    // `GET /ai/telemetry/tools` behind that comment and the first version of this test passed.
+    let mut methods_for_binding: HashMap<String, BTreeSet<String>> = Default::default();
+    let mut depth: i32 = 0;
+    let mut statement = String::new();
+    for raw in source.lines() {
+        let line = raw.trim();
+        if line.starts_with("//") || line.is_empty() {
+            continue;
+        }
+        statement.push_str(line);
+        statement.push(' ');
+        depth += raw.matches('(').count() as i32 - raw.matches(')').count() as i32;
+
+        // A binding statement ends when the line closes it. rustfmt wraps these constantly, so a
+        // single-line match would both miss real bindings and half-match others.
+        let closes = line.ends_with(';') || (depth <= 0 && line.ends_with(')'));
+        if !closes {
+            continue;
+        }
+        if let Some(rest) = statement.trim().strip_prefix("let ") {
+            let name_end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let methods: BTreeSet<String> = ["get(", "post(", "put(", "patch(", "delete("]
+                .iter()
+                .filter_map(|m| {
+                    statement.contains(m).then(|| m.trim_end_matches('(').to_uppercase())
+                })
+                .collect();
+            if !methods.is_empty() {
+                methods_for_binding.insert(rest[..name_end].to_owned(), methods);
+            }
+        }
+        statement.clear();
+        depth = 0;
+    }
+
+    // The bindings this test reasons about are the ones the mounts use; assert the parse found
+    // most of them rather than trusting that a silently-shrunk map is still a useful map.
+    assert!(
+        methods_for_binding.len() > 150,
+        "the binding parse only found {} route handlers; the tripwire would be measuring a \\
+         fraction of the router and reporting the rest as clash-free",
+        methods_for_binding.len()
+    );
+
+    // Now walk the mounts. Every `.route("path", BINDING)` claims `(path, method)` for each
+    // method its binding carries. rustfmt wraps the mount itself across lines often enough that
+    // a line-local search would miss routes, so the path and the binding are both read from a
+    // small window of text after the `.route(` rather than from the single line.
+    let mut claimed: HashMap<(String, String), String> = Default::default();
+    let mut clashes: Vec<String> = Default::default();
+    let mut cursor = 0usize;
+    while let Some(offset) = source[cursor..].find(".route(") {
+        let at = cursor + offset;
+        let window = &source[at..at + 400.min(source.len() - at)];
+        cursor = at + 1;
+
+        let Some(q1) = window.find('"') else { continue };
+        let Some(end_quote) = window[q1 + 1..].find('"') else { continue };
+        let path = &window[q1 + 1..q1 + 1 + end_quote];
+        let after_path = &window[q1 + 1 + end_quote..];
+        let Some(comma) = after_path.find(',') else { continue };
+        let binding: String = after_path[comma + 1..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let Some(methods) = methods_for_binding.get(&binding) else {
+            // Not a `let x = get(…)` binding — a nested `Router::new()` chain, say. Out of scope
+            // here, and deliberately not treated as either clash-free or a clash.
+            continue;
+        };
+        for method in methods {
+            let key = (path.to_owned(), method.clone());
+            if let Some(previous) = claimed.get(&key) {
+                clashes.push(format!("  {method} {path} is registered twice: {previous} and {binding}"));
+            } else {
+                claimed.insert(key, binding.clone());
+            }
+        }
+    }
+
+    assert!(
+        clashes.is_empty(),
+        "axum panics at ROUTER CONSTRUCTION on a duplicate method+path, so the API never starts \
+         while `cargo build` stays green. Fix by moving one route to its own path:\n{}\n\
+         Paths registered more than once are only a bug when the METHOD repeats — \
+         `.route(\"/x\", get(..)).route(\"/x\", post(..))` is the documented merge.",
+        clashes.join("\n")
     );
 }
 
