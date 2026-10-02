@@ -72,81 +72,97 @@ async function main() {
   // as an enumeration of reads: a role built from a list of the reads it wants has to be edited
   // every time a read scope is added, and the day it is not edited is the day the fixture
   // silently loses the very permission a future pass needs.
-  const sql = `
-    with source as (
-      select id, password_hash from users where email = '${CREDS.email}'
-    ),
-    org as (
-      select id from organizations order by created_at limit 1
-    ),
-    readonly_role as (
+  // ---------------------------------------------------------------------------------------
+    // THE FIX (tick 114): this block was ONE statement with a chain of sibling CTEs, and two of
+    // them silently wrote nothing.
+    //
+    // A non-recursive CTE sees the table as it was BEFORE the statement started, so `role` --
+    // which selects from `roles` -- could not see the row its own sibling `readonly_role` had
+    // inserted on a first run. The `granted` and `bound` branches therefore joined against an
+    // empty set and wrote ZERO rows, while the statement still exited 0 and still returned
+    // account=1. The DB showed role_rows=1, perms=0, accounts=1, bindings=0.
+    //
+    // The file's own comment one screen above had already named the trap ("a non-recursive CTE
+    // cannot see its own siblings' effects") and then applied the reasoning to the wrong line: it
+    // moved the COUNT into a second statement and left the WRITES in the first. Counting in a
+    // second statement was necessary -- counting the insert instead reports 0 on every re-run --
+    // but it fixed the measurement, not the cause. The cause was four writes sharing one snapshot.
+    //
+    // The fix is the boring one: four statements, each of which reads what the previous one wrote.
+    // Every write is now independently observable, so a broken step is a broken step rather than a
+    // zero that the next statement silently inherits.
+    //
+    // It is also idempotent per statement (`on conflict` / `where not exists`), which is what the
+    // single statement was reaching for.
+    // ---------------------------------------------------------------------------------------
+
+    // 1. The role. `where not exists` keeps a re-run from failing on the unique key; `do update`
+    // (not `do nothing`) is deliberate but unnecessary here, so it is left as `nothing` because a
+    // re-run must not rewrite a row the pass may already have bound to.
+    psql(`
       insert into roles (organization_id, key, name, description, priority, is_system)
       select org.id, 'qa-readonly-developer', 'QA read-only developer',
              'Fixture role: developer reads without any manage key.',
              10, false
-      from org
+      from (select id from organizations order by created_at limit 1) org
       where not exists (select 1 from roles where key = 'qa-readonly-developer')
-      returning id
-    ),
-    -- Exactly one row, and limit 1 over a UNION ALL is NOT that: the inserting branch and the
-    -- already-present branch both produce a row on a re-run, order by id picks whichever sorts
-    -- first, and the grants then land on a role id that is not the one the account is bound to.
-    -- The role's own key is what identifies it, so the union is de-duplicated on that.
-    role as (
-      select distinct id from roles where key = 'qa-readonly-developer'
-    ),
-    granted as (
-      -- The effect column is NOT NULL and has no default; omitting it
-      -- inserts the column default, which the table does not have, so the statement fails on
-      -- a not-null violation. The role's whole point is to ALLOW, and the column carries
-      -- nothing more subtle than that here.
-      insert into role_permissions (role_id, permission_key, effect)
-      select role.id, p.key, 'allow'
-      from role, permissions p
-      where p.key like 'developer.%.read'
-        and p.key not in ('${DENIED}')
-      on conflict (role_id, permission_key) do update set effect = 'allow'
-      returning 1
-    ),
-    -- A non-recursive CTE cannot see its own siblings' effects, so a CTE that counts the
-    -- permissions this same statement just granted reads the PRE-statement table and reports the
-    -- previous run's number. The count therefore happens in a SECOND statement below, after the
-    -- write has landed -- the alternative (counting the insert) reports zero on every re-run
-    -- because on-conflict rows are not returned, which is the same class of lie.
-    reads as (
-      select 1
-    ),
-    account as (
-      -- display_name, not name: users has no name column, and a fixture that guessed the
-      -- column name fails at insert time rather than at the assertion that needed it.
-      insert into users (email, display_name, password_hash, organization_id, status, created_at, updated_at)
-      select 'qa-readonly-${stamp}@omnion.test', 'QA read-only developer', source.password_hash,
-             org.id, 'active', now(), now()
-      from source, org
-      returning id
-    ),
-    bound as (
-      insert into role_bindings (role_id, user_id, scope_type, organization_id)
-      select role.id, account.id, 'organization', org.id
-      from role, account, org
-      returning 1
-    )
-    select (select count(*) from reads),
-           (select count(*) from account),
-           (select count(*) from bound);
-  `;
+      on conflict do nothing;
+    `);
 
-  const out = psql(sql);
-  const [, account, bound] = out.split("|").map((n) => Number(n.trim()));
-
-  // Read the granted state in its own statement, now that the write above has committed.
-  const granted = Number(
+    // 2. The grants. This is the step that silently wrote nothing, so it asserts on its own effect
+    // immediately rather than letting a later statement report a number that merely looks right.
     psql(`
-      select count(*) from role_permissions rp
-      join roles r on r.id = rp.role_id
-      where r.key = 'qa-readonly-developer';
-    `),
-  );
+      insert into role_permissions (role_id, permission_key, effect)
+      select r.id, p.key, 'allow'
+      from roles r, permissions p
+      where r.key = 'qa-readonly-developer'
+        and p.key like 'developer.%.read'
+        and p.key not in ('${DENIED}')
+      on conflict (role_id, permission_key) do update set effect = 'allow';
+    `);
+
+    const granted = Number(
+      psql(`
+        select count(*) from role_permissions rp
+        join roles r on r.id = rp.role_id
+        where r.key = 'qa-readonly-developer';
+      `),
+    );
+
+    // 3. The account, then 4. the binding. Split for the same reason, and the binding is the step
+    // that decides whether the fixture can authenticate with ANY permission at all: an unbound
+    // account is refused by everything, which is the failure mode the guard below names.
+    psql(`
+      insert into users (email, display_name, password_hash, organization_id, status, created_at, updated_at)
+      select 'qa-readonly-${stamp}@omnion.test', 'QA read-only developer', s.password_hash,
+             o.id, 'active', now(), now()
+      from (select password_hash from users where email = '${CREDS.email}') s,
+           (select id from organizations order by created_at limit 1) o
+      where not exists (select 1 from users where email = 'qa-readonly-${stamp}@omnion.test');
+    `);
+
+    psql(`
+      insert into role_bindings (role_id, user_id, scope_type, organization_id)
+      select r.id, u.id, 'organization', o.id
+      from roles r,
+           (select id from users where email = 'qa-readonly-${stamp}@omnion.test') u,
+           (select id from organizations order by created_at limit 1) o
+      where r.key = 'qa-readonly-developer'
+      on conflict do nothing;
+    `);
+
+    const account = Number(
+      psql(`select count(*) from users where email = 'qa-readonly-${stamp}@omnion.test';`),
+    );
+    const bound = Number(
+      psql(`
+        select count(*) from role_bindings rb
+        join roles r on r.id = rb.role_id
+        join users u on u.id = rb.user_id
+        where r.key = 'qa-readonly-developer'
+          and u.email = 'qa-readonly-${stamp}@omnion.test';
+      `),
+    );
 
   // The fixture is only useful if it produced the *contrast* it exists for: an account that can
   // sign in and that genuinely lacks the key. Asserting the account exists is not enough — a
