@@ -12052,7 +12052,7 @@ because the fixture holds two columns rather than four; `outlineWarningPublishDi
 because criterion 7 requires a heading-order warning to be advisory. The single `netFailure` is a
 404 on the pass's own placeholder media id.
 
-**Next.** REQ-063's slices are all shipped and criterion 17 is its last open box, so it closes as
-`done` on the next tick once the checklist is read back. Wave-2 order after it: REQ-064 (menus,
+**Next.** REQ-063's checklist has no open box left, so it closes as `done (…1f03be44)` on this
+tick. Wave-2 order after it: REQ-064's own criterion sweep, then REQ-062, then REQ-019. Wave-2 order after it: REQ-064 (menus,
 forms, SEO, redirects, scheduled publishing, comments, newsletter, memberships — all shipped, needs
 its own criterion sweep), then REQ-062, REQ-019.
