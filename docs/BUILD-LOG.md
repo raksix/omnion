@@ -10636,3 +10636,74 @@ still unmeasured. The gate fix is what makes that pass able to run at all; it ha
 
 **Next.** Read the focused pass when the slot frees, and judge the `edge-delete` box off
 `edge-delete.removed` / `edge-delete-undo.restored` with the label no longer winning the hit test.
+
+
+---
+
+## Tick 81 (wave3) — the box that was never waiting for a slot
+
+**The finding.** `runWorkflowTableDepth` navigates with `${admin}`. `admin` is a **local** of
+`runPasskeysDepth` (walkthrough.cjs:10520), where it is deliberately `localhost` instead of
+`127.0.0.1` so a WebAuthn credential binds to the origin the browser is actually on. Nothing in
+`runWorkflowTableDepth` binds it. A template string over an unbound identifier throws a
+`ReferenceError` **before** `.catch` attaches — so this was never a swallowed navigation error, it
+was the whole pass dying on its first line, on **every** run, since `98010ed6` added the row.
+
+The harness said so, in the log, on one line: `depth pass workflow-table failed: ReferenceError:
+admin is not defined`. That line is in `pass.log` and it is the only evidence in three ticks of
+build-log entries that the `table-save-survives` box was **not** blocked by a slot. Ticks 78, 79
+and 80 attributed the missing row to a crowded box, a held QA slot and a renderer gate. All three
+explanations were wrong, and all three were cheaper to believe than to open the log — the
+`summary.json` has no row and a missing row looks identical whether the pass refused or the box was
+busy.
+
+**Why it survived everything.** `node --check` is green: the file parses, the name is unresolved
+only at run time, and only inside one function out of ninety. The refusal is loud but small — one
+line, no stack, no non-zero exit naming the criterion.
+
+**The fix** (`3c223c00`) is two navigations: `URL_ADMIN`, the module constant every other depth
+pass uses.
+
+**The gate** (`8ca582c9`) is `scripts/qa/probe-pass-scope.cjs`, 10/10. Every `${name}` in all
+ninety top-level functions must be bound in a scope that can see it. Proven red three ways against
+copies of the source — the shipped defect, a name borrowed from a sibling, a name that exists
+nowhere — and proven green on the unmutated file, so it cannot pass by reporting nothing at all.
+
+**The gate was wrong three times, and that is the part worth keeping.**
+
+| attempt | what it reported | the mistake |
+| --- | --- | --- |
+| 1 | 300 findings | module scope is **not a line prefix** — `URL_ADMIN` is declared at line 50, after the first helper, so "everything before the first function" is not the outer scope |
+| 2 | 9 functions walked | brace counting cannot lex a regex literal: `/127\.0\.0\.1/` and `/\$\{/` both contain a brace, depth drifted to −17, and every later line was attributed to the wrong scope |
+| 3 | 3 mutations "failed" | the mutation replaced the head of a statement and left `.catch(() => {});` dangling — **a mutation that corrupts the file's structure tests nothing**, and it showed up as three failures with a reason unrelated to the name under test |
+
+Each one was a wrong answer wearing a passing shape, which is what the earlier `undo-selection`
+and `renderer gate` gates in this repo got wrong too. The rule that came out of it: **a gate that
+cannot parse its input must report that it could not parse it, not findings it does not trust.**
+
+Two smaller lessons from the same hour. `catch (err)` and destructured parameters are bindings:
+`({ token, stamp: localStamp }) =>` binds `localStamp`, not `stamp`, and a walker that knows only
+`const` reports both. And the orphan-brace check I wrote first flagged the module-level `if/else`
+CLI entry block (walkthrough.cjs:10148) as an error — that is **correct code**, so the check was
+wrong; it is replaced by the invariant that actually matters, that no body swallows the declaration
+after it.
+
+**Proof.**
+
+| gate | result |
+| --- | --- |
+| `node scripts/qa/probe-pass-scope.cjs` | **10/10** (3 mutations red on their exact name, 1 green on the unmutated file) |
+| `cargo test -p omnion-workflows --lib` | **157/157** |
+| `pnpm typecheck` | 2/2 (cache hit — no TypeScript changed; this tick is harness-only) |
+| `node --check` both files | clean |
+
+**Not measured, and the reason has changed.** `table-save-survives` is still unticked, and now for
+a reason that is a fact about the code rather than a fact about the box: the pass that would
+measure it has never executed a single assertion. The remaining four rows — `edge-delete.removed`,
+`edge-delete-undo.restored`, `listener.captureKind`, `plugin-palette` — are in `runWorkflowBuilderDepth`,
+which does run, and they are still waiting on a slot.
+
+**Next.** A focused `--only=workflow-table` pass on the w3 stack is now a five-minute run instead
+of a twenty-five-minute gamble: it has a fixed start and a fixed end. `table-save-survives` is
+ticked only on a live reading with `clicked > 0`, `inspected > 0` **and** `builderSeesTableEdit:
+true` — a conjunction, because the first two are what make the third mean anything.
