@@ -10354,3 +10354,34 @@ file exists to prevent — caught in the harness, this time, which is the only p
 **Next.** Read the focused pass: `edge-delete.removed` / `edge-delete-undo.restored` off the fix,
 then `listener.captureKind` and `plugin-palette` now that the pass is on the builder when it
 reads them, and `table-save-survives` — the row that never ran at all.
+
+### The pass could not run, and the reason is the box rather than the branch
+
+The focused pass took the slot, reset `omnion_qa_w3`, and brought the **API** up on `:18082`
+and the **admin panel** up on `:3102`. The **public renderer** on `:3202` never answered, and
+`run.sh` treats it as a hard gate, so the pass exited before the walkthrough.
+
+The cause is visible in the renderer's own log and in the disk: `apps/web/.next` is gone and
+Next logged `Slow filesystem detected. The benchmark took 650ms` on `/mnt/apopic`. `/mnt/apopic`
+is at **92%** (4.8 G free) and the fat is not this worktree — `omnion-w3` is 475 M total with a
+0-byte `target`. It is `docker-data` at 30 G and other writers' `omnion-w2-target` (2.7 G),
+`omnion-w4` (3.5 G) and `omnion` (8.0 G), none of which are mine to delete. `/dev/shm/w3-target`
+(5.1 G) is **live** — pid 1486192 with cwd `apps/api` — so deleting it would have killed a
+running API, which is the reason the reclaim step stopped rather than reaching for the biggest
+number on the box.
+
+**What is honestly blocked and what is not.** The pass is deferred, not skipped: the slot was
+taken, released cleanly, and the four rows this tick could not read (`edge-delete.removed`,
+`edge-delete-undo.restored`, `listener.captureKind`, `plugin-palette`, `table-save-survives`) are
+all *admin-side* rows that need only the API and the admin panel — both of which came up. So
+the next tick should re-run the same focused pass on a box with room, and the reading it
+produces is the gate for the `edge-delete` box. Nothing here is reported as measured.
+
+**The lesson worth keeping, and it is not about disk.** `wait_http` on the renderer gates every
+pass, including passes whose rows never touch the public renderer. A depth pass for a screen in
+the *admin* app cannot be read on a box where the *public* app will not boot, and the error
+printed is about the one component that does not matter for that pass — the two minutes spent
+reading `public renderer did not answer` were spent looking for a web defect in a branch whose
+web app was merely out of room. A gate that is not scoped to what the pass measures is a gate
+on the wrong axis, and the honest reading of "the pass died" is "the pass died", never "the
+product is broken".
