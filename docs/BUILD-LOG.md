@@ -17238,3 +17238,103 @@ and the keyboard/mobile box stay open for that reason and no other.
 **Next:** the walkthrough needs its developer routes added to `scripts/qa/walkthrough.cjs` — no
 untested screen is accepted, and a route list that omits `/developer` means a pass that is green
 because it never looked. Then the pass itself, then the state boxes, and only then `done`.
+
+## Slice 20 — REQ-133 project export: the word between "archive" and "delete"
+
+Slice 19 wrote the settings row's **last** word (`delete`) and left the one before it unwritten.
+The REQ's Risks section names four things that make deleting a project with dependencies safe and
+one of them is an **"export-first hint"** — so after slice 19 the delete dialog's blocked branch
+told a user to move their workflows out and the record of what was in the project could not be
+taken. Same signature defect as slice 19, one word earlier.
+
+**What shipped.** `omnion_workflows::project_export` (project row + members + workflows, **one
+transaction** — an export read across three connections is a snapshot of nothing in particular).
+JSON only, and the reason is the guarantee it carries: `steps`, `conditions` and `schedule` cannot
+be flattened into a CSV without a second engine that can drift from the first. `GET
+/api/v1/projects/{id}/export` served as a **download**, not a JSON body — `Content-Disposition:
+attachment`, `application/json`, `Cache-Control: no-store` (a cached snapshot means clicking
+"export" twice yields yesterday's file, which for an archive taken before a deletion is the one
+failure the feature exists to prevent). `projects.read`, **not** `projects.manage`: exporting
+writes nothing and locks nothing, and a second permission on the same data would mean "read it
+here but not there" — the `visible_project_ids` vs `find_visible` split this surface has already
+paid for once. The detail screen's button is **enabled on an archived project**, which contradicts
+every other control beside it and is deliberate: archiving is the state an operator reaches
+precisely when they want the record.
+
+**The gate's first run caught a false premise of mine, and it was a claim rather than a defect.**
+The store carried a fallback rendering `deleted account (3f2a…)` for a membership whose account is
+gone — defensive, careful-looking, and **unreachable**: `automation_project_members.user_id` is
+`on delete cascade`, so no membership can name a user that is not there. Unreachable code written
+to look careful is worse than no code, because the test that "proves" it is proving the writer's
+assumption. The fallback is gone, `build_export` names the invariant if it is ever broken, and
+`a_membership_cannot_outlive_its_account` asserts the FK — so a future `set null` (reasonable;
+`automation_projects.owner_user_id` already is `set null`) **fails this gate and says what has to
+be written next** instead of being discovered in a file somebody has already archived.
+
+A second, smaller one, in the same run: the filename test asserted two dashes and the real name has
+three. Writing down a wrong number is how a test stops testing, so it now reads the stamp segment
+and checks its length and character class.
+
+### Gates, all run this tick
+
+| Gate | Command | Result |
+|---|---|---|
+| export | `bash scripts/qa/run-project-export.sh` | **12 passed**, and **proven to fail at 8/12** |
+| crate | `cargo test -p omnion-workflows --lib --quiet` | **63 passed** (was 56) |
+| build | `cargo build -p omnion-api` | exit 0, no warning from the files touched |
+| types | `tsc --noEmit` (apps/admin) | exit 0 |
+| regression | `bash scripts/qa/run-project-delete.sh` | **6 passed** (unchanged after the change) |
+| harness | `node --check scripts/qa/walkthrough.cjs` | parses |
+
+**Proven to fail: the `project_id` filter dropped from the export's workflow read** — four tests go
+red and the eight that do not touch it stay green, which is what shows the gate names this defect
+and not its neighbourhood. The four are the ones that can only fail for this fix: the count, the
+content, the steps-as-stored, the stable order, and the negative control that names the sibling's
+workflow text.
+
+**The walkthrough assertion is the download EVENT, not the button's presence.** A button wired to
+nothing renders exactly like one wired to the endpoint — the branch's rule that an assertion which
+cannot fail is worse than none, applied to a control. `record({action: "project-export"})` gates on
+`waitForEvent("download")` firing (with an explicit loser, since a download that never comes is a
+hang, not an event) and separately reads the route's status, content-type, `attachment` disposition
+and parsed schema through the page.
+
+**Not run: the browser pass.** The QA slot is held live by `w6` (holder pid verified with
+`kill -0`, `cwd=/mnt/apopic/omnion-w6`), load 30, 999 chrome processes, `/mnt/apopic` 84% with 9.2 G
+free — which is where a pass that rebuilds `.next` (~1.5 G) dies. So the two screens are built,
+typechecked and harness-driven but **not observed**, and acceptance 16's screen half stays unticked
+for that reason and no other.
+
+**Commits:** `1c6ff897` (the store), `da919e81` (the route), `13332e24` (the gate and the two fixes
+it forced), `148ae542` (the panel and the walkthrough), pushed.
+
+**Next:** run `--only=projects` when the slot frees, so `exportDownloadStarted` and
+`deleteProjectGone` both come from one `summary.json`; then the unticked 390 px criterion; then the
+wave-4 requests after REQ-061 manufacturing, which w4 has not reached.
+
+### The gate that was not this tick's regression
+
+`run-project-limits.sh` went **14/14, 13/14, 14/14, 14/14, 13/14** on identical code. Reverting to
+the pre-slice-20 commit and re-running gave 14/14, which reads as "this change broke it" — and
+**one run of a flaky gate is not a comparison.** Three runs separated the two for four minutes less
+than the bisect already started.
+
+The cause is real and was fixed: `fail_step` matches `where status = 'running'` and returns `Ok(())`
+when nothing matches — correct product behaviour, because the engine always claims a step before
+failing it. A fixture whose claim had not landed produced zero rows, `fail_step` reported success,
+and `.expect("the step fails")` **passed**, because it asserts the call did not *error* and a silent
+no-op is not an error. The settlement assertion one line down then settled a run whose step was
+still `pending` and reported `left: None, right: Some(Failed)` against a platform that had done
+nothing wrong. The fixture now reads the step's status back and asserts `failed` — the consequence,
+not the call, which is the stronger check and needs no product change (`fail_step` keeps
+`Result<()>`; widening it to `Result<u64>` is a product edit made for a test).
+
+**BLOCKER for the next tick, and it is the box, not the work:** the shared `omnion-postgres` entered
+**crash recovery** partway through this tick (load 19–30 across nine writers, 999 chrome processes
+before the reboot, `/mnt/apopic` at 84%). Every `psql` — including `pg_isready` — answers
+`FATAL: the database system is in recovery mode`, so **no gate that provisions its own database can
+run** until Postgres finishes recovery. `run-project-limits.sh` was **one clean 14/14 after the
+fixture fix and could not be repeated**; the repeat is what the next tick should do first, and it
+should treat "the database is in recovery" as a box condition to wait out rather than a product
+verdict. The QA slot is now free (the w6 holder died with its pass), so the browser pass is the
+next thing to attempt **once Postgres answers**.
