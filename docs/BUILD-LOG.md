@@ -1,3 +1,102 @@
+## Tick 82 (wave3) — an allowance that could not match the refusals it was registered for
+
+fix(qa): the deliberate refusals a pass provokes were the findings it was charged for
+
+**What this tick is, given that no REQ moved.** Five rows are unticked and every one of them is
+waiting on a browser pass, so the tick began by starting one. It died at `resetting the QA
+database` — and the reason is worth recording before the slice, because it is a class of failure
+that reads like a capacity problem and is not one.
+
+**`omnion-postgres` was in an fsync crash-recovery loop, and it is the shared database, not mine.**
+`docker logs omnion-postgres --tail 3`:
+
+```
+LOG:  syncing data directory (fsync), elapsed time: 530.00 s, current path: ./base/17403330/13514
+FATAL:  the database system is starting up
+```
+
+The container is up and the port is bound, and every `psql` answers `FATAL: the database system is
+starting up`. `pg_isready` says **rejecting connections**, not *no response* — that distinction is
+the whole diagnosis, because a pass that dies there exits on the line `resetting the QA database`
+and reads as a harness or a fixture problem. It took ~20 minutes to recover on its own, at
+`/mnt/apopic` 96–98%, which is the reason. Two ticks of my ledger had attributed missing rows to a
+crowded box; a container that is recovering from a disk-full crash looks exactly like a box that is
+too busy, and the one-line log that names it was never read. **When a shared service refuses
+connections, read its own log before reading anything about your own workload.**
+
+**The slice.** With the pass queued behind that, the roll-up got read — because tick 78 had written
+"19 high findings are the probe's own refusals" and left "`expectedRefusals` being empty is a
+harness gap worth naming" as a note, and a note three ticks old is a claim waiting to be checked
+rather than a conclusion.
+
+It was true, and the shape of it was worse than the note guessed. `expectRefusal` exists so that **a
+refusal a pass provokes on purpose is an assertion rather than a defect**. Two halves of that
+contract did not hold:
+
+- **The net matcher could not match what the file registers.** It accepted `[401, 403]` — the shape
+  an *authorisation* gate refuses with — while the most-registered deliberate refusals in the file
+  are not authorisation at all. A two-tab conflict is a **409**, a body the server is right to
+  reject is a **422**, a loop the pass left open on purpose is a **400**, a read of a legitimately
+  empty collection is a **404**. Not one could be excused by the allowance the pass had registered
+  for it, so all of them arrived as high findings. A **500 stays out**, and that exclusion is what
+  keeps the widened list a list rather than a switch that turns the net roll-up off: an allowance is
+  a licence for a refusal the pass *asked for*, and a crash is the product failing.
+- **The console half was broken the other way, and the obvious fix would have made it worse.** A
+  line was excused on the status alone (`/status of 40[13]/`), so whichever allowance happened to
+  be live swallowed every 401/403/404-shaped line for the rest of the session. Widening the status
+  list *without* scoping the match by URL would have traded "charges the pass for its own refusals"
+  for "hides everybody's 403" — the same number of findings, in the opposite direction, and the
+  second one is the one that loses a real defect. A line is excused only when it names an excusable
+  status **and** arrives at a URL its allowance registered for; the two callers registering a bare
+  path fragment (`"passkeys/"`, `"notifications/emit"`) fall back to the line's own text, which is
+  the only handle they have.
+- **Nothing said an allowance went unused.** `summary.json` carried `expectedRefusals`, which is the
+  list of refusals it *claimed*. An allowance that matched nothing left no trace, so a pass charged
+  for its own deliberate refusals produced **the same report** as a pass that provoked none. Three
+  ticks read that empty list as evidence and it was evidence of nothing. The claimed and unused
+  halves now sit in `counts` beside each other, because a number readable without its counterpart is
+  a number that will be read alone.
+
+**The gate, and the two ways it was wrong first.** `scripts/qa/probe-expected-refusals.cjs` is
+**38/38**, and it splits into behavioural rules (the matcher, run against the shapes passes really
+register) and structural ones (the two decisions the *shipped* source makes) — because a
+transcription can be right while the source is wrong, which is the failure this file exists to
+prevent. Four mutations of the real source each have to go red on a **named** rule:
+
+| mutation | the rule that must catch it |
+|---|---|
+| net matcher narrowed back to `[401, 403]` | net matcher takes its statuses from `REFUSAL_STATUSES` |
+| console matcher deciding on the status alone | console matcher keys on the URL |
+| unused allowances dropped from the report | `summary.json` reports the unused allowances |
+| a 500 added to the excusable list | no 5xx is excusable |
+
+Two of the four were wrong before the gate was right, and both are the tick-81 lesson a second
+time. One deleted the `statusNamed` declaration instead of the decision, leaving dangling
+references so the mutant **threw** before any rule could decide — a mutation that corrupts the
+file's structure tests nothing. The other anchored on `entry =>` when the source writes
+`(entry) =>` inside a `.find()`. A third failure was the block's own: the mutation child spawned
+its own mutation children, so its red came from a nested mutation rather than from the defect under
+test — a gate that re-executes itself has to be told not to (`QA_REFUSAL_MUTANT=1`), or the
+mutation proof measures the harness instead of the defect.
+
+| gate | result |
+|---|---|
+| `node scripts/qa/probe-expected-refusals.cjs` | **38/38** (4 mutations red on their named rule, green on the unmutated file) |
+| `node scripts/qa/probe-pass-scope.cjs` | **10/10** (unchanged — this tick's edit adds no template string) |
+| `cargo test -p omnion-workflows --lib` | **157/157** |
+| `pnpm typecheck` | 2/2 (admin cache miss, web cache hit) |
+| `node --check` both files | clean |
+
+**Still unticked.** `table-save-survives`, `edge-delete.removed`, `edge-delete-undo.restored`,
+`listener.captureKind`, `plugin-palette` — all five need a browser reading, and none of them may be
+ticked on the strength of this commit.
+
+**Next.** The focused `--only=workflow-table` pass on the w3 stack, now that the database answers.
+It is a bounded five-minute run rather than a twenty-five-minute gamble: fixed start, fixed end, one
+depth pass. `table-save-survives` is ticked only on a live reading with `clicked > 0`, `inspected
+> 0` **and** `builderSeesTableEdit: true` — a conjunction, because the first two are what make the
+third mean anything.
+
 ## 2026-10-02 — tick 71: the generate route was the only one that answered with its own absence
 
 feat(app-builder): a prompt becomes a plan, and the artifacts are stored
