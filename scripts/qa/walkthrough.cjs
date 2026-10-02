@@ -7821,7 +7821,23 @@ async function runMembersDepth(page, report) {
   await page.waitForTimeout(1200);
   // The drawer's block button is a named hook, not "the first action": a dialog opened by the
   // wrong button is a dialog whose assertion proves nothing.
-  await page.locator("[data-member-drawer-action=\"block\"]").first().click({ timeout: 6000 }).catch(() => {});
+  //
+  // It has to be SCOPED to the drawer as well as named. `SmallButton` renders one hook,
+  // `data-member-action`, and the table rows, the phone card list and the drawer all use it — in
+  // that DOM order. So `[data-member-action="block"]` alone, and `.first()` on it, would drive a
+  // ROW button while the assertions below read the member the drawer was opened for. This line
+  // previously asked for `data-member-drawer-action`, which the product renders **nowhere**: the
+  // click threw into the `.catch()`, the dialog never opened, and every step from here to the
+  // `blockedInSql` assertion silently reported on a member that was never blocked. The selector was
+  // a plausible name for a real control, which is why it survived review, and the refusal is
+  // silent, which is why no artifact ever said so.
+  // `scripts/qa/probe-selector-contract.cjs` is what found it, and it exists because this pass had
+  // not been run since it was written.
+  await page
+    .locator(`[data-member-drawer="${memberId}"] [data-member-action="block"]`)
+    .first()
+    .click({ timeout: 6000 })
+    .catch(() => {});
   await page.waitForTimeout(600);
   steps.blockDialogAskedForAReason =
     (await page.locator("[data-member-block-reason]").count()) > 0;
@@ -7872,7 +7888,14 @@ async function runMembersDepth(page, report) {
 
   await page.locator(`[data-member-open="${waitingId}"]`).first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(1200);
-  await page.locator("[data-member-drawer-action=\"delete\"]").first().click({ timeout: 6000 }).catch(() => {});
+  // Scoped for the same reason as the block button above: `data-member-action="delete"` exists only
+  // in the drawer (a row offers open / verify / block), but "only in the drawer" is a claim about
+  // the product, and the product is not what proves this pass drove the drawer.
+  await page
+    .locator(`[data-member-drawer="${waitingId}"] [data-member-action="delete"]`)
+    .first()
+    .click({ timeout: 6000 })
+    .catch(() => {});
   await page.waitForTimeout(600);
   const deleteDialogText = await page
     .locator("[data-member-delete-dialog]")
