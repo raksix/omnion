@@ -108,6 +108,20 @@ if [ "${QA_SLOTS:-1}" != "0" ]; then
   # catches is silent by construction.
   step "testing the screen inventories"
   node "$(dirname "${BASH_SOURCE[0]}")/screen-coverage.cjs" || echo "[qa] screen-coverage test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # Every `[data-*]` the walkthrough addresses must be a hook the product renders.
+  #
+  # The other gates above each guard a mechanism. This one guards the thing they all rest on: a
+  # pass can only assert against a hook the page draws. `runMembersDepth` asked for
+  # `[data-member-drawer-action="block"]` — a plausible name for a real control, rendered by no file
+  # in `apps/`. The `click()` threw into a `.catch()`, the block dialog never opened, and every
+  # step from there to `blockedInSql` reported on a member that was never blocked, on every run
+  # since the pass was written. The pass had never been executed; the review read as clean and the
+  # artifacts said nothing, because a swallowed refusal is not an error.
+  #
+  # It is a static read, so it costs milliseconds and needs no slot — which is what makes it useful
+  # on a tick when the shared slot is held and the browser pass cannot run at all.
+  step "testing the selector contract"
+  node "$(dirname "${BASH_SOURCE[0]}")/probe-selector-contract.cjs" || echo "[qa] selector-contract test reported failures (continuing: a broken test is not a reason to skip a pass)"
   # The database this pass DROPS. This one runs before the reset rather than after it, because the
   # operation is destructive: `reset-db.sh` defaults its name to `omnion_qa` — the MAIN writer's
   # database — so a writer on its own stack who runs that script by hand (the natural thing to do
