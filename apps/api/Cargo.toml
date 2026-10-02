@@ -50,6 +50,7 @@ omnion-notifications = { path = "../../crates/notifications" }
 omnion-security = { path = "../../crates/security" }
 omnion-module-analytics = { path = "../../modules/analytics" }
 omnion-onboarding = { path = "../../crates/onboarding" }
+omnion-developer = { path = "../../crates/developer" }
 omnion-permissions = { path = "../../crates/permissions" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }
