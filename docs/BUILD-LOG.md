@@ -9088,3 +9088,61 @@ directory`), which is the harness, not the code.
 
 **Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps out
 of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+## tick 68 — REQ-130 slice 2 · persisted documents, and a settings row nobody read
+
+**What.** The registry's back end: `crates/graphql/src/persisted.rs` (canonical hash, registry
+row, allowlist verdict, pruning), `apps/api/src/routes/graphql_documents.rs` (the store),
+`graphql_settings.rs`, `graphql_manager.rs` (the routes), migration `0238_graphql_settings.sql` at
+the UNION high-water (w7 holds 0237), and `apps/api/tests/graphql_documents.rs`. Two earlier commits:
+`aa4ff7b5` (the decision layer) and `ac497004` (the store). Plus a merge of `origin/main`
+(`97d0211f`) and a QA harness fix (`a9f5f5d7`).
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-graphql --lib` | 95/95 |
+| `cargo test -p omnion-api --lib graphql_manager` | 3/3 |
+| `cargo test -p omnion-api --test graphql_documents` | **10/10** in 89 s |
+| `scripts/qa/sign-in-rate-limit.test.cjs` | 9/9; 7/9 of those fail against the pre-fix file |
+| the eight pre-existing QA gates | 9/9 |
+| `cargo build -p omnion-api` | clean |
+
+**The result this tick is actually about — four defects, and the walk found all of them:**
+
+1. **The settings row was never read.** `run_pre_execution` built its limits from
+   `Settings::default()`. The walk wrote `persisted_only: true`, sent an ad-hoc document, and got a
+   `200` with a normal `data` envelope: the flag the screen reported as saved had no effect on
+   execution. One line wearing the costume of a default, and the FOURTH "documented but
+   unreachable" shape this request has produced.
+2. **An uncatalogued guard — the fifth occurrence in this repository.** The request's API table
+   names `developer.read` and `developer.graphql.manage`; this tree ships no `developer.*` key at
+   all, so those resolve to no permission and answer `403` for every caller including the owner.
+   Reads are `content.pages.read`, writes `deployment.migrations.apply`. **The test that holds this
+   first failed to hold it:** it grepped the catalogue's source, the string appeared in a COMMENT,
+   and the test passed green while every walk died with `UnknownPermission`. It asks the registry
+   now, and `is_known` is the only thing that proves a key is grantable.
+3. **A `.layer()` on a `get().post()` pair applies ONE key to both verbs.** The first draft guarded
+   `GET /graphql/documents` with the write key; the manager would have refused the readers it
+   exists to inform, and nothing in review could see it. Reads and writes are separate routers now.
+4. **`body["message"]` is Null for every `ApiError`.** The envelope is `{"error": {...}}`, so three
+   walk assertions read an empty string and reported a handler that had in fact named the field.
+
+**The QA pass, and a harness bug worth more than the run.** The pass walked 150 screenshots and
+then died in the LAST loop of the report on `d.horizontalOverflow` with no `diagnostics`, writing a
+94-byte summary that said `fatal` and nothing else — every finding before it discarded by one
+untested line. Two of the two loops above that one already guarded it. And its 22 "the session was
+lost" screens were a `429`: the sign-in loop read a rate limit as a refusal, so 22 screens were
+measured as a login form — the exact shape tick 59 was fixed for, with a different cause.
+`a9f5f5d7` fixes both, and the gate for it caught two defects in my own first attempt (an invented
+`page.__qaNet` that was always empty, and a network mark taken AFTER the click it had to precede —
+so the retry branch was dead code twice over, reading exactly like a fix).
+
+**Not proven, on purpose.** The four admin screens do not exist yet, so box 16 and the playground's
+cost meter are untouched, and this tick's pass had nothing new of mine to visit. A registered
+document that USES a variable has not been walked either.
+
+**Next.** The admin surface: `/developer/graphql`, `/documents`, `/documents/{id}`, `/settings` with
+the walkthrough route entries and depth passes, then the playground's over-budget refusal (box 13)
+and the schema explorer's role diff (box 14).
