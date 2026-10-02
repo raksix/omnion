@@ -13341,41 +13341,81 @@ async function main() {
   // The navigation and queue pass (REQ-064, slice 1). It runs after the content passes because
   // `Add pages…` needs a published page to point at, and it cleans up every menu and entry it
   // creates — a QA database whose header menu grows a row per pass stops proving anything.
-  report.forms = await runFormsDepth(page, report);
-  log(`forms: ${JSON.stringify(report.forms)}`);
-  report.menus = await runMenusDepth(page, report);
-  log(`menus: ${JSON.stringify(report.menus)}`);
+  //
+  // Every pass in this block used to run UNCONDITIONALLY, which is what `--only` is supposed to
+  // prevent. A focused pass that names one depth pass walked this whole group as well: it made
+  // `--only=block-editor` build a page, publish it, drive five more browser passes and then die
+  // in the newsletter fixture, so the pass this REQ owed finished its own summary and then threw
+  // away the stack. The symptom read like a product defect — an FK violation naming a site that
+  // the site fixture had already written — and cost a tick before the shape was clear: a
+  // `--only` run that runs passes nobody asked for is a filter that matches nothing AND
+  // everything, and the unmatched-name finding below cannot report a name that DID run.
+  //
+  // Each pass now checks `wants()`, and records itself in `matchedOnly` so the roll-up can still
+  // report a filter that named it. `members` keeps its own entry point above and is skipped here
+  // rather than run twice.
+  if (wants("forms")) {
+    matchedOnly.add("forms");
+    report.forms = await runFormsDepth(page, report);
+    log(`forms: ${JSON.stringify(report.forms)}`);
+  }
+  if (wants("menus")) {
+    matchedOnly.add("menus");
+    report.menus = await runMenusDepth(page, report);
+    log(`menus: ${JSON.stringify(report.menus)}`);
+  }
 
   // The comment queue pass (REQ-064, slice 4a). It runs after the forms pass because the two
   // share the public-submission surface — the form submit route and the comment submit route are
-  // the only two endpoints a stranger posts to — and a failure in either should be read with
-  // the other in view. It creates its own page and leaves the comments it seeded: a queue whose
+  // the only two endpoints a stranger posts to — and a failure in either should be read with the
+  // other in view. It creates its own page and leaves the comments it seeded: a queue whose
   // rows are cleaned up afterwards is a queue whose next pass opens on an empty screen.
-  report.comments = await runCommentsDepth(page, report);
-  log(`comments: ${JSON.stringify(report.comments)}`);
+  if (wants("comments")) {
+    matchedOnly.add("comments");
+    report.comments = await runCommentsDepth(page, report);
+    log(`comments: ${JSON.stringify(report.comments)}`);
+  }
 
   // The mailing-list pass (REQ-064, slice 4b). It runs right after the comment pass because
   // both write rows nobody in the browser could have written — the comments pass seeds a
   // moderation queue, this one seeds a pending subscription — and a failure in either should be
   // read with the other in view. It leaves its rows: a list cleaned up afterwards is a list the
   // next pass opens empty.
-  report.newsletter = await runNewsletterDepth(page, report);
+  if (wants("newsletter")) {
+    matchedOnly.add("newsletter");
+    report.newsletter = await runNewsletterDepth(page, report);
+    log(`newsletter: ${JSON.stringify(report.newsletter)}`);
+  }
   // The theme gallery (REQ-062, slice 1). Driven right after the CMS depth passes because it
   // is the one screen in this group that changes what every OTHER one renders.
-  report.themes = await runThemesDepth(page, report);
+  if (wants("themes")) {
+    matchedOnly.add("themes");
+    report.themes = await runThemesDepth(page, report);
+    log(`themes: ${JSON.stringify(report.themes)}`);
+  }
   // The theme settings screens (REQ-062, slice 2). They run immediately after the gallery
   // because the gallery's cards are the only way into them, and a settings pass that started
   // from a typed URL would never test the link an operator actually clicks.
-  report.themeSettings = await runThemeSettingsDepth(page, report);
-  log(`newsletter: ${JSON.stringify(report.newsletter)}`);
+  if (wants("theme-settings")) {
+    matchedOnly.add("theme-settings");
+    report.themeSettings = await runThemeSettingsDepth(page, report);
+    log(`theme settings: ${JSON.stringify(report.themeSettings)}`);
+  }
 
   // The visitor-accounts pass (REQ-064, slice 4c). It runs after the newsletter pass because
   // both hold a stranger's address and both put an operator in the position of deciding about
   // one, and a failure in either should be read with the other in view. It leaves its rows: a
   // members table cleaned up afterwards is a table the next pass opens empty, and an empty table
   // is where the "no visitors have signed up yet" state has never been checked.
-  report.members = await runMembersDepth(page, report);
-  log(`members: ${JSON.stringify(report.members)}`);
+  //
+  // Skipped on a focused pass: `members` has its own entry point above, which runs this same
+  // function and ends the process, so reaching here with `members` in the filter is already
+  // answered and running it a second time would seed a second membership table.
+  if (wants("members") && !onlyEntry("members")) {
+    matchedOnly.add("members");
+    report.members = await runMembersDepth(page, report);
+    log(`members: ${JSON.stringify(report.members)}`);
+  }
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
