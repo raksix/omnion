@@ -11572,3 +11572,95 @@ that was mis-measuring them.
 **Next:** re-run `QA_STACK=w3 … --only=workflow-table,workflow-builder` the moment the slot is free,
 for `table-save-survives` (`clicked > 0` AND `inspected > 0` AND `builderSeesTableEdit: true`) off the
 `cc90c56a` starter fix, and `edge-delete.removed` / `edge-delete-undo.restored` off this tick's row.
+
+## Tick 86 (wave3) — the sixteenth reading was a constant, and a sweep found the fifth site of its class
+
+**The row.** `narrow-lock` asserts the criterion's middle claim — *"Below 1024px the builder is
+read-only with the banner, **Table mode stays editable**"* — with a count:
+
+```js
+const editableOnTable = await page.locator("[data-workflow-table-edit], [data-table-edit]").count();
+tableSaves = { landedOnTable: onTable, editControls: editableOnTable };
+```
+
+Neither attribute has ever been rendered. `grep -rn 'data-table-edit' apps/ scripts/ crates/`
+returns that line and nothing else; the table ships `data-table-label`, `data-table-param` and
+`data-table-save`. So `editControls` was structurally **0** — and a 404 page and a working
+Table mode reported the same number, which is the whole tell: **the row reports a count, so a
+constant is indistinguishable from a reading.**
+
+Four lines of comment directly above the selector say *"a lock that locked Table mode too would
+satisfy 'read-only' and fail the criterion in the same breath. So the link is followed and **a
+value is changed there**."* Nothing ever typed a value. The comment described the measurement
+the row did not take.
+
+**The fix.** The criterion names writability, so the row writes: wait for `[data-table-mode]`
+(never a fixed sleep), report `rendered` and `editable` separately, type into the first control
+that is neither `disabled` nor `readOnly`, read the product's own `data-table-save-state` back,
+and restore the author's value. `tableMounted` is what lets a 0 say *which* zero.
+
+| what | command | result |
+|---|---|---|
+| instrument suite | `node --test features/workflows/narrow-lock-row.test.ts` | **5 passed, 0 failed** |
+| real pre-fix bytes | `mutate-narrow-lock-row.mjs` control | **5 failed / 0 passed** — the shipped defect |
+| mutations | `node scripts/qa/mutate-narrow-lock-row.mjs` | **7/7 red**, each naming its assertion |
+| restore | (asserted every run) | byte-exact |
+| admin suite | `node --test features/workflows/*.test.ts` | **381 passed** (376 → 381) |
+| types | `pnpm typecheck` (admin + web) | exit 0 / exit 0 |
+| syntax | `node --check scripts/qa/walkthrough.cjs` | clean |
+
+**Four of seven mutations survived the gate's first draft, and every survivor was the gate being
+weak rather than the code being wrong** — the same shape as tick 84, and the second time this
+file has had to learn it:
+
+| mutation | why the rule missed it | how the rule reads now |
+|---|---|---|
+| `tableMounted` → `tableMountedDropped` | a bare substring rule is satisfied by a **rename** | anchored on the assignment `/^\s*tableMounted\s*,/m` |
+| `editControls` → `editableControls` | satisfied by a **sibling** — `editControlsRendered` is one line below | `/^\s*editControls\s*:/m` |
+| mount wait → `const tableMounted = true` | the wait stayed in the source behind a `void (…)`, so a presence rule passed | anchored on the **derivation** |
+| type → `if (input) return null` | two `dispatchEvent` sites; stripping one left the other, and a lazy `[\s\S]*?` sailed over the early exit | anchored on **reachability**: exactly one exit before the dispatch, and it must be the `!input` guard |
+
+**The class, and the fifth site.** `probe-probe-markers.cjs` sweeps every `data-*` attribute the
+two builder passes query. It found `undoSelNote.inspectorOpen` reading `[data-node-inspector]`;
+`NodeInspector` renders `data-inspector={node.id}`, so that field was structurally false on
+every run. **The walkthrough's own comment, three lines above the defect, already says why it
+survived: *fixing the sites a report names leaves every unnamed site holding the defect.*** Tick
+62 fixed four; that fix was written from the row that reported them rather than from a search for
+the pattern.
+
+87 selectors, 0 unresolved, **with a control that bites**. Against `git stash`ed pre-fix bytes —
+not a hand-written string — it names `data-node-inspector` and exits 1.
+
+**The sweep was three wrong scripts before it was right, and each reported a clean bill of health
+while being wrong:**
+
+1. Requiring quotes missed every bare JSX attribute. The fix used an alternation containing a bare
+   `("|…)`, which matches **a quote alone** — so every file with any quote "hit", `node_modules`
+   binaries included, and 578-of-590 became zero.
+2. Requiring `=` after the bare form missed attributes written alone on a line, which is how this
+   codebase writes them (`data-builder`, line 2178, nothing after it but the newline).
+3. A trailing-delimiter class without `$` **cannot match a line-final attribute, because grep is
+   line-oriented** — the newline is not in the line. This is what made version 3 disagree with
+   the tree in both directions at once.
+
+**A stale control must say so.** `mutate-narrow-lock-row.mjs` compared whole files to decide
+whether HEAD still carried the defect; after committing an unrelated fix to the walkthrough it
+reported *"THE GATE IS NOT PROVEN"* on a gate that was perfectly proven — a false alarm that
+trains the next reader to ignore the one line that matters. It now tests the fix's **code**, with
+comments stripped first, because the fix's own comment quotes the marker verbatim to explain why
+it went: **the guard that reads prose and calls it code, arriving one commit later, in the guard
+for the guard.**
+
+**Not ticked — the readings are still unmeasured.** No browser pass: the QA slot is held by a
+LIVE `omnion-w6` pass (holder 212963, `/proc/212963/cwd` = `/mnt/apopic/omnion-w6`), and the box
+is at 1032 Chrome, load 34 and 0 free RAM. A pass in that state measures the machine. `cargo test
+--workspace` was also started (the `/dev/shm/w3-target` symlink had survived the reboot while the
+tmpfs did not — `failed to create directory .../target` / *Not a directory*) and had not reported
+by the close of this tick.
+
+**Commits:** `5fc52c1f` (the row and its instrument), `a0f2af06` (the sweep and the fifth site),
+pushed.
+
+**Next:** `QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202 … --only=workflow-table,workflow-builder`
+the moment the slot frees, for `table-save-survives`, `edge-delete.removed` / `edge-delete-undo.restored`,
+and the first reading of `narrow-lock.tableMode.editControls` that can be anything but 0.
