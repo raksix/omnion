@@ -51,6 +51,7 @@ pub mod openapi;
 pub mod parity;
 pub mod persisted;
 pub mod schema;
+pub mod sdk;
 pub mod settings;
 
 pub use cost::{Catalogue, Priced, Weight, price};

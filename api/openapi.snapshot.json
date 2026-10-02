@@ -209,7 +209,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_ai_providers_by_id_discover-models",
+        "operationId": "post_ai_providers_by_id_discover_models",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1156,7 +1156,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_auth_step-up",
+        "operationId": "post_auth_step_up",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1527,7 +1527,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_backup-schedules",
+        "operationId": "get_backup_schedules",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1554,7 +1554,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_backup-schedules",
+        "operationId": "post_backup_schedules",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1583,7 +1583,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_backup-schedules_by_id",
+        "operationId": "delete_backup_schedules_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1610,7 +1610,7 @@
       "put": {
         "deprecated": false,
         "description": null,
-        "operationId": "put_backup-schedules_by_id",
+        "operationId": "put_backup_schedules_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1639,7 +1639,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_backup-schedules_by_id_run",
+        "operationId": "post_backup_schedules_by_id_run",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1668,7 +1668,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_backup-settings",
+        "operationId": "get_backup_settings",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1695,7 +1695,7 @@
       "put": {
         "deprecated": false,
         "description": null,
-        "operationId": "put_backup-settings",
+        "operationId": "put_backup_settings",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1952,7 +1952,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_backups_by_id_restore-jobs",
+        "operationId": "get_backups_by_id_restore_jobs",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -1981,7 +1981,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_backups_by_id_restore-preview",
+        "operationId": "get_backups_by_id_restore_preview",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2010,7 +2010,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_backups_by_id_restore-queue",
+        "operationId": "post_backups_by_id_restore_queue",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2068,7 +2068,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_command-center_context",
+        "operationId": "get_command_center_context",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2097,7 +2097,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_command-center_recent",
+        "operationId": "delete_command_center_recent",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2124,7 +2124,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_command-center_recent",
+        "operationId": "get_command_center_recent",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2151,7 +2151,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_command-center_recent",
+        "operationId": "post_command_center_recent",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2180,7 +2180,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_command-center_resolve",
+        "operationId": "post_command_center_resolve",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2267,7 +2267,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_credential-slots",
+        "operationId": "get_credential_slots",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2296,7 +2296,7 @@
       "put": {
         "deprecated": false,
         "description": null,
-        "operationId": "put_credential-slots_by_scope_by_slot",
+        "operationId": "put_credential_slots_by_scope_by_slot",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2325,7 +2325,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_credential-slots_by_scope_by_slot_resolve_by_scope_id",
+        "operationId": "get_credential_slots_by_scope_by_slot_resolve_by_scope_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2354,7 +2354,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_deployment-keys",
+        "operationId": "get_deployment_keys",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2381,7 +2381,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_deployment-keys",
+        "operationId": "post_deployment_keys",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2410,7 +2410,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_deployment-keys_by_id",
+        "operationId": "delete_deployment_keys_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2439,7 +2439,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_deployment-keys_by_id_revoke",
+        "operationId": "post_deployment_keys_by_id_revoke",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -2468,7 +2468,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_deployment-keys_by_id_uses",
+        "operationId": "get_deployment_keys_by_id_uses",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -3326,7 +3326,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_deployment_migrations_by_version_verify-down",
+        "operationId": "post_deployment_migrations_by_version_verify_down",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -3413,7 +3413,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_deployment_upgrade-plan",
+        "operationId": "get_deployment_upgrade_plan",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -3442,7 +3442,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_deployment_upgrade-plan_acknowledge",
+        "operationId": "post_deployment_upgrade_plan_acknowledge",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -3471,7 +3471,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_developer_api-keys",
+        "operationId": "get_developer_api_keys",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -3498,7 +3498,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_developer_api-keys",
+        "operationId": "post_developer_api_keys",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -3527,7 +3527,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_developer_api-keys_by_id",
+        "operationId": "delete_developer_api_keys_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -3554,7 +3554,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_developer_api-keys_by_id",
+        "operationId": "get_developer_api_keys_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -3583,7 +3583,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_developer_api-keys_by_id_rotate",
+        "operationId": "post_developer_api_keys_by_id_rotate",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -4325,7 +4325,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_health_maintenance-windows",
+        "operationId": "get_health_maintenance_windows",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -4352,7 +4352,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_health_maintenance-windows",
+        "operationId": "post_health_maintenance_windows",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -4381,7 +4381,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_health_maintenance-windows_by_id",
+        "operationId": "delete_health_maintenance_windows_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -4468,7 +4468,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_health_metrics.csv",
+        "operationId": "get_health_metrics_csv",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -4957,7 +4957,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_iam_effective-permissions",
+        "operationId": "get_iam_effective_permissions",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6060,7 +6060,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_iam_security-policies",
+        "operationId": "get_iam_security_policies",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6087,7 +6087,7 @@
       "put": {
         "deprecated": false,
         "description": null,
-        "operationId": "put_iam_security-policies",
+        "operationId": "put_iam_security_policies",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6116,7 +6116,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_iam_service-accounts",
+        "operationId": "get_iam_service_accounts",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6143,7 +6143,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_iam_service-accounts",
+        "operationId": "post_iam_service_accounts",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6172,7 +6172,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_iam_service-accounts_by_id",
+        "operationId": "delete_iam_service_accounts_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6199,7 +6199,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_iam_service-accounts_by_id",
+        "operationId": "get_iam_service_accounts_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6228,7 +6228,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_iam_service-accounts_by_id_keys",
+        "operationId": "post_iam_service_accounts_by_id_keys",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6257,7 +6257,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_iam_service-accounts_by_id_keys_by_key_id",
+        "operationId": "delete_iam_service_accounts_by_id_keys_by_key_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6599,7 +6599,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_iam_users_by_id_reset-mfa",
+        "operationId": "post_iam_users_by_id_reset_mfa",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -6628,7 +6628,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_iam_users_by_id_sign-out-all",
+        "operationId": "post_iam_users_by_id_sign_out_all",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -7225,7 +7225,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_media_grant-subjects",
+        "operationId": "get_media_grant_subjects",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -7540,7 +7540,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_media_scan-settings",
+        "operationId": "get_media_scan_settings",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -7567,7 +7567,7 @@
       "put": {
         "deprecated": false,
         "description": null,
-        "operationId": "put_media_scan-settings",
+        "operationId": "put_media_scan_settings",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -7739,7 +7739,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_media_settings_test-connection",
+        "operationId": "post_media_settings_test_connection",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -7768,7 +7768,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_media_transformation-presets",
+        "operationId": "get_media_transformation_presets",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -7795,7 +7795,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_media_transformation-presets",
+        "operationId": "post_media_transformation_presets",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -7824,7 +7824,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_media_transformation-presets_by_id",
+        "operationId": "delete_media_transformation_presets_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -7851,7 +7851,7 @@
       "patch": {
         "deprecated": false,
         "description": null,
-        "operationId": "patch_media_transformation-presets_by_id",
+        "operationId": "patch_media_transformation_presets_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -8052,7 +8052,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_media_by_id_grant-effective",
+        "operationId": "get_media_by_id_grant_effective",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -8251,7 +8251,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_media_by_id_shares_revoke-all",
+        "operationId": "post_media_by_id_shares_revoke_all",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -8597,7 +8597,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_notifications_mark-all-read",
+        "operationId": "post_notifications_mark_all_read",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -8769,7 +8769,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_notifications_push-key",
+        "operationId": "get_notifications_push_key",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -8798,7 +8798,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_notifications_push-subscriptions",
+        "operationId": "get_notifications_push_subscriptions",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -8825,7 +8825,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_notifications_push-subscriptions",
+        "operationId": "post_notifications_push_subscriptions",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -8854,7 +8854,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_notifications_push-subscriptions_by_id",
+        "operationId": "delete_notifications_push_subscriptions_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -9111,7 +9111,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_observability_alert-rules",
+        "operationId": "get_observability_alert_rules",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -9138,7 +9138,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_observability_alert-rules",
+        "operationId": "post_observability_alert_rules",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -9167,7 +9167,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_observability_alert-rules_preview",
+        "operationId": "post_observability_alert_rules_preview",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -9196,7 +9196,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_observability_alert-rules_by_id",
+        "operationId": "delete_observability_alert_rules_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -9223,7 +9223,7 @@
       "patch": {
         "deprecated": false,
         "description": null,
-        "operationId": "patch_observability_alert-rules_by_id",
+        "operationId": "patch_observability_alert_rules_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -9911,7 +9911,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_onboarding_ai-provider",
+        "operationId": "post_onboarding_ai_provider",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -10085,7 +10085,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_openapi.json",
+        "operationId": "get_openapi_json",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -10114,7 +10114,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_openapi.json_drift",
+        "operationId": "get_openapi_json_drift",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -10856,7 +10856,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_reliability_breakers_by_key_force-open",
+        "operationId": "post_reliability_breakers_by_key_force_open",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11169,7 +11169,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_reliability_intake_by_id_verify-sample",
+        "operationId": "post_reliability_intake_by_id_verify_sample",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11198,7 +11198,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_reliability_rate-limits",
+        "operationId": "get_reliability_rate_limits",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11225,7 +11225,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_reliability_rate-limits",
+        "operationId": "post_reliability_rate_limits",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11254,7 +11254,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_reliability_rate-limits_evaluate",
+        "operationId": "post_reliability_rate_limits_evaluate",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11283,7 +11283,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_reliability_rate-limits_refusals",
+        "operationId": "get_reliability_rate_limits_refusals",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11312,7 +11312,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_reliability_rate-limits_by_id",
+        "operationId": "delete_reliability_rate_limits_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11339,7 +11339,7 @@
       "patch": {
         "deprecated": false,
         "description": null,
-        "operationId": "patch_reliability_rate-limits_by_id",
+        "operationId": "patch_reliability_rate_limits_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11368,7 +11368,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_reliability_retry-attempts",
+        "operationId": "get_reliability_retry_attempts",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11397,7 +11397,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_reliability_retry-attempts_by_id_retry-now",
+        "operationId": "post_reliability_retry_attempts_by_id_retry_now",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11426,7 +11426,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_reliability_retry-policies",
+        "operationId": "get_reliability_retry_policies",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11455,7 +11455,7 @@
       "put": {
         "deprecated": false,
         "description": null,
-        "operationId": "put_reliability_retry-policies_by_subsystem",
+        "operationId": "put_reliability_retry_policies_by_subsystem",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -11484,7 +11484,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_restore-jobs_by_id_cancel",
+        "operationId": "post_restore_jobs_by_id_cancel",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12133,7 +12133,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_secret-leases",
+        "operationId": "get_secret_leases",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12162,7 +12162,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_secret-leases_by_id_redeem",
+        "operationId": "post_secret_leases_by_id_redeem",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12191,7 +12191,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_secret-leases_by_id_revoke",
+        "operationId": "post_secret_leases_by_id_revoke",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12394,7 +12394,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_secrets_root-key",
+        "operationId": "get_secrets_root_key",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12423,7 +12423,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_secrets_root-key_rewrap-jobs_by_id",
+        "operationId": "get_secrets_root_key_rewrap_jobs_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12452,7 +12452,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_secrets_root-key_rewrap-jobs_by_id_pause",
+        "operationId": "post_secrets_root_key_rewrap_jobs_by_id_pause",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12481,7 +12481,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_secrets_root-key_rewrap-jobs_by_id_resume",
+        "operationId": "post_secrets_root_key_rewrap_jobs_by_id_resume",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12510,7 +12510,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_secrets_root-key_rotate",
+        "operationId": "post_secrets_root_key_rotate",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12684,7 +12684,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_security_events.csv",
+        "operationId": "get_security_events_csv",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12742,7 +12742,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_security_findings.csv",
+        "operationId": "get_security_findings_csv",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12941,7 +12941,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_security_ip-rules",
+        "operationId": "get_security_ip_rules",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12968,7 +12968,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_security_ip-rules",
+        "operationId": "post_security_ip_rules",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -12997,7 +12997,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_security_ip-rules_test",
+        "operationId": "post_security_ip_rules_test",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13026,7 +13026,7 @@
       "delete": {
         "deprecated": false,
         "description": null,
-        "operationId": "delete_security_ip-rules_by_id",
+        "operationId": "delete_security_ip_rules_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13055,7 +13055,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_security_locked-accounts",
+        "operationId": "get_security_locked_accounts",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13084,7 +13084,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_security_locked-accounts_by_user_id_unlock",
+        "operationId": "post_security_locked_accounts_by_user_id_unlock",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13142,7 +13142,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_security_rate-limits",
+        "operationId": "get_security_rate_limits",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13169,7 +13169,7 @@
       "put": {
         "deprecated": false,
         "description": null,
-        "operationId": "put_security_rate-limits",
+        "operationId": "put_security_rate_limits",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13198,7 +13198,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_security_rate-limits_test",
+        "operationId": "post_security_rate_limits_test",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13256,7 +13256,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_security_sign-in-protection",
+        "operationId": "get_security_sign_in_protection",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13283,7 +13283,7 @@
       "put": {
         "deprecated": false,
         "description": null,
-        "operationId": "put_security_sign-in-protection",
+        "operationId": "put_security_sign_in_protection",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13312,7 +13312,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_security_sign-in-protection_probe",
+        "operationId": "post_security_sign_in_protection_probe",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13907,7 +13907,7 @@
       "get": {
         "deprecated": false,
         "description": null,
-        "operationId": "get_workflow-executions_by_id",
+        "operationId": "get_workflow_executions_by_id",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."
@@ -13936,7 +13936,7 @@
       "post": {
         "deprecated": false,
         "description": null,
-        "operationId": "post_workflow-executions_by_id_cancel",
+        "operationId": "post_workflow_executions_by_id_cancel",
         "responses": {
           "403": {
             "description": "The caller's permissions do not cover this route."

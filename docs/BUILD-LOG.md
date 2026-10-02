@@ -10054,3 +10054,81 @@ the log table and its detail drawer, the nav entry, all three states per screen,
 mobile behaviour the REQ names. The request-log **middleware** that writes rows on every API call also
 belongs to it: `omnion-developer::logs_store::record` exists and is walked, but nothing calls it on the
 request path yet, which is the same "described but inert" shape this REQ's predecessors shipped.
+
+## Tick 72 — wave6 (REQ-130 slice 3 closed): the SDK generators, and six defects no unit test could see
+
+**What.** The two SDK generators, pinned to the document hash, plus the acceptance line's hard half
+actually run. `crates/graphql/src/sdk.rs` (1,340 lines, 22 tests) emits a TypeScript and a Python
+package from `api/openapi.snapshot.json`; `apps/api/src/bin/sdk_emit.rs` writes them; and
+`scripts/qa/sdk-gate.sh` is the whole acceptance line in one command: **4/4 green**.
+
+**Proof, every number from this tick:**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-graphql --lib` | **126 passed**, 0 failed |
+| api | `cargo test -p omnion-api --lib` | **391 passed**, 0 failed |
+| drift | `openapi_emit --check` | in sync, **exit 0** (496 routes, 496 documented, 0 undocumented, 0 orphaned) |
+| reproducible | two runs, `diff -r` per language | byte-identical from `sha256:b1bf277d…` |
+| compiles | `bun build` + `python3 -m compileall` | both parse (inside the crate's own test) |
+| live, python | `scripts/qa/sdk-smoke.py --base-url …:18085` | **7 passed**, 0 failed |
+| live, typescript | `scripts/qa/sdk-smoke.mjs --base-url …:18085` | **6 passed**, 0 failed |
+| secrets | an INDEPENDENT scan of the emitted bytes | 0 findings, 0 hostnames, 0 token-shaped strings |
+| types | `pnpm typecheck` | clean |
+
+**The pin is a gate, not a record.** `sdk::generate` takes the caller's hash and refuses when the
+document's own differs; a wrong `--hash` prints both and exits non-zero rather than writing a
+package that claims a provenance it does not have.
+
+**Six defects, and the reason for every one of them is the same.** A unit test over the generator's
+own functions can only prove the generator agrees with itself.
+
+1. **108 of 496 operation ids contained hyphens** — `post_auth_step-up`, `delete_backup-schedules_by_id`
+   — a syntax error in *both* target languages. The sanitiser moved into `openapi.rs`, where the ids
+   are made, rather than into each generator where two copies would drift.
+2. **The Python group methods emitted a type annotation where a value belongs**:
+   `call(id, {scope: str, slot: str, scope_id})`. One string was being used for both the signature
+   and the dictionary.
+3. **A tag containing a dot produced the member `Openapi.json()`.** The generator had its own copy
+   of the sanitiser, which capitalised letters and dropped hyphens and so missed the dot. Fix: one
+   `pub(crate)` function, used by both.
+4. **The route groups were emitted at file top level**, a bare `Ai(): OperationGroup {` with no
+   enclosing class.
+5. **`index.ts` and `client.ts` formed an import cycle** — the package **parsed, imported cleanly,
+   and threw `ReferenceError: Can't find variable: OperationGroup` on the first call.** No compile
+   check can see this; a module cycle between two modules that both import successfully still fails
+   at run time. Fix: a third file.
+6. **`OPERATIONS_BY_ID` was used across modules but not exported** — the same runtime failure, the
+   same reason, one fix later.
+
+**The gate that found them.** `the_generated_packages_parse_in_their_own_toolchains` writes the
+emitted text to a temp directory and hands it to `bun build` and `python3 -m compileall`. It skipped
+loudly when a toolchain was absent rather than passing, because a machine without `bun` is not a
+platform that should fail a release — and a machine *with* it must not be able to publish an
+unparseable client. **It also taught the assertion to print stdout:** `compileall` writes its
+SyntaxError to stdout and leaves stderr empty, so the first failure reported "does not parse:" with
+nothing after it.
+
+**A test that asserted a name the author invented.** The Python smoke test hardcoded `get_health`
+and failed on a document that plainly contains `/healthz` (`get_healthz`). Both smoke tests now
+*discover* the health operation from the client's own table. A test asserting a name it made up is
+a test of the name.
+
+**Not run: the browser walkthrough.** The shared QA slot is held live by `w4` (pid 3537824, verified
+with `kill -0` and `/proc/<pid>/cwd`). This tick is not a close tick — slice 4 still owns acceptance
+11–12 — and per the slot discipline the tick was not spent blocked.
+
+**Merge first.** Main moved 8 commits in. Two needed a decision: main's nine developer-portal routes
+registered with bare `.route(...)`, which is how every route looked before tick 71, so left alone
+they would be the first undocumented routes the drift gate has ever seen — all nine now adopt
+`documented!`, and the permission recorded is the one the guard enforces, not the function's name.
+BUILD-LOG is append-only and both sides wrote to it, so it is spliced from the merge base
+(multiset proof: 0 lines missing from ours, theirs or base; 0 headings lost). And my own tripwire on
+the key substitution fired correctly: it asserted `developer.read` AND `developer.graphql.manage`
+were both uncatalogued, main catalogued the first, and a single assertion over a pair stays green
+only while the pair moves together. Split per key.
+
+**Commits:** `be8c60b7` (the merge) and the generator below.
+
+**Next:** slice 4 — deprecation headers, the sunset sweeper and the deprecation screens.
+

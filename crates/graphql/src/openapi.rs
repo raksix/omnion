@@ -68,25 +68,72 @@ impl RouteEntry {
         }
     }
 
-    /// The OpenAPI operation id base: `get_graphql_documents_by_id`.
+    /// The OpenAPI operation id: `get_graphql_documents_by_id`.
     ///
     /// Derived from the route itself so two operations can never be issued the same id — an
     /// OpenAPI document with duplicate operation ids is rejected by every generator, and the
     /// error points at the document rather than at the two routes that collided.
+    ///
+    /// **Every character here has to survive both target languages.** A generated client turns
+    /// this string into a *method name* in TypeScript and a *function name* in Python, and a
+    /// hyphen in either is a syntax error rather than a warning: `post_auth_step-up` is not
+    /// callable, and `delete_backup-schedules_by_id` reads as the subtraction of two names. The
+    /// first version emitted segments verbatim and **108 of 496 operations** came out with
+    /// hyphens, from real paths like `/backup-schedules` and `/auth/step-up` — every one of them
+    /// a package that would not compile.
+    ///
+    /// So the id is normalised HERE rather than in each generator. Normalising downstream would
+    /// mean two sanitisers that can disagree, and a document whose ids are valid is worth more
+    /// than one that two of our own tools happen to cope with: the Explorer, the docs site and a
+    /// third-party generator all read the same document.
+    ///
+    /// The substitution cannot merge two ids. Every non-alphanumeric run becomes one `_`, and
+    /// the method prefix already separates verbs, so distinct `(method, path)` pairs stay
+    /// distinct — asserted in the tests below against the live snapshot, not against a fixture
+    /// that was written to agree.
     pub fn operation_id(&self) -> String {
         let mut out = String::with_capacity(self.method.len() + self.path.len() + 4);
-        out.push_str(&self.method.to_ascii_lowercase());
+        out.push_str(&sanitize_identifier(&self.method.to_ascii_lowercase()));
         for segment in self.path.split('/').filter(|s| !s.is_empty()) {
             out.push('_');
             if let Some(inner) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
                 out.push_str("by_");
-                out.push_str(inner);
+                out.push_str(&sanitize_identifier(inner));
             } else {
-                out.push_str(segment);
+                out.push_str(&sanitize_identifier(segment));
             }
         }
         out
     }
+}
+
+/// Collapse a segment into characters that are legal in a TypeScript identifier and in a Python
+/// one.
+///
+/// Both languages agree on `[A-Za-z0-9_]`, so one function serves both generators. Leading
+/// digits are left alone: a segment can start with a digit (`/v2/...`) and it is always preceded
+/// by `_` or a word character by the time it is used, so it can never be the first character of
+/// the identifier.
+///
+/// **`pub(crate)` rather than private, and the reason is a defect this crate already shipped:**
+/// the SDK generator needs the same rule for TAG names, and while it had its own copy the two
+/// drifted — the copy capitalised letters and dropped hyphens, so it handled `/backup-schedules`
+/// and emitted `Openapi.json()` for a tag containing a dot. One rule, one place to fix it.
+pub(crate) fn sanitize_identifier(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut last_was_underscore = false;
+    for ch in segment.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+            last_was_underscore = ch == '_';
+        } else if !last_was_underscore {
+            // A run of punctuation becomes ONE underscore, so `step-up` and `step_up` cannot
+            // land on the same id from different routes.
+            out.push('_');
+            last_was_underscore = true;
+        }
+    }
+    out
 }
 
 /// What the annotation registry knows about one route.
