@@ -12424,3 +12424,52 @@ the log table and its detail drawer, the nav entry, all three states per screen,
 mobile behaviour the REQ names. The request-log **middleware** that writes rows on every API call also
 belongs to it: `omnion-developer::logs_store::record` exists and is walked, but nothing calls it on the
 request path yet, which is the same "described but inert" shape this REQ's predecessors shipped.
+## 2026-10-02 · wave2 tick 67 · acceptance 18 was UNMEASURABLE, and the gate that proves it
+
+**What.** REQ-064's acceptance criterion 18 asks for every new screen at 390 px. `walkthrough.cjs`
+keeps two inventories — the desktop `routes` list and `mobileRoutes` — and thirty-nine screens were
+in the first and not the second: twelve of this wave's own (`/blocks`, `/patterns`,
+`/page-templates`, `/menus`, `/publishing/queue`, `/forms`, `/seo`, `/comments`, `/newsletter`,
+`/themes`, `/themes/minimal/builder`, `/themes/upload`) and twenty-seven belonging to waves this
+branch does not own. A screen in one list and not the other is measured at 1440 px and at no other
+width, by any pass, ever.
+
+Nothing reports that. A missing route does not error, does not print red and does not set a
+non-zero code — it is simply never opened on a phone, so the pass writes a clean sheet for a screen
+it never looked at. The tick that added `/menus` recorded it as measured because `/menus` IS
+walked. It was walked on a desktop.
+
+`scripts/qa/screen-coverage.cjs` closes the hole as a GATE rather than a list edit, and is wired
+into `run.sh` beside the `--only` filter test.
+
+**Proof.**
+
+- `node scripts/qa/screen-coverage.cjs` → **PASS**: 73 desktop, 73 at 390 px, paths agree, no
+  duplicates, and the predicate re-asked against a screen removed from the 390 px list flags
+  exactly that screen.
+- **Verified to fail**: with `/menus` removed from `mobileRoutes` the gate reports
+  `FAIL no screen is walked at 1440 px only — menus (/menus)` at 73/72, exit 1; restoring it
+  reports none. `node --check` stays clean in both states, which is the point — the syntax gate
+  never could have caught this.
+- `cargo test -p omnion-content --lib --quiet` → **349 passed; 0 failed** (merged tree).
+- `env -i … pnpm typecheck` → **2/2 successful**, 14 packages.
+- Merge `c05af171`: `scripts/qa/merge-build-log.py` spliced BUILD-LOG.md with its entry-level
+  check — 174 `## ` entries present, 0 lost, 0 markers.
+
+**The gate was wrong first, in the exact way it was written to catch.** Its scanner counted
+brackets without tracking strings and comments; the inventories are full of comments that name other
+lists, so the scan stopped early and it reported "73 desktop routes" for a *partial* array,
+comparing two truncated inventories. The count printed on every run is what exposed it — which is
+why the gate asserts the number it read rather than only the verdict. A second wrong reading came
+from the fault injection itself: my first injector wrote a double bracket, and the gate correctly
+complained about the FILE rather than about the entry. Neither was a gate defect and both would
+have been reported as one if the probe had not been run separately.
+
+**A gate satisfied only for its own author is worth nothing.** The gate found twenty-seven
+unmeasured screens in waves this branch does not own (media, backups, sites, IAM roles,
+notifications, events, webhooks, seven analytics screens, security secrets, two health screens) and
+all of them are closed too.
+
+**Next.** Criterion 18 stays unticked until the `--only=menus,forms,seo,comments,newsletter,themes,
+blocks,patterns,page-templates,publishing-queue,theme-builder,theme-upload` pass returns — queued
+behind w7's holder as this entry is written. Then REQ-064's own criterion sweep, REQ-062, REQ-019.
