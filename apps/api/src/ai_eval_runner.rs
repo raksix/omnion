@@ -649,7 +649,40 @@ pub async fn execute(pool: &PgPool, run: &RunRow, turn: &dyn CaseTurn) -> Result
         tracing::warn!(run = %run.id, %error, "a settled run's case projection could not be written");
     }
 
-    announce(pool, run, &verdict, gate, gate_verdict.regressed, &enabled).await;
+    // **The regression announcement names the cases that REGRESSED, and this is the only place
+    // in the runner that knows which ones they are.** `announce` used to receive `&enabled` —
+    // every case the suite ran — and publish all of their names under
+    // `regressed_cases`. Structurally that list satisfies the field: every name in it is a real
+    // case, and a subscriber that re-runs them cannot tell it re-ran the whole suite. The spec's
+    // row asks for the regression "with their names", and the point of a name is to be the short
+    // list somebody acts on: a suite of 80 with one broken case announces 80 names, so the alert
+    // reads as noise and the one real finding is the one somebody filters out.
+    //
+    // The diff is computed from the STORED rows of the baseline and this run — the same rows
+    // the panel's diff view reads. If those rows and the announcement ever disagree, the rows
+    // are the truth and the disagreement is the finding, so the announcement is derived here
+    // rather than from the in-memory `enabled` list the runner happened to iterate.
+    let regressed_names = if gate_verdict.regressed {
+        let head = eval_run::list_case_results(pool, run.organization_id, run.id)
+            .await
+            .unwrap_or_default();
+        let base = match run.base_run_id {
+            Some(base_id) => eval_run::list_case_results(pool, run.organization_id, base_id)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        eval_run::diff_runs(&base, &head)
+            .rows
+            .into_iter()
+            .filter(|row| row.movement == "regressed")
+            .map(|row| row.case_name)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    announce(pool, run, &verdict, gate, gate_verdict.regressed, regressed_names).await;
     Ok(verdict)
 }
 
@@ -683,7 +716,7 @@ async fn announce(
     verdict: &Verdict,
     gate: &str,
     regressed: bool,
-    cases: &[CaseRow],
+    regressed_cases: Vec<String>,
 ) {
     // The tenant comes from the run this event is *about*. The first version read it back with
     // `select organization_id from ai_eval_runs limit 1` — an arbitrary run's tenant — which
@@ -705,6 +738,11 @@ async fn announce(
     } else if gate == "block" {
         emit(pool, org, "ai.eval.gate.blocked", base.clone()).await;
     }
+    // `regressed` is the suite-level verdict (the rate fell further than the suite tolerates) and
+    // `regressed_cases` is which cases did it. They can legitimately disagree — a gate can
+    // regress on a rate that moved with no single case regressing — so the count is published
+    // beside the names rather than derived from them: an empty list beside a true flag reads as
+    // "we looked and found nothing", and the fix view needs to be able to say that.
     if regressed {
         emit(
             pool,
@@ -715,7 +753,7 @@ async fn announce(
                 "suite_id": run.suite_id,
                 "suite_key": run.suite_key,
                 "pass_rate": verdict.pass_rate,
-                "regressed_cases": cases.iter().map(|case| case.name.clone()).collect::<Vec<_>>(),
+                "regressed_cases": regressed_cases,
             }),
         )
         .await;

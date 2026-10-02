@@ -383,6 +383,38 @@ impl Runner {
         row
     }
 
+    /// Every `ai.eval.*` payload the bus recorded for one tenant, under one event name.
+    ///
+    /// **Read the ROW, never the return value.** The acceptance rows are about the events a
+    /// subscriber receives, and `announce()` returns nothing: a runner that skipped the emit
+    /// and one that emitted a different name, a different tenant or a payload missing the
+    /// regressed case names would both leave `tick()` returning the same `TickReport`. The
+    /// tenant predicate is here for the same reason the emit reads its tenant off the run —
+    /// an event published under another organization's id is the failure this catches.
+    async fn eval_events(&self, organization_id: Uuid, name: &str) -> Vec<serde_json::Value> {
+        sqlx::query_scalar(
+            "select payload from events where organization_id = $1 and name = $2 order by created_at, id",
+        )
+        .bind(organization_id)
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .expect("the events must read")
+    }
+
+    /// The set of `ai.eval.*` event names this tenant has, so a walk can prove an event was
+    /// NOT emitted as well as proving one was.
+    async fn eval_event_names(&self, organization_id: Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            "select distinct name from events where organization_id = $1 and name like 'ai.eval.%' \
+             order by name",
+        )
+        .bind(organization_id)
+        .fetch_all(&self.pool)
+        .await
+        .expect("the events must read")
+    }
+
     async fn case_statuses(&self, suite_id: Uuid) -> Vec<(String, Option<String>)> {
         sqlx::query_as("select name, last_status from ai_eval_cases where suite_id = $1 order by name")
             .bind(suite_id)
@@ -717,6 +749,242 @@ async fn a_gate_run_below_the_threshold_blocks_and_the_suite_says_so() {
     let (rate, gate) = fx.suite_state(suite).await;
     assert_eq!(gate.as_deref(), Some("block"), "the suite's badge is the blocked gate");
     assert_eq!(rate, settled.pass_rate);
+
+    fx.dispose().await;
+}
+
+/// The most recently created run id for a suite — the gate's own row, not the baseline's.
+///
+/// `order by created_at desc, id desc` matches the runner's own "latest" ordering elsewhere; a
+/// tie on `created_at` inside one test transaction is broken by the id rather than left to the
+/// planner, because "whichever row the index returned first" is not a run identity.
+async fn latest_run(fx: &Runner, suite: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "select id from ai_eval_runs where suite_id = $1 order by created_at desc, id desc limit 1",
+    )
+    .bind(suite)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("the suite must have a run")
+}
+
+/// **A blocked gate is ANNOUNCED, and the announcement names the run it is about.**
+///
+/// The row assertions above are about `ai_eval_runs` and `ai_eval_suites`; this row is about
+/// `events`, which is what a webhook, a workflow trigger or an e-mail rule subscribes to. The
+/// runner calls `announce()` after settling and nothing read it back, so a runner that stopped
+/// emitting the promotion signal — or emitted `gate.passed` for a blocked run — would have left
+/// every other walk green.
+///
+/// Three claims, and the middle one is the one that would be easy to fake:
+/// - exactly one `ai.eval.gate.blocked` row exists for this tenant;
+/// - its payload names the gate run, the suite and the rate the run actually settled with;
+/// - `gate.passed` was NOT emitted for it, since a subscriber acting on both would promote the
+///   very release the gate refused.
+#[tokio::test]
+async fn a_blocked_gate_is_announced_with_the_run_it_is_about() {
+    let fx = runner!();
+    let org = fx.organization().await;
+    let model = fx.model().await;
+    let suite = fx
+        .suite_with(org, "announced", model, &[("only", exact("right"), 1.0)], 90, 5.0, None)
+        .await;
+
+    // A passing run first, so the gate has a baseline and the pre-gate events are not the
+    // empty set — an assertion against `[]` proves nothing about which name was written.
+    fx.queue(org, suite, model).await;
+    ai_eval_runner::tick(&fx.pool, 1, &ScriptedTurn::new(&[("only", "right")]))
+        .await
+        .expect("the baseline tick must not fail");
+
+    let gate_run = eval_run::create_run(
+        &fx.pool,
+        org,
+        &NewRun {
+            suite_id: suite,
+            kind: "gate".to_string(),
+            snapshot: serde_json::json!({ "model": "p/walk-model" }),
+            model_id: Some(model),
+            judge_model_id: None,
+            threshold_percent: 90,
+            base_run_id: Some(first_run(&fx, suite).await),
+            triggered_by: None,
+        },
+    )
+    .await
+    .expect("the gate run must be created");
+    ai_eval_runner::tick(&fx.pool, 1, &ScriptedTurn::new(&[("only", "wrong")]))
+        .await
+        .expect("the gate tick must not fail");
+
+    let blocked = fx.eval_events(org, "ai.eval.gate.blocked").await;
+    assert_eq!(
+        blocked.len(),
+        1,
+        "exactly one gate must be announced, got {:?}",
+        fx.eval_event_names(org).await
+    );
+
+    // The payload is compared against the SETTLED row, not against the fixture's own inputs:
+    // the rate in the payload is the claim a subscriber renders, and a runner that computed it
+    // independently would be free to disagree with the row it is announcing.
+    let settled = eval_run::find_run(&fx.pool, org, gate_run.id)
+        .await
+        .expect("the read must succeed")
+        .expect("the gate run must still be there");
+    let payload = &blocked[0];
+    assert_eq!(payload["run_id"], serde_json::json!(gate_run.id.to_string()));
+    assert_eq!(payload["suite_id"], serde_json::json!(suite.to_string()));
+    assert_eq!(payload["gate"], "block");
+    assert_eq!(payload["kind"], "gate");
+    assert_eq!(payload["pass_rate"], serde_json::json!(settled.pass_rate));
+    // `Verdict::total()` is passed + failed + errors, and the settled row is where the third of
+    // those lives. A payload that omitted the errored cases would report a smaller suite than the
+    // one that ran — which reads as a clean run rather than a lossy one.
+    assert_eq!(
+        payload["total_cases"],
+        serde_json::json!(settled.passed_cases + settled.failed_cases + settled.error_cases)
+    );
+
+    // The counter-case inside the same run: a blocked gate must not also announce a pass.
+    let passed = fx.eval_events(org, "ai.eval.gate.passed").await;
+    assert!(
+        passed.iter().all(|row| row["run_id"] != serde_json::json!(gate_run.id.to_string())),
+        "the blocked run must not also be announced as a passed gate"
+    );
+    // Every run announces its completion, so the blocked one stays visible to a subscriber that
+    // listens only for `run.completed`.
+    let completed = fx.eval_events(org, "ai.eval.run.completed").await;
+    assert_eq!(completed.len(), 2, "both runs announce a completion");
+
+    fx.dispose().await;
+}
+
+/// **A regression is announced WITH THE NAMES OF THE CASES THAT REGRESSED.**
+///
+/// This is the acceptance row's "with their names", and it is the row most likely to be
+/// satisfied by the wrong thing: a payload listing every case in the suite is *structurally* the
+/// same claim as one listing the regressed ones, and a subscriber reading it to decide which evals
+/// to re-run cannot tell the difference without diffing the whole suite itself.
+///
+/// So the fixture is built so the two lists differ: three cases, the baseline passes all of them
+/// and the gate run regresses exactly one. A payload naming all three is wrong even though every
+/// name in it is a real case.
+///
+/// The expected list is computed from the stored `ai_eval_case_results`, not from the turn's
+/// script: the rows are what the diff view reads, so if the rows and the announcement ever
+/// disagree, the announcement should be judged against the rows and the disagreement is the
+/// finding.
+#[tokio::test]
+async fn a_regression_is_announced_with_the_names_of_the_regressed_cases_only() {
+    let fx = runner!();
+    let org = fx.organization().await;
+    let model = fx.model().await;
+    let suite = fx
+        .suite_with(
+            org,
+            "regressing",
+            model,
+            &[
+                ("alpha", exact("right"), 1.0),
+                ("beta", exact("right"), 1.0),
+                ("gamma", exact("right"), 1.0),
+            ],
+            50,
+            5.0,
+            None,
+        )
+        .await;
+
+    // The baseline: all three cases pass.
+    fx.queue(org, suite, model).await;
+    ai_eval_runner::tick(
+        &fx.pool,
+        1,
+        &ScriptedTurn::new(&[("alpha", "right"), ("beta", "right"), ("gamma", "right")]),
+    )
+    .await
+    .expect("the baseline tick must not fail");
+    let baseline = first_run(&fx, suite).await;
+
+    // The gate run: only `beta` regresses. The threshold is low enough that the rate alone
+    // (66% >= 50%) still holds the gate, so this run can only be announced as a regression
+    // because of the drop against the baseline — which is the behaviour the row is about, not
+    // the threshold check the other walk already covers.
+    eval_run::create_run(
+        &fx.pool,
+        org,
+        &NewRun {
+            suite_id: suite,
+            kind: "gate".to_string(),
+            snapshot: serde_json::json!({ "model": "p/walk-model" }),
+            model_id: Some(model),
+            judge_model_id: None,
+            threshold_percent: 50,
+            base_run_id: Some(baseline),
+            triggered_by: None,
+        },
+    )
+    .await
+    .expect("the gate run must be created");
+    ai_eval_runner::tick(
+        &fx.pool,
+        1,
+        &ScriptedTurn::new(&[("alpha", "right"), ("beta", "wrong"), ("gamma", "right")]),
+    )
+    .await
+    .expect("the gate tick must not fail");
+
+    // **The expectation comes from `diff_runs`, the function the announcement is derived from.**
+    // The first version of this row hand-wrote the SQL: `base.status = 'passed' and
+    // head.status <> 'passed'`, in a schema whose status vocabulary is `pass`/`fail`/`error`/
+    // `skipped`. It matched nothing, so the walk asserted `[] == ["beta"]` and failed — the
+    // fixture, not the announcement, was wrong. It is worth naming why that is the dangerous
+    // shape: a reader who fixed it by widening to `status <> 'pass'` would have passed, and
+    // would have proved nothing about which cases regressed. Deriving the expectation from the
+    // store's own comparator keeps the row honest about *what regressed* instead of about *a
+    // query I wrote twice*.
+    let head_rows = eval_run::list_case_results(&fx.pool, org, latest_run(&fx, suite).await)
+        .await
+        .expect("the head run's results must be readable");
+    let base_rows = eval_run::list_case_results(&fx.pool, org, baseline)
+        .await
+        .expect("the baseline's results must be readable");
+    let regressed: Vec<String> = eval_run::diff_runs(&base_rows, &head_rows)
+        .rows
+        .into_iter()
+        .filter(|row| row.movement == "regressed")
+        .map(|row| row.case_name)
+        .collect();
+    assert_eq!(
+        regressed,
+        vec!["beta".to_string()],
+        "the fixture must regress exactly one case"
+    );
+
+    let announced = fx.eval_events(org, "ai.eval.regression.detected").await;
+    assert_eq!(
+        announced.len(),
+        1,
+        "exactly one regression must be announced, got {:?}",
+        fx.eval_event_names(org).await
+    );
+
+    let names: Vec<String> = announced[0]["regressed_cases"]
+        .as_array()
+        .expect("regressed_cases must be a list")
+        .iter()
+        .map(|name| name.as_str().expect("each name must be a string").to_owned())
+        .collect();
+    assert_eq!(
+        names, regressed,
+        "the announcement must name the regressed cases the rows show, not every case in the suite"
+    );
+    assert!(
+        !names.contains(&"alpha".to_string()) && !names.contains(&"gamma".to_string()),
+        "cases that still pass must not be announced as regressed: a subscriber re-running the \
+         named cases would burn budget on cases that were never broken"
+    );
 
     fx.dispose().await;
 }

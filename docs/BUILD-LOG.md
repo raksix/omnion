@@ -1,3 +1,59 @@
+## 2026-10-02 — REQ-107 slice 6a: the announcements, and the list of every case pretending to be the list of the broken ones
+
+fix(ai-eval) + test(ai-eval): `regressed_cases` now names the cases that regressed, and two walks
+read the `events` table that `announce()` writes and nothing else has ever read.
+
+**The box rebooted mid-tick, and the first hour was infrastructure, not code.** `omnion-postgres`
+came back into 18 GB of crash-recovery fsync (`FATAL: the database system is starting up` for ~30
+minutes) and `omnion-redis` crash-looped 15 times on a torn AOF. Redis is shared by every QA stack,
+so it was repaired with `redis-check-aof --fix` after backing the file up to
+`/mnt/apopic/backups/redis-aof-2026-10-02/`: the base RDB was valid and the first 9.3 MB of the tail
+was, so the fix keeps the valid prefix and drops the torn 24 MB. Postgres was left alone and left to
+finish — its startup process was visibly burning CPU, so restarting it would have thrown away thirty
+minutes of redo for nothing. Both are shared infrastructure used by all ten writers; neither is mine
+to `docker restart`.
+
+**The defect.** `announce()` took `cases: &[CaseRow]` and was called with `&enabled` — every case
+the suite ran — then published all of their names under `regressed_cases`. The field is structurally
+correct: every name in it is a real case, a subscriber can re-run every name it is given, and
+nothing about the payload is malformed. It is also useless in exactly the way this request exists to
+prevent. The spec asks for the regression "with their names", and the point of a name is to be the
+short list somebody acts on. A suite of 80 cases with one broken case announced 80 names, which is
+the same alert as "the suite is red", and the alert an operator learns to dismiss is the one whose
+only real finding is buried in it.
+
+**Where the names come from now.** `diff_runs` over the **stored** result rows of the baseline and
+this run — the same rows the panel's diff view reads, so the announcement and the view cannot
+disagree. Not from the in-memory `enabled` list the runner happened to iterate: that list is what
+the bug was. The suite-level `regressed` flag and the case list are published together and may
+legitimately disagree (a rate can move with no single case regressing), so the empty list beside a
+true flag is a fact the fix view needs to be able to state, not an inconsistency to be smoothed
+over.
+
+**Falsified before committing.** Production file stashed, walks kept: the regression walk is red on
+the pre-fix body with `left: ["alpha", "beta", "gamma"]` vs `right: ["beta"]`, and green after.
+15/15 in the suite, `omnion-ai-hub --lib` green.
+
+**The walk's own first version was wrong, and it is worth recording.** It hand-wrote the expected
+regressed list in SQL: `base.status = 'passed' and head.status <> 'passed'` — in a schema whose
+case statuses are `pass`/`fail`/`error`/`skipped`. It matched nothing and the walk failed on its own
+fixture, asserting `[] == ["beta"]`. The tempting repair is `status <> 'pass'`, which passes and
+proves nothing about *which* cases regressed. The expectation is now derived from `diff_runs`, the
+same comparator the announcement is derived from, so the row tests the claim rather than a query
+written twice.
+
+**Also proved:** `ai.eval.gate.blocked` is announced exactly once for a blocked gate, its payload
+carries the run, the suite and the **settled** rate (compared against the settled row, not the
+fixture's inputs, so a runner computing the rate independently is caught disagreeing with the row it
+announces), `total_cases` includes the errored cases, and `gate.passed` was **not** emitted for the
+blocked run — a subscriber acting on both would promote the release the gate refused.
+
+**Still owed, named so the next tick does not find it by reading this file:** the closing browser
+pass (`QA_STACK=w7 ... bash scripts/qa/run.sh`); rubric cost under `eval:judge`; `no_pii` at the run
+level; Run-now disabled with the permission named.
+
+**Next.** REQ-107 slice 6b: run the pass, then the three remaining acceptance rows.
+
 ## 2026-10-01 — REQ-106 slice 4: the "Run AI locally" manual, and the pass that compares it to the API
 
 feat(admin) + test(qa): the local-AI documentation page, its nav entry, the walkthrough route and
