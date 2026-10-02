@@ -13779,3 +13779,73 @@ already produced three times.
 **Next.** The browser pass when the slot frees (RAM first: 0 available is the real blocker, and a
 browser pass across three writers at 32 GB is what took the box down in September), then the three
 state boxes, the keyboard box and `done`.
+
+## 2026-10-02 · tick 78 · REQ-051 · the retry leg was a permanent `false`
+
+**What.** `fix(qa)` on the state sweep's retry leg, plus `scripts/qa/probe-crm-sweep-selectors.cjs`,
+a slot-free gate for the two CRM legs that cannot be measured without a browser.
+
+**The defect.** `theRetryRecoversTheScreen` asserted recovery by looking for
+`[data-qa='crm-row'], [data-qa='crm-contacts-empty']`. **Neither marker exists anywhere in the
+module** — the contacts table draws its rows through `CrmRow`, which emits `data-qa-crm-cursor` and
+no `data-qa` at all, and `EmptyState` is a bare `<div>` with no hook. The clause was therefore
+permanently `0 > 0`, so the step could only ever be `false`.
+
+That is the worst shape a harness bug can take, and this module has a name for it: a **pass that
+grades its own ruler**. A green step here would have meant a working retry was broken, on the single
+step whose whole purpose is to prove a retry is wired to something rather than decorative. Had the
+slot been free, this tick would have spent 25 minutes of browser time manufacturing a false defect
+and, worse, a reader would have gone looking for a broken retry button that was never broken.
+
+**The fix.** Recovery is asserted against what the screen actually renders once the list arrives:
+cursor rows (`CrmRow`'s marker, any count — a fresh database legitimately has no contacts) or the
+table's own header row. What must fail is the *refusal staying on screen*, which is the actual
+claim. The two counters are reported alongside the step so a reader can see what it measured.
+
+**The gate.** Both legs press keys and stub the network against a served stack, so with the QA slot
+held by a sibling the one checkable property is whether they are **able to pass at all**: every
+literal `[data-qa='…']` they query must be rendered by the module, and the retry clause is
+re-scanned separately so a dead second clause cannot hide behind a healthy first one. Template-built
+selectors are out of scope by design — checking those would mean re-implementing the sweep's own
+table, and a gate that re-implements its subject is a second subject.
+
+| Gate | Command | Result |
+|---|---|---|
+| sweep selectors | `node scripts/qa/probe-crm-sweep-selectors.cjs` | **11/11**, exit 0 |
+| proven to fail | same, with the two dead markers restored | **10/13**, exit 1, naming `crm-row` and `crm-contacts-empty` |
+| screen states | `node scripts/qa/probe-crm-screen-states.cjs` | **28/28**, exit 0 |
+| crm crate | `CARGO_TARGET_DIR=/dev/shm/w4-target cargo test -p omnion-module-crm` | **172 passed**, 0 failed |
+| types | `npx tsc --noEmit` (apps/admin) | exit 0 |
+| syntax | `node --check` on both probe files | exit 0 |
+
+**Three bugs in the gate before it was allowed to be a gate** — all three were the gate's own model
+of its subject, which is the only honest place to look for them:
+
+| What the gate got wrong | How it showed | Fix |
+|---|---|---|
+| counted identical selectors once per query | `crm-contacts-error` reported 4×, inflating the denominator into looking thorough | dedupe per leg, and report the literal count separately |
+| read its own documentation as code | the fix is documented in place, so the prose naming the dead marker was reported as the defect it removed | strip line comments before scanning |
+| a block-comment stripper | `/\* … \*/` paired a `page.route` glob with an unrelated closer and **swallowed 8,549 bytes of real code**, including the clause the gate exists to check — the gate reported the leg clean | strip `//` only; a regex pretending to parse a comment stream is the wrong shape |
+
+The third is worth keeping: prose **about** a delimiter cannot contain the delimiter, and this
+comment had to be rewritten three times before the file would parse. That is the cheapest possible
+proof that the regex approach was wrong.
+
+**Why no browser pass again.** The slot is held by **main** (`pid 315364`, `cwd=/mnt/apopic/omnion`,
+verified with `kill -0` + `/proc/<pid>/cwd`), and the box is the real reason: 26.7 GB used of 33,
+**22 GB of swap already in use**, and `/mnt/apopic` at **100%**. A browser pass launched into that is
+an OOM kill whose output is a defect list. Barging is precisely what the guard exists to prevent.
+
+**Also found, and it matters for the next tick.** A sibling's disk reclamation deleted this
+worktree's `target/` **mid-build** — cargo failed with `could not write output to …: No such file or
+directory` on `sqlx-macros`, and the shell pipeline reported `EXIT: 0` anyway, because `$?` after a
+pipe is the pipe's status, not cargo's. A wiped target is not a red test suite; it is a build that
+never ran. The suite was re-run with `CARGO_TARGET_DIR=/dev/shm/w4-target` (tmpfs, out of the
+disk's reach) and gave the real **172/172**.
+
+**NOT CLAIMED.** No acceptance box ticked. The three open boxes are still browser-only: screen
+states, the 390×844 mobile layout and the keyboard contract. A static gate narrows what can hide
+behind the queue; it does not produce a pixel.
+
+**Next.** The browser pass when the slot frees **and** `/mnt/apopic` is off 100% — then the three
+boxes, then `done`. Reclaim before the pass, and expect `CARGO_TARGET_DIR` to point off this volume.
