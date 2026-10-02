@@ -6533,13 +6533,19 @@ async function runGraphqlDepth(page, report) {
   );
   const runDisabled = await page
     .locator("[data-view='graphql-playground'] button")
-    .filter({ hasText: /^Run/ })
+    .filter({ hasText: /⌘↵/ })
     .first()
     .isDisabled()
     .catch(() => false);
   check(
     "run-is-blocked-on-an-over-budget-document",
     runDisabled,
+    // **This locator is the KEYPAD glyph, not the word "Run".** The first version filtered on
+    // `/^Run/` and matched the SECONDARY control — "Run a registered document" — which is
+    // correctly enabled on an over-depth document, so the claim failed against a screen that was
+    // doing exactly what it should. The screenshot settled it: the primary Run button renders
+    // "Run ⌘↵", and that trailing key hint is what distinguishes it. A claim that fails against
+    // correct behaviour is a defect in the claim, and the artifact is what says which.
     "the run button stayed enabled on a document the meter had already refused",
   );
   await shot(page, "graphql-playground-over-depth");
@@ -6547,7 +6553,7 @@ async function runGraphqlDepth(page, report) {
   // A legal document runs and the result pane carries the endpoint's own numbers.
   await page.locator("[data-view='graphql-playground'] textarea").first().fill(`query QaWalkMe {\n  me {\n    id\n  }\n}`).catch(() => {});
   await page.waitForTimeout(300);
-  await page.locator("[data-view='graphql-playground'] button").filter({ hasText: /^Run/ }).first().click({ timeout: 8000 }).catch(() => {});
+  await page.locator("[data-view='graphql-playground'] button").filter({ hasText: /⌘↵/ }).first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForSelector("[data-graphql-result]", { timeout: 20000 }).catch(() => {});
   const result = (await page.locator("[data-graphql-result]").count()) > 0;
   check("a-legal-document-runs", result, "running a legal document produced no result pane");

@@ -61,8 +61,25 @@ const FIELDS: Field[] = [
     label: "Cost budget",
     detail: "Priced units one operation may cost. Refused with COST_LIMIT, naming the top contributors.",
     min: 1,
+    // **The upper bound was `200`, which is BELOW the shipped default of `1000`** — so the screen
+    // declared its own default out of range and marked it "Out of range — the endpoint accepts 1 to
+    // 200" on a fresh installation. The endpoint's `Settings::validate` accepts 100_000. Two
+    // validators, and this one was wrong in the direction that makes the feature unusable.
+    //
+    // Found by the gate written for a DIFFERENT defect on this very screen (the `step`), which is
+    // the strongest argument for writing the gate over the whole field set rather than over the
+    // one field in front of you.
     max: 100_000,
-    step: 10,
+    // **Step 1, not 10 — and the walk found this by refusing a legal save.** The shipped default is
+    // `1000`, and an `<input type=number step=10 min=1>` considers `1000` INVALID: the valid grid
+    // is `1, 11, 21 … 991, 1001`. The browser's own validation tooltip said so on the screen —
+    // "Please enter a valid value. The two nearest valid values are 991 and 1001" — while the
+    // endpoint, whose validator is `Settings::validate`, happily accepts it.
+    //
+    // So the step has to be a step every integer in the range can sit on. `1` is the only honest
+    // choice for a cost budget, and the alternative — a step that starts at 0 — still rejects
+    // `1000` when `min` is 1.
+    step: 1,
   },
   {
     key: "max_aliases",
@@ -86,7 +103,11 @@ const FIELDS: Field[] = [
     detail: "The largest `first`/`limit` any single argument may ask for. Refused with PAGE_SIZE_LIMIT.",
     min: 1,
     max: 1000,
-    step: 10,
+    // Step 1, for the same reason as the cost budget: the shipped default is 100, and
+    // `(100 - 1) % 10 != 0`, so the browser's own validation refuses the value the endpoint
+    // accepts. Checked arithmetically over all six fields rather than one at a time, because the
+    // second and third instances of a defect are the ones a reviewer stops looking for.
+    step: 1,
   },
   {
     key: "timeout_ms",
@@ -94,7 +115,9 @@ const FIELDS: Field[] = [
     detail: "Wall-clock budget for one execution.",
     min: 100,
     max: 120_000,
-    step: 500,
+    // Step 1 for the same reason: `(10000 - 100) % 500 != 0`, so the shipped 10 s default is not
+    // on the validation grid either.
+    step: 1,
   },
 ];
 
