@@ -1,3 +1,98 @@
+## Tick 82b (wave3) — `--only` matched no depth pass at all, and the pass failed WIDE
+
+fix(qa): the focused-pass filter was compared against keys it could never equal
+
+**How this was found, which is the part worth keeping.** The tick launched a focused
+`--only=workflow-table` pass on the w3 stack — the build log's own plan for the previous tick, and
+the whole reason tick 81 fixed the navigation that had been killing that pass since `98010ed6`.
+Twenty-five minutes later `clicks.jsonl` read `automations-operations-depth`. Not "the box was busy".
+Not "the pass was slow". **A different screen.**
+
+So the filter ran wide. It is worth being precise about why that survived four ticks, because the
+answer is a property of how the failure looks rather than of how it was caused:
+
+| what a wide pass looks like | why it reads as something else |
+|---|---|
+| it writes `summary.json` | a pass that produced nothing writes no summary |
+| it exits 0 | so does a pass that measured everything |
+| it prints `focused: workflow-table` | `run.sh` prints `QA_ONLY_FILTER` — the name **asked for**, never the names **walked** |
+| `clicks.jsonl` names other screens | nothing in the report compares the two |
+
+The banner is about intent. The gap between the banner and the clicks file was the entire signal, and
+a tick reading the build log rather than the artifact directory had no way to see it. Three earlier
+ticks each concluded "crowded box", which is the cheapest available explanation for a pass that takes
+too long — and the one every preceding tick had already used.
+
+**The defect.** `runDepthPass` is called 49 times; 34 sites are wrapped in `if (wants("…"))` and are
+individually focusable through the route filter. The other fifteen are not — including `automations`,
+`automations-operations`, `workflow-builder` and `workflow-table` themselves. Those are focusable only
+through a second lookup: the `DEPTH_PASSES` table and the early exit at `walkthrough.cjs:9213`. That
+table's keys are **de-hyphenated** (`workflowtable`, `automationsoperations`, `iamauthentication`) while
+every other name in the file is **hyphenated**, and the exit did `DEPTH_PASSES[only]` with no
+normalisation. So the spelling `run.sh` recommends matched nothing, every time.
+
+The requested name is now normalised at the single point where the two conventions meet, and the log
+names the spelling that was accepted rather than only the one that was requested.
+
+**Two more defects the same gate found, both about coverage rather than about filters.**
+
+The four system-health passes all sat inside one `if (wants("health-overview")) {` wrapper. That is
+one bug with three faces: *focus* (`--only=health-incidents` did not run the incidents pass, and
+`--only=health-overview` ran three passes nobody asked for); *coverage* (no health slice could be
+proven without buying a full pass, and the full pass is what gets cut off — REQ-014's slice-3 screens
+have been unprovable for exactly this reason); and *report*, because `report.health` was assigned inside
+the guard while the other three were not, so `summary.json`'s key set depended on which filter was used.
+Each is now guarded by its own name, plus the overview whose numbers it reads.
+
+Worse, and in a shape the "no untested screen" rule cannot see: `runAutomationsActionsDepth` and
+`runAutomationsApprovalsDepth` were **written in full, registered in `DEPTH_PASSES`, and called from
+nowhere.** Two references each — the definition and the table entry. So `--only=automations-actions`
+exited early, measured nothing, and wrote a report naming a pass that produced no rows, while a full
+pass silently omitted two screens the file had complete coverage for. Those screens pass a DOM check
+and appear in the route list; they simply never had a pass driving them. A screen that is *reachable*
+is not a screen that is *driven*, and only the second one is coverage.
+
+**The gate, and four times it was wrong before it was right.** `scripts/qa/probe-only-filter.cjs` is
+**27/27**, with four mutations of the real source each red on a named rule and green on the unmutated
+file. Its failures are worth more than its passes:
+
+1. It demanded the guard name match the pass name and reported eleven legitimate route-vs-pass renames
+   — `wants("analytics-depth")` guarding `runDepthPass("analyticsDepth")`. A rename is not a filter
+   bug; `--only=analytics-depth` reaches the pass exactly as intended.
+2. It then compared de-hyphenated forms and missed eight others, because the route name carries a
+   `-depth` suffix the pass name drops (`notifications-depth` over `runDepthPass("notifications")`).
+3. It then read `canonical` off a hand-copied array that had silently dropped the field, so every call
+   site reported `undefined` and it fell back to the pass name.
+4. And `\\"` inside a template literal is a **literal backslash followed by a quote**, so the guard
+   matcher never matched one of the 31 guards and reported seven working call sites. Invisible from
+   reading the line: `\\"` looks like a correctly-escaped quote and is wrong only once the template is
+   evaluated.
+
+Each of those is a gate reporting findings it does not understand — the failure mode this repo's
+earlier gates (`undo-selection`, the renderer gate) also got wrong. The rule is now stated over what the
+code **means** — the name a pass *answers to* (`matchedOnly`, what the roll-up prints) against the name
+its guard *reads* (`wants`, what the filter reads) — rather than over a string comparison the file never
+promised. That gap between printed name and read name is precisely what made the health defect invisible.
+
+| gate | result |
+|---|---|
+| `node scripts/qa/probe-only-filter.cjs` | **27/27** (4 mutations red on their named rule, green on the unmutated file) |
+| `node scripts/qa/probe-expected-refusals.cjs` | **38/38** (unchanged this half) |
+| `node scripts/qa/probe-pass-scope.cjs` | **10/10** (unchanged — no template string added) |
+| `node --check` both files | clean |
+
+**Still unticked.** `table-save-survives`, `edge-delete.removed`, `edge-delete-undo.restored`,
+`listener.captureKind`, `plugin-palette`. The pass that was running when this landed was launched before
+the fix, so it is still walking wide — but it does eventually reach `runWorkflowTableDepth`, which is
+the pass the criterion needs. **A row may only be ticked on a reading from a pass launched with the
+fixed filter**, so nothing here changes a checkbox.
+
+**Next.** Let the wide pass finish (it is the only thing currently reaching `workflow-table`), read
+`table-save-survives` from it, then re-run `--only=workflow-table` with the fix in place so the filter
+can be trusted for every future tick. With the early exit firing it is a bounded walk of one depth pass
+rather than a twenty-five-minute gamble — which is what it has been supposed to be since the flag was
+added, and which four ticks of "the box is busy" cost.
+
 ## Tick 82 (wave3) — an allowance that could not match the refusals it was registered for
 
 fix(qa): the deliberate refusals a pass provokes were the findings it was charged for
