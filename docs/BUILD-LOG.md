@@ -13494,3 +13494,73 @@ and the keyboard/mobile box stay open for that reason and no other.
 **Next:** the walkthrough needs its developer routes added to `scripts/qa/walkthrough.cjs` — no
 untested screen is accepted, and a route list that omits `/developer` means a pass that is green
 because it never looked. Then the pass itself, then the state boxes, and only then `done`.
+
+---
+
+## Tick 76 — `merge(wave4): take origin/main (10 commits) into wave4, keeping both guard shapes`
+
+**What.** Merged `origin/main` into `wave4` at tick start (main was 10 commits ahead, all of it the
+developer portal: `bb8f04c9` … `6e8bd678`). Four files conflicted, and **every one of them failed in
+the direction of quietly dropping a screen or a guard** rather than in the direction of leaving
+obvious damage:
+
+- **`apps/api/src/guards.rs` — took ours, after proving ours is a superset.** Main added the
+  reporting-principal split (`check_kind_reporting` → `ResolvedPrincipal` → response extension);
+  wave4 added `require_any`, `require_department_scoped` + `granted_departments`, and the
+  `merge_principal`/`attach_principal`/`finish` trio. `checkout --ours` is only correct when ours
+  *contains* theirs, so the check is a function-by-function diff of all three stages, not an
+  opinion: `^fn` lists in base/ours/theirs plus `git diff base..origin/main` show main's whole
+  post-base delta is already present in wave4's file. Taking "theirs" would have deleted
+  `require_any` and the department-scoped guard — i.e. REQ-052's quotes-only reader and REQ-055's
+  visibility levels, two closed slices, silently gone.
+- **`scripts/qa/walkthrough.cjs` — union, counted.** Wave4's `mobileRoutes` carried the six CRM
+  rows, main's carried `developer-overview` / `developer-api-keys` / `developer-logs`. A text merge
+  keeps one list; the dropped rows are screens that stop being measured **with nothing saying so**.
+  Merged list is **38 entries / 38 unique, zero duplicates**, and every `crm-*` and `developer-*`
+  name is present. The second conflict glued main's `deadPasses` block *inside* wave4's closing
+  brace — `node --check` caught it (`Unexpected end of input`), which is the one tool that sees it.
+- **`docs/BUILD-LOG.md` — `merge-build-log.py`, verified as a multiset against BOTH parents.**
+  base 7965 · ours 13392 · theirs 8069 → merged 13496; **191 `## ` headings, zero line-delta in
+  either direction**. A length check would also have passed a merge that duplicated a block.
+- **`apps/admin/components/app-shell.tsx`** — the lucide import is the one line both sides edited
+  (wave4: `Package`/`Users`/`Warehouse`/`Palmtree`; main: `Code2`/`HeartPulse`). Union, with the
+  comment saying *why* it is a union.
+
+**Proof**
+
+| gate | command | result |
+|---|---|---|
+| merge | `git merge origin/main` → `f4ea5ea9` | 4 conflicts, all resolved by hand |
+| walkthrough parses | `node --check scripts/qa/walkthrough.cjs` | **exit 0** |
+| mobile routes kept | count of `name:` in `mobileRoutes` | **38 / 38 unique**, 0 dups |
+| BUILD-LOG | `python3 scripts/qa/merge-build-log.py docs/BUILD-LOG.md` | **0 entries lost**, both sides present |
+| BUILD-LOG multiset | `Counter` vs each parent | delta `{}` **and** `{}` — nothing missing either way |
+| compile | `cargo check -p omnion-api` | exit 0 (20 pre-existing warnings) |
+| web | `env -i … pnpm typecheck` | **2/2 packages** |
+| CRM crate | `cargo test -p omnion-module-crm --quiet` | **172 passed · 0 failed** |
+| isolation probe | `bash scripts/qa/probe-walk-gate-isolation.sh` | **6 passed · 0 failed** (control still leaks) |
+| verdict probe | `node scripts/qa/probe-verdict-gate.cjs` | **9 passed · 0 failed** (control still exits 0) |
+
+**A probe that failed on a stale port, and what its output said about itself.** The isolation probe
+first ran with `QA_PG_PORT=5444` — w4's private Postgres from tick 74's write-up. **Nothing is
+listening there** (`docker ps` shows `omnion-postgres` on 5433 and w2's on 5449; w4 has no
+container), and `count_prefix` ends in `|| echo "-"`, so four assertions compared two `-`:
+`before=- after=- distinct=2`, four FAILs, reading as "tick 75's cleanup fix regressed". On the
+script's own default: **6/6, control intact.** The lesson is about the *shape* of the failure: an
+assertion whose operands are both empty is not a measurement — a real regression fails *some*
+assertions, a wrong target fails all of them identically. Also worth recording: **`run.sh` defaults
+`QA_PG_PORT` to the shared 5433 deliberately.** The forbidden thing in the wave rules is the
+*stack* (18080/3100/3200, `omnion_qa`, `omnion-qa-*`), not the container — every stack shares the
+Postgres and owns its own database name. I spent minutes hunting for a w4 container I was never
+supposed to have.
+
+**What is *not* claimed.** No acceptance box ticked; the CRM browser pass is still queued behind
+w6's slot (queued with `QA_SLOT_WAIT=2400`, holder re-read — it turned over from w2 to w6 mid-tick).
+The three boxes — empty/loading/error states, mobile 390×844, keyboard — remain browser-only and
+untouched. `cargo build -p omnion-api --tests` hit `/mnt/apopic` at 100% mid-build
+(`failed to create query cache … os error 2`), rebuilt clean with `CARGO_INCREMENTAL=0`; the
+inventory walks against per-walk databases are the pending item.
+
+**Next.** The CRM pass on `QA_STACK=w4` (18083/3103/3203) with `QA_ONLY=crm` — the reading that
+turns the three boxes into ticks or names the leg that broke. Then REQ-051 `done`, or a tick that
+says which of the three could not be produced.
