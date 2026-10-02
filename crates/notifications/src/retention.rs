@@ -59,6 +59,40 @@ pub const MAX_ROWS_PER_SWEEP: i64 = 1_000;
 /// disagreeing about when a phone's row goes away.
 pub const DEFAULT_DEVICE_STALE_DAYS: i32 = 30;
 
+/// The shortest window a delivery log may be kept for.
+///
+/// **The same number `0236`'s check constraint enforces**, spelled here as a constant so the
+/// API's refusal and the column's backstop cannot drift apart. It is deliberately not `0`: a
+/// zero window deletes the log the moment a row is written, which leaves an administrator
+/// staring at an empty delivery screen and a sweep that claims it ran.
+pub const MIN_RETENTION_DAYS: i32 = 1;
+
+/// The longest window — ten years, past which the log is a database and not a log.
+///
+/// The same argument `crates/events::MAX_RETENTION_DAYS` makes for the event bus.
+pub const MAX_RETENTION_DAYS: i32 = 3_650;
+
+/// Validate a delivery-log window.
+///
+/// **The refusal names the field and the range**, for the reason `crates/events::validation::
+/// validate_retention_window` gives: a bare "invalid" leaves the caller guessing which bound it
+/// crossed, and the two bounds mean opposite things to an operator — the floor is "you cannot
+/// keep nothing", the ceiling is "that is a decade, and nothing will read it".
+///
+/// The bounds are read from the constants rather than written here, so a column check
+/// constraint, an API refusal and this function cannot disagree — which is the shape of the
+/// defect this slice exists to close.
+pub fn validate_retention_window(days: i32) -> Result<i32> {
+    if !(MIN_RETENTION_DAYS..=MAX_RETENTION_DAYS).contains(&days) {
+        return Err(crate::error::NotificationError::invalid(format!(
+            "notification_retention_days must be between {MIN_RETENTION_DAYS} and \
+             {MAX_RETENTION_DAYS}, and {days} is not"
+        )));
+    }
+
+    Ok(days)
+}
+
 /// One organization's window, and whether the sweep could read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -103,6 +137,164 @@ pub async fn work_list(pool: &PgPool, limit: i64) -> Result<Vec<RetentionPolicy>
             window_days,
         })
         .collect())
+}
+
+/// Read one organization's window, or the platform default when it has no opinion.
+///
+/// **`coalesce` on a subquery rather than a plain read**, for the reason `crates/events::store::
+/// retention_window` gives: the column is `not null default 60`, so a `None` here can only mean
+/// the organization row does not exist — and answering with the published default is what lets
+/// the outbox render its sentence before the first organization exists.
+///
+/// This is the read the sweep does *not* make. The sweep reads its window inside `work_list`,
+/// joined to the organizations that actually have notifications; this one is the screen's read,
+/// and it is what finally makes `organizations.notification_retention_days` a value a person can
+/// look at rather than a column only a worker consults.
+pub async fn retention_window(pool: &PgPool, organization_id: Option<Uuid>) -> Result<i32> {
+    let days: i32 = sqlx::query_scalar(
+        "select coalesce((select notification_retention_days from organizations where id = $1), $2)",
+    )
+    .bind(organization_id)
+    .bind(crate::push::OUTBOX_RETENTION_DAYS)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(days)
+}
+
+/// Set one organization's window and read back what the column now holds.
+///
+/// **The write is validated by the store, not only by the handler**, for the reason the event
+/// bus gives for its own setter: the store is also reached by an operator's SQL and by a future
+/// import, and a rule true in one handler is a rule the next writer re-implements. The column's
+/// check constraint is the backstop; the read-back is what the caller returns to the screen, so
+/// a caller can never report a number the database did not accept.
+///
+/// **An organization that does not exist is an error, not a silent zero-row update.** The
+/// events setter refuses the same way, and the reason matters here: a `fetch_optional` that
+/// falls back to the default would answer `200` and change nothing, which is exactly the
+/// "a platform account has no window to set" trap the handler refuses by name.
+pub async fn set_retention_window(pool: &PgPool, organization_id: Uuid, days: i32) -> Result<i32> {
+    let days = validate_retention_window(days)?;
+    let stored: i32 = sqlx::query_scalar(
+        "update organizations set notification_retention_days = $2, updated_at = now() \
+         where id = $1 returning notification_retention_days",
+    )
+    .bind(organization_id)
+    .bind(days)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        crate::error::NotificationError::invalid(format!(
+            "no organization {organization_id} to keep a delivery log for"
+        ))
+    })?;
+
+    Ok(stored)
+}
+
+/// What one organization's window is, and what is due for removal because of it.
+///
+/// **One statement for both numbers**, for the reason `crates/events::store::retention_counts`
+/// gives: the screen shows the kept count and the due count together, and two round trips could
+/// be answered by two different instants — a panel drawing "3,412 rows, 12 due" where the 12
+/// came from a moment after the 3,412.
+///
+/// **The `due` predicate is the sweep's own**, restricted to rows nobody is delivering right
+/// now. A screen that said "12 due" while the sweeper removes 0 would be lying, and the two
+/// only stay equal if one of them is written once.
+///
+/// **The window comes out of the same subquery the work list reads it through** (`o.window`),
+/// rather than being bound as a parameter. That is the whole point of this statement: a count
+/// that took the window from a *second* place would answer for a different window than the sweep
+/// deletes on, and the difference only appears on a tenant that has set its own — which is the
+/// only tenant for whom the number matters.
+pub async fn retention_counts(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    lease_seconds: f64,
+) -> Result<(i64, i64)> {
+    let row: (i64, i64) = sqlx::query_as(
+        "select count(*) as total, \
+                count(*) filter (where coalesce(d.settled_at, d.created_at) \
+                                   < now() - make_interval(days => o.window) \
+                                  and (d.claimed_at is null \
+                                       or d.claimed_at <= now() - \
+                                          make_interval(secs => $2::double precision))) as due \
+         from notification_deliveries d \
+         join notifications n on n.id = d.notification_id \
+         cross join (select coalesce((select notification_retention_days from organizations o \
+                                     where o.id = $1), $3) as window) o \
+         where n.organization_id is not distinct from $1",
+    )
+    .bind(organization_id)
+    .bind(lease_seconds)
+    .bind(i32::from(crate::push::OUTBOX_RETENTION_DAYS))
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
+/// What one organization's window is, and the last sweep that ran against it.
+///
+/// The read side of the pair the sweep writes. Without it the run log has exactly one reader —
+/// the worker that wrote it — which is the "capability with no caller" shape this branch has
+/// been paying for in six figures.
+pub async fn retention_status(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    lease_seconds: f64,
+) -> Result<RetentionStatus> {
+    let window_days = retention_window(pool, organization_id).await?;
+    let (rows, due) = retention_counts(pool, organization_id, lease_seconds).await?;
+    let last_run = sqlx::query_as::<_, RetentionRun>(
+        "select id, organization_id, started_at, finished_at, window_days, cutoff, \
+                deliveries_deleted, devices_deleted, failed, error \
+         from notification_retention_runs \
+         where organization_id is not distinct from $1 and finished_at is not null \
+         order by started_at desc limit 1",
+    )
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(RetentionStatus {
+        organization_id,
+        window_days,
+        rows,
+        due,
+        last_run,
+    })
+}
+
+/// One finished sweep, as the screen renders it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RetentionRun {
+    pub id: Uuid,
+    pub organization_id: Option<Uuid>,
+    pub started_at: OffsetDateTime,
+    pub finished_at: OffsetDateTime,
+    pub window_days: i32,
+    pub cutoff: OffsetDateTime,
+    pub deliveries_deleted: i32,
+    pub devices_deleted: i32,
+    pub failed: i32,
+    pub error: Option<String>,
+}
+
+/// The delivery log's retention, as one organization sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionStatus {
+    pub organization_id: Option<Uuid>,
+    /// How many days of delivery history this organization keeps.
+    pub window_days: i32,
+    /// How many delivery rows the log holds now.
+    pub rows: i64,
+    /// How many of them the next sweep would remove — the sweep's own predicate.
+    pub due: i64,
+    /// The last finished sweep, or none.
+    pub last_run: Option<RetentionRun>,
 }
 
 /// What one organization's sweep removed.
@@ -277,7 +469,8 @@ pub async fn run_pass(
         // own run row would skip the failure case entirely, and a run log that records only
         // successes cannot tell "nothing has been swept since March" from "every sweep has been
         // failing since March".
-        let (report, failure) = match sweep_deliveries(pool, *policy, max_rows, lease_seconds).await {
+        let (report, failure) = match sweep_deliveries(pool, *policy, max_rows, lease_seconds).await
+        {
             Ok(report) => {
                 if report.deliveries_deleted > 0 || report.devices_deleted > 0 {
                     tracing::info!(
@@ -317,7 +510,10 @@ pub async fn run_pass(
     // any given day — so it is logged at debug, where it is available and does not push a real
     // warning out of the reader's attention.
     if deliveries_deleted == 0 && devices_deleted == 0 && failed == 0 {
-        tracing::debug!(walked, "the notification retention sweep found nothing to remove");
+        tracing::debug!(
+            walked,
+            "the notification retention sweep found nothing to remove"
+        );
     }
 
     Ok(PassReport {
@@ -487,7 +683,150 @@ mod tests {
         );
     }
 
-    /// **The bounds are constants, so the assertion about them is a constant too** — clippy
+    /// A window outside the range is refused by name, and the bounds are the column's.
+    ///
+    /// Both ends, not just the obvious one: a caller asking for `0` is asking to delete the log
+    /// the moment a row is written, and a caller asking for `3651` is asking for a decade of a
+    /// table nobody reads. The assertion is on the *message*, because the message is what the
+    /// screen shows an operator who typed the wrong thing.
+    #[test]
+    fn a_window_outside_the_range_is_refused_by_name() {
+        for days in [0, -1, MAX_RETENTION_DAYS + 1] {
+            let refused = validate_retention_window(days).expect_err("the window must be refused");
+            assert!(
+                refused.to_string().contains("notification_retention_days"),
+                "the refusal names the field: {refused}"
+            );
+            assert!(
+                refused
+                    .to_string()
+                    .contains(&MIN_RETENTION_DAYS.to_string())
+                    && refused
+                        .to_string()
+                        .contains(&MAX_RETENTION_DAYS.to_string()),
+                "the refusal names both bounds, so a caller can tell which one it crossed: \
+                     {refused}"
+            );
+        }
+
+        // Both ends are legal, and the *returned* value is the input — the store returns what
+        // was asked for so the handler can hand the same number back to the screen.
+        assert_eq!(
+            validate_retention_window(MIN_RETENTION_DAYS).expect("the floor is valid"),
+            MIN_RETENTION_DAYS
+        );
+        assert_eq!(
+            validate_retention_window(MAX_RETENTION_DAYS).expect("the ceiling is valid"),
+            MAX_RETENTION_DAYS
+        );
+        assert_eq!(
+            validate_retention_window(90).expect("a quarter is valid"),
+            90
+        );
+    }
+
+    /// **The floor and the ceiling are the ones `0236`'s check constraint enforces.**
+    ///
+    /// A constant asserted against itself proves nothing; what matters is that the migration's
+    /// SQL and this module agree, because the constraint is the backstop for the operator's own
+    /// SQL and for a future import. So the number is read *out of the migration file* rather
+    /// than typed here — the same trick the module's `code()` reader plays on this file.
+    #[test]
+    fn the_bounds_are_the_migrations_own_check_constraint() {
+        let migration = crate::testing::code_of(include_str!(
+            "../../../database/migrations/0236_notification_retention.sql"
+        ));
+        let flat = migration.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&format!(
+                "check (notification_retention_days between {MIN_RETENTION_DAYS} and \
+                     {MAX_RETENTION_DAYS})"
+            )),
+            "the migration's constraint and this module's bounds must be one number pair, or a \
+                 write refused here and a write allowed there are two different rules"
+        );
+    }
+
+    /// **The published constant sits inside the range, and is not the floor.**
+    ///
+    /// The default window is what an installation with no row gets. If it were ever set to the
+    /// floor (`1`), every fresh installation would silently keep one day of delivery history —
+    /// and the screen would say "The log goes back 1 day" beside a log that has already lost
+    /// yesterday's failures. So the relationship is asserted, not the literal.
+    #[test]
+    fn the_default_window_is_inside_the_range_and_is_not_the_floor() {
+        let default = crate::push::OUTBOX_RETENTION_DAYS;
+        assert!(
+            (MIN_RETENTION_DAYS..=MAX_RETENTION_DAYS).contains(&default),
+            "the fallback the work list binds must itself be a legal window"
+        );
+        assert!(
+            default > MIN_RETENTION_DAYS,
+            "a default of {MIN_RETENTION_DAYS} day would keep no history at all, and the screen \
+                 would publish that number"
+        );
+    }
+
+    /// **The count reads its window from the same subquery the work list does.**
+    ///
+    /// `retention_counts` is the screen's "12 due" and `sweep_deliveries` is what actually
+    /// removes rows. Two statements that spell the window differently agree on every tenant
+    /// using the default and disagree on exactly one kind of tenant — the one that set its own
+    /// window — which is the only kind for which the sentence is worth anything. So this
+    /// asserts the *shared spelling*: the `due` filter references `o.window`, the cross join that
+    /// produces `o.window` is the one that reads the column, and neither hardcodes a literal.
+    #[test]
+    fn the_due_count_reads_the_window_from_the_column_rather_than_a_literal() {
+        let flat = flat();
+        let counts = flat
+            .split("pub async fn retention_counts")
+            .nth(1)
+            .expect("the counts statement")
+            .split("pub async fn retention_status")
+            .next()
+            .expect("the counts statement's end");
+        assert!(
+            counts.contains("< now() - make_interval(days => o.window)"),
+            "the due count must be judged on the organization's own window"
+        );
+        assert!(
+            counts.contains("notification_retention_days"),
+            "that window is read from the column, not from the published constant"
+        );
+        assert!(
+            !counts.contains("days => $2::int"),
+            "a window bound as a parameter is a SECOND place the window comes from, and the two \
+                 are only equal until a tenant sets its own"
+        );
+    }
+
+    /// **The run log finally has a reader, and the reader filters finished runs.**
+    ///
+    /// `notification_retention_runs` shipped with exactly one reader — the worker that wrote it —
+    /// which is this branch's standing defect in its purest form: a table an operator can find
+    /// nothing about on the day they ask why a March delivery is still on the screen. The
+    /// screen's read must also exclude an unfinished run, because an unfinished one is a run in
+    /// flight or a process that died mid-sweep, and rendering "last sweep at 03:00, removed
+    /// nothing" from a row that never finished is the log lying in the one direction it exists
+    /// to prevent.
+    #[test]
+    fn the_run_log_is_readable_and_only_finished_runs_are() {
+        let flat = flat();
+        let status = flat
+            .split("pub async fn retention_status")
+            .nth(1)
+            .expect("the status read");
+        assert!(
+            status.contains("from notification_retention_runs"),
+            "the last sweep must be read out of the run log the sweep writes"
+        );
+        assert!(
+            status.contains("finished_at is not null"),
+            "an unfinished run is a run in flight, not the last sweep"
+        );
+    }
+
+    /// The bounds are constants, so the assertion about them is a constant too — clippy
     /// says so, and it is right. `assert!(MAX_ORGANIZATIONS > 0)` in a test body is evaluated
     /// at run time and reads like a measurement; a `const` block is evaluated at compile time
     /// and **fails the build** when somebody sets the bound to zero, which is the actual defect
@@ -495,6 +834,9 @@ mod tests {
     /// sweeps everything in one transaction).
     const _: () = assert!(MAX_ORGANIZATIONS > 0);
     const _: () = assert!(MAX_ROWS_PER_SWEEP > 0);
+    /// The same for the window's bounds, which are compile-time facts about the column too.
+    const _: () = assert!(MIN_RETENTION_DAYS >= 1);
+    const _: () = assert!(MAX_RETENTION_DAYS >= MIN_RETENTION_DAYS);
 
     /// The clamps are in the statements, which is the half a constant assertion cannot reach.
     #[test]

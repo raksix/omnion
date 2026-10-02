@@ -57,8 +57,10 @@ pub use push::{
 };
 pub use retention::{
     DEFAULT_DEVICE_STALE_DAYS, MAX_ORGANIZATIONS as MAX_RETENTION_ORGANIZATIONS,
-    MAX_ROWS_PER_SWEEP, PassReport as RetentionPassReport, RetentionPolicy, SweepReport,
-    run_pass as run_retention_pass, sweep_deliveries, work_list as retention_work_list,
+    MAX_RETENTION_DAYS, MAX_ROWS_PER_SWEEP, MIN_RETENTION_DAYS, PassReport as RetentionPassReport,
+    RetentionPolicy, RetentionRun, RetentionStatus, SweepReport, retention_counts,
+    retention_status, retention_window, run_pass as run_retention_pass, set_retention_window,
+    sweep_deliveries, validate_retention_window, work_list as retention_work_list,
     write_run as write_retention_run,
 };
 pub use router::{

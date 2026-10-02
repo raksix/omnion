@@ -451,11 +451,10 @@ pub async fn route(pool: &PgPool, event: &RoutedEvent) -> Result<RouteReport> {
         // a stranger has not been satisfied, and reporting it as a created row is how the same
         // event looks successful three times over.
         let organizations = crate::store::recipient_organizations(pool, &resolved).await?;
-        let kept = crate::audience::addressable_recipients(
-            event.organization_id,
-            &resolved,
-            &|id| Some(organizations.get(&id).copied().flatten()),
-        );
+        let kept =
+            crate::audience::addressable_recipients(event.organization_id, &resolved, &|id| {
+                Some(organizations.get(&id).copied().flatten())
+            });
         if kept.is_empty() {
             report.unmatched_rules += 1;
             continue;

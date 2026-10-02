@@ -48,9 +48,14 @@ pub fn strip_comments(source: &str) -> String {
         LineComment,
         /// `/* … */`, which unlike a line comment **spans** lines and must keep consuming
         /// newlines — that is what preserves the line count.
-        BlockComment { depth: usize },
+        BlockComment {
+            depth: usize,
+        },
         /// Inside `"…"`. Kept verbatim in the output, because SQL is the subject here.
-        Str { raw: bool, hashes: usize },
+        Str {
+            raw: bool,
+            hashes: usize,
+        },
         Char,
     }
     let mut state = State::Code;
@@ -173,10 +178,7 @@ pub fn strip_comments(source: &str) -> String {
                                 probe += 1;
                             }
                             if chars.get(probe) == Some(&'"') {
-                                state = State::Str {
-                                    raw: true,
-                                    hashes,
-                                };
+                                state = State::Str { raw: true, hashes };
                                 index = probe + 1;
                                 continue;
                             }
@@ -330,7 +332,10 @@ mod tests {
     fn a_lifetime_is_not_a_character_literal() {
         let stripped = strip_comments("fn f<'a>(x: &'a str) -> &'a str { \"kept\" }");
         assert!(stripped.contains("fn f"));
-        assert!(stripped.contains("&'a str"), "the lifetimes must survive as code");
+        assert!(
+            stripped.contains("&'a str"),
+            "the lifetimes must survive as code"
+        );
         assert!(stripped.contains("kept"));
     }
 

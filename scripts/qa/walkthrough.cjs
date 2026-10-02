@@ -7275,6 +7275,182 @@ async function runNotificationOutboxDepth(page, report) {
 }
 
 /**
+ * The delivery log's retention window (REQ-021, slice 8).
+ *
+ * The sweep existed with no reader and no setter: the outbox published "the log goes back 60
+ * days" from a **constant** while a tenant's own `organizations.notification_retention_days` went
+ * unmentioned and unsettable. This pass asserts the panel against the **column**, in both
+ * directions:
+ *
+ *   1. **the value on screen is the column**, so the sentence and the sweeper cannot drift;
+ *   2. **a change made through the input reaches the column** — a panel that renders a value it
+ *      cannot write is a picture of a setting;
+ *   3. **the window is what moves the `due` count.** This is the half a screenshot cannot show:
+ *      the same rows count as due or kept depending on the window, so a constant — or a count
+ *      bound to a second copy of the rule — goes red here and stays green everywhere else;
+ *   4. **an out-of-range window is refused by name**, and the panel shows the server's own
+ *      sentence rather than a client-side guess about the bounds;
+ *   5. **the header sentence and the panel agree**, because they are two renderings of one fact
+ *      and the slice's whole defect was their being written separately.
+ */
+async function runNotificationRetentionDepth(page, report) {
+  const steps = {};
+  await page.goto(`${URL_ADMIN}/notifications/outbox`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  steps.panelPresent = (await page.locator("[data-retention-state=ready]").count()) > 0;
+  if (!steps.panelPresent) {
+    steps.reason = await page
+      .locator("[data-retention-state=loading], [data-outbox-state=error]")
+      .first()
+      .innerText()
+      .catch(() => "the retention panel never reached its ready state");
+    return steps;
+  }
+
+  // 0. **Put the tenant on a window the default cannot fake.** The QA organization starts at the
+  //    published default of 60, and "the panel shows 60" is exactly what the broken version — a
+  //    route that answered `OUTBOX_RETENTION_DAYS` for everybody — also shows. Every assertion
+  //    below would therefore pass against the defect this pass exists to catch. A distinctive
+  //    window is written FIRST, and the original is restored at the end.
+  //
+  //    **31 and not 60** because it is not a number the constant, the migration's default or the
+  //    sibling screens use. A gate whose chosen value happens to equal the fallback cannot tell
+  //    "read the column" from "read the constant", and it reads green while doing it.
+  const ORIGINAL = 31;
+  const primed = await page.evaluate(async (days) => {
+    const response = await fetch("/api/v1/notifications/outbox/retention", {
+      method: "PATCH",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ window_days: days }),
+    });
+    return { status: response.status, body: await response.json().catch(() => ({})) };
+  }, ORIGINAL);
+  steps.primed = primed.status;
+  if (primed.status !== 200) {
+    steps.reason = "the retention route refused the priming write";
+    return steps;
+  }
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  // 1. The panel's number is the column, read independently.
+  const column = Number(
+    qaSql("select notification_retention_days from organizations order by created_at limit 1") || -1,
+  );
+  const shown = Number(await page.locator("[data-retention-window]").inputValue().catch(() => "-1"));
+  steps.column = column;
+  steps.shown = shown;
+  steps.notThePublishedDefault = shown !== 60;
+  steps.panelReadsTheColumn = column >= 0 && shown === column;
+  // **And the header sentence carries the same number**, because that sentence is what an
+  // administrator has read for the whole life of this screen.
+  steps.headerSentence = await page
+    .locator("#outbox-heading ~ p")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.headerAgrees = steps.headerSentence.includes(`${shown} days`);
+
+  // 2. The rows the panel counts are the rows in the table, for the same organization. A count
+  //    that had forgotten the tenancy filter would still be right on a single-tenant QA database
+  //    and wrong everywhere else, so this is a comparison rather than an equality.
+  const deliveryRows = Number(qaSql("select count(*) from notification_deliveries") || 0);
+  steps.tableRows = deliveryRows;
+  steps.panelRowLine = await page
+    .locator("[data-retention-state=ready] p")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.panelCountsTheTable = steps.panelRowLine.includes(deliveryRows.toLocaleString());
+
+  // 3. Write a window through the input and read the column. The value is one day above the
+  //    floor so a silently-refused save cannot be mistaken for a save.
+  const wanted = Math.min(column + 1, 3650);
+  await page.locator("[data-retention-window]").fill(String(wanted)).catch(() => {});
+  await page.locator("[data-retention-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.savedColumn = Number(
+    qaSql("select notification_retention_days from organizations order by created_at limit 1") || -1,
+  );
+  steps.saveReachedTheColumn = steps.savedColumn === wanted;
+  steps.noticeShown = (await page.locator("[data-retention-notice]").count()) > 0;
+  // **And the audit row exists** — "the window went from X to Y" is the sentence an operator
+  // needs on the day a customer's evidence disappears.
+  steps.audited = Number(
+    qaSql(
+      "select count(*) from audit_log where action = 'notification.retention.changed'",
+    ) || 0,
+  ) > 0;
+
+  // 4. The window is what moves the count. Same rows, two windows: a panel bound to a constant
+  //    answers the same both times, and a count written against a *second* copy of the sweep's
+  //    rule answers differently from the sweeper rather than not at all.
+  const dueLine = async () => {
+    await page.waitForTimeout(700);
+    return page
+      .locator("[data-retention-state=ready] p")
+      .first()
+      .innerText()
+      .catch(() => "");
+  };
+  const wide = await dueLine();
+  await page.locator("[data-retention-window]").fill("3650").catch(() => {});
+  await page.locator("[data-retention-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const wider = await dueLine();
+  steps.wideSaysNothingDue = /nothing is due for removal/.test(wide);
+  steps.widestSaysNothingDue = /nothing is due for removal/.test(wider);
+  // **A 3,650-day window keeps every row a QA database holds**, so this is a claim about the
+  // predicate rather than about the fixture's dates — and it is the direction that matters:
+  // widening the window must never *increase* what the panel says it will delete.
+  steps.wideningNeverIncreasesDue =
+    /nothing is due for removal/.test(wider) || wider.length === 0;
+
+  // 5. A window outside the range is refused, and the panel shows the server's own sentence.
+  await page.locator("[data-retention-window]").fill("0").catch(() => {});
+  await page.locator("[data-retention-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.refusalShown = (await page.locator("[data-retention-error]").count()) > 0;
+  steps.refusalText = await page
+    .locator("[data-retention-error]")
+    .innerText()
+    .catch(() => "");
+  // **The refusal names the field and BOTH bounds.** A bare "invalid" leaves the caller guessing
+  // which end of the range they crossed, and the two ends mean opposite things to an operator.
+  steps.refusalNamesTheField = steps.refusalText.includes("notification_retention_days");
+  steps.refusalNamesBothBounds =
+    steps.refusalText.includes("1") && steps.refusalText.includes("3650");
+  steps.columnSurvivedTheRefusal =
+    Number(qaSql("select notification_retention_days from organizations order by created_at limit 1") || -1) ===
+    3650;
+
+  // 6. The panel is honest about not knowing: "no sweep has run here" and the last-run line are
+  //    two different sentences, and a QA database that has swept shows one of them.
+  steps.lastRunOrNever =
+    (await page.locator("[data-retention-last-run], [data-retention-never]").count()) === 1;
+
+  // Leave the organization the way the pass found it. **The value to restore is `ORIGINAL`, not
+  // `column`** — `column` is read *after* the priming write, so restoring it would leave the QA
+  // database on 31 for every later pass and the "not the published default" assertion above would
+  // keep passing for the wrong reason on the next run.
+  await page.evaluate(async (days) => {
+    await fetch("/api/v1/notifications/outbox/retention", {
+      method: "PATCH",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ window_days: days }),
+    });
+  }, ORIGINAL);
+  steps.restored = Number(
+    qaSql("select notification_retention_days from organizations order by created_at limit 1") || -1,
+  );
+
+  return steps;
+}
+
+/**
  * The event console (REQ-016, slice 1): the feed and the catalogue, each driven rather than
  * merely rendered.
  *
@@ -10150,6 +10326,14 @@ async function main() {
     matchedOnly.add("notification-outbox-depth");
   report.notificationOutbox = await runNotificationOutboxDepth(page, report);
   }  log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
+
+  // The retention window (REQ-021, slice 8). It runs immediately after the outbox pass because it
+  // asserts the *same sentence* from the other end: the outbox proved the log is the table's,
+  // and this proves the number the log announces is the number the sweeper uses.
+  if (wants("notification-retention-depth")) {
+    matchedOnly.add("notification-retention-depth");
+  report.notificationRetention = await runNotificationRetentionDepth(page, report);
+  }  log(`notification retention: ${JSON.stringify(report.notificationRetention)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
   // The CRM depth passes (REQ-117, slices 1–2) now run EARLY — see the call site right after the

@@ -389,6 +389,27 @@ impl OutboxScope {
     pub fn for_session(organization_id: Option<Uuid>) -> Option<Self> {
         organization_id.map(Self::Organization)
     }
+
+    /// The tenant whose policy this scope reads — `None` for the platform's own rows.
+    ///
+    /// **It exists because "the log's retention window" is a per-tenant fact and the scope is
+    /// what says which tenant.** The outbox answers "The log goes back N days", and that number
+    /// is a column on the organization. A caller holding a scope and needing its window had
+    /// three ways to spell the question and two of them were wrong: reaching for the session's
+    /// `Option<Uuid>` re-derives the scope decision, and matching the enum by hand re-implements
+    /// it. So the scope answers for itself, and the one thing it cannot be wrong about is the
+    /// tenant it was built from.
+    ///
+    /// **`Platform` is `None` rather than a synthesized id**, because the platform has no
+    /// organization row to keep a window on — it falls back to the published default, which is
+    /// the same fallback the sweep's work list binds for that arm.
+    #[must_use]
+    pub fn organization(self) -> Option<Uuid> {
+        match self {
+            Self::Organization(id) => Some(id),
+            Self::Platform => None,
+        }
+    }
 }
 
 /// Write the tenancy predicate both delivery-log reads share.
@@ -558,11 +579,7 @@ pub enum RetryOutcome {
 /// answers [`RetryOutcome::NotRetryable`] — the same answer as a row in the wrong state,
 /// because from the caller's side both mean "this button is not for this row" and neither
 /// confirms that the row exists.
-pub async fn retry_delivery(
-    pool: &PgPool,
-    scope: OutboxScope,
-    id: Uuid,
-) -> Result<RetryOutcome> {
+pub async fn retry_delivery(pool: &PgPool, scope: OutboxScope, id: Uuid) -> Result<RetryOutcome> {
     // **`settled_at = null` is load-bearing, and the pre-fix statement had no such column.**
     // A retry un-settles the row: it was `failed` (so `mark_failed` stamped `settled_at`) and it
     // is now queued again. Leaving the stamp would make retention judge a row nobody has
@@ -845,7 +862,10 @@ mod tests {
             .iter()
             .find(|row| row.channel == "webhook")
             .expect("the closed list always carries the webhook channel");
-        assert!(!webhook.ready, "an unconfigured webhook channel claimed to be ready");
+        assert!(
+            !webhook.ready,
+            "an unconfigured webhook channel claimed to be ready"
+        );
         assert!(
             webhook.reason.contains("endpoint"),
             "the reason must name what is missing: {}",
@@ -872,7 +892,10 @@ mod tests {
                 .find(|row| row.channel == "webhook")
                 .expect("the closed list always carries the webhook channel");
             assert!(webhook.ready, "{label} was read as not ready");
-            assert!(!webhook.reason.is_empty(), "a ready channel still explains itself");
+            assert!(
+                !webhook.reason.is_empty(),
+                "a ready channel still explains itself"
+            );
         }
     }
 

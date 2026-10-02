@@ -123,7 +123,9 @@ pub fn addressable_recipients(
             // instead of a sentence. Refusing it here is what turns a payload naming a
             // fabricated uuid into an unmatched rule rather than a 500.
             None => None,
-            Some(recipient_organization) if may_address(sender_organization, recipient_organization) => {
+            Some(recipient_organization)
+                if may_address(sender_organization, recipient_organization) =>
+            {
                 Some((id, recipient_organization))
             }
             Some(_) => None,
@@ -305,11 +307,13 @@ mod tests {
             union.extend(refused_ids.iter().copied());
             union.sort();
             union.dedup();
-            assert_eq!(union.len(), asked.len(), "every asked id is in exactly one list");
+            assert_eq!(
+                union.len(),
+                asked.len(),
+                "every asked id is in exactly one list"
+            );
             assert!(
-                !kept_ids
-                    .iter()
-                    .any(|id| refused_ids.contains(id)),
+                !kept_ids.iter().any(|id| refused_ids.contains(id)),
                 "no id is both kept and refused: sender {sender:?}"
             );
         }

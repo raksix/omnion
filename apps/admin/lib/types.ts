@@ -1139,6 +1139,46 @@ export type NotificationOutbox = {
 };
 
 /**
+ * One finished retention sweep, as the log's retention panel shows it.
+ *
+ * `failed` is a boolean while the server keeps a count of failed organizations, because a reader
+ * asks "did it work" and never asks "how many of what".
+ */
+export type NotificationRetentionRun = {
+  id: string;
+  started_at: string;
+  finished_at: string;
+  window_days: number;
+  cutoff: string;
+  deliveries_deleted: number;
+  devices_deleted: number;
+  failed: boolean;
+  error: string | null;
+};
+
+/**
+ * The delivery log's own retention.
+ *
+ * **The bounds travel with the value**, so the input is bounded by the server's rule rather than
+ * by a second copy of it in the panel: a window outside `min_days`..`max_days` is refused by
+ * name, and a panel with its own copy of the range would refuse a different set of days after
+ * the next migration moved them.
+ *
+ * `due` is the **sweep's own predicate**, not a re-count written for the screen. A panel that
+ * said "12 due" while the sweeper removed nothing would be the second lie this screen already
+ * had once, in the other direction.
+ */
+export type NotificationRetention = {
+  organization_id: string | null;
+  window_days: number;
+  min_days: number;
+  max_days: number;
+  rows: number;
+  due: number;
+  last_run: NotificationRetentionRun | null;
+};
+
+/**
  * One registered browser, as the devices list shows it.
  *
  * `endpoint_hint` is `…abcdef01` — enough for a reader to recognise their own phone, useless to

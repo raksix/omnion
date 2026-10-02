@@ -132,6 +132,7 @@ import type {
   NotificationPreferencesSaved,
   NotificationPushKey,
   NotificationPushOutcome,
+  NotificationRetention,
   NotificationRouteReport,
   NotificationRouteRule,
   NotificationRow,
@@ -4635,6 +4636,31 @@ export function fetchNotificationOutbox(filters: {
 export function retryNotificationDelivery(id: string): Promise<{ outcome: string }> {
   return request<{ outcome: string }>(`/api/v1/notifications/outbox/${id}/retry`, {
     method: "POST",
+  });
+}
+
+/**
+ * The delivery log's retention window, the counts it would act on, and the last sweep.
+ *
+ * Read separately from the page rather than folded into it: the page is what an administrator
+ * filters, this is what they *configure*, and a slow count query failing should not empty the
+ * table above it.
+ */
+export function fetchNotificationRetention(): Promise<NotificationRetention> {
+  return request<NotificationRetention>("/api/v1/notifications/outbox/retention");
+}
+
+/**
+ * Set the window.
+ *
+ * **The server's refusal is rendered verbatim, not summarised** — `notification_retention_days
+ * must be between 1 and 3650, and 0 is not` names the field and the two bounds, and an operator
+ * who has just deleted their own evidence needs to know which end of the range they crossed.
+ */
+export function setNotificationRetention(windowDays: number): Promise<NotificationRetention> {
+  return request<NotificationRetention>("/api/v1/notifications/outbox/retention", {
+    method: "PATCH",
+    body: JSON.stringify({ window_days: windowDays }),
   });
 }
 

@@ -1204,6 +1204,21 @@ pub fn router(state: AppState) -> Router {
             "/notifications/outbox/{id}/retry",
             post(notifications_admin::retry_outbox),
         )
+        // **Read and write are one permission, not two.** `notifications.admin` already means
+        // "the organization-wide delivery log and the router's rules" (catalogue `notifications.
+        // admin`), so a window that decides how long that log keeps its rows is part of the same
+        // surface — splitting it would need a new catalogued key, and a key with no route behind
+        // it is a promise the platform cannot keep (the catalogue's own note, on
+        // `notifications.admin` itself, which sat uncatalogued for two slices).
+        //
+        // The window is set by `PATCH` and read by `GET` on the SAME path, which is why the
+        // handler for the write delegates to the read rather than re-assembling the answer: two
+        // bodies describing one fact is the defect class this branch keeps meeting.
+        .route(
+            "/notifications/outbox/retention",
+            get(notifications_admin::outbox_retention)
+                .merge(patch(notifications_admin::set_outbox_retention)),
+        )
         .route_layer(guards::require(&state, "notifications.admin"));
     let notifications_routes = Router::new()
         .route(

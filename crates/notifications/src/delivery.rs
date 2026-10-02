@@ -363,9 +363,7 @@ fn channels_without_transport() -> Vec<&'static str> {
     CHANNELS
         .iter()
         .copied()
-        .filter(|channel| {
-            *channel != crate::preferences::IN_APP && !QUEUEABLE.contains(channel)
-        })
+        .filter(|channel| *channel != crate::preferences::IN_APP && !QUEUEABLE.contains(channel))
         .collect()
 }
 
@@ -531,10 +529,7 @@ pub async fn claim_due(pool: &PgPool, batch: i64, lease_seconds: f64) -> Result<
                left join webhook_endpoints w on w.id = c.endpoint_id and w.enabled \
                where d.id = any ($1) \
                order by d.next_attempt_at asc, d.created_at asc";
-    let rows: Vec<ClaimedRow> = sqlx::query_as(sql)
-        .bind(claimed)
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<ClaimedRow> = sqlx::query_as(sql).bind(claimed).fetch_all(pool).await?;
     let mut jobs: Vec<DeliveryJob> = rows.into_iter().map(DeliveryJob::from_row).collect();
 
     attach_push_targets(pool, &mut jobs).await?;
@@ -752,10 +747,7 @@ impl TransportOutcome {
     #[must_use]
     pub fn with_pruned(self, pruned: Vec<PrunedSubscription>) -> Self {
         match self {
-            Self::Accepted { status, .. } => Self::Accepted {
-                status,
-                pruned,
-            },
+            Self::Accepted { status, .. } => Self::Accepted { status, pruned },
             Self::Failed { status, reason, .. } => Self::Failed {
                 status,
                 reason,
@@ -1212,8 +1204,8 @@ mod tests {
         assert!(built.is_accepted());
 
         // The failed arm keeps its sentence, which is the column the outbox renders.
-        let built = TransportOutcome::failed(Some(500), "the service answered 500")
-            .with_pruned(Vec::new());
+        let built =
+            TransportOutcome::failed(Some(500), "the service answered 500").with_pruned(Vec::new());
         match built {
             TransportOutcome::Failed { reason, .. } => {
                 assert_eq!(reason, "the service answered 500");
