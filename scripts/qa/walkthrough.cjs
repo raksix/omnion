@@ -15574,7 +15574,16 @@ async function runWorkflowTableDepth(page, report) {
     }, workflowId);
 
   // ---- The builder, and the link an author would press -----------------------------------
-  await page.goto(`${admin}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  // `URL_ADMIN`, not `admin`. `admin` is a LOCAL of `runIamPasskeysDepth` (line 10520), where it
+  // is deliberately `localhost` rather than `127.0.0.1` so a WebAuthn credential binds to the
+  // origin the browser will actually be on. Two navigations in this function borrowed the name
+  // from there, and a template string over an unbound identifier throws a `ReferenceError`
+  // *before* `.catch` attaches — so it was not a swallowed navigation error, it was the whole
+  // pass dying at its first line, on every run, since `98010ed6` added the row. The harness
+  // reported it as one line in a 40-line log and the acceptance box it guarded sat unmeasured.
+  await page
+    .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
   await page.waitForSelector("[data-builder-table-mode]", { timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(900);
 
@@ -15745,7 +15754,9 @@ async function runWorkflowTableDepth(page, report) {
   // asking every card's inspector in turn, because the criterion does not say which node the
   // table edit landed on and a probe that assumed it would be asserting a guess. The node id
   // travels into the report so a `false` names the node that did not show it.
-  await page.goto(`${admin}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
   // Wait for the MARKER rather than a delay. `waitForTimeout(1500)` is a guess about mount time,
   // and every assertion below is green against a page that has not drawn yet — the race tick 57
   // spent itself on, here in its quietest form: a fixed delay is the only kind of wait that is
