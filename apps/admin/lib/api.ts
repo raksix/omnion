@@ -113,6 +113,12 @@ import type {
   CreatedMediaShare,
   EventCatalogue,
   DeviceLookup,
+  RegionDetail,
+  RegionHealthMatrix,
+  RegionLatencyMatrix,
+  RegionOverview,
+  RegionPatchInput,
+  RegionPatchResponse,
   DeviceStart,
   ManifestReport,
   ScaffoldList,
@@ -7426,5 +7432,60 @@ export async function setOAuthAppSuspended(
   return request(`/api/v1/oauth-apps/${encodeURIComponent(appId)}/suspend`, {
     method: "POST",
     body: JSON.stringify({ suspended }),
+  });
+}
+
+// The edge region registry (REQ-035, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The registry, the health matrix and the latency matrix, in one read.
+ *
+ * One request rather than three, and the reason is specific rather than tidy: the list screen
+ * renders all three, so three fetches mean three independent paint states AND three moments
+ * in time. On a deployment that is actively changing, the region table and the health badges
+ * disagree for as long as the slowest request takes -- and the disagreement looks like a bug in
+ * the panel rather than a race between two reads of the same instant.
+ */
+export async function fetchRegions(): Promise<RegionOverview> {
+  return request<RegionOverview>("/api/v1/regions");
+}
+
+/**
+ * One region, for the detail screen.
+ *
+ * A separate call rather than a filter of the overview, because the detail screen shows the
+ * region's own row and column of the latency matrix — which the overview carries anyway, but a
+ * deep link from a search result should not have to load every region to render one.
+ */
+export async function fetchRegion(code: string): Promise<RegionDetail> {
+  return request<RegionDetail>(`/api/v1/regions/${encodeURIComponent(code)}`);
+}
+
+/** The health matrix on its own, for the health checker's own polling. */
+export async function fetchRegionHealth(): Promise<RegionHealthMatrix> {
+  return request<RegionHealthMatrix>("/api/v1/regions/health");
+}
+
+/** The region-to-region latency matrix on its own. */
+export async function fetchRegionLatency(): Promise<RegionLatencyMatrix> {
+  return request<RegionLatencyMatrix>("/api/v1/regions/latency-matrix");
+}
+
+/**
+ * Rename a region, set its status, activate it, or move the routing default.
+ *
+ * `PATCH` rather than `PUT` and never a form-encoded body: the two endpoints are nullable, and
+ * a `PUT` that means "replace the whole document" cannot express "clear the admin host, leave
+ * the web host alone" without also resending every other field — which is how a concurrent
+ * editor loses a change.
+ */
+export async function patchRegion(
+  code: string,
+  patch: RegionPatchInput,
+): Promise<RegionPatchResponse> {
+  return request<RegionPatchResponse>(`/api/v1/regions/${encodeURIComponent(code)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
   });
 }

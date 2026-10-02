@@ -3885,3 +3885,160 @@ export type DeviceLookup = {
   expired: boolean;
   already_approved: boolean;
 };
+
+// The edge region registry (REQ-035, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** One of the seven services a region runs. The union, not a `string`. */
+export type RegionService =
+  | "api"
+  | "admin"
+  | "web"
+  | "worker"
+  | "database"
+  | "storage"
+  | "cache";
+
+/**
+ * How a service answered.
+ *
+ * `unknown` is a member and not an absence, and that is the whole point of the type: a cell
+ * with no recent check must render `Unknown` and a cell whose check failed renders `down`.
+ * A type that only had the three "answers" would force the panel to invent one for the
+ * missing case, and the invention is always green.
+ */
+export type RegionServiceStatus = "healthy" | "degraded" | "down" | "unknown";
+
+/** How a whole region is doing. `maintenance` is an operator's decision, not a checker's. */
+export type RegionStatusValue = "healthy" | "degraded" | "down" | "maintenance";
+
+/** A stored region row. */
+export type Region = {
+  code: string;
+  display_name: string;
+  country_group: string;
+  status: string;
+  api_endpoint: string;
+  admin_endpoint: string | null;
+  web_endpoint: string | null;
+  storage_bucket: string;
+  cache_namespace: string;
+  is_default: boolean;
+  is_active: boolean;
+  traffic_share: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** One region's service checks, in the API's own order. */
+export type RegionServiceCheck = {
+  service: RegionService;
+  status: RegionServiceStatus;
+  latency_ms: number | null;
+  checked_at: string;
+  stale: boolean;
+};
+
+/**
+ * A region as the list screen renders it: the row, the status the checks imply, and the
+ * status actually shown.
+ *
+ * `derived_status` and `status` are reported side by side on purpose. `status` is what the
+ * checker last concluded (or what an operator set); `derived_status` is what the current
+ * checks say. An operator looking at a region whose row says `healthy` and whose API is
+ * `down` needs to see BOTH — the gap between them is the finding.
+ */
+export type RegionView = Region & {
+  derived_status: RegionStatusValue;
+  effective_status: RegionStatusValue;
+  home_for_organizations: number;
+  last_check_at: string | null;
+  p95_ms: number | null;
+  services: RegionServiceCheck[];
+};
+
+/** One cell of the region × service grid. */
+export type RegionHealthCell = {
+  region_code: string;
+  service: RegionService;
+  status: RegionServiceStatus;
+  latency_ms: number | null;
+  checked_at: string | null;
+  stale: boolean;
+};
+
+/** One recorded status change, for the history panel. */
+export type RegionHistoryEntry = {
+  region_code: string;
+  service: RegionService;
+  status: RegionServiceStatus;
+  changed_at: string;
+};
+
+/** The health matrix, with the history that explains it. */
+export type RegionHealthMatrix = {
+  cells: RegionHealthCell[];
+  history: RegionHistoryEntry[];
+  newest_check: string | null;
+  stale_region_codes: string[];
+};
+
+/** One region-to-region latency figure. */
+export type RegionLatencyCell = {
+  from_region: string;
+  to_region: string;
+  p95_ms: number | null;
+  sample_count: number;
+  measured_at: string | null;
+  stale: boolean;
+};
+
+/** The latency matrix, and the window past which a figure is marked stale. */
+export type RegionLatencyMatrix = {
+  cells: RegionLatencyCell[];
+  measured_at: string | null;
+  stale_after_seconds: number;
+};
+
+/**
+ * Everything the list screen renders, in one read.
+ *
+ * `multi_region_active` is a top-level field rather than something the panel derives by
+ * counting `regions`: the API also knows whether the one region that exists is *active*, and
+ * a panel that counted rows would say "multi-region" for a registry of one disabled region.
+ */
+export type RegionOverview = {
+  regions: RegionView[];
+  health: RegionHealthMatrix;
+  latency: RegionLatencyMatrix;
+  multi_region_active: boolean;
+  inactive_reason: string | null;
+};
+
+/** The region detail route's body. */
+export type RegionDetail = {
+  region: RegionView;
+  multi_region_active: boolean;
+  inactive_reason: string | null;
+  latency: RegionLatencyMatrix;
+};
+
+/**
+ * The fields a `PATCH` may carry.
+ *
+ * Every field is optional and the two endpoints are `string | null`, so "leave the admin host
+ * alone" and "clear it" stay different instructions. A type that collapsed them would make a
+ * region with no admin host impossible to edit at all.
+ */
+export type RegionPatchInput = {
+  display_name?: string;
+  status?: RegionStatusValue;
+  admin_endpoint?: string | null;
+  web_endpoint?: string | null;
+  traffic_share?: number;
+  is_active?: boolean;
+  is_default?: boolean;
+};
+
+/** The API's answer to a `PATCH`. */
+export type RegionPatchResponse = { region: Region };
