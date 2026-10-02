@@ -14,6 +14,7 @@ import {
   Bot,
   Building2,
   ClipboardCheck,
+  Code2,
   Compass,
   FileText,
   Fingerprint,
@@ -113,6 +114,11 @@ const NAV: readonly NavItem[] = [
   // developer section is usually trying to make a call, and the reference is the first
   // question, not the third. The key screen is where you answer "how do I authenticate"
   // once the Explorer has told you what the call is.
+  // The section root comes first and carries the plain name: a section with six children and no
+  // landing page can only be entered by knowing which child you wanted, which is the one question
+  // the root exists to answer. It is placed before the Explorer deliberately — the Explorer is the
+  // first child, not the section.
+  { href: "/developer", label: "Developer", icon: Code2 },
   { href: "/developer/api-explorer", label: "Developer · API Explorer", icon: Compass },
   { href: "/developer/keys", label: "Developer · API keys", icon: KeyRound },
   // The OAuth app registry (REQ-033, slice 3) sits *after* the keys and not before them: a
