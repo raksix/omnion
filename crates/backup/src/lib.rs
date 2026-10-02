@@ -64,7 +64,8 @@ pub use media::{
 pub use part::{
     MANIFEST_VERSION, MAX_ERROR_LENGTH, MAX_LABEL_LENGTH, Manifest, ObservedPart, PARTS, Part,
     PartStatus, RunStatus, Verification, build_manifest, bytes_checksum, canonical_json,
-    manifest_checksum, normalise_scopes, summarise, truncate_error, validate_label,
+    manifest_checksum, normalise_scopes, summarise, summarise_failure, truncate_error,
+    validate_label,
     verify_manifest,
 };
 pub use purge::{

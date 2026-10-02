@@ -6,6 +6,11 @@
 //! All three live here rather than as inline blocks so the next walk that needs a directory, a
 //! mail catcher or a queue can share the same place — and so a security change is made in one
 //! file instead of twenty.
+//!
+//! `image_bytes` is the one place that writes a **decodable** PNG, for the walks that put a file
+//! through a transform: a hand-written header stores and lists happily and then fails the first
+//! time something opens the image, which reads as a product defect.
+pub mod image_bytes;
 pub mod isolated_db;
 pub mod stub_idp;
 pub mod walk_auth;

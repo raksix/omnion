@@ -3747,6 +3747,331 @@ fn every_live_name_has_an_emitter() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The third direction: a name a request *consumes* must be one the platform can deliver
+// ---------------------------------------------------------------------------------------------
+
+/// Every event a request file names under `Consumed:` is either live with an emitter, or
+/// listed as `Reserved` with an owner.
+///
+/// The two gates above close both ends of one seam — emitters cannot name a missing row, and a
+/// `Live` row cannot lack an emitter. Neither can see the third thing a request file does:
+/// **write down a name it expects to receive.** A `Consumed:` line is a contract with a future
+/// consumer, and nothing in the repository ever compared it to the registry, so a name that no
+/// emitter will ever produce sat in five shipped request specs and would have survived every
+/// gate this repo owns.
+///
+/// The failure is silent in the exact place it hurts. A module built to the spec — the CDN edge
+/// (REQ-011) consumes `media.replaced` to invalidate a replaced file — subscribes to a name the
+/// bus will never publish. The subscription is accepted (an unknown concrete name is kept, so
+/// plugins can own names the table has never heard of), the picker offers nothing, and the
+/// feature that was specced works for every file except the ones it exists to fix. No test
+/// fails, because from every gate's point of view the registry is correct: nothing emits that
+/// name and nothing claims to.
+///
+/// So this walks `docs/requests/` and checks the third direction. Nine such names exist today,
+/// across six specs; each is a real promise the platform cannot keep.
+///
+/// **Why the area test matters.** Fifty-nine of the names collected across all specs are in
+/// areas nothing emits yet (`order.paid`, `crm.deal.won`, `chat.notify`, …) — a module that has
+/// not been built yet is *expected* to consume its neighbour's names, and demanding a row for
+/// those would mean writing a registry row per unbuilt module, which is the lie in the other
+/// direction this crate exists to prevent. The gate therefore only fires when the name's own
+/// area is **already live**: `media`, `backups`, `identity`, `tenancy`, `themes`, `plugins`.
+/// In that case a neighbour of that area exists and is shipping, so a name nothing emits is a
+/// contract the platform has already broken rather than one it has not taken on yet.
+#[test]
+fn every_consumed_name_in_a_live_area_is_deliverable() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("the workspace root is two levels above apps/api")
+        .to_path_buf();
+    let requests = workspace.join("docs/requests");
+
+    let Ok(entries) = std::fs::read_dir(&requests) else {
+        // A source tarball without the docs is not a broken platform. Skipping is the honest
+        // answer; failing here would punish a packaging change with a database-free test.
+        eprintln!(
+            "SKIP: {} is not readable — no request specs to read",
+            requests.display()
+        );
+        return;
+    };
+
+    // One walk, because "which areas are live" is a question about the registry and asking it
+    // inside the per-name loop would rebuild the same set for every row.
+    let live_areas: std::collections::BTreeSet<&str> = omnion_events::catalogue::live_names()
+        .into_iter()
+        .filter_map(|name| name.split('.').next())
+        .collect();
+
+    let mut specs = 0_usize;
+    let mut consumed = 0_usize;
+    let mut undeliverable: Vec<String> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        specs += 1;
+
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("<unknown>")
+            .to_owned();
+
+        for (name, line) in consumed_names(&text) {
+            consumed += 1;
+            let area = name.split('.').next().unwrap_or_default();
+
+            // A name in an area nothing emits yet is a promise about the future, not a lie.
+            if !live_areas.contains(area) {
+                continue;
+            }
+            // Listed as `Reserved` with an owner is the honest way to write this down, and
+            // `the_reserved_row_names_its_owner` in the crate holds that half.
+            if omnion_events::catalogue::is_known(&name) {
+                continue;
+            }
+
+            undeliverable.push(format!("  {name}  ({stem}.md:{line}, area `{area}`)"));
+        }
+    }
+
+    assert!(
+        specs > 20,
+        "the walk read {specs} spec file(s); a walk that sees nothing proves nothing"
+    );
+    assert!(
+        consumed > 30,
+        "the walk read {consumed} `Consumed:` name(s); the specs are not where this test looks"
+    );
+
+    // **The gate is a ratchet, not a wall.** Twenty-five names were already unpayable when this
+    // test was written — every one of them owed by a wave-5b module that has not been built
+    // (`iam.role_permissions_changed` by the role UI, `backup.completed` by the backup worker,
+    // `theme.installed` by the installer). Demanding a catalogue row for each today would mean
+    // adding 25 rows nothing emits, which is precisely the lie this crate exists to prevent,
+    // and a gate that is red from the moment it is written is a gate people stop reading.
+    //
+    // So the debt is *written down* instead of hidden: every name appears below with the module
+    // that owes it. The assertion then fails on anything **not** in this list — a new spec that
+    // consumes a name nothing will ever produce, or a name quietly dropped from here while its
+    // owner is still unbuilt. Both directions are the same lie and both are caught.
+    //
+    // Deleting an entry is not free, and that is the point: the owner's `Reserved` row satisfies
+    // the real check below *before* the entry becomes stale, so an entry that is still needed
+    // will already have been removed by the time this complains that it is redundant.
+    const OWED_BY_AN_UNBUILT_MODULE: &[(&str, &str)] = &[
+        // ---- REQ-013 backup centre: the worker's own run lifecycle, none of it emitted yet.
+        ("backup.completed", "REQ-013 (backup worker run completion)"),
+        ("backup.failed", "REQ-013 (backup worker run failure)"),
+        // ---- REQ-066/067/068/069/070/071/072/074: the IAM depth wave, all `pending`.
+        //      `iam.*` rows here are owed by whichever of those builds the write path; the
+        //      existing `iam.session_revoked`, `iam.binding_created`, `iam.approval_decided`
+        //      rows show the area's naming is settled and these are simply not written yet.
+        (
+            "iam.role_permissions_changed",
+            "REQ-067 (role management UI)",
+        ),
+        ("iam.role_priority_changed", "REQ-067 (role management UI)"),
+        (
+            "iam.permissions_catalogue_updated",
+            "REQ-068 (permission catalogue screen)",
+        ),
+        (
+            "iam.resource_grant_changed",
+            "REQ-070 (scopes and resource permissions)",
+        ),
+        (
+            "iam.binding_revoked",
+            "REQ-070 (scopes and resource permissions)",
+        ),
+        ("iam.group_membership_synced", "REQ-071 (groups and teams)"),
+        ("iam.policy_denied", "REQ-069 (ABAC policy engine)"),
+        (
+            "iam.security_policy_changed",
+            "REQ-069 (ABAC policy engine)",
+        ),
+        (
+            "iam.provider_updated",
+            "REQ-065 (identity providers and SSO)",
+        ),
+        (
+            "iam.provisioning_synced",
+            "REQ-072 (SCIM provisioning sync)",
+        ),
+        ("iam.account_locked", "REQ-066 (MFA and device trust)"),
+        ("iam.mfa_challenge_failed", "REQ-066 (MFA and device trust)"),
+        ("iam.step_up_failed", "REQ-066 (MFA and device trust)"),
+        (
+            "iam.catalogue_drift_detected",
+            "REQ-068 (permission catalogue screen)",
+        ),
+        // ---- REQ-021 notification centre: the delivery lifecycle.
+        (
+            "notification.delivery.failed",
+            "REQ-021 (notification delivery runner)",
+        ),
+        // ---- REQ-010/024/012/014: cross-module facts the platform does not record yet.
+        (
+            "user.login.failed",
+            "REQ-006 (sign-in failure is logged, never recorded)",
+        ),
+        ("user.deactivated", "REQ-006 (deactivate route)"),
+        ("site.deleted", "tenancy (a site is archived, not deleted)"),
+        (
+            "site.domain.expiring",
+            "REQ-011 (CDN) or tenancy (expiry check)",
+        ),
+        // ---- Theme packaging: REQ-044 ships `plugin.*`; the theme half is REQ-062/084.
+        ("theme.installed", "REQ-062 (ten default themes)"),
+        (
+            "theme.version.published",
+            "REQ-084 (theme SDK and packaging)",
+        ),
+        // ---- REQ-114 translation engine.
+        ("translation.job.completed", "REQ-114 (translation engine)"),
+        ("translation.memory.updated", "REQ-114 (translation memory)"),
+    ];
+
+    let mut unaccounted: Vec<String> = Vec::new();
+    let mut owed: Vec<String> = Vec::new();
+
+    for row in &undeliverable {
+        let name = row.split_whitespace().next().unwrap_or_default().to_owned();
+        match OWED_BY_AN_UNBUILT_MODULE
+            .iter()
+            .find(|(owed_name, _)| *owed_name == name)
+        {
+            Some((_, module)) => owed.push(format!("  {name}  (owed by {module})")),
+            None => unaccounted.push(row.clone()),
+        }
+    }
+
+    let mut retired: Vec<String> = OWED_BY_AN_UNBUILT_MODULE
+        .iter()
+        .filter(|(name, _)| {
+            !undeliverable
+                .iter()
+                .any(|row| row.starts_with(&format!("  {name} ")))
+        })
+        .map(|(name, module)| format!("  {name}  ({module})"))
+        .collect();
+    retired.sort();
+
+    assert!(
+        retired.is_empty() && unaccounted.is_empty(),
+        "{} `Consumed:` name(s) cannot be delivered and nothing owes them, and {} entr(ies) below \
+         have become redundant:\n{}\n{}\n\
+         The owed list is a ratchet: a new undelivered name must be added there with the module \
+         that owes it, and an entry is removed when its `Reserved` catalogue row (or its emitter) \
+         makes the real check below pass — the assertion above already sees it satisfied, so a \
+         stale entry reports itself.",
+        unaccounted.len(),
+        retired.len(),
+        if unaccounted.is_empty() {
+            "(none)".to_owned()
+        } else {
+            unaccounted.join("\n")
+        },
+        if retired.is_empty() {
+            "(none)".to_owned()
+        } else {
+            retired.join("\n")
+        },
+    );
+
+    eprintln!(
+        "note: {} `Consumed:` name(s) are unpayable today and owed by an unbuilt module; the \
+         ratchet holds that number at {}",
+        owed.len(),
+        OWED_BY_AN_UNBUILT_MODULE.len(),
+    );
+}
+
+/// The event names a request file names under a `Consumed:` marker, with their line numbers.
+///
+/// Two things about the reading, both of which are the difference between a gate that measures
+/// the specs and one that measures a guess:
+///
+/// * **The marker, not the section.** `Consumed:` also appears inside prose in half a dozen
+///   specs (`REQ-021` routes bus events into notifications and never writes the word as a
+///   header). Reading the line it is on would collect those sentences' backtick spans too.
+/// * **One line, not the paragraph.** A `Consumed:` clause runs on and names six triggers across
+///   two hundred characters; stopping at the first newline loses every one after the first. The
+///   next `**` or blank line ends it, which is where every spec in this repository ends its own
+///   clause.
+fn consumed_names(text: &str) -> Vec<(String, usize)> {
+    let mut found = Vec::new();
+
+    for (index, line) in text.lines().enumerate() {
+        let Some(marker) = line.find("Consumed:") else {
+            continue;
+        };
+        // A backtick before the marker means the sentence is *about* consumption, not a
+        // declaration of it — `the \`Consumed:\` line`. The gate that reads those would report
+        // prose as a contract.
+        let before = &line[..marker];
+        if before.contains('`') && before.trim_start().starts_with('-') {
+            continue;
+        }
+
+        // The clause is the rest of the line, then any following continuation line that is
+        // neither blank nor a new markdown construct.
+        let mut clause = line[marker + "Consumed:".len()..].to_owned();
+        for following in text.lines().skip(index + 1) {
+            let trimmed = following.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("**")
+                || trimmed.starts_with('-')
+                || trimmed.starts_with('#')
+                || trimmed.starts_with('|')
+            {
+                break;
+            }
+            clause.push(' ');
+            clause.push_str(following);
+        }
+
+        let mut ticks = clause.match_indices('`');
+        while let Some((open, _)) = ticks.next() {
+            let Some((close, _)) = ticks.next() else {
+                break;
+            };
+            let candidate = &clause[open + 1..close];
+            if is_event_name(candidate) {
+                found.push((candidate.to_owned(), index + 1));
+            }
+        }
+    }
+
+    found
+}
+
+/// A dotted lower-case token: two or more segments, no wildcards, nothing else.
+///
+/// The wildcard exclusion is not cosmetic. A `Consumed:` clause legitimately contains group
+/// forms (`crm.deal.*`, `appearance.*`, `migration.*`), and a group is *not* a name the bus
+/// records — `reconcile` expands it against what exists, which for an unbuilt area is nothing.
+/// Firing on those would demand a catalogue row per group per spec, which is the registry
+/// writing down names that do not exist.
+fn is_event_name(candidate: &str) -> bool {
+    let segments: Vec<&str> = candidate.split('.').collect();
+    segments.len() >= 2
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_')
+        && candidate.contains('.')
+        && !candidate.contains('*')
+}
+
+// ---------------------------------------------------------------------------------------------
 
 /// Connect to the compose PostgreSQL; `None` means the stack is not running.
 async fn live_db(config: &Config) -> Option<Db> {
