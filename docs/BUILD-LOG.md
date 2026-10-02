@@ -13316,3 +13316,73 @@ tick, so the pass is reported as not-run rather than reported as green.
 **One harness note worth keeping:** `QA_ONLY=backups` still ran every `media-*` depth pass.
 `wants()` filters *routes and depth passes*, but the route list itself is walked first, so a
 focused pass is narrower than it looks — and on a box this loaded, the width is what killed it.
+
+## Tick 114 — REQ-035 slice 1 · the region registry, and two defects that only ran
+
+**Shipped.** `crates/regions` (768-line model, 655-line store, 12 unit tests), migration
+`0239_edge_regions.sql` (regions + per-service health + latency, three seeded regions), the five
+permission-guarded routes, and the two admin screens — `/platform/regions` (table, service badges,
+latency matrix) and `/platform/regions/{code}` (services, history, config summary, set-as-default).
+Migration number `0239` is taken above the union high-water across all ten worktrees, not above
+this branch's own last file.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-regions` | 12/12 in 0.00 s |
+| `cargo test -p omnion-api --lib` | 414/414 in 0.40 s |
+| `cargo test -p omnion-api --test regions` | 9/9 in 25.08 s (9 tests, 9 `#[tokio::test]`, none skipped) |
+| `pnpm typecheck` | exit 0 |
+| `GET /api/v1/regions` (authenticated, live DB) | **200**, 3 regions, `traffic_share` decoded |
+
+**The first QA pass reported 26 high findings. Every one had one cause.**
+
+The walkthrough logged `503` on `/api/v1/regions` ten times. The API log held nothing for it, which
+is the shape that usually means "the database is fine and the handler never ran" — so the next step
+was to ask the endpoint directly rather than to read the code. It answered with the real error:
+
+```
+region store: database error: error occurred while decoding column "traffic_share":
+mismatched types; Rust type `core::option::Option<alloc::string::String>` (as SQL type TEXT)
+is not compatible with SQL type NUMERIC
+```
+
+`traffic_share` is `numeric(5,2)` in the migration and `Option<String>` in `Region`. sqlx refuses
+that pair. All five read sites share one `REGION_COLUMNS` constant, so the fix was one line —
+`traffic_share::text as traffic_share` — and every read site is corrected by construction. After the
+rebuild the same call answers `200` with `'100.00'`.
+
+**Why twelve unit tests and nine route tests did not catch it.** The twelve never touch a database.
+The nine had been running green against `127.0.0.1:5449`, a scratch PostgreSQL that the reboot had
+taken down — and a refused connection on that port is the same silence as a passing suite, so the
+number in the log was never evidence. The first live `curl` is what produced the error string; the
+browser had only ever reported its symptom.
+
+**The second defect was in the harness, and its own guard is what caught it.** The tick-113 fixture
+(`seed-readonly-developer.cjs`) aborted the pass before the browser started:
+
+```
+[qa] read-only developer: 0 read scopes, account=true, bound=false
+```
+
+Its own `granted === 0` guard — added last tick precisely to refuse a role with no reads — fired.
+The database showed `role_rows=1, perms=0, accounts=1, bindings=0`: the role existed, the account
+existed, and the fixture still reported success on the way to failing. Cause: four writes in ONE
+statement. A non-recursive CTE sees the table as it was before the statement began, so the
+`granted` and `bound` branches joined against a `role` their own sibling had not yet inserted, and
+wrote nothing — exit 0, `account=1`, and two silent zero-row writes. The file's comment had already
+named the trap ("a non-recursive CTE cannot see its own siblings' effects") and then applied it to
+the wrong line: the COUNT was moved into a second statement while the WRITES stayed in the first.
+That fixed the measurement, not the cause. Four statements now, each reading what the previous one
+wrote; re-run is idempotent (2 bindings after 2 runs, one per run).
+
+**QA harness.** `/platform/regions` is registered in the route list. The detail screen is
+deliberately NOT: it takes a region code from the path, so a walk with a placeholder proves only
+that the not-found state renders — the same trap the media file-detail screen already documents.
+`runRegionsDepth` opens a real region by following the list's own `Open` link and asserts six
+claims, including that an unchecked service renders a *word* rather than an empty badge.
+
+**Next.** Slice 2 — residency policy and region-aware storage (`/settings/data-residency`).
+The browser pass is queued behind a live w3 holder; the region screen's live proof above is a
+direct authenticated read, and the pass itself has not yet reported.
