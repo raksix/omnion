@@ -16175,3 +16175,27 @@ minute count, and the lead timeline shows `delayed` as a one-word reason — nei
 instant the message goes out, which is the sentence an operator needs when a lead that was
 "answered" is not. Slice 46: the due instant on the timeline and in the editor's preview, read
 from the stored row rather than recomputed from the configuration.
+- **2026-10-02 · omnion-w8 · REQ-117 slice 46 — the recovery sweep could not see the rows it existed to recover.**
+  `due_reservations` is the only thing that re-offers an uncompleted autoresponder claim, and its
+  WHERE required a `due_at`. An immediate claim writes `due_at: null` (`claim` builds the key from
+  `message.due_at`), so the sweep could not see those rows; a delayed reservation survives only
+  because its due instant passes. `mark_sent` erroring, the process dying between `prepare` and the
+  socket, or a failing `release_claim` all leave a claim that nobody owes — `was_sent` is false, so
+  `prepare` re-decides `Ready`, the insert then loses 0058's partial unique index, and `prepare` says
+  `AlreadySent`. The module header's own "recoverable direction" sentence was true for the delayed
+  path only. → WHERE is now a disjunction (due instant passed, OR no due instant and `created_at`
+  older than `ABANDONED_CLAIM_AFTER`), bounded by a real `timestamptz` for the reason 0205 wrote
+  down; `ClaimState` names the five states, with `of` deliberately unable to return `Abandoned` and
+  `at(detail, claimed_at, now)` the only way there; `EventBody` carries it with ONE `now` for the
+  whole timeline; the panel renders it through a `satisfies Record<…>` map so an unknown state is a
+  type error rather than a blank. Proof: `run-autoresponder-recovery.sh` 7 legs / 18 assertions,
+  **proven to fail at 6** with the WHERE reduced to its pre-fix body; module lib 203 (was 195);
+  `omnion-api` lib 327; `crm_autoresponder` 18/18 over a real database; admin `tsc --noEmit` exit 0;
+  walkthrough +3 steps. Three gate defects of my own, the first a **false PASS** (a one-line grep
+  for SQL this crate writes with `\` continuations — a pattern absent from the repository is an
+  inverted assertion), the second the substring passing where the predicate was meant, the third
+  `yes … && echo false || echo true` printing `true` when the grep fails. No browser pass and none
+  claimed: the QA slot holder was alive under a sibling's worktree, and this screen needs a real
+  claim in a real database, which only the Rust walk can produce. Next: the trail line's `reason`
+  for a *delivered* claim still reads `sent` rather than the state, so the same line names the
+  verdict two ways — one from `Delivery::reason()`, one from `ClaimState`.
