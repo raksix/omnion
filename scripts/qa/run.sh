@@ -108,6 +108,13 @@ if [ "${QA_SLOTS:-1}" != "0" ]; then
   # catches is silent by construction.
   step "testing the screen inventories"
   node "$(dirname "${BASH_SOURCE[0]}")/screen-coverage.cjs" || echo "[qa] screen-coverage test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The database this pass DROPS. This one runs before the reset rather than after it, because the
+  # operation is destructive: `reset-db.sh` defaults its name to `omnion_qa` — the MAIN writer's
+  # database — so a writer on its own stack who runs that script by hand (the natural thing to do
+  # while debugging a pass) drops the wrong one, and `run.sh` exports `QA_DB` so every pass through
+  # the harness was already right. That is exactly why only a test can catch it.
+  step "testing the QA database identity"
+  bash "$(dirname "${BASH_SOURCE[0]}")/test-reset-db-identity.sh" || echo "[qa] reset-db identity test reported failures (continuing: a broken test is not a reason to skip a pass)"
   # The disk guard's tmpfs reading, for the same reason and because this box runs out of RAM
   # before it runs out of disk: /dev/shm is a real tmpfs and every writer's CARGO_TARGET_DIR
   # lands in it, so a guard that misreads how full it is leaves the box one build away from
