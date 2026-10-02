@@ -48,10 +48,38 @@
 > claim about the rule — it was written down, in that field's own doc comment, and I wrote the claim
 > from the *shape* of the thing rather than from the sentence.
 >
-> **Still open: one focused re-run.** The fix and the corrected claims are committed and pushed; what
-> is owed is the same focused pass again to see all 4 claims green. The QA slot was taken by a live
-> `w3` run (holder pid 2724189, cwd `/mnt/apopic/omnion-w3`) when the re-run was due, so per this
-> branch's rule it is queued rather than reported as a pass that never ran.
+> **The re-run is green: 27/27 claims, 0 failed passes.** The device-code flow now completes in
+> the browser — request a code, look it up, read "omnion-cli wants access to this organization"
+> with the plain-language scopes, approve it, and the same code cannot be approved twice. The
+> download serves a real zip (`theDownloadServesAZip`, `theDownloadNamesTheFile`,
+> `theDownloadIsTypedAsAZip`, `theDownloadHasContent`), the validator refuses a broken manifest and
+> accepts a good one, and `previewRecordedNothing` holds.
+>
+> **The first re-run reported the SAME `invalid device code` after the fix — and the cause was the
+> harness, not the product.** `run.sh` rebuilt the API when the binary was missing or a
+> `database/migrations/*.sql` was newer, and did **not** watch the Rust sources, so a committed fix
+> left a 30-minute-old binary under test (`fd4821a5`). The symptom is the argument: `cargo test`
+> passed on the new code and the browser pass failed on it, and the two disagreed because they were
+> not testing the same thing. The guard now watches `crates/` and `apps/api`; a migration is a
+> special case of "the source is newer than the binary", not a separate concern. **A pass that can
+> report a verdict about code it did not run is worse than no pass, because the verdict is
+> trusted.**
+>
+> **One medium finding was mine and it was real: `unlabeled-input` on `/developer/sdks`.** The
+> manifest textarea had a heading above it and a JSON placeholder in it; a screen reader announces
+> "edit text, blank", and a placeholder disappears the moment the field has content — exactly when a
+> person reads the screen to check what they typed. Now a real `<label htmlFor>` with the field's
+> `id` and an `aria-describedby` pointing at the hint (`ef1b2546`). The gate for it took four tries,
+> each failing differently, and the failures are the argument for the fifth version: an aggregate
+> count was satisfied by `aria-label` on the *tablist*; `[^>]*` ended a JSX tag at an arrow
+> function's `>`; "some label body contains an `<input`" survived unwrapping the first of two
+> same-tag inputs. **A gate that cannot tell correct code from broken code is worse than no gate.**
+> Proven to fail 1/3, 1/3, 1/3 and 2/3 on four mutations, all reverted, view byte-identical.
+>
+> **Pass counters for the record** (scoped run, so NOT a whole-repository result): 27/27 claims,
+> 0 failed passes, 84 screenshots. The run's 4 high findings are all in other waves — a 422 from
+> `/api/v1/pages` and two `web-page` items about the renderer sample page, both the main writer's
+> CMS and renderer surfaces.
 >
 > Tick 111's note stands for the record: slice 3's code is complete — the panel screen tick 110 said was open (`6fa5d647`, corrected at `f26b96d8` with the pass's 33 `data-oauth-app-*` hooks cross-checked against the view's 33), and the event catalogue that was the slice's last item (`6e994015`, `318321cd`).
 >

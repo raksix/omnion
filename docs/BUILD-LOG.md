@@ -136,6 +136,43 @@ what to store. Both are fixed: the fixtures are canonical, the form is asserted 
 Both mutations (grouped value bound again; helper bypassed with an inline normalise — identical
 behaviour, duplicated decision) now fail 1/3 each. Reverted, file verified byte-identical.
 
+### The re-run agreed with `cargo test` and both were right — about different binaries
+
+After `792d610f` the focused pass reported the **same** `invalid device code`. The fix was correct
+and `cargo test` had passed on it, so the disagreement was informative rather than confusing:
+`run.sh` rebuilds the API when the binary is missing or a `database/migrations/*.sql` is newer, and
+it did **not** watch the Rust sources. A committed fix therefore left a 30-minute-old binary under
+test. The guard now watches `crates/` and `apps/api` as well (`fd4821a5`), and a migration is
+treated as a special case of "the source is newer than the binary" rather than a separate concern —
+sqlx embeds the SQL at compile time, so the Rust watch already covers it.
+
+**A pass that can report a verdict about code it did not run is worse than no pass, because the
+verdict is trusted.** Two gates in one tick disagreeing is the cheapest possible signal that one of
+them measured something other than the thing under review.
+
+### One medium finding, and the gate that took four attempts to be able to fail
+
+`unlabeled-input` on `/developer/sdks` — the manifest textarea. Real, and the fix is a `<label
+htmlFor>` with the field's `id` (`ef1b2546`).
+
+The gate for it is the more useful half. Four versions, each wrong in a different way:
+
+| # | The check | What it missed |
+| --- | --- | --- |
+| 1 | fields vs. label-ish tokens in the file | `aria-label` on the **tablist** satisfied it; deleting the label stayed green |
+| 2 | `<label>\s*<input` | the wrapping labels put a `<span>` between themselves and the field |
+| 3 | `[^>]*` for the attributes | JSX props hold arrow functions (`onChange={(event) => …}`) whose `>` ends the tag; a self-closing `/>` ends it earlier |
+| 4 | "some label body contains an `<input`" | with two same-tag inputs, unwrapping the **first** label left the second in scope |
+
+The version that works pairs each field's own opening tag with the label body that contains it, and
+recognises the implicit form (a field nested in a `<label>`) alongside the explicit one
+(`htmlFor`/`aria-label`, or an `id` a `<label htmlFor>` elsewhere names). Proven to fail **1/3,
+1/3, 1/3 and 2/3** on four mutations; all reverted, view verified byte-identical.
+
+**An aggregate count is satisfied by any one correct thing**, and a regex that does not understand
+the language it is reading will confidently report the wrong answer. The check states its limit in
+the file: it proves every field has a label association; it is not a JSX parser.
+
 ### Host note
 
 `/dev/shm` was at 95% with four writers building. `/dev/shm/w4-target` (1.3G) had **no holder** —
