@@ -44,9 +44,15 @@ check() { # check <label> <expected> <actual>
   fi
 }
 
-# --- 1. a non-main stack derives its OWN database -----------------------------------------
+# `reset-db.sh` deliberately lets an explicit QA_DB win over the derived name, because run.sh
+# exports it. That makes these derivation checks measure whatever QA_DB happens to be in the
+# ambient environment instead of the derivation itself: run from a pass, QA_STACK=w2 inherits
+# QA_DB=omnion_qa_w2, so the "w2 derives its own database" checks pass *by coincidence* and
+# "QA_STACK=main keeps omnion_qa" — which wants the derivation to produce a different name —
+# cannot pass at all. A test that reads the environment instead of the code is not a test.
+# `env -u QA_DB` is what makes the case say what it means.
 : > "$LOG"
-out="$(QA_STACK=w2 bash "$SCRIPT" 2>&1)"
+out="$(env -u QA_DB QA_STACK=w2 bash "$SCRIPT" 2>&1)"
 got_db="$(grep -oE 'CREATE DATABASE [a-z0-9_]+' "$LOG" | head -1 | awk '{print $3}')"
 check "QA_STACK=w2 drops omnion_qa_w2, not omnion_qa" "omnion_qa_w2" "$got_db"
 check "QA_STACK=w2 never names the main writer's database" "" \
@@ -54,15 +60,28 @@ check "QA_STACK=w2 never names the main writer's database" "" \
 
 # the same, on the stack this branch actually runs
 : > "$LOG"
-QA_STACK=w2 bash "$SCRIPT" >/dev/null 2>&1
+env -u QA_DB QA_STACK=w2 bash "$SCRIPT" >/dev/null 2>&1
 got_db="$(grep -oE 'CREATE DATABASE [a-z0-9_]+' "$LOG" | head -1 | awk '{print $3}')"
 check "the stack this branch runs resolves to its own database" "omnion_qa_w2" "$got_db"
 
 # --- 2. main keeps the shared name --------------------------------------------------------
 : > "$LOG"
-QA_STACK=main bash "$SCRIPT" >/dev/null 2>&1
+env -u QA_DB QA_STACK=main bash "$SCRIPT" >/dev/null 2>&1
 got_db="$(grep -oE 'CREATE DATABASE [a-z0-9_]+' "$LOG" | head -1 | awk '{print $3}')"
 check "QA_STACK=main keeps omnion_qa" "omnion_qa" "$got_db"
+
+# ...and it can fail: derivation that ignores QA_STACK would hand the main writer a private
+# database named after whoever happened to ask last. Removing the derivation from reset-db.sh
+# makes this check red.
+sed 's/^\[ "\$STACK" != "main" \] && DEFAULT_DB="omnion_qa_\${STACK}"/:/' "$SCRIPT" \
+  > "$SCRIPT.derived-less"
+chmod +x "$SCRIPT.derived-less"
+: > "$LOG"
+env -u QA_DB QA_STACK=w2 QA_DERIVED_LESS=1 bash "$SCRIPT.derived-less" >/dev/null 2>&1
+got_db="$(grep -oE 'CREATE DATABASE [a-z0-9_]+' "$LOG" | head -1 | awk '{print $3}')"
+check "and it can fail: without the derivation every stack drops the main writer's database" \
+  "omnion_qa" "$got_db"
+rm -f "$SCRIPT.derived-less"
 
 # an explicit override still wins — run.sh exports QA_DB, and a pass must not be second-guessed
 : > "$LOG"
