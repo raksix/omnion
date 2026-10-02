@@ -534,7 +534,16 @@ async fn a_delayed_autoresponder_is_sent_when_its_time_comes() {
         .await
         .expect("prepare");
     assert!(matches!(outcome.verdict, Delivery::Ready(ref m) if m.delayed));
-    assert_eq!(outcome.verdict.reason(), "sent");
+    // **This line asserted the defect slice 47 fixed.** It read `assert_eq!(…, "sent")` for a
+    // message that is reserved, not delivered — the test was named "is sent when its time
+    // comes" and its first half asserted it was sent *now*, which is the opposite claim. The
+    // rest of the test (the sweep finds nothing early, finds it after, and the row completes)
+    // is the actual subject and it is unchanged; this assertion is the word, and the word was
+    // wrong. **A test named after a promise must not assert the opposite of the promise in its
+    // first line** — the name is what the next reader trusts, and this one is why a delayed lead
+    // was logged as answered for 45 minutes.
+    assert_eq!(outcome.verdict.reason(), "delayed");
+    assert!(!outcome.verdict.is_sendable(), "a reserved message is not in the mailer");
 
     // Before the delay, the sweep finds nothing. This is the half that says "not early",
     // and it is the half a "just send it" implementation passes by accident.

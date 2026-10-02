@@ -898,7 +898,19 @@ export function LeadDetail() {
                           : " from the unassigned queue"}
                       </span>
                     ) : null}
-                    {typeof event.detail?.reason === "string" ? (
+                    {/* The raw `reason` is printed for every other kind of line, because for
+                        them it is the sentence explaining the event. On a CLAIM line it is not:
+                        `reason` is `Delivery::reason()`, a one-word verdict that the autoresponder
+                        state chip below already says in the operator's words — so a reserved
+                        claim read "sent" and "Reply reserved, waiting out the send delay" on one
+                        line, naming the same fact twice with one of the two false. The chip is
+                        the authority for a claim line because it is read from the stored row
+                        (`ClaimState`), while `reason` is a word chosen at decision time and can
+                        disagree with what was recorded. So the guard is on the LINE, not on the
+                        string: a claim line has a state, and a claim line's reason is redundant
+                        with it. */}
+                    {typeof event.detail?.reason === "string" &&
+                    !event.autoresponder_state ? (
                       <span className="text-[11.5px] text-muted">{event.detail.reason}</span>
                     ) : null}
                     {typeof event.detail?.status === "string" ? (

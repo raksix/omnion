@@ -36,6 +36,22 @@ pub enum Delivery {
     /// The source has an autoresponder but the lead has no address to send it to.
     NoAddress,
     /// The configured delay has not elapsed yet.
+    ///
+    /// **This variant has no producer, and that is not a tidying opportunity — it is the
+    /// evidence.** `Autoresponder::deliver` answers a delayed source with
+    /// `Ready(Message { delayed: true, .. })` instead, because the claim is what makes the
+    /// delay happen *later* rather than never, and a `NotYet` would have no message attached
+    /// for the worker to send. So the one variant whose name is the answer to "why has
+    /// nothing gone out?" was unreachable, while the variant that *is* reachable was given
+    /// the word `sent` by `reason()` — the trail said a 30-minute reservation had been
+    /// delivered. `reason()` now maps both to `delayed`, so the arm and the word agree.
+    ///
+    /// It is kept rather than deleted because `deliver` is the only producer of `Delivery`
+    /// and a variant that names a real state is worth keeping: the moment a caller needs the
+    /// due instant *without* a message — a preview, a probe — this is the variant that says
+    /// it, and deleting it would mean re-adding it with a name already in use. **An enum
+    /// variant with no producer is a question the type is asking that nothing has answered
+    /// yet; deleting it loses the question.**
     NotYet(OffsetDateTime),
     /// This lead has already been answered.
     AlreadySent,
@@ -100,14 +116,31 @@ impl Delivery {
     }
 
     /// The trail line's `reason`, one word per variant so the timeline is scannable.
+    ///
+    /// ## The word "sent" is a claim about a MAILER, and this is the second copy of that claim
+    ///
+    /// It read `Self::Ready(_) => "sent"`, and `Ready` does not mean "handed to the mailer":
+    /// [`Autoresponder::deliver`] returns `Ready(Message { delayed: true, .. })` for every
+    /// source with a non-zero `delay_minutes` — that is the *reservation* mechanism, and the
+    /// thing that eventually mails the lead is [`autoresponder_store::due_reservations`]'s
+    /// caller. So a 30-minute autoresponder wrote a trail line reading `sent` for a
+    /// reservation no mailer had touched, beside a `ClaimState::Reserved` chip the panel
+    /// renders from the same row. **One line, two verdicts, and the false one is the word an
+    /// operator scans for.** This is [`Delivery::sendable`] asked a second time in a different
+    /// spelling, one accessor over.
+    ///
+    /// `delayed` is therefore an arm of its own, and it is the arm `NotYet` was already
+    /// spelled for: the same word, reachable at last. The variant stays because it is the
+    /// enum's own name for the case, and because a variant with no producer is what let this
+    /// ship — see [`Delivery::NotYet`].
     #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
-            Self::Ready(_) => "sent",
+            Self::Ready(message) if !message.delayed => "sent",
+            Self::Ready(_) | Self::NotYet(_) => "delayed",
             Self::Disabled => "not_configured",
             Self::NoRecipient(_) => "not_accepted",
             Self::NoAddress => "no_address",
-            Self::NotYet(_) => "delayed",
             Self::AlreadySent => "already_sent",
             Self::InvalidTemplate(_) => "invalid_template",
         }
@@ -463,6 +496,78 @@ mod tests {
             assert!(!variant.is_sendable(), "{variant:?} is not a send");
             assert_eq!(variant.sendable(), None);
         }
+    }
+
+    /// The word "sent" must mean a mailer, and the word "delayed" must mean a reservation.
+    ///
+    /// `reason()` is what the lead timeline shows, so these two are the sentence an operator
+    /// reads after a lead that looks answered was not answered for half an hour. The positive
+    /// control is the undelayed case: a gate (or a test) whose every assertion is "the delayed
+    /// message is not called sent" is satisfied by a function that cannot say "sent" at all.
+    #[test]
+    fn a_delayed_message_is_not_reported_as_sent() {
+        assert_eq!(ready(false).reason(), "sent");
+        assert_eq!(ready(true).reason(), "delayed");
+    }
+
+    /// `NotYet` and a delayed `Ready` name the same fact and must answer with the same word.
+    ///
+    /// The two are different variants for a real reason — a `NotYet` carries no message to
+    /// send, a delayed `Ready` does — and the trail only ever needed the word. Spelling the
+    /// word twice is how the delayed case ended up borrowing the sent one.
+    #[test]
+    fn the_unreachable_delayed_variant_agrees_with_the_reachable_one() {
+        assert_eq!(Delivery::NotYet(MORNING).reason(), ready(true).reason());
+    }
+
+    /// `reason()` and `verdict_name()` are two vocabularies on purpose: one for the operator's
+    /// timeline and one for the editor. They must not drift into each other — a preview that
+    /// said "sent" for a reserved message would be the same defect one screen over — so the
+    /// editor's word for a ready message stays "ready" whatever the delay, because the editor
+    /// is showing a *decision* and the timeline is showing a *fact*.
+    #[test]
+    fn the_editor_word_is_the_decision_and_the_reason_is_the_fact() {
+        assert_eq!(ready(false).verdict_name(), "ready");
+        assert_eq!(ready(true).verdict_name(), "ready");
+        assert_eq!(ready(false).reason(), "sent");
+        assert_eq!(ready(true).reason(), "delayed");
+    }
+
+    /// Every reason is a distinct, non-empty, machine-shaped word.
+    ///
+    /// Counted rather than copied — a copy of the list would be a second spelling of the rule,
+    /// which is the defect this file exists to stop. What is worth asserting is that no two
+    /// cases share a word, because a shared word is exactly how "sent" came to mean both
+    /// "handed to the mailer" and "reserved for later".
+    #[test]
+    fn reason_names_are_distinct_and_machine_shaped() {
+        let reasons = [
+            ready(false).reason(),
+            ready(true).reason(),
+            Delivery::NotYet(MORNING).reason(),
+            Delivery::Disabled.reason(),
+            Delivery::NoRecipient("spam").reason(),
+            Delivery::NoAddress.reason(),
+            Delivery::AlreadySent.reason(),
+            Delivery::InvalidTemplate("x".into()).reason(),
+        ];
+        for reason in reasons {
+            assert!(!reason.is_empty(), "a variant has no word of its own");
+            assert!(
+                reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{reason:?} is not machine-shaped — the panel renders these verbatim"
+            );
+        }
+        // The two DELAYED cases are allowed to share a word: they are one fact. That makes
+        // eight cases and seven words, and the count is the assertion — a shared word between
+        // two DIFFERENT facts is exactly how "sent" came to mean both "handed to the mailer"
+        // and "reserved for later". Stating the number rather than the list means adding a
+        // variant forces this to be re-derived rather than silently accepted.
+        let mut facts: Vec<&str> = reasons.to_vec();
+        facts.sort_unstable();
+        facts.dedup();
+        assert_eq!(facts.len(), 7, "two different facts share a word");
+        assert_eq!(reasons.len(), 8, "a case stopped being counted");
     }
 
     #[test]
