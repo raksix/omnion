@@ -10228,3 +10228,54 @@ the log table and its detail drawer, the nav entry, all three states per screen,
 mobile behaviour the REQ names. The request-log **middleware** that writes rows on every API call also
 belongs to it: `omnion-developer::logs_store::record` exists and is walked, but nothing calls it on the
 request path yet, which is the same "described but inert" shape this REQ's predecessors shipped.
+
+### Tick 73 — REQ-130 slice 4: the versioned API policy, and the gate that measured prose
+
+**What.** Deprecation headers on the wire (`Deprecation`, `Sunset` in IMF-fixdate, a `Link` to the
+changelog), a sunset in the past answering `410` **without running the handler**, the sunset sweeper,
+the announce window enforced on the WRITE path, and `/developer/api/deprecations` with its loading,
+empty, error and populated states, `n`/`Escape` keys, 390px cards, nav entry, `DEPRECATION_SCREENS`
+and the route list. Commits `19a91743` (the slice) and `d1bebd5c` (the screen's client directive).
+
+**Three defects, and the second one is the reason this entry is worth reading.**
+
+1. *The policy read the status column instead of the dates.* `headers_for` asked the COLUMN, so
+   between a sunset and the next sweep — which is every row until the sweeper runs — the response
+   carried a `Sunset` header naming a date already in the client's past. That is the failure the
+   request's own risks section exists to prevent ("a route without a `Sunset` header is only
+   removed in a major release"), and it would have shipped a client-visible promise nobody could
+   keep. The DATES decide now, through the one `outcome` the screen and the middleware already
+   share. Proven load-bearing: reverting it fails
+   `a_past_sunset_stops_the_headers_even_while_the_column_still_says_active`.
+2. *The route inventory refused a second build of the SAME router.* The inventory is process-global
+   and a test binary builds the router once per request, so ten walks in `graphql_documents` died on
+   a panic naming a duplicate `POST /media` that is registered exactly once in `mod.rs`. An entry
+   with the same annotation is a re-registration now; a different one is still the duplicate the
+   check exists for — comparing only the path would have made it green by refusing to notice.
+3. *The surface gate measured the author's prose.* Three of its twelve proven-to-fail mutations
+   failed, and all three were defects in the GATE: two pointed at the wrong file through a swapped
+   index map, so each `String.replace` silently matched nothing; the third read `next.run` out of the
+   gone branch's own comment explaining that it is deliberately NOT awaited. The gate was reporting
+   on an explanation instead of on code. 43/43 with all twelve mutations load-bearing now.
+
+**Proof.** graphql **139/139** · api lib **401/401** · **8/8** walks over the real router (82 s,
+`omnion_w6_deprecations`) · `pnpm typecheck` exit 0 · the policy fix proven load-bearing by
+reverting it.
+
+**The browser pass ran, found a screen that could never render, and then died of the box.** The
+walk reached `/developer/api/deprecations` and reported "the app shell did not render"; the admin
+log said why — the view imports `useState` with no `"use client"`, so Next refuses to build it.
+`tsc --noEmit` is green on a module that never builds, which is why this needed a browser. Fixed in
+`d1bebd5c`; the same missing directive takes down 42 pages of this pass, and
+`apps/admin/features/media/metadata-pairs.tsx` is the only other one in `features/` — it belongs to
+a sibling commit (`7fde0bdb`) and is deliberately left alone.
+
+**The confirming pass did not finish, and the close gate stays unticked.** It queued behind w2,
+started, measured 294 pages, then hit `ENOSPC` writing screenshots and stalled with the box at 0
+free RAM and **1892 chrome processes** (16 of them mine; the rest belong to siblings and were not
+touched). This pass was killed rather than left to spin. `/mnt/apopic` 97%, `/` 95%. Reclaiming my
+own target (517 rlibs older than 25 min, no live cargo holding it) freed ~4 GB; **no sibling's build
+cache or process was removed.** The two `api-deprecations` lines in the log are both pre-fix.
+
+**Next.** Re-run the focused pass against `d1bebd5c` on a box with RAM to spare, then close
+acceptance 11–12's browser half and the request.
