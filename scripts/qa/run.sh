@@ -97,6 +97,17 @@ if [ "${QA_SLOTS:-1}" != "0" ]; then
   # original regresses, which is exactly the thing it exists to catch.
   step "testing the --only filter"
   node "$(dirname "${BASH_SOURCE[0]}")/test-only-filter.cjs" || echo "[qa] --only filter test reported failures (continuing: a broken test is not a reason to skip a pass)"
+  # The two screen inventories. This one is different from the others above, and the difference is
+  # the reason it is here: a screen in the desktop `routes` list and missing from `mobileRoutes`
+  # is measured at 1440 px and at no other width, by any pass, ever — and it does not error, does
+  # not print red and does not set a non-zero code. It simply never gets opened on a phone, so
+  # REQ-064's acceptance 18 ("all new screens render at 390 px") could not be answered for
+  # thirty-nine screens, including twelve this branch shipped. The gate runs `warn`-style like its
+  # neighbours rather than aborting the pass, because a wrong inventory must not cost a whole
+  # walkthrough — but unlike the others it is re-checked on every run, because the thing it
+  # catches is silent by construction.
+  step "testing the screen inventories"
+  node "$(dirname "${BASH_SOURCE[0]}")/screen-coverage.cjs" || echo "[qa] screen-coverage test reported failures (continuing: a broken test is not a reason to skip a pass)"
   # The disk guard's tmpfs reading, for the same reason and because this box runs out of RAM
   # before it runs out of disk: /dev/shm is a real tmpfs and every writer's CARGO_TARGET_DIR
   # lands in it, so a guard that misreads how full it is leaves the box one build away from
