@@ -119,6 +119,7 @@ pub mod onboarding;
 pub mod promotions;
 pub mod public;
 pub mod readyz;
+pub mod regions;
 pub mod restore_jobs;
 pub mod scim;
 pub mod search;
@@ -1158,6 +1159,26 @@ pub fn router(state: AppState) -> Router {
     let cdn_settings_test =
         post(cdn_purge::test_settings).layer(guards::require(&state, "cdn.manage"));
     let cdn_adapters = get(cdn_purge::adapters).layer(guards::require(&state, "cdn.read"));
+
+    // The edge region registry (docs/requests/REQ-035, slice 1). Two keys, and the split is
+    // the point rather than a convention: "which regions exist and how are they doing" is an
+    // operator's question during an incident, and "rename one / move the default / drain one"
+    // is a control-plane action. One key would hand every person reading the health matrix
+    // the ability to move where traffic goes.
+    //
+    // `/regions/health` and `/regions/latency-matrix` are registered as their own paths and
+    // NOT as extra methods on `/regions`: the checker polls them, and a machine caller
+    // should not have to read the panel's card payload to get a matrix.
+    let regions = get(regions::list).layer(guards::require(&state, "platform.regions.read"));
+    let regions_health =
+        get(regions::health).layer(guards::require(&state, "platform.regions.read"));
+    let regions_latency =
+        get(regions::latency).layer(guards::require(&state, "platform.regions.read"));
+    let region_one = get(regions::get_one)
+        .layer(guards::require(&state, "platform.regions.read"))
+        .merge(
+            patch(regions::patch).layer(guards::require(&state, "platform.regions.manage")),
+        );
 
     // The developer platform (docs/requests/REQ-033, slice 1). Two keys and the split is the
     // point: reading a key's metadata is an auditor's question, minting one is a much larger
@@ -2382,6 +2403,14 @@ pub fn router(state: AppState) -> Router {
         .route("/cdn/settings", cdn_settings)
         .route("/cdn/settings/test", cdn_settings_test)
         .route("/cdn/adapters", cdn_adapters)
+        // Order matters for the same reason `/cdn/rules/reorder` precedes
+        // `/cdn/rules/{id}`: the literal segments are registered first so a path parameter
+        // can never swallow them. `/regions/health` and `/regions/latency-matrix` are two
+        // literals against `{code}`.
+        .route("/regions", regions)
+        .route("/regions/health", regions_health)
+        .route("/regions/latency-matrix", regions_latency)
+        .route("/regions/{code}", region_one)
         .route("/deployment/version", deployment_version)
         .route("/deployment/environments", deployment_environments)
         .route(
