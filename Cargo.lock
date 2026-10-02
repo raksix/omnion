@@ -1552,6 +1552,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.21",
  "time",
+ "time-tz",
  "tokio",
  "uuid",
 ]

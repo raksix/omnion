@@ -17,7 +17,9 @@
  *    it is the only thing that tells an editor whether retrying can possibly help.
  * 4. **The timezone label sits beside the instant, in the author's wall clock.** The instant is
  *    stored in UTC and the label is a display convention; converting one into the other here would
- *    make "9:00" mean two different things in two columns of the same table.
+ *    make "9:00" mean two different things in two columns of the same table. Because the label is
+ *    printed as the author's own wall clock, the server refuses a zone its IANA table does not
+ *    know rather than storing one nobody can compute — see `omnion_content::publishing::validate_timezone`.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CalendarClock, Loader2, Play, RefreshCw, RotateCcw, X } from "lucide-react";

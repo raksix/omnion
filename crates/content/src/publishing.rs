@@ -46,6 +46,36 @@ const QUEUE_COLUMNS: &str = "q.id, q.organization_id, q.page_id, q.action, q.sch
 /// The lifecycle changes a schedule may request.
 pub const ACTIONS: [&str; 2] = ["publish", "unpublish"];
 
+/// Check an author's timezone label against this build's IANA table.
+///
+/// The queue prints the label beside the instant it is stored next to, which makes it a claim:
+/// "09:00 Europe/Istanbool" tells an editor their post goes out at a wall clock this platform
+/// cannot compute, and no code anywhere turns the label into an offset — the instant is already
+/// UTC when it is stored. A misspelled zone is therefore worse than no zone at all: it looks
+/// like the author's time was honoured.
+///
+/// So it is refused here, with the same table and the same shape of message the backup cadence
+/// already uses (`crates/backup/src/cadence.rs`), which is why this is `time-tz` rather than a
+/// second parser. `UTC` is accepted by name because it is the route's own default and what a
+/// hand-written row carries.
+pub fn validate_timezone(label: &str) -> Result<()> {
+    let name = label.trim();
+    if name.is_empty() || name.len() > 64 {
+        return Err(ContentError::InvalidSchedule(
+            "the timezone label must be 1-64 characters".to_owned(),
+        ));
+    }
+    if name.eq_ignore_ascii_case("utc") {
+        return Ok(());
+    }
+    if time_tz::timezones::get_by_name(name).is_none() {
+        return Err(ContentError::InvalidSchedule(format!(
+            "{name:?} is not a timezone this build knows (use an IANA name such as `Europe/Istanbul`)"
+        )));
+    }
+    Ok(())
+}
+
 /// A queue row, joined with the page it acts on.
 ///
 /// The page's slug, type and title ride the row because the queue screen is a list of *pages*,
@@ -231,11 +261,7 @@ pub async fn schedule(
 ) -> Result<PublishingEntry> {
     let action = validate_action(&new.action)?;
     let timezone = new.timezone.trim();
-    if timezone.is_empty() || timezone.len() > 64 {
-        return Err(ContentError::InvalidSchedule(
-            "the timezone label must be 1-64 characters".to_owned(),
-        ));
-    }
+    validate_timezone(timezone)?;
     // A schedule in the past is refused rather than fired immediately: an author who typed
     // yesterday's date made a typo, and firing it anyway is the surprise version of a helpful
     // assistant. `now - 1 minute` is the grace, so a client whose clock runs a few seconds fast
@@ -533,6 +559,53 @@ mod tests {
         for status in ["pending", "done", "failed", "cancelled"] {
             assert_eq!(validate_queue_status(status).unwrap(), status);
         }
+    }
+
+    #[test]
+    fn an_unknown_timezone_is_refused_by_name() {
+        // The queue prints this label beside the instant, so a typo that stored would tell an
+        // editor their wall clock was honoured when the platform cannot compute it at all.
+        let error = validate_timezone("Europe/Istanbool").unwrap_err();
+        assert_eq!(error.code(), "invalid_schedule");
+        assert!(
+            error.to_string().contains("Europe/Istanbool"),
+            "the refusal must name the zone the author typed: {error}"
+        );
+        assert!(
+            error.to_string().contains("Europe/Istanbul"),
+            "the refusal must offer a spelling that works: {error}"
+        );
+    }
+
+    #[test]
+    fn a_real_timezone_and_utc_both_pass() {
+        for zone in [
+            "UTC",
+            "utc",
+            "Europe/Istanbul",
+            "Europe/Istanbul ".trim(),
+            "America/New_York",
+            "Asia/Tokyo",
+        ] {
+            assert!(
+                validate_timezone(zone).is_ok(),
+                "{zone:?} is a zone this platform should accept"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_oversized_label_is_refused_before_the_table_is_consulted() {
+        for label in ["", "   "] {
+            assert_eq!(
+                validate_timezone(label).unwrap_err().code(),
+                "invalid_schedule"
+            );
+        }
+        assert_eq!(
+            validate_timezone(&"x".repeat(65)).unwrap_err().code(),
+            "invalid_schedule"
+        );
     }
 
     #[test]

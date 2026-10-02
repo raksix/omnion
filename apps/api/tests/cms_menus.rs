@@ -118,7 +118,14 @@ fn test_storage() -> omnion_storage::Storage {
 }
 
 async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    // A deployment with no CSRF secret never issues the token, and every cookie-authenticated
+    // write is then refused with `csrf_unavailable`. Fifteen walks in this file sign in through
+    // `walk_auth::Session`, which asserts that token rather than tolerating its absence — so
+    // without this line the whole file fails in its own `login` helper and reports nothing about
+    // the code it is testing. The suites that already call `with_csrf_secret` do so for the same
+    // reason; this file was simply never updated when that helper landed.
+    walk_auth::with_csrf_secret(&mut config);
     let db = match Db::connect(&config.database).await {
         Ok(db) => db,
         Err(error) => {
@@ -1243,6 +1250,82 @@ async fn scheduling_validates_the_instant_and_the_action() {
         "{}",
         not_a_time.body
     );
+
+    fixture.cleanup().await;
+}
+
+/// **Acceptance 13 (the timezone half).** A zone this build does not know is refused by the
+/// route, and nothing is written — the label is printed beside the instant in the queue, so a
+/// stored typo tells an editor their wall clock was honoured when the platform cannot compute
+/// it at all. `crates/backup/src/cadence.rs` has refused an unknown zone in a backup cadence
+/// since it shipped; this is the same refusal on the CMS side, proved through HTTP rather than
+/// by calling the validator, because a store test cannot catch a route that skips it.
+#[tokio::test]
+async fn an_unknown_timezone_is_refused_and_stores_nothing() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture.curator().await;
+    let page = fixture.draft_page(&token, "tz", "Timezone check").await;
+    let when = (time::OffsetDateTime::now_utc() + time::Duration::hours(2))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{page}/schedule"),
+            Some(&token),
+            Some(json!({ "action": "publish", "scheduled_at": when, "timezone": "Europe/Istanbool" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["error"]["code"], "invalid_schedule"
+    );
+    let message = refused.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Europe/Istanbool") && message.contains("Europe/Istanbul"),
+        "the refusal must name what was typed and offer a spelling that works: {message}"
+    );
+    let stored: (i64,) = sqlx::query_as(
+        "select count(*) from cms_publishing_queue where page_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&page).expect("a page id"))
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the count must answer");
+    assert_eq!(
+        stored.0, 0,
+        "a refused schedule must leave no row: the queue cannot show what it refused"
+    );
+
+    // The same route accepts a real zone, so the refusal is about the zone and not about the
+    // field having been closed off.
+    let accepted = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{page}/schedule"),
+            Some(&token),
+            Some(json!({ "action": "publish", "scheduled_at": when, "timezone": "Europe/Istanbul" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        accepted.status,
+        StatusCode::CREATED,
+        "{}",
+        accepted.body
+    );
+    assert_eq!(accepted.body["timezone"], "Europe/Istanbul");
 
     fixture.cleanup().await;
 }

@@ -17,6 +17,12 @@ uuid.workspace = true
 time.workspace = true
 tokio.workspace = true
 
+# The scheduled publishing queue stores an author's timezone beside the instant and prints it
+# in the queue (REQ-064, slice 1). `time-tz` is the same table `crates/backup` already uses to
+# refuse an unknown zone in a backup cadence, so "a schedule in a zone this build does not know"
+# is one refusal with one message in the platform instead of two.
+time-tz.workspace = true
+
 # Argon2id password hashing for visitor accounts (REQ-064, slice 4c). The dependency is on the
 # identity crate rather than on `argon2` directly, deliberately: the point of reusing it is that
 # a member's credential costs exactly what a user's costs, and duplicating the PHC plumbing here
