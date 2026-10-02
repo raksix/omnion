@@ -115,3 +115,6 @@ time.workspace = true
 # posts the assertion back, so it needs an HTTP client of its own rather than the one the sign-in
 # path uses to talk to the provider.
 reqwest = { workspace = true, features = ["json"] }
+omnion-regions = { path = "../../crates/regions" }
+omnion-environment = { path = "../../crates/environment" }
+omnion-cdn = { path = "../../crates/cdn" }

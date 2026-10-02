@@ -16,3 +16,5 @@ serde_json.workspace = true
 reqwest = { workspace = true, features = ["json", "stream"] }
 tokio.workspace = true
 tracing.workspace = true
+omnion-permissions = { path = "../permissions" }
+omnion-content = { path = "../content" }

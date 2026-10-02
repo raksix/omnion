@@ -27,3 +27,6 @@ thiserror.workspace = true
 # kind of thing that needs a test with real instants in it.
 time = { workspace = true, features = ["macros"] }
 uuid.workspace = true
+omnion-permissions = { path = "../permissions" }
+omnion-media = { path = "../media" }
+omnion-deployment = { path = "../deployment" }

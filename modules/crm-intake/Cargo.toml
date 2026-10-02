@@ -34,3 +34,5 @@ tokio.workspace = true
 # claim's correctness is a property of the *transaction* and no unit test can prove one.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true }
+omnion-notifications = { path = "../../crates/notifications" }
+omnion-module-crm = { path = "../crm" }

@@ -17,3 +17,4 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+omnion-media = { path = "../media" }

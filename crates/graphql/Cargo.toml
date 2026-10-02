@@ -24,3 +24,4 @@ sha2.workspace = true
 # is enabled here for the one test fixture that builds an instant without parsing one, so a
 # fixture cannot silently drift from the format the production path accepts.
 time = { workspace = true, features = ["macros"] }
+omnion-permissions = { path = "../permissions" }

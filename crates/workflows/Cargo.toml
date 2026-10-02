@@ -19,3 +19,6 @@ omnion-audit = { path = "../audit" }
 [dev-dependencies]
 # The handler tests drive one host-action future to completion.
 tokio = { workspace = true }
+omnion-search = { path = "../search" }
+omnion-core = { path = "../core" }
+omnion-automation = { path = "../automation" }

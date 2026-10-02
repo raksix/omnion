@@ -13,3 +13,4 @@ thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+omnion-permissions = { path = "../permissions" }

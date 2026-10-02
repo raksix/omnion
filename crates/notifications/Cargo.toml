@@ -19,3 +19,6 @@ uuid.workspace = true
 # who holds it through role inheritance. One direction only: permissions must not know about
 # notifications, or a permission check would start emitting.
 omnion-permissions = { path = "../permissions" }
+omnion-events = { path = "../events" }
+omnion-backup = { path = "../backup" }
+omnion-audit = { path = "../audit" }

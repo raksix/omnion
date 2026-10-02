@@ -20,3 +20,5 @@ tokio.workspace = true
 reqwest.workspace = true
 omnion-secrets = { path = "../secrets" }
 omnion-events = { path = "../events" }
+omnion-workflows = { path = "../workflows" }
+omnion-core = { path = "../core" }

@@ -44,3 +44,5 @@ omnion-health = { path = "../health" }
 # backup the day a site is pointed at a directory.
 omnion-storage = { path = "../storage" }
 time-tz = "2.0.0"
+omnion-events = { path = "../events" }
+omnion-audit = { path = "../audit" }

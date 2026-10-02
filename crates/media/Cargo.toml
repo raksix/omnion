@@ -21,3 +21,4 @@ thiserror.workspace = true
 time = { workspace = true, features = ["formatting", "parsing", "macros"] }
 tracing.workspace = true
 uuid.workspace = true
+omnion-storage = { path = "../storage" }
