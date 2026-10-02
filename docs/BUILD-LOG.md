@@ -1,3 +1,64 @@
+## 2026-10-02 — REQ-108 slice 1, and two harness bugs that had stopped any pass from running
+
+feat(mcp): the platform as a tool server — clients, hashed tokens, the grant store
+(`d7212acc`, `dad7a785`); fix(qa): two defects in the pass harness itself (`a572779e`).
+
+**The tick opened on a pass that had been queued for forty-nine minutes.** The queue was not
+busy. `qa-slot.sh` reaped dead places once, *before* its wait loop, so a place whose holder died
+while another pass was queued for it was never reclaimed — and `count_places()` counts files, so an
+unreclaimed place reads as full capacity and the queue never drains. The holder here had been dead
+since 07:53; the pass had been waiting since 07:13. Both of my artifact directories from those
+runs were empty: not one screenshot, not one `summary.json`, two passes that would each have
+printed "no findings" had anyone believed them. Reaping inside the loop fixed it, and the
+re-run proved the fix rather than asserting it — `[qa-slot] reclaimed a stale place from
+1207094-1790928246 (271s old, holder 1207109)` four seconds after starting.
+
+**The second harness bug would have measured code that no longer exists.** `run.sh` decided the
+API binary was stale only when a *migration* was newer. A code-only commit leaves every migration
+older than the binary, so the check passes, the build is skipped and pm2 starts the previous
+binary. Commit `936eae4e` — the `model_key_of` fix that made every model-targeted eval run stop
+500ing — landed at 07:36 against a binary built at 07:32, with no migration involved. A pass
+running then would have re-measured the exact 500 the commit had just removed and reported it as a
+live defect. Sources count as stale now.
+
+**Then the slice, and one mistake worth recording.** A `thiserror` variant without an
+`#[error("...")]` attribute does not fail where you wrote it: the derive aborts, and every
+`AiHubError` use in the crate becomes "could not convert the error", so one missing attribute
+surfaced as **351 errors** and a 23-second compile. The count pointed at every file in the crate
+and at none of the cause. The real line was the only one whose message was not about `?`.
+
+1. **The token is minted in exactly one function.** `McpStore::create_client` is the only
+   function that has ever seen a cleartext token, which is what makes "shown once" a property of
+   the code instead of a promise the panel makes.
+2. **Verification has no early return.** `==` on a hex string stops at the first differing
+   character; the time it takes to stop leaks the length of the prefix a guess matched. The
+   comparison folds the XOR over all 64 bytes instead.
+3. **Revocation is not deletion.** Revoking keeps the row and its invocation history, so a call
+   made at 09:14 is still answerable at 09:15. The migration makes `revoked_at` and `enabled`
+   mutually exclusive, so an edit that sets one without the other is refused by the database
+   rather than producing a row that says "revoked" and answers calls anyway.
+4. **Three states, not one boolean.** `status()` distinguishes active / disabled / revoked,
+   because a pause and a revocation have different remedies and the panel has to be able to say
+   which one it is.
+5. **The base64 encoder was hand-rolled and wrong.** A nibble-at-a-time encoder gives `u8` where
+   `String` is needed, and it would have halved the token's entropy per character. 32 bytes of
+   `OsRng` through `URL_SAFE_NO_PAD` is 43 characters carrying all 256 bits.
+
+**Proof** — `cargo test -p omnion-ai-hub --lib`: **686 passed, 0 failed** (6 new: mint →
+authenticate → one-more-character does not, display prefix is recognition not credential, two
+mints differ, hash stability, name/rate refusals, the three states). `cargo test -p
+omnion-permissions`: **64 passed** with `mcp.clients.read` / `mcp.clients.manage` catalogued.
+
+**Not done, and named rather than implied:** no QA pass is claimed for this slice. The one I ran
+at 08:04 measured a tree whose derive was broken — it printed the same 351 errors, which is the
+harness honestly refusing to measure a half-written branch, not a product result. It is not a
+gate and it is not a finding. The pass still owed to REQ-107 is equally unclaimed. Both need a
+slot; w3 held it at the end of this tick.
+
+**Next** — slice 2: the tool registry, `tools/list` / `tools/call` over JSON-RPC at
+`/api/v1/mcp`, the permission intersection with a `-32003` denial, `mcp_invocations` and the
+sandbox plan. Then REQ-107's closing pass.
+
 ## 2026-10-02 — REQ-107 slice 6b: the seam nobody was walking, and five defects behind it
 
 fix(ai-eval) + test(ai-eval): two walks that dial real sockets, and the five production bugs that

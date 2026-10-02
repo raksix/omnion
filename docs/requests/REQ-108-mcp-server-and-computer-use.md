@@ -1,6 +1,6 @@
 # REQ-108 — MCP Server & Computer Use
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress (slice 1: `mcp_clients` / `mcp_client_tools` / `mcp_invocations`, the hashed token with a one-time reveal, rotation, revocation and the grant store — `d7212acc`, `dad7a785`; plus two pass-harness fixes that had stopped any QA pass from running at all — `a572779e`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
