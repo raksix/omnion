@@ -508,6 +508,64 @@ async fn the_block_registry_is_read_only_and_permission_gated() {
         "a block that only exists inside another container is not offered as an insert choice"
     );
 
+    // The bounds travel with the registry, because the editor used to carry its own copies.
+    // It held `MAX_DEPTH = 3` and `MAX_BLOCKS = 400` in TypeScript with a comment on each
+    // saying "mirrors the server's" and nothing that compared them; `MAX_BLOCKS` was read by no
+    // code at all. So the route has to ANSWER with them, and answer with the numbers the
+    // validator actually uses — a limit published beside a different enforced one would be the
+    // same drift one layer down.
+    let limits = &listed.body["limits"];
+    assert_eq!(limits["max_depth"], json!(3), "the depth bound is published");
+    assert_eq!(limits["max_blocks"], json!(400), "the block bound is published");
+    assert_eq!(
+        limits["max_blocks_bytes"],
+        json!(1024 * 1024),
+        "the payload size bound is published"
+    );
+    assert_eq!(limits["min_columns"], json!(2));
+    assert_eq!(limits["max_columns"], json!(4));
+
+    // And the published depth bound is the one that refuses. A tree one level past it must come
+    // back with `block_too_deep`, which is what makes the published number a promise rather than
+    // a decoration: an editor that trusted it would otherwise build exactly this.
+    let mut deep = json!({ "id": Uuid::new_v4().to_string(), "type": "text", "props": { "text": "x" } });
+    for _ in 0..=limits["max_depth"].as_u64().unwrap_or(0) {
+        deep = json!({
+            "id": Uuid::new_v4().to_string(),
+            "type": "columns",
+            "props": { "columns": 2 },
+            "children": [
+                {
+                    "id": Uuid::new_v4().to_string(),
+                    "type": "column",
+                    "props": {},
+                    "children": [deep],
+                },
+                { "id": Uuid::new_v4().to_string(), "type": "column", "props": {}, "children": [] },
+            ],
+        });
+    }
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/blocks/validate",
+            Some(&editor),
+            Some(json!({ "blocks": [deep] })),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::OK, "{}", refused.body);
+    assert!(
+        refused.body["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .any(|issue| issue["code"] == "block_too_deep"),
+        "the published max_depth is the bound that refuses: {}",
+        refused.body
+    );
+
     let mut keys: Vec<&str> = blocks
         .iter()
         .filter_map(|entry| entry["key"].as_str())

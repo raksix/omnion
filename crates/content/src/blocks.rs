@@ -564,14 +564,28 @@ pub fn is_structure_only(key: &str) -> bool {
     key == "column"
 }
 
-/// The whole registry as the API answers with it: the version, the categories and every
-/// definition. The panel builds both its insert panel and its `/blocks` reference from this
-/// document — neither hard-codes a list.
+/// The whole registry as the API answers with it: the version, the categories, the limits the
+/// editor has to be told rather than guess, and every definition. The panel builds its insert
+/// panel and its `/blocks` reference from this document — neither hard-codes a list.
+///
+/// **The limits are here for the reason `count_tree` is one function.** The editor mirrored
+/// `MAX_DEPTH` and `MAX_BLOCKS` by hand in TypeScript, each with a comment saying "mirrors the
+/// server's" and nothing anywhere that could notice when one side moved. The `MAX_BLOCKS` mirror
+/// was worse than dead: no editor code read it at all, so the comment described a tie that did
+/// not exist. A limit the panel is *told* is the only limit that cannot end up with two answers,
+/// and the editor already fetches this document on every screen that needs the limits.
 #[must_use]
 pub fn registry_document() -> Value {
     json!({
         "version": REGISTRY_VERSION,
         "categories": CATEGORIES,
+        "limits": {
+            "max_depth": MAX_DEPTH,
+            "max_blocks": MAX_BLOCKS,
+            "max_blocks_bytes": MAX_BLOCKS_BYTES,
+            "min_columns": MIN_COLUMNS,
+            "max_columns": MAX_COLUMNS,
+        },
         "blocks": REGISTRY.iter().map(BlockDefinition::to_document).collect::<Vec<_>>(),
     })
 }
@@ -2014,6 +2028,40 @@ mod tests {
             .expect("column is registered");
         assert_eq!(column["structure_only"], json!(true));
         assert_eq!(column["container"], json!(true));
+    }
+
+    #[test]
+    fn the_registry_document_carries_the_limits_the_editor_used_to_mirror() {
+        // The editor held `MAX_DEPTH = 3` and `MAX_BLOCKS = 400` in TypeScript, each with a
+        // comment saying it mirrored the constant here, and no gate anywhere that compared the
+        // two. A mirror with no reader is worse than a duplicate: it looks maintained, and the
+        // `MAX_BLOCKS` copy was read by *nothing* — no insert path, no status bar, no validator.
+        // So the numbers travel with the registry and the panel is told rather than trusting.
+        let document = registry_document();
+        let limits = &document["limits"];
+        assert_eq!(limits["max_depth"], json!(MAX_DEPTH), "the depth bound is published");
+        assert_eq!(limits["max_blocks"], json!(MAX_BLOCKS), "the block bound is published");
+        assert_eq!(
+            limits["max_blocks_bytes"],
+            json!(MAX_BLOCKS_BYTES),
+            "the payload size bound is published"
+        );
+        // Published AND inside the range the constants themselves allow, because a limit pair
+        // that contradicts itself is two answers again: a page may not be narrower than the
+        // smallest grid it can draw.
+        assert_eq!(limits["min_columns"], json!(MIN_COLUMNS));
+        assert_eq!(limits["max_columns"], json!(MAX_COLUMNS));
+        assert!(
+            limits["min_columns"].as_u64() <= limits["max_columns"].as_u64(),
+            "a columns bound published upside down: {limits}"
+        );
+        // The bound the editor could not enforce is now enforceable from the document alone:
+        // a tree over it is refused by the same constant the panel was told about.
+        let over = vec![columns_holding(MAX_BLOCKS + 1)];
+        assert!(
+            validate(&json!(over)).issues.iter().any(|issue| issue.code == "block_too_many"),
+            "the number the panel is told is the number the validator refuses at"
+        );
     }
 
     #[test]
