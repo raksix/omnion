@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Blocks, Bot, Boxes, ClipboardCheck, Database, FileCode2, FileDown, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Waypoints, Webhook, X } from "lucide-react";
+import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Blocks, Bot, CalendarClock, Boxes, ClipboardCheck, Database, FileCode2, FileDown, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Waypoints, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -81,6 +81,11 @@ const NAV = [
   { href: "/developer/graphql/documents", label: "Persisted documents", icon: FileCode2 },
   { href: "/developer/graphql/schema", label: "GraphQL schema", icon: Blocks },
   { href: "/developer/graphql/settings", label: "GraphQL settings", icon: SlidersHorizontal },
+  // The versioned API policy (REQ-130, slice 4). Beside the GraphQL settings rather than
+  // under them: a sunset is a DATE an integrator reads, and Settings is where nobody goes
+  // looking for a deadline. The screen and the response headers read the same rows, so an
+  // operator who changes a date here has changed what the API says.
+  { href: "/developer/api/deprecations", label: "API deprecations", icon: CalendarClock },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

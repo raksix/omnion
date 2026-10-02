@@ -212,20 +212,24 @@ pub const CHANGELOG_PATH: &str = "/docs/api/changelog";
 /// ask a client to plan around a date in its own past.
 #[must_use]
 pub fn headers_for(row: &DeprecationRow, now: OffsetDateTime) -> Option<DeprecationHeaders> {
-    if !row.status.sends_headers() {
+    // **The DATES decide, not the status column** — and the unit test in the middleware caught the
+    // first version of this getting it wrong. It asked the column, so a row whose sunset had
+    // passed while its column still said `active` (which is every row until the sweeper runs)
+    // carried a `Sunset` header naming a date in the past. That is the exact failure the request's
+    // own risks section forbids: *"a route without a `Sunset` header is only removed in a major
+    // release"* exists precisely so a client always knows the date, and a past date tells it to
+    // plan around something that has already happened.
+    //
+    // So this calls `outcome`, which is the ONE decision about what a row means at an instant.
+    // Two predicates about the same row in one crate is how the screen and the middleware come to
+    // disagree, and this request has produced that defect shape four times already.
+    if outcome(row, now) != Outcome::Headered {
         return None;
     }
     Some(DeprecationHeaders {
         deprecation: row.deprecated_in.clone(),
         sunset: http_date(row.sunset_at),
         link: format!("<https://omnion.local{CHANGELOG_PATH}>; rel=\"deprecation\""),
-    })
-    .map(|headers| {
-        // `now` is part of the signature so the signature of "is this row still announced"
-        // cannot drift from the signature that builds the headers. It is used below by the
-        // caller-visible helper rather than here, which keeps this function total.
-        let _ = now;
-        headers
     })
 }
 
@@ -398,7 +402,11 @@ pub fn add_months(from: OffsetDateTime, months: i64) -> OffsetDateTime {
     // `Date::from_calendar_date` is checked only because a leap day on a non-leap month cannot
     // happen here: `day` is already clamped to that month's length. The fallback keeps the
     // function total rather than panicking on an arithmetic mistake that the tests would catch.
-    match Date::from_calendar_date(year, time::Month::try_from(month).unwrap_or(time::Month::January), day) {
+    match Date::from_calendar_date(
+        year,
+        time::Month::try_from(month).unwrap_or(time::Month::January),
+        day,
+    ) {
         Ok(date) => from.replace_date(date),
         Err(_) => from,
     }
@@ -647,6 +655,37 @@ mod tests {
             "the changelog Link carries the relation: {}",
             headers.link
         );
+    }
+
+    #[test]
+    fn a_past_sunset_stops_the_headers_even_while_the_column_still_says_active() {
+        // The defect the middleware's own unit test found, held here where the policy lives. The
+        // sweeper advances the COLUMN, and between a sunset and the next sweep the column still
+        // says `active`. A `Sunset` header in that window names a date in the client's past, so
+        // the header follows the date and not the column.
+        let now = at("2026-10-01T00:00:00Z");
+        let stale = row(
+            Some("/api/v1/pages"),
+            None,
+            "2026-09-01T00:00:00Z",
+            Status::Active,
+        );
+        assert_eq!(status_at(&stale, now), Some(Status::Removed));
+        assert_eq!(
+            headers_for(&stale, now),
+            None,
+            "the column says active and the policy says gone; the policy wins on the wire"
+        );
+
+        // And the control: the same row with a FUTURE sunset still carries all three, so this is
+        // not a check that quietly disables the header.
+        let live = row(
+            Some("/api/v1/pages"),
+            None,
+            "2027-04-15T00:00:00Z",
+            Status::Active,
+        );
+        assert!(headers_for(&live, now).is_some());
     }
 
     #[test]

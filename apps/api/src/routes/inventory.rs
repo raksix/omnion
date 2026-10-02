@@ -76,7 +76,25 @@ fn record(entry: Entry) -> Result<(), DuplicateRoute> {
     let mut guard = inventory()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.iter().any(|e| e.route == entry.route) {
+    // **A second build of the SAME router is not a duplicate registration.**
+    //
+    // The inventory is process-global because `routes::router()` is a function that runs when it
+    // is called, and a test binary calls it once per HTTP request. So the second call re-records
+    // all 401 routes, and the original check refused the second `POST /media` with a panic naming
+    // a route that is registered exactly once in `mod.rs`. Ten of the ten walks in
+    // `graphql_documents` died that way, and the message pointed at a duplicate in the router
+    // rather than at the fact that the inventory outlives one call.
+    //
+    // The rule is therefore: an entry for a route that is ALREADY recorded **with the same
+    // annotation** is a re-registration and is accepted. One with a DIFFERENT summary or a
+    // different permission is refused, because that is the defect this check exists for — two
+    // handlers, one documented operation, and the second one dead while the document describes
+    // the first. Comparing the annotation rather than only the route is what keeps the check
+    // worth having: a bare path comparison would have made this green by refusing to notice.
+    if let Some(existing) = guard.iter().find(|e| e.route == entry.route) {
+        if existing.annotation == entry.annotation {
+            return Ok(());
+        }
         return Err(DuplicateRoute {
             key: format!("{} {}", entry.route.method, entry.route.path),
         });
@@ -116,8 +134,11 @@ pub fn registry() -> omnion_graphql::openapi::Registry {
     {
         // Cannot fail: `record` refuses a duplicate, and the registry is built fresh from one
         // pass over records with no duplicate `METHOD path` among them.
-        registry
-            .annotate_unchecked(&entry.route.method, &entry.route.path, entry.annotation.clone());
+        registry.annotate_unchecked(
+            &entry.route.method,
+            &entry.route.path,
+            entry.annotation.clone(),
+        );
     }
     registry
 }
@@ -136,10 +157,7 @@ pub const MINIMUM_ROUTES: usize = 100;
 
 /// How many routes are recorded.
 pub fn len() -> usize {
-    inventory()
-        .lock()
-        .map(|g| g.len())
-        .unwrap_or_default()
+    inventory().lock().map(|g| g.len()).unwrap_or_default()
 }
 
 /// Whether anything is recorded.
@@ -263,7 +281,8 @@ macro_rules! documented {
 /// one item from this module instead of three (`MethodRouter`, `AppState`, `Infallible`) that a
 /// caller may or may not have imported -- the macro expands in the CALLER's module, where this
 /// file's `use` statements do not apply.
-pub type MethodRouterOf = ::axum::routing::MethodRouter<crate::state::AppState, std::convert::Infallible>;
+pub type MethodRouterOf =
+    ::axum::routing::MethodRouter<crate::state::AppState, std::convert::Infallible>;
 
 /// The wire method of an `axum::http::Method`, as the inventory spells it.
 ///
@@ -370,10 +389,8 @@ mod tests {
     #[test]
     fn a_route_is_recorded_with_its_annotation_and_read_back_sorted() {
         let _guard = Isolated::new();
-        record_entry(RouteEntry::new("GET", "/z"), "content.pages.read", "Zeta")
-            .expect("first");
-        record_entry(RouteEntry::new("GET", "/a"), "content.pages.read", "Alpha")
-            .expect("second");
+        record_entry(RouteEntry::new("GET", "/z"), "content.pages.read", "Zeta").expect("first");
+        record_entry(RouteEntry::new("GET", "/a"), "content.pages.read", "Alpha").expect("second");
 
         let all = routes();
         assert_eq!(all.len(), 2);
@@ -399,15 +416,76 @@ mod tests {
     }
 
     #[test]
-    fn registering_the_same_method_and_path_twice_is_refused() {
-        // axum's `Router::route` silently overwrites, so without this a copy-pasted line yields
-        // a document describing one operation while the router serves the second handler.
+    fn a_second_build_of_the_same_route_is_accepted_and_a_second_handler_is_not() {
+        // axum's `Router::route` silently overwrites, so a copy-pasted line yields a document
+        // describing one operation while the router serves the second handler. THAT is what this
+        // check is for, and it is still refused below.
+        //
+        // The identical re-registration beside it is the case the fix had to make legal: the
+        // inventory is process-global and a walk builds the router once per HTTP request, so
+        // without this half every walk in the repository died on a duplicate it had itself
+        // created. **The two halves together are the whole rule** — asserting only that a repeat
+        // is refused would forbid the re-registration every test binary performs, and asserting
+        // only that a repeat is accepted would make this module's duplicate check a no-op.
         let _guard = Isolated::new();
-        record_entry(RouteEntry::new("GET", "/pages"), "content.pages.read", "List").expect("first");
-        let err = record_entry(RouteEntry::new("GET", "/pages"), "content.pages.read", "List")
-            .unwrap_err();
-        assert!(err.to_string().contains("GET /pages"), "got {err}");
-        assert_eq!(len(), 1, "the refused registration must not be recorded");
+        record_entry(
+            RouteEntry::new("GET", "/pages"),
+            "content.pages.read",
+            "List",
+        )
+        .expect("first");
+
+        // The control: an IDENTICAL registration is a second description of the same route, and it
+        // must not grow the inventory or refuse.
+        record_entry(
+            RouteEntry::new("GET", "/pages"),
+            "content.pages.read",
+            "List",
+        )
+        .expect("an identical re-registration is a re-registration, not a duplicate handler");
+        assert_eq!(len(), 1, "a re-registration must not add a second entry");
+
+        // Two different handlers on one path, under three shapes: a different summary, a different
+        // permission, and both. Each is the defect the check exists for and each is refused.
+        for (permission, summary) in [
+            ("content.pages.read", "List (rewritten)"),
+            ("content.pages.manage", "List"),
+            ("content.pages.manage", "List (rewritten)"),
+        ] {
+            let err = record_entry(RouteEntry::new("GET", "/pages"), permission, summary)
+                .expect_err("a second handler for one path is dead code");
+            assert!(
+                err.to_string().contains("GET /pages"),
+                "the refusal names the route: got {err}"
+            );
+        }
+        assert_eq!(len(), 1, "every refused registration must not be recorded");
+    }
+
+    #[test]
+    fn a_re_registration_that_changed_its_permission_is_still_refused() {
+        // The same assertion as above, written out on its own because it is the shape a MERGE
+        // produces: two writers registering one route with the guard each of them read, and the
+        // second one silently documenting a permission the first one's handler does not enforce.
+        // A check that only compared paths would accept that pair and the document would describe
+        // a permission no guard reads.
+        let _guard = Isolated::new();
+        record_entry(
+            RouteEntry::new("POST", "/graphql/documents"),
+            "content.pages.read",
+            "Register",
+        )
+        .expect("first");
+        let err = record_entry(
+            RouteEntry::new("POST", "/graphql/documents"),
+            "deployment.migrations.apply",
+            "Register",
+        )
+        .expect_err("the permission a document describes is the guard that enforces it");
+        assert!(
+            err.to_string().contains("POST /graphql/documents"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -415,9 +493,18 @@ mod tests {
         // GET and POST on one path is a `MethodRouter` with two handlers; calling that a
         // duplicate would make the gate reject the most ordinary route shape in the API.
         let _guard = Isolated::new();
-        record_entry(RouteEntry::new("GET", "/pages"), "content.pages.read", "List").expect("get");
-        record_entry(RouteEntry::new("POST", "/pages"), "content.pages.create", "Create")
-            .expect("post");
+        record_entry(
+            RouteEntry::new("GET", "/pages"),
+            "content.pages.read",
+            "List",
+        )
+        .expect("get");
+        record_entry(
+            RouteEntry::new("POST", "/pages"),
+            "content.pages.create",
+            "Create",
+        )
+        .expect("post");
         assert_eq!(len(), 2);
     }
 
@@ -430,7 +517,10 @@ mod tests {
         record_entry(RouteEntry::new("GET", "/healthz"), "", "Liveness probe").expect("record");
         let registry = registry();
         assert_eq!(
-            registry.get(&RouteEntry::new("GET", "/healthz")).unwrap().permission,
+            registry
+                .get(&RouteEntry::new("GET", "/healthz"))
+                .unwrap()
+                .permission,
             None
         );
     }

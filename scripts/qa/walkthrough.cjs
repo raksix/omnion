@@ -198,6 +198,26 @@ function assertGraphqlScreensWalked() {
 }
 
 /**
+ * The versioned API policy screen (REQ-130, slice 4).
+ *
+ * One screen, and the guard is written anyway rather than left to review: this surface is the one
+ * a merge is most likely to resolve away, because its route (`/developer/api/deprecations`) sits
+ * on the `/api` prefix that reads like the API's OWN routes rather than the panel's, so a conflict
+ * in `mod.rs` has a plausible-looking resolution that deletes it. A screen reachable only from a
+ * nav entry nobody clicked is a screen nobody measured.
+ */
+const DEPRECATION_SCREENS = ["/developer/api/deprecations"];
+
+function assertDeprecationScreensWalked() {
+  const missing = DEPRECATION_SCREENS.filter((path) => !srcHasRoute(path));
+  if (missing.length > 0) {
+    throw new Error(
+      `deprecation screens missing from the route list: ${missing.join(", ")} — the screen reads the same rows the response headers are built from, so not walking it leaves the wire behaviour unmeasured`,
+    );
+  }
+}
+
+/**
  * A route measured while the session is gone is NOT a clean screen.
  *
  * Tick 59's pass reported 16/16 pages walked and ZERO findings on the wave-5b screens, and eight
@@ -9467,6 +9487,7 @@ module.exports = {
   runDeploymentInstallDepth,
   runDeploymentUpgradeDepth,
   DEPLOYMENT_SCREENS,
+  DEPRECATION_SCREENS,
   walkVersion,
   runObservabilityOverviewDepth,
   runObservabilityMetricsDepth,
@@ -10963,6 +10984,7 @@ async function main() {
   assertDeploymentScreensWalked();
   assertWave5bScreensWalked();
   assertGraphqlScreensWalked();
+  assertDeprecationScreensWalked();
   const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
   const browser = await chromium.launch({
@@ -11084,6 +11106,10 @@ async function main() {
   { path: "/developer/graphql/documents", name: "graphql-documents" },
   { path: "/developer/graphql/schema", name: "graphql-schema" },
   { path: "/developer/graphql/settings", name: "graphql-settings" },
+  // The versioned API policy screen (REQ-130, slice 4). In DEPRECATION_SCREENS as well, so a
+  // merge that drops it from this list stops the pass rather than quietly reducing coverage —
+  // the same rule the four GraphQL screens earn.
+  { path: "/developer/api/deprecations", name: "api-deprecations" },
   { path: "/settings/iam", name: "iam-overview" },
     { path: "/settings/iam/users", name: "iam-users" },
     { path: "/settings/iam/groups", name: "iam-groups" },

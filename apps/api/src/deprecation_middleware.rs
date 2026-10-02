@@ -315,11 +315,11 @@ mod tests {
         // The process may serve traffic before the first refresh completes, or with the table
         // absent. Every answer here must be "the surface is not deprecated", never a panic and
         // never "everything is removed".
-        let guard = SNAPSHOT.write().expect("the lock is free");
+        let mut guard = SNAPSHOT.write().expect("the lock is free");
         let saved = guard.clone();
         *guard = None;
         drop(guard);
-        assert_eq!(lookup("GET", "/api/v1/pages"), None);
+        assert!(lookup("GET", "/api/v1/pages").is_none(), "no entry before the first build");
         // The `NoDeprecations` answer and the `gone` answer are different, and only one of them
         // would take the platform offline.
         let now = at("2026-10-01T00:00:00Z");
