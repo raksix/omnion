@@ -25,6 +25,8 @@
  * Keyboard: `n` opens Announce, `r` reloads, `Esc` closes the open dialog.
  */
 
+"use client";
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
