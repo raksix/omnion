@@ -189,6 +189,18 @@ function CanvasBlock({
         {block.children.map((column, columnIndex) => (
           <div
             key={column.id}
+            // A column slot is a node in the stored tree and the server counts it as one
+            // (`count_tree`), so the canvas has to carry the same identifying attributes or the
+            // two numbers are counting different things. It was drawn as a labelled box with no
+            // `data-block-canvas-block` at all, which is why a page of twelve blocks with two
+            // column pairs drew seven nodes beside a status bar reading "12 blocks": the bar
+            // counted every node, the canvas counted only the content inside them, and the
+            // walkthrough's `canvasCountMatchesStatus` was measuring that disagreement rather
+            // than anything the author would see. `mode` is recorded too, for the same reason
+            // the render branch below records its own — a step has to be able to demand the
+            // read-only branch by name.
+            data-block-canvas-block="column"
+            data-block-canvas-mode={mode}
             data-block-column
             data-block-column-index={columnIndex}
             className="rounded-md border border-dashed border-line p-1.5"
