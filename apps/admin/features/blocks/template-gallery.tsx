@@ -28,12 +28,20 @@ import {
   fetchSites,
 } from "@/lib/api";
 import { describeTree } from "./block-tree-summary";
+import { FALLBACK_LIMITS } from "./block-tree";
 import { UseTemplateForm } from "./use-template-form";
 import { useContentTenant } from "@/lib/tenant";
 import { TenantPicker } from "@/components/tenant-picker";
 
 /** A registry-shaped value for when the registry request failed. */
-const NO_REGISTRY: BlockRegistry = { version: "0", categories: [], blocks: [] };
+const NO_REGISTRY: BlockRegistry = {
+  version: "0",
+  categories: [],
+  // An empty registry carries no limits either, and `registryLimits` falls back for it — the
+  // library reads blocks, never enforces bounds, so an outage cannot strand a card.
+  limits: FALLBACK_LIMITS,
+  blocks: [],
+};
 
 /** The template gallery. */
 export function TemplateGallery() {

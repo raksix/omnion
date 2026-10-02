@@ -73,8 +73,8 @@ import {
   type History,
 } from "@/features/blocks/block-history";
 import {
-  MAX_DEPTH,
   addColumn,
+  canNest,
   appendChild,
   blockAt,
   breadcrumb,
@@ -83,6 +83,7 @@ import {
   insertColumns,
   moveBlock,
   newBlock,
+  registryLimits,
   removeBlock,
   setProp,
   setSetting,
@@ -289,13 +290,13 @@ export function ThemeBuilderView() {
   const insert = useCallback(
     (definition: BlockDefinition) => {
       const depth = selected ? selected.length : 0;
-      if (definition.container && depth + 1 > MAX_DEPTH) {
-        setError(`Blocks nest at most ${MAX_DEPTH} levels deep. Insert this one at the top level instead.`);
+      if (!canNest(registry, depth)) {
+        setError(`Blocks nest at most ${limits.max_depth} levels deep. Insert this one at the top level instead.`);
         return;
       }
       if (definition.key === "columns") {
         apply(`Add ${definition.label}`, (current) => {
-          const placed = insertColumns(current, selected ?? [], definition);
+          const placed = insertColumns(current, selected ?? [], definition, undefined, limits);
           setSelected(placed.path);
           return placed.blocks;
         });
@@ -326,7 +327,9 @@ export function ThemeBuilderView() {
       });
       setInsertOpen(false);
     },
-    [apply, selected],
+    // `registry` because the depth bound is read off it; without it the callback keeps the
+    // fallback numbers from the render that created it.
+    [apply, registry, selected],
   );
 
   const save = async () => {
@@ -509,6 +512,9 @@ export function ThemeBuilderView() {
   const blocking = issues.filter((issue) => issue.severity === "error");
   const words = wordCount(blocks);
   const crumbs = selected ? breadcrumb(registry, blocks, selected) : [];
+  // Read off the registry document, so this builder's ceiling is the validator's ceiling rather
+  // than a second copy of a constant that can move without this file noticing.
+  const limits = registryLimits(registry);
   const siblings = selected ? siblingList(blocks, selected) : [];
   const position = selected ? (selected[selected.length - 1] ?? 0) : 0;
   const canMoveUp = selected ? position > 0 : false;
@@ -807,7 +813,7 @@ export function ThemeBuilderView() {
                       type="button"
                       data-block-add-column
                       className="rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas"
-                      onClick={() => apply("Add column", (current) => addColumn(current, columnsPath))}
+                      onClick={() => apply("Add column", (current) => addColumn(current, columnsPath, limits))}
                     >
                       Add column
                     </button>

@@ -22,6 +22,7 @@ import { LoadingTable } from "@/components/loading-table";
 import { TenantPicker } from "@/components/tenant-picker";
 import { ApiError, deletePattern, fetchBlockRegistry, fetchPatterns } from "@/lib/api";
 import { countBlocks, describeTree, keyProblem } from "./block-tree-summary";
+import { FALLBACK_LIMITS } from "./block-tree";
 
 /**
  * A registry-shaped value for when the registry request failed.
@@ -30,7 +31,14 @@ import { countBlocks, describeTree, keyProblem } from "./block-tree-summary";
  * type key, which is worse but not broken. What it must not do is throw on a render, because
  * a registry outage would otherwise take the screen down with it.
  */
-const NO_REGISTRY: BlockRegistry = { version: "0", categories: [], blocks: [] };
+const NO_REGISTRY: BlockRegistry = {
+  version: "0",
+  categories: [],
+  // An empty registry carries no limits either, and `registryLimits` falls back for it — the
+  // library reads blocks, never enforces bounds, so an outage cannot strand a card.
+  limits: FALLBACK_LIMITS,
+  blocks: [],
+};
 import { PatternEditor } from "./pattern-editor";
 import { useContentTenant } from "@/lib/tenant";
 

@@ -58,13 +58,12 @@ import {
   type StepIdentity,
 } from "@/features/blocks/block-history";
 import {
-  MAX_COLUMNS,
-  MAX_DEPTH,
-  MIN_COLUMNS,
   addColumn,
   appendChild,
   blockAt,
   breadcrumb,
+  canNest,
+  limitProblem,
   cloneWithNewIds,
   duplicateBlock,
   insertAfter,
@@ -72,6 +71,7 @@ import {
   insertGroup,
   moveBlock,
   newBlock,
+  registryLimits,
   removeBlock,
   removeColumn,
   setProp,
@@ -396,15 +396,22 @@ export function BlockEditor() {
     () => (registry && selected ? breadcrumb(registry, blocks, selected) : []),
     [registry, blocks, selected],
   );
+  // The bounds come from the registry document, so the depth the editor refuses and the depth
+  // the validator refuses are the same number read once.
+  const limits = useMemo(() => registryLimits(registry), [registry]);
+  // Checked here, against the tree the author is holding, rather than only after a dry run:
+  // the server already refuses these payloads, and an author who builds past a bound should be
+  // told by the editor instead of by a 422 that names a block id.
+  const overLimit = useMemo(() => limitProblem(blocks, limits), [blocks, limits]);
 
   const insert = useCallback(
     (definition: BlockDefinition) => {
       // A container's children have to fit inside the depth the platform allows; the check is
       // here so the author gets the sentence at the moment they press the button.
       const depth = selected ? selected.length : 0;
-      if (definition.container && depth + 1 > MAX_DEPTH) {
+      if (!canNest(registry, depth)) {
         setActionError(
-          `Blocks nest at most ${MAX_DEPTH} levels deep. Insert this one at the top level instead.`,
+          `Blocks nest at most ${limits.max_depth} levels deep. Insert this one at the top level instead.`,
         );
         return;
       }
@@ -413,7 +420,7 @@ export function BlockEditor() {
       // author lands inside the first column, which is the block they are about to fill.
       if (definition.key === "columns") {
         apply(`Add ${definition.label}`, (current) => {
-          const placed = insertColumns(current, selected ?? [], definition);
+          const placed = insertColumns(current, selected ?? [], definition, undefined, limits);
           setSelected(placed.path);
           return placed.blocks;
         });
@@ -460,11 +467,21 @@ export function BlockEditor() {
       setInsertOpen(false);
       setActionError(null);
     },
-    [apply, selected],
+    // `registry` is in the deps because the depth bound is read off it: the callback is created
+    // on the first render, when the document has not landed yet, so a stale closure would keep
+    // answering with the fallback numbers for the whole session. That is the mirror this tick
+    // removed, reintroduced one level up.
+    [apply, registry, selected],
   );
 
   const save = async () => {
     if (saving) {
+      return;
+    }
+    // BEFORE `setSaving(true)`: a guard placed after it returns without ever clearing the flag,
+    // so the button keeps its spinner forever and the author has no way to try again.
+    if (overLimit) {
+      setActionError(overLimit);
       return;
     }
     setSaving(true);
@@ -614,13 +631,13 @@ export function BlockEditor() {
   // count before it offers to take the blocks with it.
   const columnsPath = selectedBlock?.type === "columns" ? selected : null;
   const columnCount = columnsPath ? (blockAt(blocks, columnsPath)?.children?.length ?? 0) : 0;
-  const canAddColumn = columnsPath !== null && columnCount < MAX_COLUMNS;
+  const canAddColumn = columnsPath !== null && columnCount < limits.max_columns;
   const isColumn = selectedBlock?.type === "column";
   const columnParentPath = isColumn && selected ? selected.slice(0, -1) : null;
   const columnIndex = isColumn && selected ? (selected[selected.length - 1] ?? 0) : -1;
   const canRemoveColumn =
     columnParentPath !== null &&
-    (blockAt(blocks, columnParentPath)?.children?.length ?? 0) > MIN_COLUMNS;
+    (blockAt(blocks, columnParentPath)?.children?.length ?? 0) > limits.min_columns;
   // Narrow means "measured, and too narrow to edit". An unmeasured viewport is treated as wide
   // for one frame, because the alternative is a phone that flashes a read-only notice before the
   // author has seen an editor — and a desktop that does the same on a slow first paint.
@@ -931,14 +948,14 @@ export function BlockEditor() {
                       type="button"
                       data-block-add-column
                       onClick={() =>
-                        apply("Add column", (current) => addColumn(current, columnsPath))
+                        apply("Add column", (current) => addColumn(current, columnsPath, limits))
                       }
                       disabled={!canAddColumn}
                       aria-label="Add a column"
                       title={
                         canAddColumn
                           ? "Add a column"
-                          : `A Columns block holds at most ${MAX_COLUMNS} columns`
+                          : `A Columns block holds at most ${limits.max_columns} columns`
                       }
                       className="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11.5px] transition hover:bg-canvas disabled:opacity-40"
                     >
@@ -953,7 +970,7 @@ export function BlockEditor() {
                       onClick={() => {
                         if (!canRemoveColumn) {
                           setActionError(
-                            `A Columns block keeps at least ${MIN_COLUMNS} columns. Add another one before removing this.`,
+                            `A Columns block keeps at least ${limits.min_columns} columns. Add another one before removing this.`,
                           );
                           return;
                         }
@@ -970,7 +987,7 @@ export function BlockEditor() {
                         }
                         setActionError(null);
                         apply("Remove column", (current) =>
-                          removeColumn(current, columnParentPath, columnIndex),
+                          removeColumn(current, columnParentPath, columnIndex, limits),
                         );
                         setSelected(columnParentPath);
                       }}
@@ -978,7 +995,7 @@ export function BlockEditor() {
                       title={
                         canRemoveColumn
                           ? "Remove this column and everything in it"
-                          : `A Columns block keeps at least ${MIN_COLUMNS} columns`
+                          : `A Columns block keeps at least ${limits.min_columns} columns`
                       }
                       className="flex items-center gap-1 rounded-md border border-line px-2 py-1 text-[11.5px] text-accent-strong transition hover:bg-accent-soft"
                     >
@@ -1078,6 +1095,11 @@ export function BlockEditor() {
           <Pencil className="size-3" aria-hidden />
           {words} words · {blockCount} blocks
         </span>
+        {overLimit ? (
+          <span data-block-over-limit className="font-medium text-caution">
+            {overLimit}
+          </span>
+        ) : null}
         {blocking.length > 0 ? (
           <button
             type="button"

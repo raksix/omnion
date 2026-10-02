@@ -9,21 +9,58 @@
  * check is a correct "did anything change" test and the undo stack (slice 4) can hold onto
  * previous trees without a copy dance.
  *
- * Depth is capped by the registry (`MAX_DEPTH` in `crates/content`) rather than here, so the
- * rule the server enforces and the rule the editor offers are the same one.
+ * Depth and size are capped by the registry document rather than by constants here, so the rule
+ * the server enforces and the rule the editor offers are read from the same answer.
  */
+import { countBlocks } from "@/features/blocks/block-tree-summary";
+
 import type {
   BlockDefinition,
+  BlockLimits,
   BlockRegistry,
   BlockSettings,
   ContentBlock,
 } from "@omnion/types";
 
-/** Deepest nesting the editor offers. Mirrors the server's `MAX_DEPTH`. */
-export const MAX_DEPTH = 3;
+/**
+ * The bounds the editor enforces, read off the registry it fetched.
+ *
+ * **These were constants here, with a comment on each saying "mirrors the server's".** Nothing
+ * compared the two, so a bound that moved in `crates/content` produced an editor that offered
+ * what the API refused, and the author found out at save time. Worse, `MAX_BLOCKS` was read by
+ * *nothing at all* — no insert path, no status bar — so its comment described a tie that did
+ * not exist. The registry publishes the numbers with the types (REQ-063, `GET /api/v1/blocks`),
+ * so the editor is told rather than trusted, and a bound exists in exactly one place.
+ *
+ * The defaults are what a panel shows for the fraction of a second before the document lands,
+ * and what a caller reads with no registry in hand. They are never used to refuse anything:
+ * `registryLimits` is what the editor's own checks run on.
+ */
+export const FALLBACK_LIMITS: BlockLimits = {
+  max_depth: 3,
+  max_blocks: 400,
+  max_blocks_bytes: 1024 * 1024,
+  min_columns: 2,
+  max_columns: 4,
+};
 
-/** Most blocks the editor will insert into one page. Mirrors the server's `MAX_BLOCKS`. */
-export const MAX_BLOCKS = 400;
+/** The bounds a registry publishes, or the fallback when a caller has none. */
+export function registryLimits(registry: Pick<BlockRegistry, "limits"> | null): BlockLimits {
+  return registry?.limits ?? FALLBACK_LIMITS;
+}
+
+/**
+ * `true` when a container may be inserted `depth` levels down.
+ *
+ * Split out so the editor and the theme builder ask one question — they had the same check
+ * written out twice against the same mirrored constant, which is the shape that drifts.
+ */
+export function canNest(
+  registry: Pick<BlockRegistry, "limits"> | null,
+  depth: number,
+): boolean {
+  return depth + 1 <= registryLimits(registry).max_depth;
+}
 
 /** A block id the editor mints. `crypto.randomUUID` is available in every browser the panel
  * supports, and a fallback keeps a private-mode context from silently losing every id. */
@@ -32,6 +69,36 @@ export function newBlockId(): string {
     return crypto.randomUUID();
   }
   return `b-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * The sentence to show when a tree is over one of the registry's bounds, or `null` when it fits.
+ *
+ * **This is what the editor's dead `MAX_BLOCKS` mirror should have been.** The constant was
+ * exported, documented as "mirrors the server's", and read by no code at all — so an author
+ * could build a page the API would refuse and only find out at save. The count is computed here
+ * from the tree itself, and the ceiling is the number the registry published, so the editor's
+ * answer and the validator's answer are the same comparison over the same value.
+ *
+ * The bound is checked against the *whole* tree, nested included, which is the whole point: the
+ * top-level length is not the page.
+ */
+export function limitProblem(
+  blocks: ContentBlock[],
+  limits: BlockLimits,
+): string | null {
+  const count = countBlocks(blocks);
+  if (count > limits.max_blocks) {
+    return `A page holds at most ${limits.max_blocks} blocks; this one has ${count}.`;
+  }
+  // The size bound is checked on the serialized payload because that is what the validator
+  // measures — a tree of a hundred blocks with one 16 KiB text each is under the count bound
+  // and over the byte one.
+  const bytes = new TextEncoder().encode(JSON.stringify(blocks)).length;
+  if (bytes > limits.max_blocks_bytes) {
+    return `This page's blocks are ${Math.round(bytes / 1024)} KB, over the ${Math.round(limits.max_blocks_bytes / 1024)} KB limit.`;
+  }
+  return null;
 }
 
 /** A fresh block of a type, with the props its schema defaults to. */
@@ -291,10 +358,6 @@ function replaceSiblings(
   }));
 }
 
-/** Fewest and most columns a Columns block holds. Mirrors the server's `MIN_COLUMNS`/`MAX_COLUMNS`. */
-export const MIN_COLUMNS = 2;
-export const MAX_COLUMNS = 4;
-
 /**
  * Insert a Columns block with the column wrappers it needs, then leave the author inside the
  * first one.
@@ -308,9 +371,14 @@ export function insertColumns(
   blocks: ContentBlock[],
   path: number[],
   definition: BlockDefinition,
-  wanted = MIN_COLUMNS,
+  wanted?: number,
+  limits: BlockLimits = FALLBACK_LIMITS,
 ): { blocks: ContentBlock[]; path: number[] } {
-  const count = Math.min(MAX_COLUMNS, Math.max(MIN_COLUMNS, wanted));
+  // Clamped to the bounds the registry publishes, which are the ones the validator refuses
+  // outside of — a tree built past the ceiling saves and is rejected, so the editor would be
+  // offering a payload that cannot exist.
+  const requested = wanted ?? limits.min_columns;
+  const count = Math.min(limits.max_columns, Math.max(limits.min_columns, requested));
   const columns: ContentBlock[] = Array.from({ length: count }, () => ({
     id: newBlockId(),
     type: "column",
@@ -341,12 +409,13 @@ export function insertColumns(
 export function addColumn(
   blocks: ContentBlock[],
   path: number[],
+  limits: BlockLimits = FALLBACK_LIMITS,
 ): ContentBlock[] {
   const container = blockAt(blocks, path);
   if (!container || container.type !== "columns") {
     return blocks;
   }
-  if ((container.children?.length ?? 0) >= MAX_COLUMNS) {
+  if ((container.children?.length ?? 0) >= limits.max_columns) {
     return blocks;
   }
   const column: ContentBlock = { id: newBlockId(), type: "column", props: { align: "left" }, children: [] };
@@ -369,13 +438,14 @@ export function removeColumn(
   blocks: ContentBlock[],
   path: number[],
   columnIndex: number,
+  limits: BlockLimits = FALLBACK_LIMITS,
 ): ContentBlock[] {
   const container = blockAt(blocks, path);
   if (!container || container.type !== "columns") {
     return blocks;
   }
   const count = container.children?.length ?? 0;
-  if (count <= MIN_COLUMNS || columnIndex < 0 || columnIndex >= count) {
+  if (count <= limits.min_columns || columnIndex < 0 || columnIndex >= count) {
     return blocks;
   }
   const children = (container.children ?? []).filter((_, index) => index !== columnIndex);

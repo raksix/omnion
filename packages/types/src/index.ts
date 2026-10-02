@@ -141,12 +141,35 @@ export interface BlockDefinition {
   props: BlockPropSchema[];
 }
 
+/**
+ * The bounds the server enforces on a block tree, as the registry publishes them.
+ *
+ * These were hand-mirrored in `block-tree.ts` with a comment on each saying "mirrors the
+ * server's" — and nothing anywhere that compared the two, so a bound that moved on one side
+ * produced an editor that allowed what the API refused (or the reverse) until an author hit it.
+ * They travel with the registry so the panel is told the number instead of keeping its own.
+ */
+export interface BlockLimits {
+  /** Deepest nesting a tree may reach. */
+  max_depth: number;
+  /** Most blocks one page's draft may carry, nested included. */
+  max_blocks: number;
+  /** Largest a serialized tree may be. */
+  max_blocks_bytes: number;
+  /** Fewest columns a Columns block holds. */
+  min_columns: number;
+  /** Most columns a Columns block holds. */
+  max_columns: number;
+}
+
 /** The registry document (`GET /api/v1/blocks`). */
 export interface BlockRegistry {
   /** Registry version, for the panel and the renderer to compare against. */
   version: string;
   /** Category order the insert panel groups by. */
   categories: string[];
+  /** The bounds the validator enforces, so the editor enforces the same ones. */
+  limits: BlockLimits;
   /** Every block type the platform ships. */
   blocks: BlockDefinition[];
 }
