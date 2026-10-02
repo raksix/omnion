@@ -9212,9 +9212,27 @@ async function main() {
   // the pass a developer is actually working on. Reset the database first if the pass expects the
   // first-run wizard to have run.
   const only = (process.argv.find((arg) => arg.startsWith("--only=")) || "").split("=")[1];
-  if (only && DEPTH_PASSES[only]) {
+  // **The two spellings, reconciled here and nowhere else.** `DEPTH_PASSES`'s keys are
+  // de-hyphenated (`workflowtable`) because that is how a caller passes them on a command line
+  // without quoting a hyphen, while every other name in this file — the `runDepthPass("workflow-table")`
+  // call sites, the `wants("…")` guards, the roll-up's matched set — is hyphenated. The lookup used
+  // to compare the two directly, so `--only=workflow-table` (the spelling `run.sh`'s own comment
+  // recommends, and the spelling every guard in this file uses) matched nothing, the exit never fired,
+  // and a pass asked for one five-minute screen walked the whole inventory.
+  //
+  // It failed WIDE, which is why four ticks read it as a crowded box: the run still produced a
+  // summary, still exited 0, and still printed a banner naming the filter the caller asked for — a
+  // banner about intent, not about coverage. The only symptom was `clicks.jsonl` naming a different
+  // screen than the build log claimed to be measuring.
+  //
+  // So the requested name is normalised, and the log line says which spelling was ACCEPTED rather
+  // than only which was asked for. Normalising in one place is the point: a second convention has to
+  // have exactly one crossing point, or the next table added next month reopens this.
+  const onlyKey = only ? only.replace(/-/g, "") : "";
+  if (only && DEPTH_PASSES[onlyKey]) {
     await ensureSignedIn(page, report);
-    await DEPTH_PASSES[only](page, report);
+    log(`focused depth pass: requested ${only} → resolved ${onlyKey}`);
+    await DEPTH_PASSES[onlyKey](page, report);
     // The depth passes are the ones a REQ close depends on, so the stack check matters most
     // here: a pass that lost its stack halfway through a depth pass produces a *confident*
     // report (`rows: 0`, `listsTheCreate: false`) that reads exactly like a broken screen.
@@ -9648,15 +9666,32 @@ async function main() {
   // because both screens run live probes, and running them in the other order
   // would have the health screen's own PostgreSQL probe read the connection pool
   // the security scan is still holding.
-  if (wants("health-overview")) {
-    matchedOnly.add("health-overview");
+  // The system-health centre (REQ-014) is four passes: the overview, its metrics, the incident log
+  // and the settings screen. **Each is guarded by its OWN name** (plus the overview, which reads
+  // their numbers), so `--only=health-incidents` measures the incident log and nothing else.
+  //
+  // They used to ride a single `wants("health-overview")` wrapper, which is a bug with three faces:
+  // *focus* (asking for one health screen bought all four), *coverage* (no health slice could be
+  // proven without a full pass, and the full pass is what gets cut off), and *report* (`report.health`
+  // was assigned inside the guard while the other three were not, so `summary.json`'s key set
+  // depended on which filter was used).
+  if (wants("health-overview") || wants("health")) {
+    matchedOnly.add("health");
     report.health = await runDepthPass("health", () => runHealthDepth(page, report));
-  report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
-  // Slice 3's two passes (REQ-014). Both are `runDepthPass` like every other depth walk, which
-  // is what makes them survive a page crash: the wrapper records the failure instead of the run
-  // dying on the next `page.locator`.
-  report.healthIncidents = await runDepthPass("health-incidents", () => runHealthIncidentsDepth(page, report));
-  report.healthSettings = await runDepthPass("health-settings", () => runHealthSettingsDepth(page, report));
+  }
+  if (wants("health-overview") || wants("health-metrics")) {
+    matchedOnly.add("health-metrics");
+    report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
+  }
+  if (wants("health-overview") || wants("health-incidents")) {
+    matchedOnly.add("health-incidents");
+    report.healthIncidents = await runDepthPass("health-incidents", () => runHealthIncidentsDepth(page, report));
+  }
+  if (wants("health-overview") || wants("health-settings")) {
+    matchedOnly.add("health-settings");
+    report.healthSettings = await runDepthPass("health-settings", () => runHealthSettingsDepth(page, report));
+  }
+  if (wants("health-overview")) {
     log(`health: ${JSON.stringify(report.health)}`);
   }
 
@@ -9762,6 +9797,28 @@ async function main() {
   // delete. It runs before the sign-out below and leaves the database as it found it.
   await runDepthPass("automations", () => runAutomationsDepth(page, report));
   log(`automations: ${JSON.stringify(report.automations)}`);
+
+  // **Two passes that existed in full and never ran.** `runAutomationsActionsDepth` and
+  // `runAutomationsApprovalsDepth` were written, registered in `DEPTH_PASSES` (so
+  // `--only=automations-actions` would have found them) and then called from **nowhere**: the only
+  // two references each had were its own definition and its table entry.
+  //
+  // That combination is the worst shape a harness defect can take, and it is worth naming why.
+  // `--only=automations-actions` did not error and did not run the full pass — it exited early,
+  // measured nothing, and wrote a report naming a pass that had produced no rows. Meanwhile a full
+  // pass silently omitted two screens the file had complete coverage for, so `report` never carried
+  // `automationsActions` and nothing read the absence. The "no untested screen" rule cannot see this
+  // either: the screens ARE in the walkthrough's route list and pass a DOM check, they just never
+  // get a pass driving them.
+  //
+  // Both are REQ-003 screens (the action catalogue and the approvals inbox), so they belong beside
+  // the automations pass that covers their parent screen, and after it: the actions pass reads the
+  // rule list the automations pass leaves in a known state, the same ordering reason the operations
+  // pass gives below.
+  await runDepthPass("automations-actions", () => runAutomationsActionsDepth(page, report));
+  log(`automations actions: ${JSON.stringify(report.automationsActions)}`);
+  await runDepthPass("automations-approvals", () => runAutomationsApprovalsDepth(page, report));
+  log(`automations approvals: ${JSON.stringify(report.automationsApprovals)}`);
 
   // The operations pass (REQ-003, slice 4): the run history, the run's own route with its
   // step trace, the Versions tab with a restore, the Audit tab and the templates gallery. It
