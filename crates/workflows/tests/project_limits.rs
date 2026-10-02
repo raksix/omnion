@@ -346,9 +346,40 @@ async fn counters_agree_with_the_runs_they_count() {
             .await
             .expect("the step is claimed");
             assert_eq!(claimed.rows_affected(), 1, "the step exists to be claimed");
+            // **The row count here is the whole fix, and its absence was a gate that passed for the
+            // wrong reason on some runs and failed on others.** `fail_step` matches
+            // `where status = 'running'` and **silently no-ops otherwise** — by design, because the
+            // engine always claims a step before failing it. So a fixture whose claim had not
+            // landed yet produced zero rows, `fail_step` reported `Ok(())`, and the assertion one
+            // line down read the settlement of a run whose step was still `pending`:
+            // `settle_execution` counts open steps first, returns `None`, and the test reported
+            // `left: None, right: Some(Failed)` against a platform that had done nothing wrong.
+            //
+            // **The earlier `.expect("the step fails")` could not see this**, because it asserts
+            // that the call did not *error* — and a silent no-op is not an error. That is the
+            // branch's rule about a check that is *nearly* the promise, applied to a control's row
+            // count: the promise is "this step failed", and "the UPDATE ran" is not that promise.
+            //
+            // **The assertion reads the row's status rather than a return value, and that is
+            // deliberate.** `fail_step` returns `Result<()>`, and widening it to
+            // `Result<u64>` would be a product change made for a test — but reading the state back
+            // is the *stronger* check anyway: it asserts the consequence rather than the call, and
+            // it would still pass if a future `fail_step` matched the row some other way. The
+            // product's signature is left alone; the fixture is made honest.
             store::fail_step(&pool, step.id, "the action refused")
                 .await
                 .expect("the step fails");
+            let step_status: String =
+                sqlx::query_scalar("select status from workflow_steps where id = $1")
+                    .bind(step.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("the step row is readable");
+            assert_eq!(
+                step_status, "failed",
+                "the step was claimed as running, so failing it must change its state — a silent \\
+                 no-op here is what made this assertion read a pending run's settlement"
+            );
             assert_eq!(
                 store::settle_execution(&pool, execution.id)
                     .await
