@@ -211,6 +211,59 @@ async fn live_db(config: &Config) -> Option<Db> {
     }
 }
 
+/// Print one timed fixture stage when `CRM_FIXTURE_TRACE` is set.
+///
+/// Four ticks of this suite argued about where the time goes *from reading the code*, and each
+/// read named a different culprit (a deadlock, then a broken probe, then "starved"). Every number
+/// that actually settled it came from a measurement, so the measurement now lives in the file:
+/// set the variable and each stage of the fixture reports its own cost in milliseconds.
+struct Stage(&'static str, std::time::Instant);
+
+impl Stage {
+    fn start(name: &'static str) -> Option<Self> {
+        std::env::var_os("CRM_FIXTURE_TRACE")
+            .map(|_| Self(name, std::time::Instant::now()))
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        eprintln!(
+            "[fixture] {:<22} {:>9.1} ms",
+            self.0,
+            self.1.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// Guards the boot work every walk used to repeat, once per test binary.
+///
+/// **What is guarded is the *work*, not a resource.** This started as a `tokio::sync::OnceCell`
+/// holding the `(AppState, Db)` pair, and that was wrong in a way only a run could show: every
+/// `#[tokio::test]` builds and tears down **its own runtime**, and a `PgPool` is bound to the
+/// runtime that opened it. A two-test reproduction is the whole argument — the first walk builds
+/// the pool, prints `pool size=3 idle=2`, passes; the second walk, on a different runtime, cannot
+/// take a connection out of it and dies with `PoolTimedOut` before its first query. The old code
+/// gave each walk its own pool and therefore never noticed.
+///
+/// So the pool stays per-walk and what is remembered is a flag. The work behind it is genuinely
+/// process-wide and genuinely idempotent:
+///
+/// * `db.migrate()` — the applied-migration table is in the database, not in the process,
+/// * `seed::ensure` — the permission catalogue and platform roles are rows, not memory,
+/// * `give_the_process_its_own_sign_in_budget` — already a `OnceLock`, so the second walk never got
+///   a second limiter and re-installing bought nothing,
+/// * "is PostgreSQL reachable at all" — decided once, so a run with no database says so once
+///   instead of attempting 57 connections and printing 57 paragraphs.
+///
+/// The first walk pays the bill (~12 s measured, dominated by the catalogue upsert) and the other
+/// 56 pay nothing. Each walk still creates its own organizations, accounts and pipeline rows, so
+/// every tenant-scoped assertion still reads rows nothing else wrote.
+static BOOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Serialises the boot work, so two walks starting together cannot both run it.
+static BOOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A state whose database has all migrations applied and the IAM seed loaded.
 async fn live_state() -> Option<(AppState, Db)> {
     let mut config = Config::from_env().expect("environment must be valid");
@@ -219,8 +272,10 @@ async fn live_state() -> Option<(AppState, Db)> {
     // refused with `csrf_unavailable` — which is the product working correctly on a deployment
     // that never configured a secret.
     walk_auth::with_csrf_secret(&mut config);
+    let stage = Stage::start("connect+migrate");
     let db = live_db(&config).await?;
     db.migrate().await.expect("migrations must apply");
+    drop(stage);
 
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
@@ -252,6 +307,25 @@ async fn live_state() -> Option<(AppState, Db)> {
             &state, policies,
         ));
     });
+
+    // The IAM seed is boot work: the whole permission catalogue upserted, the platform roles
+    // reconciled and the "at least one Owner" invariant re-checked. It has to run **after** this
+    // walk's connections exist and it runs before any walk creates an account, which is the order
+    // `Fixture::new` had — the seed cannot hand the Owner role to an account that does not exist
+    // yet, and each walk still binds its own owner explicitly through `seed::bind_owner`.
+    // `bool` in a `OnceLock` could not be filled here: the closure is synchronous and this call is
+    // not, so the flag and the lock do the work a `OnceCell` would otherwise have done — the
+    // double check keeps the lock off the fast path after the first walk.
+    if !BOOTED.load(std::sync::atomic::Ordering::Acquire) {
+        let _boot = BOOT_LOCK.lock().await;
+        if !BOOTED.load(std::sync::atomic::Ordering::Relaxed) {
+            let stage = Stage::start("iam seed");
+            seed::ensure(db.pool()).await.expect("the IAM seed must run");
+            drop(stage);
+            BOOTED.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     Some((state, db))
 }
 
@@ -282,11 +356,10 @@ impl Fixture {
     async fn new() -> Option<Self> {
         let walk = CRM_WALK.lock().await;
         let (state, db) = live_state().await?;
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
-
         let org = create_organization_row(&db, "a").await;
         let other_org = create_organization_row(&db, "b").await;
 
+        let stage = Stage::start("six accounts");
         let (owner_id, owner) = create_account(&db, None, "CRM Owner").await;
         seed::bind_owner(db.pool(), owner_id)
             .await
@@ -312,12 +385,22 @@ impl Fixture {
             create_account(&db, Some(other_org), "CRM Other Writer").await;
         grant(&db, other_org, other_writer_id, owner_id, &OTHER_WRITER_PERMISSIONS).await;
 
+        drop(stage);
+        let stage = Stage::start("grants+pipelines");
         // The default pipeline is seeded per organization by the migration; a fresh organization
         // created by the fixture gets one only through that function, so the suite calls it — the
         // same path a new tenant takes.
         seed_default_pipeline(&db, org).await;
         seed_default_pipeline(&db, other_org).await;
+        drop(stage);
 
+        if std::env::var_os("CRM_FIXTURE_TRACE").is_some() {
+            eprintln!(
+                "[fixture] pool size={} idle={} org={org}",
+                db.pool().size(),
+                db.pool().num_idle(),
+            );
+        }
         Some(Self {
             _walk: walk,
             state,
