@@ -1126,6 +1126,21 @@ pub async fn run_schedule_now(
     let finished = omnion_backup::finish_run(pool, row.id, &stored, &now_string()).await?;
     let _ = settings;
 
+    // The schedule's own bookkeeping, which is what this route was missing. A manual run is a
+    // run **of this schedule** — it is tied to it, it carries its scopes and its retention, and
+    // it appears in the list as a scheduled run — so `last_run_at` and `last_backup_id` must
+    // move or the panel lies: an operator presses "Run now", watches the run appear in the
+    // list, and the schedule beside it still says **"never"** in the last-run column and
+    // "—" for the run it produced. The button's own doc comment promised that column would
+    // have something real in it, and the only writer of those two columns was the unattended
+    // worker, so the promise held for 02:00 and failed for a person.
+    //
+    // **`None` for the next run, and that is the load-bearing part.** The worker rearms; this
+    // route does not. An operator testing a 03:00 schedule at 09:00 has not consumed
+    // tomorrow's 03:00, and `coalesce` inside the store leaves the existing slot exactly as
+    // the schedule had it rather than recomputing one this path has no business computing.
+    omnion_backup::record_schedule_run(pool, schedule.id, finished.id, None).await?;
+
     record(
         pool,
         org,
