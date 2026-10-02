@@ -1094,6 +1094,260 @@ async fn workflow_count_in(
     Ok(count)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Deletion (REQ-133, acceptance 16 / "Settings": archive, export, delete).
+//
+// The REQ's API table has documented `DELETE /api/v1/projects/{id}` — "typed confirmation,
+// dependency check" — and its settings screen has a delete action, for as long as the rest of the
+// surface has existed. Neither existed anywhere: no `delete_project` in this module, no route,
+// no button. Migration 0164 even documented the `on delete restrict` choice as protecting
+// "deletion with its own dependency check (slice 4)", and slice 4 shipped the caps, the transfer
+// and the archive guards without ever writing the function the comment names. So an installation
+// could create projects for ever and never remove one, and the REQ's event table's
+// `automation.project.deleted` was emitted by nothing.
+//
+// **The default project cannot be deleted, and that is the database's rule rather than a check
+// here.** `automation_projects_one_default_uidx` is a filtered unique index, so deleting the
+// default does not violate it — the rule that protects the default is the OTHER one, and the
+// refusal has to be stated here or the delete would succeed and leave an organization with no
+// place to put a resource. Every insert path resolves through [`default_project`], so a
+// successful delete of the default is a broken installation rather than a tidy one.
+
+/// What deleting a project would take with it, or leave behind.
+///
+/// **A report, not a boolean**, and the shape is the point: the REQ asks for "a dependency check"
+/// and a refusal that says *how many* workflows are in the way is an answer an operator can act
+/// on, where "this project has dependencies" is a wall. Each kind carries its own resolution hint
+/// because the remedies differ — workflows are moved, members are dismissed, history is
+/// destroyed — and a refusal that names none of them is the dialog telling a user to go and find
+/// out.
+///
+/// The counts are read **in the deleting transaction, with the project row held `for update`**
+/// (see [`delete_project`]), so a report cannot describe a project that a concurrent create
+/// changed between the report and the delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDependencies {
+    /// The project.
+    pub project_id: Uuid,
+    /// Its key, so the refusal names it rather than an id.
+    pub project_key: String,
+    /// Workflow definitions that must be moved or deleted first.
+    pub workflows: i64,
+    /// Member rows that would be cascaded away.
+    pub members: i64,
+    /// Execution rows that would be cascaded away with their workflows.
+    ///
+    /// Read through `workflow_executions` rather than counted from the workflows above, because
+    /// the two answers differ the moment a workflow was moved into this project from one that
+    /// had history: a project with one workflow and four hundred runs is exactly the case where
+    /// "this will be destroyed" is the fact the operator needs.
+    pub executions: i64,
+    /// Audit rows already recorded **inside** this project. They survive: `audit_logs.project_id`
+    /// is `on delete set null`, and a trail that deletes itself along with the container is not a
+    /// trail.
+    pub audit_rows: i64,
+}
+
+impl ProjectDependencies {
+    /// Whether the delete may proceed.
+    ///
+    /// **Workflows and history are the blockers; members and the trail are not.** A member row is
+    /// cascaded deliberately (the people are being dismissed, and keeping a membership in a
+    /// project that no longer exists would make every one of their scoped queries read a
+    /// `project_not_found`), and an audit row with a null project is a documented state the
+    /// instance-wide stream already renders. Refusing on either would make the project
+    /// undeletable for reasons an operator cannot fix on this screen.
+    #[must_use]
+    pub const fn blocks_delete(&self) -> bool {
+        self.workflows > 0
+    }
+}
+
+/// Read what stands in the way of deleting a project.
+///
+/// Takes a connection because its only caller is [`delete_project`], which holds the project row
+/// `for update` while it runs: a dependency count read through a pool on its own would be a
+/// count of a state that may already be gone.
+pub async fn project_dependencies(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<ProjectDependencies> {
+    let project_key: String = sqlx::query_scalar("select key from automation_projects where id = $1")
+        .bind(project_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| {
+            WorkflowError::invalid("project_not_found", "this project no longer exists")
+        })?;
+
+    let workflows: i64 =
+        sqlx::query_scalar("select count(*) from workflows where project_id = $1")
+            .bind(project_id)
+            .fetch_one(&mut *connection)
+            .await?;
+    let members: i64 =
+        sqlx::query_scalar("select count(*) from automation_project_members where project_id = $1")
+            .bind(project_id)
+            .fetch_one(&mut *connection)
+            .await?;
+    let executions: i64 = sqlx::query_scalar(
+        "select count(*) from workflow_executions e join workflows w on w.id = e.workflow_id \
+         where w.project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    let audit_rows: i64 =
+        sqlx::query_scalar("select count(*) from audit_log where project_id = $1")
+    .bind(project_id)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(ProjectDependencies {
+        project_id,
+        project_key,
+        workflows,
+        members,
+        executions,
+        audit_rows,
+    })
+}
+
+/// The typed confirmation the REQ asks for, and the one that makes the delete a deliberate act.
+///
+/// **Why the project KEY and not the name or the id.** The name is free text an operator can
+/// change without thinking, and the id is on screen. The key is the short form people write in a
+/// ticket (`PLAT`, `OPS`), it is unique per organization, and it is the one identifier that both
+/// identifies the project *and* cannot be produced by muscle memory from a list — typing `PAY`
+/// when the project is `PAYROLL` fails, which is the entire purpose of a typed confirmation. This
+/// is the same argument the account-deletion confirmations on this platform make.
+///
+/// The check is an **exact** equality on the key, and a wrong answer is a
+/// [`WorkflowError::invalid`] naming the expected value: a confirmation that fails silently
+/// leaves a user retyping into a field that never said what it wanted.
+///
+/// **No `trim()`, and the first version had one — my own gate caught it.** Trimming makes
+/// `"OPS "` an acceptable answer, which is a pasted key with a trailing space, which is the most
+/// common way a typed confirmation gets satisfied without anybody having read it. It is also the
+/// exact disagreement this dialog family keeps meeting: the panel compares `typed === key` and the
+/// store compared `typed.trim() === key`, so the dialog would refuse what the server accepted, and
+/// the "the message is not the negation" rule applies here in a new place — a check that is *nearly*
+/// exact is not exact, and "nearly" is where muscle memory lives.
+pub fn ensure_delete_confirmation(
+    dependencies: &ProjectDependencies,
+    confirmation: &str,
+) -> Result<()> {
+    if confirmation != dependencies.project_key {
+        return Err(WorkflowError::invalid(
+            "project_delete_confirmation_mismatch",
+            format!(
+                "type the project key ({}) exactly to confirm the deletion",
+                dependencies.project_key
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Delete a project, once its dependencies and its typed confirmation are satisfied.
+///
+/// **Everything that can refuse this does so before the `delete` statement, in the order that
+/// gives each refusal the remedy that works:**
+///
+/// 1. **The default project.** An organization with no default has nowhere to put a resource
+///    created without an explicit project — every insert path resolves through
+///    [`default_project`] — so the refusal is *"this is the default project; it cannot be
+///    deleted"* rather than a cap to raise or a workflow to move. It is checked first because it
+///    is the one refusal no amount of cleanup fixes.
+/// 2. **The typed confirmation**, so a client that got this far without meaning to cannot delete
+///    a project by sending a `DELETE` with an empty body.
+/// 3. **The dependencies.** A project holding workflows is refused **by count**, naming the key
+///    and the number, because `on delete restrict` would otherwise answer a 23503 that names a
+///    constraint and not a project.
+///
+/// The project row is held **`for update`** across the whole check, so a workflow created between
+/// the dependency read and the `delete` cannot slip in and take the row down with it. That is the
+/// check-then-write race this module has removed from the run path and the move path, on the last
+/// write path that had it.
+///
+/// Cascades: members, limits, usage counters, limit notices and switcher recents go with it
+/// (`on delete cascade` in 0164/0170/0172/0176), and `audit_log.project_id` is set to null — the
+/// trail stays. Workflows and their runs are `on delete restrict`, which is why step 3 exists.
+///
+/// **The write is a separate function, and it is separate because the audit row has to go in
+/// between.** `audit_log.project_id` is a foreign key with `on delete set null`, so a trail row
+/// naming this project is legal only while the project exists — writing one *after* the `delete`
+/// in the same transaction answers 23503, because the constraint is checked immediately and
+/// `set null` runs against rows that are already there, not against a row inserted afterwards.
+/// A single function that both checked and deleted would have forced the caller to write the
+/// audit row after a delete that had already happened, which is the one order that cannot work.
+/// So [`project_delete_checks`] decides and [`commit_project_delete`] writes, and the handler puts
+/// the audit row between them.
+pub async fn project_delete_checks(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+    confirmation: &str,
+) -> Result<ProjectDependencies> {
+    // `for update` and the default flag in one read: the lock is taken here rather than later so
+    // every refusal below is decided against a project that cannot change underneath the check,
+    // and the lock is HELD until the transaction ends — which is what lets the delete below trust
+    // the dependency count it read a moment ago.
+    let is_default: Option<bool> = sqlx::query_scalar(
+        "select is_default from automation_projects where id = $1 for update",
+    )
+    .bind(project_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    match is_default {
+        None => {
+            return Err(WorkflowError::invalid(
+                "project_not_found",
+                "this project no longer exists",
+            ));
+        }
+        Some(true) => {
+            return Err(WorkflowError::invalid(
+                "project_is_default",
+                "the default project cannot be deleted — every automation created without a \
+                 project of its own lands here",
+            ));
+        }
+        Some(false) => {}
+    }
+
+    let dependencies = project_dependencies(connection, project_id).await?;
+    ensure_delete_confirmation(&dependencies, confirmation)?;
+
+    if dependencies.blocks_delete() {
+        return Err(WorkflowError::invalid(
+            "project_has_dependencies",
+            format!(
+                "{} holds {} workflow(s) — move or delete them before deleting the project",
+                dependencies.project_key, dependencies.workflows
+            ),
+        ));
+    }
+
+    Ok(dependencies)
+}
+
+/// Remove the project row, once every check has passed and the audit row has been written.
+///
+/// Public so the handler can order the two, and documented so the order is not an accident
+/// somebody tidies away: **the audit row goes in first, this goes second.** Both are in the same
+/// transaction, so a failure anywhere rolls the whole thing back together.
+pub async fn commit_project_delete(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<()> {
+    sqlx::query("delete from automation_projects where id = $1")
+        .bind(project_id)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
 /// Count the workflows in a project, for the list column and the limit screen.
 pub async fn workflow_count(pool: &PgPool, project_id: Uuid) -> Result<i64> {
     let count: i64 = sqlx::query_scalar("select count(*) from workflows where project_id = $1")
