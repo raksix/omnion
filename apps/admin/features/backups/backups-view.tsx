@@ -641,6 +641,24 @@ export function BackupsOverviewScreen() {
                         protected
                       </span>
                     ) : null}
+                    {/* WHY the run is not green, in the list and not only in the detail panel.
+                        `run.error` has been on every row of this API since slice 1 and this
+                        table has never drawn it, so a `partial` or `failed` run was a coloured
+                        pill with no sentence next to it — and the one sentence an operator
+                        needs is the reason. The detail panel has it, which is exactly why this
+                        was invisible: the defect reads as "the reason is one click away" on a
+                        screen whose whole job is to tell an operator which run to click.
+                        Drawn only for the states that have one, so a `running` row is not
+                        carrying an empty gap where a message would be. */}
+                    {run.error && run.status !== "succeeded" ? (
+                      <span
+                        className="mt-0.5 block max-w-[26ch] truncate text-[11px] text-muted"
+                        title={run.error}
+                        data-testid="backup-row-reason"
+                      >
+                        {run.error}
+                      </span>
+                    ) : null}
                   </td>
                   <td className="px-3 py-2 text-muted">{run.destination}</td>
                   <td className="px-3 py-2 text-muted">
