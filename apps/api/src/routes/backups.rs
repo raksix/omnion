@@ -231,6 +231,44 @@ pub struct DestinationBody {
     pub message: String,
     /// Whether archives are encrypted. The screen states this plainly when they are not.
     pub encryption: String,
+    /// How much room is left on the destination, and whether the next run fits.
+    pub headroom: HeadroomBody,
+}
+
+/// A destination's room, which is a different fact from whether it accepts a write.
+///
+/// The split exists because the card that used to read "writable" was the only answer, and
+/// writability is a 31-byte write succeeding. Every one of these fields is `null`-able on
+/// purpose: a card that renders `0 B` for a destination it could not measure invents a number,
+/// and an invented number on this particular card is one an operator enlarges a disk over.
+#[derive(Debug, Serialize)]
+pub struct HeadroomBody {
+    /// `healthy`, `tight`, `full` or `unknown`.
+    pub level: String,
+    /// Free bytes on the destination's filesystem, or `null` when the kernel would not say.
+    pub free_bytes: Option<u64>,
+    /// The largest backup this tenant holds there — the yardstick `level` was judged against.
+    pub largest_backup_bytes: Option<u64>,
+    /// The sentence the card shows under the numbers.
+    pub message: String,
+}
+
+impl HeadroomBody {
+    /// Build the body from a verdict and the two numbers it came from.
+    fn new(verdict: omnion_backup::Headroom, free: Option<u64>, largest: Option<u64>) -> Self {
+        Self {
+            level: match verdict {
+                omnion_backup::Headroom::Healthy => "healthy",
+                omnion_backup::Headroom::Tight => "tight",
+                omnion_backup::Headroom::Full => "full",
+                omnion_backup::Headroom::Unknown => "unknown",
+            }
+            .to_owned(),
+            free_bytes: free,
+            largest_backup_bytes: largest,
+            message: verdict.message(free, largest),
+        }
+    }
 }
 
 /// Settings, as the settings screen reads them.
@@ -500,6 +538,13 @@ pub async fn status(
     // `message()` borrows the report, so it is computed before `reason` is moved out of it.
     let probe_message = probe.message();
 
+    // The yardstick, and the reading. Both are asked for here rather than in the crate because
+    // one is a database question (what this tenant's biggest run was) and one is a filesystem
+    // question (how much room is left) — and because the verdict is meaningless without the
+    // first, so a caller that wants a level has to have had the opportunity to fetch both.
+    let largest = omnion_backup::largest_backup_bytes(pool, org).await?;
+    let (verdict, free) = omnion_backup::headroom_for(&probe, largest);
+
     Ok(Json(StatusBody {
         last_successful_at: last_at,
         last_successful_id: last_id,
@@ -517,6 +562,7 @@ pub async fn status(
             reason: probe.reason,
             message: probe_message,
             encryption: settings.encryption,
+            headroom: HeadroomBody::new(verdict, free, largest),
         },
     }))
 }
@@ -1079,6 +1125,21 @@ pub async fn run_schedule_now(
     let stored = omnion_backup::list_parts(pool, row.id).await?;
     let finished = omnion_backup::finish_run(pool, row.id, &stored, &now_string()).await?;
     let _ = settings;
+
+    // The schedule's own bookkeeping, which is what this route was missing. A manual run is a
+    // run **of this schedule** — it is tied to it, it carries its scopes and its retention, and
+    // it appears in the list as a scheduled run — so `last_run_at` and `last_backup_id` must
+    // move or the panel lies: an operator presses "Run now", watches the run appear in the
+    // list, and the schedule beside it still says **"never"** in the last-run column and
+    // "—" for the run it produced. The button's own doc comment promised that column would
+    // have something real in it, and the only writer of those two columns was the unattended
+    // worker, so the promise held for 02:00 and failed for a person.
+    //
+    // **`None` for the next run, and that is the load-bearing part.** The worker rearms; this
+    // route does not. An operator testing a 03:00 schedule at 09:00 has not consumed
+    // tomorrow's 03:00, and `coalesce` inside the store leaves the existing slot exactly as
+    // the schedule had it rather than recomputing one this path has no business computing.
+    omnion_backup::record_schedule_run(pool, schedule.id, finished.id, None).await?;
 
     record(
         pool,

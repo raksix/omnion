@@ -1444,6 +1444,7 @@ dependencies = [
  "omnion-backup",
  "omnion-content",
  "omnion-core",
+ "omnion-developer",
  "omnion-events",
  "omnion-health",
  "omnion-identity",
@@ -1511,6 +1512,7 @@ dependencies = [
  "aes-gcm",
  "hex",
  "hkdf",
+ "omnion-health",
  "omnion-storage",
  "rand 0.8.8",
  "serde",
@@ -1564,6 +1566,23 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omnion-developer"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "thiserror 2.0.21",
+ "time",
+ "uuid",
 ]
 
 [[package]]

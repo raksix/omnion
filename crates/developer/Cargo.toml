@@ -1,0 +1,24 @@
+[package]
+name = "omnion-developer"
+description = "Omnion developer portal: API keys, OAuth apps and the request log (REQ-022)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+hex.workspace = true
+# The key's own SHA-256 and the client's keyed fingerprint share one hash, and the fingerprint
+# needs a *key* (a pepper) so a log export cannot be reversed into an address list.
+hmac.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+# Constant-time hash comparison. Already in the tree via `crates/identity`; a `==` on a
+# digest is a timing oracle, because the token's public prefix is printed on the key list.
+subtle = "2"
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true

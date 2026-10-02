@@ -2139,3 +2139,354 @@ async fn an_opened_finding_reaches_a_receiver_as_an_identity_and_not_as_content(
 
     harness.dispose().await;
 }
+
+
+/// The two checks whose probe used to be a frozen `unknown` answer the policy they were meant
+/// to read: `csp_configured` and `rate_limiting`.
+///
+/// **The defect this walk was written for.** Both probes in `gather` returned a literal
+/// `Probe::unreadable("… configured in slice 2/3; nothing to verify yet")`. Slices 2 and 3
+/// **shipped**: `0135_security_headers.sql` creates and seeds `security_settings.headers`, and
+/// `0151_security_rate_limits.sql` adds `rate_limits` to the same singleton row, both of which
+/// the `/security/headers` and `/security/rate-limits` screens have been writing through for
+/// the whole of REQ-012. So `/security` reported *"`csp_configured`: Not checked yet — header
+/// policy is configured in slice 2; nothing to verify yet"*, with the row's own action link
+/// pointing at the page where the policy was plainly on screen. The score sat permanently
+/// depressed and the reason it gave was a slice number, which is the worst kind of wrong on a
+/// screen whose entire job is to be truthful.
+///
+/// **Why the row is not enough.** The response is computed from a freshly gathered environment
+/// *and* the last stored result (`to_overview` returns the stored row when one exists), so a
+/// response can report `pass` for a check whose stored row says `unknown`, and vice versa. Every
+/// assertion below therefore reads `security_check_results` **out of PostgreSQL** — the same
+/// rule as tick 105's manifest checksum, tick 106's `last_run_at` and REQ-010's purge walk: a
+/// route can compute a correct answer and never store it.
+///
+/// **The four states, and which of them are new.** `warn` for report-only was already
+/// reachable in the unit tests; what had never been reachable through a route was `pass`. The
+/// walk proves the whole ladder through the real endpoints, because "all scopes disabled" and
+/// "an enforcing policy" are the two states an operator actually produces, and a probe that can
+/// only answer one of them is half a check.
+///
+/// Every write goes through `PUT` as the operator, not SQL: the point is that the *panel's*
+/// action changes the answer, which is the whole claim. Writing the column directly would prove
+/// the query works and nothing about whether a person can fix the row.
+#[tokio::test]
+async fn a_saved_header_and_rate_policy_change_the_posture_row_that_used_to_be_frozen() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "Posture Probes").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        operator_id,
+        organization,
+        &["security.read", "security.manage", "security.scan"],
+    )
+    .await;
+
+    /// One check's **stored** row, read straight out of PostgreSQL.
+    ///
+    /// `store::latest_results` is exactly this query, so this is not a second implementation —
+    /// it is the read the route itself does, pointed at by key instead of enumerated.
+    async fn stored_state(
+        harness: &Harness,
+        organization: Uuid,
+        key: &str,
+    ) -> Option<(String, serde_json::Value)> {
+        let row: Option<(String, serde_json::Value)> = sqlx::query_as(
+            "select state, detail from security_check_results r \
+             where r.organization_id = $1 and r.check_key = $2 \
+               and r.id = (select newest.id from security_check_results newest \
+                           where newest.organization_id = $1 and newest.check_key = $2 \
+                           order by newest.checked_at desc, newest.id desc limit 1)",
+        )
+        .bind(organization)
+        .bind(key)
+        .fetch_optional(harness.db.pool())
+        .await
+        .expect("the stored posture row must be readable");
+        row
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The premise: with nothing ever saved, both checks must be `unknown` and must SAY why.
+    // Asserted before anything is written, because a walk that only checks the "after" would
+    // pass just as well if the probe answered `pass` unconditionally.
+    // -----------------------------------------------------------------------------------------
+    let first = harness
+        .call(post("/api/v1/security/checks/run", json!({}), Some(&operator)))
+        .await;
+    assert_eq!(
+        first.status,
+        StatusCode::OK,
+        "the first run must be recorded: {}",
+        first.text
+    );
+
+    // The premise is asserted rather than assumed, and **it is not `unknown`** — the first
+    // version of this walk assumed it was and failed with `left: "fail", right: "unknown"`,
+    // which is worth recording rather than papering over.
+    //
+    // A fresh install is not an unverified platform. Migrations `0135` and `0151` seed
+    // `security_settings` with `headers = {}` and `rate_limits = []`, and both readers treat an
+    // empty document as **the baseline**, deliberately: a missing settings row must never mean
+    // "send no headers" (`an_unreadable_document_falls_back_to_the_baseline_rather_than_to_no_headers`
+    // pins it). So the honest first-run answers are `warn` — the baseline CSP is report-only, so
+    // it reports and does not protect — and `pass` for the limiter, whose defaults are enabled.
+    //
+    // Both are real states with real reasons, and that is the point: the old frozen probe
+    // answered `unknown` for both, which is the one state that means *nobody knows*.
+    let (csp_state, csp_detail) = stored_state(&harness, organization, "csp_configured")
+        .await
+        .expect("the first run must have stored a row for csp_configured");
+    assert_eq!(
+        csp_state, "warn",
+        "the seeded baseline is a report-only policy of FOUR directives, so the first run must \
+         say so rather than claim a pass or hide behind `unknown`: {}",
+        first.text
+    );
+    // `detail.fact` is the probe's own value, which is where the count lives: the top level of
+    // `detail` is the sentence and the reason an operator reads, and reading the count out of
+    // it would be reading a UI field as if it were the store.
+    assert_eq!(
+        csp_detail["fact"]["directives"], 4,
+        "and the directive count must be the parsed policy's, not zero — the check read the \
+         count as an array once and reported `fail` with `no directives` on a platform whose \
+         baseline has four: {csp_detail}"
+    );
+    assert_eq!(
+        csp_detail["fact"]["mode"], "report_only",
+        "and the fact must name the mode the middleware will actually send: {csp_detail}"
+    );
+
+    let (rate_state, rate_first_detail) = stored_state(&harness, organization, "rate_limiting")
+        .await
+        .expect("the first run must have stored a row for rate_limiting");
+    assert_eq!(
+        rate_state, "pass",
+        "an empty limiter document resolves to the default policy, which is enabled — and a \
+         check that said `unknown` here was withholding a fact the platform had: {}",
+        first.text
+    );
+    assert!(
+        rate_first_detail["fact"]["enabled_scopes"]
+            .as_array()
+            .is_some_and(|scopes| !scopes.is_empty()),
+        "a passing rate-limit row must name the scopes it counted: {rate_first_detail}"
+    );
+
+    // -----------------------------------------------------------------------------------------
+    // Now the operator enforces a CSP through the panel's own endpoint.
+    // -----------------------------------------------------------------------------------------
+    let saved = harness
+        .call(put(
+            "/api/v1/security/headers",
+            json!({
+                "csp_mode": "enforce",
+                // `script-src` is not optional: `HeaderPolicy::new` refuses a policy without it
+                // ("a policy needs \"script-src\" or \"script-src-elem\""), and the first
+                // draft of this walk did exactly that and read the refusal as a bug. It was the
+                // fixture. A validator that holds here is the validator working.
+                "csp": [
+                    { "directive": "default-src", "values": ["'self'"] },
+                    { "directive": "script-src", "values": ["'self'"] },
+                ],
+                "hsts_max_age_seconds": 31_536_000,
+                "hsts_include_subdomains": true,
+                "hsts_preload": false,
+                "content_type_options": true,
+                "referrer_policy": "strict-origin-when-cross-origin",
+                "permissions_policy": ["camera=()"],
+            }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "the policy must be savable by the operator who holds the key: {}",
+        saved.text
+    );
+
+    // The second run's stored row is the assertion — not the response, and not the panel.
+    let second = harness
+        .call(post("/api/v1/security/checks/run", json!({}), Some(&operator)))
+        .await;
+    assert_eq!(
+        second.status,
+        StatusCode::OK,
+        "the second run must be recorded: {}",
+        second.text
+    );
+
+    let (csp_after, csp_after_detail) = stored_state(&harness, organization, "csp_configured")
+        .await
+        .expect("the second run must have stored a row for csp_configured");
+    assert_eq!(
+        csp_after, "pass",
+        "a policy this operator just enforced, read back out of the database, must be a `pass` — \
+         and for ever, not only after a restart"
+    );
+    assert_eq!(
+        csp_after_detail["fact"]["mode"], "enforce",
+        "the stored fact must be the policy the middleware will send, not the request's shape: \
+         {csp_after_detail}"
+    );
+    assert_eq!(
+        csp_after_detail["fact"]["directives"], 2,
+        "the directive count is read from the same parsed policy the header middleware builds, \
+         so the row cannot claim a policy the platform does not hold: {csp_after_detail}"
+    );
+
+    // -----------------------------------------------------------------------------------------
+    // And the honest middle: report-only is a `warn`, never a green row.
+    // -----------------------------------------------------------------------------------------
+    let report_only = harness
+        .call(put(
+            "/api/v1/security/headers",
+            json!({
+                "csp_mode": "report_only",
+                "csp": [
+                    { "directive": "default-src", "values": ["'self'"] },
+                    { "directive": "script-src", "values": ["'self'"] },
+                ],
+                "hsts_max_age_seconds": 31_536_000,
+                "hsts_include_subdomains": true,
+                "hsts_preload": false,
+                "content_type_options": true,
+                "referrer_policy": "strict-origin-when-cross-origin",
+                "permissions_policy": [],
+            }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        report_only.status,
+        StatusCode::OK,
+        "switching back to report-only must be savable: {}",
+        report_only.text
+    );
+    harness
+        .call(post("/api/v1/security/checks/run", json!({}), Some(&operator)))
+        .await;
+    let (csp_warn, _) = stored_state(&harness, organization, "csp_configured")
+        .await
+        .expect("the third run must have stored a row");
+    assert_eq!(
+        csp_warn, "warn",
+        "a header that only reports violations is not a policy, and a green row here is the \
+         over-claim this whole screen exists to prevent"
+    );
+
+    // -----------------------------------------------------------------------------------------
+    // The limiter, same three steps — and the state that had no writer at all: every scope off.
+    // -----------------------------------------------------------------------------------------
+    let all_scopes: Vec<Value> = omnion_security::RATE_SCOPES
+        .iter()
+        .map(|scope| {
+            json!({
+                "scope": scope,
+                "window_seconds": 60,
+                "limit": 600,
+                "burst": 0,
+                "enabled": *scope != "sign_in",
+            })
+        })
+        .collect();
+
+    let saved_limits = harness
+        .call(put(
+            "/api/v1/security/rate-limits",
+            json!(all_scopes),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        saved_limits.status,
+        StatusCode::OK,
+        "the limiter document must be savable: {}",
+        saved_limits.text
+    );
+    harness
+        .call(post("/api/v1/security/checks/run", json!({}), Some(&operator)))
+        .await;
+    let (rate_after, rate_detail) = stored_state(&harness, organization, "rate_limiting")
+        .await
+        .expect("the fourth run must have stored a row");
+    assert_eq!(
+        rate_after, "pass",
+        "four of five scopes enabled is a limiter that is limiting, read back out of the \
+         database"
+    );
+    assert_eq!(
+        rate_detail["fact"]["enabled_scopes"].as_array().map(Vec::len),
+        Some(4),
+        "the row must name the scopes it counted, so a wrong count is visible on the screen \
+         rather than inferred: {rate_detail}"
+    );
+
+    // The one that had no writer: a document with every scope disabled.
+    let none_enabled: Vec<Value> = omnion_security::RATE_SCOPES
+        .iter()
+        .map(|scope| {
+            json!({
+                "scope": scope,
+                "window_seconds": 60,
+                "limit": 600,
+                "burst": 0,
+                "enabled": false,
+            })
+        })
+        .collect();
+    let off = harness
+        .call(put(
+            "/api/v1/security/rate-limits",
+            json!(none_enabled),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        off.status,
+        StatusCode::OK,
+        "disabling every scope is a legal configuration and must be savable: {}",
+        off.text
+    );
+    harness
+        .call(post("/api/v1/security/checks/run", json!({}), Some(&operator)))
+        .await;
+    let (rate_off, rate_off_detail) = stored_state(&harness, organization, "rate_limiting")
+        .await
+        .expect("the fifth run must have stored a row");
+    assert_ne!(
+        rate_off, "pass",
+        "a limiter with every scope disabled is a limiter that is not limiting, and `pass` here \
+         is the single most expensive row on the screen"
+    );
+    assert_eq!(
+        rate_off, "fail",
+        "and the state is the failing one, not `unknown`: this platform read the document and \
+         knows exactly what it says: {rate_off_detail}"
+    );
+
+    // The last claim, and the one the whole walk exists for: **neither row may still be frozen.**
+    let mut still_frozen: Vec<&str> = Vec::new();
+    for key in ["csp_configured", "rate_limiting"] {
+        let Some((_, detail)) = stored_state(&harness, organization, key).await else {
+            continue;
+        };
+        let reason = detail.get("reason").and_then(Value::as_str).unwrap_or_default();
+        if reason.contains("nothing to verify yet") {
+            still_frozen.push(key);
+        }
+    }
+    assert!(
+        still_frozen.is_empty(),
+        "a check whose reason still names a slice as missing is a check that stopped reading the \
+         platform: {still_frozen:?}"
+    );
+
+    harness.dispose().await;
+}
