@@ -498,6 +498,43 @@ pub async fn get_log(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Overview
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/developer/overview` — the card row and the recent failures.
+///
+/// The whole body is one number set read in one snapshot (see `omnion_developer::overview`), so
+/// the route's own job is only to resolve the organization and hand back the answer. It does not
+/// add a retention field of its own: the retention window the screen prints comes from the same
+/// [`logs_store::window_days`] the log screen and the detail drawer use, so a screen cannot
+/// quote a window the table does not honour.
+pub async fn overview(
+    State(state): State<AppState>,
+    session: CurrentSession,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let organization_id = crate::scope::resolve_organization(&session, None)?;
+    let read = omnion_developer::overview::read(
+        state.db().pool(),
+        organization_id,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .map_err(map_store)?;
+
+    Ok(Json(json!({
+        "keys": {
+            "active": read.active_keys,
+            "expired": read.expired_keys,
+            "revoked": read.revoked_keys,
+        },
+        "requests_today": read.requests_today,
+        "errors_today": read.errors_today,
+        "recent_failures": read.recent_failures,
+        "log_retention_days": logs_store::window_days(),
+    })))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Shared
 // ---------------------------------------------------------------------------------------------
 
