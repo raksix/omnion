@@ -11504,3 +11504,71 @@ group is a harness fix, which by its own nature ticks nothing.
 **Next:** the re-run's `table-save-survives` reading — `clicked > 0` AND `inspected > 0` AND
 `builderSeesTableEdit: true`, the conjunction the criterion needs — then `edge-delete.removed` /
 `edge-delete-undo.restored` off the `eec3ad5d` label fix, which still has no live reading.
+
+## Tick 85 (wave3) — a field that said "the probe pressed the mouse" under the name "the click landed"
+
+`table-save-survives` could not be re-read this tick: the QA slot's holder is a **live w2 pass**
+(`kill -0 81156` and `81196` both alive, `/proc/<pid>/cwd` = `/mnt/apopic/omnion-w2`), so the pass was
+queued rather than run against a sibling's process. `/mnt/apopic` sat at 84% with 9.5 G free, which
+is where a pass that rebuilds `.next` dies. The tick went to work that needs no slot — and reading
+the `edge-delete` row to prepare that reading found a defect in it.
+
+**`hit: true` was a fact about the probe.** `edgeHit` was initialised `false` and assigned `true`
+immediately after `mouse.move/down/up`, inside a block whose only condition was `if (edgeScreenPoint)` —
+*a point could be measured at all*. So the field named "the click landed" meant "the mouse moved and
+the button went down". Ticks 78 and 79 each spent themselves on this row's `selected: false`, and
+both misread this number:
+
+* tick 78 read `hit: true, onEdge: true` as *the click was on the edge*;
+* tick 79 read `blockedBy: "text"` and needed `onEdge`'s help to reason about it.
+
+`onEdge` is the browser's own hit test at the measured point and is the only one of the three that
+means what its name says; `blockedBy` names that test's winner.
+
+Fixed (`c4cd1ccf`): `edgeHit = Boolean(edgeScreenPoint.onEdge)`. **The press stays unconditional**,
+which is the part worth writing down — guarding the press on `onEdge` would mean a probe that never
+presses at a point it already predicts will miss, and the miss branch is exactly where the evidence
+for "the curve is obstructed" comes from. A new `pressed` field separates "did not try" from "tried
+and missed", and both `edge-delete` notes now carry `onEdge` / `blockedBy` / `inViewport` beside the
+number.
+
+### The gate, and the two ways it lied first
+
+`scripts/qa/probe-edge-delete-claim.cjs`, 15 rules, exit 0 = pass.
+
+| what | command | result |
+|---|---|---|
+| harness gate | `node scripts/qa/probe-edge-delete-claim.cjs` | **15 passed, 0 failed** |
+| proven red | `QA_WALKTHROUGH_SRC=<pre-fix walkthrough.cjs> …` | **9 passed, 6 failed** — names *"`edgeHit` is derived from the hit test rather than the constant `true` (assigned `true` — that is a fact about the probe, not a reading of the edge)"* |
+| mutation 1 | `QA_EDGE_MUTANT=1 …` | **14 passed, 2 failed** on that same named assertion |
+| mutation 2 | `QA_EDGE_MUTANT=2 …` | **14 passed, 2 failed** — the evidence fields stripped from the note |
+| neighbours | `probe-only-filter` / `probe-hook-order` / `probe-pass-scope` | 33 / 2 / 10, all green |
+| syntax | `node --check scripts/qa/walkthrough.cjs` | clean |
+| types | `npx tsc --noEmit` (apps/admin) | exit 0 |
+
+**The gate was wrong three times before it was right, and both wrong shapes are the file's own theme.**
+
+1. It first demanded the press be **guarded** by `onEdge`. That is the wrong rule, and following it
+   would have pushed the fix towards not pressing at all — a probe that skips the press on a point it
+   predicts will miss can never produce the miss branch, so the row would go green on a pass that
+   could not report a miss. The rule now reads the assignment's **right-hand side** and fails on a
+   bare `true`; the press is separately pinned to still run.
+2. Its first mutation regex matched `const edgeHit = (?:let|const)…`, a shape the declaration has not
+   had since the fix. It matched **nothing**, and MUTANT 1 came back **15/15 green on a source that had
+   reverted the entire defect**. A mutation that does not apply is worse than no mutation: it is a
+   green line in the table that certifies nothing. The gate now asserts `before !== src` — that its
+   mutation actually changed the source — before it will trust any run.
+3. Its `step: "edge-delete"` alternation matched `edge-delete-undo` too, then a count of **two** notes
+   read the **three** real ones as a duplicate. It now distinguishes the three by their bodies
+   (selected branch / miss branch / undo), because a gate that measures only the branch which runs when
+   things work is the one-sided shape this REQ has now hit thirteen times.
+
+**Not ticked:** `edge-delete.removed` / `edge-delete-undo.restored` and `table-save-survives` both need
+a live reading; the slot is w2's. The criteria are unchanged by this commit — it fixes the instrument
+that was mis-measuring them.
+
+**Commits:** `54bdd629` (merge of `origin/main` through `6e8bd678`), `c4cd1ccf` (the row), pushed.
+
+**Next:** re-run `QA_STACK=w3 … --only=workflow-table,workflow-builder` the moment the slot is free,
+for `table-save-survives` (`clicked > 0` AND `inspected > 0` AND `builderSeesTableEdit: true`) off the
+`cc90c56a` starter fix, and `edge-delete.removed` / `edge-delete-undo.restored` off this tick's row.
