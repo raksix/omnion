@@ -1418,6 +1418,9 @@ dependencies = [
 name = "omnion-ai-hub"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "rand 0.8.8",
  "regex",
  "reqwest",
  "serde",
