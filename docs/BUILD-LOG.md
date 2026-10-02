@@ -7722,3 +7722,70 @@ The screen-states box stays open for that reason and **not** for a defect in the
 
 **Next:** the browser pass on a free slot with `--only=backups`, then the four-frequency
 schedules form (the only REQ-013 code item left), and the walkthrough criterion.
+
+---
+
+## Tick 106 — REQ-013 · the four frequencies, and a column the operator's own button never wrote
+
+**What.** Two slices, both on the schedule bookkeeping.
+
+1. **`fix(backups)` (`810a65f7`)** — `POST /api/v1/backup-schedules/{id}/run` produced a real
+   backup tied to the schedule, and the schedule's own `last_run_at` stayed null, so the panel's
+   last-run column read **"never"** beside the run it had just produced. Only the unattended
+   worker wrote those two columns. `record_schedule_run` now takes `Option<OffsetDateTime>` and
+   writes `next_run_at = coalesce($3, next_run_at)` — **one statement, so it cannot half-apply** —
+   the worker passes `Some(next)` and rearms, the manual path passes `None` and leaves the slot
+   alone. An operator testing a 03:00 schedule at 09:00 has not consumed tomorrow's 03:00.
+2. **`test(backups)` (`52a7b3fd`)** — `all_four_frequencies_save_and_compute_a_next_run_of_their_own_shape`.
+
+**The defect the criterion was claiming and nobody had proved.** The box has read *"all four
+frequencies"* since it was written. The walk behind it created **exactly one schedule and it was
+`daily`**. `hourly`, `weekly` and `monthly` had never been through the router. The 18 unit tests in
+`cadence.rs` cover all four — they are the reason the DST round-tripping exists — but they never
+touch `upsert_schedule`, which is where a frequency's own fields are written.
+
+**Three assertions the pure tests could not have made:**
+
+* **The column, not the response.** `upsert_schedule` and `set_schedule_next_run` are two
+  statements. A route that computed a correct next run and failed to store it answers perfectly
+  and never fires — the exact defect the previous half of this criterion was about.
+* **The shape of the answer per frequency.** `hourly` lands on `(minute, second) == (0, 0)`;
+  `weekly` with `day_of_week = 3` lands on a **Wednesday**; `monthly` on the 28th lands on the
+  **28th**. A route that stored both as `daily` returns a plausible future instant for all four
+  calls. Each frequency's own column must also be populated **only** where the schema says it
+  belongs, or the editor opens on defaults.
+* **Four due schedules in one tick.** The old walk could not catch a worker claiming one per tick,
+  because it only ever had one due. Now: four runs, each with **exactly one** run of its own
+  (`schedule_id AND organization_id` — a worker tying every run to the last row read would point
+  all four at one backup while the counts still read four), each `last_backup_id` equal to the run
+  it produced (**the manual-run defect above, reappearing on the unattended path**), and a second
+  tick starting **zero** — a worker leaving the column in the past takes four more backups a minute
+  later, and a nightly schedule running every minute fills the destination by morning.
+
+**The tree I inherited had a syntax error in it.** The previous tick's run was interrupted after
+writing the manual-run walk, and its assertion message contained `\\"` inside a Rust string
+literal, which terminates the literal. No compiler had been run against the file. Fixed; it is
+now in `52a7b3fd`.
+
+**Gates, all run this tick:**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-backup --lib --quiet` | **185 passed**, 0 failed |
+| build | `cargo build -p omnion-api` | exit 0 (pre-existing warnings only) |
+| compile | `cargo test -p omnion-api --test backups --no-run` | exit 0 |
+| walk | `cargo test -p omnion-api --test backups all_four_frequencies` | **1 passed** in 9.4 s, fresh database, `--nocapture` |
+| proven to fail | `fires_on`'s `weekly` arm regressed to `true` | **FAILED** — `left: Saturday, right: Wednesday` |
+
+The regression is the interesting one: it is a **weekly schedule silently behaving as a daily
+one**, which is the exact class the criterion asks about and which no amount of green unit tests
+in the cadence module could have surfaced.
+
+**Not run: the browser pass.** The shared QA slot was held live by `w4` when this tick began
+(`/tmp/omnion-qa-slot-holders`, verified with `kill -0` and `/proc/<pid>/cwd`). The box had also
+just rebooted — `omnion-postgres` spent ~13 minutes in post-reboot fsync, which is where the
+fresh test database went. The walkthrough criterion stays open for that reason and not for a
+defect in the code.
+
+**Next:** the browser pass with `--only=backups` on a free slot, then the status-card browser
+tick and the walkthrough criterion.
