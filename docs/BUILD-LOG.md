@@ -13604,3 +13604,30 @@ throwaway database directly. (The binary is already built.)
 `QA_STACK=w4 QA_ONLY=crm QA_HIGH_FAIL_ON=0 bash scripts/qa/run.sh` with a wait above the queue, then
 REQ-051 `done` — or a tick that names which of the three browser-only boxes could not be produced, and
 why.
+
+**The CRM walks, re-run as tick 75 asked — 57/57 GREEN.** The queued browser pass could not produce
+artifacts (`error: failed to write …/target/debug/deps/libomnion_api-*.rmeta: No such file or
+directory` — the same disk), but the walks are the half that does not need a slot:
+
+```
+createdb omnion_w4_x_crm                                     (a throwaway, not the stack's database)
+OMNION_DATABASE_URL=…/omnion_w4_x_crm /dev/shm/w4-target/debug/deps/crm-* --test-threads=1
+  → test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 347.81s
+dropdb omnion_w4_x_crm
+```
+
+**And the disk-guard lesson, which cost this tick about twenty minutes.** `scripts/qa/disk-guard.sh`
+documents this exact trap in its own header: it decides a target is reclaimable from the *environment*
+of the processes writing into it, and a plain `cargo build` in a worktree takes the **default** target
+with no `CARGO_TARGET_DIR` to read — so the guard deleted **14 GB out from under two builds and a QA
+pass**, twice, with `…/query-cache.bin: os error 2` and `…/libomnion_api-*.rmeta: No such file or
+directory`. The file's own advice is the fix: **build with `CARGO_TARGET_DIR` on tmpfs**
+(`/dev/shm/w4-target`, with `CARGO_INCREMENTAL=0` because `/mnt/apopic` is at 94% and the box has
+seven writers). The build then completed with the guard unable to touch it, and the walk ran from
+there. **A build that a reclaimer deletes is not a flaky build** — check `df` and the guard's
+`WORKTREE_TARGET_MAX_MB` before reading anything into the error's own file name.
+
+**Still not claimed.** The three browser-only boxes (empty/loading/error states, mobile 390×844,
+keyboard) remain unticked: the pass needs the slot plus a target the guard will not delete, and both
+were unavailable this tick. `QA_SLOT_WAIT=3600` was the right call — the earlier 2400 s waits expired
+with **zero artifacts**, which is a run that proved nothing.
