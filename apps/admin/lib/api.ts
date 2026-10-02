@@ -15,6 +15,17 @@ import type {
   HeaderPolicyDocument,
   HeaderPolicySave,
   HeaderPolicySaved,
+  LockedAccountsPage,
+  LockoutPolicy,
+  RateLimitScope,
+  RateLimitsDocument,
+  RateLimitsSave,
+  RateLimitsSaved,
+  RateLimitTestRequest,
+  RateLimitTestResponse,
+  SignInProtectionDocument,
+  SignInProtectionSave,
+  SignInProtectionSaved,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   WebhookEndpoint,
@@ -25,6 +36,12 @@ import type {
   WebhookTestReport,
   CreatedMediaShare,
   EventCatalogue,
+  GraphDocument,
+  GraphRead,
+  GraphSaved,
+  GraphValidated,
+  ExpressionPreviewed,
+  ExpressionCompleted,
   EventFilters,
   EventPage,
   RetentionStatus,
@@ -73,6 +90,28 @@ import type {
   NotificationChannelReadiness,
   NotificationDevice,
   NotificationFilters,
+  NodeCategory,
+  NodeType,
+  NodeTypeFilters,
+  NodeTypePage,
+  CredentialType,
+  CredentialTypePage,
+  // Credential instances (REQ-087 slice 2). `Credential` is the masked read; there is no type
+  // here for a secret value because the API has no endpoint that returns one.
+  Credential,
+  CredentialDeleteResult,
+  CredentialFilters,
+  CredentialPage,
+  CredentialTestResult,
+  CredentialUsage,
+  NewCredential,
+  NodePackage,
+  NodePackageInstall,
+  NodePackagePage,
+  NodePackageRemoval,
+  NodePackageToggle,
+  PortKindCatalogue,
+  RegistryLint,
   NotificationOutbox,
   NotificationPage,
   NotificationPreferences,
@@ -3553,17 +3592,6 @@ export type IamProvisioningToken = {
   last_used_at: string | null;
   revoked_at: string | null;
   created_at: string;
-  /** When the token stops being accepted; null only for tokens minted before expiry existed. */
-  expires_at: string | null;
-  /** Set when a newer token replaced this one. */
-  rotated_at: string | null;
-  /**
-   * Computed by the API, not by the client. A panel that compares timestamps in the browser
-   * disagrees with the server by the viewer's timezone and its clock, and an expired token that
-   * still reads as live is the one thing this screen must never show.
-   */
-  expired: boolean;
-  rotated: boolean;
 };
 
 /** One line of the SCIM sync log. */
@@ -3577,13 +3605,6 @@ export type IamSyncLogEntry = {
   action: string;
   outcome: string;
   detail: string;
-  /**
-   * Live sessions this line ended (`0126`). Always a number: 0 means the line revoked nothing,
-   * which is the true answer for a create or a group write. The panel must not re-parse `detail`
-   * to get this — the sentence in `detail` is for a reader, and two consumers parsing it
-   * differently is how a security panel ends up quoting a wrong figure to somebody leaving.
-   */
-  revoked_sessions: number;
   created_at: string;
 };
 
@@ -3599,32 +3620,14 @@ export function fetchIamProvisioningTokens(
 export function createIamProvisioningToken(input: {
   name?: string;
   organizationId?: string | null;
-  /** Lifetime in days; omitted means the server's default rather than "never expires". */
-  expiresInDays?: number;
 }): Promise<{ token: IamProvisioningToken; secret: string }> {
   return request("/api/v1/iam/provisioning/tokens", {
     method: "POST",
     body: JSON.stringify({
       name: input.name ?? "",
       ...(input.organizationId ? { organization_id: input.organizationId } : {}),
-      ...(input.expiresInDays !== undefined ? { expires_in_days: input.expiresInDays } : {}),
     }),
   });
-}
-
-/**
- * Rotate a token: the old secret stops working and a new one is returned, shown once.
- *
- * `replaced` is re-read from the database rather than echoing the pre-rotation row, so the panel
- * can render "replaced by" without contradicting the list it refreshes into.
- */
-export function rotateIamProvisioningToken(id: string): Promise<{
-  rotated: boolean;
-  replaced: IamProvisioningToken;
-  token: IamProvisioningToken;
-  secret: string;
-}> {
-  return request(`/api/v1/iam/provisioning/tokens/${id}`, { method: "POST" });
 }
 
 /** Revoke a token. */
@@ -3660,7 +3663,7 @@ export type IamAuthProvider = {
   id: string;
   organization_id: string;
   slug: string;
-  kind: "oidc" | "oauth2" | "saml" | "ldap" | "active_directory";
+  kind: "oidc" | "oauth2" | "saml";
   name: string;
   config: Record<string, unknown>;
   secret_ref: string | null;
@@ -3670,19 +3673,6 @@ export type IamAuthProvider = {
   default_role_id: string | null;
   jit_enabled: boolean;
   enabled: boolean;
-  /**
-   * `null` on `last_test_ok` is *never tested* — a third state, not a failure. The chip renders
-   * it differently because a brand-new provider and a broken one call for different actions.
-   */
-  last_test_at: string | null;
-  last_test_ok: boolean | null;
-  /** 0 means "not on a schedule", which is a real choice for an interactive-only directory. */
-  sync_interval_minutes: number;
-  last_sync_at: string | null;
-  last_sync_status: "ok" | "partial" | "failed" | null;
-  plugin_key: string | null;
-  /** Derived by the server, so the list and the drawer can never disagree about it. */
-  status: "enabled" | "disabled" | "degraded";
   created_at: string;
   updated_at: string;
   sign_in_count: number;
@@ -3700,45 +3690,15 @@ export type IamProviderEvent = {
   created_at: string;
 };
 
-/**
- * One step of a directory connection test.
- *
- * The ladder is the answer, not a decoration on one: a directory fails at exactly one of these
- * and "connection failed" leaves an operator with nothing to act on.
- */
-export type IamTestStep = {
-  step: "dns" | "tcp" | "tls" | "bind" | "search" | "attributes";
-  status: "pending" | "ok" | "failed";
-  detail: string;
-};
-
-/** A configuration problem, attached to the field the wizard should underline. */
-export type IamTestProblem = {
-  field: string;
-  message: string;
-  kind: "missing" | "invalid" | "conflict";
-};
-
-/**
- * The answer of a connection test. A failed test is a `200`, not a transport error.
- *
- * `status` is three-valued on purpose: `incomplete` means the form is sound and nothing has
- * asked the directory anything yet, which is NOT a pass and does not unlock the enable button.
- */
+/** The answer of the discovery test — a failed test is a `200` with `status: "failed"`. */
 export type IamProviderTest = {
   provider_id: string;
   slug: string;
-  kind: "oidc" | "oauth2" | "saml" | "ldap" | "active_directory";
-  status: "ok" | "failed" | "incomplete";
+  kind: "oidc" | "oauth2" | "saml";
+  status: "ok" | "failed";
   detail: string;
   endpoints?: Record<string, unknown> | null;
   secret_present: boolean;
-  /**
-   * The step ladder, for every kind. A directory walks six checks and a protocol provider walks
-   * four; the two sets differ, the shape does not, so the panel renders one list.
-   */
-  steps?: IamTestStep[] | null;
-  problems?: IamTestProblem[] | null;
 };
 
 /** The provider list, with the kinds the form offers. */
@@ -3747,13 +3707,7 @@ export function fetchIamProviders(
 ): Promise<{
   organization_id: string;
   providers: IamAuthProvider[];
-  kinds: {
-    value: string;
-    label: string;
-    default_scopes: string[];
-    /** A directory is configured and proved differently, so the form branches on this. */
-    family: "protocol" | "directory";
-  }[];
+  kinds: { value: string; label: string; default_scopes: string[] }[];
 }> {
   const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
   return request(`/api/v1/iam/providers${query}`);
@@ -3770,7 +3724,6 @@ export function createIamProvider(input: {
   groupClaim?: string | null;
   jitEnabled?: boolean;
   organizationId?: string | null;
-  syncIntervalMinutes?: number | null;
 }): Promise<IamAuthProvider> {
   return request("/api/v1/iam/providers", {
     method: "POST",
@@ -3784,9 +3737,6 @@ export function createIamProvider(input: {
       ...(input.groupClaim ? { group_claim: input.groupClaim } : {}),
       ...(typeof input.jitEnabled === "boolean" ? { jit_enabled: input.jitEnabled } : {}),
       ...(input.organizationId ? { organization_id: input.organizationId } : {}),
-      ...(typeof input.syncIntervalMinutes === "number"
-        ? { sync_interval_minutes: input.syncIntervalMinutes }
-        : {}),
     }),
   });
 }
@@ -3802,7 +3752,6 @@ export function updateIamProvider(
     groupClaim?: string | null;
     jitEnabled?: boolean;
     enabled?: boolean;
-    syncIntervalMinutes?: number;
   },
 ): Promise<IamAuthProvider> {
   return request(`/api/v1/iam/providers/${id}`, {
@@ -3824,113 +3773,9 @@ export function deleteIamProvider(id: string): Promise<null> {
   return request(`/api/v1/iam/providers/${id}`, { method: "DELETE" });
 }
 
-/** One account the deletion would take away, as the dialog shows it. */
-export type IamDeletionAccount = {
-  user_id: string;
-  email: string;
-  /** Which system owns the account: `local`, `sso`, `scim`, … */
-  source: string;
-  /** What the directory calls it, when it has said. */
-  external_id: string | null;
-};
-
-/** One row of the per-source breakdown. */
-export type IamDeletionSourceCount = {
-  source: string;
-  count: number;
-};
-
-/**
- * What removing this provider would do, read *before* the button is pressed.
- *
- * `by_source` is carried alongside the total rather than instead of it, and the panel adds it up
- * in front of the operator: "7 accounts" is a number to wave through, "7 accounts: 5 LDAP, 2
- * SCIM" says a directory sweep created these people. `unknown_sources` is why a total that does
- * not add up is still renderable — a source string a newer migration wrote must not leave the
- * dialog showing a number it cannot account for.
- */
-export type IamProviderDeletionImpact = {
-  provider_id: string;
-  slug: string;
-  affected_accounts: number;
-  by_source: IamDeletionSourceCount[];
-  /** A bounded sample, not the whole set: a directory of 4000 people must not render 4000 rows. */
-  accounts: IamDeletionAccount[];
-  unknown_sources: boolean;
-  /** `true` when the delete would be refused, so the panel never re-derives the rule itself. */
-  blocked: boolean;
-};
-
-/**
- * Read the deletion impact.
- *
- * Separate from the delete on purpose. A dialog that discovers the block only after the click is
- * a dialog that failed, and the refusal it would then show arrives as an error body rather than
- * as the answer to a question somebody asked.
- */
-export function fetchIamProviderDeletionImpact(id: string): Promise<IamProviderDeletionImpact> {
-  return request(`/api/v1/iam/providers/${id}/deletion-impact`);
-}
-
-/**
- * The answer of a reassignment: four numbers, and the caller shows them rather than the count
- * they asked for.
- *
- * `requested` is what the button sent, `reassigned` is what the update actually moved. A batch
- * that named a local account and another tenant's account is a batch of two, and printing
- * "4 reassigned" would be the lie. `not_moved` is always zero today and is carried anyway —
- * an update reporting fewer rows than the scope query matched means something moved
- * concurrently, and a caller that could not see the difference would report a success one
- * account short.
- */
-export type IamProviderReassignResult = {
-  requested: number;
-  reassigned: number;
-  not_moved: number;
-  skipped: number;
-};
-
-/**
- * Fall accounts back to local sign-in — the action the refusal tells the operator to take.
- *
- * Every id is checked against the caller's organization *and* the provider's, so a batch cannot
- * quietly take an account from a different tenant that happens to be in the list; an id from
- * elsewhere comes back in `skipped` instead.
- */
-export function reassignIamProviderAccounts(
-  id: string,
-  userIds: string[],
-): Promise<IamProviderReassignResult> {
-  return request(`/api/v1/iam/providers/${id}/reassign`, {
-    method: "POST",
-    body: JSON.stringify({ user_ids: userIds }),
-  });
-}
-
 /** Ask the provider what it actually is. A broken provider is a result, not a transport error. */
 export function testIamProvider(id: string): Promise<IamProviderTest> {
   return request(`/api/v1/iam/providers/${id}/test`, { method: "POST" });
-}
-
-/**
- * Switch a provider on. Refused with `provider_not_ready` until a test has passed — which is why
- * this is a verb of its own rather than a PATCH, and why the button stays disabled until then.
- */
-export function enableIamProvider(id: string): Promise<{
-  id: string;
-  enabled: boolean;
-  gate_passed: boolean;
-}> {
-  return request(`/api/v1/iam/providers/${id}/enable`, { method: "POST" });
-}
-
-/** Switch a provider off. Never gated: stopping something broken must always be possible. */
-export function disableIamProvider(id: string): Promise<{
-  id: string;
-  enabled: boolean;
-  gate_passed: boolean;
-}> {
-  return request(`/api/v1/iam/providers/${id}/disable`, { method: "POST" });
 }
 
 /** A provider's sign-in log, newest first. */
@@ -3945,337 +3790,12 @@ export function fetchIamProviderEvents(
   return request(`/api/v1/iam/providers/${id}/events${query ? `?${query}` : ""}`);
 }
 
-// ---------------------------------------------------------------------------------------------
-// The sync ledger (REQ-065, slice 4 part 2)
-// ---------------------------------------------------------------------------------------------
-
-/**
- * One sync run, as the ledger lists it.
- *
- * `healthy` is carried separately from `status` because the panel must not colour a `partial`
- * run green: a sweep that created forty accounts and refused three people is the failure this
- * screen exists to surface, and a boolean derived from the counters would hide exactly that.
- * `duration_seconds` is `null` while a run is still going — never "time so far", which renders a
- * slow run as permanently unfinished.
- */
-export type IamSyncRun = {
-  id: string;
-  provider_id: string;
-  kind: "full" | "delta" | "scim" | "manual";
-  status: "running" | "ok" | "partial" | "failed";
-  healthy: boolean;
-  started_at: string;
-  finished_at: string | null;
-  duration_seconds: number | null;
-  counts: {
-    users_seen: number;
-    users_created: number;
-    users_updated: number;
-    users_deactivated: number;
-    groups_seen: number;
-  };
-  error_count: number;
-  message: string | null;
-  triggered_by: string | null;
-};
-
-/** One subject a run could not process, however many attempts it took. */
-export type IamFailedSubject = {
-  key: string;
-  attempts: number;
-  code: string;
-  message: string;
-  last_failed_at: string;
-};
-
-/** A provider's runs, newest first, with the counts the header shows. */
-export function fetchIamSyncRuns(
-  id: string,
-  input: { limit?: number; problemsOnly?: boolean } = {},
-): Promise<{
-  provider_id: string;
-  sync_interval_minutes: number;
-  summary: { runs: number; problems: number; running: number };
-  runs: IamSyncRun[];
-}> {
-  const params = new URLSearchParams();
-  if (input.limit) params.set("limit", String(input.limit));
-  if (input.problemsOnly) params.set("problems_only", "true");
-  const query = params.toString();
-  return request(`/api/v1/iam/providers/${id}/sync-runs${query ? `?${query}` : ""}`);
-}
-
-/**
- * One run and the subjects it could not process.
- *
- * `attempts` and `subjects` are separate on purpose: three honest failures of one person are
- * three rows underneath and one row to act on. Collapsing either direction produces a screen
- * that looks right and is not.
- */
-export function fetchIamSyncRun(
-  id: string,
-  runId: string,
-): Promise<{
-  run: IamSyncRun;
-  attempts: number;
-  failed_subjects: IamFailedSubject[];
-}> {
-  return request(`/api/v1/iam/providers/${id}/sync-runs/${runId}`);
-}
-
-/**
- * Re-attempt named subjects. The names are required: an empty list would mean every subject that
- * ever failed, which is not what the button says.
- */
-export function retryIamSyncRun(
-  id: string,
-  runId: string,
-  subjects: string[],
-): Promise<{ retry_run_id: string; source_run_id: string; subjects: string[] }> {
-  return request(`/api/v1/iam/providers/${id}/sync-runs/${runId}/retry`, {
-    method: "POST",
-    body: JSON.stringify({ subjects }),
-  });
-}
-
-/** The groups a sync has seen, with the two values that go stale quietly. */
-export function fetchIamSyncGroups(
-  id: string,
-): Promise<{
-  provider_id: string;
-  summary: { groups: number; unsynced: number };
-  groups: {
-    id: string;
-    external_id: string;
-    external_label: string;
-    member_count: number;
-    last_seen_at: string;
-    synced: boolean;
-  }[];
-}> {
-  return request(`/api/v1/iam/providers/${id}/sync-groups`);
-}
-
-// ---------------------------------------------------------------------------------------------
-// The attribute map (REQ-065, slice 2)
-// ---------------------------------------------------------------------------------------------
-
-/** One row of a provider's attribute map. */
-export type IamAttributeMapping = {
-  source_attr: string;
-  target_field: string;
-  transform: string;
-  /** Whether the transform needs an argument — the server says so, the client does not guess. */
-  needs_argument: boolean;
-  transform_arg: string | null;
-  required: boolean;
-  position: number;
-};
-
-/** One transform, with the hint the picker shows. */
-export type IamTransform = { name: string; needs_argument: boolean; hint: string };
-
-/**
- * The map, plus the catalogue the editor renders itself from.
- *
- * The pickers are built from `target_fields` and `transforms` rather than from constants here, so
- * adding a field to the server does not leave this screen offering an option that is then
- * refused — the failure an operator reads as "the panel is broken".
- */
-export type IamAttributeMap = {
-  provider_id: string;
-  mappings: IamAttributeMapping[];
-  target_fields: string[];
-  transforms: IamTransform[];
-  problems: IamTestProblem[];
-};
-
-/**
- * The result of running the map against a pasted sample.
- *
- * `ok: false` with a non-empty `missing` is the important case: it is what a real sign-in would
- * do, which is why this endpoint runs the sign-in function rather than a display-only one.
- */
-export type IamAttributePreview = {
-  provider_id: string;
-  ok: boolean;
-  values: { field: string; value: string }[];
-  missing: string[];
-  unused: string[];
-  rows: {
-    source_attr: string;
-    target_field: string;
-    transform: string;
-    transform_arg: string | null;
-    raw: string | null;
-    value: string | null;
-    required: boolean;
-  }[];
-  problems: IamTestProblem[];
-};
-
-/** The provider's map, with the field and transform catalogues. */
-export function fetchIamAttributeMap(id: string): Promise<IamAttributeMap> {
-  return request(`/api/v1/iam/providers/${id}/attribute-mappings`);
-}
-
-/**
- * Replace the whole map. A PUT and not a row-at-a-time POST because a partially applied map is
- * the failure that matters: an email row that never landed refuses real sign-ins for a reason
- * nobody can see from the panel.
- */
-export function saveIamAttributeMap(
-  id: string,
-  mappings: IamAttributeMapping[],
-): Promise<IamAttributeMap> {
-  return request(`/api/v1/iam/providers/${id}/attribute-mappings`, {
-    method: "PUT",
-    body: JSON.stringify({ mappings }),
-  });
-}
-
-/** Run the map against a pasted sample. Writes nothing and creates no account. */
-export function previewIamAttributeMap(
-  id: string,
-  sample: unknown,
-): Promise<IamAttributePreview> {
-  return request(`/api/v1/iam/providers/${id}/attribute-mappings/preview`, {
-    method: "POST",
-    body: JSON.stringify({ sample }),
-  });
-}
-
-/** One rule, as the editor reads it. */
-export type IamRoleRule = {
-  id: string | null;
-  position: number;
-  when_kind: string;
-  needs_key: boolean;
-  when_key: string;
-  when_operator: string;
-  when_value: string;
-  role_id: string;
-  scope_type: string;
-  site_id: string | null;
-  stop: boolean;
-  enabled: boolean;
-};
-
-/** A picker option the server sent, so the client never hard-codes a vocabulary. */
-export type IamRuleOption = { name: string; hint: string; needs_key?: boolean; needs_site?: boolean };
-
-/** The provider's role rules, with the kind/operator/scope catalogues. */
-export type IamRoleRules = {
-  provider_id: string;
-  rules: IamRoleRule[];
-  when_kinds: IamRuleOption[];
-  when_operators: IamRuleOption[];
-  scope_types: IamRuleOption[];
-  default_role_id: string | null;
-  problems: IamTestProblem[];
-};
-
-/**
- * The result of walking the rules against a sample.
- *
- * `trace` is the reason this is worth showing rather than just the role: a rule that did not fire
- * carries the values it read, so "matched nothing" and "read nothing" — different bugs with
- * different fixes — are visibly different.
- */
-export type IamRoleRuleDryRun = {
-  provider_id: string;
-  role_id: string | null;
-  reason: string;
-  matched_rule_index: number | null;
-  sample_email: string;
-  sample_groups: string[];
-  trace: {
-    index: number;
-    label: string;
-    when_kind: string;
-    when_key: string;
-    when_operator: string;
-    when_value: string;
-    role_id: string;
-    scope_type: string;
-    read: string[];
-    matched: boolean;
-    verdict: "matched" | "no_match" | "not_reached" | "disabled";
-  }[];
-  problems: IamTestProblem[];
-};
-
-export function fetchIamRoleRules(id: string): Promise<IamRoleRules> {
-  return request(`/api/v1/iam/providers/${id}/role-rules`);
-}
-
-/**
- * Replace the whole rule set in one PUT. The order is the semantics, so a save that applies rows
- * one at a time would let a sign-in land between the delete and the insert and see an empty set.
- */
-export function saveIamRoleRules(
-  id: string,
-  rules: IamRoleRule[],
-): Promise<IamRoleRules> {
-  return request(`/api/v1/iam/providers/${id}/role-rules`, {
-    method: "PUT",
-    body: JSON.stringify({ rules }),
-  });
-}
-
-/** Dry-run a pasted identity against the *stored* rules. Writes nothing. */
-export function dryRunIamRoleRules(
-  id: string,
-  sample: unknown,
-): Promise<IamRoleRuleDryRun> {
-  return request(`/api/v1/iam/providers/${id}/role-rules/preview`, {
-    method: "POST",
-    body: JSON.stringify({ sample }),
-  });
-}
-
 /** The providers a person may sign in with — the public list the sign-in screen renders. */
 export function fetchSsoProviders(): Promise<{
   organization_id: string;
   providers: { slug: string; name: string; kind: string; start_url: string }[];
 }> {
   return request("/api/v1/auth/sso/providers");
-}
-
-/** What a bulk provider action did to one provider. */
-export type IamProviderBulkRow = {
-  id: string;
-  slug: string;
-  enabled: boolean | null;
-  error?: string;
-  message?: string;
-};
-
-/**
- * The answer of a bulk enable/disable.
- *
- * `results` is one row per **requested** id — a refusal is a row with a code, never a hole, so
- * the panel can render "3 switched on, 2 need a passing test" from the same list that carries
- * the slugs. `missing` is separate because a provider in another tenant is not a gate refusal
- * and must not be counted as one.
- */
-export type IamProviderBulkResult = {
-  action: string;
-  results: IamProviderBulkRow[];
-  applied: number;
-  refused: number;
-  missing: string[];
-};
-
-/** Switch several providers on or off in one request. */
-export function bulkIamProviders(
-  action: "enable" | "disable",
-  ids: string[],
-): Promise<IamProviderBulkResult> {
-  return request("/api/v1/iam/providers/bulk", {
-    method: "POST",
-    body: JSON.stringify({ action, ids }),
-  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4638,7 +4158,231 @@ export function emitNotification(input: {
     body: JSON.stringify(input),
   });
 }
+// ---------------------------------------------------------------------------------------------
+// Node library and credential catalogue (REQ-087 slice 1)
+// ---------------------------------------------------------------------------------------------
+/** Build the node-type query string; an empty filter is left out, never sent as an empty value. */
+function nodeTypeQuery(filters: NodeTypeFilters): string {
+  const params = new URLSearchParams();
+  if (filters.search) params.set("search", filters.search);
+  if (filters.category) params.set("category", filters.category);
+  if (filters.capability) params.set("capability", filters.capability);
+  if (filters.include_deprecated === false) params.set("deprecated", "false");
+  if (filters.credential !== undefined) params.set("credential", String(filters.credential));
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+/** The node library, filtered. `matched` and `total` come from the server, not from this list. */
+export async function fetchNodeTypes(filters: NodeTypeFilters = {}): Promise<NodeTypePage> {
+  return request<NodeTypePage>(`/api/v1/node-types${nodeTypeQuery(filters)}`);
+}
+/** One node definition, in full. */
+export async function fetchNodeType(key: string): Promise<NodeType> {
+  return request<NodeType>(`/api/v1/node-types/${encodeURIComponent(key)}`);
+}
+/** The palette's category tree, with its counts. */
+export async function fetchNodeCategories(): Promise<{ categories: NodeCategory[] }> {
+  return request<{ categories: NodeCategory[] }>("/api/v1/node-types/categories");
+}
+/** The registry's own lint, as the running server sees it. */
+export async function fetchRegistryLint(): Promise<RegistryLint> {
+  return request<RegistryLint>("/api/v1/node-types/lint");
+}
+/** The credential catalogue with every field schema. */
+export async function fetchCredentialTypes(): Promise<CredentialTypePage> {
+  return request<CredentialTypePage>("/api/v1/credential-types");
+}
+/** One credential type, in full. */
+export async function fetchCredentialType(key: string): Promise<CredentialType> {
+  return request<CredentialType>(`/api/v1/credential-types/${encodeURIComponent(key)}`);
+}
+/** The three port kinds and what each means. */
+export async function fetchPortKinds(): Promise<PortKindCatalogue> {
+  return request<PortKindCatalogue>("/api/v1/port-kinds");
+}
+/* ------------------------------------------------------------------ *
+ * Credential instances (REQ-087, slice 2)
+ * ------------------------------------------------------------------ */
 
+/**
+ * `?organization_id=…` for a read route, or an empty string.
+ *
+ * Every credential read resolves its organization with `None` on the server unless the client
+ * names one, so a platform account — which has no primary organization of its own — is refused
+ * `organization_required` before a single row is read. The suffix is empty for a tenant, whose
+ * own organization the server already knows.
+ */
+function scopeSuffix(organizationId?: string | null): string {
+  return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+}
+
+/**
+ * Build the query string of a credential read.
+ *
+ * `organizationId` rides along for a platform account. It is not a filter: a tenant's call is
+ * byte-for-byte unchanged without it, and a platform account that omits it is refused
+ * `organization_required` — the refusal has nothing to do with credentials, and it happens
+ * before the list is read.
+ */
+function credentialQuery(filters: CredentialFilters, organizationId?: string | null): string {
+  const params = new URLSearchParams();
+  if (organizationId) params.set("organization_id", organizationId);
+  if (filters.search) params.set("search", filters.search);
+  if (filters.type) params.set("type", filters.type);
+  if (filters.scope) params.set("scope", filters.scope);
+  if (filters.health) params.set("health", filters.health);
+  if (filters.sharing) params.set("sharing", filters.sharing);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+/** The credential list. */
+export async function fetchCredentials(
+  filters: CredentialFilters = {},
+  organizationId?: string | null,
+): Promise<CredentialPage> {
+  return request<CredentialPage>(`/api/v1/credentials${credentialQuery(filters, organizationId)}`);
+}
+/** One credential, masked. */
+export async function fetchCredential(
+  id: string,
+  organizationId?: string | null,
+): Promise<Credential> {
+  return request<Credential>(
+    `/api/v1/credentials/${encodeURIComponent(id)}${scopeSuffix(organizationId)}`,
+  );
+}
+/** Create one. Secrets ride in `secrets[]` and are never sent anywhere else. */
+export async function createCredential(
+  input: NewCredential,
+  organizationId?: string | null,
+): Promise<Credential> {
+  return request<Credential>("/api/v1/credentials", {
+    method: "POST",
+    body: JSON.stringify({ ...input, organization_id: organizationId ?? null }),
+  });
+}
+/** Update the non-secret half. Sending a secret here is refused by the API, by design. */
+export async function updateCredential(
+  id: string,
+  patch: {
+    name?: string;
+    scope?: string;
+    sharing?: string;
+    owner_user_id?: string;
+    settings?: Record<string, unknown>;
+  },
+  organizationId?: string | null,
+): Promise<Credential> {
+  return request<Credential>(
+    `/api/v1/credentials/${encodeURIComponent(id)}${scopeSuffix(organizationId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ ...patch, organization_id: organizationId ?? null }),
+    },
+  );
+}
+/**
+ * Remove one.
+ *
+ * `force` is the REQ's forced delete: it removes the row and returns the dependents so the
+ * panel can name what it broke. Without it the API answers `credential_in_use` with the same
+ * list in `details`, which is what the panel renders the "these workflows will break" line from.
+ */
+export async function deleteCredential(
+  id: string,
+  force = false,
+  organizationId?: string | null,
+): Promise<CredentialDeleteResult> {
+  const params = new URLSearchParams();
+  if (force) params.set("force", "true");
+  if (organizationId) params.set("organization_id", organizationId);
+  const query = params.toString();
+  return request<CredentialDeleteResult>(
+    `/api/v1/credentials/${encodeURIComponent(id)}${query ? `?${query}` : ""}`,
+    { method: "DELETE" },
+  );
+}
+/** Who names this credential. */
+export async function fetchCredentialUsage(
+  id: string,
+  organizationId?: string | null,
+): Promise<CredentialUsage> {
+  return request<CredentialUsage>(
+    `/api/v1/credentials/${encodeURIComponent(id)}/usage${scopeSuffix(organizationId)}`,
+  );
+}
+/** Run the type's test hook. */
+export async function testCredential(
+  id: string,
+  organizationId?: string | null,
+): Promise<CredentialTestResult> {
+  return request<CredentialTestResult>(
+    `/api/v1/credentials/${encodeURIComponent(id)}/test${scopeSuffix(organizationId)}`,
+    { method: "POST" },
+  );
+}
+/** The only write path for a secret. The value is sent once and never read back. */
+export async function replaceCredentialSecret(
+  id: string,
+  secrets: { field: string; value: string }[],
+  organizationId?: string | null,
+): Promise<Credential> {
+  return request<Credential>(
+    `/api/v1/credentials/${encodeURIComponent(id)}/secret${scopeSuffix(organizationId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ secrets, organization_id: organizationId ?? null }),
+    },
+  );
+}
+/**
+ * The installer ledger.
+ *
+ * `organizationId` is sent by a platform account, which has no primary organization of its
+ * own: without it the API refuses the read `organization_required` and the screen shows an
+ * error instead of a ledger.
+ */
+export async function fetchNodePackages(organizationId?: string | null): Promise<NodePackagePage> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<NodePackagePage>(`/api/v1/node-packages${query}`);
+}
+/**
+ * Install a package from its manifest.
+ *
+ * The body is the manifest, not a summary of it: the server validates what it is given and
+ * computes the checksum itself, so there is no `checksum` field here to send and no way for a
+ * client to talk the ledger into a checksum that does not match the package.
+ */
+export async function installNodePackage(
+  manifest: unknown,
+  organizationId?: string | null,
+): Promise<NodePackageInstall> {
+  return request<NodePackageInstall>("/api/v1/node-packages", {
+    method: "POST",
+    body: JSON.stringify({ manifest, organization_id: organizationId ?? null }),
+  });
+}
+/** Enable or disable a package. Disabling never touches a workflow. */
+export async function setNodePackageEnabled(
+  key: string,
+  enabled: boolean,
+  organizationId?: string | null,
+): Promise<NodePackageToggle> {
+  return request<NodePackageToggle>(`/api/v1/node-packages/${encodeURIComponent(key)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled, organization_id: organizationId ?? null }),
+  });
+}
+/** Remove a package; the ledger row stays, marked removed, and the dependents come back. */
+export async function removeNodePackage(
+  key: string,
+  organizationId?: string | null,
+): Promise<NodePackageRemoval> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<NodePackageRemoval>(`/api/v1/node-packages/${encodeURIComponent(key)}${query}`, {
+    method: "DELETE",
+  });
+}
 /**
  * The caller's own channel configuration (REQ-021, slice 2).
  *
@@ -4650,7 +4394,6 @@ export function emitNotification(input: {
 export function fetchNotificationPreferences(): Promise<NotificationPreferences> {
   return request<NotificationPreferences>("/api/v1/notifications/preferences");
 }
-
 /**
  * Save the stated cells and the settings row.
  *
@@ -4670,11 +4413,9 @@ export function saveNotificationPreferences(input: {
     body: JSON.stringify(input),
   });
 }
-
 // ---------------------------------------------------------------------------------------------
 // Slice 3: the half that leaves the panel
 // ---------------------------------------------------------------------------------------------
-
 /**
  * The organization's delivery log.
  *
@@ -4696,7 +4437,6 @@ export function fetchNotificationOutbox(filters: {
   const suffix = query.toString();
   return request<NotificationOutbox>(`/api/v1/notifications/outbox${suffix ? `?${suffix}` : ""}`);
 }
-
 /**
  * Requeue one failed delivery.
  *
@@ -4710,12 +4450,10 @@ export function retryNotificationDelivery(id: string): Promise<{ outcome: string
     method: "POST",
   });
 }
-
 /** This person's registered browsers. The endpoint itself is never in the answer. */
 export function fetchNotificationDevices(): Promise<NotificationDevice[]> {
   return request<NotificationDevice[]>("/api/v1/notifications/push-subscriptions");
 }
-
 /** Register (or re-point) this browser. The four outcomes are the answer, not a boolean. */
 export function registerNotificationDevice(input: {
   endpoint: string;
@@ -4727,22 +4465,18 @@ export function registerNotificationDevice(input: {
     body: JSON.stringify(input),
   });
 }
-
 /** Remove one device. `404` for somebody else's, so existence does not leak. */
 export function removeNotificationDevice(id: string): Promise<void> {
   return request<void>(`/api/v1/notifications/push-subscriptions/${id}`, { method: "DELETE" });
 }
-
 /** What each channel can do on this installation, and the sentence explaining it. */
 export function fetchNotificationChannels(): Promise<NotificationChannelReadiness[]> {
   return request<NotificationChannelReadiness[]>("/api/v1/notifications/channels");
 }
-
 /** Every routing rule, enabled or not. */
 export function fetchNotificationRoutes(): Promise<NotificationRouteRule[]> {
   return request<NotificationRouteRule[]>("/api/v1/notifications/routes");
 }
-
 /**
  * Write one routing rule.
  *
@@ -4763,12 +4497,10 @@ export function createNotificationRoute(input: {
     body: JSON.stringify(input),
   });
 }
-
 /** Remove one rule. */
 export function deleteNotificationRoute(id: string): Promise<void> {
   return request<void>(`/api/v1/notifications/routes/${id}`, { method: "DELETE" });
 }
-
 /**
  * Run one bus event through the router, now.
  *
@@ -5158,4 +4890,192 @@ export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySa
     method: "PUT",
     body: JSON.stringify(save),
   });
+}
+
+/* ------------------------------------------------------------------ *
+ * The visual graph (REQ-086)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Read a workflow's graph, with the revision it was read at.
+ *
+ * The revision is not metadata: the canvas holds it for the life of the session and sends it
+ * back on every save, and a save carrying a revision the server does not have is a `409` rather
+ * than an overwrite. A read that dropped the number would make the editor's conflict path
+ * unreachable.
+ */
+export function fetchGraph(workflowId: string): Promise<GraphRead> {
+  return request<GraphRead>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Save the whole graph. The compiled steps are written with it, in one request.
+ *
+ * `revision` is the one the editor loaded. On a `409` the thrown `ApiError` carries
+ * `details.current_revision`, which is what the compare-and-reload prompt shows; this function
+ * does not retry, because a silent retry is an overwrite wearing a retry's name.
+ */
+export function saveGraph(
+  workflowId: string,
+  graph: GraphDocument,
+  revision: number,
+): Promise<GraphSaved> {
+  return request<GraphSaved>(`/api/v1/workflows/${encodeURIComponent(workflowId)}/graph`, {
+    method: "PUT",
+    body: JSON.stringify({ graph, revision }),
+  });
+}
+
+/**
+ * Compile and report without saving, so a person typing a node parameter can be told it is wrong
+ * before anything is stored. The server owns every rule; the canvas never pre-validates.
+ */
+export function validateGraph(
+  workflowId: string,
+  graph: GraphDocument,
+  revision: number,
+): Promise<GraphValidated> {
+  return request<GraphValidated>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/validate`,
+    { method: "POST", body: JSON.stringify({ graph, revision }) },
+  );
+}
+
+/**
+ * Evaluate one node's parameters against pinned sample data, storing nothing.
+ *
+ * A **server** call, and the REQ is explicit that it has to be: a client that reimplemented
+ * the expression rules would agree with the server on the day it was written and drift the
+ * first time a rule changed — which is the day somebody is relying on the preview to decide
+ * whether a step will do what they meant. The sample travels in the body rather than being
+ * fetched for the same reason: a preview that could reach live data would answer differently
+ * on every keystroke, and could read a row the person editing has no permission to see.
+ *
+ * A field whose expression cannot be resolved is a `422` whose message names the field, and
+ * this function does not swallow it — the inspector needs that sentence on the row, not a
+ * rejected promise with nothing on it.
+ */
+export function previewExpressions(
+  workflowId: string,
+  params: Record<string, unknown>,
+  namespaces: Record<string, unknown>,
+): Promise<ExpressionPreviewed> {
+  return request<ExpressionPreviewed>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/expressions/preview`,
+    { method: "POST", body: JSON.stringify({ params, namespaces }) },
+  );
+}
+
+/**
+ * Ask the server which expressions are legal in the field being typed.
+ *
+ * The **graph travels in the body**, and that is the part worth arguing for. "Upstream
+ * outputs" is a fact about the graph as it is on screen — including wires drawn but not yet
+ * saved — so reading the stored graph would complete against a topology the person has
+ * already changed, at exactly the moment they are most likely to trust the list.
+ *
+ * The candidate grammar is the server's for the same reason the preview's is: a client that
+ * reimplemented the rules would offer `{{node.count + 1}}`, which previews as a refusal.
+ *
+ * `prefix` may be the path inside the braces or the whole expression; the server accepts both,
+ * so the seam between them cannot become a bug where typing `{{` empties the menu.
+ */
+export function completeExpressions(
+  workflowId: string,
+  nodeKey: string,
+  prefix: string,
+  graph: GraphDocument,
+  namespaces: Record<string, unknown>,
+): Promise<ExpressionCompleted> {
+  return request<ExpressionCompleted>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/expressions/complete`,
+    {
+      method: "POST",
+      body: JSON.stringify({ node_key: nodeKey, prefix, graph, namespaces }),
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Security centre (REQ-012, slice 3) — rate limiting and sign-in protection
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The five scopes, merged with the baseline.
+ *
+ * `no-store` for the same reason the overview and the header policy carry it: a stale limiter
+ * table is a screen that says "600 per minute" while the platform enforces something else, and
+ * the whole value of the screen is that the two agree.
+ */
+export function fetchRateLimits(): Promise<RateLimitsDocument> {
+  return request<RateLimitsDocument>("/api/v1/security/rate-limits", { cache: "no-store" });
+}
+
+/**
+ * Save the limiter document.
+ *
+ * `expected_scopes` is the document the form was opened with and is the compare-and-swap key:
+ * a form somebody else has since saved is **refused** rather than silently overwriting them. The
+ * client validates nothing — the server owns every range, and a second rule that disagreed with
+ * it would be a second place to be wrong about a limit that is refusing real traffic.
+ */
+export function saveRateLimits(save: RateLimitsSave): Promise<RateLimitsSaved> {
+  return request<RateLimitsSaved>("/api/v1/security/rate-limits", {
+    method: "PUT",
+    body: JSON.stringify(save),
+  });
+}
+
+/**
+ * Dry-run one request through the limiter.
+ *
+ * This is a **server** call rather than a local computation on purpose, and the reason is the
+ * acceptance criterion it satisfies: the tester's verdict must match the real middleware
+ * decision. Only the server holds the same `decide` the middleware runs, so a client that
+ * reimplemented the arithmetic would agree with it on the day it was written and drift the
+ * first time somebody tunes a limit — which is the day somebody is relying on it.
+ */
+export function testRateLimit(body: RateLimitTestRequest): Promise<RateLimitTestResponse> {
+  return request<RateLimitTestResponse>("/api/v1/security/rate-limits/test", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** The lockout document, its ranges, and how many accounts are locked right now. */
+export function fetchSignInProtection(): Promise<SignInProtectionDocument> {
+  return request<SignInProtectionDocument>("/api/v1/security/sign-in-protection", {
+    cache: "no-store",
+  });
+}
+
+/** Save the lockout document. `expected_policy` is the compare-and-swap key. */
+export function saveSignInProtection(save: SignInProtectionSave): Promise<SignInProtectionSaved> {
+  return request<SignInProtectionSaved>("/api/v1/security/sign-in-protection", {
+    method: "PUT",
+    body: JSON.stringify(save),
+  });
+}
+
+/** Who is locked out right now, soonest to expire first. */
+export function fetchLockedAccounts(): Promise<LockedAccountsPage> {
+  return request<LockedAccountsPage>("/api/v1/security/locked-accounts", { cache: "no-store" });
+}
+
+/**
+ * Release one account early.
+ *
+ * The REQ calls out that lockout can be weaponised against a known account, so the unlock path
+ * is deliberately not hidden behind a confirmation dialog with no escape: it is one click, and
+ * it is audited server-side with the actor. The remaining `lockout_minutes` is the thing a
+ * cautious operator narrows, not this button.
+ */
+export function unlockAccount(userId: string): Promise<LockedAccountsPage> {
+  return request<LockedAccountsPage>(
+    `/api/v1/security/locked-accounts/${encodeURIComponent(userId)}/unlock`,
+    { method: "POST" },
+  );
 }

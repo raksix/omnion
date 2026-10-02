@@ -22,8 +22,8 @@
 
 use std::time::Duration;
 
-use omnion_core::RedisClient;
 use redis::AsyncCommands;
+use omnion_core::RedisClient;
 
 use crate::error::{Result, SecurityError};
 use crate::limiter::{ClientId, RatePolicy, Verdict, decide};
@@ -97,9 +97,9 @@ pub async fn count(
     {
         Ok(count) => count,
         Err(error) => {
-            return Err(SecurityError::Database(sqlx::Error::Io(
-                std::io::Error::other(error),
-            )));
+            return Err(SecurityError::Database(sqlx::Error::Io(std::io::Error::other(
+                error,
+            ))));
         }
     };
     Ok(Counted {
@@ -110,12 +110,7 @@ pub async fn count(
 
 /// Read a counter without changing it — for the panel's tester, and for a "would this be
 /// limited right now" check that must not spend the caller's budget.
-pub async fn peek(
-    redis: &RedisClient,
-    policy: &RatePolicy,
-    client: &ClientId,
-    now: i64,
-) -> Counted {
+pub async fn peek(redis: &RedisClient, policy: &RatePolicy, client: &ClientId, now: i64) -> Counted {
     let key = policy.counter_key(client, now);
     let Ok(mut connection) = redis.connection().await else {
         return Counted {
@@ -146,17 +141,11 @@ pub async fn peek(
 /// platform is healthy, and a failure here means the key is still there and the next sign-in
 /// starts one failure closer to a lockout than the user deserves. The caller decides whether
 /// that is worth surfacing — sign-in logs it and continues.
-pub async fn forget(
-    redis: &RedisClient,
-    policy: &RatePolicy,
-    client: &ClientId,
-    now: i64,
-) -> Result<()> {
+pub async fn forget(redis: &RedisClient, policy: &RatePolicy, client: &ClientId, now: i64) -> Result<()> {
     let key = policy.counter_key(client, now);
-    let mut connection = redis
-        .connection()
-        .await
-        .map_err(|error| SecurityError::Database(sqlx::Error::Io(std::io::Error::other(error))))?;
+    let mut connection = redis.connection().await.map_err(|error| {
+        SecurityError::Database(sqlx::Error::Io(std::io::Error::other(error)))
+    })?;
     redis::cmd("DEL")
         .arg(&key)
         .query_async::<i64>(&mut connection)
@@ -309,10 +298,7 @@ mod tests {
         // turn the limiter into one that counts nothing.
         let mut row = sign_in_policy();
         row.window_seconds = 0;
-        assert!(
-            retention_for(&row).as_secs() > 0,
-            "a TTL of zero deletes the key"
-        );
+        assert!(retention_for(&row).as_secs() > 0, "a TTL of zero deletes the key");
     }
 
     #[test]
@@ -329,20 +315,10 @@ mod tests {
 
         // The key is scope + bucket + a fixed-width hash: the bucket is what makes the counter
         // roll over, and the fixed width is what stops a long client string from lengthening it.
-        assert!(
-            key.starts_with("omnion:rl:sign_in:"),
-            "the scope is in the key: {key}"
-        );
+        assert!(key.starts_with("omnion:rl:sign_in:"), "the scope is in the key: {key}");
         let tail = key.rsplit(':').next().expect("a hashed tail");
-        assert_eq!(
-            tail.len(),
-            16,
-            "a fixed-width hash, not the client's own text"
-        );
-        assert!(
-            !key.contains("203.0.113.7"),
-            "the address is hashed, not inlined: {key}"
-        );
+        assert_eq!(tail.len(), 16, "a fixed-width hash, not the client's own text");
+        assert!(!key.contains("203.0.113.7"), "the address is hashed, not inlined: {key}");
 
         // One second apart inside a 60-second window is the same bucket; a full window later is
         // not. If `count` and `peek` ever derived the bucket differently this is where it shows.

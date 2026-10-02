@@ -606,18 +606,12 @@ pub fn code_hash(code: &str) -> String {
 }
 
 /// The kind a provider's row describes, as the flow needs it.
-///
-/// A directory has no authorization-code flow at all — it has a bind and a search — so it is
-/// named here rather than being given a protocol flow it cannot perform. The challenge table's
-/// `flow` column does not accept it either, which is deliberate: an SSO challenge for a
-/// directory is a thing that cannot exist.
 #[must_use]
 pub fn flow_of(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Oidc => "oidc",
         ProviderKind::Oauth2 => "oauth2",
         ProviderKind::Saml => "saml",
-        ProviderKind::Ldap | ProviderKind::ActiveDirectory => "directory",
     }
 }
 

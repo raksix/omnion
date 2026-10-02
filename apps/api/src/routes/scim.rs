@@ -23,8 +23,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use omnion_identity::provisioning::{self, ProvisioningToken};
-use omnion_identity::provenance::mark_scim_provisioned;
-use omnion_identity::sso::scim_runs;
 use omnion_identity::users;
 use omnion_permissions::groups;
 use serde::Deserialize;
@@ -420,56 +418,6 @@ fn member_ids(members: &[ScimMember]) -> Result<Vec<Uuid>, ScimError> {
     Ok(ids)
 }
 
-/// Record that a group write changed who belongs to it.
-///
-/// The event is the whole point of a group-based role rule: a `when_group` rule grants its role
-/// through `group_members`, so a person who joins a directory group has their effective
-/// permissions change **without any sign-in happening**. Automation (REQ-003) and the security
-/// centre subscribe to this to re-evaluate a subject, and a cached rule result has to be dropped
-/// when it fires — otherwise a revoked group still reads as granted until the next sign-in.
-///
-/// Two decisions, each with a test saying so:
-///
-/// * **It fires on a change, not on a write.** A PATCH that re-sends the same member list
-///   changes nothing, and an event for it would train a subscriber to ignore the name. A
-///   connector re-sending a full group on a timer would otherwise produce a fire every time.
-/// * **The counts are the diff, not the size.** `added`/`removed` are how many people crossed in
-///   each direction; `members` alone would make a subscriber that only cares about removals
-///   diff two snapshots itself, and a snapshot has no "before".
-///
-/// The payload names ids and counts only. A group's member list is the directory's most
-/// personal export, and an event is delivered to subscribers outside the tenant.
-async fn announce_membership(
-    state: &AppState,
-    organization_id: Uuid,
-    group: &groups::Group,
-    before: &[Uuid],
-    after: &[Uuid],
-) {
-    let added = after.iter().filter(|id| !before.contains(id)).count();
-    let removed = before.iter().filter(|id| !after.contains(id)).count();
-    if added == 0 && removed == 0 {
-        return;
-    }
-
-    if let Err(error) = omnion_events::bus::emit(
-        state.db().pool(),
-        omnion_events::NewEvent::new("iam.group_membership_synced")
-            .organization(Some(organization_id))
-            .payload(json!({
-                "group_id": group.id,
-                "group_name": group.name,
-                "added": added,
-                "removed": removed,
-                "members": after.len(),
-            })),
-    )
-    .await
-    {
-        tracing::warn!(error = %error, "the group membership event could not be recorded");
-    }
-}
-
 /// The SCIM document of one account.
 fn user_json(user: &users::User, external_id: Option<&str>, location_base: &str) -> Value {
     json!({
@@ -579,29 +527,10 @@ struct SyncLine<'a> {
     entity_id: Option<Uuid>,
     /// One readable line.
     detail: String,
-    /// Live sessions this line ended (`0126`).
-    ///
-    /// `None` is the default for every other write path, and `None` means the row records zero
-    /// rather than "unknown" — see `NewSyncEntry::revoked_sessions`.
-    revoked_sessions: Option<u64>,
 }
 
 /// Write one line of the sync log, ignoring a log failure (the operation itself already landed).
-///
-/// This is also where a provider-scoped push is folded into the run ledger (REQ-065, slice 4
-/// part 3), and it is here rather than at fifteen call sites for the reason the log helper
-/// exists: every SCIM outcome passes through this function, so a run cannot miss a line and
-/// cannot double-count one.
-///
-/// A token that provisions a whole *organization* has no provider to hang a run off, and that is
-/// not a degraded case — an organization-scoped connector is a legitimate configuration whose
-/// work is answered by the provisioning screen it already appears on. Inventing a provider row
-/// for it would put a sync ledger entry on a tenant that never configured a directory.
 async fn log(state: &AppState, organization_id: Uuid, line: SyncLine<'_>) {
-    // The detail is cloned rather than moved: `touch_run` reads it afterwards, and taking it by
-    // reference here would make the struct partially moved, which the borrow checker refuses at
-    // the next line. One sentence of duplication, and the alternative is a log entry and a run
-    // entry that can say different things about the same failure.
     let entry = provisioning::NewSyncEntry {
         direction: "inbound".to_owned(),
         resource: line.resource.to_owned(),
@@ -609,65 +538,11 @@ async fn log(state: &AppState, organization_id: Uuid, line: SyncLine<'_>) {
         entity_id: line.entity_id,
         action: line.action.to_owned(),
         outcome: line.outcome.to_owned(),
-        detail: line.detail.clone(),
-        revoked_sessions: line.revoked_sessions,
+        detail: line.detail,
     };
 
     if let Err(error) = provisioning::log_sync(state.db().pool(), organization_id, &entry).await {
         tracing::warn!(error = %error, "the sync-log line could not be written");
-        return;
-    }
-
-    touch_run(state, organization_id, &line).await;
-}
-
-/// Fold one logged line into the provider's open SCIM run, when there is a provider to fold it
-/// into.
-///
-/// The action is namespaced as `scim/<action>` so the run's recount can tell a provisioning line
-/// from anything else that may share the table, and so the log stays readable: `scim/create` says
-/// which surface wrote the line, and a bare `create` would be ambiguous the moment a second
-/// surface writes one.
-async fn touch_run(state: &AppState, organization_id: Uuid, line: &SyncLine<'_>) {
-    let provider: Option<Uuid> = sqlx::query_scalar(
-        "select p.id from auth_providers p \
-         where p.organization_id = $1 and p.kind in ('ldap', 'active_directory') \
-           and exists (select 1 from provisioning_tokens t \
-                       where t.organization_id = p.organization_id and t.revoked_at is null) \
-         order by p.created_at limit 1",
-    )
-    .bind(organization_id)
-    .fetch_optional(state.db().pool())
-    .await
-    .ok()
-    .flatten();
-
-    let Some(provider_id) = provider else { return };
-
-    match scim_runs::current_run(state.db().pool(), provider_id, time::OffsetDateTime::now_utc())
-        .await
-    {
-        Ok(Some(run_id)) => {
-            if line.outcome == "failed" {
-                // A failure has no retry button in the protocol, but it has an operator: the
-                // person who configured the connector. Without this row the failure lives only
-                // in a log line nobody reads, and a run that reports `error_count: 0` over three
-                // refusals is a run lying by omission.
-                if let Err(error) = scim_runs::record_failure(
-                    state.db().pool(),
-                    run_id,
-                    line.external_id.unwrap_or(""),
-                    "scim_refused",
-                    &line.detail,
-                )
-                .await
-                {
-                    tracing::warn!(error = %error, "the SCIM run failure could not be recorded");
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(error) => tracing::warn!(error = %error, "the SCIM run could not be opened"),
     }
 }
 
@@ -815,16 +690,6 @@ pub async fn create_user(
             if let Some(external_id) = payload.external_id.as_deref() {
                 set_external_id(&state, existing.id, Some(external_id)).await?;
             }
-            // An address that already exists is claimed by this connector, not merely echoed
-            // back. A connector that provisions people by e-mail is authoritative about the
-            // fact that it provisioned them, and the delete guard's count comes from this
-            // column — so a connector that adopted an account on its second sweep would be
-            // the one sweep the guard could not see. Marked here rather than only on the
-            // create path, and idempotently: a re-send changes nothing, which is what keeps
-            // the log from claiming a change on every sweep.
-            mark_scim_provisioned(state.db().pool(), existing.id)
-                .await
-                .map_err(internal)?;
             let external = external_id_of(&state, existing.id).await?;
             log(
                 &state,
@@ -836,7 +701,6 @@ pub async fn create_user(
                     external_id: payload.external_id.as_deref(),
                     entity_id: Some(existing.id),
                     detail: format!("{} already exists in this organization", existing.email),
-                    revoked_sessions: None,
                 },
             )
             .await;
@@ -882,23 +746,8 @@ pub async fn create_user(
         set_external_id(&state, created.id, Some(external_id)).await?;
     }
 
-    // The create path's own provenance write. `0127` backfilled the rows that already existed at
-    // migration time and then nothing wrote the column again, so an account a connector created
-    // afterwards was `local` for the rest of its life — and `local` is the one value the delete
-    // guard's query excludes. The guard was therefore counting a directory that had just created
-    // eight people as zero, which is the exact failure the criterion it was built for names.
-    // Written here rather than inside `users::create_user` so that a person who signs up through
-    // the panel is never labelled as somebody else's directory's account.
-    mark_scim_provisioned(state.db().pool(), created.id)
-        .await
-        .map_err(internal)?;
-
     if payload.active == Some(false) {
-        // A connector may create an account already deactivated. The status setter that revokes
-        // is the one used here, not the display-only one: a brand-new account has no sessions,
-        // but "it has none today" is not a property that stays true, and this write path is the
-        // same one that deactivates a live account further down.
-        users::set_status_and_end_sessions(state.db().pool(), created.id, "disabled", "scim_deactivated")
+        users::set_status(state.db().pool(), created.id, "disabled")
             .await
             .map_err(internal)?;
     }
@@ -919,7 +768,6 @@ pub async fn create_user(
             external_id: payload.external_id.as_deref(),
             entity_id: Some(user.id),
             detail: format!("{} was provisioned", user.email),
-            revoked_sessions: None,
         },
     )
     .await;
@@ -1019,33 +867,13 @@ async fn apply_user_changes(
         set_external_id(state, user.id, Some(external_id)).await?;
     }
 
-    // A replace/patch from a connector is also a claim, not only a create is. A directory that
-    // creates nobody and only ever patches the accounts it found already in the table would
-    // otherwise be invisible to the delete guard — the count reads this column, and an account
-    // the connector actively maintains is at least as much its own as one it created.
-    mark_scim_provisioned(state.db().pool(), user.id)
-        .await
-        .map_err(internal)?;
-
     let mut outcome = "updated";
-    let mut revoked_sessions = 0_u64;
     if let Some(active) = payload.active {
         let status = if active { "active" } else { "disabled" };
         if status != user.status {
-            // The revoking setter, because this is the path a directory takes a *live* person
-            // out of service on, and `resolve_session` reading `status = 'active'` is a filter,
-            // not a revocation: the tokens stay in the browser and stop working again the moment
-            // a later sync re-activates the account. See `users::set_status_and_end_sessions`.
-            let change = users::set_status_and_end_sessions(
-                state.db().pool(),
-                user.id,
-                status,
-                "scim_deactivated",
-            )
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| ScimError::not_found(format!("no account {}", user.id)))?;
-            revoked_sessions = change.1.revoked_sessions;
+            users::set_status(state.db().pool(), user.id, status)
+                .await
+                .map_err(internal)?;
             if !active {
                 outcome = "deactivated";
             }
@@ -1066,23 +894,7 @@ async fn apply_user_changes(
             outcome,
             external_id: payload.external_id.as_deref(),
             entity_id: Some(updated.id),
-            detail: if revoked_sessions > 0 {
-                // The count is in the log because it is the number an operator needs and cannot
-                // get anywhere else: "deactivated" says the account is out, and this says how
-                // many live tokens went with it. A directory that reports one deactivated account
-                // while three people are still holding working sessions is the failure this
-                // slice removes, and it is invisible from the account row alone.
-                format!(
-                    "{} now reads {} — {revoked_sessions} session(s) ended",
-                    updated.email, updated.status
-                )
-            } else {
-                format!("{} now reads {}", updated.email, updated.status)
-            },
-            // The sentence below is for a reader; this is the same number as a value, so the
-            // panel can sum a run, sort the log, or badge the row instead of every consumer
-            // re-parsing English to find out how many sessions an offboarding ended.
-            revoked_sessions: Some(revoked_sessions),
+            detail: format!("{} now reads {}", updated.email, updated.status),
         },
     )
     .await;
@@ -1267,20 +1079,9 @@ pub async fn delete_user(
     .await
     .map_err(internal)?;
 
-    // The `?` and the `.ok_or_else` are the same handling the PATCH path above uses, and for the
-    // same reason: the account was read a few lines ago, so a row that has since disappeared is
-    // not a client error to be reported as "no such user" on a DELETE that already found one —
-    // but it is not a 500 either, and silently logging "deactivated" for an account this call
-    // never touched would be a log line about nothing.
-    let deactivate = users::set_status_and_end_sessions(
-        state.db().pool(),
-        user.id,
-        "disabled",
-        "scim_deactivated",
-    )
-    .await
-    .map_err(internal)?
-    .ok_or_else(|| ScimError::not_found(format!("no account {}", user.id)))?;
+    users::set_status(state.db().pool(), user.id, "disabled")
+        .await
+        .map_err(internal)?;
 
     log(
         &state,
@@ -1291,20 +1092,10 @@ pub async fn delete_user(
             outcome: "deactivated",
             external_id: None,
             entity_id: Some(user.id),
-            // DELETE is what connectors send last for somebody who left, and it is the one path
-            // where "the account is disabled" is the whole meaning. Ending the sessions is not an
-            // extra nicety here: a DELETE that left the tokens working would hand a departed
-            // employee's browser a working session until the token expired on its own.
             detail: format!(
-                "{} was deactivated (the SCIM default — the account stays, its sessions do not)",
+                "{} was deactivated (the SCIM default — the account stays)",
                 user.email
             ),
-            // The count is reported as a number here because `detail` is prose: this line
-            // is the only record of how many live tokens went with a departed colleague, and
-            // "the account is disabled" does not say whether the tokens in their browser
-            // still work. An offboarding that disabled the account without this figure is the
-            // failure the number exists to make visible.
-            revoked_sessions: Some(deactivate.1.revoked_sessions),
         },
     )
     .await;
@@ -1421,15 +1212,6 @@ pub async fn create_group(
         .await
         .map_err(internal)?;
 
-    // A group created *with* members has just changed that group's membership, so the event
-    // fires here with nothing as the "before". A group whose members arrive with it is the
-    // case a `when_group` rule is most often waiting for, and it is the one a create-only
-    // listener would otherwise miss entirely.
-    if !ids.is_empty() {
-        let now: Vec<Uuid> = members.iter().map(|member| member.user_id).collect();
-        announce_membership(&state, organization_id, &group, &[], &now).await;
-    }
-
     log(
         &state,
         organization_id,
@@ -1440,7 +1222,6 @@ pub async fn create_group(
             external_id: None,
             entity_id: Some(group.id),
             detail: format!("{} now has {} member(s)", group.name, members.len()),
-            revoked_sessions: None,
         },
     )
     .await;
@@ -1609,13 +1390,6 @@ pub async fn patch_group(
         .await
         .map_err(internal)?;
 
-    // The diff is computed from the member list read *before* the write against the one read
-    // after, so the event counts the people who actually crossed the boundary in this request
-    // rather than the size of the group. `current` is the pre-image the patch already had in
-    // hand; comparing against a fresh read would make a concurrent write look like this one.
-    let applied: Vec<Uuid> = members.iter().map(|member| member.user_id).collect();
-    announce_membership(&state, principal.organization_id(), &group, &current, &applied).await;
-
     log(
         &state,
         principal.organization_id(),
@@ -1626,7 +1400,6 @@ pub async fn patch_group(
             external_id: None,
             entity_id: Some(group.id),
             detail: format!("{} now has {} member(s)", group.name, members.len()),
-            revoked_sessions: None,
         },
     )
     .await;
@@ -1658,7 +1431,6 @@ pub async fn delete_group(
             external_id: None,
             entity_id: Some(group.id),
             detail: format!("{} was removed", group.name),
-            revoked_sessions: None,
         },
     )
     .await;

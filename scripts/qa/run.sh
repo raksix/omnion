@@ -60,7 +60,7 @@ wait_http() { # url, seconds
 QA_SLOT_PID=""
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
-  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" QA_SLOT_OWNER="$$" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
 # Free the place whenever this pass ends, however it ends.
@@ -87,69 +87,86 @@ stop_stack
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
-step "API on :$API_PORT (database $QA_DB_NAME)"
+step "API on :$API_PORT (database omnion_qa)"
 # A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
 # than the newest migration, which is cheap when nothing changed and correct when something did.
-if [ ! -x target/debug/omnion-api ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
+# A writer whose worktree cannot hold a build (a full /mnt/apopic) builds elsewhere and points
+# at the result. Without this the pass rebuilds into a full disk and then reports "script not
+# found" for a binary that exists — a failure that reads as a broken API rather than a full
+# filesystem. `QA_API_BIN` is the escape hatch; the default is unchanged.
+QA_API_BIN="${QA_API_BIN:-$ROOT/target/debug/omnion-api}"
+if [ ! -x "$QA_API_BIN" ] \
+   || [ -n "$(find database/migrations -name '*.sql' -newer "$QA_API_BIN" -print -quit)" ]; then
+  step "building the API (missing or stale at $QA_API_BIN)"
   step "building the API (first pass, or a migration changed since the last build)"
-  # Build somewhere the disk guard cannot delete from under the compiler.
-  #
-  # `scripts/qa/disk-guard.sh` drops a worktree's `target/` whenever the box falls under its
-  # `MIN_FREE_GB` floor, and on a busy box it is *always* under that floor — so a pass that
-  # compiles into `target/` is a pass that dies with "could not write output to
-  # target/debug/deps/…: No such file or directory", a hundred seconds in, with a report that
-  # says the build failed and no mention of a guard. A compiler whose output directory is deleted
-  # mid-run does not recover, and the pass dies however many times it is retried.
-  #
-  # CARGO_BUILD_TARGET_DIR, when set, is tmpfs: it is not under /mnt/apopic, so the guard's glob
-  # cannot see it, and it is far faster than the loop device. The binary is then *installed* into
-  # `target/debug/` with a copy to a temporary name and one rename, so `target/debug/omnion-api` is
-  # never a half-written file that a later pass mistakes for a good build.
-  BUILD_TARGET_DIR="${CARGO_BUILD_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
-  if [ -n "$BUILD_TARGET_DIR" ] && [ "$BUILD_TARGET_DIR" != "target" ]; then
-    mkdir -p "$BUILD_TARGET_DIR" target/debug
-    step "building into ${BUILD_TARGET_DIR} (the disk guard may drop target/ at any time)"
-    CARGO_TARGET_DIR="$BUILD_TARGET_DIR" CARGO_INCREMENTAL=0 cargo build -p omnion-api
-    cp "$BUILD_TARGET_DIR/debug/omnion-api" "target/debug/.omnion-api.new" \
-      && mv -f "target/debug/.omnion-api.new" "target/debug/omnion-api"
-    touch "target/debug/omnion-api"   # newer than every migration, so this pass is the last build
-  else
-    cargo build -p omnion-api
-  fi
+  # `CARGO_TARGET_DIR` has to be honoured, or a caller that points `QA_API_BIN` at an
+  # out-of-tree build gets a rebuild into the default `target/` — the full disk this override
+  # exists to avoid.
+  # `omnion-core` is the crate that owns `sqlx::migrate!("../../database/migrations")`, and
+  # sqlx embeds the directory at *that* crate's compile. So a renamed or added migration does
+  # not reach the binary through `-p omnion-api`: cargo sees the api crate as up to date, prints
+  # `Finished` in under a minute, and the API then dies on `migration N was previously applied
+  # but has been modified` — a failure that reads as a database problem and is a build-graph
+  # one. The fix is to make the embedding crate recompile, which is a cache problem rather
+  # than a source one.
+  cargo clean -p omnion-core --target-dir ${CARGO_TARGET_DIR:-target} 2>/dev/null || true
+  cargo build ${CARGO_TARGET_DIR:+--target-dir "$CARGO_TARGET_DIR"} -p omnion-api
 fi
-if pm2 describe "$API_NAME" >/dev/null 2>&1; then
-  pm2 restart "$API_NAME" >/dev/null
-else
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
-  OMNION_REDIS_URL="redis://127.0.0.1:6380" \
-  OMNION_PORT="$API_PORT" \
-  OMNION_ENV=development \
-    pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
-fi
+# `delete` then `start`, never `restart`. That looks like a pointless extra second of
+# startup and it is the most expensive line in this file.
+#
+# `pm2 restart` **keeps the environment the process was first started with**. This script
+# drops and recreates the QA database a moment earlier, so a process left over from a pass
+# that used a different `QA_DB` still holds the *old* connection string — and after the drop,
+# "that database does not exist" comes back as a restart loop whose log reads `migration 19
+# was previously applied but is missing in the resolved migrations`. That sentence names a
+# migration, so it sends you auditing 41 SQL files that are all perfectly fine.
+#
+# It happened here for real: an earlier attempt left a process pointing at the main writer's
+# `omnion_qa` while every later pass reset `omnion_qa_w10`, and three consecutive passes
+# inherited it. The ports, the CSRF secret and the binary path are inherited the same way, and
+# each of those has changed between passes at least once.
+#
+# The binary pm2 starts must also be `QA_API_BIN`, not the default path: a writer that built
+# out of tree passed a working `QA_API_BIN` through the staleness check and then had pm2 report
+# `Script not found` for a path that was never built.
+#
+# The CSRF guard *refuses* a cookie-authenticated mutation when no secret is configured
+# (REQ-012: refuse, never skip), which is right in production and useless in a QA stack — every
+# create, install and delete in the walkthrough answers 403 and the pass reports a product
+# defect that does not exist. The secret is a throwaway for a disposable database that is
+# dropped on every pass, and it is generated per pass so a half-finished run cannot leave a
+# token a later one still validates.
+pm2 delete "$API_NAME" >/dev/null 2>&1 || true
+OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
+OMNION_REDIS_URL="redis://127.0.0.1:6380" \
+OMNION_PORT="$API_PORT" \
+OMNION_ENV=development \
+OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-csrf-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')}" \
+  pm2 start "$QA_API_BIN" --name "$API_NAME" --time >/dev/null
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
 
 step "admin panel on :$ADMIN_PORT"
 NEXT_ADMIN="$ROOT/apps/admin/node_modules/next/dist/bin/next"
-if pm2 describe "$ADMIN_NAME" >/dev/null 2>&1; then
-  pm2 restart "$ADMIN_NAME" >/dev/null
-else
-  OMNION_API_URL="$API_URL" \
+# Same reasoning as the API: `restart` inherits the environment and the port of the
+# process that was there before, and both have moved between passes.
+pm2 delete "$ADMIN_NAME" >/dev/null 2>&1 || true
+OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_ADMIN" --name "$ADMIN_NAME" --cwd "$ROOT/apps/admin" --time -- dev --port "$ADMIN_PORT" --hostname 127.0.0.1 >/dev/null
-fi
+
 wait_http "http://127.0.0.1:$ADMIN_PORT/login" 150 || { echo "[qa] admin panel did not answer"; pm2 logs "$ADMIN_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "public renderer on :$WEB_PORT"
 NEXT_WEB="$ROOT/apps/web/node_modules/next/dist/bin/next"
-if pm2 describe "$WEB_NAME" >/dev/null 2>&1; then
-  pm2 restart "$WEB_NAME" >/dev/null
-else
-  OMNION_API_URL="$API_URL" \
+# Same reasoning as the API: `restart` inherits the environment and the port of the
+# process that was there before, and both have moved between passes.
+pm2 delete "$WEB_NAME" >/dev/null 2>&1 || true
+OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
-fi
+
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "browser walkthrough"

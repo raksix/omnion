@@ -30,20 +30,13 @@ use axum::response::{IntoResponse, Response};
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
 use omnion_identity::security;
-use omnion_identity::sso::attributes::TargetField;
 use omnion_identity::sso::challenges::{self, SsoChallenge};
 use omnion_identity::sso::claims::{self, Identity};
-use omnion_identity::sso::group_context::GroupContext;
-use omnion_identity::sso::mappings;
 use omnion_identity::sso::oidc::{self, Discovery, HttpClient, MetadataCache, VerifiedAssertion};
-use omnion_identity::sso::protocol_steps;
 use omnion_identity::sso::providers::{self, AuthProvider, ProviderKind};
 use omnion_identity::sso::provisioning::{self, ProvisionOutcome};
-use omnion_identity::sso::role_rule_store;
-use omnion_identity::sso::role_rules::{Resolution, ScopeType, WhenKind};
 use omnion_identity::sso::saml::{self, SamlConfig};
 use omnion_permissions::bindings;
-use omnion_permissions::groups as group_store;
 use omnion_permissions::model::Scope;
 use omnion_permissions::roles as role_store;
 use serde::Deserialize;
@@ -250,17 +243,6 @@ pub async fn start(
             tracing::info!(provider = %provider.slug, "sign-in started");
             Ok(redirect(url.as_str()))
         }
-        // A directory is not a redirect. There is no authorization endpoint to send a browser
-        // to and no callback to come back through — the sign-in is a bind and a search, which
-        // is slice 4's business. Answering it as anything else would mean inventing a redirect
-        // to a URL that does not exist, and a 404 from the sign-in screen is a far better
-        // failure than a plausible-looking loop.
-        ProviderKind::Ldap | ProviderKind::ActiveDirectory => Err(ApiError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "directory_signin_not_available",
-            "signing in through a directory is not available yet — connect it in Settings → IAM \
-             → Authentication, and it will appear on the sign-in screen once it can be reached",
-        )),
     }
 }
 
@@ -521,26 +503,6 @@ async fn finish_sign_in(
     let ip_address = client.as_text();
     let agent = user_agent(&headers);
 
-    // The attribute map is applied *before* anything looks at the identity, because everything
-    // downstream — account matching, JIT creation, the audit line — reads the email, and an email
-    // the map produced is the one the operator configured. A provider with no map is unaffected.
-    let mut identity = identity;
-    if let Err(error) = project_through_map(pool, provider, &mut identity).await {
-        log_event(
-            pool,
-            provider,
-            None,
-            Some(&identity.subject),
-            "refused",
-            Some(error.code()),
-            &[],
-            ip_address.clone(),
-            agent.clone(),
-        )
-        .await;
-        return Err(error);
-    }
-
     let provisioned = match provisioning::provision(pool, provider, &identity).await {
         Ok(provisioned) => provisioned,
         Err(error) => {
@@ -615,7 +577,7 @@ async fn finish_sign_in(
     }
 
     provisioning::touch_account(pool, user.id, provider, &identity).await?;
-    let outcome =
+    let roles =
         apply_mapped_roles(pool, provider, &identity, user.organization_id, user.id).await?;
 
     log_event(
@@ -625,17 +587,13 @@ async fn finish_sign_in(
         Some(&identity.subject),
         provisioned.outcome.as_str(),
         Some(provisioned.outcome.as_str()),
-        &outcome.applied,
+        &roles,
         ip_address.clone(),
         agent.clone(),
     )
     .await;
     providers::touch_provider(pool, provider.id).await?;
 
-    // The rule that decided a role is the answer to "why does this person have that role", so it
-    // rides the sign-in audit — as a sentence, next to the roles it produced. The *condition* the
-    // rule tested does not: a rule's `when_value` is usually a group name or a department, and a
-    // rule diff in a log nobody audits is a second copy of the directory.
     record(
         state,
         NewAuditEntry::by_user(user.id, "iam.sso_sign_in")
@@ -644,46 +602,13 @@ async fn finish_sign_in(
                 "slug": provider.slug,
                 "kind": provider.kind.as_str(),
                 "external_subject": identity.subject,
-                "roles_applied": outcome.applied,
-                "role_reason": outcome.reason,
-                "role_rule_position": match &outcome.resolution {
-                    Some(Resolution::Matched { rule_position, .. }) => Some(*rule_position),
-                    _ => None,
-                },
+                "roles_applied": roles,
                 "outcome": provisioned.outcome.as_str(),
             }))
             .ip_address(ip_address.clone())
             .organization(Some(provider.organization_id)),
     )
     .await?;
-
-    // A role granted by a rule is a fact the security centre, a webhook subscriber and the panel's
-    // own log all want, and the only moment it exists is this one. Emitted after the audit so a
-    // subscriber that reads the audit entry finds it already written.
-    if let Some(Resolution::Matched {
-        rule_position,
-        role_id,
-        scope_type,
-        site_id,
-        ..
-    }) = &outcome.resolution
-    {
-        let _ = bus::emit(
-            pool,
-            NewEvent::new("iam.role_rule_matched")
-                .organization(Some(provider.organization_id))
-                .actor(Some(user.id))
-                .payload(json!({
-                    "subject_id": user.id,
-                    "provider_id": provider.id,
-                    "rule_position": rule_position,
-                    "role_id": role_id,
-                    "scope_type": scope_type.as_str(),
-                    "site_id": site_id,
-                })),
-        )
-        .await;
-    }
 
     if provisioned.outcome == ProvisionOutcome::Created {
         // A provisioned account is a fact the rest of the platform reacts to: `user.created` is
@@ -711,7 +636,7 @@ async fn finish_sign_in(
                     "user_id": user.id,
                     "provider_id": provider.id,
                     "slug": provider.slug,
-                    "roles_applied": outcome.applied,
+                    "roles_applied": roles,
                 })),
         )
         .await;
@@ -984,66 +909,6 @@ fn identity_from_verified(
     .map_err(|error| ApiError::bad_request("claims_refused", error.to_string()))
 }
 
-/// Re-project a claims payload through the provider's **attribute map**.
-///
-/// This is the point where the map stops being a panel setting and becomes the sign-in path.
-/// The claims reduction above reads `email` and guesses at mail-shaped claim names, which is
-/// right for a well-behaved provider and wrong for every one that names its fields its own way —
-/// Azure sends `userPrincipalName`, many directories send `mail` with the case spelled differently,
-/// and an attribute is frequently a *path*. When an operator has mapped the provider, that map is
-/// the authority: the same `AttributeMap::project()` the preview runs, so a sign-in cannot disagree
-/// with the rehearsal.
-///
-/// A provider with **no** map keeps the old guessing behaviour, deliberately. A new provider has
-/// no map yet, and refusing its sign-ins until somebody configures one would turn "not set up
-/// yet" into "nobody can sign in" — the exact lock-out the local sign-in invariant forbids.
-async fn project_through_map(
-    pool: &PgPool,
-    provider: &AuthProvider,
-    identity: &mut Identity,
-) -> Result<(), ApiError> {
-    let map = mappings::load_map(pool, provider.id).await?;
-    if map.rows.is_empty() {
-        return Ok(());
-    }
-
-    let payload = Value::Object(identity.attributes.clone());
-    let projection = map.project(&payload);
-    if !projection.ok() {
-        // Name the field rather than the claim: the operator's question is "what is missing from
-        // the payload", and the panel field is the thing they configured.
-        let missing: Vec<&str> = projection
-            .missing
-            .iter()
-            .map(|field| field.as_str())
-            .collect();
-        return Err(ApiError::bad_request(
-            "attributes_incomplete",
-            format!(
-                "the provider's answer has no {} — check the attribute map",
-                missing.join(", ")
-            ),
-        )
-        .with_details(json!({ "missing": missing })));
-    }
-
-    // The mapped values overwrite what the claim reduction guessed. The subject, the group list
-    // and the raw attributes are left alone: the map maps *fields*, and an operator who has not
-    // mapped groups should not find that mapping them broke the role rules.
-    if let Some(email) = projection.get(TargetField::Email) {
-        identity.email = email.to_ascii_lowercase();
-    }
-    if let Some(display_name) = projection.get(TargetField::DisplayName) {
-        identity.display_name = Some(display_name.to_owned());
-    }
-    for (field, value) in &projection.values {
-        identity
-            .attributes
-            .insert(field.as_str().to_owned(), Value::String(value.clone()));
-    }
-    Ok(())
-}
-
 /// The claim reduction of [`identity_from_verified`] without a provider row.
 fn identity_from_claims_only(
     verified: VerifiedAssertion,
@@ -1065,212 +930,22 @@ impl<T> Pipe for T {}
 // Role mapping
 // ---------------------------------------------------------------------------------------------
 
-/// What a sign-in's role evaluation decided, and the sentence that goes into the audit with it.
+/// Apply the claim → role rules and answer the role names that were actually attached.
 ///
-/// The sentence is not decoration. "the user's audit shows `role via rule #N`" is the only way an
-/// administrator can answer "why does this person have that role" without reconstructing the rule
-/// set from a mental model, and the reason travels with the binding it caused, so the two cannot
-/// drift apart in the log.
-#[derive(Debug, Clone)]
-struct RoleOutcome {
-    /// The role keys this sign-in actually attached, deduplicated and in a stable order.
-    applied: Vec<String>,
-    /// `role via rule #N` or `no rule matched → default role`.
-    reason: String,
-    /// The resolution, when the provider has an ordered rule set to resolve.
-    resolution: Option<Resolution>,
-}
-
-/// Build the group context a sign-in's rules are evaluated against.
-///
-/// This is the seam that makes a `when_group` rule work for a **provisioned** account, and it is
-/// the last clause of the criterion `iam.group_membership_synced` was emitted into. The chain
-/// that makes it necessary:
-///
-/// 1. A connector creates the account through `/scim/v2/Users` and adds it to a group through
-///    `/scim/v2/Groups`. Both write `group_members`.
-/// 2. The person signs in at the IdP, which is a separate system and knows nothing about SCIM.
-///    Its token carries whatever *its* policy says, and for most configurations that is **no
-///    group claim at all**.
-/// 3. The rule evaluator used to read only the claim. So the group rule the operator wrote for
-///    this person could not match, the audit said `no rule matched → default role`, and the
-///    panel's dry run — run against a *pasted sample* that happens to carry a group claim —
-///    said the rule was fine. The rule was correct and unreachable.
-///
-/// A failed membership read is reported as its own state rather than as an empty membership.
-/// Collapsing the two would resolve a group rule as a miss and grant the *default* role to
-/// somebody who was about to be granted a real one, which is a privilege change caused by a
-/// database blip — the one outcome a sign-in must not produce on its own.
-async fn group_context(
-    pool: &PgPool,
-    identity: &Identity,
-    organization_id: Option<Uuid>,
-    user_id: Uuid,
-) -> GroupContext {
-    let claim = identity.groups.clone();
-    let membership = match group_store::membership_groups(pool, user_id, organization_id).await {
-        Ok(groups) => groups,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                %user_id,
-                "stored group membership could not be read; a group role rule will not match on this sign-in"
-            );
-            return GroupContext::from_claim(claim).with_membership_unavailable();
-        }
-    };
-
-    // Both spellings are offered, because a rule is written against whichever string the
-    // operator's directory showed them. The name is only offered when it differs from the slug:
-    // for a group whose name already *is* its slug, sending both would double every value in the
-    // dry run's trace and make "why did this rule match" ambiguous between two identical entries.
-    let mut context = GroupContext::from_claim(claim);
-    let mut values = Vec::with_capacity(membership.len() * 2);
-    for group in &membership {
-        values.push(group.slug.clone());
-        if !group.name.eq_ignore_ascii_case(&group.slug) {
-            values.push(group.name.clone());
-        }
-    }
-    context.push_membership(values);
-    context
-}
-
-/// Apply the provider's role rules and answer what they decided.
-///
-/// The ordered rules are read through [`role_rule_store::load_rules`], which is the *same* reader
-/// the dry run uses, and resolved through [`RoleRules::resolve`], which is the *same* evaluator.
-/// That is the entire reason the preview is evidence rather than a decoration: there is one
-/// implementation of "which role does this identity get", and the sign-in path is not a second
-/// opinion of it.
-///
-/// **A rule set is authoritative when it exists.** This is the decision the whole slice turns on,
-/// and it is worth stating precisely because the alternative is quietly wrong in both directions.
-/// A provider that has *some* rules configured and a leftover claim mapping in `config` would —
-/// if both ran — grant the union of the two, and the panel's dry run, which shows the rules alone,
-/// would then disagree with the sign-in it was supposed to predict. The person who notices is a
-/// security administrator asking why somebody has a role no rule grants. So: rules present means
-/// the rules decide, and the legacy mapping is only consulted for a provider that has never been
-/// configured with one. The migration is not hidden behind a flag; a rule set that matches nothing
-/// falls through to the provider's default role, and the audit says so in those words.
+/// Every binding goes through `grant_if_missing`, so a person who signs in twice through the same
+/// provider does not collect a second copy of the same role, and the rows are the ordinary ones
+/// the panel's member tabs already show.
 async fn apply_mapped_roles(
     pool: &PgPool,
     provider: &AuthProvider,
     identity: &Identity,
     organization_id: Option<Uuid>,
     user_id: Uuid,
-) -> Result<RoleOutcome, ApiError> {
-    let default_role_id = claims::default_role_id(&provider.config, provider.default_role_id);
-    let rules = role_rule_store::load_rules(pool, provider.id)
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, provider = %provider.slug, "the role rules could not be read");
-            ApiError::from(error)
-        })?;
-
-    // No organization means no scope to bind into, and a rule that names a site cannot be resolved
-    // without one either. The answer is "nothing was applied", never a guess.
+) -> Result<Vec<String>, ApiError> {
     let Some(organization_id) = organization_id else {
-        return Ok(RoleOutcome {
-            applied: Vec::new(),
-            reason: if rules.rules.is_empty() {
-                "no rule set".to_owned()
-            } else {
-                Resolution::Default { default_role_id }.reason()
-            },
-            resolution: (!rules.rules.is_empty()).then(|| Resolution::Default { default_role_id }),
-        });
+        return Ok(Vec::new());
     };
 
-    if !rules.rules.is_empty() {
-        // The group's stored membership joins the token's claim. This is the third call site that
-        // decides a sign-in's role, and it is the one that makes `when_group` mean something for a
-        // SCIM-provisioned account — the case the `iam.group_membership_synced` event exists to
-        // announce and which nothing read until now.
-        let groups = group_context(pool, identity, Some(organization_id), user_id).await;
-        let resolution = rules.resolve_with(identity, &groups, default_role_id);
-        let mut applied = Vec::new();
-
-        if let Resolution::Matched {
-            role_id,
-            scope_type,
-            site_id,
-            rule,
-            ..
-        } = &resolution
-        {
-            // A group rule that fired on **stored membership** rather than on the token says so in
-            // the audit. The two are operationally different: one is revoked by the next sign-in,
-            // the other by the next SCIM sync, and an administrator answering "why does this person
-            // have this role" needs to know which clock to watch. The value is a slug or a group
-            // name — never a member list, never a claim document.
-            let group_source = (rule.when_kind == WhenKind::Group)
-                .then(|| groups.source_of(rule.when_value.trim()))
-                .flatten();
-            if let Some(source) = group_source {
-                tracing::info!(
-                    provider = %provider.slug,
-                    group_source = source.as_str(),
-                    "a group rule fired on stored membership rather than on the token claim"
-                );
-            }
-            // A site-scoped rule names a site, and the sign-in resolved one: the challenge carries
-            // the organization, and the site is the one the request was addressed to. A rule that
-            // names a *different* site than the person signed in at is still honoured — that is the
-            // point of a site-scoped rule — but the site must belong to this organization, which is
-            // the same tenant check the save path performs on the role.
-            let scope = match (scope_type, site_id) {
-                (ScopeType::Site, Some(site))
-                    if site_belongs_to(pool, *site, organization_id).await? =>
-                {
-                    Scope::Site {
-                        organization_id: Some(organization_id),
-                        site_id: *site,
-                    }
-                }
-                (ScopeType::Site, _) => {
-                    // The rule names a site that is not this organization's. Granting the
-                    // organization-wide role instead would be a wider grant than the operator
-                    // wrote, which is the one substitution that must never happen silently; the
-                    // sign-in still succeeds and the audit says nothing was applied.
-                    tracing::warn!(
-                        provider = %provider.slug,
-                        "a site-scoped rule names a site outside this organization; no role was attached"
-                    );
-                    return Ok(RoleOutcome {
-                        applied: Vec::new(),
-                        reason: "site outside this organization → no role attached".to_owned(),
-                        resolution: Some(resolution),
-                    });
-                }
-                (ScopeType::Organization, _) => Scope::Organization { organization_id },
-            };
-
-            if let Some(key) = attach(pool, *role_id, user_id, scope).await? {
-                applied.push(key);
-            }
-        } else if let Resolution::Default { default_role_id } = &resolution
-            && let Some(default_role) = *default_role_id
-            && let Some(key) = attach(
-                pool,
-                default_role,
-                user_id,
-                Scope::Organization { organization_id },
-            )
-            .await?
-        {
-            applied.push(key);
-        }
-
-        return Ok(RoleOutcome {
-            applied,
-            reason: resolution.reason(),
-            resolution: Some(resolution),
-        });
-    }
-
-    // No rule set: the provider predates ordered rules, so the claim → role mapping in its config
-    // is what it means. Same helper, same bindings, same audit shape.
     let mappings = claims::mappings_from_config(&provider.config)
         .map_err(|error| ApiError::bad_request("invalid_request", error.to_string()))?;
     let mut slugs = claims::resolve_roles(identity, &mappings);
@@ -1278,138 +953,64 @@ async fn apply_mapped_roles(
 
     let mut applied: Vec<String> = Vec::new();
     for slug in slugs {
-        let role = match find_grantable_role(pool, organization_id, &slug).await? {
+        // A role is found the way the rest of the platform finds one: this organization's own
+        // role if it defines one, otherwise the platform's base role of that name. Asking for
+        // *only* the organization's own role is what made a claim → role mapping silently do
+        // nothing for every tenant — the base roles are seeded at platform scope, so a directory
+        // mapping `editors` → `editor` matched nothing and the person signed in with no role and
+        // no error, which is the worst possible outcome for a feature whose whole point is the
+        // mapping.
+        let role = match role_store::find_role_by_key(pool, Some(organization_id), &slug).await? {
             Some(role) => role,
-            None => {
-                // A rule naming a role nobody has must not fail the sign-in: the person still
-                // gets in, and the operator sees a warning instead of an outage.
-                tracing::warn!(
-                    provider = %provider.slug,
-                    role = %slug,
-                    "a claim maps to a role this organization and the platform do not define"
-                );
-                continue;
-            }
+            None => match role_store::find_role_by_key(pool, None, &slug).await? {
+                Some(role) => role,
+                None => {
+                    // A rule naming a role nobody has must not fail the sign-in: the person still
+                    // gets in, and the operator sees a warning instead of an outage.
+                    tracing::warn!(
+                        provider = %provider.slug,
+                        role = %slug,
+                        "a claim maps to a role this organization and the platform do not define"
+                    );
+                    continue;
+                }
+            },
         };
-        if let Some(key) = attach(
-            pool,
-            role.id,
-            user_id,
-            Scope::Organization { organization_id },
-        )
-        .await?
-        {
-            applied.push(key);
+        if grant(pool, role.id, user_id, organization_id).await? {
+            applied.push(slug);
         }
     }
 
     // The provider's own default role rides the same path, so "every sign-in gets Editor" is one
     // ordinary row rather than a special case in the sign-in code.
-    if let Some(default_role) = default_role_id
-        && let Some(key) = attach(
-            pool,
-            default_role,
-            user_id,
-            Scope::Organization { organization_id },
-        )
-        .await?
-        && !applied.contains(&key)
+    if let Some(default_role) = claims::default_role_id(&provider.config, provider.default_role_id)
+        && grant(pool, default_role, user_id, organization_id).await?
     {
-        applied.push(key);
+        let name = role_store::find_role(pool, default_role)
+            .await?
+            .map_or_else(String::new, |role| role.key);
+        if !name.is_empty() {
+            applied.push(name);
+        }
     }
 
     applied.dedup();
-    Ok(RoleOutcome {
-        reason: if applied.is_empty() {
-            "no rule matched → default role".to_owned()
-        } else {
-            "claim mapping".to_owned()
-        },
-        applied,
-        resolution: None,
-    })
+    Ok(applied)
 }
 
-/// Attach one role, unless the person already holds it at this scope, and answer the role's key.
-///
-/// Returns the key only when a binding was actually created, so the audit names the roles this
-/// sign-in changed rather than every role the person has ever had.
-async fn attach(
-    pool: &PgPool,
-    role_id: Uuid,
-    user_id: Uuid,
-    scope: Scope,
-) -> Result<Option<String>, ApiError> {
-    if !grant(pool, role_id, user_id, &scope).await? {
-        return Ok(None);
-    }
-    Ok(role_store::find_role(pool, role_id)
-        .await
-        .map_err(ApiError::from)?
-        .map(|role| role.key))
-}
-
-/// The organization's own role of this key, or the platform's.
-///
-/// Asking for *only* the organization's own role is what made a claim → role mapping silently do
-/// nothing for every tenant — the base roles are seeded at platform scope, so a directory mapping
-/// `editors` → `editor` matched nothing and the person signed in with no role and no error, which
-/// is the worst possible outcome for a feature whose whole point is the mapping.
-async fn find_grantable_role(
-    pool: &PgPool,
-    organization_id: Uuid,
-    slug: &str,
-) -> Result<Option<omnion_permissions::model::Role>, ApiError> {
-    Ok(
-        role_store::find_role_by_key(pool, Some(organization_id), slug)
-            .await
-            .map_err(ApiError::from)?
-            .or(role_store::find_role_by_key(pool, None, slug)
-                .await
-                .map_err(ApiError::from)?),
-    )
-}
-
-/// Whether a site belongs to this organization.
-///
-/// The save path checks the same thing about a *role*; a rule can name a role this tenant may grant
-/// and a site it may not, and a site-scoped binding across tenants is a cross-tenant read.
-async fn site_belongs_to(
-    pool: &PgPool,
-    site_id: Uuid,
-    organization_id: Uuid,
-) -> Result<bool, ApiError> {
-    sqlx::query_scalar::<_, bool>(
-        "select exists (select 1 from sites where id = $1 and organization_id = $2)",
-    )
-    .bind(site_id)
-    .bind(organization_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|error| ApiError::from(omnion_identity::IdentityError::Database(error)))
-}
-
-/// Grant one role at a scope, unless the person already holds it there.
-///
-/// Takes a [`Scope`] rather than an organization id because a site-scoped rule grants at a site.
-/// The scope is the thing a binding is *about*, so passing the scope keeps the caller from having
-/// to know that a site binding also carries the owning organization.
-///
-/// `grant_if_missing` is the whole reason a second sign-in does not collect a second copy: the
-/// unique index on `(role, subject, scope)` is live, so the "already bound" case is a database
-/// fact rather than a check this code might forget.
+/// Grant one role at organization scope unless the person already holds it.
 async fn grant(
     pool: &PgPool,
     role_id: Uuid,
     user_id: Uuid,
-    scope: &Scope,
+    organization_id: Uuid,
 ) -> Result<bool, ApiError> {
     let binding = bindings::grant_if_missing(
         pool,
         omnion_permissions::model::NewBinding {
             role_id,
             user_id,
-            scope: scope.clone(),
+            scope: Scope::Organization { organization_id },
             granted_by: None,
             expires_at: None,
         },
@@ -1590,23 +1191,6 @@ async fn discovery_for(provider: &AuthProvider) -> Result<Discovery, ApiError> {
             format!("the provider's discovery document is incomplete: {error}"),
         )
     })?;
-    // The document says who it *is*; the row says who it was configured to be. RFC 8414 requires
-    // those to match, and the whole security of OIDC rests on it — a document served by the
-    // configured host that names a different issuer is a host serving somebody else's identity.
-    //
-    // It is checked *here*, in the one function every code path reads the document through, and
-    // not in the caller: a check a caller can forget is a check that eventually is. The metadata
-    // cache makes that concrete — a document fetched once is served to every later sign-in, so a
-    // mismatch the `Test connection` button reports and the callback ignores is a mismatch an
-    // operator has been told about and nothing has acted on. Same function, same verdict.
-    protocol_steps::require_issuer(&discovery, config_text(provider, "issuer").as_deref())
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "provider_misconfigured",
-                error.to_string(),
-            )
-        })?;
     cache.put(&key, document);
     Ok(discovery)
 }
@@ -1838,12 +1422,6 @@ mod tests {
     /// A provider row that names its group claim, so the group mapping is actually exercised.
     fn provider(kind: ProviderKind) -> AuthProvider {
         AuthProvider {
-            last_test_at: None,
-            last_test_ok: None,
-            sync_interval_minutes: 60,
-            last_sync_at: None,
-            last_sync_status: None,
-            plugin_key: None,
             id: Uuid::new_v4(),
             organization_id: Uuid::new_v4(),
             slug: "okta".into(),

@@ -45,28 +45,14 @@ say() { printf '%s\n' "$*"; }
 # Unreadable `/proc/N/environ` (the process exited between the glob and the read) is not a
 # "held" answer — it is a process that no longer exists.
 in_use() {
-  local dir="$1" p env val cwd
+  local dir="$1" p
   for p in /proc/[0-9]*; do
-    env="$(tr '\0' '\n' < "$p/environ" 2>/dev/null)" || continue
-    grep -qx "CARGO_TARGET_DIR=$dir" <<<"$env" && return 0
-    # A *relative* CARGO_TARGET_DIR is relative to the process that carries it, not to this
-    # script: a shell that exported `.tmp-target` and then `cd`'d into a worktree is building
-    # into `<that shell's cwd>/.tmp-target`, and the answer must not depend on where the guard
-    # happens to be standing. So each candidate's value is resolved against its own cwd before
-    # it is compared. Resolving it against `$PWD` — the first attempt at this fix — matches
-    # only by accident, when the two happen to agree, and reports a running build as unused for
-    # every other combination.
-    while IFS= read -r val; do
-      [ "${val#/}" != "$val" ] && continue          # absolute: already compared above
-      cwd="$(readlink "$p/cwd" 2>/dev/null)" || continue
-      [ -n "$cwd" ] || continue
-      if [ "$cwd/$val" = "$dir" ]; then return 0; fi
-    done < <(sed -n 's/^CARGO_TARGET_DIR=//p' <<<"$env")
+    tr '\0' '\n' < "$p/environ" 2>/dev/null | grep -qqx "CARGO_TARGET_DIR=$dir" && return 0
   done
   return 1
 }
 
-# Is a QA pass running against the worktree that owns this build cache?
+# Is a QA pass running against the worktree that owns this tmpfs target?
 #
 # `in_use` alone was not enough, and this function exists because of the day it was not. A
 # stack's build runs in its own wrapper process (`qa-pass.sh` → `cargo build`), which **exits**
@@ -76,40 +62,14 @@ in_use() {
 # that was a minute from using it. The honest test is not "is somebody building right now" but
 # "is anybody at all still working in that worktree", and a live process with its cwd in the
 # worktree is the cheapest honest answer.
-#
-# The worktree is derived from the **directory itself**, never from a guessed stack name, and
-# that is the whole reason this function could be protecting the wrong tree. It used to strip
-# `-target` off the basename and look for `omnion-<token>`: for a tmpfs cache that is right
-# (`w9-target` → `omnion-w9`), but for a worktree's *own* `target/` the token comes out as the
-# literal string `target`, the directory `/mnt/apopic/omnion-target` does not exist, and the
-# loop fell through to its last candidate — `/mnt/apopic/omnion`, the **main** checkout. So
-# the one cache whose own liveness matters most (a pass builds into /dev/shm, stages the binary
-# into `target/`, and the ceiling deletes `target/` in the window between the two) resolved to a
-# tree nobody was working in, and the fallthrough additionally pinned the main writer's target
-# for as long as any process happened to be living in it.
-worktree_of() {
-  local dir="$1" w
-  # `.../omnion-w9/target` → `.../omnion-w9`; `.../omnion/target` → `.../omnion`.
-  case "$(basename "$dir")" in
-    target) echo "$(dirname "$dir")" ;;
-    *)      # a tmpfs cache: `w9-target` → `omnion-w9`, best effort.
-      w="$(basename "$dir")"; w="${w%-target}"; w="${w#omnion-}"
-      [ -d "$ROOT/omnion-$w" ] && echo "$ROOT/omnion-$w" ;;
-  esac
-}
 worktree_busy() {
-  local dir="$1" own wt p
-  own="$(worktree_of "$dir")"
-  [ -n "$own" ] || return 1
-  for p in /proc/[0-9]*; do
-    wt="$(readlink "$p/cwd" 2>/dev/null)" || continue
-    [ -n "$wt" ] || continue
-    # The worktree itself, or anything under it: a pass leaves a node server with its cwd in
-    # `apps/admin` and Chromium children in the worktree root, and neither is the process that
-    # launched them.
-    if [ "$wt" = "$own" ] || [ "${wt#"$own"/}" != "$wt" ]; then
-      return 0
-    fi
+  local dir="$1" token wt p
+  token="$(basename "$dir")"; token="${token%-target}"; token="${token#omnion-}"
+  for wt in "$ROOT"/omnion-$token "$ROOT"/omnion; do
+    [ -d "$wt" ] || continue
+    for p in /proc/[0-9]*; do
+      [ "$(readlink "$p/cwd" 2>/dev/null)" = "$wt" ] && return 0
+    done
   done
   return 1
 }
@@ -156,25 +116,14 @@ for art in "$ROOT"/omnion*/qa-artifacts; do
   done < <(find "$art" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | head -n -2)
 done
 
-# 3. per-worktree ceiling: never let one target/ grow past the cap
-#
-# The liveness check is the whole point and it is the step that lacked it. This loop ran
-# `rm -rf` on the fattest target with no question of who was using it, and a QA pass is
-# precisely the case: `run.sh` builds into a tmpfs CARGO_TARGET_DIR, then copies the binary
-# into `target/debug/` — a target/ that is over the ceiling precisely because the build just
-# filled it, in a worktree where the pass is running. The guard deleted the directory between
-# the build and the copy, and the pass died with `cp: cannot create regular file
-# 'target/debug/.omnion-api.new': No such file or directory` after a full 1m47s compile, with
-# no mention of a guard anywhere in the output.
+# 4. per-worktree ceiling: never let one target/ grow past the cap
 for t in "$ROOT"/omnion*/target; do
   [ -d "$t" ] || continue
   m=$(dir_mb "$t")
   if [ "$m" -gt "$MAX_MB" ]; then
     w="$(dirname "$t")"
-    reclaimable "$t" && {
-      say "target ${m}M over the ${MAX_MB}M ceiling — dropping: $(basename "$w")"
-      freed=$((freed + m)); rm -rf "$t"
-    }
+    say "target ${m}M over the ${MAX_MB}M ceiling — dropping: $(basename "$w")"
+    freed=$((freed + m)); rm -rf "$t"
   fi
 done
 
@@ -220,18 +169,8 @@ while [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; do
     [ "$w" = "$ROOT/omnion" ] && continue      # the deploy script runs this binary
     # Same rule as the tmpfs sweep: a target a live build is writing into is not a victim, no
     # matter how full the disk is. Step 4 is the step that used to skip this, and a disk at 100%
-    # is exactly when a wrong `rm -rf` looks like a reasonable idea. It also asked `in_use`
-    # alone, which is the test that answers "not held" for a pass between its build and its
-    # `cp` — the two steps above use the full `reclaimable` test and this one did not, so the
-    # last-resort path was the most willing to delete a running pass's target of the three.
-    #
-    # `reclaimable` returns **true when the target may be deleted**, so the guard is `||`:
-    # written as `reclaimable "$t" && continue` this line skips every idle target — the ones
-    # this step exists to reclaim — and nominates every *busy* one as a victim, which is the
-    # exact inverse of its intent and would delete a running pass on a box that is under
-    # pressure. The ceiling above is written as `reclaimable && { drop }` and is correct; the
-    # two steps read in opposite directions on purpose, and conflating them is the trap.
-    reclaimable "$t" || continue
+    # is exactly when a wrong `rm -rf` looks like a reasonable idea.
+    in_use "$t" && continue
     m=$(dir_mb "$t")
     [ "${m:-0}" -gt "$best" ] && { best=$m; victim="$t"; }
   done

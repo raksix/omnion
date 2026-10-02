@@ -78,15 +78,6 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, code, message)
     }
 
-    /// `409` — the request is well formed and the caller may do it, but the current state
-    /// refuses it. Distinct from `400` on purpose: `400` says "fix your request", `409` says
-    /// "your request is right and the world is not", and a client that conflates them either
-    /// gives up on a recoverable state or retries a malformed one forever.
-    #[must_use]
-    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
-        Self::new(StatusCode::CONFLICT, code, message)
-    }
-
     /// Map a core error onto the API surface.
     ///
     /// A dependency that did not answer becomes `503` (retryable); everything else is an
@@ -313,15 +304,6 @@ impl From<IdentityError> for ApiError {
             IdentityError::InvalidOrganization(message)
             | IdentityError::InvalidSite(message)
             | IdentityError::InvalidHost(message) => Self::bad_request("invalid_request", message),
-            // A provisioning refusal is the *caller's* mistake: a token name that is too long, a
-            // lifetime outside the range, an attempt to rotate something already dead. Until this
-            // arm existed it fell through to the catch-all and answered `500 internal_error` —
-            // a status code that tells the operator the platform is broken when in fact they
-            // typed a zero, and (as the JIT-password defect in the same REQ showed) a
-            // distinguishable status on a credential path is a small tell worth closing.
-            IdentityError::InvalidProvisioning(message) => {
-                Self::bad_request("invalid_provisioning", message)
-            }
             // Security policy, second factors and stored secrets (REQ-006, slice 3). A policy
             // refused by a range check names the control the reader has to fix, so the panel can
             // point at the field instead of printing a sentence.
@@ -870,6 +852,41 @@ impl From<WorkflowError> for ApiError {
             ),
             WorkflowError::Audit(err) => err.into(),
             WorkflowError::Invalid { code, message } => Self::bad_request(code, message),
+            // The credential taxonomy (REQ-087 slice 2). The statuses are the ones the routes
+            // use too, kept here so a `?` conversion and a `.map_err(map_store)` cannot answer
+            // the same failure two different ways: `credential_in_use` is a `409` because the
+            // resource exists and the conflict is real, and the rest are the caller's `400`.
+            WorkflowError::CredentialInUse { key, workflows } => Self::new(
+                StatusCode::CONFLICT,
+                "credential_in_use",
+                format!("{key:?} is still named by {workflows} workflow(s)"),
+            ),
+            WorkflowError::CredentialSecretWriteOnly { field } => Self::bad_request(
+                "credential_secret_write_only",
+                format!(
+                    "{field:?} is write-only — a secret is accepted once, on the replace-secret \
+                     path, and is never returned"
+                ),
+            ),
+            WorkflowError::CredentialFieldRequired { field } => Self::bad_request(
+                "credential_field_required",
+                format!("{field:?} is required by this credential type"),
+            ),
+            WorkflowError::CredentialTypeUnknown(key) => Self::bad_request(
+                "credential_type_unknown",
+                format!("{key:?} is not a credential type"),
+            ),
+            WorkflowError::CredentialScopeDenied {
+                field,
+                value,
+                allowed,
+            } => Self::bad_request(
+                "credential_scope_denied",
+                format!("{field} {value:?} is not one of {}", allowed.join(", ")),
+            ),
+            WorkflowError::CredentialInvalid(message) => {
+                Self::bad_request("credential_invalid", message)
+            }
         }
     }
 }

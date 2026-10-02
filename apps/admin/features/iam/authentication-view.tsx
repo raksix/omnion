@@ -24,7 +24,6 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react
 import {
   AlertTriangle,
   CheckCircle2,
-  ChevronRight,
   CircleSlash,
   KeyRound,
   Link2,
@@ -33,33 +32,21 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
-  Square,
-  SquareCheckBig,
   Trash2,
   XCircle,
 } from "lucide-react";
 
 import { useSession } from "@/lib/session";
-import { AttributeMapEditor } from "@/features/iam/attribute-map-editor";
-import { RoleRulesEditor } from "@/features/iam/role-rules-editor";
-import { SyncLedger } from "@/features/iam/sync-ledger";
-import {
-  ProviderDeletionDialog,
-  type ProviderDeletionOutcome,
-} from "@/features/iam/provider-deletion-dialog";
 import {
   ApiError,
-  bulkIamProviders,
   createIamProvider,
-  disableIamProvider,
-  enableIamProvider,
+  deleteIamProvider,
   fetchIamProviderEvents,
   fetchIamProviders,
   fetchOrganizations,
   testIamProvider,
   updateIamProvider,
   type IamAuthProvider,
-  type IamProviderBulkResult,
   type IamProviderEvent,
   type IamProviderTest,
 } from "@/lib/api";
@@ -69,55 +56,6 @@ const KIND_LABELS: Record<string, string> = {
   oidc: "OpenID Connect",
   oauth2: "OAuth 2.0",
   saml: "SAML 2.0",
-  ldap: "LDAP",
-  active_directory: "Active Directory",
-};
-
-/** The kinds that are a live directory rather than a protocol round trip (REQ-065). */
-const DIRECTORY_KINDS = new Set(["ldap", "active_directory"]);
-
-/**
- * What a directory needs instead of a discovery document.
- *
- * `bind_secret_ref` is a field like the others and that is deliberate: the bind password is a
- * *name* of an environment variable, never a value, and putting it beside the host in the form
- * is what makes it obvious that it is a reference. A directory has no client secret, so the
- * protocol `secret_ref` input is not shown for these kinds at all.
- */
-const DIRECTORY_FIELDS = [
-  { key: "host", label: "Host", hint: "ldaps://dir.example.com — scheme and port included" },
-  { key: "base_dn", label: "Base DN", hint: "The subtree the search runs in" },
-  { key: "bind_dn", label: "Service account DN", hint: "cn=omnion,ou=svc,dc=example,dc=com" },
-  {
-    key: "bind_secret_ref",
-    label: "Bind password reference",
-    hint: "The NAME of an environment variable — the password itself is never stored here",
-  },
-  { key: "user_filter", label: "User filter", hint: "Must contain {username}" },
-  { key: "group_filter", label: "Group filter", optional: true },
-] as const;
-
-/**
- * Step names, in the vocabulary both ladders share.
- *
- * A directory walks six checks and a protocol provider walks four, and the two sets do not
- * overlap except in `issuer` — a directory's `bind` is a service-account credential and a
- * protocol's `certificate` is a pasted public key. The table holds every name either ladder can
- * produce, and the renderer falls back to the raw name for anything added later, so a new step
- * shows up with a readable name instead of silently rendering nothing.
- */
-const STEP_LABELS: Record<string, string> = {
-  dns: "DNS",
-  tcp: "TCP",
-  tls: "TLS",
-  bind: "Bind",
-  search: "Search",
-  attributes: "Attributes",
-  discovery: "Discovery",
-  certificate: "Certificate",
-  issuer: "Issuer",
-  key_set: "Signing keys",
-  claims: "Claims",
 };
 
 /** What a SAML provider needs instead of a discovery document. */
@@ -155,14 +93,12 @@ const OUTCOME_STYLES: Record<string, string> = {
 type Draft = {
   id: string | null;
   slug: string;
-  kind: "oidc" | "oauth2" | "saml" | "ldap" | "active_directory";
+  kind: "oidc" | "oauth2" | "saml";
   name: string;
   secretRef: string;
   groupClaim: string;
   jitEnabled: boolean;
   enabled: boolean;
-  /** Minutes between scheduled syncs. 0 = never on a schedule. */
-  syncIntervalMinutes: number;
   config: Record<string, string>;
 };
 
@@ -180,20 +116,7 @@ function emptyDraft(kind: Draft["kind"] = "oidc"): Draft {
     jitEnabled: false,
     // And a new provider is created switched off — `test` proves it, `enabled` publishes it.
     enabled: false,
-    syncIntervalMinutes: 60,
-    config: DIRECTORY_KINDS.has(kind)
-      ? {
-          directory_kind: kind,
-          host: "ldaps://",
-          base_dn: "",
-          bind_dn: "",
-          bind_secret_ref: "",
-          // The placeholder is not optional: without it the filter is constant and every
-          // sign-in would match every person in the directory.
-          user_filter: "(&(objectClass=person)(uid={username}))",
-          group_filter: "(objectClass=group)",
-        }
-      : {},
+    config: {},
   };
 }
 
@@ -212,7 +135,6 @@ function draftOf(provider: IamAuthProvider): Draft {
     groupClaim: provider.group_claim ?? "",
     jitEnabled: provider.jit_enabled,
     enabled: provider.enabled,
-    syncIntervalMinutes: provider.sync_interval_minutes,
     config,
   };
 }
@@ -228,28 +150,10 @@ export function AuthenticationView() {
   const [busy, setBusy] = useState(false);
 
   const [draft, setDraft] = useState<Draft | null>(null);
-  /* The provider whose removal is being negotiated, as an object rather than an id. The dialog
-   * needs the name and the slug for its own heading, and holding the whole provider here means
-   * the list can re-render underneath without the dialog losing what it was opened for. */
-  const [deleting, setDeleting] = useState<IamAuthProvider | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [tests, setTests] = useState<Record<string, IamProviderTest>>({});
   const [events, setEvents] = useState<Record<string, IamProviderEvent[]>>({});
   const [showLog, setShowLog] = useState<string | null>(null);
-  // Which provider has its sync ledger open. Separate from `showLog` on purpose: the sign-in
-  // log and the sync history are different questions, and one disclosure closing the other is
-  // how a screen ends up showing neither.
-  const [showSync, setShowSync] = useState<string | null>(null);
-  /* The ticked provider ids, for the bulk enable/disable. Kept as a set-like string array and
-   * pruned against the loaded list on every render rather than cleared on each load: an operator
-   * who has ticked three rows, opened the drawer by accident and closed it should not come back
-   * to a selection they have to rebuild. What the selection is FOR is the reason the bar only
-   * appears above a non-empty one — a control that is always on screen and usually does nothing
-   * is a control nobody learns to read. */
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  /* The last bulk answer, kept so the operator can read *which* provider was refused after the
-   * list has re-rendered. A notice that says "2 were refused" and cannot name them is the same
-   * number-in-a-sentence problem the revocation count had: it is not actionable. */
-  const [bulk, setBulk] = useState<IamProviderBulkResult | null>(null);
 
   // A platform account names the organization it manages providers for; an organization account
   // never sees the picker, because it can only ever work inside its own.
@@ -330,16 +234,8 @@ export function AuthenticationView() {
           groupClaim: draft.groupClaim || null,
           jitEnabled: draft.jitEnabled,
           enabled: draft.enabled,
-          syncIntervalMinutes: draft.syncIntervalMinutes,
         });
-        // A directory's config edit invalidates the stored test result server-side, so the
-        // notice says it: otherwise the next thing the operator sees is the chip reverting to
-        // "never tested" with no explanation of why a green tick just disappeared.
-        setNotice(
-          DIRECTORY_KINDS.has(draft.kind)
-            ? `${draft.name || draft.slug} was saved. Test the connection again before switching it on.`
-            : `${draft.name || draft.slug} was saved.`,
-        );
+        setNotice(`${draft.name || draft.slug} was saved.`);
       } else {
         const created = await createIamProvider({
           slug: draft.slug,
@@ -350,7 +246,6 @@ export function AuthenticationView() {
           groupClaim: draft.groupClaim || null,
           jitEnabled: draft.jitEnabled,
           organizationId: activeOrg,
-          syncIntervalMinutes: draft.syncIntervalMinutes,
         });
         setNotice(
           `${created.name} was connected. Test the connection, then switch it on when it passes.`,
@@ -394,24 +289,16 @@ export function AuthenticationView() {
     }
   };
 
-  /**
-   * Switch a provider on or off.
-   *
-   * Two verbs, not a PATCH: switching on is refused until a test has passed and switching off
-   * never is. The button is also *disabled* rather than merely erroring on an untested provider,
-   * because a control that only tells you no after the click is a control people click twice.
-   */
   const toggle = async (provider: IamAuthProvider) => {
     setBusy(true);
     setError(null);
     try {
-      if (provider.enabled) {
-        await disableIamProvider(provider.id);
-        setNotice(`${provider.name} is switched off; nobody can sign in with it.`);
-      } else {
-        await enableIamProvider(provider.id);
-        setNotice(`${provider.name} is live — people can sign in with it now.`);
-      }
+      await updateIamProvider(provider.id, { enabled: !provider.enabled });
+      setNotice(
+        provider.enabled
+          ? `${provider.name} is switched off; nobody can sign in with it.`
+          : `${provider.name} is live — people can sign in with it now.`,
+      );
       await load(activeOrg);
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : "The provider could not be changed.");
@@ -420,71 +307,19 @@ export function AuthenticationView() {
     }
   };
 
-  /** Switch a whole selection on or off, and say per provider what happened. */
-  const runBulk = async (action: "enable" | "disable") => {
-    if (selectedIds.length === 0) return;
+  const remove = async (provider: IamAuthProvider) => {
     setBusy(true);
     setError(null);
-    setNotice(null);
-    setBulk(null);
     try {
-      const outcome = await bulkIamProviders(action, selectedIds);
-      setBulk(outcome);
-      // The list is re-read rather than patched from the answer: the API reports what it did,
-      // and the row also carries the status chip, the untested marker and the sign-in count,
-      // so a locally patched list would disagree with the next reload in three ways.
+      await deleteIamProvider(provider.id);
+      setNotice(`${provider.name} was removed, with its sign-in log.`);
+      setConfirmDelete(null);
       await load(activeOrg);
-      const verb = action === "enable" ? "switched on" : "switched off";
-      if (outcome.refused === 0 && outcome.missing.length === 0) {
-        setNotice(
-          `${outcome.results.length} provider${outcome.results.length === 1 ? "" : "s"} ${verb}.`,
-        );
-        setSelectedIds([]);
-      } else {
-        // The selection is deliberately KEPT when something was refused: the refused providers
-        // are the ones that still need work, and clearing the ticks would make the operator
-        // tick them again by hand to find out which they were.
-        setNotice(
-          `${outcome.applied} ${verb}, ${outcome.refused} refused` +
-            (outcome.missing.length > 0 ? `, ${outcome.missing.length} not found` : "") +
-            " — see the list below.",
-        );
-      }
     } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : "The providers could not be changed.");
+      setError(cause instanceof ApiError ? cause.message : "The provider could not be removed.");
     } finally {
       setBusy(false);
     }
-  };
-
-  const toggleSelection = (id: string) => {
-    setSelectedIds((current) =>
-      current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id],
-    );
-  };
-
-  /* The dialog reports back. The list is re-read either way, because a reassignment and a
-   * deletion change different things but neither of them can be reflected in the row that was
-   * rendered before the click. */
-  const finishDeletion = async (outcome: ProviderDeletionOutcome) => {
-    if (outcome.kind === "deleted") {
-      setDeleting(null);
-      setNotice("The provider was removed, with its sign-in log.");
-    } else if (outcome.deleted) {
-      setDeleting(null);
-      setNotice(
-        `${outcome.moved} accounts fell back to a local sign-in and the provider was removed.`,
-      );
-    } else {
-      /* The provider is still there, so the dialog stays open with a fresh impact read. The
-       * announcement is written as what happened, not as what the operator should do next: the
-       * dialog is the thing that offers the next step. */
-      setNotice(
-        `${outcome.moved} accounts fell back to a local sign-in. The connector stays until you remove it.`,
-      );
-      return;
-    }
-    await load(activeOrg);
   };
 
   return (
@@ -492,9 +327,8 @@ export function AuthenticationView() {
       <header className="flex flex-col gap-1">
         <h1 className="text-[17px] font-semibold text-ink">Sign-in providers</h1>
         <p className="max-w-2xl text-[12.5px] text-muted">
-          Connect a directory over OpenID Connect, OAuth 2.0, SAML 2.0, LDAP or Active Directory.
-          Local sign-in stays available whatever happens here — a provider is an extra way in,
-          never the only one.
+          Connect a directory over OpenID Connect, OAuth 2.0 or SAML 2.0. Local sign-in stays
+          available whatever happens here — a provider is an extra way in, never the only one.
         </p>
       </header>
 
@@ -579,75 +413,6 @@ export function AuthenticationView() {
         </div>
       ) : null}
 
-      {status === "ready" && providers.length > 0 ? (
-        /* The bulk bar. It is *above* the list and only exists when something is ticked, which
-           is the whole reason it can be trusted: a permanent toolbar of actions that mostly
-           apply to nothing teaches operators to click before reading. */
-        <div
-          data-provider-bulk
-          className="sticky top-0 z-10 flex flex-wrap items-center gap-2 rounded-lg border border-accent/30 bg-accent-soft px-3 py-2"
-        >
-          <span className="text-[12.5px] text-ink" data-provider-bulk-count>
-            {selectedIds.length} selected
-          </span>
-          <button
-            type="button"
-            data-provider-bulk-enable
-            disabled={busy}
-            onClick={() => void runBulk("enable")}
-            className="flex h-8 items-center gap-1.5 rounded-lg bg-accent px-3 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:opacity-50"
-          >
-            <CheckCircle2 className="size-3.5" aria-hidden />
-            Switch on
-          </button>
-          <button
-            type="button"
-            data-provider-bulk-disable
-            disabled={busy}
-            onClick={() => void runBulk("disable")}
-            className="flex h-8 items-center gap-1.5 rounded-lg border border-line bg-surface px-3 text-[12.5px] text-ink transition hover:bg-panel disabled:opacity-50"
-          >
-            <CircleSlash className="size-3.5" aria-hidden />
-            Switch off
-          </button>
-          <button
-            type="button"
-            data-provider-bulk-clear
-            onClick={() => setSelectedIds([])}
-            className="ml-auto text-[12px] text-muted transition hover:text-ink"
-          >
-            Clear
-          </button>
-        </div>
-      ) : null}
-
-      {/* The per-provider outcome of the last batch. A refusal is listed by slug, not counted:
-          "1 refused" sends the operator hunting, and the whole point of asking the gate per row
-          is that the operator learns WHICH row needs a test before they can act. */}
-      {bulk && (bulk.refused > 0 || bulk.missing.length > 0) ? (
-        <div
-          role="status"
-          data-provider-bulk-report
-          className="flex flex-col gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-900"
-        >
-          {bulk.refused > 0 ? (
-            <span>
-              {bulk.refused} could not be switched {bulk.action === "enable" ? "on" : "off"}:{" "}
-              {bulk.results
-                .filter((row) => row.error)
-                .map((row) => `${row.slug} (${row.message ?? row.error})`)
-                .join(", ")}
-            </span>
-          ) : null}
-          {bulk.missing.length > 0 ? (
-            <span data-provider-bulk-missing>
-              {bulk.missing.length} provider{bulk.missing.length === 1 ? " was" : "s were"} not
-              found in this organization.
-            </span>
-          ) : null}
-        </div>
-      ) : null}
-
       {status === "ready" && providers.length === 0 ? (
         <div
           data-providers-empty
@@ -685,61 +450,20 @@ export function AuthenticationView() {
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="flex min-w-0 flex-col gap-1">
                     <div className="flex flex-wrap items-center gap-2">
-                      {/* The selection tick, first in the row because it is the only control
-                          that acts on something other than this one row. A screen reader
-                          announces it as the provider's name and its checked state, which is
-                          the sentence a screen reader user needs and would otherwise have to
-                          assemble from the row's contents. */}
-                      <button
-                        type="button"
-                        role="checkbox"
-                        aria-checked={selectedIds.includes(provider.id)}
-                        aria-label={`Select ${provider.name}`}
-                        data-provider-select={provider.slug}
-                        data-selected={selectedIds.includes(provider.id) ? "true" : "false"}
-                        onClick={() => toggleSelection(provider.id)}
-                        className="flex size-6 shrink-0 items-center justify-center rounded-md border border-line text-muted transition hover:border-accent hover:text-accent"
-                      >
-                        {selectedIds.includes(provider.id) ? (
-                          <SquareCheckBig className="size-3.5 text-accent" aria-hidden />
-                        ) : (
-                          <Square className="size-3.5" aria-hidden />
-                        )}
-                      </button>
                       <span className="text-[13.5px] font-medium text-ink">{provider.name}</span>
                       <span className="rounded-full border border-line bg-panel px-2 py-0.5 text-[11px] text-muted">
                         {KIND_LABELS[provider.kind] ?? provider.kind}
                       </span>
                       <code className="font-mono text-[11.5px] text-muted">/{provider.slug}</code>
-                      {/* Four states, and the middle one is the point: an *enabled* provider
-                          whose last test failed is load-bearing and broken, which is neither
-                          "live" nor "off" and needs an operator to look at it. */}
-                      <span
-                        data-provider-status={provider.status}
-                        className={`rounded-full border px-2 py-0.5 text-[11px ${
-                          provider.status === "enabled"
-                            ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700"
-                            : provider.status === "degraded"
-                              ? "border-amber-500/40 bg-amber-500/10 text-amber-800"
-                              : "border-line bg-panel text-muted"
-                        }`}
-                      >
-                        {provider.status === "enabled"
-                          ? "live"
-                          : provider.status === "degraded"
-                            ? "live — needs attention"
-                            : "off"}
-                      </span>
-                      {/* Never tested is not the same as tested and failed, and a brand-new
-                          provider must not look like a broken one. */}
-                      {!provider.enabled && provider.last_test_ok === null ? (
-                        <span
-                          data-provider-untested={provider.slug}
-                          className="rounded-full border border-line bg-panel px-2 py-0.5 text-[11px] text-muted"
-                        >
-                          never tested
+                      {provider.enabled ? (
+                        <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-700">
+                          live
                         </span>
-                      ) : null}
+                      ) : (
+                        <span className="rounded-full border border-line bg-panel px-2 py-0.5 text-[11px] text-muted">
+                          off
+                        </span>
+                      )}
                       {provider.jit_enabled ? (
                         <span className="rounded-full border border-sky-500/40 bg-sky-500/10 px-2 py-0.5 text-[11px] text-sky-700">
                           provisions new accounts
@@ -786,16 +510,7 @@ export function AuthenticationView() {
                     <button
                       type="button"
                       data-provider-toggle={provider.slug}
-                      // Switching *off* is never gated; switching on needs a passing test, and
-                      // the button says so before the click rather than after it.
-                      disabled={busy || (!provider.enabled && provider.last_test_ok !== true)}
-                      title={
-                        provider.enabled
-                          ? "Nobody will be able to sign in with this provider"
-                          : provider.last_test_ok === true
-                            ? undefined
-                            : "Run a passing connection test first"
-                      }
+                      disabled={busy}
                       onClick={() => void toggle(provider)}
                       className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-ink transition hover:bg-panel disabled:opacity-50"
                     >
@@ -819,22 +534,37 @@ export function AuthenticationView() {
                       <KeyRound className="size-3.5" aria-hidden />
                       Sign-in log
                     </button>
-                    {/* One button, not a confirm pair. The pair could not know whether the delete
-                        would be refused until it pressed, and a refusal discovered that way
-                        arrives as an error payload with no repair attached. The dialog reads
-                        the impact first, so the count and the way out are on screen before
-                        anything is at stake. `data-provider-delete-confirm` survives on the
-                        dialog's final button so the walkthrough's existing selector still
-                        drives the same action it did when this was inline. */}
-                    <button
-                      type="button"
-                      data-provider-delete={provider.slug}
-                      onClick={() => setDeleting(provider)}
-                      className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-ink transition hover:bg-panel"
-                    >
-                      <Trash2 className="size-3.5" aria-hidden />
-                      Remove
-                    </button>
+                    {confirmDelete === provider.id ? (
+                      <span className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          data-provider-delete-confirm={provider.slug}
+                          disabled={busy}
+                          onClick={() => void remove(provider)}
+                          className="flex h-8 items-center gap-1.5 rounded-lg border border-danger/50 px-2.5 text-[12px] text-caution"
+                        >
+                          <Trash2 className="size-3.5" aria-hidden />
+                          Remove for good
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDelete(null)}
+                          className="h-8 rounded-lg border border-line px-2.5 text-[12px] text-ink"
+                        >
+                          Keep
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        data-provider-delete={provider.slug}
+                        onClick={() => setConfirmDelete(provider.id)}
+                        className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-ink transition hover:bg-panel"
+                      >
+                        <Trash2 className="size-3.5" aria-hidden />
+                        Remove
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -868,87 +598,22 @@ export function AuthenticationView() {
                 </div>
 
                 {test ? (
-                  <div
+                  <p
                     data-provider-test-result={provider.slug}
                     data-test-status={test.status}
-                    className={`flex flex-col gap-2 rounded-lg border px-2.5 py-2 text-[12px] ${
+                    className={`flex items-start gap-1.5 rounded-lg border px-2.5 py-1.5 text-[12px] ${
                       test.status === "ok"
                         ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700"
-                        : test.status === "incomplete"
-                          ? "border-line bg-panel text-muted"
-                          : "border-amber-500/40 bg-amber-500/10 text-amber-800"
+                        : "border-amber-500/40 bg-amber-500/10 text-amber-800"
                     }`}
                   >
-                    <p className="flex items-start gap-1.5">
-                      {/* Three states get three icons. `incomplete` is neither a tick nor a
-                          cross: the form is fine and the server has not been asked, and drawing
-                          a cross there sends the operator to fix something that is not broken. */}
-                      {test.status === "ok" ? (
-                        <CheckCircle2 className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-                      ) : test.status === "incomplete" ? (
-                        <Loader2 className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-                      ) : (
-                        <XCircle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-                      )}
-                      <span>{test.detail}</span>
-                    </p>
-
-                    {/* The step ladder. A directory fails at exactly one of these and
-                        "connection failed" gives an operator nothing to act on, so each step
-                        keeps its own verdict and its own sentence. */}
-                    {test.steps && test.steps.length > 0 ? (
-                      <ol
-                        data-test-steps={provider.slug}
-                        className="flex flex-col gap-1 border-t border-line/60 pt-2"
-                      >
-                        {test.steps.map((step) => (
-                          <li
-                            key={step.step}
-                            data-test-step={step.step}
-                            data-test-step-status={step.status}
-                            className="flex items-start gap-2"
-                          >
-                            {step.status === "ok" ? (
-                              <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-emerald-600" aria-hidden />
-                            ) : step.status === "failed" ? (
-                              <XCircle className="mt-0.5 size-3 shrink-0 text-caution" aria-hidden />
-                            ) : (
-                              <span
-                                aria-hidden
-                                className="mt-1 size-2 shrink-0 rounded-full border border-line"
-                              />
-                            )}
-                            <span className="w-20 shrink-0 font-medium">{STEP_LABELS[step.step] ?? step.step}</span>
-                            <span className={step.detail ? "" : "text-muted"}>
-                              {step.detail || "not tried yet"}
-                            </span>
-                          </li>
-                        ))}
-                      </ol>
-                    ) : null}
-
-                    {/* Field-level problems, each naming the input it belongs to. The wizard
-                        underlines the same field, so the two are the same answer twice. */}
-                    {test.problems && test.problems.length > 0 ? (
-                      <ul
-                        data-test-problems={provider.slug}
-                        className="flex flex-col gap-1 border-t border-line/60 pt-2"
-                      >
-                        {test.problems.map((problem) => (
-                          <li
-                            key={`${problem.field}-${problem.message}`}
-                            data-test-problem={problem.field}
-                            data-problem-kind={problem.kind}
-                            className="flex items-start gap-2"
-                          >
-                            <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
-                            <code className="font-mono text-[11.5px]">{problem.field}</code>
-                            <span>{problem.message}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    ) : null}
-                  </div>
+                    {test.status === "ok" ? (
+                      <CheckCircle2 className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                    ) : (
+                      <XCircle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                    )}
+                    <span>{test.detail}</span>
+                  </p>
                 ) : null}
 
                 {showLog === provider.id ? (
@@ -1004,48 +669,13 @@ export function AuthenticationView() {
                     )}
                   </div>
                 ) : null}
-
-                {/* The sync ledger (REQ-065, slice 4 part 2). Its own disclosure rather than a
-                    column: the provider row answers "is it reachable now", the ledger answers
-                    "what did the last sweep do to real people", and putting the second in the
-                    first would bury it under a status chip. Only a directory syncs, so a
-                    protocol provider is not offered a tab with nothing in it. */}
-                {DIRECTORY_KINDS.has(provider.kind) ? (
-                  <>
-                    <button
-                      type="button"
-                      data-sync-toggle={provider.id}
-                      aria-expanded={showSync === provider.id}
-                      onClick={() => setShowSync((current) => (current === provider.id ? null : provider.id))}
-                      className="mt-2 flex w-full items-center gap-1.5 rounded-md border border-line bg-panel px-2.5 py-1.5 text-left text-[12px] text-muted hover:text-ink"
-                    >
-                      <ChevronRight
-                        className={`size-3.5 transition-transform ${showSync === provider.id ? "rotate-90" : ""}`}
-                        aria-hidden
-                      />
-                      Sync history
-                      {provider.last_sync_status === "failed" ? (
-                        <span className="ml-auto rounded-full border border-caution bg-caution/10 px-1.5 py-0.5 text-[10px] text-caution">
-                          last run failed
-                        </span>
-                      ) : null}
-                    </button>
-                    {showSync === provider.id ? (
-                      <div className="mt-2">
-                        <SyncLedger
-                          providerId={provider.id}
-                          providerName={provider.name}
-                          kind={provider.kind}
-                        />
-                      </div>
-                    ) : null}
-                  </>
-                ) : null}
               </li>
             );
           })}
         </ul>
       ) : null}
+
+      {selected ? null : null}
 
       {draft ? (
         <div
@@ -1079,72 +709,35 @@ export function AuthenticationView() {
             </header>
 
             {!draft.id ? (
-              /* Two groups, because these are two different products: a protocol provider is
-                 configured with endpoints and proved by discovery, a directory is configured
-                 with a service account and proved by walking a ladder. Merging them into one
-                 row of five buttons is how "which fields does an LDAP provider need?" becomes a
-                 support question. */
-              <div className="flex flex-col gap-2">
-                <div className="flex flex-col gap-1">
-                  <span className="text-[11.5px] text-muted">Protocol</span>
-                  <div className="flex flex-wrap gap-1.5" data-provider-kind="protocol">
-                    {Object.entries(KIND_LABELS)
-                      .filter(([value]) => !DIRECTORY_KINDS.has(value))
-                      .map(([value, label]) => (
-                        <button
-                          key={value}
-                          type="button"
-                          data-kind={value}
-                          onClick={() =>
-                            setDraft((current) =>
-                              current
-                                ? {
-                                    ...current,
-                                    kind: value as Draft["kind"],
-                                    config: {},
-                                    secretRef: value === "saml" ? "" : current.secretRef,
-                                  }
-                                : current,
-                            )
-                          }
-                          className={`h-8 rounded-lg border px-3 text-[12px] transition ${
-                            draft.kind === value
-                              ? "border-accent bg-accent/10 text-ink"
-                              : "border-line text-muted hover:bg-panel"
-                          }`}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                  </div>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <span className="text-[11.5px] text-muted">Directory</span>
-                  <div className="flex flex-wrap gap-1.5" data-provider-kind="directory">
-                    {Object.entries(KIND_LABELS)
-                      .filter(([value]) => DIRECTORY_KINDS.has(value))
-                      .map(([value, label]) => (
-                        <button
-                          key={value}
-                          type="button"
-                          data-kind={value}
-                          onClick={() =>
-                            setDraft((current) =>
-                              // The template comes with the kind rather than being typed in, so
-                              // a new directory starts from a filter that is already safe.
-                              current ? { ...emptyDraft(value as Draft["kind"]), name: current.name } : current,
-                            )
-                          }
-                          className={`h-8 rounded-lg border px-3 text-[12px] transition ${
-                            draft.kind === value
-                              ? "border-accent bg-accent/10 text-ink"
-                              : "border-line text-muted hover:bg-panel"
-                          }`}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                  </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-[11.5px] text-muted">Protocol</span>
+                <div className="flex gap-1.5" data-provider-kind>
+                  {Object.entries(KIND_LABELS).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      data-kind={value}
+                      onClick={() =>
+                        setDraft((current) =>
+                          current
+                            ? {
+                                ...current,
+                                kind: value as Draft["kind"],
+                                config: {},
+                                secretRef: value === "saml" ? "" : current.secretRef,
+                              }
+                            : current,
+                        )
+                      }
+                      className={`h-8 rounded-lg border px-3 text-[12px] transition ${
+                        draft.kind === value
+                          ? "border-accent bg-accent/10 text-ink"
+                          : "border-line text-muted hover:bg-panel"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
                 </div>
               </div>
             ) : (
@@ -1179,11 +772,7 @@ export function AuthenticationView() {
               </label>
             ) : null}
 
-            {/* A directory has no client secret: its credential is the bind password, named by
-                `bind_secret_ref` in the fields above. Showing a second, unrelated secret field
-                for the same provider is how an operator ends up putting the bind password in
-                the wrong box. */}
-            {draft.kind !== "saml" && !DIRECTORY_KINDS.has(draft.kind) ? (
+            {draft.kind !== "saml" ? (
               <label className="flex flex-col gap-1">
                 <span className="text-[11.5px] text-muted">
                   Client secret — the <em>name</em> of the environment variable, never the value
@@ -1204,19 +793,10 @@ export function AuthenticationView() {
 
             <div className="flex flex-col gap-1">
               <span className="text-[11.5px] text-muted">
-                {DIRECTORY_KINDS.has(draft.kind)
-                  ? "Directory connection"
-                  : draft.kind === "saml"
-                    ? "Assertion settings"
-                    : "Endpoints and claims"}
+                {draft.kind === "saml" ? "Assertion settings" : "Endpoints and claims"}
               </span>
               <div className="grid gap-2 sm:grid-cols-2">
-                {(DIRECTORY_KINDS.has(draft.kind)
-                  ? DIRECTORY_FIELDS
-                  : draft.kind === "saml"
-                    ? SAML_FIELDS
-                    : OIDC_FIELDS
-                ).map((field) => (
+                {(draft.kind === "saml" ? SAML_FIELDS : OIDC_FIELDS).map((field) => (
                   <label
                     key={field.key}
                     className={`flex flex-col gap-1 ${field.key === "certificate_pem" || field.key === "redirect_uri" ? "sm:col-span-2" : ""}`}
@@ -1237,46 +817,13 @@ export function AuthenticationView() {
                   </label>
                 ))}
               </div>
-              {DIRECTORY_KINDS.has(draft.kind) ? (
-                <span className="text-[11px] text-muted">
-                  The bind password is never written here — this field names the environment
-                  variable that holds it. The user filter must contain{" "}
-                  <code className="font-mono">{"{username}"}</code>, otherwise every sign-in would
-                  match every person in the directory.
-                </span>
-              ) : draft.kind !== "saml" ? (
+              {draft.kind !== "saml" ? (
                 <span className="text-[11px] text-muted">
                   With only an issuer, everything else is discovered from it. The endpoints are only
                   needed for a provider that publishes no discovery document.
                 </span>
               ) : null}
             </div>
-
-            {/* Only a directory syncs, and only on a schedule the operator chose. The field is
-                not shown for a protocol provider because a number that does nothing is worse
-                than no number. */}
-            {DIRECTORY_KINDS.has(draft.kind) ? (
-              <label className="flex flex-col gap-1">
-                <span className="text-[11.5px] text-muted">
-                  Sync every (minutes) — 0 means never on a schedule
-                </span>
-                <input
-                  type="number"
-                  min={0}
-                  max={10080}
-                  value={draft.syncIntervalMinutes}
-                  data-provider-sync-interval
-                  onChange={(e) =>
-                    setDraft({ ...draft, syncIntervalMinutes: Number(e.target.value) })
-                  }
-                  className="h-9 w-32 rounded-lg border border-line bg-panel px-2.5 font-mono text-[13px] text-ink outline-none focus:border-accent"
-                />
-                <span className="text-[11px] text-muted">
-                  Applies to the user and group sync, which lands in the next slice. Until then a
-                  change here is stored and not acted on.
-                </span>
-              </label>
-            ) : null}
 
             <label className="flex flex-col gap-1">
               <span className="text-[11.5px] text-muted">Claim carrying group membership</span>
@@ -1325,26 +872,6 @@ export function AuthenticationView() {
               </label>
             ) : null}
 
-            {/* The attribute map belongs to a *saved* provider: the map is rows keyed by
-                provider id, so there is nothing to attach it to while the provider is still a
-                draft. It lives in the same drawer as the connection settings because it is the
-                next step of the same job, not a separate screen. */}
-            {draft.id ? (
-              <div className="border-t border-line pt-3">
-                <AttributeMapEditor providerId={draft.id} />
-              </div>
-            ) : null}
-
-            {/* The role rules are the next step of the same job, and for the same reason they sit
-                in the same drawer rather than on a screen of their own: the wizard asks Basics ->
-                Connection -> Attribute mapping -> Role mapping -> Enable, and splitting the fourth
-                step onto a separate route would make the wizard's own order a lie. */}
-            {draft.id ? (
-              <div className="border-t border-line pt-3">
-                <RoleRulesEditor providerId={draft.id} />
-              </div>
-            ) : null}
-
             <div className="mt-auto flex items-center justify-end gap-2 border-t border-line pt-3">
               <button
                 type="button"
@@ -1365,18 +892,6 @@ export function AuthenticationView() {
             </div>
           </form>
         </div>
-      ) : null}
-
-      {/* Rendered outside the section's flow but inside its markup, so the overlay stacks above
-          the table and the provider drawer alike. Only one of the two can be open at a time: the
-          dialog owns the decision, and a draft open behind a deletion dialog is a draft
-          somebody cannot see they are editing. */}
-      {deleting && !draft ? (
-        <ProviderDeletionDialog
-          provider={{ id: deleting.id, slug: deleting.slug, name: deleting.name }}
-          onClose={() => setDeleting(null)}
-          onDone={(outcome) => void finishDeletion(outcome)}
-        />
       ) : null}
     </section>
   );

@@ -931,11 +931,287 @@ export const NOTIFICATION_CHANNELS = [
   "webhook",
   "chat",
 ] as const;
-
+// ------------------------------------------------------------------------------------------
+// Node library and credential catalogue (REQ-087 slice 1)
+// ------------------------------------------------------------------------------------------
+/** The filters the node library takes. */
+export type NodeTypeFilters = {
+  search?: string;
+  category?: string;
+  capability?: string;
+  include_deprecated?: boolean;
+  credential?: boolean;
+};
+/** One port of a node, as the palette draws it. */
+export type NodePort = {
+  name: string;
+  kind: "main" | "error" | "ai_tool";
+  /** Data kinds the port accepts; empty means "anything". */
+  accepts: string[];
+  open: boolean;
+};
+/** How the inspector renders one parameter. */
+export type ParamUi = "text" | "textarea" | "code" | "select" | "number" | "boolean";
+/** One parameter of a node's inspector form. */
+export type NodeParam = {
+  name: string;
+  kind: string;
+  label: string;
+  required: boolean;
+  ui: ParamUi;
+  options: string[];
+  /** Where a select's options come from when they are not an enum. */
+  options_source: string | null;
+  placeholder: string | null;
+  help: string | null;
+  default: unknown;
+  /** Whether this field holds a credential *key* rather than a value. */
+  secret_field: boolean;
+};
+/** What a library row shows as its state. */
+export type NodeLibraryState = "available" | "deprecated" | "node_package_missing";
+/** One node in the library. */
+export type NodeType = {
+  key: string;
+  version: string;
+  label: string;
+  description: string;
+  category: string;
+  icon: string;
+  docs_url: string;
+  inputs: NodePort[];
+  outputs: NodePort[];
+  params: NodeParam[];
+  credential_types: string[];
+  capabilities: string[];
+  sandbox: "none" | "required";
+  default_max_attempts: number;
+  deprecated: boolean;
+  superseded_by: string | null;
+  state: NodeLibraryState;
+  /** Why the node is in that state, in words the row can show next to the chip. */
+  state_reason: string | null;
+};
+/** The node filters, as the server applied them. */
+export type AppliedNodeFilters = {
+  search: string | null;
+  category: string | null;
+  capability: string | null;
+  include_deprecated: boolean;
+  credential: boolean | null;
+  /** How many nodes ship with the release. */
+  bundled_count: number;
+};
+/** The library list payload. */
+export type NodeTypePage = {
+  nodes: NodeType[];
+  matched: number;
+  total: number;
+  filters: AppliedNodeFilters;
+};
+/** One field of a credential type's form. */
+export type CredentialTypeField = {
+  name: string;
+  label: string;
+  kind: "string" | "secret" | "url" | "number" | "boolean" | "select";
+  required: boolean;
+  options: string[];
+  help: string | null;
+  never_log: boolean;
+  /** `true` when the API will never return a value for this field. */
+  write_only: boolean;
+};
+/** One credential type in the catalogue. */
+export type CredentialType = {
+  key: string;
+  kind: string;
+  label: string;
+  description: string;
+  icon: string;
+  docs_url: string;
+  fields: CredentialTypeField[];
+  /** The nodes that accept this type, so the picker can say what it is for. */
+  used_by: string[];
+  oauth: boolean;
+  oauth_pkce: boolean | null;
+  oauth_scopes: string | null;
+  test_timeout_seconds: number;
+};
+/** The credential catalogue payload. */
+export type CredentialTypePage = {
+  types: CredentialType[];
+  total: number;
+};
+/** One group of the palette's category tree. */
+export type NodeCategory = {
+  key: string;
+  label: string;
+  count: number;
+  node_keys: string[];
+};
+/** The registry's own lint, as the running server sees it. */
+export type RegistryLint = {
+  ok: boolean;
+  findings: { code: string; subject: string; message: string }[];
+  node_count: number;
+  credential_type_count: number;
+};
+/** The three port kinds and what each means. */
+export type PortKindCatalogue = {
+  kinds: string[];
+  descriptions: Record<string, string>;
+};
+/* ------------------------------------------------------------------ *
+ * Credential instances (REQ-087, slice 2)
+ * ------------------------------------------------------------------ */
+/**
+ * One credential, as the API reads it.
+ *
+ * There is no field here for a secret value and there never will be: the API answers with
+ * `has_secret` and a list of which fields to mask. A type that grew a `secret` field would
+ * mean the API grew one too, and that is the review you want.
+ */
+export type Credential = {
+  id: string;
+  key: string;
+  name: string;
+  type: string;
+  type_label: string;
+  scope: string;
+  sharing: string;
+  has_secret: boolean;
+  settings: Record<string, unknown>;
+  secret_fields: string[];
+  health: string;
+  effective_health: string;
+  expired: boolean;
+  health_checked_at: string | null;
+  health_detail: string | null;
+  oauth_subject: string | null;
+  oauth_expires_at: string | null;
+  oauth_scopes: string | null;
+  last_used_at: string | null;
+  owner_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+  /**
+   * Set only on a create whose secret could not be written, and never on a read.
+   *
+   * The credential exists; the secret did not attach. The panel says so on the row it is
+   * about, because a reader who pasted a key and was redirected to a detail screen with no
+   * mention of it will assume the key is there.
+   */
+  secret_write_warning?: string | null;
+};
+/** The credential list filters. */
+export type CredentialFilters = {
+  search?: string;
+  type?: string;
+  scope?: string;
+  health?: string;
+  sharing?: string;
+};
+/** The credential list payload. */
+export type CredentialPage = {
+  credentials: Credential[];
+  total: number;
+  needs_attention: number;
+  filters: {
+    search: string | null;
+    type: string | null;
+    scope: string | null;
+    health: string | null;
+    sharing: string | null;
+  };
+};
+/** One reference from a workflow graph to a credential. */
+export type CredentialUsageRef = {
+  workflow_id: string;
+  workflow_name: string;
+  node_id: string;
+  node_label: string | null;
+  node_type: string | null;
+};
+/** The usage view of one credential. */
+export type CredentialUsage = {
+  references: CredentialUsageRef[];
+  workflow_count: number;
+  node_type_count: number;
+  in_use: boolean;
+  key: string;
+};
+/** What a delete did, and what it broke. */
+export type CredentialDeleteResult = {
+  deleted: boolean;
+  references: CredentialUsageRef[];
+  workflow_count: number;
+};
+/** The result of a test hook run. */
+export type CredentialTestResult = {
+  ok: boolean;
+  duration_ms: number;
+  detail: string;
+  health: string;
+  credential: Credential;
+};
+/** One installed node package. */
+export type NodePackage = {
+  key: string;
+  version: string;
+  source: string;
+  checksum: string;
+  permissions: string[];
+  /** The *namespaced* node keys the package installed (`package.node`, 0055). */
+  node_keys: string[];
+  enabled: boolean;
+  installed_at: string;
+};
+/** The package ledger payload. */
+export type NodePackagePage = {
+  packages: NodePackage[];
+  total: number;
+};
+/** One validator finding, as an install refusal reports it. */
+export type PackageFinding = {
+  code: string;
+  subject: string;
+  message: string;
+};
+/** The answer to an install: the row, the checksum the server computed, and what moved. */
+export type NodePackageInstall = NodePackage & {
+  checksum: string;
+  node_keys: string[];
+  /** Nodes the previous install had and this one no longer ships. */
+  replaced_node_keys: string[];
+  enabled: boolean;
+};
+/** The answer to an enable/disable. */
+export type NodePackageToggle = {
+  package: NodePackage;
+  node_keys: string[];
+  message: string;
+};
+/** The answer to a removal: what it broke, named. */
+export type NodePackageRemoval = {
+  key: string;
+  removed: boolean;
+  node_keys: string[];
+  affected_workflows: { workflow_id: string; workflow_name: string; node_keys: string[] }[];
+  message: string;
+};
+/** The body of a create. Secrets ride in `secrets[]`, never in `settings`. */
+export type NewCredential = {
+  key?: string;
+  name: string;
+  type: string;
+  scope?: string;
+  sharing?: string;
+  settings?: Record<string, unknown>;
+  secrets?: { field: string; value: string }[];
+};
 // ---------------------------------------------------------------------------------------------
 // Slice 2: the reader's own channel configuration
 // ---------------------------------------------------------------------------------------------
-
 /**
  * One cell of the matrix: "does category *C* reach me over *channel*?".
  *
@@ -947,7 +1223,6 @@ export type NotificationPreferenceCell = {
   channel: string;
   enabled: boolean;
 };
-
 /** Quiet hours, the timezone and the digest cadence. */
 export type NotificationSettingsRow = {
   /** `HH:MM` in the reader's own timezone, or `null` for no window. */
@@ -962,7 +1237,6 @@ export type NotificationSettingsRow = {
   /** Which hour a digest goes out in. */
   digest_hour: number;
 };
-
 /**
  * The whole preferences answer.
  *
@@ -975,7 +1249,6 @@ export type NotificationPreferences = {
   settings: NotificationSettingsRow;
   locked_channel: string;
 };
-
 /** What a save changed, and the authoritative state to render from. */
 export type NotificationPreferencesSaved = {
   /** How many cells actually changed value — zero is a legitimate answer. */
@@ -984,9 +1257,7 @@ export type NotificationPreferencesSaved = {
   settings: NotificationSettingsRow;
   locked_channel: string;
 };
-
 export const DIGEST_CADENCES = ["off", "daily", "weekly"] as const;
-
 /** 0 = Monday, which is the numbering the server's `extract(dow) - 1` uses. */
 export const DIGEST_WEEKDAYS = [
   "Monday",
@@ -997,7 +1268,6 @@ export const DIGEST_WEEKDAYS = [
   "Saturday",
   "Sunday",
 ] as const;
-
 /**
  * The zones the form offers.
  *
@@ -1021,11 +1291,9 @@ export const NOTIFICATION_TIMEZONES = [
   "Asia/Tokyo",
   "Australia/Sydney",
 ] as const;
-
 // ---------------------------------------------------------------------------------------------
 // Slice 3: the half that leaves the panel
 // ---------------------------------------------------------------------------------------------
-
 /** The four states a delivery can be in. A closed list, so the filter chips are exhaustive. */
 export const NOTIFICATION_DELIVERY_STATUSES = [
   "pending",
@@ -1033,9 +1301,7 @@ export const NOTIFICATION_DELIVERY_STATUSES = [
   "failed",
   "skipped",
 ] as const;
-
 export type NotificationDeliveryStatus = (typeof NOTIFICATION_DELIVERY_STATUSES)[number];
-
 /**
  * One row of the organization's delivery log.
  *
@@ -1060,7 +1326,6 @@ export type NotificationOutboxRow = {
   sent_at: string | null;
   created_at: string;
 };
-
 /** The counts behind the filter chips, plus the total so a chip need not add them up itself. */
 export type NotificationOutboxCounts = {
   pending: number;
@@ -1069,14 +1334,12 @@ export type NotificationOutboxCounts = {
   skipped: number;
   total: number;
 };
-
 /** The outbox answer: a page, the counts, and how far back the log reaches. */
 export type NotificationOutbox = {
   rows: NotificationOutboxRow[];
   counts: NotificationOutboxCounts;
   retention_days: number;
 };
-
 /**
  * One registered browser, as the devices list shows it.
  *
@@ -1091,10 +1354,8 @@ export type NotificationDevice = {
   created_at: string;
   last_seen_at: string;
 };
-
 /** What registering a browser did — the four outcomes, not a boolean. */
 export type NotificationPushOutcome = "created" | "refreshed" | "reassigned" | "re-keyed";
-
 /** What a channel can do on this installation, and why. */
 export type NotificationChannelReadiness = {
   channel: string;
@@ -1102,7 +1363,6 @@ export type NotificationChannelReadiness = {
   locked: boolean;
   detail: string;
 };
-
 /** The four shapes a routing rule can address. Kept as data for the form's select. */
 export const NOTIFICATION_RECIPIENT_SHAPES = [
   { value: "actor", label: "The actor who caused it", needsTarget: false },
@@ -1110,7 +1370,6 @@ export const NOTIFICATION_RECIPIENT_SHAPES = [
   { value: "role:", label: "Everybody with a role", needsTarget: true },
   { value: "payload_user:", label: "The user named in the payload", needsTarget: true },
 ] as const;
-
 /** One rule of the router: an event name, a category, and who hears about it. */
 export type NotificationRouteRule = {
   id: string;
@@ -1124,7 +1383,6 @@ export type NotificationRouteRule = {
   created_by: string | null;
   created_at: string;
 };
-
 /** What one routing pass did — the counts are the whole point of the answer. */
 export type NotificationRouteReport = {
   created: number;
@@ -1537,6 +1795,139 @@ export type HeaderPolicySave = {
 /** The save's answer: the stored policy, flattened, plus the history row it wrote. */
 export type HeaderPolicySaved = HeaderPolicyDocument & { change_id: number | null };
 
+// -------------------------------------------------------------------------------------------
+// Security centre, slice 3 — rate limiting and sign-in protection
+//
+// The verdict type is the important one. `retry_after` is `number | null` and NOT optional:
+// the server always sends the field, and a `?:` would let a client read a missing field as
+// "no wait" — the one reading that turns a refusal into a suggestion. Likewise `ceiling` is
+// the *merged* ceiling (limit + burst), sent by the server so the table and the tester cannot
+// each compute it and disagree on one row.
+// -------------------------------------------------------------------------------------------
+
+/** One rate-limit scope, as `GET /api/v1/security/rate-limits` returns it. */
+export type RateLimitScope = {
+  scope: string;
+  window_seconds: number;
+  limit: number;
+  burst: number;
+  enabled: boolean;
+  /** `limit + burst`, computed by the server. */
+  ceiling: number;
+  /** Seconds until this window frees a place. */
+  window_remaining_seconds: number;
+};
+
+/** The limiter document, merged with the platform's baseline. */
+export type RateLimitsDocument = {
+  /** Always all five scopes: a missing row and an unconfigured row are different states. */
+  scopes: RateLimitScope[];
+  /** The scope names this build knows — the form's own vocabulary check. */
+  vocabulary: string[];
+  updated_by: string | null;
+  updated_at: string | null;
+  /** `false` means the baseline is showing because nobody has saved one. */
+  is_saved: boolean;
+};
+
+/** The save request. `expected_scopes` is the compare-and-swap key. */
+export type RateLimitsSave = {
+  scopes: Array<{
+    scope: string;
+    window_seconds: number;
+    limit: number;
+    burst: number;
+    enabled: boolean;
+  }>;
+  expected_scopes?: unknown;
+};
+
+/** The save's answer: the stored document plus the row it wrote. */
+export type RateLimitsSaved = RateLimitsDocument & { change_id: number | null };
+
+/** A dry run of one request through the limiter. */
+export type RateLimitTestRequest = {
+  method: string;
+  path: string;
+  client_ip?: string | null;
+  user_id?: string | null;
+  /** The counter to assume — what makes the tester usable during a real incident. */
+  count?: number | null;
+  machine_key?: boolean;
+};
+
+/**
+ * The limiter's answer, produced by the *same* function the middleware calls.
+ *
+ * `counter_identity` and `counter_key` are shown on purpose: an operator explaining a refusal
+ * to a developer needs to say "your budget is `ip:203.0.113.7` in the `sign_in` scope", and
+ * the key is what makes that checkable against a Redis dump.
+ */
+export type RateLimitTestResponse = {
+  scope: string;
+  verdict: {
+    limited: boolean;
+    scope: string;
+    reason: string;
+    count: number;
+    ceiling: number;
+    retry_after: number | null;
+  };
+  counter_identity: string;
+  counter_key: string;
+};
+
+/** The brute-force policy, as `GET /api/v1/security/sign-in-protection` returns it. */
+export type LockoutPolicy = {
+  window_seconds: number;
+  attempts: number;
+  lockout_minutes: number;
+  progressive_delay: boolean;
+  base_delay_seconds: number;
+  reset_on_success: boolean;
+};
+
+/** The accepted ranges, sent by the server so the form does not hard-code them twice. */
+export type LockoutBounds = {
+  window_seconds: [number, number];
+  attempts: [number, number];
+  lockout_minutes: [number, number];
+  base_delay_seconds: [number, number];
+  max_delay_seconds: number;
+};
+
+/** The lockout document, with the live count so the form can say so before the table. */
+export type SignInProtectionDocument = {
+  policy: LockoutPolicy;
+  locked_accounts: number;
+  is_saved: boolean;
+  bounds: LockoutBounds;
+};
+
+/** The save request. `expected_policy` is the compare-and-swap key. */
+export type SignInProtectionSave = {
+  policy: LockoutPolicy;
+  expected_policy?: unknown;
+};
+
+/** The save's answer: the stored document plus the row it wrote. */
+export type SignInProtectionSaved = SignInProtectionDocument & { change_id: number | null };
+
+/** One account currently locked out. */
+export type LockedAccount = {
+  user_id: string;
+  email: string;
+  locked_until: string;
+  seconds_remaining: number;
+  failed_sign_in_count: number;
+};
+
+/** The locked list, soonest to expire first, with the true total behind the page. */
+export type LockedAccountsPage = {
+  accounts: LockedAccount[];
+  total: number;
+};
+
 /** The directives this build recognises, in render order — the form's own dropdown. */
 export const CSP_DIRECTIVE_NAMES = [
   "default-src",
@@ -1579,3 +1970,140 @@ export const REFERRER_POLICIES = [
  * the browser silently drops", and an operator setting 3600 deserves to be told before saving.
  */
 export const MIN_HSTS_MAX_AGE = 15_768_000;
+
+/* ------------------------------------------------------------------ *
+ * The visual graph (REQ-086)
+ *
+ * These mirror `crates/workflows/src/graph.rs` field for field, and the server's structs are
+ * `deny_unknown_fields`. That is not pedantry: a canvas that sends a `notes` field a node does
+ * not have gets a `400` on every save, and the failure reads as "the graph is broken" rather
+ * than as "the client and the server disagree about the shape". A field that is not in the
+ * Rust struct does not belong here either.
+ * ------------------------------------------------------------------ */
+
+/** Where a node sits on the canvas. Canvas units; the editor scales them by the zoom. */
+export type GraphPosition = { x: number; y: number };
+/** One node on the canvas. `key` is the stable editor string every connection names. */
+export type GraphNode = {
+  key: string;
+  type: string;
+  label: string;
+  position: GraphPosition;
+  params: Record<string, unknown>;
+  /** A switched-off node compiles to nothing at all — the engine has no "skip" state. */
+  disabled: boolean;
+};
+/** One wire. `label` is the branch name the run overlay shows. */
+export type GraphConnection = {
+  from: string;
+  from_port: string;
+  to: string;
+  to_port: string;
+  label?: string;
+};
+/** A sticky note: a comment on the canvas that never compiles and never executes. */
+export type GraphNote = {
+  id: string;
+  position: GraphPosition;
+  color: string;
+  width: number;
+  height: number;
+  text: string;
+};
+/** The document the canvas authors and the server stores. */
+export type GraphDocument = {
+  nodes: GraphNode[];
+  connections: GraphConnection[];
+  notes: GraphNote[];
+};
+/**
+ * One problem with a graph.
+ *
+ * `node_key` and `connection_index` are both optional on the wire, and the difference is
+ * meaningful: a node problem can be badged and jumped to, a connection problem can only be
+ * listed, because an edge has no element to select.
+ */
+export type GraphIssue = {
+  code: string;
+  node_key?: string;
+  /**
+   * The parameter the problem is on, when it is about one.
+   *
+   * Optional on the wire and used by the code editor's gutter to mark a line. Deliberately a
+   * field rather than a convention in `message`: the message is prose, and `"url" must be a
+   * URL` naming the parameter in quotes is a sentence convention, not something a client can
+   * depend on.
+   */
+  param?: string;
+  connection_index?: number;
+  message: string;
+};
+/** `GET /workflows/{id}/graph` — the document plus the revision it was read at. */
+export type GraphRead = {
+  workflow_id: string;
+  graph: GraphDocument;
+  revision: number;
+  node_count: number;
+  connection_count: number;
+  note_count: number;
+  updated_at: string | null;
+  updated_by: string | null;
+};
+/** `PUT /workflows/{id}/graph` — what a successful save reports back. */
+export type GraphSaved = { revision: number; step_count: number; node_order: string[] };
+/** `POST /workflows/{id}/graph/validate` — every problem, in a stable order. */
+export type GraphValidated = {
+  valid: boolean;
+  issues: GraphIssue[];
+  issue_count: number;
+  step_count?: number;
+};
+/**
+ * One field's evaluated value. `typed` distinguishes a lone expression — whose `value` keeps
+ * its own JSON shape, so a count stays a number — from a field that mixes text, whose `value`
+ * is the string it will actually be.
+ */
+export type ExpressionPreview = {
+  field: string;
+  value: unknown;
+  expression: string;
+  rendered: string;
+  typed: boolean;
+};
+/** `POST /workflows/{id}/graph/expressions/preview` — the server's answer for one node. */
+export type ExpressionPreviewed = {
+  workflow_id: string;
+  previews: ExpressionPreview[];
+  preview_count: number;
+  /** The namespaces that were available, for autocomplete. */
+  namespaces: string[];
+};
+
+/**
+ * Where a completion candidate came from.
+ *
+ * The value is the contract, not a label: the menu groups on it, so a typo here would not
+ * fail a build and would quietly merge the three groups the REQ asks to be distinguishable.
+ */
+export type CompletionSource = "upstream" | "runtime" | "sample";
+
+/** One candidate the expression editor can insert. */
+export type CompletionCandidate = {
+  /** The text to insert, e.g. `node_fetch_1.body`. */
+  label: string;
+  source: CompletionSource;
+  /** The second line of the menu entry. */
+  detail: string;
+};
+
+/** `POST /workflows/{id}/graph/expressions/complete` — the server's candidate list. */
+export type ExpressionCompleted = {
+  node_key: string;
+  candidates: CompletionCandidate[];
+  candidate_count: number;
+  /** Upstream node keys, sorted. */
+  upstream_nodes: string[];
+  /** How many upstream namespaces were left out because the answer was capped. */
+  truncated_namespaces: number;
+  truncated_paths: boolean;
+};

@@ -89,6 +89,10 @@ const BASE_ROLES: &[BaseRole] = &[
             "workflows.read",
             "workflows.manage",
             "workflows.run",
+            // A manager can see which integrations the installation has and can add one; that
+            // is the same person who wires up the workflows that use them (REQ-087 slice 2).
+            "workflows.credentials.read",
+            "workflows.credentials.manage",
             "users.read",
             "users.update",
             "iam.permissions.read",
@@ -143,6 +147,10 @@ const BASE_ROLES: &[BaseRole] = &[
             "ai.chat",
             "workflows.read",
             "workflows.run",
+            // Read-only on credentials: a moderator can see that a workflow needs a
+            // credential and that it is failing, and cannot replace a secret. The two halves
+            // are separate keys for exactly this split.
+            "workflows.credentials.read",
             "users.read",
             "audit.read",
             "sites.read",

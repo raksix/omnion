@@ -500,19 +500,6 @@ fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
-/// Cut a revocation reason to what the column is prepared to store.
-///
-/// `revoke_reason` is free text and the column has no length limit, but the panel renders it in
-/// a session list beside five other columns. An unbounded reason written by a caller that
-/// interpolated a provider's error message is a row that pushes the whole list sideways, so the
-/// cap is here rather than at each call site — a reason that is too long is truncated, never
-/// refused, because losing the tail of a reason is a cosmetic problem and failing a deactivation
-/// over it is not.
-#[must_use]
-pub fn truncate_reason(reason: &str) -> String {
-    truncate(reason, MAX_REASON_LENGTH)
-}
-
 /// Reject tokens that cannot have been produced by [`generate_token`].
 pub fn validate_token_shape(token: &str) -> Result<()> {
     let shaped = token.len() == TOKEN_BYTES * 2 && token.chars().all(|c| c.is_ascii_hexdigit());

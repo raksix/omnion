@@ -75,17 +75,16 @@ pub mod auth;
 pub mod automation;
 pub mod commands;
 pub mod content;
+pub mod credential_oauth;
+pub mod credentials;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
-pub mod iam_attribute_mappings;
 pub mod iam_policy;
 pub mod iam_providers;
 pub mod iam_provisioning;
-pub mod iam_role_rules;
 pub mod iam_security;
 pub mod iam_subjects;
-pub mod iam_sync;
 pub mod me;
 pub mod media;
 pub mod media_duplicates;
@@ -98,6 +97,8 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
+pub mod node_packages;
+pub mod node_types;
 pub mod notifications;
 pub mod notifications_admin;
 pub mod onboarding;
@@ -107,10 +108,12 @@ pub mod scim;
 pub mod search;
 pub mod security;
 pub mod security_headers;
+pub mod security_limiter;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
 pub mod webhooks;
+pub mod workflow_graph;
 pub mod workflows;
 
 use axum::Router;
@@ -259,7 +262,6 @@ pub fn router(state: AppState) -> Router {
         .merge(post(iam_provisioning::create_token))
         .layer(guards::require(&state, "iam.provisioning.manage"));
     let iam_provisioning_token = delete(iam_provisioning::revoke_token)
-        .merge(post(iam_provisioning::rotate_token))
         .layer(guards::require(&state, "iam.provisioning.manage"));
     let iam_provisioning_log =
         get(iam_provisioning::list_log).layer(guards::require(&state, "iam.provisioning.manage"));
@@ -285,77 +287,12 @@ pub fn router(state: AppState) -> Router {
         .merge(
             delete(iam_providers::delete_provider)
                 .layer(guards::require(&state, "iam.providers.manage")),
-        )
-        // Two more verbs on the same guard, and the split is the design: reading the impact is
-        // a *read*, and a dialog that had to press Delete to learn that Delete is refused is a
-        // dialog that failed. The reassign action writes accounts, so it stays under `manage` —
-        // an account that can read the provider list must not be able to strip a directory's
-        // claim on somebody's identity.
-        ;
-
-    let iam_provider_deletion_impact = get(iam_providers::provider_deletion_impact)
-        .layer(guards::require(&state, "iam.providers.read"));
-
-    let iam_provider_reassign = post(iam_providers::reassign_provisioned_accounts)
-        .layer(guards::require(&state, "iam.providers.manage"));
+        );
 
     let iam_provider_test =
         post(iam_providers::test_provider).layer(guards::require(&state, "iam.providers.manage"));
 
-    // Enable and disable are their own verbs rather than a PATCH with a boolean, because the
-    // difference is the *gate*: switching on is refused until a test has passed, switching off
-    // never is. Folding them into the generic update would mean either bypassing the gate or
-    // blocking the safe direction as well (REQ-065).
-    let iam_provider_enable =
-        post(iam_providers::enable_provider).layer(guards::require(&state, "iam.providers.manage"));
-    let iam_provider_disable = post(iam_providers::disable_provider)
-        .layer(guards::require(&state, "iam.providers.manage"));
-
     let iam_provider_events = get(iam_providers::list_provider_events)
-        .layer(guards::require(&state, "iam.providers.read"));
-
-    // Bulk enable/disable (REQ-065, slice 4 part 11). One guard, the same `manage` the single
-    // verbs sit behind: a batch is not a cheaper way to do something the caller could not do one
-    // at a time, and the moment it is, the batch is the privilege escalation. It is a *separate
-    // route* rather than a `POST /{id}` with a list, because a list in the path is a shape a
-    // router and an audit log both have to be able to read.
-    let iam_providers_bulk = post(iam_providers::bulk_update_providers)
-        .layer(guards::require(&state, "iam.providers.manage"));
-
-    // The sync ledger (REQ-065, slice 4 part 2). Reading a run and its failures is `read`; asking
-    // for a retry is `manage`, because a retry re-walks a live directory and writes a run row
-    // an operator will later read as evidence that somebody asked.
-    let iam_provider_sync_runs = get(iam_sync::list_sync_runs)
-        .layer(guards::require(&state, "iam.providers.read"));
-    let iam_provider_sync_run = get(iam_sync::get_sync_run)
-        .layer(guards::require(&state, "iam.providers.read"));
-    let iam_provider_sync_retry = post(iam_sync::retry_sync_run)
-        .layer(guards::require(&state, "iam.providers.manage"));
-    let iam_provider_sync_groups = get(iam_sync::list_group_links)
-        .layer(guards::require(&state, "iam.providers.read"));
-
-    // The attribute map (REQ-065, slice 2). Reading it and rehearsing it is `read` — a preview
-    // writes nothing — while replacing it is `manage`, because the map decides which claim becomes
-    // somebody's email address.
-    let iam_provider_attribute_mappings = get(iam_attribute_mappings::get_attribute_mappings)
-        .layer(guards::require(&state, "iam.providers.read"))
-        .merge(
-            put(iam_attribute_mappings::replace_attribute_mappings)
-                .layer(guards::require(&state, "iam.providers.manage")),
-        );
-    let iam_provider_attribute_preview = post(iam_attribute_mappings::preview_attribute_mappings)
-        .layer(guards::require(&state, "iam.providers.read"));
-
-    // The role rules (REQ-065, slice 3). Same split as the attribute map and for the same reason:
-    // reading the set and rehearsing it write nothing, so they are `read`, while replacing it is
-    // `manage`, because the rules decide which role a verified directory identity is granted.
-    let iam_provider_role_rules = get(iam_role_rules::get_role_rules)
-        .layer(guards::require(&state, "iam.providers.read"))
-        .merge(
-            put(iam_role_rules::replace_role_rules)
-                .layer(guards::require(&state, "iam.providers.manage")),
-        );
-    let iam_provider_role_rule_preview = post(iam_role_rules::preview_role_rules)
         .layer(guards::require(&state, "iam.providers.read"));
 
     // The public sign-in surface: no guard, because there is no session yet — the same reason
@@ -585,6 +522,10 @@ pub fn router(state: AppState) -> Router {
         get(media_settings::read).layer(guards::require(&state, "media.read"));
     let media_settings_write: MethodRouter<AppState, Infallible> =
         put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> =
+        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
+    let media_settings_write: MethodRouter<AppState, Infallible> =
+        put(media_settings::write).layer(guards::require(&state, "media.settings.manage"));
     let media_settings_test: MethodRouter<AppState, Infallible> =
         post(media_settings::test_connection)
             .layer(guards::require(&state, "media.settings.manage"));
@@ -628,12 +569,24 @@ pub fn router(state: AppState) -> Router {
         put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_run: MethodRouter<AppState, Infallible> =
         post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> =
+        put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> =
+        post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_write: MethodRouter<AppState, Infallible> =
+        put(media_scan::write).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_run: MethodRouter<AppState, Infallible> =
+        post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_runs_route: MethodRouter<AppState, Infallible> =
         get(media_scan::runs).layer(guards::require(&state, "media.read"));
     let media_quarantine: MethodRouter<AppState, Infallible> =
         get(media_scan::list_held).layer(guards::require(&state, "media.read"));
     let media_quarantine_release: MethodRouter<AppState, Infallible> =
         post(media_scan::release).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> =
+        post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
+    let media_scan_test: MethodRouter<AppState, Infallible> =
+        post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
     let media_scan_test: MethodRouter<AppState, Infallible> =
         post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage"));
 
@@ -647,8 +600,16 @@ pub fn router(state: AppState) -> Router {
         get(media_grants::folder_grants).layer(guards::require(&state, "media.read"));
     let media_folder_grant_write: MethodRouter<AppState, Infallible> =
         put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
+    let media_folder_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage"));
     let media_file_grants: MethodRouter<AppState, Infallible> =
         get(media_grants::file_grants).layer(guards::require(&state, "media.read"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
+    let media_file_grant_write: MethodRouter<AppState, Infallible> =
+        put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
     let media_file_grant_write: MethodRouter<AppState, Infallible> =
         put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage"));
     // A grant is removed by its own id alone — the row knows the node it was written on, so
@@ -721,6 +682,37 @@ pub fn router(state: AppState) -> Router {
     let workflow_run =
         post(workflows::run_workflow).layer(guards::require(&state, "workflows.run"));
 
+    // The visual graph (docs/requests/REQ-086, slice 1). Reading a graph is a read of the
+    // workflow, so it carries `workflows.read` — the canvas is not an edit surface and the
+    // document holds no secret. Writing one carries `workflows.manage` like any other change to
+    // the definition, because a graph save rewrites the compiled steps the engine runs. The
+    // validate call sits on the *read* power on purpose: a person typing a node parameter must
+    // be able to find out it is wrong without holding the power to save a wrong one, and it
+    // stores nothing.
+    let workflow_graph = get(workflow_graph::get_graph)
+        .layer(guards::require(&state, "workflows.read"))
+        .merge(
+            put(workflow_graph::save_graph).layer(guards::require(&state, "workflows.manage")),
+        );
+
+    let workflow_graph_validate = post(workflow_graph::validate_graph)
+        .layer(guards::require(&state, "workflows.read"));
+
+    // The expression preview (slice 3) sits on the *read* power for the same reason validate
+    // does, and for one more: it takes the sample data it evaluates against in the request
+    // body, so it has nothing to read that the reader has not already chosen to send. It
+    // stores nothing, and nothing it returns is derived from a row the caller cannot see.
+    let workflow_graph_preview = post(workflow_graph::preview_expressions)
+        .layer(guards::require(&state, "workflows.read"));
+
+    // The completion list (slice 3) takes the same read power for the same reason, and one
+    // more that is specific to it: the *graph* travels in the body, so the only row it reads
+    // is the workflow's own, which the caller could already read. Completing a list against
+    // the saved graph rather than the one on screen would answer against a topology the
+    // person has already changed.
+    let workflow_graph_complete = post(workflow_graph::complete_expressions)
+        .layer(guards::require(&state, "workflows.read"));
+
     let workflow_executions =
         get(workflows::list_executions).layer(guards::require(&state, "workflows.read"));
 
@@ -729,6 +721,86 @@ pub fn router(state: AppState) -> Router {
 
     let workflow_execution_cancel =
         post(workflows::cancel_execution).layer(guards::require(&state, "workflows.run"));
+    // The node library and the credential catalogue (docs/requests/REQ-087, slice 1). Both are
+    // pure reads of the registry in `omnion_workflows::registry` — code, not rows — so they
+    // carry the workflow *read* power and nothing more: a palette is not an edit surface, and
+    // the registry has no writable side to guard. The credential *instances* arrive in slice 2
+    // with their own `workflows.credentials.*` powers.
+    let node_types =
+        get(node_types::list_node_types).layer(guards::require(&state, "workflows.read"));
+    let node_type = get(node_types::get_node_type).layer(guards::require(&state, "workflows.read"));
+    let node_categories =
+        get(node_types::get_node_categories).layer(guards::require(&state, "workflows.read"));
+    let node_registry_lint =
+        get(node_types::get_registry_lint).layer(guards::require(&state, "workflows.read"));
+    let port_kinds =
+        get(node_types::get_port_kinds).layer(guards::require(&state, "workflows.read"));
+    let credential_types =
+        get(node_types::list_credential_types).layer(guards::require(&state, "workflows.read"));
+    let credential_type =
+        get(node_types::get_credential_type).layer(guards::require(&state, "workflows.read"));
+    // Credential *instances* (REQ-087, slice 2). Two powers, not one: reading which
+    // integrations an installation has is not the same permission as being able to replace a
+    // secret, and a role that may build a workflow should not thereby gain every credential
+    // in the organization. The sub-resources are separate routers for the same reason — a
+    // test writes health, and a usage read is a read.
+    let credentials_list = get(credentials::list_credentials)
+        .layer(guards::require(&state, "workflows.credentials.read"))
+        .merge(
+            post(credentials::create_credential)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        );
+    let credential_item = get(credentials::get_credential)
+        .layer(guards::require(&state, "workflows.credentials.read"))
+        .merge(
+            patch(credentials::update_credential)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        )
+        .merge(
+            delete(credentials::delete_credential)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        );
+    let credential_usage = get(credentials::credential_usage)
+        .layer(guards::require(&state, "workflows.credentials.read"));
+    let credential_test = post(credentials::test_credential)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
+    // The replace-secret path: manage, and audited. It is a distinct route rather than a
+    // branch of the PATCH so the audit entry can say "a secret was replaced" instead of
+    // "a credential changed".
+    let credential_secret = post(credentials::replace_secret)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
+    // The node-package ledger (REQ-087 slices 2 and 4). The list is a read of a table that
+    // holds no secrets, so it carries the credential *read* power; installing one changes what
+    // the canvas can place, so it carries the credential *manage* power.
+    let node_packages = get(credentials::list_node_packages)
+        .layer(guards::require(&state, "workflows.credentials.read"))
+        .merge(
+            post(node_packages::install_node_package)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        );
+    let node_package_item = patch(node_packages::set_node_package_enabled)
+        .layer(guards::require(&state, "workflows.credentials.manage"))
+        .merge(
+            delete(node_packages::remove_node_package)
+                .layer(guards::require(&state, "workflows.credentials.manage")),
+        );
+
+    // The OAuth flow (REQ-087 slice 3). Start and disconnect carry the credential manage
+    // power because both change what the credential can do; the forced refresh is the same
+    // power for the same reason — it spends a provider token.
+    //
+    // The callback is the one route on this surface with NO guard and NO session: the browser
+    // is at the provider and carries nothing back but `?code=…&state=…`. Its authentication is
+    // the signed `state`, which names the organization and the credential it was minted for,
+    // so a state cannot be replayed into another tenant or onto another credential. That is
+    // the whole reason the organization is inside the signature.
+    let credential_oauth_start = post(credential_oauth::start_oauth)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
+    let credential_oauth_refresh = post(credential_oauth::refresh_credential)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
+    let credential_disconnect = post(credential_oauth::disconnect)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
+    let oauth_callback = get(credential_oauth::oauth_callback);
 
     // Onboarding: the first-run flow (REQ-050). No permission guard — the flow itself decides
     // who may act, and it must be reachable before any account, role or binding exists.
@@ -926,7 +998,6 @@ pub fn router(state: AppState) -> Router {
             put(notifications::put_preferences)
                 .layer(guards::require(&state, "notifications.manage")),
         );
-
     // Slice 3 splits by *scope* rather than by action, and the split is the whole point of the
     // slice:
     //
@@ -1042,6 +1113,56 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/security/headers",
             put(security_headers::put).layer(guards::require(&state, "security.manage")),
+        )
+        // Rate limiting and sign-in protection (REQ-012, slice 3).
+        //
+        // Reading either document is `security.read` — the same read the overview already makes,
+        // and a deployment where a viewer could not see its own limits would make the screen
+        // useless to the person diagnosing a refusal. Writing is `security.manage`, the same
+        // power that dismisses a finding, because raising a limit until nothing is refused is
+        // the same act as making the refusals stop mattering.
+        //
+        // The tester is `security.read`, not `security.scan`: it changes nothing, and it is the
+        // screen an operator has open at 3am with a client being refused. Requiring a write power
+        // to *look* at why something was refused would make the screen unusable exactly when it
+        // is needed.
+        .route(
+            "/security/rate-limits",
+            get(security_limiter::get_rate_limits)
+                .layer(guards::require(&state, "security.read"))
+                .merge(
+                    put(security_limiter::put_rate_limits)
+                        .layer(guards::require(&state, "security.manage")),
+                ),
+        )
+        .route(
+            "/security/rate-limits/test",
+            post(security_limiter::test_rate_limit)
+                .layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/sign-in-protection",
+            get(security_limiter::get_sign_in_protection)
+                .layer(guards::require(&state, "security.read"))
+                .merge(
+                    put(security_limiter::put_sign_in_protection)
+                        .layer(guards::require(&state, "security.manage")),
+                ),
+        )
+        .route(
+            "/security/sign-in-protection/probe",
+            post(security_limiter::probe_lockout)
+                .layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/locked-accounts",
+            get(security_limiter::get_locked_accounts)
+                .layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/locked-accounts/{user_id}/unlock",
+            post(security_limiter::unlock)
+                .layer(guards::require(&state, "security.manage")),
         )
         .route(
             "/security/findings/{id}",
@@ -1220,46 +1341,7 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/providers", iam_providers)
         .route("/iam/providers/{id}", iam_provider)
         .route("/iam/providers/{id}/test", iam_provider_test)
-        // Separate routes, not verbs merged onto `/iam/providers/{id}`. The deletion impact is a
-        // GET on a *sub*-path and the reassign a POST: merging them into the `{id}` method
-        // router would make the impact a second GET of the provider and the reassign a second
-        // POST of a provider, which are different actions with different guards.
-        .route(
-            "/iam/providers/{id}/deletion-impact",
-            iam_provider_deletion_impact,
-        )
-        .route(
-            "/iam/providers/{id}/reassign",
-            iam_provider_reassign,
-        )
-        .route("/iam/providers/{id}/enable", iam_provider_enable)
-        .route("/iam/providers/{id}/disable", iam_provider_disable)
         .route("/iam/providers/{id}/events", iam_provider_events)
-        // The batch sits at `/iam/providers/bulk`, NOT `/iam/providers/{id}/bulk`: axum matches
-        // static segments before `{id}`, so the two can share a prefix — but only because the
-        // batch is registered on a literal path. Folding the ids into the path instead would
-        // give the router a second pattern that looks like a provider id and is not.
-        .route("/iam/providers/bulk", iam_providers_bulk)
-        .route("/iam/providers/{id}/sync-runs", iam_provider_sync_runs)
-        .route("/iam/providers/{id}/sync-runs/{run_id}", iam_provider_sync_run)
-        .route(
-            "/iam/providers/{id}/sync-runs/{run_id}/retry",
-            iam_provider_sync_retry,
-        )
-        .route("/iam/providers/{id}/sync-groups", iam_provider_sync_groups)
-        .route(
-            "/iam/providers/{id}/attribute-mappings",
-            iam_provider_attribute_mappings,
-        )
-        .route(
-            "/iam/providers/{id}/attribute-mappings/preview",
-            iam_provider_attribute_preview,
-        )
-        .route("/iam/providers/{id}/role-rules", iam_provider_role_rules)
-        .route(
-            "/iam/providers/{id}/role-rules/preview",
-            iam_provider_role_rule_preview,
-        )
         .route("/scim/v2/ServiceProviderConfig", scim_config)
         .route("/scim/v2/Schemas", scim_schemas)
         .route("/scim/v2/Users", scim_users)
@@ -1397,15 +1479,63 @@ pub fn router(state: AppState) -> Router {
         // credential. It is a *static* `shared` segment, so it never collides with the
         // `{id}` parameter above it.
         .route("/public/media/shared/{token}", public_media_shared)
+        // The OAuth callback (REQ-087 slice 3). Unauthenticated by necessity — a provider
+        // redirects a browser, not a session — and authenticated by the signed `state` it
+        // carries, which names the organization and the credential it was minted for. It is
+        // declared under `/public` with the other browser-facing entry points so the shape of
+        // the unauthenticated surface stays readable in one place.
+        .route("/public/oauth/callback", oauth_callback)
         .route("/workflows", workflows)
         .route("/workflows/{id}", workflow)
         .route("/workflows/{id}/run", workflow_run)
+        .route("/workflows/{id}/graph", workflow_graph)
+        .route("/workflows/{id}/graph/validate", workflow_graph_validate)
+        .route(
+            "/workflows/{id}/graph/expressions/preview",
+            workflow_graph_preview,
+        )
+        .route(
+            "/workflows/{id}/graph/expressions/complete",
+            workflow_graph_complete,
+        )
         .route("/workflows/{id}/executions", workflow_executions)
         .route("/workflow-executions/{id}", workflow_execution)
         .route(
             "/workflow-executions/{id}/cancel",
             workflow_execution_cancel,
         )
+        // Node library and credential catalogue. The static segments come before the `{key}`
+        // parameter on purpose: `categories` and `lint` are node-library screens, not node
+        // keys, and a reader who types `/node-types/categories` must get the tree rather than a
+        // 404 for an unregistered node.
+        .route("/node-types/categories", node_categories)
+        .route("/node-types/lint", node_registry_lint)
+        .route("/node-types", node_types)
+        .route("/node-types/{key}", node_type)
+        .route("/port-kinds", port_kinds)
+        .route("/credential-types", credential_types)
+        .route("/credential-types/{key}", credential_type)
+        // Credential *instances* (REQ-087 slice 2). Read and manage are separate routes, not
+        // one method-guarded handler, because a role that may see which integrations exist is
+        // not a role that may replace a secret. The sub-resources are declared before the
+        // `{id}` parameter so `/credentials/{id}/test` is a test and not an id.
+        .route("/credentials/{id}/usage", credential_usage)
+        .route("/credentials/{id}/test", credential_test)
+        .route("/credentials/{id}/secret", credential_secret)
+        // The OAuth sub-resources (REQ-087 slice 3), declared before `{id}` for the same
+        // reason. `refresh` and `disconnect` are separate verbs rather than one
+        // `POST /{id}/oauth` because the first spends a provider token and the second throws
+        // it away, and the panel wants to be able to say which one it pressed.
+        .route("/credentials/{id}/oauth/start", credential_oauth_start)
+        .route("/credentials/{id}/oauth/refresh", credential_oauth_refresh)
+        .route("/credentials/{id}/disconnect", credential_disconnect)
+        .route("/credentials", credentials_list)
+        .route("/credentials/{id}", credential_item)
+        // The node-package ledger (REQ-087 slice 2/4). The static `installed` screen is a
+        // read of the ledger, so it carries the workflow read power and not the credential
+        // power: an installer ledger holds no secrets.
+        .route("/node-packages", node_packages)
+        .route("/node-packages/{key}", node_package_item)
         .route("/onboarding", get(onboarding::status))
         .route("/onboarding/owner", onboarding_owner)
         .route("/onboarding/organization", onboarding_organization)

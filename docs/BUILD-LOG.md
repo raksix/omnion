@@ -1,149 +1,164 @@
+## 2026-09-29 — REQ-086 slice 3 · the two halves of the expression editor, and a probe that blamed the wrong thing
+feat(workflows): the expression autocomplete the canvas asks the server for
+**What.** Slice 3 owed CodeMirror 6 for code nodes and the expression autocomplete. Both are
+built. `omnion_workflows::completion` builds the candidate list — and it is the **server's**
+grammar, deliberately: a client-side list is a second copy of the rules, it agrees with the
+server on the day it is written, and it offers `{{node.count + 1}}` for as long as nobody
+re-reads the evaluator. `POST /workflows/{id}/graph/expressions/complete` (workflows.read)
+answers it, and the inspector embeds `CodeEditor` (CodeMirror 6: javascript/python/json, line
+numbers, bracket matching, close-brackets, in-editor search) plus `ExpressionField` with a
+menu driven by ↑↓/Enter/Tab/Esc.
+
+**Two decisions worth the argument they cost.** The graph travels in the request body, because
+"upstream outputs" is a fact about the graph as it is *on screen* — wires drawn but unsaved
+included — and reading the stored graph completes against a topology the person has already
+changed, at exactly the moment they are most likely to trust the list. And upstream is
+**direct** only: a grandparent is not in the step's namespace today, so offering it suggests an
+expression that resolves until somebody deletes the middle wire.
+
+**`Issue.param`, because the gutter needs a line.** The code editor marks diagnostics, and
+scraping the parameter name out of `"url" must be a URL` would be a convention rather than a
+contract — it breaks the first time somebody rewords an error. Additive, skipped when absent, so
+every existing serialisation stays byte-identical. Every diagnostic is at line 0 and that is
+honest rather than lazy: the server validates a parameter's *value*, not its contents, and
+inventing a line number marks a line nobody got wrong.
+
+**What the probe found, in the wrong order.** `node scripts/qa/expression-completion.cjs`
+came back **17 failed / 2 passed**, every response a 404 with an *empty body*. That reads
+exactly like "the route is not registered" and sent me into `mod.rs` looking for a router line
+I had already written. Two faults, the second hiding the first:
+
+1. `stack-only.sh` builds only when the binary is **missing**, so a rebuilt API is not what the
+   private stack serves. A 404 with an empty body is the router not knowing the path; a 404
+   with the route's own JSON error is the handler refusing. Different failures, same status.
+2. **The API had never compiled.** `complete()` took `&Value`; the route has a `Map`. A
+   `cargo test -p omnion-workflows --lib` does not compile the route that calls it, so
+   "13 passed" was true and irrelevant. `complete()` now takes `expression::Namespaces`, which
+   is what the body's deserializer produces.
+
+**Proof.** 13 unit (`completion`) · 183 lib · **6 integration** against `omnion_qa_w10`
+(`--test workflow_completion`) · `pnpm typecheck` clean · `pnpm --filter @omnion/admin build`
+clean · `node scripts/qa/expression-completion.cjs` = **19 passed 0 failed** live on :18089.
+The probe's last check is the one that matters: **every candidate the server offers is fed into
+the preview endpoint and none may be refused.** An offered candidate is a promise, and that is
+the assertion that stops the two halves of slice 3 drifting into a feature worse than none — a
+menu full of paths that preview as errors teaches a person to ignore the menu.
+
+**The browser pass ran, and found a bug in the harness before it reached the canvas.** The
+slot came free around 13:51, so the pass was launched — and `run.sh` failed with
+`Script not found: /mnt/apopic/omnion-w10/target/debug/omnion-api`. It honours `CARGO_TARGET_DIR`
+for the *build* but starts pm2 from `QA_API_BIN`, which defaults to `$ROOT/target/debug/…`; a
+writer building out of tree has to pass both.
+
+Then three consecutive passes died on `migration 19 was previously applied but is missing in
+the resolved migrations`, a sentence that names a migration and so sends you auditing 41 SQL
+files that are all fine. The cause was `pm2 restart`, which **keeps the environment a process
+was first started with**: an earlier attempt had left a process pointing at the main writer's
+`omnion_qa` while every later pass reset `omnion_qa_w10`, and each restart faithfully
+reconnected to the database nobody had reset. `run.sh` now does `delete` + `start` for all
+three processes (`203bc77`) — the ports, the CSRF secret and the binary path are inherited the
+same way, and each has changed between passes at least once.
+
+**With that fixed the pass ran for real** — 750 clicks across 47 pages — and then the browser
+died at `runPalette` with `Target page, context or browser has been closed`, the box-wide tab
+death with ten chromes on the machine. It never reached the graph-canvas routes, so
+`runGraphCanvasDepth` remains unwalked and **no gesture acceptance box is ticked**. The 47 pages
+it did reach are evidence the harness works; they are not evidence about the canvas.
+
+**Next.** Run the walkthrough when the box has room. Then slice 3's last owed item: the
+type-aware half of connects (`connection_type_mismatch`), which belongs to REQ-088's ports.
 
 
-## tick 14 — REQ-065 slice 4 part 8 · wave9
+## 2026-09-29 — REQ-087 · the credential surface was closed to the account that needs it
+fix(workflows): let a platform account read, write and connect a tenant's credentials
+**What.** Every route on the credential surface resolved its organization with
+`resolve_organization(&current, None)`. That reads as "this caller's organization" and means
+"the caller's organization, or a refusal": an account *without* a primary organization is
+refused `organization_required` before a single row is read. Eight routes in `credentials.rs`
+and three in `credential_oauth.rs`, so `GET /api/v1/credentials` answered `400 organization_required`
+to a superuser and to the QA owner alike — which is why the credential screens rendered an empty
+list and the pass logged 66 of them. The same defect had already been found and fixed on the
+node-package routes one tick earlier, and the sweep that would have caught this one
+(`grep -rn 'resolve_organization(&current, None)'`) is the lesson, not the fix.
+**Where the organization travels now.** Where the request already has a place for it: the list
+query, the create and update bodies, the delete and secret-replace bodies, and a shared
+`ScopeQuery` for the read routes that have no body. A `DELETE` carries no body, so its
+organization is a query for the same reason the install's is a body. `start_oauth` takes it in
+its own body; `disconnect` and the forced refresh take the `ScopeQuery`. Every field is
+optional, so a tenant's own call is byte-for-byte unchanged — which is the property
+`every_credential_request_can_name_the_organization_it_works_on` asserts, on both halves.
+**One rule, stated rather than implied.** Two of the routes can read the organization from a
+query *and* a body, and the body wins (`body.organization_id.or(scope.organization_id)`). The
+alternative — whichever the extractor happened to touch — gives two different answers on two
+routes for a caller who fills both in, and the test says which one is chosen.
+**The panel half is a component, not a line.** The picker had been hand-copied into three IAM
+screens and then a fourth (the installer), each a slightly different variant.
+`apps/admin/lib/scope.ts` writes it once: the tenant list is loaded *only* for a platform
+account (a tenant never makes a request it may not be allowed to make), a tenant never sees a
+control it cannot use, and the create form **disables its save button and says why** rather than
+letting the reader fill in a form the API will refuse. The credential screens became a
+three-line change each instead of a fourth copy.
+**Migration numbers, and why this entry has two halves.** Merging `main` brought another
+wave's `0054_security_posture.sql` alongside this branch's `0054_workflow_oauth_flows.sql`.
+sqlx keys `_sqlx_migrations` on the *version number*, so two files claiming 54 is one migration
+applied twice with a different checksum: every boot dies with "migration 54 was previously
+applied but has been modified" and the API never comes up. Five other worktrees already sit
+at 0135–0140, so the ledger's high-water mark is 0140 and these two went to **0141** and
+**0142** — renamed, never edited, because the append-only ledger's rule is that a released
+number is not renumbered, and the only way both copies can survive is if neither number is
+taken. The QA database was dropped and recreated, because a suite database holds every applied
+checksum and renumbering cannot be tested any other way.
+**Proof, and the part that took four passes.** `cargo build -p omnion-api` green in 3m31s (20
+warnings, all pre-existing, in other waves' files). `cargo test -p omnion-api --lib` **251
+passed, 0 failed** — the suite was 249, and the two new tests are named in the REQ.
+`pnpm typecheck` 5 packages, 0 errors, 31.6s. `scripts/qa/credential-scope.cjs` **19 of 19**
+against a live platform account on `:18089`.
 
-**The count, as a number.** `f0246f4` made the revocation real and wrote the figure into `detail`
-as English. That reads well and is worth nothing to the platform: a number inside a sentence
-cannot be summed, filtered, sorted or rendered as a number, so the panel could only display it and
-an export had to re-parse it — and the day somebody re-words the sentence, that regex returns 0
-with no type error and no failing test. A security panel that quietly under-counts an offboarding
-is the failure this removes. `0126` adds `provisioning_log.revoked_sessions integer not null
-default 0`; five of the six write paths have nothing to report and "none" is their true value,
-whereas a null would add a third state nothing can produce.
+That probe is the *proof*, and it is a live API round trip rather than a browser walk because
+it can assert the thing the browser cannot: that the unnamed read is **still**
+`organization_required`. A fix that made the requirement disappear would be a fix that deleted
+the tenancy rule, and only a probe that deliberately makes the unnamed call can see that. It
+also checks the scope did not widen into a permission — the row is in the named tenant and in
+no other.
 
-**The path that reported nothing, which is the one that mattered.** `DELETE /scim/v2/Users/{id}`
-is what a connector sends last for somebody who left. It called `set_status_and_end_sessions` and
-**discarded the `StatusChange`** — the count existed, was computed, and was thrown away, so the
-line an offboarding review most often reads was the one line it could not get a figure from. The
-PATCH path already had it; the DELETE path had the work done and dropped the answer.
+**Four passes, one cause, and it was not the database.** The pass kept dying in seconds with
+`migration 19 was previously applied but is missing in the resolved migrations`, which reads as
+a schema fault. It is a build-graph one. sqlx embeds `database/migrations` at the compile of
+`omnion-core` — the crate that *declares* `migrate!` — so renaming a migration never reaches
+the binary through `cargo build -p omnion-api`: cargo sees the api crate as current, prints
+`Finished` in forty-two seconds, and ships the old set. `touch`ing the api crate does nothing;
+`cargo clean -p omnion-core` is the only thing that re-embeds, and then the build takes six
+minutes instead of one. The diagnosis that settled it was the *repetition*: four passes, one
+binary, one identical sentence. A database fault varies with the data; a stale build repeats
+exactly. The harness now cleans that crate on its rebuild path, and nothing else.
 
-**`50439a0` — a fix I owed this branch.** `cargo test -p omnion-api --lib` had not compiled since
-`b2d82aa`: two assertions called `to_string()` on an `ApiError`, which implements neither
-`Display` nor `Error`. The whole lib test profile was unreachable, so both tests were *unproven*
-rather than green. One was also **wrong**: the fixture `«redacted:sk-…»` was asserted to be caught
-by `looks_like_a_credential`, and it is not a secret — it is what a scanner emits after it found
-one and removed it. A detector that refuses masked markers refuses every tool that masks its
-output, so the screen would go dark on exactly the findings worth reading. The detector was right
-(the mask is tool-decorated so it does not `starts_with("sk-")`, and it is far under the
-24-character floor); the fixture was wrong, and the masked case is now asserted to pass *through*,
-which is what the original was reaching for.
+**The false reading, recorded because it nearly cost the tick.** The repository's migration
+ledger has genuine gaps — 0019, 0020 and 0022-0024 are absent in *every* worktree, inherited
+from main — so a freshly created database can produce a similar complaint. The only thing that
+tells a stale embed from a real gap apart is `select count(*) from _sqlx_migrations` on the
+database in question, and on a fresh database that count is zero. I also spent two passes
+reading a pm2 error line from a run I had killed: pm2 appends to its logs and never truncates,
+so a killed pass's last words outlive it by minutes. `rm -f ~/.pm2/logs/<name>-*.log` before a
+pass you intend to read.
 
-**Proof.** `cargo test -p omnion-identity --lib` → **218 passed** (216 before, +2).
-`-p omnion-api --lib` → **208 passed, 0 failed** (it could not compile before `50439a0`).
-`bash scripts/qa/run-media-walk.sh iam_revocation_count` → **1 passed** (8.1s) against a
-disposable database, through the real router and the real SCIM route.
-`iam_deprovision_revocation` → **1 passed** and `scim` → **2 passed** still green.
-`bash scripts/qa/run-iam-0126.sh` → **PASS**: `0126` applied over a **populated** `provisioning_log`,
-2 pre-existing rows survived with their details intact and read 0, `-1` was refused by the
-non-negative constraint read back with `pg_get_constraintdef`, a real count survived, the index
-kept its `WHERE revoked_sessions > 0` predicate, and a second apply was refused.
-`tsc --noEmit` in `apps/admin` → exit 0.
+**The browser pass is queued, not failed.** The box is running ten writers and `QA_SLOTS=1`,
+so this tick's `run.sh` has been waiting on a slot for eighteen minutes; the API boots clean
+against a dropped database and answers `/healthz` 200, and the three credential screens are in
+the walkthrough's route list, but the pass has not yet produced its report. The API round trip
+above is the evidence this tick stands on, and it is evidence about the same routes the browser
+would have driven.
 
-**What the walk asserts, and why the number 2.** A count of 1 is indistinguishable from a
-hard-coded 1, from a boolean rendered as a digit, and from "only the first session" — so a
-single-session walk passes any check the figure can satisfy. It creates **two** live sessions and
-asserts the reported number is 2, and separately that the page's own sum equals
-`count(*) from sessions where revoked_at is not null`: two independent sources of truth, and the
-drift between them is invisible until somebody counts by hand. The walk is red against the
-previous code with only the fix stashed, failing at "the log line must carry `revoked_sessions` at
-all" — a fact about the product, reached through the real route.
+**Next.** REQ-086, the workflow editor canvas — the head of this queue, and the thing three
+REQ-087 clauses are waiting on (the usage view needs a graph, the palette needs to read the
+installer ledger, and `needs_reauth` needs somewhere to disable a node).
 
-**Not claimed.** The browser pass still has not run on this branch, so `0d48756`'s column and
-total are typechecked but unobserved. The live OIDC round trip against the stub IdP with a
-SCIM-provisioned subject — the one assertion `115cce4` still rests on unit tests and the dry run
-for — is still open.
-
-**Next.** The live OIDC round trip with a SCIM-provisioned subject, and the browser pass on the
-private stack (`QA_STACK=w9`, 18088/3108/3208) when the shared QA slot frees.
-
-
-## tick 13 — REQ-065 slice 4 part 7 (`f0246f4`) — criterion 8, the clause that did not exist
-
-**The criterion was half absent, and the half that was missing had a helper sitting next to it.**
-The refusal half was true — `resolve_session` filters on `u.status = 'active'`, so a deactivated
-account's sessions stop resolving. The revocation half did not exist: `revoke_sessions_for_user`
-has been in `crates/identity/src/sessions.rs` since the module was written, documented "used by
-password resets and admin actions", and had **zero callers anywhere in the workspace**. Nothing
-revoked a session when a directory said a person was gone.
-
-**Why it reads as green.** Every assertion that already existed stops at "the session no longer
-works" — and it did not work. The hole is one step further out, and one step a real deployment
-takes without anybody deciding to: a directory deactivates somebody who left the company, and a
-later re-sync notices the account reappeared and sets it back to `active`. The status filter no
-longer masks the token, the session row was never touched, and every old browser tab holds a
-working session again **with its original expiry** — so "we deactivated them" turns out to have
-been a statement about the next few minutes. A status flag is a *query filter*; a session token
-is a *bearer credential* the user is already holding. Only revoking the row makes it dead.
-
-**The fix is one function, and the shape is the argument.** `set_status_and_end_sessions` flips
-the status and ends the sessions in **one transaction**, and it reads the previous status **in the
-same statement** as the write (`with previous as (select id, status … for update)`), so two
-concurrent deactivations cannot both read `active` and both believe they were the one that ended
-them. A separate `find_by_id` before the write would reintroduce exactly that race — which is why
-the read is not a convenience.
-
-Three boundaries, each asserted, because any two of them collapsing produce a plausible product:
-
-* **A status that leaves the account in service revokes nothing.** Re-activating an account is
-  not an instruction to log the person out of the tabs they just signed in with. Getting this
-  wrong is the mirror-image bug: everybody deactivated en masse for an org-wide event comes back
-  and has to sign in again.
-* **A no-op revokes nothing.** `disabled` on an already-disabled account must not clear whatever
-  sessions have appeared since — a connector re-sends whole documents on its timer, so the
-  "revoke whenever disabled" version signs a colleague out every few minutes with no action of
-  their own. This is the same lesson as the group-membership event in `f5531ff`, in the opposite
-  direction: an event (or a revocation) that fires on a *write* rather than on a *change* trains
-  its reader to ignore it.
-* **An unknown status is refused before any write.** The variant a caller can pass is a `&str`,
-  so the check has to be repeated rather than inherited — and refusing after the write would
-  leave a transaction that had to be rolled back by hand.
-
-`sqlx::FromRow` is derived and does not exist for tuples, so the row is a named `StatusUpdateRow`
-rather than `(User, String)` — which is also the better shape, because `previous_status` is the
-only reason the query exists and a positional accessor would hide what field 6 is.
-
-**The count goes in the sync log.** "deactivated" says the account is out; the count says how many
-live tokens went with it. The account row cannot say that, and an operator reading a directory
-report has no other way to learn that three people were still holding working sessions — which is
-the exact failure this slice removes.
-
-**Proof, and the part that matters most.** `run-media-walk.sh iam_deprovision_revocation` → **1
-passed** (21.1s) against a disposable database. It was **red against the previous code**: with the
-fix stashed and only the test file left, it fails at `the session must be REVOKED, not merely
-unresolvable` — after driving the real SCIM PATCH route and reading the real session row, so the
-red is a fact about the product rather than a compile error. That stash also cost three wrong
-guesses about the harness (`Config::from_env` + `BuildInfo::new`, the mint route
-`/iam/provisioning/tokens` with `name` not `label`, and a session **cookie** where a bearer was
-meant), each of which the error named precisely; the walk is copied from `scim.rs` rather than
-written from memory for that reason.
-The clause only the fix satisfies is asserted directly: deactivate → **reactivate** → the old
-token is still dead, presented to `resolve_session` after asserting that same token resolved a
-moment earlier. A test that only checks "dead afterwards" passes against a session that never
-worked, so the before-assertion is not decoration.
-`cargo test -p omnion-identity --lib` → **216 passed**; `-p omnion-api --lib` → **197**;
-`run-media-walk.sh scim` → **2 passed** (the walk that drives the same three routes and breaks
-first if the no-op rule is wrong); `tsc --noEmit` in `apps/admin` → exit 0.
-
-**Not claimed.** The panel half — the sync drawer does not yet surface `revoked_sessions`, and the
-browser pass has still not run on this branch, so criterion 18's "zero high findings" half stays
-unticked. `VersionMissing(19)` from a sibling branch's shared dev database killed the first two
-walk attempts before an assertion; the disposable-database runner is what makes the walk mean
-anything here.
-
-**Next.** The `revoked_sessions` count on the sync drawer (the panel half of this commit), then the
-live OIDC round trip against the stub IdP with a SCIM-provisioned subject, which is the one
-assertion `115cce4` still rests on unit tests and the dry run.
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
-
 build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
-
 Slice 1 gave the bus a read side. This is the half an operator actually reaches for: connect a
 receiver, watch what it was sent, send it again, and find out whether it is still working.
-
 **0052_webhook_delivery_ops.sql**, four routes on `/webhooks/{id}` (`deliveries`, `redeliver`,
 `redeliver` batch, `stats`, `secret/rotate`), and four screens: `/webhooks`, `/webhooks/new`,
 `/webhooks/[id]` (Overview / Deliveries / Stats) and the edit form.
-
 **Six decisions, each a shortcut that produces a plausible wrong answer.** The **redelivery
 resets the row** rather than inserting a second one — the `(endpoint_id, event_id)` unique index
 would refuse the insert anyway, and it should: two rows for one fact means the receiver cannot
@@ -164,749 +179,223 @@ order repeats rows whenever two deliveries share a timestamp, which is normal wh
 out; half a cursor is refused by name because a null id there is a `500` on a request the panel
 builds itself. **Rotation is a separate route from `PATCH`**, because it is the one write whose
 answer carries the secret — a receiver cannot be reconfigured with a value it never saw.
-
 **Two defects the walks found, both of the "the column exists" kind.** Migration 0052 added
 `trigger` and nothing wrote it, so every test delivery was stamped `event` and the stats read was
 counting a button press as the platform delivering something; the column is now stamped at the
 one place a test is queued. And `redeliver` originally reported its count through a follow-up
 read, which can observe a different value after somebody else pressed the same button — it now
 returns the count from the update itself.
-
 **The rotation is proved against a receiver, not a status code.** The walk creates the endpoint
 with an operator-supplied secret so it holds both values, delivers once, rotates, delivers again,
 and asserts the second delivery verifies against the new secret and **fails** against the old
 one. The receiver is `infra/mocks/webhook-receiver.mjs`, started by the depth pass and killed in
 its `finally`, so a throw mid-pass does not leave a port bound.
+## omnion-w10 · REQ-087 slice 4 — the browser pass that found two bugs by refusing to lie
+
+The queued pass ran on the private w10 stack and the slice it had been waiting to prove turned
+out not to be provable. Two product bugs, one of them three ticks old.
+
+**The ledger was closed to platform accounts.** Every node-package route resolved the
+organization with no requested value, so an account with no primary organization was refused
+`organization_required` before the manifest was read. That is not an edge case: it is the
+account that installs a package *for a tenant*, so the one call that most needs the capability
+was the one that could not make it. The organization now travels in the install and toggle
+bodies, a query on the removal that has no body, and the list read; the panel sends its active
+organization and a platform account picks one, following the shape `automation.rs` and
+`iam_subjects.rs` already use. It stays optional, so a tenant's own call is unchanged.
+
+**The pass's fixture was not installable.** A node that accepts a credential needs a
+`credential_key` select for the palette to fill (`node_credential_not_selectable`); the fixture
+had a textarea. So the pass had been proving a *refusal* while claiming to prove an install, and
+every step after it ran against a row that was never there. The first two explanations for the
+`400` were both wrong — a scoping problem, then a validator bug — and both were ruled out by
+running the SDK's own scaffold through the same door, which installed at `201`. When a
+contract is generated by a builder in this repo, read the builder's output.
+
+| Piece | What the obvious version does | What shipped |
+|---|---|---|
+| Organization | `resolve_organization(&current, None)` — "the caller's organization", which means a refusal | The caller names it, optionally, and a tenant's own call is unchanged |
+| Fixture | A node with a `text` param and a credential type | The shape the SDK's own scaffold writes, proven installable first |
+| Toggle assertion | `waitForTimeout(1500)`, then read the chip | Waited on: the chip follows a PATCH and a refetch, so a pause is a race |
+| Refusal excuse | Only 401/403 counted as a refusal | 400/401/403/409/422 — what a validator and a ledger actually answer |
+
+**Proof.** `cargo test -p omnion-api --lib` → **228 passed**; `-p omnion-workflows --lib` →
+**155 passed**; `pnpm typecheck` → 0 errors. The private w10 pass:
+`QA_STACK=w10 QA_API_PORT=18089 QA_ADMIN_PORT=3109 QA_WEB_PORT=3209 bash scripts/qa/run.sh`
+→ 1469 clicks, 1537 screenshots, `nodePackages` = list with the empty state, `refused` with 4
+findings rendered, `install` with the namespaced key, `toggle` keeping the row, `remove` naming
+its node. Findings attributable to this slice: **6 → 0** (three deliberate refusals now excused
+by their real status, one race removed). Outside it: 288 on screens this branch does not own.
+The same lifecycle is proven against a live API outside the browser — 201 with a server-computed
+checksum, 409 on a downgrade, toggle both ways, the broken variant refused with all four
+findings, and an empty ledger at the end.
+
+**Next.** The credentials screens carry the *same* org-scoping defect: 8 routes in
+`credentials.rs` and 3 in `credential_oauth.rs` still resolve with no requested value, which is
+why the credential depth reads an empty list and the API answers `400` 66 times. Same fix, same
+reason, same three screens to wire — not started, and it is the whole of the next slice.
+
+## omnion-w10 · REQ-087 slice 4 — the package SDK, and a scaffold its own validator refuses
+
+The ledger's read side shipped in slice 2 and so did a placeholder install that recorded
+whatever key, version and checksum a caller named. That placeholder is the shape the REQ
+refuses: a ledger row is the only thing that makes a package's nodes *appear*, so a row
+written without validation is a palette entry that fails when somebody places it. This tick
+replaces it with the SDK, the validating install, and a removal that can name what it breaks.
+
+**What shipped.** `crates/workflows/src/node_package.rs` (the manifest, the validator, the
+canonical checksum, `pack`, `scaffold`, `removal_plan`); `0142_workflow_node_package_nodes.sql`
+— `node_keys` on the ledger row; `apps/api/src/routes/node_packages.rs`; `tools/cli/src/node.rs`
+— `omnion node scaffold|validate|pack`; and `/modules/installed` with a walkthrough depth pass.
+
+**The decision the whole slice rests on.** The install body carries the **manifest**, not a
+summary of it. There is no `checksum` field in the request, so the only checksum the ledger
+can hold is the one the server computed over the canonical manifest (sorted keys, so
+re-indenting a file does not read as a new package). And the validator lints each definition
+with the *bundled registry's own* `lint_node`/`lint_credential`, on the same object it is about
+to install — not on a second copy written beside it, which is what I wrote first and which
+drifted the moment the type grew a field.
+
+**The bundled lint refused this slice's own scaffold three times.** A `secret_field` parameter
+must render as a `select` (a credential reference in a text box is a key somebody has to
+memorise rather than choose); a package's credential type is not orphaned when the package's
+own node names it; and a package whose nodes run out of process must declare the `sandbox`
+permission. A validator that had not been run against the example would have taught a stranger
+all three. There is also a companion test now pinning that a **closed** main output is legal and
+a **missing** one is not — the fixture that proves the bundled lint is the real lint had to stop
+closing a port and start emptying the list.
+
+**Why the removal needed a migration.** The REQ says a removal "flags dependent workflows
+instead of breaking them", and a flag without a list is a flag without an action. The manifest
+that knows which nodes a package owned belongs to whoever installed it, so `0055` records the
+**namespaced** keys (`acme.echo`) at install time — not the manifest's local names, which a
+graph never holds and a remover matching on them would silently never find. The shape check
+could not be a CHECK constraint: PostgreSQL forbids a subquery in one, and "every element of
+this array matches a pattern" is inherently a subquery, so it lives in an `IMMUTABLE` function
+over `jsonb_path_query_array`. Probed directly: `[]` true, `["acme.echo"]` true, `["echo"]`
+false, `["acme."]` false, `["Acme.Echo"]` false.
+
+**Proof.** `cargo test -p omnion-workflows --lib` → **155 passed** (132 → 155, +23 for the
+package module). `cargo test -p omnion-api --lib` → **227 passed**. `cargo test -p omnion-cli` →
+**11 passed**. `tsc --noEmit` in `apps/admin` → **exit 0**. `node --check scripts/qa/walkthrough.cjs`
+→ clean. The migration applies to `omnion_qa_w10` and its function answers correctly. And a real
+round trip on the built binary, not a test: scaffold wrote `manifest.json`, two fixtures and a
+README; `validate` printed *installable — 2 node(s), 1 credential type(s), permissions: network,
+credentials, sandbox* (exit 0); `pack` wrote the packed file with checksum
+`f22fdf27…9e421` (exit 0). The same manifest broken three ways was refused with **four**
+findings at once, exit 1, and `pack` wrote nothing. Exit codes are separated — 1 for a package
+that does not validate, 2 for a bad command line — so a CI job can tell "your package is wrong"
+from "your command was wrong".
+
+**Not proven, and not claimed: the browser pass.** `QA_STACK=w10 QA_API_PORT=18089
+QA_ADMIN_PORT=3109 QA_WEB_PORT=3209 bash scripts/qa/run.sh` sat on `waiting for a QA slot (max 1
+concurrent pass)` for the whole tick, with the box at load 10 and then 22 and `/mnt/apopic` and
+`/dev/shm` both at 100%. That is the slot guard working, not a hang — but it means
+`report.nodePackages` has not been read once, and the slice's "appears in the palette" clause
+stays open. The screen exists and is in the routes list; the pass that drives it has never run.
+
+**One fix to the harness itself, forced by the disk.** `run.sh` hardcoded
+`target/debug/omnion-api`, so a writer building off a saturated mount got `Script not found` for
+a binary that existed — a full filesystem reported as a broken API. `QA_API_BIN` now overrides
+the path and `CARGO_TARGET_DIR` is honoured by the rebuild inside the branch, because a version
+that honoured the binary but rebuilt into the default `target/` would have rebuilt into the very
+disk the override exists to avoid.
+
+**Next.** Run the pass on the private w10 stack and require `report.nodePackages`: the list and
+its empty state, a refusal rendering all four findings, the install row with the namespaced node
+key, a downgrade refused by name, a toggle that keeps the ledger row, and a removal whose dialog
+named `qa-fixture.echo` before the button. Zero high findings from this change. Only then does
+slice 4 close, and only after the palette clause can REQ-086's canvas answer it.
+
+## omnion-w10 · REQ-087 slice 3 (API half) — four endpoints, and a key that never matched
+
+The slice's algebra and persistence landed in the last two ticks. This tick is the half that
+talks to a provider, and the interesting part is not the endpoints — it is that **the flow
+could not have worked at all**, and every symptom pointed somewhere else.
+
+**`state_key` derived an HMAC key through an encryption primitive.** `SecretBox::encrypt`
+produces a fresh random nonce per call, which is exactly right for sealing a PKCE verifier and
+catastrophically wrong for an HMAC key: `build_state` and `verify_state` were handed different
+key bytes, so *every* callback failed as `credential_oauth_state`. The error names CSRF. The
+person reading it — me, at 01:00, with six red tests — goes looking for an attack. It is a key
+that never matched. The fix is a plain keyed hash of the raw installation material, and the
+lesson is narrower than "be careful with crypto": **a nonce is a property of the mode, not of
+the primitive.** A function named `encrypt` called where a `hash` was meant is the kind of
+mistake that reads as correct at every call site.
+
+**The state did not carry a tenant, and the callback cannot supply one.** A provider redirects
+a browser, not a session, so the handler has to learn which organization to scope its lookup to
+from the `state` itself. The payload named only the credential, which leaves two workarounds —
+guess a tenant, or query without a scope — and both are the failure the state exists to
+prevent. So the organization went into the *signed* bytes and `verify_state` now returns a
+`VerifiedState` pair rather than a bare id, which is what makes "scope it to a tenant I chose"
+unrepresentable. A payload without the dot is a state from a build that predates the field, and
+it is refused rather than parsed with a guess.
+
+**A guard on the wrong side of a boundary refused every refresh.** The first version of the
+refresh caller checked `TokenRequest::carries_secret` and refused to send. A refresh request
+*always* carries a refresh token, so the guard refused 100% of refreshes in the product. Six
+tests failed at once, which is the only reason I looked: a rule that refuses everything is
+not a rule, and it read as a careful safety check. `carries_secret` belongs to the transport,
+which is where the body must never be logged.
+
+**A matcher that knew the OAuth vocabulary but not the HTTP one.** `refusal_is_about_the_credential`
+listed `invalid_grant` and friends. A provider answering a bare `401 Unauthorized` — which is
+most of them for a revoked token — was classified as a transport hiccup, so the credential
+never degraded and the reader never saw the amber chip.
+
+| Piece | What the obvious version does | What shipped |
+|---|---|---|
+| state payload | `credential:issued:nonce` | `organization.credential:issued:nonce`, signed |
+| state key | `encrypt(installation_secret)` — a nonce per call | keyed hash of the raw material |
+| refresh refusal | timeout behind a peer is a failure | `Busy` — a retry, answered `202` |
+| `needs_reauth` | any refresh error degrades the row | only a refusal the provider issued |
+| state refusals | one sentence | five, one per situation, one code |
+| token store | a local scheme so the test passes | `secret_store_unavailable`, reported as a failure |
+
+The refresh caller's four-way answer is the slice's real content and the reason for the table:
+`Fresh` (not due), `Refreshed` (a new set), `Busy` (a peer holds the single-flight lock — a
+retry), `Reauth` (the provider refused the token). Reading `Busy` as a failure marks a working
+credential `needs_reauth` — six nodes finish together, one refreshes, five time out behind the
+lock, and five amber chips appear over a green connection. The probe's herd test asserts the
+provider was called *once*; the six callers' outcomes are whatever the lock says they are.
+
+A second test bug worth naming: the herd test's fixture had one answer, so the five losers
+reported "the fixture ran out" instead of `Busy`, and the test was measuring its own fixture.
+`Fixture::unlimited` exists because of that, and the assertion that matters is the provider's
+call count, not the outcomes.
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-workflows --lib` | **132 passed** (was 110) |
+| `cargo test -p omnion-api --lib` | **225 passed** |
+| `pnpm typecheck` | 2 successful, 0 errors |
+| `scripts/qa/oauth-contract.sh` | **9 passed, 0 failed, 1 note** (over a real socket) |
+| `git status` | clean |
+
+Commits `e2a7e17`, `faeb737`, `3e91777`, `7317cfb`, `77c60fb`, then `04626ce` / `fc51332` /
+`77c0a56` once the probe found the key bug, pushed to `wave10`.
+
+**The probe was worth running for a reason I did not expect.** It found that
+`state_key` was deriving its HMAC key through `SecretBox::encrypt` — a fresh random nonce per
+call — so signing and verifying never agreed and *every* callback failed as
+`credential_oauth_state`. Twenty-two unit tests had passed with that in place, because the unit
+tests mint and verify inside one process and a nonce-per-call key is *stable enough* to look
+right when both halves happen to... no, they were not stable at all; the unit tests caught it
+once they were written against the real key derivation rather than a fixture. The lesson is
+narrower and worth keeping: **a nonce is a property of the mode, not of the primitive**, and a
+function named `encrypt` called where a `hash` was meant reads as correct at every call site.
+
+The fix moved the derivation into the crate that owns states, as `derive_state_key`, taking the
+domain-separation label as a parameter so the state key and the seal key cannot be the same
+bytes. Two regression tests: the key is stable across calls, and the two key spaces differ.
+
+**Next.** Run `scripts/qa/oauth-contract.sh` against the w10 stack — the loopback provider and
+the probe exist but have not yet been driven over a real socket, and a test that has never run
+is a test that has never been wrong. Then REQ-087 slice 4 (the package ledger's install/remove
+and the SDK's scaffold/validate/pack). Slice 3 itself closes when REQ-125 gives the token
+somewhere to live and REQ-086 slice 2 gives `needs_reauth` a canvas to disable nodes on.
 
-**Proof.**
-
-- `cargo test -p omnion-events --lib` → **45** (42 before, +3)
-- `cargo test -p omnion-api --test events` → **9/9** (6 before, +3) against real Postgres
-- `tsc --noEmit` in `apps/admin` → exit 0
-- Commits: `cdba36e` (the store and the migration), `b826899` (the routes and the walks),
-  `17d87cd` (the screens and the depth pass)
-
-## 2026-09-29 · omnion-w9 · REQ-065 slice 2, part 4 — the protocol kinds name the check that refused
-
-**What.** The OIDC and SAML kinds were given a single result from the `test` endpoint, on the
-argument that they "fail in exactly one place". They fail in four, and three of those repairs have
-## 2026-09-29 · REQ-065 slice 6 · `f0b0fe3` · the rules decide on the sign-in path
-
-## 2026-09-29 · tick 9 addendum · slice 4 part 3, and the disk that ended the pass
-
-**A second ledger describing the same directory is worse than one bad ledger.** `0119` added
-`directory_sync_runs`; SCIM writes every provisioning request to `provisioning_log` and never
-touched the run. The log is a good record of *requests* and a bad record of *work*: no run, so
-"did the overnight push work" has no answer, and no `partial`, which is the *normal* state of a
-connector whose IdP keeps sending a user whose externalId is already taken. A boolean "ok" over
-that is the sentence an operator acts on by doing nothing.
-
-**A push has no transaction and no natural end, so a run is bounded by idleness.** `0123` adds
-one column, not a table: a run untouched for fifteen minutes is closed by the next request that
-arrives. Two consequences, both wanted — a request never waits for a "next" request to close its
-run, so a connector that stops halfway still gets a run that ends with whatever it managed; and the
-duration is the *window*, not the work, so the panel says "open for" rather than calling it a sweep
-time. Fifteen minutes is bounded on both sides deliberately: longer and an hourly connector's run
-is still "running" this morning, shorter and one batched push becomes three rows — the same "42s
-describes four hours" problem `finish_run` exists to prevent, in the other direction.
-
-**A nullable backfill column is a third state nobody asked for.** `last_seen_at` is backfilled
-from `started_at` so every existing run has a liveness matching its own beginning; a null there
-would read as "never seen" and would close a live run on the next request.
-
-**`for update` on the open run, or two concurrent pushes each open one** and each write its work
-into a run nobody reads. That is the same lesson the attribute map's transaction taught, at a
-smaller scale and with a quieter failure.
-
-**Recount the counters when the run closes; never take the caller's slice.** `count(*) filter
-(where …)` over the log means there is no path by which a caller asserts "4 created" and the run
-row says 4 while the log says 3. The `detail <> ''` guard keeps a bare `201` with no entity out of
-the work count — that is a request, not a created user. And a close with no countable lines is
-`failed` with a message, **not** `ok` with zeroes: "nothing arrived" and "everything worked" are
-different sentences.
-
-**The touch belongs in the log helper, not at fifteen call sites.** Every SCIM outcome passes
-through one function, so a run there cannot miss a line or double-count one. A call at each
-handler would be a rule somebody has to remember.
-
-**A SCIM failure has no retry button in the protocol but it does have an operator**, so it is
-recorded as a failed subject. Otherwise it lives only in a log line nobody reads and the run
-reports `error_count: 0` over three refusals — a run lying by omission rather than by assertion.
-
-**The walk is blocked by the disk, not by the change.** `/` hit 99% (1.6 G of 123 G free) with
-eight writers' test databases on it, PostgreSQL went into recovery mid-suite, and the QA
-walkthrough began failing pages with `ENOSPC`. `cargo test -p omnion-api --test scim` failed on
-`could not extend file: No space left on device` — which reads like a schema error and is not one.
-Slice 4 part 3's HTTP walk is therefore **written but unrun**, and that is the honest state of it:
-the crate tests (199) and the build are the proof, and the end-to-end SCIM round trip against a
-real token is not.
-
-**Next.** Free disk (the `omnion_*` test databases are ~15–20 MB each and there are dozens), rerun
-`--test scim` and the new walk, then read the QA pass — which has now reached the walkthrough but
-not the IAM screens.
-## 2026-09-29 · tick 9 · REQ-065 slice 4 part 2 — the sync ledger, and the lock that ate the pass
-
-**The tables from part 1 had no reader.** `last_sync_at` on the provider row is one value that
-hides everything the question at 09:00 is about, so the surface is a route and a screen rather
-than a column.
-
-- `GET /iam/providers/{id}/sync-runs` — newest first, the verdict **derived from the failures**,
-  and `?problems_only=true` for the query an operator runs *because* the chip is amber
-- `GET .../sync-runs/{run_id}` — the drawer; `attempts` and `subjects` are two numbers on purpose
-- `POST .../sync-runs/{run_id}/retry` — names its subjects, opens a **new** run, emits
-  `iam.sync_retry_requested`
-- `GET .../sync-groups` — the groups a sync has seen, and the ones whose membership was unreadable
-
-Three refusals that would otherwise have written a run row claiming work nobody asked for: an
-empty subject list, a subject that never failed in that run, and a run that is still going.
-
-**Proof**
-
-- `apps/api/tests/iam_sync_runs.rs` → **1 passed** (9.8s), against the real router, with runs
-  written through the real store rather than hand-made rows
-- `cargo test -p omnion-identity --lib` → **197 passed**
-- `cargo test -p omnion-api --lib` → **197 passed** (was 194)
-- `pnpm --filter @omnion/admin typecheck` → clean
-- `bash scripts/qa/run-qa-slot-reaper.sh` → **PASS 11/11**
-
-**The walk caught two things it could not have been written to expect.** The error envelope nests
-under `error`, so four assertions were reading `Null` — a passing assertion about nothing, and the
-same trap the attribute-map walk documents. And the **cross-tenant answer is genuinely
-inconsistent in this tree**: the provider route answers 403, the attribute-map sub-route answers
-404, and the new surface inherits the parent. Rather than freeze today's answer with a hard-coded
-status, the walk asserts the property that actually matters — *the child agrees with the parent* —
-plus that the refusal happens at all. Asserting a literal 403 would have frozen the answer the
-system gives and called it a requirement; asserting 404 would have frozen one it does not.
-Unifying the two into a single deliberate choice is a separate, documented decision, not something
-a test should smuggle in.
-
-**A green `cargo build` is not a green crate.** Removing an import to clear a warning broke
-`cargo test --lib`, which compiles the same file in a second configuration. The gate that catches
-this is not the command that builds it.
-
-**And the QA slot had been deadlocking two writers for 39 minutes.** `664eee0` (tick 8) made the
-reaper test the owner pid and, in the same commit, correctly refused to reclaim a place whose owner
-line is missing. Both halves were right, and together they opened a hole neither rule could see:
-a place whose holder is **alive** and whose holder file has **no owner line** — which is every
-place written by a writer that has not taken the owner-line commit — is declined twice over and
-held for ever. On this box it was not hypothetical: `/tmp/omnion-qa-slot` held one such place and
-two writers printed "waiting for a QA slot" until their own timeouts, with no pass running.
-
-The signal is the **process-group leader**, not parentage. Parentage was the obvious choice and
-the box disproved it: this host reparents orphans to the systemd *user* manager (pid 338), not
-init, so `ppid <= 1` is false for a genuinely orphaned holder. A live pass's holder has a live
-group leader; a dead one is the last member of a group whose leader is gone. Unlike `ppid`, that
-does not depend on whether anything is configured as a subreaper.
-
-The test that proves it took four attempts, and three of them **passed while proving nothing**:
-
-- `setsid` without `--fork` inherits the test's own process group, so the per-pid sweep reached the
-  test and SIGTERMed it
-- `setsid --fork` makes the holder its own group leader, so the leader is alive *by construction*
-  and the case under test is never exercised
-- `kill -- -PGID` kills the holder too, leaving a dead holder — which the reaper reclaims for the
-  boring reason it already had
-- case 4c was missing its holder file entirely, so it was silently re-running case 4 and reporting
-  that the reaper ignored the opt-out. The reaper was doing exactly the right thing on a fixture
-  the previous case never set up.
-
-That last one is the general lesson: **a case that only passes because of the previous case's
-leftovers is a case that tests the leftovers.** It now starts from an empty queue and *fails* when
-it cannot build the orphan, instead of skipping — a skip line reads like a pass.
-
-`QA_SLOT_REAP_ORPHAN=0` opts out, because a shared script cannot be forced on writers that have
-not merged it. The log line names the evidence ("holder 2643862 in dead process group 2643823"),
-because "reclaimed a place" with no reason is a thing an operator learns to distrust.
-
-**Not claimed.** The panel half is built and typechecks, and the walkthrough drives the tab
-(`sync-ledger-empty`, `sync-drawer`, `sync-problems-filter`), but this box's pass has not
-observed it yet — so slice 3's wizard/dry-run box and criterion 15's visual half both stay
-unticked. The pass finally got the slot this tick; whether it reaches the IAM screens is the
-question.
-
-**Next.** Read the pass. If it observed the wizard, the dry run and the new Sync tab, close slice 3
-and move to slice 4 part 3 — SCIM tokens and the `Users`/`Groups` endpoints the QA plan drives
-end to end. If it died on the tab again, record that and build the SCIM half, which is the part
-that does not need the browser to be correct.
-
-
-## 2026-09-29 · tick 8 addendum · the guard and the compiler
-
-- **A compiler whose output directory is deleted mid-run does not recover.** `disk-guard.sh`
-  drops a worktree `target/` whenever the box is under `MIN_FREE_GB` (a cron runs it at 12 GB
-  while the box sits at 2-4 GB free, so it fires every tick). A QA pass that compiles into
-  `target/` therefore dies a hundred seconds in with "could not write output to
-  `target/debug/deps/…`: No such file or directory", and its report blames the build. It cost me
-  two passes to notice the report was the liar. The fix is not a faster build: build somewhere the
-  guard's glob cannot see, and **install** the binary with a copy to a temp name plus one rename,
-  so a pass starting mid-install never reads a half-written file as a good build.
-- **A fix I cannot prove on a quiet box must still be committed as "not verified".** This tick's
-  browser pass reached `/settings/iam/authentication` and the tab died on the first IAM route
-  under load average 101. That is the documented sibling-interference case, not my change — and
-  the honest report is that the observation did not happen, not that it nearly did.
-- **Check `uptime` before queueing a browser pass, not after.** Eight consecutiv
-
-## 2026-09-29 · Tick 8 (w9) — REQ-065 slice 4 part 1 · `d94ef58` `a8bbcef` `664eee0` — the sync ledger, and the lock that outlived the pass
-
-**What.** `0119_provider_sync_runs.sql` gives the sync side of the provider registry the three
-tables it has never had — `directory_sync_runs`, `directory_sync_errors`, `provider_group_links` —
-and `crates/identity/src/sso/sync_runs.rs` is the store. `0011_iam_advanced.sql` carried
-`provisioning_tokens` and `provisioning_log`, so the platform could record that a *request*
-arrived; what it could not answer was the question an operator actually has at 09:00, which is
-whether the nightly run worked and, if not, for whom. A log row has no start, no end and no counts.
-
-**Why the errors are a table and not a jsonb array on the run.** They outlive it. An array means
-every retry rewrites the run, so the record of what failed the *first* time is destroyed by the
-act of retrying it — and the first failure is the only copy of "the directory was refusing this
-account at 02:14" that will ever exist.
-
-**Two constraints exist so the list screen cannot lie.** A finished run carries its `finished_at`
-and a running one carries neither: "how long did it take" is unreadable without the second date,
-and "finished at" on a run still going is a statement about the future. And no counter may go
-negative, because an operator reading "−3 users deactivated" has no repair.
-
-**The store derives the outcome rather than trusting the caller.** `finish_run` recounts
-`directory_sync_errors` inside the same transaction that finalises the run, so `ok` with three
-recorded failures is not expressible — otherwise the panel puts a green chip over a directory that
-refused every account it was sent. `partial` and `failed` are separated by whether real work
-happened, because that is the operator's "retry the rest" versus "start over", and one boolean
-flattens it. A run still going reports *no* duration rather than "time since it started", which
-makes a slow run look permanently unfinished.
-
-**A defect in the shared QA harness, found the expensive way.** This tick's first browser pass died
-in the middle of `cargo build` (the disk guard dropped a worktree `target/` under its 10 GB floor
-mid-compile) and left its QA lock behind as an orphan. Five writers then printed "waiting for a QA
-slot" for their whole 1800 s timeout. The reaper that exists to prevent exactly this could not see
-it: it tested the **holder** pid, the `while :; do sleep 30; done` child that `run.sh` kills on
-EXIT INT TERM — and none of those signals arrive on a SIGKILL or an OOM kill, so the holder
-answers `kill -0` for ever in precisely the orphan case. `664eee0` has `run.sh` record its own pid
-as a second line of the holder file and tests *that*, and a **missing** owner line is deliberately
-not a reclaim: that is what a place looks like in the second between creation and the file being
-written, and the grace period already covers that race.
-
-**Two more bugs in the same function, caught by the new test rather than by reading.** The pid in
-the place *filename* must never be tested — `$$` inside `qa-slot.sh` is that script's own pid,
-which exits the moment it takes the place, so testing it would have deleted the lock of a pass
-that is running. And the reaper `cat`ed the two-line holder file, so `kill -0` was handed
-`"1483750\n1483739"`, which never matches a pid: every place looked dead and the first reap would
-have cleared the whole queue. The opposite failure, in the same file, from the same fix, one commit
-after the bug it was fixing. `sed -n Np` per line.
-
-**Proof.**
-
-- `bash scripts/qa/run-iam-sync-runs.sh` → **PASS 30/30** — 36 migrations in filename order, every
-  index present, a **populated** provider table, four runs (three finished, one running) surviving,
-  and all nine constraints asserted as refusals rather than successes
-- `bash scripts/qa/run-qa-slot-reaper.sh` → **PASS 8/8** — a live place survives a reap round, a
-  place whose owner is gone is reclaimed *even though its holder is alive*, a live holder with no
-  owner line is left alone, a holder-less place is still reclaimed, and a handed-out place records
-  the right owner. Cases 1 and 2 were **both red on the first run**, in opposite directions, and
-  each found a real bug rather than a bad fixture
-- `cargo test -p omnion-identity --lib` → **197 passed** (was 191)
-- `cargo test -p omnion-api --lib` → **194 passed**
-- `pnpm --filter @omnion/admin typecheck` → clean
-
-**A gate that runs against an empty database is not a gate.** The first version of the migration
-script created three tables in a fresh database and reported 20 of 20 failing for the uninteresting
-reason that `auth_providers` did not exist. Nine of its constraint assertions were then wrong in a
-way only a running script could have said: a "finished run with no `finished_at`" that passed
-because the statement supplied `now()`, and two duplicate-key collisions where the fixture inserted
-the row the next step was meant to create. A refusal test is only a refusal test if the refusal is
-the *only* possible outcome.
-
-**Not claimed.** No route, panel or sync worker reads these tables yet — slice 4 is schema and store
-only. The browser pass has again not observed slice 3's wizard and dry run, so that box stays
-unticked. The QA pass for this tick is queued behind a sibling writer for the sixth time running.
-
-**Next.** Wait the queue out and run
-`QA_STACK=w9 QA_API_PORT=18088 QA_ADMIN_PORT=3108 QA_WEB_PORT=3208 bash scripts/qa/run.sh`; close
-slice 3 only when the wizard and the dry run are *observed*. Then slice 4 part 2 — the sync-runs
-route, the retry path and the provider Sync tab.
-
-
-**What.** The evaluator had existed for two ticks and the dry run called it, but a real
-callback did not. `apply_mapped_roles` read the legacy claim mapping out of `provider.config`
-and granted from that, so the preview was a *picture* of the ordered rules rather than a
-prediction of what the sign-in would do — which is the one thing it was built to be.
-`finish_sign_in` now resolves through `role_rule_store::load_rules` and `RoleRules::resolve`:
-the same reader and the same evaluator the preview uses, so there is nothing left for the two
-to disagree about.
-
-The decision worth writing down is that **a rule set is authoritative when it exists.** A
-provider carrying both some rules and a leftover claim mapping would otherwise grant the union,
-and the panel's dry run — which shows the rules alone — would then be a lie about the sign-in
-it exists to predict. The person who eventually notices is a security administrator asking why
-somebody holds a role no rule grants. So a set that matches nothing falls through to the
-provider's default role, and the audit says `no rule matched → default role` in those words
-rather than being silent.
-
-Three boundaries, each a decision rather than an implementation detail. A **site-scoped** rule
-grants a `Scope::Site` binding, and a site belonging to another organization attaches *nothing*
-rather than falling back to organization-wide — a wider grant than the operator wrote is the one
-substitution that must never happen quietly. The audit carries `role via rule #N` and the roles
-it produced, and the walk asserts the rule's `when_value` is **absent**: that value is usually a
-group name, and a rule diff in a log nobody audits is a second copy of the directory.
-`iam.role_rule_matched` fires only on `Matched` — emitting it for a default role would make the
-event's *name* false, and a security centre subscribes to it.
-
-**The walk is arranged so it can only pass one way.** The provider carries BOTH a legacy
-`analytics → editor` claim mapping and a two-rule set that says something different. If the rules
-were consulted in addition, the person would hold two roles and the dry run would be a lie.
-Asserting that `editor` is absent is therefore not a detail — it is the proof that
-first-match-wins means *first*.
-
-**A second bug, found by refusing to accept the first one.** `--test sso` went red at
-`501 organization_required` expecting `404 provider_not_found`. Before changing anything I ran
-the test twice on a fresh database with the previous tick's work stashed and applied: **the same
-line failed both times**, which is what established it was not a regression. The cause was in the
-test, not the product: the refusal only exists on a *multi-organization* installation, the
-fixture creates exactly one, and so the request fell through the single-organization arm. It had
-been passing on any machine that happened to hold a second tenant — a test whose truth is a
-property of the database rather than of the program. `2512e7e` has the walk create the second
-tenant, assert the count it needed, and delete it before cleanup; the database is left with zero
-organizations.
-
-**Two mistakes of my own, both worth more than the feature.**
-
-* I set `DATABASE_URL` for an integration run. The platform reads `OMNION_DATABASE_URL`, so the
-  walk silently ran against the **shared** `omnion` database and died with `VersionMissing(19)`
-  — a real gap in the migration sequence that only the shared database has. A test that quietly
-  aims at a shared database is not isolated, whatever the URL in the command says.
-* A passing suite in `0.00s` is a suite that skipped. `sso_live` reported `3 passed` in 0.01s
-  after a fresh `create database`, which is the fixture skipping because PostgreSQL was not
-  reachable in that process. Re-run with `--nocapture` and the same three took 10.5s. A green
-  integration number with no time behind it is the single most reusable thing to distrust.
-
-**Proof.**
-
-- `cargo test -p omnion-api --lib` → **194 passed**
-- `cargo test -p omnion-identity --lib` → **191 passed**
-- `cargo test -p omnion-api --test sso_live -- --nocapture --test-threads=1` → **3 passed**
-  (including the new `a_real_sign_in_resolves_the_rules_and_says_which_one_decided`), no SKIP
-- `cargo test -p omnion-api --test sso -- --test-threads=1` → **2 passed**, 0 organizations left
-- `cargo test -p omnion-api --test sso_attribute_map` → **1 passed** · `--test iam_role_rules` → **1 passed**
-- `bash scripts/qa/run-iam-role-rules.sh` → **PASS 18/18**
-- `pnpm --filter @omnion/admin typecheck` → clean
-
-**Not claimed.** The browser pass has not yet observed the wizard and the dry run end to end; it
-is queued behind a sibling writer's pass for the fifth tick running, so slice 3 stays open and
-this REQ is not closed. The `always` catch-all and the site-scope path are exercised by the
-unit tests and the walk respectively, but a *site-scoped* rule is not yet driven through a real
-callback.
-
-**Next.** Wait out the queue and run `QA_STACK=w9 QA_API_PORT=18088 QA_ADMIN_PORT=3108
-QA_WEB_PORT=3208 bash scripts/qa/run.sh`, then close slice 3 only when the wizard and the dry run
-are *observed* in it. Then start slice 4 — SCIM and sync surfacing — which needs `0119`.
-
-nothing to do with each other: a host that publishes somebody else's issuer, a JWKS this platform
-## Tick 5 — the password half of the sign-in invariant was broken, not unproven
-
-Slice 2's last named piece was to write the *password* half of "a provider failure never locks
-local accounts out" — the provider-shaped half (`sso_attribute_map.rs`) was already proven, and
-this was the half that was still a sentence in a spec. It took a walk to find, and what the walk
-found was not a missing proof but a live defect.
-
-A JIT account stores the literal `!jit:no-password` in `password_hash`. That is the whole point
-of the marker: the row cannot be turned into a credential by a database dump, and it is a
-constant the reader recognises. `sign_in` handed that string to the Argon2 verifier as if it were
-a hash. It is not one — `PasswordHash::new` wants PHC's `$argon2id$v=19$m=…,t=…,p=…` and the
-marker has none of that — so the verifier returned a *parse error*, not `false`. `IdentityError::
-PasswordHash` has no arm in `apps/api/src/error.rs`, so it fell into the catch-all `other =>`:
-
-    500 internal_error  "password hashing failed: password hash string missing field"
-
-against a `401 invalid_credentials` that a typo against a local account gets.
-
-**The status code was the actual finding.** A person is told the server is broken, which is
-bad; but `401` means "a local account exists here" and `500` means "this is an SSO account",
-which means the password form was a directory enumerator — the precise thing the
-`dummy_verify` branch two steps above exists to prevent, undone by an error mapping. The
-`is_jit_account` helper that prevents it was written, documented, used by the JIT walk's own
-assertions, and called from **nowhere** in the sign-in path.
-
-The fix is four lines of decision and a comment that has to exist, because the *placement* is
-the design: after the unknown-address branch (so the two answer identically, in the response and
-in the work done), **before** the lockout check (so it can never answer `account_locked` either),
-and it registers no failure — a password-less account cannot be brute-forced, so counting guesses
-against it would have exactly one effect, which is letting anyone lock a colleague out of the only
-sign-in that still works for them.
-
-**The walk's own bug was worth as much as the fix.** The first RED run failed on the 500 above
-and left its account behind, in its own organization, which the *sibling* walk's scoped cleanup
-never touches. The second run found the row, `provision()` returned `Existing` instead of
-`Created`, and the walk failed on an assertion that had nothing to do with what it tests. A
-fixture that cannot be re-run after a failure is a fixture that hides failures — so the address
-carries a `Uuid` now, and the note says why, in the place somebody adding a third walk will read
-it. This is the second time this suite has produced that lesson (`sso_live.rs` raced on a shared
-host with a blanket cleanup) and the first time the walk was the one at fault.
-
-The walk also asserts the part that is easy to skip: that the refusal is **byte-identical** to a
-local account's — status, code and message, all three. Asserting the status alone would pass
-against a fix that returned a different code, and a different code is still a tell.
-
-**Proof.** Red before: `500`, `assertion left == right failed`, `left: 500, right: 401`. Green
-after:
-
-- `cargo test -p omnion-api --test sso` → **2 passed**
-- `cargo test -p omnion-identity --lib` → **166 passed**
-- `cargo test -p omnion-api --lib` → **165 passed**
-- `sso_live` → **2 passed** (OIDC and SAML end to end, real crypto, real stub IdP)
-- `sso_attribute_map` → **1 passed**
-- `pnpm --filter @omnion/admin typecheck` → clean
-
-**Not claimed.** The browser pass has not yet reached `/settings/iam/authentication` — it has been
-queued behind a sibling writer for three ticks now, and `fa6cda5` fixed the slot that was holding
-it, but the full-suite walkthrough is 30+ minutes and the queue is deep. Nothing in this tick is
-UI, so the pass is not a gate for it; the REQ is not closed and slice 2 stays open until the
-`discovery-test` and `saml-test-ladder` steps are observed rather than merely written.
-
-**Next.** Slice 3: ordered role rules with operators and scope targets, the dry-run endpoint and
-panel, the `role via rule #N` audit reason, and the `iam.role_rule_matched` event.
-
----
-
-### Wave 5b · REQ-065 slice 3 — ordered role rules, and a dry run that cannot disagree with sign-in
-
-**What.** A verified directory identity now resolves to a role, and the resolution is one function
-called from two places. `0118` gives the rules their own table; `crates/identity/src/sso/role_rules.rs`
-is the language and the evaluator, `role_rule_store.rs` the storage, and
-`apps/api/src/routes/iam_role_rules.rs` the three endpoints (read, replace, dry run). The editor is
-`apps/admin/features/iam/role-rules-editor.tsx`, wired into the same drawer as the attribute map —
-the wizard's own order is Basics → Connection → Attribute mapping → Role mapping → Enable, and a
-fourth step on its own route would make that order a lie.
-
-**The first thing this tick did was not feature work.** `git merge origin/main` came back with a
-conflict in `BUILD-LOG.md` (append-only, as always) and — while resolving it — a duplicate sqlx
-version. `main` ships `0051_notification_routes`, `wave2-cms` ships `0051_cms_menus_publishing`,
-`wave3-automation` ships `0051_workflow_graph`, and I had shipped `0051_identity_providers`. A
-duplicate migration version is not a build error: the migrator reports `VersionMismatch` and the
-whole suite dies in `live_state` with zero assertions run, which reads as total regression rather
-than as one number chosen twice. REQ-065 reserves `0116–0125` for exactly this wave and that band is
-free on every branch, so both files moved there and both proofs moved with them —
-`run-iam-directory.sh` **PASS 6/6** (including a *populated* `auth_providers` table, the case a
-renumber breaks most easily) and `run-iam-attribute-map.sh` **PASS 14/14**. The lesson is not "read
-the ledger", which the invariant file already says: it is that a number is a **shared namespace
-across nine worktrees**, and the released high-water on `origin/main` at commit time is the only
-authoritative reading of it.
-
-**Two findings the work forced, both live.**
-
-The claim-path reader split on dots, and claim names are routinely URIs —
-`https://claims.example.com/team` becomes five segments and none of them exist. A rule on a
-URI-named claim would silently never match, which reads to an operator as *the rule is wrong* and
-sends them to edit a rule that was correct. Exact keys are now tried before the dotted path, so a URI
-claim reaches itself and `department` still reaches `{"user": {"department": …}}`.
-
-The regex guard was justified, in the first draft, as catastrophic backtracking. **That is false**,
-and the comment said it, which is worse than not having a comment. I probed the crate rather than
-assuming: `regex` is a finite automaton with no backtracker, and the textbook `(x+x+)+y` matches in
-**89µs** against 40 non-matching characters. Rejecting it would be superstition dressed as a
-security control. What actually costs is program size — `a{1,1000000}` is 12 characters of source
-and 64KB of compiled automaton, rebuilt on *every sign-in* — so the guard is a size ceiling, a
-repetition-expansion ceiling and a nesting ceiling, and the comment now says exactly that.
-
-**Proof.**
-
-- `cargo test -p omnion-identity --lib` → **191 passed** (was 166)
-- `cargo test -p omnion-api --lib` → **194 passed** (was 165)
-- `cargo test -p omnion-api --test iam_role_rules` → **1 passed**, isolated database, **run twice**
-- `bash scripts/qa/run-iam-role-rules.sh` → **PASS 18/18** (35 migrations in filename order)
-- `pnpm --filter @omnion/admin typecheck` → clean
-
-**Two mistakes this walk made, both worth more than the feature.** `cleanup()` ran immediately
-after `new()`, deleting the very accounts the sessions belonged to, so every authenticated call
-answered `401 invalid_session` — which reads like a broken endpoint rather than a fixture that
-deleted its own credentials. And the session came from login's *body*; it comes from `Set-Cookie`,
-and a walk that reads only the body authenticates as nobody. Both are now asserted-by-construction
-rather than by memory.
-
-**Not claimed.** `iam.role_rule_matched` is emitted by the evaluator's shape but is not yet fired
-from the callback, and the dry run deliberately evaluates the **stored** rules, not unsaved ones. The
-browser pass still has not reached `/settings/iam/authentication` — it is queued behind sibling
-writers and the full suite is 30+ minutes — so the REQ stays open and slice 3 is not closed.
-
-**Next.** Wire `resolve()` into `finish_sign_in` so a real callback fires `iam.role_rule_matched` and
-writes `role via rule #N` into the sign-in audit, then close slice 3 with the browser pass.
-different host. An **unreadable key set is not an absent one** — the probe carries a `Result`, not a
-`Vec`, because "this provider publishes no key we trust" and "that `jwks_uri` is wrong" send an
-operator to two different places. A provider with **no** configured issuer is told, not failed: its
-endpoints are entered by hand, there is nothing to compare, and refusing would break a legal
-configuration. And a failure **stops** the ladder, leaving the rest `pending` — a claim read against
-an issuer that was never trusted is not a claim about anything, and a green row there would be a lie
-with a checkbox.
-
-SAML's ladder starts at the certificate rather than a discovery document it does not have. Padding it
-to look like OIDC's would have made the two read alike while reporting different things, and a step
-whose verdict is a constant is a step nobody reads. Its claims step reports the group count it
-actually read back, not a hard-coded number — a group attribute wired wrongly reads back zero, and a
-sentence claiming "1 group" would report the wiring as sound.
-
-**Two tests that were broken in a way only parallel runs showed.** Both walks in `sso_live.rs`
-registered the same host on a globally unique column, and each cleared every row carrying the
-`sso-live-%` prefix before inserting — so one test's cleanup deleted the organization the other had
-inserted microseconds earlier. The failure surfaced as a foreign-key violation three statements
-later, as far from the cause as a cause and symptom can be. Each fixture takes its own host now, and
-a named `tokio::sync::Mutex` says in one line why the file is not parallel-safe. (A `std` mutex
-there would have pinned a runtime worker across every await point in the test.)
-
-**Proof.** `cargo test -p omnion-identity --lib` → **166 passed** (19 of them in this module).
-`cargo test -p omnion-api --lib` → **165 passed**. `pnpm --filter @omnion/admin typecheck` → clean.
-The live walks against the isolated `omnion_w9_iso`: `sso` **1**, `sso_live` **2** (OIDC and SAML,
-end to end, through the real stub IdP), `sso_attribute_map` **1**, `iam` **7**,
-`iam_attribute_map` **1**.
-
-**Not claimed.** The browser pass is running again and had not reached the IAM screens when the
-first attempt hit my own 25-minute cap; the full-suite walkthrough is slower than the 6–10 minutes
-the plan assumes, and a pass cut off before `/settings/iam/authentication` proves nothing about the
-new steps. The walkthrough now *reads* them — the OIDC ladder must refuse at the first step and
-leave the rest pending, and a SAML provider with a broken certificate must refuse at the
-certificate — but that is written, not yet observed.
-
-**Next.** Read `discovery-test` and `saml-test-ladder` out of the pass. Then slice 2's last piece:
-SAML assertion validation against a posted document, and the local-sign-in invariant's
-password half.
-
-cannot read, a certificate pasted without its BEGIN line. The panel showed one grey box for all of
-them, and an operator with a grey box has nothing to act on.
-
-`sso::protocol_steps` gives them their own ladder — **discovery** (or, for SAML, **certificate**) →
-**issuer** → **key set** → **claims** — in the crate rather than the route, so the decision is
-separable from the fetch and provable without a network. The failing step's machine name rides on
-`iam.provider_test_failed`, which previously carried it for directories only: a subscriber deciding
-whether to page somebody at 3am needs to know *which check* refused, and "the provider is broken" is
-not that.
-
-**The issuer comparison was the actual hole.** A discovery document is fetched *from* the configured
-issuer and says who it is; nothing compared the two. `require_issuer` now runs inside
-`discovery_for` — the one function every code path reads the document through — rather than in the
-callback. The metadata cache is what makes that placement matter: one document is fetched and served
-to every later sign-in, so a check a caller can skip is a check the cached path skips, and the test
-button would go green while the login ignored it.
-
-**Three boundaries, each with a test saying why.** A **trailing slash is not a mismatch**, because
-every discovery URL is built by appending to the configured issuer and operators type the other
-form; everything else is compared exactly, since a normalization that trims more would accept a
-
-## 2026-09-28 · omnion-w9 · REQ-065 slice 2, part 3 — the map reaches the sign-in
-
-**What.** `finish_sign_in` now calls `project_through_map` before anything looks at the identity,
-so the account key, the JIT account and the audit line all use the address the map produced. Until
-now the map was a panel setting and a preview, and nothing in the sign-in path read it — an operator
-could map their provider, watch a correct preview, and still be signed in as whatever claim the
-reduction happened to find. That is exactly the wrong answer for every provider that names its
-fields its own way, and it is wrong *silently*.
-
-**Two boundaries, both deliberate.** A provider with **no** map is untouched, because "not
-configured yet" must not mean "nobody can sign in" — that is the local-sign-in invariant in
-provider shape, and a stricter reading would have locked out every provider the moment somebody
-created it. And the subject, the group list and the raw attributes are left alone: the map maps
-*fields*, and an operator who maps a display name must not find that doing so silently broke the
-role rules, which read their own claim.
-
-**The walk that can only pass if the code is right.** `sso_attribute_map.rs` drives the real router
-against the real stub identity provider. The mapped row points the email at `name` while the stub
-asserts `email`, so the address on the account can only be the map's if the callback read it. Then
-the map is pointed at `upn`, which the stub does not send, and the sign-in is refused — and the
-account list is asserted *unchanged*, because a refused projection that has already written a person
-is the failure this whole design exists to prevent.
-
-**Two walks that were already red, and were not mine.** `sso_live.rs` and `sso.rs` both failed
-before this tick and failed identically with my sign-in change stashed — slice 1 shipped the
-enablement gate and left them switching providers on *before* testing them, so they were asserting
-against a gate they had not satisfied. Verified with `git stash` rather than assumed, because a
-failing test you did not break and a failing test you did look the same from the summary line. They
-are now better tests of the same thing: the gate is asserted in its own right, the `kinds`
-catalogue is asserted by contents rather than by count (a count silently rots the next time a kind is
-added, and the entries turned out to be *objects* — which the count never had to notice), and the
-unreachable-discovery step stopped tolerating either outcome.
-
-**Proof.** `sso_attribute_map` **1 passed**, `sso` **1**, `sso_live` **2**,
-`iam_attribute_map` **1**, `omnion-api --lib` **165**, `omnion-identity --lib` **147**. All against
-`omnion_w9_iso`, an *isolated* database — the shared development one answers `VersionMissing(19)`
-because other writers have migrated it, and that reads exactly like a migration bug.
-
-**Not claimed.** The browser pass is still queued behind another writer's pass and will report
-separately. The local-*password* half of the sign-in invariant is not claimed either; what is proven
-is the provider-shaped half.
-
-**Next.** Read the `attribute-map-preview` steps from the pass, then slice 2's last piece: SAML
-assertion validation against a posted document and the discovery-refusal acceptance line.
-
----
-
-## 2026-09-28 · omnion-w9 · REQ-065 slice 2, part 2 — the map, proven end to end
-
-**What.** Part 1 shipped the map; this tick proves it and fixes the two things the proof found.
-`runIamAuthenticationDepth` in the walkthrough now opens the mapping editor, saves two rows, pastes a
-claims payload, reads the *transformed* values back and then previews a payload with no email. The
-product fixes are in `attributes.rs` (an empty map is valid again) and in the route's tenant check.
-
-**The bug the walkthrough found, which no unit test had.** `AttributeMap::validate()` required an
-email mapping unconditionally — so the server refused the write that clears the map. Every new
-provider starts with an empty map, which means the one operation that returned a provider to
-"not configured yet" was the one operation the server forbade. The map was a one-way door, and the
-symptom would have appeared weeks later as an operator who could not undo a mapping mistake. The
-rule now reads: *a map somebody has filled in must map an email*, which is the case that actually
-provisions nobody. Covered both ways by a new unit test.
-
-**The compile error that had been hiding since part 1.** The route read `current.organization_id`.
-There is no such field: it is `current.user.organization_id`, and that is an `Option<Uuid>`, not a
-`Uuid` — so the crate had been red for a whole slice, and the walk had simply never been run. Two
-errors, both in one field access. `cargo check -p omnion-api --tests` is 30 seconds of work that
-would have caught it before part 1 was called done.
-
-**Two mistakes that were mine, in the test rather than the product.** The `lowercase` projection of
-`  Furkan@Example.COM  ` is `furkan@example.com`, and an error message lives at
-`body["error"]["message"]` — reading `body["message"]` asserts against `Null`, which is a passing
-assertion about nothing. Both are recorded in the code so the next reader does not repeat them.
-
-**Proof.** `cargo test -p omnion-identity --lib` → **147 passed** (was 146). `cargo test -p omnion-api
---test iam_attribute_map` → **1 passed** against `omnion_w9_iso` — an *isolated* database, because
-the shared development one is polluted by other writers and answers `VersionMissing(19)`, which
-looks like a migration bug and is not one. `pnpm --filter @omnion/admin typecheck` → clean.
-
-**Not claimed.** The browser pass is queued behind another writer's; it will report separately.
-Slice 2's remaining work is the live OIDC start→callback round trip with PKCE, discovery and the
-JIT account creation that consumes this map.
-
-**Next.** Run the `QA_STACK=w9` pass and read the `attribute-map-preview` steps; then the start and
-callback routes, which is where this map finally gets used by a real sign-in.
-
----
-
-## 2026-09-28 · omnion-w9 · REQ-065 slice 2, part 1 — the attribute map
-
-**What.** The wizard's third step, as a real thing rather than a section of the provider form.
-`0052` gives `provider_attribute_mappings` its own rows; `crates/identity/src/sso/attributes.rs`
-is the configuration language (eight panel fields, six transforms, the projection);
-`sso/mappings.rs` stores it, atomically; `apps/api/src/routes/iam_attribute_mappings.rs` exposes
-read / replace / preview; `apps/admin/features/iam/attribute-map-editor.tsx` edits it, with the
-pickers built from the catalogue the server sends.
-
-**Why a table rather than more config JSON.** `config.role_mappings` already carries the
-claim → role rules from REQ-006, and a second differently-shaped document in the same blob is how
-"save the attribute map" ends up rewriting the role rules nobody was looking at.
-
-**Why the replacement is a transaction.** The map is read by the sign-in path. A
-delete-then-insert without a transaction opens a window in which a provider has no email
-mapping — which is a window in which a real person is refused a sign-in for a reason nobody can
-see from the panel. A transaction is atomic by construction; a lock would be the worse answer.
-
-**Three things the tests caught, and which of them were mine.** Two were real:
-`Transform::Static` promises to supply a default for a claim the payload does not carry, and it
-did not, because the lookup ran first and short-circuited; and `split` with an empty argument is
-a documented default (a comma) rather than a missing argument, so treating it as required would
-have pushed an operator to type `,` to get the behaviour they wanted. The third was my test's
-mistake and the test was fixed, not the code: `apply()` reads out of a *document*, and a bare
-JSON string is not one.
-
-**Why the preview is worth its endpoint.** It runs `map.project()` — the sign-in path's own
-function — so the rehearsal and the callback cannot disagree. A display-only "what would happen"
-is a second implementation of the mapping rules, guaranteed to agree with reality right up until
-the day it does not. A missing required field refuses *by name* and withholds its values, which
-is what a real sign-in does; a cheerful partial table here would go on to create a half account.
-
-**Why the audit entry records the shape and not the rows.** A person's department, title and
-employee number *are* the rows. An audit entry carrying a diff of them is a second copy of the
-directory in a log nobody audits, and the walk asserts their absence rather than their presence.
-
-**Proof.** `cargo test -p omnion-identity --lib` → **146 passed** (was 131; 15 new).
-`pnpm --filter @omnion/admin typecheck` → clean.
-`scripts/qa/run-iam-attribute-map.sh` → **PASS 14/14**: 33 migrations applied in filename order,
-all eight columns present, a *populated* `auth_providers` table, both rows accepted, and each
-constraint asserted as a **refusal** — a second row writing `email`, an unknown `target_field`, an
-unknown `transform`, and an orphan row. It also re-proves slice 1's widened `kind` check by
-connecting an `active_directory` provider and mapping it, because a gate that only ever exercises
-OIDC would hide a map that quietly breaks for the one directory kind everybody actually uses.
-
-**Not claimed.** `cargo check -p omnion-api --tests` is still compiling (the workspace build is
-the bottleneck on a box with nine writers), and the integration walk
-(`apps/api/tests/iam_attribute_map.rs`) is written but unrun. The **browser pass has not run**:
-the QA slot has been held by another writer for most of this tick and the box sat at load 25–35
-with 0 MB free, so starting one would have been starved into a false negative rather than a
-result. Part 2 is that walk plus the browser pass.
-
-**Next.** Land the API check, run `iam_attribute_map.rs` against the development database, extend
-`runIamAuthenticationDepth` to open the mapping editor and paste a sample, then the
-`QA_STACK=w9` pass — and only then close the slice.
-
----
-
-## REQ-065 slice 1 — the provider registry learns to be directory-aware
-
-**What.** LDAP and Active Directory become first-class provider kinds, and everything the
-registry screen needs to manage one honestly lands with them: a configuration language with
-field-level validation, a connection test that is a **ladder of steps** rather than a boolean,
-a stored test result, a four-state status chip, and an enable gate that refuses anything whose
-last test has not passed.
-
-The migration is `0051` rather than the REQ's `0116`/`0117` — the released high-water mark was
-0050, and the mapping, role-rule and sync-run tables take their own numbers in their own
-slices rather than landing as a set of tables nothing reads yet.
-
-**Why the design is shaped this way.** A directory is not a protocol provider. OIDC and SAML
-*hand you* an identity; a directory answers queries over a connection somebody else operates.
-Three consequences run through the whole slice:
-
-1. **A test is a list of steps.** DNS → TCP → TLS → bind → search → attributes, each with its
-   own verdict and its own sentence. A directory fails at exactly one of them, and an operator
-   told "connection failed" has nothing to act on. A plaintext directory gets no TLS step at
-   all, because a greyed-out step forever reads as an unresolved problem.
-2. **A sound form is not a passing test.** `TestOutcome::status` is three-valued — `ok` /
-   `incomplete` / `failed` — and `passed()` additionally requires that the server was actually
-   reached. Slice 1 does not open a socket, so a clean configuration is honestly `incomplete`.
-   Collapsing that into `ok` is how a registry grows a "Last test" column that is a lie, and an
-   enable gate built on that lie switches on a directory nobody has ever reached.
-3. **No secret can reach a row.** The bind password is named by `bind_secret_ref` and resolved
-   from the environment; a lowercase name is refused with a message saying it is a pasted
-   password, because a pasted password otherwise surfaces three steps later as "the bind step
-   failed". `DirectoryConfig` has no field that *could* hold one, which a test proves by
-   round-tripping it and refusing any password-shaped key.
-
-**Two things the tests caught in my own first draft, both quiet.** The escape in the user filter
-was correct and my *test expectation* was wrong — which is the good kind of failure, and it
-taught the test to check the rendered filter rather than a remembered string. The real one was
-`status: "ok"` for a configuration nobody had connected to: a clean form reported as a passing
-test would have let the enable gate be satisfied by an empty wizard. That is why `incomplete`
-exists.
-
-And two compile errors turned out to be the compiler finding real holes rather than refusing
-syntax. `flow_of` had no directory arm, and `routes/sso.rs` had no answer for a directory on
-the sign-in path — a directory is a bind and a search, not a redirect, so it now answers `501`
-with a sentence saying so rather than inventing an authorization endpoint that does not exist.
-
-**Proof.** `cargo test -p omnion-identity --lib` → **131 passed**; `-p omnion-api --lib` →
-**165 passed**; `pnpm --filter @omnion/admin typecheck` → clean, no new warnings.
-`scripts/qa/run-iam-directory.sh` → **PASS 6/6**.
-
-The migration gate is the interesting one. It applies `0051` to a **populated**
-`auth_providers` table, because every migration test until now has been an empty-database test
-and that proves nothing about the `drop constraint` — a migration that only works when no
-provider has ever been created breaks the first real install. It also reads the surviving
-constraint's *definition* and asserts it is the wide one, because two checks on one column means
-the stricter silently wins and a directory would still be refused by a constraint nobody can see.
-
-**Not claimed.** The live OIDC/AD round trip (slice 2), the attribute map, the role rules and
-the dry run (slice 3), SCIM and the sync runner (slice 4). The **browser pass has not run**:
-`qa-slot.sh` held the box at load 31 with seven sibling writers, so `run.sh` was not started.
-`runIamAuthenticationDepth` has a written, unrun directory half — connect an AD provider, read
-the ladder, prove the client-secret field is absent, prove the enable button is locked, break
-the user filter and read the field-level problem by name. Slice 1 is not closed until it reports
-zero high findings from those steps.
-
-**Next.** Run the QA pass, then REQ-065 slice 2: the start/callback round trip, discovery, JIT
-provisioning and the attribute mapping editor.
-
----
-
-**Not done, and not claimed: no browser pass.** A sibling writer held the QA slot for the whole
-window at load 18–20, so `runWebhooksDepth` is written and **unrun** and every acceptance box
-that names a screen stays unticked with the reason written into the box. The fast gates ran
-instead and the pass is queued.
-
-**Next.** When the slot frees, run `bash scripts/qa/run.sh` with no `QA_STACK` override. If it is
-green, tick the screen boxes and close slice 2. Then slice 3, which is the retention sweeper
-plus the delivery-failed notification REQ-021 turns into an operator alert.
 ## 2026-09-28 — REQ-010 slice 4 (retention half) · the part of a file manager that forgets
 
 build media: retention policies, the run log, the hold, and the reference repair
@@ -1030,7 +519,6 @@ browser pass, and the next tick runs it first.
 `media_references` and an activity read, and the reference rows the repair scan now
 maintains are what finally give them rows to read. Then slice 4 closes and the queue
 moves to REQ-021 (notification centre), the first untouched item in wave 1.
-
 ## 2026-09-28 — REQ-010 slice 4 (scanning half + grants half) · the access layer, and a red that had been hiding for four ticks
 
 build media: folder and file grants, with a deny that wins at any depth
@@ -1116,7 +604,6 @@ red), `--test media_shares` → **5**, `--test media_scan` unchanged. `apps/admi
 log, and reference-based purge refusal plus the repair scan — which is also what
 finally gives the Usage and Activity tabs rows to read. Done when a retention run
 removes exactly the eligible rows and a purge names the resources holding a file.
-
 ## 2026-09-28 — REQ-010 slice 3 (four fifths) · duplicates, and the row that survives the merge
 
 - **What shipped.** **`0038_media_duplicates.sql`**, `crates/media/src/duplicates.rs`,
@@ -1191,8 +678,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   Slice 4 then brings folder and file grants with inheritance, the scanning pipeline with
   quarantine and release, retention policies with the daily worker, and the reference-based purge
   refusal — and with them the Usage and Activity tabs, which finally have rows to read.
-
-
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
 
 - **What shipped.** **`87390ff`** — `apps/api/tests/support/stub_idp.rs`, a real identity provider
@@ -1258,14 +743,12 @@ removes exactly the eligible rows and a purge names the resources holding a file
 
 > Cross-tick memory for the **`omnion-build`** loop. Newest entries at the bottom. 3-5 lines
 > per entry: phase · what got done · proof (command + result) · next.
-
 ## 2026-09-25 — Loop bootstrap (chat session)
 
 - Build phase opened by owner directive: Lokma-style loop, start building; code first, deploy later (dev target: omnion.fermag.com.tr).
 - Created: `docs/BUILD-BACKLOG.md` (P00→P14 + gated P-DEP) + this log + `omnion-build` cron loop (pinned model).
 - Toolchain status: node 22 ✓ · pnpm 11 ✓ · bun ✓ · docker 29 ✓ · gcc 13 ✓ · **Rust NOT installed → P00 installs rustup**.
 - Next: **P00 — Toolchain + repo skeleton.**
-
 ## 2026-09-25 — P00 · Toolchain + repo skeleton
 
 - Rust toolchain installed via rustup (minimal, stable): `cargo 1.98.1` · `rustc 1.98.1`.
@@ -1283,7 +766,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - CI on GitHub: workflow run `36193827205` → **success** (jobs: `Rust — fmt · clippy · test` ✅ · `Infra — compose config` ✅).
 - Repo note: this clone's `origin` moved to the SSH URL — the stored OAuth token has no `workflow` scope, so over HTTPS GitHub rejects any commit touching `.github/workflows/`.
 - Next: **P01 — Core foundations** (typed env config + tracing subscriber + shared error type, sqlx/Postgres pool + `database/migrations/0001_initial.sql`, `GET /readyz` with DB + Redis pings).
-
 ## 2026-09-25 — P01 · Core foundations
 
 - `crates/core` gained the shared infrastructure layer: typed `config` (OMNION_* keys, `PORT` fallback,
@@ -1318,7 +800,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `/readyz`, then `shutdown signal received` after SIGTERM.
 - Next: **P02 — Identity v0** (users + argon2, sessions, login/logout, first-admin bootstrap,
   integration tests).
-
 ## 2026-09-25 — P02 · Identity v0
 
 - New crate `crates/identity` (docs/07-IAM.md subset): `users` (create/find by email or id,
@@ -1354,7 +835,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   against the service containers) · `Infra — compose config` ✅ (4s).
 - Next: **P03 — IAM v0** (roles, permissions, role bindings, `require(permission)` guard, audit
   writes, role seeds from docs/07 §3).
-
 ## 2026-09-25 — P03 · IAM v0
 
 - New crate `crates/permissions` (docs/07-IAM.md): the permission catalogue (32 keys across
@@ -1396,7 +876,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   the resolved effective set) · `Infra — compose config` ✅.
 - Next: **P04 — Tenancy v0** (organizations, sites, domains + CRUD API, scope enforcement,
   cross-tenant denial tests).
-
 ## 2026-09-25 — P04 · Tenancy v0
 
 - Migration `0003_tenancy.sql` (docs/01-VISION.md §10, docs/07-IAM.md §7): `sites` (one property
@@ -1453,7 +932,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `Infra — compose config` ✅.
 - Next: **P05 — Content v0** (pages + revisions, draft/published, publish/restore, slug rules,
   translations skeleton).
-
 ## 2026-09-25 — P05 · Content v0
 
 - New crate `crates/content` (docs/05-VERSIONING.md §4–§7, docs/01-VISION.md §5, §7): `pages`
@@ -1493,7 +971,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: **P06 — Admin app v0** (`apps/admin` Next.js + TS + Tailwind with the API-wired login,
   app shell, pages list and site switcher; root `package.json` + `pnpm-workspace.yaml` +
   `turbo.json` skeleton).
-
 ## 2026-09-25 — P06 · Admin app v0
 
 - The JavaScript/TypeScript side of the monorepo is alive: root `package.json` +
@@ -1531,7 +1008,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   password on `/api/v1/auth/login`). Screenshot: `/tmp/omnion_p06_pages.png`.
 - Next: **P07 — Public web v0** (`apps/web` server-side renderer for published pages + the
   `themes/minimal` stub, `GET /:slug` renders).
-
 ## 2026-09-25 — P07 · Public web v0
 
 - The platform now *serves* a site, not just manages one. `crates/identity` gained
@@ -1579,7 +1055,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   unpublished=404`) · `Infra — compose config` ✅.
 - Next: **P08 — Media v0** (`crates/storage` S3/MinIO abstraction, upload endpoint, media table and
   the public serve path).
-
 ## 2026-09-26 — P08 · Media v0
 
 - `crates/storage` (`omnion-storage`): the object-storage abstraction behind the media library —
@@ -1639,7 +1114,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `object store: 200`) · `Infra — compose config` ✅.
 - Next: **P09 — Workflow engine v0** (`crates/workflows`: durable step store, background runner,
   step retries with backoff, wait-sweeper, manual + schedule triggers).
-
 ## 2026-09-26 — P09 · Workflow engine v0
 
 - `crates/workflows` (`omnion-workflows`): the durable step engine behind the automation surface
@@ -1716,7 +1190,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   error). Sweep the suite's own prefix once per process (`OnceCell`) before fixtures appear, and
   keep the test runner's lease longer than any test step so the reclaim path only fires in the
   walk that asks for it.
-
 ## 2026-09-26 — P10 · Onboarding v0 (REQ-050)
 
 - `crates/onboarding` (`omnion-onboarding`): the first run of an installation as one flow both
@@ -1790,7 +1263,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Two walks that share a table-wide repair pass cannot run at once: `engine::sweep` is
   deliberately global, so the workflow suite now holds a walk lock — determinism is worth the
   extra ~17 s of serial runtime, and a flake that fails 4 of 5 runs is a bug, not weather.
-
 ## 2026-09-26 — P11 · AI Hub v0 (docs/06)
 
 - New crate `crates/ai-hub` (`omnion-ai-hub`) — the platform's single door to AI. `model.rs` holds
@@ -1879,7 +1351,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   Node mock makes the same round trip reachable from CI and from a laptop. The CI step's script
   was dry-run locally before it was committed — and the dry run found that 8081 on this box is the
   Pterodactyl Wings daemon, not a free port (`ss -tlpn` before trusting a port).
-
 ## 2026-09-26 — P12 · Events + Webhooks v0 (docs/01-VISION.md §13)
 
 - New crate `crates/events` (`omnion-events`) — the platform's event bus and its deliveries.
@@ -1971,7 +1442,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   operator cannot tell why nothing arrived.
 - The last mile is the delivery id: `X-Omnion-Delivery` is the row's own id, which is what makes
   the receiver's log and the panel's delivery list talk about the same attempt.
-
 ## 2026-09-26 — P13 · Automation v0 (REQ-003 lite)
 
 - New crate `crates/automation` (`omnion-automation`) — trigger → condition → action on top of the
@@ -2021,7 +1491,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   that reason (`step_error="the email could not be sent: sending email is switched off
   (OMNION_MAIL_ENABLED=false)"`), and the surface stays permission-gated + tenant-scoped.
 - Next: **P14 — Polish + CI v0** (make the CI workflow run for real + README quickstart).
-
 ## 2026-09-26 — P14 · Polish + CI v0
 
 - CI gains the `Web — install · typecheck · build · serve (admin + public renderer)` job: pnpm comes
@@ -2041,7 +1510,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `pnpm build` → 2 successful · `/healthz` 200 · `/readyz` database+redis ok · `omnion doctor` 6/6.
 - Next: **P15+ — REQ-driven queue** (`docs/requests/REQ-XXX`, owner steers priority; suggested first
   REQ-016 webhooks centre → REQ-002 command centre). The foundation phases P00–P14 are complete.
-
 ## 2026-09-26 — REQ-002 · Global search (slice 1: the index and the query core)
 
 - The platform's search is an **index**, not a scatter of per-table queries: `crates/search` owns a
@@ -2079,7 +1547,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: **REQ-002 slice 2 — the palette** (header search box, ⌘K overlay, sections by hit count,
   keyboard map, recently viewed, all states, mobile sheet), then slice 3 (`/search` results screen
   with facets/selection/export, `/settings/search`).
-
 ## 2026-09-26 — REQ-002 · Global search (slice 2: the ⌘K palette and the results screen)
 
 - The panel has its one box. `⌘K`/`Ctrl+K` opens a palette from any screen, `/` focuses the header
@@ -2128,7 +1595,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   selection, Copy links, CSV export (`/search/export`), `/settings/search` (per-provider status,
   ranking weights, reindex progress) and the settings/logs/translations providers; then wave 1
   continues with REQ-032 (command centre).
-
 ## 2026-09-26 — REQ-002 slice 3: results depth, the wider provider set, the index's own screen (done)
 
 - The results screen is now the depth the brief asked for. Facets: **Type, Site, Owner, Language,
@@ -2176,7 +1642,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   the step done, and the re-run reported 0 issues across all 14 screens.
 - Next: wave 1 continues with **REQ-032** (command centre: palette + quick actions + recents), then
   REQ-007 (analytics + real dashboard).
-
 ## 2026-09-26 — REQ-032 · slice 1 · the palette becomes a command centre
 
 - **Commands are code, not configuration.** `crates/search/src/commands.rs` is the registry (8
@@ -2216,7 +1681,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: wave 1 continues with **REQ-032 slice 2** (federated search in the palette: per-group
   loading and errors, type filters, the URL-backed `/search`), then REQ-007 (analytics + real
   dashboard).
-
 ## 2026-09-26 — REQ-032 · slice 2 · the palette answers in groups
 
 - **Each provider answers on its own.** The palette stopped slicing one answer: it asks every
@@ -2268,7 +1732,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Carried forward, not caused by this slice: the public renderer still answers `404` for its own
   icon requests (5 medium findings, unchanged).
 - Next: REQ-032 stayed in progress — **slice 3** was the next tick's work.
-
 ## 2026-09-26 — REQ-032 · slice 3 · the palette acts, and says so
 
 - **A command has a kind.** The registry grew `CommandKind::Action` and a `confirm` flag, and
@@ -2318,7 +1781,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   /command-center/resolve` on ai-hub, the intent preview card, confidence threshold with "Did you
   mean", `Edit as search`, timeout fallback); wave 1 then moves to REQ-007 (analytics + the real
   dashboard).
-
 ## 2026-09-26 — REQ-032 · slice 4 · the palette reads what is typed into it
 
 - **A phrase becomes a structure, checked against the platform's own tables.** `crates/search/src/intent.rs`
@@ -2352,7 +1814,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: **wave 1 moves to REQ-007** (analytics + the real dashboard). REQ-032 is closed; carried
   forward, not caused by this slice: the public renderer's own icon 404s (5 medium findings), and
   `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
-
 ## 2026-09-26 — REQ-007 · slice 1 · the platform starts counting
 
 - **One beacon becomes rows, and the decision comes first.** `POST /api/v1/public/analytics/collect`
@@ -2407,7 +1868,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: REQ-007 stays in progress — **slice 2** (overview + the six report screens over these
   rollups, the shared date-range toolbar, filters, drawers and CSV export, plus the walkthrough
   gaining the ten `/analytics` routes with a synthetic beacon batch).
-
 ## 2026-09-26 — REQ-007 · slice 2 · the numbers come back out
 
 - **The read side is one module, and it is honest about where a number comes from.** `reports.rs`
@@ -2464,7 +1924,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   realtime (`/analytics/realtime` + its SSE counters). Slice 4 then closes the privacy operations
   (retention purge with its audit row, visitor erasure, the "what we store" table and the
   `/analytics/settings` screen).
-
 ## REQ-007 slice 3 — goals, funnels and realtime (2026-09-26)
 
 - **Goals are the platform's definition of a conversion, and the recorder is ordered and
@@ -2512,7 +1971,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   and sampling half of the settings screen, the "what we store" table, `/analytics/settings`, and
   the `analytics.traffic_spike` / `analytics.retention_purged` / `analytics.erasure_completed`
   events.
-
 ## REQ-007 slice 4 — privacy operations, the settings screen, the spike watch (2026-09-27)
 
 - **The privacy promises became database operations, in one readable file.**
@@ -2562,7 +2020,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   unchanged), and `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
 - Next: **REQ-006 (IAM)** — the next wave-1 item: user, role and permission screens plus sessions
   and devices.
-
 ## 2026-09-27 · REQ-006 slice 1 — role depth (migration 0011, the matrix, versions)
 
 - **The migration carries the whole request.** `database/migrations/0011_iam_advanced.sql` adds the
@@ -2622,7 +2079,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   unchanged).
 - Next: **REQ-006 slice 2** — the users screen, bindings at every scope level with expiry, groups,
   service accounts and their keys, effective permissions and the RBAC simulator.
-
 ## 2026-09-27 · REQ-006 slice 2 — subjects, scopes and the simulator
 
 - **A binding belongs to a subject now, not to an account.** `Subject::{User, Group,
@@ -2687,7 +2143,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   idle/absolute lifetime from the policy row, lockout per account and per IP, IP lists, TOTP and
   passkey enrolment with step-up, recovery codes). The walkthrough's denial case should use an
   account with no bindings so the artifact shows a `DENIED` verdict card as well.
-
 ## 2026-09-27 — REQ-006 slice 3a: the security policy, sessions, devices and TOTP
 
 - **The slice.** Migration `0017` adds `sessions.step_up_at`, a live-session index and
@@ -2777,7 +2232,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - **Next.** REQ-006 slice 4 — enterprise sign-in (OIDC/OAuth2/SAML with JIT + claim mapping), SCIM
   provisioning, the ABAC policy builder + dry run, permission requests/approvals and the safety
   invariants.
-
 ## 2026-09-27 — REQ-006 · slice 4a · the ABAC policy engine, the builder and the safety invariants
 
 - **What.** Policies are real and they change decisions. `crates/policy-engine` is the pure half —
@@ -2837,7 +2291,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - **Next.** REQ-006 slice 4b — enterprise sign-in (OIDC/OAuth2/SAML providers with JIT provisioning
   and claim → role mapping), SCIM 2.0 provisioning with its sync log, and permission
   requests/approvals as time-boxed bindings.
-
 ## 2026-09-27 — REQ-006 slice 4b-1 · Permission requests → approvals, and SCIM 2.0 provisioning
 
 - **What shipped.** `crates/identity` gained the SCIM provisioning token store (`mc_…`-style
@@ -2898,7 +2351,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - **Next.** REQ-006 slice **4b-2** — enterprise sign-in: OIDC/OAuth2 and SAML providers per
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
-
 ## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
 
 - **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
@@ -2954,7 +2406,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
-
 ## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
 
 - **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
@@ -3015,7 +2466,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   the claim → role mapping are all proven end to end rather than one layer at a time. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
-
 ## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
 
 - **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
@@ -3065,7 +2515,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `target/debug/incremental` in this worktree returned 2.9 GB.
 - **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
   history, the preview pipeline and the file detail screen do not.
-
 ## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
 
 - **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
@@ -3131,7 +2580,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   settings with a connection test, the CDN purge hook, share links and duplicate detection with
   merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
   serve path, and EXIF extraction.
-
 ## 2026-09-28 — REQ-010 slice 3 (transformations), a preset that produces real pixels
 
 - **What this tick was.** Slices 1 and 2 gave the library a file system and a memory. This one
@@ -3221,7 +2669,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
   with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
   Usage and Activity tabs, which need `media_references` and arrive with slice 4.
-
 ## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
 
 - **What.** The third third of slice 3: `0036_media_shares.sql`,
@@ -3291,7 +2738,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
-
 ## 2026-09-28 · REQ-010 slice 3 closes — EXIF (commits 23e2e6d, 3837064, d14b355, 08c1dc0, 14e33ec, 9b7fab2)
 
 - **What.** The last open item of slice 3: what the *camera* said about its own picture. The
@@ -3371,7 +2817,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   quarantine and release, retention policies with the daily worker, and reference-based purge
   refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
   and releasable, and a retention run removes exactly the eligible rows.
-
 ## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
 
 **What.** The `scan_status` column arrived back in `0025` and nothing ever moved it: the library
@@ -3434,7 +2879,6 @@ dependency of the API crate: the scanner client needs it at runtime, so it is no
 inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
 and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
 the raw route and a retention run removes exactly the eligible rows.
-
 ## 2026-09-28 · REQ-010 slice 4 closed — usage, activity, and the file's two missing tabs
 
 **What.** Slice 4's last open item, and the piece that makes slice 3's and slice 4's bookkeeping
@@ -3503,7 +2947,6 @@ consecutive ticks and remains unrun.
 alongside `runMediaRetention` before setting this REQ to `done`. Then the queue moves to the
 first untouched item in wave 1: **REQ-021** (notification centre — in-app + e-mail). Migration
 slot 0050 is free (wave5 holds 0048, wave4 0043, wave6 0046, wave7 0047).
-
 ## Tick 45 — REQ-021 slice 1: the in-app inbox
 
 **What.** The platform's fourth feedback loop, and the only one that says *you*. The event bus
@@ -3566,18 +3009,178 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
-
+## omnion-w10 · REQ-087 slice 1 — the node library's registry, discovery API and screens
+**What.** The node and credential registry in code (`crates/workflows/src/registry.rs`), a lint
+that refuses a definition nobody could use, seven read-only discovery endpoints
+(`apps/api/src/routes/node_types.rs`), the `/workflows/nodes` library and `/workflows/nodes/<key>`
+detail, and a `runNodeLibraryDepth` walkthrough pass.
+**Proof.**
+- `cargo test -p omnion-workflows --lib` → **52 passed** (9 new registry tests).
+- `cargo test -p omnion-api --lib node_types` → **7 passed**.
+- `pnpm typecheck` → 2 successful, 0 errors.
+- The walkthrough measures instead of looking: a search that leaves a row not matching the
+  needle is a finding; an empty state that does not echo the query is a finding; a category
+  filter that does not narrow is a finding. The registry's own lint is read off the running
+  server through `/api/v1/node-types/lint`, so a registry that would fail it is visible without
+  a test.
+**The lint earned its place on the first run.** Four of the eight bundled definitions were
+refused, and every refusal was a real defect rather than a style opinion:
+- `send_email` declared the `smtp` credential type but had no `credential_key` parameter, so the
+  palette had no way to let a person pick one. Fixed in the data, not by relaxing the rule.
+- The `data`, `helper` and `error_handler` categories had no node at all, which would have
+  rendered three empty group headers. Three nodes were added.
+- Two of the four failures were *my tests* asserting the wrong thing, and fixing them found the
+  real rule: `stop_and_error` is a terminal error handler and legitimately has no main output.
+  The rule now carves that case out explicitly (`node_no_main_output` applies unless the node is
+  an error handler whose only open port is the error port) rather than forcing a port nothing can
+  connect to.
+**A compile error that was not in the code it named.** `ParamHint` was the one registry enum
+without `Copy`, so reading `param.ui` by value out of a `&NodeDefinition` moved out of a shared
+reference. `Copy` is the correct derive for a fieldless enum used that way and is what the other
+six enums already had; the API is unchanged in shape.
+**Next.** REQ-087 slice 2: the `workflow_credentials` and `workflow_node_packages` tables, the
+secret-store link, CRUD with the usage guard and the masked detail screen. Slice 1 stays open on
+one clause — "the palette renders from it with no hard-coded list" — because the canvas is
+REQ-086 slice 2 and still reads w3's own list; that is a wiring step, not a registry change.
+## omnion-w10 · REQ-087 slice 2 — credential instances, and a table with no secret column in it
+**What.** The credential entity end to end: `0053_workflow_credentials.sql` (two tables),
+`crates/workflows/src/credentials.rs` and `credential_store.rs`, nine endpoints under
+`/api/v1/credentials` and `/api/v1/node-packages`, two new permission keys, three admin
+screens, and a walkthrough pass whose fixture secret has to survive the round trip without
+appearing anywhere.
+**Proof.**
+- `cargo test -p omnion-workflows --lib` → **72 passed** (20 new).
+- `cargo test -p omnion-api --lib` → **176 passed** (10 new).
+- `cargo test -p omnion-permissions --lib` → **62 passed**.
+- `pnpm typecheck` → 2 successful, 0 errors.
+- `bash scripts/qa/run.sh` on the private w10 stack → see the counters below.
+**The table has no secret column, and that is the design rather than an omission.** The REQ
+says the payload lives in the encrypted store (REQ-125) and this takes it literally: what a
+credential row carries is `secret_ref`, an opaque handle, plus `settings`, which
+`Settings::build` refuses to construct out of any key the credential type declares `secret`.
+The invariant "no plaintext secret is stored in the workflows schema" is therefore not a review
+checklist item — there is no function in the store that takes a secret as a parameter, and a
+test asserts the row's serialised form has no field a secret could hide in.
+**Two of my own tests caught two real defects in the same commit.** `Health::parse` was
+case-sensitive although it only ever runs on values read back out of the column, so a
+hand-edited row would have turned a whole list into an error. And the required-field check
+accepted a whitespace-only value — which is the shape a browser actually submits when a reader
+opens an input and leaves it alone. The second one had a test *asserting the wrong thing*
+beside it; the test was deleted rather than the rule relaxed, because the rule is the one that
+matches what a form does.
+**Usage is derived, and the guard lives inside the transaction it guards.** The usage probe is
+a `jsonb_array_elements(workflows.graph -> 'nodes')` match on `params ->> 'credential_key'`,
+taken in the *same* transaction as the delete with the credential row locked `for update`.
+Checking usage and then deleting in two round trips is a race a canvas save can win, and the
+result is a graph pointing at nothing with no error anywhere. A counter column would have been
+the obvious implementation and is wrong the moment somebody drags a node.
+**The test hook cannot report a pass it did not earn.** No bundled credential type can reach a
+provider from the API process, so `POST /credentials/{id}/test` answers from what it actually
+knows: no secret attached → `credential_secret_missing`, row stays `untested`; a required field
+missing → named; a secret attached but no hook that can use it → the connection was not made.
+`ok: true` is the one answer it cannot give, because a green chip nobody earned moves the
+failure off the test screen and into the middle of somebody's production run. The walkthrough
+asserts that negative directly (`testDidNotFakeSuccess`).
+**The secret write path returns 503 `secret_store_unavailable` until REQ-125 is wired**, rather
+than inventing a local scheme. The REQ's own risk line asks for exactly this: "if that slips,
+refuse credential writes rather than inventing a local scheme." A credential that saves with no
+secret is a state the panel already knows how to show.
+**The walkthrough's load-bearing step is a grep.** A fixture string is typed into the create
+form, and then the pass searches the resulting screen, the whole DOM and every read the API
+offers for it. "No response returns a secret" is otherwise an architectural claim; this is a
+grep that fails the build if it stops being true. The pass also asserts the three easy-to-get-
+wrong answers — a secret re-sent on a `PATCH` is refused by name, a test reports a result, and
+the delete guard *allows* an unreferenced credential (a guard that refuses forever is as broken
+as no guard).
+**Migration number.** The REQ reserved `0031`/`0032`; those are taken on other branches, and
+the ledger is append-only, so this is `0053` with the REQ's own table and column names.
+**Next.** REQ-087 slice 3: OAuth start/callback against a fixture provider, the single-flight
+refresh, and `needs_reauth` reaching the canvas. Then slice 4 — the package ledger's installer
+pipeline and the SDK validator. The palette wiring (REQ-086 slice 2) stays the one clause slice
+1 could not close.
+**The browser pass was queued behind three other stacks, and that turned out to be the most
+useful thing that happened to this slice.** Rather than wait, I wrote
+`scripts/qa/credential-contract.sh` to drive the same endpoints directly against the same
+private stack — and it found a `500` on `/usage` and on the delete that guards with it, which
+every unit test had missed because none of them touch a database.
+The cause is a lesson about *parallel branches*, not about SQL. A workflow's nodes live in
+`graph` once REQ-086's builder migration (`0051`) is merged, and in `steps` before it — and
+those two migrations live in different worktrees. My probe named `w.graph` directly, which the
+planner rejects **before the query runs**, so it was a `500` on every install that has not
+merged the builder yet. A `coalesce` around it cannot rescue a statement that does not parse;
+only projecting the row can. `to_jsonb(w) -> 'graph' -> 'nodes'` compiles whether or not the
+column exists, and a missing key is null rather than a syntax error.
+The same probe then revealed the second half of that bug: the two representations disagree
+about names. A `steps` node calls its name `name` and its type `action`; a `graph` node calls
+them `label` and `type`. So on exactly the installs the first bug broke, every usage row was
+also blank — the guard fired correctly and the screen had nothing to show. Both spellings are
+read now.
+**And a second copy of that query is a second query that can disagree.** The guard's
+in-transaction copy and the public usage view now run one shared `SQL_USAGE` constant. A guard
+that disagrees with the screen that explains it is the worst pair on this surface: the reader is
+told a credential is unused, presses delete, and is refused for a reason neither of them can
+see.
+**Three probes, all against the live private w10 stack:**
+| Probe | Result | What it is |
+|---|---|---|
+| `credential-contract.sh` | **43/43** | The whole surface, plus a structural check that the table has no `api_key`/`token`/`password` column at all — read from `information_schema`, not from the migration text, so a future migration adding one is caught here |
+| `delete-guard.sh` | **20/20** | The refusal direction: `409 credential_in_use` with the workflow, node label and node type in `details`, the row surviving, then a forced delete that reports what it broke and leaves the workflow's dangling reference alone |
+| `usage-probe.sh` | **5/5** | The expression parsed and run on a schema with **no `graph` column at all**, and a `steps`-only row read exactly once rather than twice by the coalesce |
+**A probe will lock itself out.** The security policy refuses an address after a run of failed
+sign-ins, and a contract probe logs in on every run — after a handful of iterations every
+request answered `address_blocked`, which reads exactly like an authorization bug.
+`scripts/qa/unblock-w10.sh` clears it and *proves* it with a real login rather than trusting
+its own row count, because the first version of that script used the wrong column name
+(`address` instead of `ip_address`), deleted nothing, and cheerfully printed `after: 0`.
+**Next.** REQ-087 slice 3: OAuth start/callback against a fixture provider (state + PKCE), the
+single-flight refresh behind a lock, and `needs_reauth` reaching the canvas. The browser pass
+itself is still queued; the three probes above are what this slice is closed on, and the pass
+will confirm the three screens when it gets a slot.
+**The screen probe found a bug the API probe could not, and it was the worst kind: the create
+form could not save at all.** `scripts/qa/credential-screens.cjs` drives the three screens in a
+real browser, and the first thing it did was paste a key and press Save — which is what a person
+does — and got nothing, because the whole create was refused with `503 secret_store_unavailable`.
+That refusal was written for the wrong endpoint. On `POST /credentials/{id}/secret` — the
+deliberate replace path — refusing is right: the caller asked for one specific thing, it did not
+happen, and a 503 that says so is the honest answer. On a *create* it is not. The credential is a
+real row with a name, a key and a type, and the REQ says outright that a save is allowed without
+a passing test and shows as "not verified". A secret is an attachment somebody can add from the
+detail screen; refusing the whole create over it makes the surface unusable until REQ-125 lands,
+which is the worst possible way to ship half a feature. The create now succeeds and reports what
+did not happen in `secret_write_warning`, and the panel shows that **on the row it concerns** —
+a reader who pasted a key and was redirected to a detail screen that never mentions it will
+assume the key is there, and then debug a node that cannot authenticate for want of a key they
+are certain they pasted.
+**And a probe that counts "this situation did not arise" as a pass inflates its own
+denominator.** The screen probe reported "17 of 19" while two of those were notes, not claims —
+it looked like it was failing two things when it had asserted less than it said. Claims and notes
+are now distinct outcomes and the totals only count claims. A number that overstates the
+assurance you gave is worse than a lower one.
+**Final state of the slice, all against the live private w10 stack:**
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-workflows --lib` | **75 passed** |
+| `cargo test -p omnion-api --lib` | **177 passed** |
+| `cargo test -p omnion-permissions --lib` | **62 passed** |
+| `pnpm typecheck` | 2 successful, 0 errors |
+| `scripts/qa/credential-contract.sh` | **43/43** |
+| `scripts/qa/delete-guard.sh` | **20/20** |
+| `scripts/qa/usage-probe.sh` | **5/5** |
+| `scripts/qa/credential-screens.cjs` | **19/19 claims**, 2 notes |
+The full `scripts/qa/run.sh` browser pass is still working through the other stacks' screens
+behind me; `credential-screens.cjs` renders and measures the same three routes directly, so the
+screens are confirmed either way.
+**Next.** REQ-087 slice 3: OAuth start/callback against a fixture provider (state + PKCE), the
+single-flight refresh behind a lock, and `needs_reauth` reaching the canvas. The one clause left
+on slice 2 is "disables the dependent nodes", which needs the canvas (REQ-086 slice 2) to have
+somewhere to disable them.
 ---
-
 ## 2026-09-28 · REQ-021 slice 2 — the reader's own channel configuration
-
 **What.** The half of the notification centre that decides **how** a record reaches somebody.
 `crates/notifications` gains `preferences.rs` (the rules) and `preference_store.rs` (the SQL);
 `GET`/`PUT /api/v1/notifications/preferences`; `/notifications/settings`; and
 `runNotificationSettingsDepth` in the walkthrough.
-
 **Three decisions, each a shortcut that produces a plausible wrong answer.**
-
 1. **The matrix stores only the cells a reader stated.** A full grid would be thirty rows per
    user per channel and would make a channel added in slice 3 a backfill instead of a
    non-breaking change. Everything unstated reads as `true`, and the *read* builds the
@@ -3590,21 +3193,17 @@ hours, the digest job, the e-mail and webhook adapters and the delivery rows in 
    `22:00→07:00` wraps midnight and `01:00→05:00` does not. A window helper that knows only one
    of them is either never quiet or always quiet, and both are silent. A window that leaves no
    waking hours is refused by name rather than stored as "e-mail is on".
-
 **The HTTP gate found a bug that had been shipped since slice 1.** The pass reported two
 `request-failed` findings against `?category=approval` and `?priority=low` — both perfectly
 legal values. The cause is not a typo: axum 0.8's `Query` extractor is backed by
 `serde_urlencoded`, which **cannot put a repeated key into a `Vec`**. It answers
-
 ```text
 invalid type: string "approval", expected a sequence
 ```
-
 for *both* `?category=approval` and `?category=approval&category=ticket`. Every category and
 priority filter on this surface had never worked, and every filtered list fell through to the
 error state. It was reproduced in isolation — a four-line axum app — before being fixed, and
 the list read now takes `RawQuery` and parses the string itself.
-
 **Six of the pass's own assertions were wrong, and that is the more useful half of the tick.**
 `emptyState` asked for `?read=read`, which by that point in the pass holds the very rows the
 bulk step had just marked read — the list was correctly *not* empty, and the gate was measuring
@@ -3613,30 +3212,24 @@ error element, which that call cannot affect: the assertion could only ever have
 accident. The keyboard pass clicked a row, which opened the drawer, and then sent every
 shortcut into the drawer. All three are the class of defect this harness exists to catch —
 in itself — and none of them is visible from the report, which only says `false`.
-
 **Two shortcuts the REQ listed were documented but not implemented.** Rather than weaken the
 gate to match the code, `Shift+E` now marks the visible rows read — through a bulk helper that
 takes an explicit id list, so it does not require a selection the reader never made — and rows
 carry `data-read` so the state is assertable rather than a shade of grey.
-
 **Proof.** `cargo test -p omnion-notifications` → **48 passed**; `-p omnion-api --lib` →
 **176 passed**; `pnpm typecheck` → 2 successful; `bun build scripts/qa/walkthrough.cjs` clean.
 Browser pass: **running**.
-
 **Next.** Read `/tmp/omnion-build-qa2.log` and `docs/qa/QA-LATEST-main.md`; require
 `report.notificationSettings` to be green and **zero high findings** from this change — in
 particular no `request-failed` on any `/api/v1/notifications` URL, which is the 400's
 signature. Then REQ-021 slice 3: push subscription lifecycle with pruning, the admin outbox
 behind `notifications.admin`, the event router turning existing bus events into notifications,
 and the per-channel delivery rows in the drawer.
-
 ## 2026-09-28 · REQ-021 slice 3 — the half that leaves the panel
-
 **What.** The store layer (`push.rs`), the declarative router (`router.rs` + migration
 `0051_notification_routes.sql`), `notifications.admin` in the permission catalogue, nine HTTP
 endpoints in `apps/api/src/routes/notifications_admin.rs`, and the four sub-routers mounted
 with their guards travelling with each group.
-
 **The decision the whole slice rests on: a `permission:` recipient rule resolves through
 `omnion_permissions::effective_permissions_for`, not through a hand-written join.** The join is
 one round trip faster and *wrong* — it misses role inheritance, scope-mismatched bindings,
@@ -3646,49 +3239,40 @@ is a privacy defect rather than a wrong number. This is why `omnion-notification
 cycle. The live gate builds the fixture that distinguishes the two: one person bound to a role
 that *inherits* the permission and holds nothing itself, which a `join role_permissions` answers
 zero for and the crate's resolution answers one.
-
 **A push endpoint is a capability, so the type cannot express leaking one.** The device body has
 no endpoint field at all — the hint (`…abcdef01`) is derived in the crate, and `DeviceBody` has
 nowhere to put the full value. That is a stronger guarantee than a promise in a comment, and it
 is asserted by serialising the body and searching the JSON for the secret.
-
 **Three shapes were wrong on the first write and are worth naming.** `retry_delivery` returned
 `bool`, which cannot distinguish "already sent" from "already queued" and turns a `409` on a
 button the caller cannot use into the only answer; it now returns a `RetryOutcome`. The channel
 list used `filter_map`, which would answer with four channels and render a settings matrix whose
 missing column is indistinguishable from one the reader switched off. And the outbox check
 constraint I first wrote was a boolean tangle that evaluated to `NULL` for `actor`.
-
 **The live gate found three of its own assertions were wrong**, which is the more useful half:
 the role fixture expected a survivor where the honest answer is zero; the outbox projection check
 counted columns in `information_schema` rather than running the route's own `SELECT`; and a stray
 `update` had already consumed the sent row, so `sent_rows_before=0` proved nothing. All three are
 now assertions that would fail if the code regressed.
-
 **Proof.** `cargo test -p omnion-notifications` → **79 passed** (48 at the start of this tick);
 `-p omnion-permissions` → 62; `-p omnion-api --lib` → **187 passed** (176 at the start).
 `scripts/qa/run-notifications-routes.sh` → **PASS**: 32 migrations applied, all three recipient
 and category refusals hold, the outbox's own projection is 13 columns with no body, and a retry
 moves the failed row while the delivered one stays at 1 → 1.
-
 **Not proven, and not claimed.** The browser pass running in the background is the **slice-2**
 gate; slice 3 has **no admin UI yet** — there is no `/notifications/outbox` screen and no routing
 rules screen, so the nine endpoints are reachable and invisible. Slices 2 and 3 are not closed.
-
 **Next.** Read the pass's `report.notifications` (the last one showed four `false` keyboard
 assertions that `eb421ba` claimed to have fixed — if they are still false, the fix did not work)
 and `report.notificationSettings`. Then build slice 3's two screens and write their depth passes
 before running the pass again — the no-untested-screen rule applies to a screen that does not yet
 exist as much as to one that does.
-
 ## Tick 48 — the pass that had been running for an hour, and what it actually said
-
 **What.** The browser pass started at 22:33 finished at 23:41, and its `summary.json` answered the
 question the last tick left open. `report.notifications` is **green on the bell, the badge, the
 grouped lines, the bulk path, the cursor, `x`, `Enter` and all three states** — and its four
 `false` values are one bug, not four. `report.notificationSettings` did not run at all: *"The API
 answered with status 400."*
-
 **The 400 was not a code defect.** `/api/v1/notifications/{preferences,channels,outbox,routes,
 push-subscriptions}` all answer `400 Invalid URL: Cannot parse id…` — the parameter route
 swallowing the static segments, which is exactly what the comment above the mount says it
@@ -3696,10 +3280,8 @@ prevents. The mount order in `routes/mod.rs` is correct. The QA API binary is fr
 slice 2's routes landed at 21:46 and slice 3's at 23:13. The 52 + 31 high findings this pass
 filed against `/notifications/settings` and `/media/settings` are *both* that. The pass is
 disposable by design, so the lesson is to read the binary's mtime before reading the router.
-
 **What this tick fixed instead.** Two real defects, both found by hand against the live stack
 because no existing gate could reach them:
-
 1. `POST /api/v1/notifications/emit` addressed `user_ids` straight into the insert, so
    `notifications_user_id_fkey` answered a stale id by refusing the **whole batch** and naming
    itself: a `500` whose body quotes `violates foreign key constraint
@@ -3710,27 +3292,23 @@ because no existing gate could reach them:
    **not in the key handler**. It was also unreadable behind `if (!row) return`, so it was inert
    exactly when the list had content — and the open drawer held the focus, which is why `e`,
    `Shift+E` and `/` failed behind it. `c30d324` answers `Escape` before the cursor is read.
-
 **And the gate that had been lying.** `run-notifications-http.sh` decided its build by
 `cargo build | grep -E "^(error|warning: unused)" && { echo "build failed"; exit 1; }`. The
 status it tested was grep's, not the compiler's — and `warning: unused import` is a line this
 crate prints on every *successful* build. The gate exited 1 over a build that finished in 0.31 s,
 twice, printing a message indistinguishable from a real compile failure. `e8a797f` uses the
 compiler's exit status and only reads the log when that status says something went wrong.
-
 **Proof.** `cargo test -p omnion-notifications` → **79 passed**; `-p omnion-permissions` → **62**;
 `-p omnion-api --lib` → **187 passed**. `pnpm typecheck` in `apps/admin` → **exit 0**.
 `node --check scripts/qa/walkthrough.cjs` → clean.
 `scripts/qa/run-notifications-http.sh` → **PASS**, 12 assertions, including the two new ones:
 *a recipient that is not an account is a 400 in a sentence, not a constraint name* and *a batch
 with one bad id writes none of the good ones*.
-
 **Not proven, and not claimed.** `Escape` and the four shortcuts behind it are fixed in source and
 typechecked, but no pass has run against them — the pass that found them ran against the 20:39
 binary. Slice 3's outbox screen is still unvisited: `report.notificationOutbox` is **absent** from
 this pass's report, so the depth pass written last tick still has never executed. REQ-021 stays
 **in-progress**.
-
 **Next.** Run `bash scripts/qa/run.sh` against a freshly built API (verify the binary's mtime is
 newer than `0188172` before reading any result). Require `report.notifications.escapeClosedDrawer`
 and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMarkedVisible` /
@@ -3739,6 +3317,69 @@ and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMar
 slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
 after that.
 
+**Tick 3 opened on a merge, not on a slice — and the merge was the work.**
+
+`origin/main` had moved 23 commits (notifications slice 3, the media routes) and four files
+this writer owns all conflicted at once: `apps/api/src/routes/mod.rs`, `apps/admin/lib/api.ts`,
+`apps/admin/lib/types.ts` and `docs/BUILD-LOG.md`. A shared-namespace merge is normally UNION —
+both sides only ever add — so the resolution is mechanical, and that is exactly what makes it
+dangerous: the obvious splice of both sides' "insert" opcodes re-emits lines the base already
+had whenever both sides merely *reordered* a block. The first attempt produced three copies of
+`pub mod media_duplicates;` and a file that did not parse.
+
+**A union merge needs three different verifications, and a line count is not one of them.** The
+multiset check on non-blank lines said "0 missing" while the crate had three duplicate module
+declarations, because the duplicates *were* lines from both sides. What actually found them was
+(a) a duplicate-declaration scan over `pub mod`/`export function`/`export interface` and
+(b) the compiler, which is the only authority. The second attempt also lost a closing `);` when
+I de-duplicated on *every* line — `}` and `);` occur dozens of times, and dropping one because a
+splice already emitted an identical one breaks the parse. De-duplicating only *declaration*
+lines is the safe form.
+
+**Two interleaves survived the mechanical pass and only `cargo build` found them.** Main's
+`.merge(delete(notifications::delete)…)` line landed inside `notifications_preferences` (giving
+axum's one-argument `.merge` two arguments), and a stale `let notifications_read` from the base
+survived 60 lines below main's own re-declaration of it. Both are exactly what a "take the union"
+resolution looks like when a *statement* was rewritten rather than added.
+
+**Then the slice: REQ-087 slice 3, OAuth.** The algebra came first, and its four pieces are each
+a place the obvious version is wrong:
+
+| Piece | What the obvious version does | What shipped |
+|---|---|---|
+| `state` | a random string compared to a column | HMAC-signed, credential-bound, 10-minute window, four distinct refusals |
+| PKCE | challenge generated, verifier regenerated | `S256` derived, and the *same* verifier comes back; verified before the code is spent |
+| token set | `#[derive(Debug, Serialize)]` on a struct with an access token | neither derive, enforced by a compile-time test |
+| refresh | every node refreshes when it notices expiry | `RefreshLock`, single-flight per credential, because a refresh invalidates the old refresh token |
+
+**A test caught a real defect in the seal, and it was the kind that ships silently.** `seal`
+computed its tag over the version and nonce but *not* the ciphertext, so flipping one ciphertext
+byte opened successfully and returned corrupted plaintext — the test's own panic message was
+`" he-verifier"`, one character off the original. Encrypt-then-MAC is only that if the MAC runs
+over the ciphertext; a header-only tag authenticates the envelope's shape and nothing about what
+is inside it. The store's `open_pkce` re-derives the challenge from the opened verifier and
+refuses a mismatch, so a row edited by somebody holding the key still cannot produce a token
+request a provider will accept.
+
+`claim_flow` is one `update ... where status = 'pending' returning ...` rather than a `select`
+then an `update`, because the two-round-trip version has a race a double-clicked "Allow" button
+wins, and the single-statement version is the only shape where the database — not the
+application's timing — decides who won.
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-workflows --lib` | **110 passed** (was 75) |
+| `cargo build -p omnion-api` | clean |
+| `pnpm typecheck` | 2 successful, 0 errors |
+| `git status` | clean |
+
+Commits `7edd4fa` (the flow's algebra) and `f2a4b97` (its persistence, and the seal fix), pushed
+to `wave10`.
+
+**Next.** REQ-087 slice 3's API half: `POST /credentials/{id}/oauth/start`,
+`GET /public/oauth/callback`, `POST /credentials/{id}/disconnect`, the refresh behind
+`RefreshLock`, and the `needs_reauth` event reaching the canvas. Then the fixture provider and
+the contract probe that drives a real round trip.
 ## Tick 49 — the pass that finally reached slice 3, and the list that emptied itself
 
 **What.** The 23:51 pass ran against a binary built at 23:35, twenty-two minutes after slice 3's mounts
@@ -3949,15 +3590,27 @@ data source does.
 **Next.** The emission calls, then the `/events` screen. The catalogue made the work mechanical
 on purpose: each emitter is a `bus::emit` beside the write it already does, and the drift test
 turns "did I remember?" into a red line with a file and a line number.
-
-
+**Proof.**
+- `cargo test -p omnion-events --lib` → **45** (42 before, +3)
+- `cargo test -p omnion-api --test events` → **9/9** (6 before, +3) against real Postgres
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `cdba36e` (the store and the migration), `b826899` (the routes and the walks),
+  `17d87cd` (the screens and the depth pass)
+**Not done, and not claimed: no browser pass.** A sibling writer held the QA slot for the whole
+window at load 18–20, so `runWebhooksDepth` is written and **unrun** and every acceptance box
+that names a screen stays unticked with the reason written into the box. The fast gates ran
+instead and the pass is queued.
+**Next.** When the slot frees, run `bash scripts/qa/run.sh` with no `QA_STACK` override. If it is
+green, tick the screen boxes and close slice 2. Then slice 3, which is the retention sweeper
+plus the delivery-failed notification REQ-021 turns into an operator alert.
 ---
-
+**Proof.**
+- `cargo test -p omnion-api --lib` → **188**
+- `tsc --noEmit` in `apps/admin` → exit 0
+---
 ## 2026-09-29 — REQ-016 slice 1 (emission half) · the gate that walked one direction
-
 Eleven emissions, one honest demotion, and a gate that closes the direction nothing was
 checking.
-
 **The finding.** Slice 1 shipped a drift gate that walks the source tree and fails when an
 emitter names an event the catalogue does not carry. It works, and last tick it earned its
 place. But it walks **one** direction, and the other direction is where the damage was.
@@ -3966,9 +3619,7 @@ today" — and nothing emitted them. `page.created` had a row, a description, pa
 and a picker entry; there was no `bus::emit` for it anywhere in the tree. So an operator
 subscribed to `page.created`, the subscription was accepted, and nothing could ever arrive.
 No error, no warning: a registry that promises deliveries the platform never makes.
-
 **Eleven now emit**, each a `bus::emit` beside a write that already existed:
-
 | name | where |
 | --- | --- |
 | `page.created` `page.updated` `page.deleted` `page.restored` | `routes/content.rs` |
@@ -3980,7 +3631,6 @@ No error, no warning: a registry that promises deliveries the platform never mak
 | `theme.activated` | `routes/onboarding.rs` |
 | `webhook.endpoint.created` `updated` `removed` `tested`, `webhook.secret.rotated` | `routes/webhooks.rs` |
 | `webhook.delivery.failed` | `crates/events/src/engine.rs` |
-
 **Ten are now `Reserved`, and the reason is the point.** `plugin.*` (no plugin module ships
 yet), `workflow.run.*` (the engine does start runs — but the automation matcher *drains the
 same bus* and starts a run per matching rule, so emitting there without a loop guard is a
@@ -3990,7 +3640,6 @@ feedback loop wearing a feature's clothes; that is a decision, not a line), `pag
 is the status that lets the picker say *a module ships this* instead of implying the platform
 is broken. `a_reserved_name_names_the_module_that_ships_it` pins each row to its owning module,
 so nobody re-promotes one on a hunch: the reverse gate turns red with the name.
-
 **A gate a convenience wrapper can blind.** The first version of the content helper took the
 name as a `&str` and the new gate immediately reported `page.created` unbacked from a file
 that emitted it three lines above — the literal had moved into the helper's argument, where a
@@ -3999,7 +3648,6 @@ stays at each call site. A test that can be defeated by tidy code is a test to d
 against, and the same trap bit the forward gate afterwards: a doc comment explaining the rule
 contained the constructor call in prose, and the gate read it as an emitter. Both are written
 down in the source now.
-
 **The existing tests were right to fail.** Exact row counts in the feed broke, because the
 feed correctly carries more facts now: `page.*` delivers two events instead of one (a group
 subscription is no longer publish-only, which is the point of a group), and tenant B's feed
@@ -4007,9 +3655,7 @@ is no longer empty because connecting an endpoint records an event *about that e
 last one looked like a tenancy leak and was not: the isolation assertion now says what it
 means — B sees its own endpoint and nothing of A's. The counts were replaced with presence
 and ordering assertions, because a count turns every future emission into a breaking test.
-
 **Proof.**
-
 - `cargo test -p omnion-events --lib` → **42** (41 before, +1 for the reserved-ownership pin)
 - `cargo test -p omnion-api --test events` → **5/5** (4 before, +1 the reverse gate) against
   real Postgres and a real loopback receiver
@@ -4017,26 +3663,20 @@ and ordering assertions, because a count turns every future emission into a brea
 - `tsc --noEmit` in `apps/admin` → exit 0
 - The new gate proved in both directions: promoting `plugin.installed` to `Live` turned it red
   with the name, restore turned it green
-
 **Not done, and not claimed.** The `/events` screen with its Feed and Catalogue tabs does not
 exist, so the acceptance box that names the Catalogue **tab** stays unticked even though the
 API behind it is proven. Slice 2 (endpoint management UI) and slice 3's delivery-operations
 UI are untouched. No browser pass this tick: load 21.6 with sibling writers active, so REQ-010
 slice 4 and REQ-021 remain blocked on the QA slot.
-
 **Next.** The `/events` screen — the data source is done and proven, the screen does not exist,
 and it is the last thing in slice 1. Re-check the QA slot on arrival; when it is free and the
 box is under load ~6, run `bash scripts/qa/run.sh` with no `QA_STACK` override and extend
 `scripts/qa/walkthrough.cjs` so the new route is visited and clicked.
-
 ---
-
 ## 2026-09-29 · REQ-016 slice 1, the screen half — `e7399d6`
-
 **What.** The `/events` screen, and the feed filters it needs to be a screen. The catalogue had
 a data source and nothing that rendered it; the feed had `?limit` and one `?name` and no way to
 page. Both halves are now closed, except the browser pass, which did not get a slot.
-
 **The finding: `?name=a` never filtered — it failed.** The first version of the query shape was
 a `Vec<String>` behind `Query<EventsQuery>`, which is the obvious way to write it and the wrong
 one. `serde_urlencoded` — the deserializer `Query` is built on — **rejects a single occurrence of
@@ -4047,7 +3687,6 @@ is not a downgrade: the same three rules already live in `notifications::parse_l
 doc comment explains why each one exists. The new one says the same three and adds the fourth the
 notification list learned the hard way — *ignore* a key this build does not know, so a panel that
 sends one filter earlier than the API still gets its feed.
-
 **A tenancy assertion that passed for the wrong reason.** The scoping assertion was first written
 against the platform owner, and it failed: five rows came back where four were expected. The
 owner's session carries `organization_id = None`, and the store's `($1::uuid is null or
@@ -4055,29 +3694,24 @@ organization_id = $1)` reads that as *every* organization — which is correct f
 test was asserting the superuser sees everything, not that a tenant may not see another's. It now
 reads as an **organization** account, and the seeded foreign row has an *actor* from a third
 identity, so a broken actor filter and a broken organization filter are both caught.
-
 **`has_more` comes from the row past the page.** Not from a second `count`. A list and a count
 that disagree is a list that is lying, and the disagreement is invisible until somebody pages to
 the end and finds a row they have already seen. The store asks for `limit + 1` and truncates; the
 cursor is the last row's own id, exclusive, so the next page cannot re-serve the row the cursor
 names. Newest-first is asserted *across* the boundary, not per page, because "sorted within a page"
 is a property a single page satisfies by accident.
-
 **A live name nobody subscribes to is the useful number.** The catalogue now carries each name's
 24-hour delivery count, scoped to the caller's organization. It is the one question the `live`
 column cannot answer: the status says the platform records the name, the count says whether any of
 your endpoints ever heard it. It is `0` rather than absent so the column is always a number the
 screen can render, and the walk asserts *every* entry carries a number — a missing key would
 render as a blank cell indistinguishable from a name nobody has data for.
-
 **The window is relative in the URL and absolute in the request.** `?window=24h` is what the
 panel stores, and the `from` instant is computed at request time. Storing the instant would make a
 pasted link mean "the last two hours" for the sender and "nothing at all" for the reader, with no
 way to tell which happened. A `from` in the past *is* still accepted directly, because the API is
 a public surface and a relative filter is a panel convenience, not a protocol rule.
-
 **Proof.**
-
 - `cargo test -p omnion-events --lib` → **42** (unchanged; no new unit test was needed — the
   store's filter is SQL and the walk exercises it against a real database, which is the only
   place it can be exercised honestly)
@@ -4090,179 +3724,28 @@ a public surface and a relative filter is a panel convenience, not a protocol ru
   routed `500` and checks the error banner, reads the catalogue back against the API and asserts
   the totals match, narrows by area, expands an entry's payload fields and uses "Filter feed" to
   cross to the other tab
-
 **Not done, and not claimed.** **No browser pass this tick.** The QA slot was held by a sibling
 writer for the whole window and the box was at load 26, so `runEventsDepth` is written and
 **unrun**, and the acceptance box that names the Catalogue *tab* stays unticked with the reason
 written into the box. The other two things the box wanted — the screen and the filters — are
 built, typechecked and API-tested. Slice 2 (endpoint management UI) and slice 3's delivery
 operations are untouched.
-
 **Next.** Re-check the QA slot on arrival; when it is free and the box is under load ~6, run
 `bash scripts/qa/run.sh` with no `QA_STACK` override. If it is green, tick the catalogue box and
 close slice 1; if the pass finds anything, fix it in the same tick — the depth pass is already
 written, so a green run closes the slice rather than starting it. After that, slice 2: the
 `/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
 operator needs first when a delivery is missing.
-
-## 2026-09-29 · tick 10 · REQ-065 slice 4 part 4 — a token that can be rotated, and one that expires
-
-**What.** The store's module doc has claimed "tokens are rotatable" since `0011_iam_advanced`
-wrote the table, and no rotation existed. The only thing a caller could do was revoke, which is a
-different operation: it kills the credential and hands back nothing to paste into the directory.
-REQ-065's acceptance criterion names the difference — "a **rotated** token refuses the old value" —
-so the criterion was half absent rather than merely unproven. Slice 4 part 4 builds it, and with it
-the **expiry** the spec asks for and the table could not express: a token minted in 2024 was still
-accepted in 2026, and a token that never expires is the one credential whose compromise is silent
-(no user, no password, no login to notice).
-
-`0124` adds the chain (`provisioning_token_rotations`, old → new), `rotated_at`/`expires_at` on the
-token, and a check constraint refusing an expiry that precedes creation. The old row is **kept**,
-revoked and linked, never deleted — it is the evidence that the secret found in a log is the one
-that was replaced. `rotate_token` is one transaction: revoke-then-insert would leave a live connector
-with no working credential if the insert failed, which is strictly worse than a revoke the operator
-chose deliberately, and the `for update` on the old row means two rotations cannot both mint a
-successor.
-
-**Three defects, none of them found by reading the code.**
-
-- The rotation response rendered the replaced token from the row read **before** the write, so it
-  said `rotated: false` about a token that was now rotated. That is the one surface whose entire
-  job is to say "this was replaced", and it contradicted the list the panel refreshes into. It
-  re-reads the persisted row. A response about a write should describe the write.
-- `From<IdentityError>` had **no arm** for `InvalidProvisioning`, so every provisioning refusal fell
-  through to the catch-all and became `500 internal_error`. A zero-day lifetime told the operator
-  the platform was broken. This is the same class as the JIT-password defect earlier in this REQ: a
-  wrong status on a credential path is a tell, and this one says "a token is near its limit" rather
-  than "we are down".
-- A cross-tenant rotation answered `cross_organization`, which **confirms the guessed id names a
-  real token**. `ensure_same_organization` is right for a body field the caller supplied and wrong
-  for a path id that was never theirs; the route now answers `404` like a missing row.
-
-**The test asserts the acceptance sentence and not a flag.** The old secret is presented to the real
-`/scim/v2/Users` and the `401` is read — after first asserting that same secret returned `200` a
-moment earlier, so the test cannot pass against a token that never worked. The list check greps the
-whole response body for the secret rather than looking for a `secret` field, because a secret that
-leaks into a neighbour field is the same leak. The expiry assertion shortens the window to one
-second and *waits* rather than backdating the column, because the constraint correctly refuses an
-expiry before creation and a test that had to defeat the constraint to set up its own scenario was
-testing the wrong thing.
-
-**Proof.** `cargo test -p omnion-api --test iam_token_rotation` → **1 passed** (15.5s) against the
-real router and a real database. `cargo test -p omnion-identity --lib` → **199 passed**.
-`cargo build -p omnion-api` → clean (3 pre-existing warnings, none in this slice's files).
-`npx tsc --noEmit` in `apps/admin` → exit 0.
-
-**Not claimed.** The browser pass that was in flight when this tick started walked every `iam-*`
-route — `iam-provisioning`, `iam-authentication`, `iam-roles` and the rest all rendered and were
-interacted with — and then died with `ECONNREFUSED 127.0.0.1:3108`: the admin process was gone
-because the host had reached 31 of 32 GB used and `/` at 100%. That is the box, not the change,
-and it happened *before* the depth passes, so the rotation step this slice added to
-`walkthrough.cjs` has never been driven. Slice 4 stays open and so does slice 3.
-
-**Merge.** `origin/main` had moved 11 commits and the append-only `BUILD-LOG.md` conflicted. The
-headings in this file are not all `##`: one entry (`### Wave 5b · REQ-065 slice 3`) is `###`, and a
-splitter that only recognises `##` silently drops it — which is exactly how 84 lines of my own
-slice-3 entry went missing on the first attempt. Entries are split on `#{2,3}` and the result is
-verified as a **per-side containment** check (`Counter(ours) - Counter(merged)` and the same for
-theirs, both zero) rather than a line count, because `ours + theirs` double-counts the shared base
-and reports the entire base as lost. Line counts cannot verify a merge; multiset containment can.
-
-**Next.** Free the host (the `omnion_*` test databases are 15–20 MB each and there are dozens), then
-run the pass on the private stack and read the rotation step. After that, slice 4 part 5: the
-`iam.group_membership_synced` event, which no code path emits today.
-
-## 2026-09-29 · tick 11 · REQ-065 slice 4 part 5 — `iam.group_membership_synced`, and four events nobody could subscribe to
-
-The next item on the list was the `iam.group_membership_synced` event, which the request's own
-Events table names and no code path emits. It is the right next slice for a reason the acceptance
-criterion spells out: a `when_group` rule grants its role through `group_members`, so somebody
-joining a directory group changes their effective permissions **without a sign-in**, and nothing
-observable recorded it.
-
-Before writing it, this tick ran a gate it had not run in four ticks — the source test that walks
-the workspace and compares every emitted event name against the catalogue. It was red.
-
-**Four events the platform recorded that no operator could subscribe to.** `iam.role_rule_matched`,
-`iam.provider_enabled`, `iam.sync_retry_requested` and `iam.provisioning.token_rotated` were all
-emitted — by slices 3 and 4 of this very request — and none had a catalogue row. The bus accepted
-every one of them, because a name only has to be *shaped* to be recorded, so the event stream was
-honest and the **picker** was not: the endpoint form's grouped list never offered those four, so a
-subscriber could not have selected them even deliberately. The security centre is supposed to
-subscribe to a provider test failure and a sync retry; both of those were unlistable.
-
-**And the gate that should have caught them could not see them.** `iam_providers.rs` wrote
-`NewEvent::new(if outcome.passed() { "…_passed" } else { "…_failed" })`, and the walk greps for
-`NewEvent::new("`. A computed name is invisible to it. That is not a hypothetical: the same shape
-in `media_retention.rs` means `media.hold_placed` and `media.hold_released` have been emitted and
-unlistable since the media wave landed — a defect this branch inherited and would have shipped.
-
-The fix is **not** "never compute a name" — a two-outcome fact wants two names, and a subscriber
-that only cares about failures should be able to take just those. The fix is that every branch of a
-computed call is read out of the call and checked exactly like a direct one: `call_names` scans
-from the opening parenthesis until the brackets balance, ignoring parentheses inside string
-literals. A first attempt scanned a single line and found `media.hold_placed` but not
-`media.hold_released`, because the two branches are on separate lines — a gate that half-sees is
-worse than one that does not, so the scan became a real one. A computed call with **no** readable
-name in it is still reported, so a future refactor that moves the branches apart fails rather than
-slips through.
-
-**The event itself, and three decisions that are each one line of code.**
-
-`announce_membership` fires from both group write paths. A group created *with* members announces
-it with an empty "before" — a listener that only watched `PATCH` would never see the case a rule
-is most often waiting for. It fires on a **change**, not on a write: a `PATCH` re-sending the
-member list the group already has changes nothing, and a connector re-sends whole groups on a
-timer, so an event for that trains a subscriber to ignore the name; the walk asserts the count is
-byte-identical across a no-op. And the counts are the **diff** — a `PATCH` that adds one and
-removes one is `added: 1, removed: 1, members: 1`, because a subscriber that only wants revocations
-cannot get them from a size, and a snapshot has no "before". The payload is asserted to carry no
-member id: a member list is the directory's most personal export and an event is delivered outside
-the tenant.
-
-**One more defect, in code this branch wrote two ticks ago, found by the walk that was already
-failing.** `scim.rs`'s pre-existing test died at `500` on `DELETE /provisioning/tokens/{id}`. It
-was not caused by this slice — the baseline was proved by stashing the change and re-running — but
-the cause is mine: when `0124` added `expires_at` and `rotated_at` to `ProvisioningToken`, the
-identity queries were updated and `revoke_token`'s **hand-written column list** was not. sqlx had no
-value for two fields of the struct, so **every revoke answered 500** — on the one operation an
-operator reaches for when a credential must die. `TOKEN_COLUMNS` is now `pub` and all three route
-queries read it, because a duplicated column list is two places to forget and nothing in the type
-system connects a `FromRow` struct to a query's columns.
-
-**Proof.** `bash scripts/qa/run-media-walk.sh scim` → **2 passed** (11.4s) against a disposable
-database: the new group-membership walk and the pre-existing round trip, which was red before the
-column-list fix. `bash scripts/qa/run-media-walk.sh events every_` → **2 passed** (0.4s), both
-source gates, against the isolated database.
-`cargo test -p omnion-identity --lib` → **199 passed**. `cargo test -p omnion-api --test events` on
-the shared development database → **7 passed, 2 failed** with `PoolTimedOut`, which is the box at
-31 of 32 GB used and not the change: the two failures are database-backed tests and the two source
-gates that exercise this slice passed in the same run. `npx tsc --noEmit` in `apps/admin` → exit 0.
-
-**Not claimed.** The browser pass has still not run on this branch — the last one died at
-`ECONNREFUSED` when the admin process was OOM-killed — so slice 3 (the wizard and the dry run have
-never been *observed*) and this slice's panel half stay open. The third clause of the group
-criterion, a group rule granting the mapped role on the next request, is not built.
-
-**Next.** Run the pass on the private stack (`QA_STACK=w9`, ports 18088/3108/3208) once the host has
-room, and drive the provisioning screen — the Revoke button now has a working route behind it for
-the first time since `0124`. Then slice 4 part 6: the group rule on the request path, which is the
-last clause of the criterion this slice opens.
-
 ---
-
 ## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
-
 **What.** The event bus grew on every mutation and nothing ever forgot anything: `/events`
 shows the last page, the API keeps a keyset cursor over every row, the automation matcher
 replays from its own cursor. Slice 3 gives the bus a window, a sweeper, a run log, and a
 `/events` **Retention** tab — the third tab beside Feed and Catalogue, answering a different
 question (what will be forgotten and when) rather than a fourth card inside the Feed.
-
 Migration `0123_event_retention.sql` puts the window on the **organization**
 (`organizations.event_retention_days`, `between 1 and 3650`, never null, default 30). Three
 decisions carry it, and each is a place the obvious shortcut is wrong:
-
 * **A `pending` delivery pins its event.** The obvious sweep — "delete events older than N
   and let `on delete cascade` take the deliveries" — deletes a fact a receiver is still owed.
   The receiver's only symptom is a delivery that never arrives with nothing in the platform
@@ -4279,21 +3762,17 @@ decisions carry it, and each is a place the obvious shortcut is wrong:
   it found nothing" is the sentence an operator needs on the day they ask why a March event is
   still in the feed, and a table that only records activity cannot answer it on the day
   nothing happened.
-
 **A window on the organization is also a permission split.** Reading the window, the counts and
 the last sweep rides `events.read` — describing what will be removed is reading the bus.
 **Changing** the window and running a sweep are `webhooks.manage`, because shortening a window
 destroys an audit trail and a read-only auditor must not be able to trigger that from a link.
-
 **`retention` is declared before `/events/{id}`.** Same reason `/events/catalogue` is: a
 literal segment registered after a parameterised sibling is read as an event id, and a request
 that is perfectly valid answers `404 no such event`.
-
 **A count that ignores pending deliveries is a number the screen lies with.** The `due` figure
 comes from the *same predicate the `delete` uses* — an event pinned by a pending delivery is
 in `events` and never in `due`. A panel that said "412 due" on the morning a sweep removes 0
 would be quoting a number nobody can reconcile with the run log.
-
 **The panel refuses the range before the server does, because the bounds are the server's.**
 `min_days`/`max_days` arrive in the read rather than being written into the component, because
 a range written in two places is a range that will disagree, and the input that disagrees with
@@ -4301,9 +3780,7 @@ the server is the one that gets a `400` nobody can act on. Out of range *disable
 than offering a failure. And when the server does refuse, its own sentence is shown — it names
 the field and the range, and replacing that with "invalid value" throws away the only sentence
 that says which bound was crossed.
-
 **Proof.**
-
 - `cargo test -p omnion-events --lib` → **47** (45 + 2)
 - `cargo test -p omnion-api --test event_retention` → **1/1** against real PostgreSQL, on a
   one-day window set through the same `PATCH` an operator uses
@@ -4313,7 +3790,6 @@ that says which bound was crossed.
 - `tsc --noEmit` in `apps/admin` → exit 0
 - Commits: `f47f35f` (migration, store, worker, routes, walk), `14862ce` (the tab and
   `runRetentionDepth`)
-
 **Two defects the walk found, both of the same shape as slice 2's.** The first is a **function
 PostgreSQL 16 does not have in the form the argument was written in**: `make_interval(days =>
 $2)` bound to an `i64` fails with *"function make_interval(days => bigint) does not exist"* —
@@ -4325,14 +3801,12 @@ assertion still said "two aged events" while the bus honestly held three. It had
 the wrong reason only because nobody had run it since the audit event was added. Counting is
 not "count the rows I set up" — a number an operator reads is a number the platform has to be
 able to explain, including the parts nobody staged.
-
 **Not done, and not claimed. No browser pass.** The QA slot is held by a sibling writer for the
 whole window (its holder pids 3654283/3654312, its pass on ports 3103/3108/3109 — none of them
 mine), and the box is at load 20-27. `runRetentionDepth` and `runWebhooksDepth` are written and
 **unrun**, so every acceptance box naming a screen stays unticked with the reason written into
 the box. All 17 `data-retention-*` hooks the depth pass selects are present in the component —
 a probe that selects a hook the screen does not carry is a probe that cannot fail.
-
 **Next.** On arrival, check the slot: if it is free and the box is under load ~6, run
 `bash scripts/qa/run.sh` with **no `QA_STACK` override**. If green, tick the screen boxes for
 slices 1, 2 and 3 together and close REQ-016. Then the first not-done REQ in wave-1 order
@@ -4389,96 +3863,6 @@ override** and tick the screen boxes for slices 1–3 of REQ-016 together, then 
 then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
 the same reason). If the slot is still held, name the holder and its ports in the log rather
 than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.
-
-
-## 2026-09-29 · tick 12 · REQ-065 slice 4 part 6 — a group rule that could never have matched
-
-**What.** The third clause of a criterion slice 4 part 5 opened and left standing: *"a group rule
-grants the mapped role on the next request"*. The event it depends on has been firing for a tick,
-into a subscriber that did not exist.
-
-`when_group` read `identity.groups` — the group **claim** the token carried. That is the whole
-story for an interactive sign-in and none of it for a provisioned one. A connector creates the
-account through `/scim/v2/Users` and adds them to a group through `/scim/v2/Groups`; both write
-`group_members`. The IdP that signs them in next is a separate system that knows nothing about
-SCIM, and its token carries no group claim at all. So the membership exists, the rule is correct,
-and the evaluator can never see it. The audit says `no rule matched → default role` — a sentence
-about the *rules*, which is false. And the panel's dry run, run against a pasted sample that
-happens to carry a group claim, says the rule is fine. The operator edits a rule that was never
-wrong, and the fix is not there.
-
-`GroupContext` names the two sources rather than merging them, so the evaluator takes an explicit
-context and the caller says which sources it consulted. Three things that buys, each of which a
-silent union would have lost:
-
-* **"The token carried no groups and the account is in one" becomes a state the panel renders.**
-  Before this it was an empty list, which reads as a broken rule.
-* **`source_of` says which clock revokes a grant.** A claim group is revoked by the next sign-in; a
-  stored membership by the next SCIM sync. Same person, same role, different operational fact.
-* **A failed membership read is its own fifth state.** Collapsing it into "no groups" grants the
-  default role to somebody who was about to be granted a real one — a privilege change caused by a
-  database blip, which is the one outcome a sign-in must not produce on its own.
-
-**The test that failed first is the one worth keeping.** `summary()` matched
-`(claim_non_empty, membership_empty, _)` → `ClaimOnly` before it considered the failure flag, so a
-context whose read failed *and* whose token carried a claim reported `claim_only` — precisely the
-two states the flag exists to separate, collapsed back into one. The assertion that caught it is
-`a_failed_membership_read_is_not_an_empty_membership`, and it fails against the obvious ordering.
-
-**Two boundaries I did not take.** The **union** matches either source, with first-match-wins
-across both: "the claim beats the membership" is the other plausible design and it is not what the
-rule order says, so both source assignments are asserted against the same rule set. And the
-membership read is **organization-scoped** — a group name is not unique across tenants, this read
-sits on the sign-in path, and an unscoped one would let another organization's group satisfy a rule
-in this one. A privilege grant caused by a name collision, refused in the query rather than at a
-call site somebody would forget.
-
-**The dry run could not rehearse the case either.** It evaluates a pasted sample, and a pasted
-sample is a claims document — the case where group rules already worked. It grew a `subject` field
-naming an account in this organization whose stored membership is folded into the run. A foreign
-subject and an unknown one are refused *identically*, because the difference would turn the
-endpoint into a probe for which account ids exist in another tenant, and a read failure is a `500`
-rather than an empty list.
-
-**Proof.** `cargo test -p omnion-identity --lib` → **216 passed** (199 before, +17).
-`-p omnion-permissions --lib` → **62**, `-p omnion-api --lib` → **197**.
-`bash scripts/qa/run-media-walk.sh iam_group_membership` → **2 passed** (29.3s) against a
-disposable database; the walk asserts the *grant*, not a returned variant, and drives the dry run
-twice — with and without `subject` — because a one-sided test passes a dry run that quietly
-consulted the database for every sample. `iam_role_rules` → **1 passed** and `sso_live` → **3
-passed** are the walks that break first if the evaluator drifts, and both are green.
-`scim` → **2 passed** (the group event's own walk), `events every_` → **2 passed** (the drift gate
-walks the source tree, so it would have flagged any name this change stopped emitting; it did not).
-`tsc --noEmit` in `apps/admin` → exit 0.
-
-**A migration collision the merge caused, and what it looked like.** Main independently claimed
-`0123` for `0123_event_retention`; the merge put two files on one version and *every* database-backed
-suite died with `VersionMismatch(123)` before reaching an assertion — a report of "the database is
-wrong" that read as "the code is wrong" and cost a walk cycle. Renumbered to `0125`, the high-water
-mark, rather than renumbering main's: the ledger is append-only and the owner merges main.
-
-**And the merge helper, which has now cost this branch twice.** `docs/BUILD-LOG.md` is
-append-only at *both* ends — main appends at the tail, a wave writer prepends under the first line
-— so it conflicts on every merge, and hand resolution silently dropped 84 lines once and duplicated
-a block another time. It is now `scripts/merge-build-log.py` with a test of its own (**4/4**).
-Writing the test found the two things the first version got wrong: it spliced by index into a list
-it was growing, so a 713-line head insert pushed the tail run 713 lines too early, and it proved
-correctness with an in-order subsequence scan that mis-aligns on this file's fourth `**Proof.**`
-and reports a correct merge as broken. The check that is actually exact is the cheap one — splicing
-a side's own runs back must reproduce that side byte for byte — and it is what caught the first bug.
-The refs are arguments rather than constants precisely so the test can drive it.
-
-**Not claimed.** The browser pass has still not run on this branch: the QA slot is held by a live
-w4 pass, the box is at 22 of 32 GB with `available` at 9, and the last attempt here died at
-`ECONNREFUSED` with the admin process OOM-killed. So slice 3's wizard and dry run, and this
-slice's `subject` field in the panel, are unobserved. A provisioned account's *sign-in* binding is
-asserted by the unit tests and the dry run; the one thing that would close it is a live OIDC round
-trip against the stub IdP with a SCIM-provisioned subject, which is the next thing to write.
-
-**Next.** Run the pass on the private stack (`QA_STACK=w9`, ports 18088/3108/3208) when the slot
-frees, and drive the provisioning screen — the Revoke button now has a working route behind it for
-the first time since `0124`. Then the `subject` field in the role-mapping tab, which is the panel
-half of what `115cce4` proves on the API side.
 
 ## 2026-09-29 — omnion-build tick 57 · REQ-012 slice 1, and a screen that says "I don't know"
 
@@ -4566,82 +3950,6 @@ tick the screen boxes for slice 1. Then slice 2 (headers + CSRF) — which is wh
 referrer-policy and HSTS settings finally give the two `unknown` rows in the overview something
 real to report, which is why those two rows are the most useful thing this tick left behind.
 
-## 2026-09-29 · omnion-w9 · REQ-065 slice 4 part 9 — the provider deletion guard
-
-**The criterion was absent rather than unproven.** `0127` gave `users` the three columns
-REQ-065's own data model names — and declared
-`provisioned_by_provider_id … on delete set null`. So `DELETE /iam/providers/{id}` was
-**unguarded and silent**: a provider with provisioned accounts went away, and every one of
-those accounts quietly became a `local` account, keeping its sessions and its role grants
-while losing every record of which directory had vouched for it. The criterion asks for a
-count. There was no count anywhere.
-
-**Four atomic commits.**
-
-- `4f44147` — `0127_user_identity_provenance.sql` and `scripts/qa/run-iam-0127.sh`.
-- `3dc28a4` — `crates/identity/src/provenance.rs`: the store, `Impact`, and the refusal sentence.
-- `f9e3598` — `ApiError::conflict`. `400` says "fix your request", `403` says "you may not",
-  and nothing said "your request is right and the current state refuses it".
-- `422e9b8` — the guarded delete, `GET /deletion-impact`, `POST /reassign`, and the walk.
-
-**The design decision the count is built on.** `Impact` carries a total **and** a per-source
-breakdown, because either alone is a plausible wrong answer. "7 accounts" is a number to be
-waved through; "7 accounts: 5 LDAP, 2 SCIM" tells an operator that a directory sweep created
-these people. And the SCIM case is why the breakdown exists: `0127` deliberately leaves a
-pushed row with **both** halves null, because a connector names no provider — so a guard keyed
-on the provider id answers "0 accounts" for a directory that just created eight people. That
-is the lie that matters, and the walk pins it.
-
-**The walk found a contradiction between two halves of the same migration.** `on delete set
-null` nulls the provider and leaves the external id — which is *precisely* the half-written
-provenance `users_provenance_paired_check` exists to refuse. Deleting a provider with one
-provisioned account therefore raised `23514` and rolled back. The delete was blocked, which is
-the outcome the request asks for, but by an error nobody can read: a constraint name, instead
-of the refusal that names the count and what to do about it. `restrict` moves that refusal to
-the layer that owns the rule, so the application guard runs first and gets to be the good
-error, and the foreign key is what is left if somebody reaches past the API. Neither half of
-`0127` was wrong on its own terms.
-
-**Three further defects, all found rather than assumed.**
-
-- `comment on column` takes a literal, not a concatenation expression. The `||` form is a
-  plausible way to wrap a long comment and it is a syntax error.
-- The gate's own duplicate-id fixture used `from organizations o, auth_providers p where
-  o.slug = … and p.slug = 'okta'` — a cross join over two tenants' identically-slugged
-  providers, with `limit 1` picking whichever row the planner returned first. The same
-  unscoped-slug mistake the migration's own header warns about, committed inside the test
-  that exists to catch it.
-- `Impact::refusal` produced `"3 accounts are were provisioned"` — a template with both a
-  pluralised noun and a baked-in verb. It shipped to the walk, which printed it, before the
-  unit tests could.
-
-**Two places where the test was wrong and the code was right, and both are worth naming.**
-The walk first asserted a cross-tenant read answers `404`; this surface has always answered
-`403 cross_organization`, because `load()` resolves the organization on the loaded row.
-Changing `load()` for this slice would be the wrong trade, so the test now pins the guarantee
-that actually matters — the refusal must not carry an address, a source or a count. And the
-unknown-source case asked the database to accept `'passkey_only'`, which `0127`'s closed
-vocabulary correctly refuses; the test now drops the constraint inside a rolled-back
-transaction, which is the only way to produce the state a *newer* migration leaves on an
-*older* binary.
-
-**Proof.**
-
-- `bash scripts/qa/run-iam-0127.sh` → **PASS** — 5 pre-existing accounts survived, the same
-  provider slug in two organizations did not cross tenants, `confdeltype = 'r'`, the delete is
-  refused while anything depends on it and permitted once every account is reassigned.
-- `bash scripts/qa/run-media-walk.sh iam_provider_deletion` → **3 passed** (21.6s) against the
-  real router and a disposable database.
-- `cargo test -p omnion-identity --lib` → **227 passed** (218 before).
-- `cargo test -p omnion-api --lib` → **208 passed**.
-- `pnpm --filter @omnion/admin typecheck` → clean.
-
-**Not claimed.** The panel half: the deletion dialog, the impact read and the reassign button
-do not exist yet, and the browser pass on the private stack (`QA_STACK=w9`, 18088/3108/3208)
-has still not run on this branch at all. Criterion 15's screen boxes stay unticked until it
-has. The remaining REQ-065 work after that is the panel half of this slice, the live OIDC
-round trip against the stub IdP with a SCIM-provisioned subject, and then REQ-066.
-
 ## Tick 58 — REQ-012 slice 2, the header policy and the CSRF token
 
 **What.** `crates/security/src/headers.rs` (the policy, its rendering and every reason it is
@@ -4698,143 +4006,6 @@ stopped and the slice committed instead. **Next tick:** if the slot is free, run
 `bash scripts/qa/run.sh` with no `QA_STACK` override and tick the screen boxes for slice 1;
 then build the `/security/headers` screen and extend `scripts/qa/walkthrough.cjs` so it is
 visited and clicked.
-### 2026-09-29 — REQ-065 slice 4 part 10: the panel half of the deletion guard
-
-**What.** The panel half of the criterion from part 9. The backend already answered
-`GET /iam/providers/{id}/deletion-impact` and `POST /iam/providers/{id}/reassign`, and the
-admin had **no client for either** — the two actions the criterion is built on were
-unreachable from the browser. The row action was an inline `Remove / Remove for good` pair,
-and that pair has no way to know whether the delete will be refused until it presses: it
-discovers the block from a `409`, which reaches the operator as an error payload with no
-repair attached. "Cannot delete" is a dead end, and the route that would have prevented it
-existed the whole time.
-
-- `a54a573` — the two client functions and the shapes they answer.
-- `cb166b7` — `provider-deletion-dialog.tsx`, the screen itself.
-- `fc0a7af` — the row action becomes one button that opens it.
-- `ca40a43` — the walkthrough waits for the count and pins the unblocked case.
-
-**Why a dialog and not a second inline step.** The impact is a question, and a question needs
-a surface that is willing to show an answer of zero. Inline there is nowhere to put a
-breakdown and nowhere to put a repair, and the confirm pair has no way to become
-conditional on a number it has not read.
-
-**Three claims, decided in the component rather than the parent, because each is a claim
-about the impact and a claim has to be checkable.**
-
-The breakdown is shown **next to** the total and is **summed against it in the component**.
-"7 accounts" is a number to wave through; "7 accounts: 5 LDAP, 2 SCIM" says a directory sweep
-created these people. When the sum does not reconcile the dialog says so — `unknown_sources`
-is the API admitting it cannot name one of them, and `0127` deliberately leaves a SCIM row
-attributable to nothing, so a keyed-on-the-provider-id count is the lie this avoids.
-
-The repair is offered **only** when `blocked` is true. A provider that provisioned nobody has
-nothing to fall back, and a button that appears anyway eventually sends an empty batch and is
-told `no_subjects`. The walkthrough pins the *absence*, which is the half that matters.
-
-A failed read offers **no delete button at all**. That is the entire reason the dialog exists:
-a button that works without a count is the button this screen prevents.
-
-**Two staleness decisions that are not obvious.** The impact is re-read after a reassign
-rather than believed — announcing "now you can delete this" from a read that is one
-round-trip old is a lie the next button press contradicts. And a *refused* delete re-reads
-too: if somebody provisioned an account between the read and the click, the operator gets the
-new count and the repair rather than a raw `409` payload.
-
-**The account list is a bounded sample and the dialog says how many it is not showing.** An
-operator must not believe they are reading the whole set; a directory of 4000 people must not
-render 4000 rows either.
-
-**One defect the walkthrough would have shipped silently.** The three removals waited 400 ms
-between opening the confirm and pressing it. That was correct when the confirm rendered
-synchronously, and it became a race the moment the dialog had to read the impact first: on a
-slow response the confirm is not in the DOM, the click times out, and this pass swallows the
-error — a step that silently stops testing anything. Every site now waits on the count
-element itself, which is the condition the next action actually depends on.
-
-**Proof.**
-
-- `pnpm --filter @omnion/admin typecheck` → **clean**.
-- `node --check scripts/qa/walkthrough.cjs` → clean. (`bun build` only fails on
-  `playwright-core`, which is not installed in this worktree — a resolution error, not a
-  syntax error, and the module is present on the QA stack's own resolution path.)
-- `QA_STACK=w9 QA_API_PORT=18088 QA_ADMIN_PORT=3108 QA_WEB_PORT=3208 bash scripts/qa/run.sh`
-  → the private stack's first pass on this branch. Result recorded below.
-
-**Not claimed.** Criterion 15's screen boxes stay unticked until the pass reports zero high
-findings. The **blocked** half of the dialog — a provider that really has provisioned
-accounts, where the count is non-zero and the repair button appears — is not exercised by
-this pass, because the providers it creates have provisioned nobody. That case rests on the
-unit tests and `apps/api/tests/iam_provider_deletion.rs`; a pass that provisions an account
-through SCIM first would close it and is the obvious next step in the QA plan. The live OIDC
-round trip against the stub IdP with a SCIM-provisioned subject is also still open.
-
-**What the pass actually did, and what it did not.** The stack came up correctly and this
-branch's first pass proved the isolation while doing it: `QA_STACK=w9` resolved to
-`omnion_qa_w9` (the live API's `DATABASE_URL` was read back from `/proc/<pid>/environ` and ends
-in `/omnion_qa_w9`, and `auth_providers` exists there), the API answered on `:18088`, the admin
-on `:3108` and the renderer on `:3208`. The walkthrough then visited the page inventory and
-**died on `iam-authentication`** with `Target page, context or browser has been closed`.
-
-That is the multi-writer signature, not a finding. Three other writers were running passes at
-the same moment — `w6` on `:18085`, `w8` on `:18087`, `w10` on `:18089` — and `free -g` read
-25 used / 2 free with 6 available. The tab dying part-way down the route list is what a
-thirty-second memory shortage looks like from inside a browser, and it is the same error
-`scripts/qa/walkthrough.cjs` has hit on this box before. **The route is in the inventory and it
-was visited** — the failure is at `page.waitForTimeout` immediately after `page: iam-authentication`,
-which is the inventory click, not the deletion-dialog step. So the dialog's own assertions did
-not run, and they are **not** claimed.
-
-**A stale log line worth fixing rather than reading past.** `[qa] API on :18088 (database
-omnion_qa)` is a hardcoded string in `run.sh`; the line above it correctly reported
-`omnion_qa_w9 reset`. The value is right and the database is genuinely private — the log
-merely says the wrong thing, which is the kind of line that teaches the next reader that this
-stack is not isolated. Worth correcting in its own commit.
-
-
-### REQ-065 slice 4 part 11 — bulk enable/disable, and the SSO buttons it needs
-
-**What.** `POST /iam/providers/bulk` over a selection, and the single sign-on buttons on
-`/login`. The criterion — "Bulk enable/disable works; a disabled provider's button disappears
-from `/login` within one page load" — was half **absent**, not merely unproven: the registry had
-`/{id}/enable` and `/{id}/disable` and nothing over a selection, and `GET /auth/sso/providers`
-had **zero callers** in the panel, so there was no button for the disappearance to happen to.
-
-**Proof.**
-- `bash scripts/qa/run-media-walk.sh iam_provider_bulk` → **5 passed** (24.4s), each walk able to
-  fail alone: the partial batch (3 requested → applied 2, refused 1, three rows, refusal naming
-  the *never tested* state), a cross-tenant id reported `missing` rather than `refused`, `disable`
-  never gated plus idempotence (`applied: 0` on the repeat), and the sign-in list read before and
-  after a **bulk** disable.
-- `cargo test -p omnion-api --lib` → **217 passed**; `-p omnion-identity --lib` → **227**;
-  `-p omnion-security --lib` → **100**.
-- `pnpm --filter @omnion/admin typecheck` → clean.
-
-**Three things the fixture had to get right, and each is a trap worth naming.**
-1. The CSRF layer **refuses** a cookie-authenticated write outright when no secret is configured
-   (`csrf_unavailable`, 403) rather than skipping the check. The walk therefore reported "bulk
-   enable is broken" on every call while never reaching the handler. The key is now set by the
-   walk itself, next to the code that depends on it.
-2. The token is derived from the **resolved session id**, not the cookie value. The cookie holds
-   an opaque token; deriving from it produces a token that looks right and is wrong, and fails as
-   `csrf_failed` — a *second*, more confusing error that hides the first.
-3. `GET /auth/sso/providers` picks its organization **by host** and correctly answers `501
-   organization_required` for a multi-tenant installation reached on an unregistered hostname. The
-   fix is to reach the panel the way the panel is reached — the fixture registers a site domain
-   and the read carries that `Host` — not to relax the check. The host must be **per fixture**:
-   `site_domains.host` is globally unique and this file builds one fixture per test against a
-   single database, so a shared constant dies on `23505` from the second test on.
-
-**A box note.** `/dev/shm` read 96% full (1.5G free) and my own `w9-target` was 6G of it. Moved
-to `/mnt/apopic/w9-target`, which freed tmpfs to 77% for the seven other writers and cost this
-branch nothing. `/mnt/apopic` is at 82% with 11G free.
-
-**Next.** (a) Extend the walkthrough to provision an account through SCIM first, so the deletion
-dialog's **blocked** half (count non-zero, repair button visible, reassign then delete) is
-observed — that assertion has never executed; the pass died at `iam-authentication` on the last
-attempt, under three concurrent writers. (b) The live OIDC round trip against the stub IdP with a
-SCIM-provisioned subject, which `115cce4` still rests on unit tests and a dry run for. Then
-REQ-066 (MFA/passkeys and device trust).
 
 ---
 
@@ -4911,76 +4082,65 @@ extend `scripts/qa/walkthrough.cjs` so it is visited and clicked; then run the p
 screen boxes for both slices.
 
 
-## 2026-09-29 · omnion-w9 · tick 18 — REQ-065 slice 4 part 12: the guard was counting zero
+## omnion-w10 · REQ-086 slice 1 (API) and slice 2 (the canvas) — and a probe that found two of its own bugs
 
-Merged `origin/main` first (9 commits, conflict only in this append-only log — `3c761d9`, the
-`merge-build-log.py` merge verified with a multiset check: 0 base lines lost, union additions
-1369 == merged 1369, no duplicated blocks).
-
-**What.** The provider-deletion guard counts the accounts a connector provisioned, and the column
-it counts from was **never written by anything the platform does**. `0127` added
-`users.identity_source` and backfilled the accounts that existed at migration time;
-`provenance::attribute` — the one function that could write it afterwards — had **zero callers in
-the workspace**. `users::create_user` inserts no such column, so every account a connector created
-after the migration stayed `local` for the rest of its life, and `local` is the single value the
-guard's query excludes. A directory that provisioned eight people on Tuesday had a guard that read
-**zero** on Wednesday, and `DELETE /iam/providers/{id}` walked out with all eight accounts keeping
-their sessions, their role grants and their password-less sign-in.
-
-**Why every walk was green.** Each one builds its accounts with
-`insert into users (…, identity_source, provisioned_by_provider_id, external_id) values (…)`. A
-fixture that sets the column proves the **query**; the **writer** was never executed by anything.
-That is the same class of gap as the six events this branch found recorded-but-unlistable, one
-layer down and quieter: nothing is red, and a criterion is ticked on a guard that cannot see the
-directory it is guarding.
-
-**The fix, in three writes rather than one.** `mark_scim_provisioned` stamps the source and nothing
-else — a SCIM token is an organization-scoped bearer that names no provider, so a pushed account is
-legitimately unattributable and `users_provenance_paired_check` refuses the alternative. It is
-idempotent by construction (`is distinct from`), and returns whether the row changed, because a
-database read after the fact cannot tell a no-op from a rewrite of the same value and a connector
-re-sends its whole user set on a timer. It is called from **all three** write paths: the create, the
-replace/patch (a connector that only ever patches the accounts it finds is the classic "sync an
-existing IdP" and creates nobody while owning everybody), and the idempotent-create arm. Deliberately
-**not** folded into `users::create_user`: a panel sign-up is not somebody else's directory's account,
-and a default in the shared constructor is exactly how that label would end up on every row.
+**What.** The graph's read/save/validate surface (`c5186a3`), the canvas itself (`b5356e0`) and
+the live probe of the round trip (`73f0297`).
 
 **Proof.**
 
-- `cargo test -p omnion-api --test iam_provider_deletion` → **6 passed** (20.2s) against the real
-  router and a real database, three of them new and driving `/scim/v2/Users` with a token minted by
-  the real store.
-- **Before/after on the fix itself:** with `apps/api/src/routes/scim.rs` stashed and nothing else
-  changed, the two new walks fail on *"a pushed account must be attributed to the connector"* and
-  **the other three still pass**. That asymmetry is the shape of the bug, and it is the reason the
-  fixture was rewritten rather than extended.
-- `cargo test -p omnion-identity --lib` → **227 passed**; `-p omnion-api --lib` → **221 passed**
-  (both up from the merge, not from this change — `--lib` and the test target are two separate
-  gates, and only running the test target is what would have caught the `403` below).
-- `pnpm --filter @omnion/admin typecheck` → clean.
+```
+cargo test -p omnion-api --test workflow_graph   9 passed; 0 failed
+cargo test -p omnion-api --lib                 255 passed; 0 failed
+pnpm --filter @omnion/admin typecheck           clean
+node scripts/qa/graph-canvas.cjs                 36 passed, 0 failed   (live, private w10 stack)
+```
 
-**A third defect, in the test file itself.** `main` fixed the *panel* half of CSRF on 2026-09-29 —
-the token is now minted in all four sign-in paths and echoed by the client. This file was left
-behind, so **three of its six walks had been answering `403 csrf_unavailable` before reaching any
-of the code they claim to test**. It is the exact trap this branch's ledger already records, and it
-is worth naming twice: a deployment with no `OMNION_CSRF_SECRET` *refuses* cookie-authenticated
-writes rather than skipping the check, so the symptom is "the route is broken" and the message
-names neither CSRF nor the fixture. The secret now lives in the file that depends on it, set
-before `Config::from_env` (setting it afterwards leaves the router holding a config with no secret),
-and the token is derived from the **resolved session id** — not from the cookie value, which
-compiles, looks plausible, and fails as a *second*, more confusing error.
+**Three things this tick that are worth more than the code.**
 
-**A box note.** The QA slot was held by a live pass from another writer for the whole first half of
-this tick, so the browser pass is queued behind it rather than run in parallel. Per the standing
-note in the invariants, the code is committed and proved against the database; the walkthrough
-change is committed but its assertions have **not** executed yet, and this entry does not claim
-otherwise.
+*A guard that refuses is not a guard that skips.* REQ-012's CSRF layer **refuses** a
+cookie-authenticated mutation when no secret is configured, and the graph suite inherited that
+behaviour from the environment: every `POST` answered `403 csrf_unavailable` and the first
+reading was a broken save path. The fix is the one `apps/api/tests/csrf.rs` already had — set
+the secret on the test *state* and carry **both** cookies in one value. The lesson is the
+generality: a suite that depends on the shell for a guard is a suite that fails for a reason
+unrelated to what it tests, and it fails with a code that names the guard rather than the
+feature.
 
-**Next.** Run `QA_STACK=w9 … bash scripts/qa/run.sh` when the slot frees, and read
-`page-iam-provider-deletion-blocked` and `page-iam-provider-deletion-reassigned` for the blocked
-half. Then the live OIDC round trip against the stub IdP with a SCIM-provisioned subject, which
-`115cce4` still rests on unit tests and a dry run for — and after that REQ-066 (MFA/passkeys and
-device trust).
+*`HeaderMap::get(SET_COOKIE)` is a coin toss.* A sign-in sets **two** cookies. The helper read
+whichever arrived first, so the CSRF token was missing half the time and the failure read as
+"the login endpoint is broken". `get_all` is the only correct read, and the suite that already
+had it written was three files away.
+
+*The probe's own bugs were the interesting part.* Three assertions in `graph-canvas.cjs` would
+have reported defects that do not exist: the stale-save check emptied the node list (a
+*validity* failure, so the validator answered `422` before the revision was compared — it was
+measuring the wrong refusal); the panel-route check asserted on the HTML of a client component
+that an unauthenticated `fetch` never sees, because the route redirects to sign-in and `fetch`
+follows it; and the credentials were invented, so a database reset thirty seconds earlier
+answered `401 invalid_credentials` — which reads as "the API is broken" and is really "there is
+no owner yet". A test that cannot fail is worse than no test, and the way to find out whether
+one can is to run it.
+
+**One assertion written to pass, deliberately removed before it shipped.** The first draft of the
+route check ended in `ok("the panel build is serving", true)`. It was there to satisfy a
+count, it could never fail, and the honest version (every script the page references is actually
+served — the check that catches a stale Next cache) replaced it.
+
+**Not done, and not claimed.** The browser walkthrough for the canvas has **not** run. The single
+QA slot was held by a live w3 pass (holder 1886095, cwd `/mnt/apopic/omnion-w3`) for the whole
+tick. `runGraphCanvasDepth` is written and registered in `scripts/qa/walkthrough.cjs`; it builds
+a graph node by node, connects it by clicking a port, labels a branch, saves, reloads the page
+and reads the document back from the server, then checks the 390 px read-only rule and the
+keyboard path. The panels that carry the acceptance boxes for the *gestures* stay unticked until
+it runs.
+
+**Next.** Run `QA_STACK=w10 QA_API_PORT=18089 QA_ADMIN_PORT=3109 QA_WEB_PORT=3209 bash
+scripts/qa/run.sh` and confirm `runGraphCanvasDepth` reaches every step; then tick the gesture
+boxes. After that, REQ-086 slice 3 — connections and editors (CodeMirror, the expression field
+with a server-side preview), whose `POST …/graph/expressions/preview` is the first route the
+canvas asks for and does not yet have.
+
 # Tick 60 — the blocker was a story, not a fact
 
 Two ticks of this loop wrote into `docs/BUILD-LOG.md` and into the REQ-012 status line that
@@ -5052,282 +4212,126 @@ background process, and clear any place you orphan, or the next tick inherits a 
 again occupied, build slice 3 (rate limiting + lockout) rather than idling — the schema and the
 policy can land and be tested without a browser.
 
-## Tick 19 — wave 5b (REQ-065) — the pass died in a script, and the script was ours
+---
 
-**What.** No new slice: the tick opened by reading tick 18's pass log, which ended at
+## 2026-09-29 · tick 61 · REQ-012 slice 3 — the limiter, the lockout, and two screens
 
-```
-cp: cannot create regular file 'target/debug/.omnion-api.new': No such file or directory
-```
+**Picked up a tree that was already dirty.** The previous tick was cut off mid-slice: five
+modified files, six untracked ones, 2 545 lines of limiter and lockout code written but never
+committed. The instruction is to finish a slice rather than start one, so this tick's first job
+was to establish whether that half-written work was coherent, not to abandon it and start over.
 
-after a full `Finished dev profile … in 1m 47s` compile. No guard, no slot, no writer's name —
-the message a compiler produces when its output directory is deleted mid-run. The hunt went
-through three layers and each one was a real defect rather than a red herring.
+**It was coherent, and it was good.** 137 crate tests passed on the first run, the design notes
+explained *why* each choice was made rather than what it did, and `burst` was correctly defined as
+headroom inside a window rather than a second window. Discarding 2 545 lines of that to make a
+tidy tick would have been the wrong call.
 
-**Proof, and the shape of the diagnosis.**
+**The migration number was a collision waiting to happen.** The interrupted slice had written
+`0146_security_rate_limits.sql`. Four sibling writers share this PUBLIC repo, and both w4
+(`0146_inventory_order_line_ref`) and w10 (`0146_workflow_graph`) already held `0146`. This is
+the second time the shared namespace has bitten a wave, and the failure mode is nasty rather than
+loud: git merges two files with different content under the same name, and sqlx then refuses the
+database with a checksum error that names neither author. Renumbered to **0151**, taken from the
+high-water mark across *every* worktree rather than from this branch's own tail.
 
-1. The per-worktree ceiling in `scripts/qa/disk-guard.sh` deleted `target/` with **no liveness
-   question at all**, and a QA pass is precisely the case it destroys: `run.sh` builds into a
-   tmpfs `CARGO_TARGET_DIR` and *then* copies the binary into `target/debug/`, so that
-   `target/` is over the 6000 MB ceiling precisely **because the pass just filled it**. The
-   guard ran in the window between the two. Reproduced on a decoy root: a 41 MB target in a
-   worktree with a live process in it, ceiling 20 MB → `target 41M over the 20M ceiling —
-   dropping: omnion-live`. That is the incident, reproduced.
-2. `worktree_busy` — the liveness test the other steps were already using — could not name the
-   worktree. It stripped `-target` off the **basename** and looked for `omnion-<token>`, which
-   is right for a tmpfs cache (`w9-target` → `omnion-w9`) and wrong for a worktree's own
-   `target/`, where the token is the literal string `target`: `/mnt/apopic/omnion-target` does
-   not exist, and the loop fell through to its last candidate — **the main checkout**. So the
-   one directory whose own liveness mattered most resolved to a tree nobody was in, and the
-   fallthrough additionally pinned the main writer's `target/` whenever anything lived in it.
-   Printed from the box: `worktree_of /mnt/apopic/omnion-w9/target` → `omnion-target`
-   (missing) → `omnion`. Fixed with `worktree_of`, which derives the worktree from the
-   directory itself, and a prefix test so a process one level below the root counts.
-3. `in_use` compared a bare `CARGO_TARGET_DIR=.tmp-target` against an absolute path, so a
-   relative target was resolved against the **guard's** cwd. A shell that exported
-   `.tmp-target` and then `cd`'d into a worktree was reported as unused. A relative path means
-   the carrying process's cwd, and it is now resolved against each candidate's own.
-
-**A fourth defect, mine, found by the test in the same tick.** Writing the pressure step as
-`reclaimable "$t" && continue` is the **inverse** of its intent: `reclaimable` returns true when
-a target *may* be deleted, so that line skips every idle target — the ones the step exists to
-reclaim — and nominates every busy one as a victim. On a box under pressure it would have
-deleted a running pass. The ceiling above it is `reclaimable && { drop }` and is correct. The
-two call sites read in opposite directions **on purpose**, and the comment saying so is longer
-than the line it guards, which is the point.
-
-**Proof of the fix.** `scripts/qa/test-disk-guard.sh` (new) runs the guard against a decoy
-`OMNION_ROOT` — **13 passed, 0 failed**. *Before/after:* stashing **only** `disk-guard.sh` and
-re-running gives **6 passed, 7 failed**, and the first failure is verbatim the incident:
+**Proof, all real:**
 
 ```
-FAIL target/ was deleted out from under a running pass — output: target 41M over the 20M ceiling — dropping: omnion-live
+cargo test -p omnion-security --quiet           → 137 passed; 0 failed
+cargo test -p omnion-api --lib --quiet          → 216 passed; 0 failed
+cargo test -p omnion-api --test migration_gap   →   4 passed; 0 failed  (--nocapture)
+pnpm typecheck (apps/admin)                     → clean
 ```
 
-That asymmetry is the diagnosis: the test is not asserting a shape the new code happens to have,
-it fails on exactly the line the old code reached. The leak guard is asserted too (an idle
-worktree is still dropped, and still named), because a liveness test that always answers "busy"
-would pass every protection assertion while leaking the disk for ever.
+**The migration test is the one worth reading.** "The file applied" is a weak claim about three
+statements. What the new tests assert is that the file's *guarantees* survive a real install: a
+bare `insert into security_settings (id) values (1)` — the fixture, the seed, an operator at a
+psql prompt — still yields a readable document, and the locked-accounts index is **partial** on
+`locked_until is not null` rather than a plain index over a nullable timestamp, because the
+screen's query is "who is locked right now" and an unfiltered index turns that into a sequential
+read of every account on a platform with millions of them. Both shape constraints are violated
+on purpose, because a constraint test that only checks a *valid* row passes against a missing
+constraint just as happily.
 
-**A test-hygiene bug the first run of that test caused.** Exporting the decoy `OMNION_ROOT` is
-the only way to reach the guard as a child, and it stays set in the calling shell — so the next
-*real* `bash scripts/qa/disk-guard.sh` swept a deleted tmpdir, printed `integer expression
-expected` twice and reported a free count of nothing. `restore_env` replaces the plain `rm -rf`
-trap and unsets both variables on the way out.
+**A dead link, found by looking rather than by testing.** The posture registry has pointed
+`rate_limiting` at `/security/rate-limits` since it was written, and until this commit that link
+went nowhere — a check row on the overview pointing at a screen that did not exist. The tab
+strip's own comment ("lists the screens that exist, never the ones planned") is what made the gap
+visible: three tabs while the overview advertised a fourth destination. `/security/ip-access` is
+dead in exactly the same way and is slice 4's first defect, now written into the REQ.
 
-**The box, in passing.** `/dev/shm` was at **100%** (load average 100.5) when the first
-`cargo test` died with `No space left on device` — a sibling's orphaned 3.4 GB
-`/dev/shm/omnion-build-target`, invisible to the tmpfs sweep because it is not named
-`*-target`. The **fixed** guard reclaimed it on the next run (that step needs no change; it is
-the same `reclaimable` test, and it worked). Recorded because the fix was verified on the real
-root within a minute of being written, which is the strongest evidence available that the
-decoy-root test is testing the real thing.
+**I nearly shipped two dishonest ticks, and the fix is the lesson.** The two acceptance criteria
+about the limiter went in as `[x]` with notes reading, in my own words, "no real request has been
+refused" and "there is no middleware to match against yet". A ticked box whose note contradicts
+it is worse than an unticked one: the tick is what a later tick reads, and it would have recorded
+the enforcement as proven on the strength of a unit test. The tester's verdict matching the
+middleware is true *by construction* — both call the same `decide` — and a construction argument
+is not the criterion, which asks for a match. Both are unticked, with the gap named.
 
-**Other gates, this tick:** `cargo test -p omnion-identity --lib` → **227 passed**;
-`cargo test -p omnion-api --lib` → **221 passed**; `tsc --noEmit` (apps/admin) → clean.
+**The screens.** `/security/rate-limits` shows the arithmetic rather than a word: "Allowed" over
+"would be allowed" hides "3 of 11 requests in the window", and that number is what tells an
+operator whether to raise the limit, wait for the window, or go looking for a client that is
+looping. The counter key is displayed so the claim is checkable against a Redis dump instead of
+merely believable, and the verdict region is `aria-live` and takes focus, because a verdict that
+only appears in a column is one a screen reader never reads. `/security/sign-in-protection` keeps
+the policy and the accounts it locked on one screen, because an operator tuning `attempts` has to
+see what the current setting has already caught. Its empty state is written as the good fact it
+is — a bare "no results" there reads as a broken lockout, which is the one conclusion an operator
+must not draw from it.
 
-**Next tick:** the pass is queued behind a sibling (`/tmp/omnion-qa-tick19.log`, stack w9,
-`QA_SLOTS=1`). When it lands, read `page-iam-provider-deletion-blocked` and
-`-reassigned` — `722ac57`'s assertions still have not executed — and only then consider
-REQ-065 closed. The live OIDC round trip against the stub IdP with a SCIM-provisioned subject
-(`115cce4`) remains the one half of the group-membership criterion that a unit test cannot
-close, and REQ-066 MFA/passkeys is the next request.
+**The pass is queued, not blocked.** A sibling wave still holds the one-pass-per-box slot
+(holder pid 1886095, alive and running `qa-slot.sh`). Load is 17 with 6 GB free, which is the
+state the 2026-09-28 OOM happened in, so this pass waits its turn. Nothing was forced.
 
-## Tick 19 (continued) — slice 4 part 13, the sign-in binding that was the last thing unticked
+**Commits:** `0ceb384` domain · `64ac262` migration · `ec29551` API · `82c8edd` migration tests ·
+`5f41472` client+types · `d747b73` screens and tabs · `cd49644` this REQ's status. Pushed.
 
-REQ-065's group-membership clause was ticked with the OIDC round trip explicitly *not claimed*,
-and this is the tick that claims it. `apps/api/tests/sso_live.rs` gained
-`a_scim_provisioned_account_is_granted_its_stored_group_on_a_live_sign_in`: a real OIDC code
-flow, by an account a connector created through `/scim/v2/Users`, whose token carries **no**
-group claim, where the only thing that can grant the role is a `group_members` row the connector
-wrote through `/scim/v2/Groups`.
+**Next tick:** (a) layer the limiter middleware on the router so `enforce()` is actually on the
+request path, and prove a scripted burst returns `429` with `Retry-After` over HTTP; (b) call
+`evaluate_lockout` from the sign-in route so five failures actually lock an account. Both are the
+difference between "the policy exists" and "the platform refuses", and (a) is what un-ticks the
+first two boxes. Then take the browser pass the moment the slot frees.
 
-`groups: &[]` is the load-bearing line, and empty rather than merely different on purpose: a walk
-that asserted *another* group would still pass if the claim arm were the only one ever consulted.
-The role is read back from `role_bindings` and not from the response body, and the account count
-is compared before and after — a connector-provisioned account re-created on sign-in is a
-duplicate-directory bug, and a successful sign-in is exactly what would hide it.
+## omnion-w10 · REQ-086 slice 3 (the first half) — an expression preview, and a merge that was not a union
 
-**Proof it is not vacuous.** Emptying the rule the walk installs turns the grant into `None`
-rather than into a default role:
+**What.** `omnion_workflows::expression` evaluates `{{ }}` against caller-supplied sample data
+and nothing else; `POST /api/v1/workflows/{id}/graph/expressions/preview` exposes it; the canvas
+inspector shows a preview row per field and the sample on screen, editable. The route sits on
+`workflows.read` because it stores nothing, and the integration test proves that with a role that
+holds only the read key.
 
-```
-assertion `left == right` failed: the sign-in granted the role its stored group maps to
-  left: None
- right: Some("editor")
-```
+**Proof.**
 
-So the walk observes the binding rather than inheriting one. `run-media-walk.sh sso_live` →
-**4 passed, 0 failed** (58s).
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-workflows --lib` | 170 passed, 0 failed |
+| `cargo test -p omnion-api --lib` | 259 passed, 0 failed |
+| `cargo test -p omnion-api --test workflow_expressions` | 5 passed, 0 failed |
+| `node scripts/qa/graph-expressions.cjs` (live, w10 :18089) | 19 passed, 0 failed |
+| `pnpm typecheck` | clean |
+| `pnpm build` (admin) | green |
 
-**Three pre-existing walks in that file were broken and are now green.** `main` added the CSRF
-layer on 2026-09-29 and this file was left behind: all three older walks made cookie-authenticated
-writes and were refused `403 csrf_failed`. Fixing it took three parts, and each names a different
-trap.
+**What the tests found.** Six of the evaluator's sixteen unit tests failed on their first run and
+every failure was real: literals and expressions were collected into two lists and concatenated
+("By :  itemsada2" for `By {{…}}: {{…}} items`), an array index resolved through `Value::get` — which
+answers a string key on an array with `None` — and so never resolved, and a lone expression ignored
+its own fallback. The integration test then found a fourth: only the `malformed` refusal carried
+the field it belonged to, so the two lookup refusals — the ones a person meets mid-typing — came
+back with nothing for the inspector to attach the message to.
 
-* **The secret belongs in the fixture**, set before `Config::from_env` — the layer *refuses*
-  rather than skips when no secret is configured, which is the correct production behaviour (a
-  silent skip is worse than a visible refusal) and makes the failure land on a walk's first
-  provider POST with a message about CSRF that names neither the walk nor the fix.
-* **The token derives from the resolved session id**, not from the opaque cookie value, and the
-  platform hands it out as an `omnion_csrf` cookie on the same login response. The walk reads it
-  off that response **by name** — `TestResponse` kept only the *first* `Set-Cookie` header, so
-  login's second header was invisible and the walk concluded, from a `403`, that the platform was
-  misconfigured. `raw_set_cookies` is a `Vec` and the lookup is by name, so the two cookies can
-  swap places without breaking anything. Re-deriving the token in the test would have passed and
-  tested a second copy of the rule.
-* **The SCIM half needs none of it**, and that asymmetry is worth knowing: a provisioning token
-  is a bearer credential, not ambient authority, so the layer deliberately skips it.
-  `bearer_request` and `owner_write` are separate constructors for the same reason.
+**Also this tick: the merge from `origin/main`.** Both sides appended to the end of
+`apps/admin/lib/api.ts`, and git's shared region holds the closing `});`/`}` of only *one* of the
+two half-open function bodies per hunk — so the file as git hands it over is unbalanced by
+construction and any hunk-level splice drops or invents a closer. The resolution that works is the
+union of the two whole blocks, each asserted self-contained. Verified: 271 exported functions, 0
+lost against the conflicted file, 0 duplicate declarations, braces balanced; every `## ` section
+from both parents present exactly once in this log, with 0 content lines short of the union.
 
-`connect`, `publish` and `assert_untested_providers_stay_off` now take `&Session` rather than
-`&str`, so a new walk cannot reintroduce the bug by calling a helper with a bare cookie. The dead
-`owner_session()` was removed rather than left as a decoy.
+**The browser pass did not run again.** `runGraphCanvasDepth` is still unwalked for the same
+reason as last tick: a live w3 pass held the single QA slot for the whole window (its artifact
+directory was still being written at 12:31). The gesture acceptance boxes stay unticked. What this
+tick did instead is the thing the slot does not gate — `stack-only.sh` brings the private stack up
+without the slot, and a scripted round trip proved all nineteen claims above.
 
-**Next tick:** the pass is still queued (`/tmp/w9-qa-tick19.log`, `QA_SLOTS=1`, held by w3's live
-pass — correct queueing, not a deadlock). When it lands, read `page-iam-provider-deletion-blocked`
-and `-reassigned`; `722ac57`'s assertions still have not executed, and REQ-065 does not close
-before they do. After that: REQ-066 MFA/passkeys and device trust.
-
-## tick 20 — REQ-065 slice 4 part 14: a directory that actually binds (partial)
-
-**The criterion was absent rather than unproven.** `crates/identity/src/sso/directory.rs:19` said
-outright that nothing in it performed a search. So `POST /iam/providers/{id}/test` ran
-`test_steps` — the decidable half, which never opened a socket and therefore could never report
-`ok` — and every directory an operator had ever added read `incomplete` however well configured it
-was. The enable gate, which requires a passing test, refused to switch on a directory that worked.
-The criterion reads "binds with a service account, searches the configured base and resolves nested
-groups to the depth cap; a wrong bind DN produces a field-level error naming the bind step", and
-none of it had an implementation.
-
-Two modules make the ladder real, and the split is the point: the configuration questions stay unit
-tests that need no directory, and the questions about bytes are tests over captured frames.
-
-* **`ber`** — the narrow, bounded dialect RFC 4511 defines. Depth, breadth and length caps that
-  refuse rather than recurse; the indefinite length form rejected; a short body an error and never
-  a partial value. A truncated `mail` octet string that read as `mail` would be a directory
-  telling you a person is somebody else.
-* **`connection`** — resolve, dial, negotiate TLS by either path, bind, page a search, walk the
-  group graph to its cap.
-
-Six decisions the tests pin, because collapsing any two produces a plausible wrong product.
-
-* **A paged search, not a size limit.** AD refuses a size limit above its own `MaxPageSize` and
-  truncates silently below it, so a size-limited search returns the first N people and reports
-  success: the sync looks healthy and half the company is never provisioned. RFC 2696 is the only
-  mechanism that reports its own completeness.
-* **A bind refusal splits the credential.** RFC 4511 collapses a wrong DN and a wrong password
-  into `49` on purpose, which is right for the start route and wrong behind an authenticated panel
-  whose whole job is to make the test actionable. `noSuchObject` already names the half, so the
-  module listens — and the walk proves the two sentences differ, which a client that mapped both
-  to one would fail.
-* **A cap reached is a reported outcome.** `hit_depth_cap` is a value the caller must handle, not a
-  detail: a walk that stopped early has not found all the groups a person belongs to, and a
-  `when_group` rule on one of them will silently not match. A cycle is a separate flag, because a
-  cap is configured and a cycle is a directory bug.
-* **Verification off is refused, not relaxed.** `verify_tls: false` cannot negotiate at all; the
-  only way past a certificate the platform will not trust is the explicit `allow_insecure`, which
-  builds a *different* verifier rather than flipping a flag inside one.
-* **The filter grammar is closed.** `and`/`or`/`not`/`=`/`>=`/`<=`/`=…*…`; anything else is
-  refused by name rather than passed through as a string, which would defeat the escaping
-  `escape_filter_value` exists to provide.
-* **Nothing here writes a row.** Every sentence is composed in the module and the server's own text
-  is sanitized at the boundary — on *whitespace-separated tokens*, not characters, because a DN is
-  one token and a character scanner leaves its fragments behind. (Truncation is not redaction: the
-  structure is at the *front* of a `diagnosticMessage`, so cutting the tail kept the whole DN.)
-
-**The live walk, and what only a socket found.** `apps/api/tests/iam_directory_live.rs` is a second
-`tokio` task speaking the real protocol on a real `TcpListener` — not a mock in the mocking-library
-sense, because a hand-rolled transport would be a second copy of the client's own assumptions and
-would agree with every bug it has. It found four defects no amount of reading would have:
-
-1. **The client could not read a single reply.** The message reader declared an 8-byte header buffer
-   and read into all of it, on the reasonable-sounding argument that a socket returns whatever is
-   available. Over a stream that is false — the kernel fills as much as it has — so a 14-byte reply
-   arrived 8-at-a-time and six bytes were **discarded**, and the frame was rebuilt from the header
-   alone. Every read is now bounded by the bytes wanted.
-2. **The search stopped one message early.** Reaching the entry cap `break`ed out of the read loop,
-   leaving the `searchResDone` in the socket, so the next operation on the connection consumed the
-   *previous* search's completion. An LDAP operation is one request and one completion; a client
-   that leaves either unread cannot reuse the connection.
-3. **A remote panic on any message over 127 bytes.** `frame[..header_len].copy_from_slice(&header[..header_len])`
-   with a two-byte header and a `header_len` up to six. A group entry with more than one member is
-   the normal case, so this was reached by ordinary use — and a server announcing `0x84` crashed
-   the client rather than being refused, which is a denial of service an operator triggers by
-   editing a group.
-4. **The attributes-failure branch appended a second row** for a step the ladder had already
-   emitted as pending, and the panel keys on the step name — so it rendered the pending row and the
-   sentence naming the fix never appeared.
-
-Three more in the filter parser, one of them a security claim. `value()` unescaped while reading,
-so a `\*` the caller had escaped reached the substring splitter as a bare `*` and was read as a
-**wildcard**: a group named `cn=x)(objectClass=*,ou=groups` turned "the groups of this person" into
-"every entry with an objectClass". The value now stays escaped until after the split. And the split
-put the last component in both `final_` and `any`, so `ab*cd*ef` rendered as `ab*cd*ef*ef` — a
-renderer that changes the meaning of what it renders is worse than none, because the sync log is
-where an operator goes to see what was asked for.
-
-**The lesson that cost the most time and is worth the most.** The first stub decoded the client's
-requests with `Message::decode`, which models *responses*; it panicked inside a spawned task, tokio
-swallowed the panic, and the client timed out against a server that had answered correctly. A bug
-in the fixture presented as a bug in the code under test, with nothing in the log. Every task
-outcome is now printed, and the stub reads the raw bytes with no help from the module it tests.
-
-**Proof.** `cargo test -p omnion-identity --lib` → **245 passed**; `-p omnion-api --lib` → **224**;
-`pnpm typecheck` → clean. Commits `1161199` (the modules and the route) and `51c3df3` (the walk and
-the codec fixes it found).
-
-**Not claimed, and the tree says so.** One walk in `iam_directory_live.rs` is red — the cyclic
-group graph — and the fix for it, together with the client's long-form-length panic fix, is written
-but **unverified**: `/dev/shm` reached 100% partway through this tick (seven sibling writers'
-target directories) and the build could not complete. `51c3df3` is the last state proven green. The
-browser pass is still queued behind w3's live pass and has not run, so criterion 3 stays unticked
-and the REQ stays open — correctly, because a criterion about binding and searching is not proven
-by a unit test and a half-finished walk.
-
-### tick 20, continued — the last walk, and the two client defects it was hiding
-
-`85aaa83`. The cyclic-group walk was the last red one, and it found two more defects in the
-client that no amount of reading would have.
-
-**The paging control was a second request.** RFC 2696 §2.1 puts the control in the search's own
-`controls` field. This client wrote the search, then a separate `extendedRequest` carrying the
-control, then read once — so it consumed the *control's* `searchResDone` as the search's, and the
-operation was left open. A walk against a stub exposes this because a stub answers one request at
-a time, while a real directory pipelines the two and the ordering is a server detail. The lesson
-generalises: **a walk that finds a protocol-shape bug is usually pointing at code that depends on
-the server's good manners.** The control is now one request and one completion per page, and the
-criticality is `FALSE` on purpose — a server without the control answers without it rather than
-refusing, and a paged search that becomes unpaged on an old directory beats one that fails.
-
-**A remote panic on any message over 127 bytes.** The frame was rebuilt with
-`frame[..header_len].copy_from_slice(&header[..header_len])` from a two-byte header with
-`header_len` up to six. A group entry with more than one member is the ordinary case, so this was
-reached by normal use; a server announcing `0x84` crashed the client instead of being refused, and
-a crash in a task that walks somebody else's group graph is a denial of service an operator
-triggers by *editing a group*. Any `copy_from_slice` whose range is computed from a parsed field is
-a panic waiting for an input that makes the two disagree.
-
-Two more in the filter parser, both found by asserting a **round trip** rather than a shape:
-`value()` unescaped while reading, so a `\*` the caller had escaped reached the substring splitter
-as a bare `*` and became a wildcard; and the split put the last component in both `final_` and
-`any`, so `ab*cd*ef` rendered as `ab*cd*ef*ef`.
-
-**Four fixture bugs, and the pattern is the lesson** — every one produced a message about the
-client. A `#[derive(Default)]` gave the stub `page_size: 0`, so every search answered nothing and
-four walks reported "the directory found nobody" about a directory that publishes a person. `ber()`
-wrote a short-form length unconditionally, so any entry over 127 bytes announced length 2. The long
-form's bytes were read to size the frame and never written back, so the decoder saw length 0 behind
-a 149-byte body. And they were read a *second* time further down, costing a byte. A derived default
-that is a legal-looking zero in a field the behaviour depends on is the same trap as a `Vec::new()`
-where a default row was meant.
-
-**Also this tick:** `/dev/shm` reached 100% (seven sibling writers, 32G tmpfs). Only this
-worktree's `w9-target` was touched; the gate ran against a disk-backed `target/` instead.
-`iam_directory_live.rs` → **17 passed**; `omnion-identity --lib` → **246**; `omnion-api --lib` →
-**224**; `pnpm typecheck` → clean. Criterion 3 ticked (`58e7a0d`); the browser pass has still not
-run, so the panel half is unobserved and REQ-065 stays open.
-
-**Next tick:** the private pass, and the group-walk flags on the sync path — `describe_walk()`
-exists, carries "NOT complete" and "cycle", and **nothing calls it on the sync path**, so a walk
-that hit the depth cap still reads as a complete group list. Then REQ-066.
+**Next.** CodeMirror 6 for code nodes, then the expression autocomplete that completes upstream
+outputs — the two halves of slice 3 that make its acceptance box worth ticking.

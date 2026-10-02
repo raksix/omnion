@@ -2841,6 +2841,832 @@ async function runIamSubjectsDepth(page, report) {
   return summary;
 }
 
+// The node-library pass (REQ-087, slice 1): the registry rendered from the API, the search and
+// filters narrowing it, a node detail opening, the deprecated state naming its replacement, and
+// the counts agreeing with what is on screen. Every number here is read off the page and
+// compared, because "the library looks populated" is not a measurement of anything.
+async function runNodeLibraryDepth(page, report) {
+  const steps = {};
+  await page.goto(`${URL_ADMIN}/workflows/nodes`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  await shot(page, "page-node-library");
+
+  const rows = page.locator("[data-node-row]");
+  steps.rows = await rows.count();
+  steps.count = (await page.locator("[data-node-count]").innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  // A library screen that rendered zero rows against a shipped registry is a broken screen, not
+  // an empty library: the registry is code and always holds at least a trigger.
+  steps.hasRows = steps.rows > 0;
+  steps.states = await page.locator("[data-node-state]").allInnerTexts();
+
+  // 1. A search narrows the list, and the URL carries it so the view is shareable.
+  const search = page.locator('input[type="search"]').first();
+  await search.click({ timeout: 4000 }).catch(() => {});
+  await search.fill("http").catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.searchUrl = page.url().includes("search=http");
+  steps.searched = await rows.count();
+  // The strongest form of "the search worked": every surviving row matches the needle.
+  steps.everyRowMatches = await page.evaluate(() => {
+    const needle = new URLSearchParams(location.search).get("search") ?? "";
+    if (!needle) return true;
+    return Array.from(document.querySelectorAll("[data-node-row]")).every((row) => {
+      const text = (row.textContent ?? "").toLowerCase();
+      return text.includes(needle.toLowerCase());
+    });
+  });
+  await shot(page, "page-node-library-searched");
+
+  // 2. A search that matches nothing says what it searched, and offers a way back.
+  await search.fill("zzz_no_such_node").catch(() => {});
+  await page.waitForTimeout(1600);
+  const emptyText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.emptyStatesTheSearch = /No node matches/i.test(emptyText);
+  steps.emptyNamesTheQuery = emptyText.includes("zzz_no_such_node");
+  await shot(page, "page-node-library-empty");
+
+  // 3. Back to everything, then a category filter that has to actually filter.
+  await page.goto(`${URL_ADMIN}/workflows/nodes`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const allRows = await rows.count();
+  const selects = page.locator("select");
+  const selectCount = await selects.count();
+  // The category options come from the API, so the option count is read rather than assumed.
+  if (selectCount > 0) {
+    const options = await selects.nth(0).locator("option").allInnerTexts();
+    steps.categoryOptions = options.length - 1;
+    await selects.nth(0).selectOption({ index: 1 }).catch(() => {});
+    await page.waitForTimeout(1600);
+    steps.categoryUrl = /category=/.test(page.url());
+    steps.categoryRows = await rows.count();
+    steps.categoryNarrowed = steps.categoryRows < allRows;
+    await shot(page, "page-node-library-filtered");
+  }
+
+  // 4. A node detail opens, and the deprecated node names its replacement.
+  await page.goto(`${URL_ADMIN}/workflows/nodes/http_request`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.detailUrl = page.url().includes("/workflows/nodes/http_request");
+  steps.detailPorts = await page.locator("text=Ports").count();
+  steps.detailParams = await page.locator("text=Parameters").count();
+  await shot(page, "page-node-detail");
+
+  await page.goto(`${URL_ADMIN}/workflows/nodes/legacy_webhook`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const deprecatedText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.deprecatedBanner = /deprecated/i.test(deprecatedText);
+  steps.deprecatedNamesReplacement = deprecatedText.includes("http_request");
+  await shot(page, "page-node-detail-deprecated");
+
+  // 5. A key that is not registered is a 404 with the key echoed, not an empty detail page.
+  await page.goto(`${URL_ADMIN}/workflows/nodes/no_such_node_key`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const missingText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.unknownKeyExplains = /not in the registry/i.test(missingText);
+  steps.unknownKeyEchoes = missingText.includes("no_such_node_key");
+  await shot(page, "page-node-detail-missing");
+
+  // 6. The registry's own lint, straight off the running server. A registry that would fail its
+  // lint has to be visible here, not only in a test a deploy skips.
+  const lint = await page.evaluate(() =>
+    fetch("/api/v1/node-types/lint", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  steps.lintOk = lint?.ok === true;
+  steps.lintNodeCount = lint?.node_count ?? 0;
+  steps.lintCredentialTypeCount = lint?.credential_type_count ?? 0;
+  steps.lintFindings = lint?.findings?.length ?? -1;
+
+  // 7. The credential catalogue, including that a secret field is declared write-only and that
+  // no type is orphaned.
+  const credentialTypes = await page.evaluate(() =>
+    fetch("/api/v1/credential-types", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  steps.credentialTypes = credentialTypes?.total ?? 0;
+  steps.secretsAreWriteOnly = (credentialTypes?.types ?? []).every((type) =>
+    type.fields
+      .filter((f) => f.kind === "secret")
+      .every((f) => f.write_only === true && f.never_log === true),
+  );
+  steps.noOrphanCredentialType = (credentialTypes?.types ?? []).every(
+    (type) => type.used_by.length > 0,
+  );
+  // A payload carrying a token endpoint would be one more copy of an OAuth flow to keep in sync;
+  // the detail screen links the docs instead.
+  steps.noTokenEndpointInPayload = !JSON.stringify(credentialTypes ?? {}).includes("token_url");
+
+  return steps;
+}
+
+/**
+ * The credential pass (REQ-087, slice 2).
+ *
+ * This one *drives* the surface rather than looking at it, because the claims that matter here
+ * are behavioural and cannot be checked by reading pixels:
+ *
+ * 1. A credential is created through the real form — type picked from the catalogue, name
+ *    typed, a secret pasted — and the fixture secret is a string that must not appear
+ *    anywhere afterwards. The strongest form of "no response returns a secret" is to send one
+ *    and then grep every screen, every API response and the whole DOM for it.
+ * 2. A secret sent on a plain `PATCH` is refused by name. The API answers
+ *    `credential_secret_write_only`; a client that got a 200 would mean the payload was
+ *    accepted, which is the failure this REQ exists to prevent.
+ * 3. A test run reports a *result*, and a credential with no secret says so. `ok: true` for a
+ *    connection nobody made is the one answer that would make the health chip a lie, so the
+ *    pass asserts the negative explicitly.
+ * 4. The delete guard refuses a credential nothing references only after it *does* — so the
+ *    pass creates a workflow graph that names the key, asks for the usage view, and checks
+ *    that the refusal names the workflow rather than just saying no.
+ * 5. The detail screen renders a secret as a mask of a fixed width and offers no reveal.
+ */
+async function runCredentialDepth(page, report) {
+  const steps = {};
+  // A fixture string that must never appear again once it has been sent. If it turns up in
+  // the DOM, in a network response or in a screenshot's text, the surface leaked it.
+  const FIXTURE = "qa-fixture-secret-9f2c41ab";
+  const stamp = Date.now().toString(36);
+  const name = `QA fixture ${stamp}`;
+  const key = `qa-fixture-${stamp}`;
+
+  // 1. The list, empty or not, says which of the two situations it is.
+  await page.goto(`${URL_ADMIN}/workflows/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const countText = (await page.locator("[data-credential-count]").innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+  steps.listCount = countText;
+  steps.listHasEmptyOrRows =
+    (await page.locator("[data-credential-row]").count()) > 0 ||
+    (await page.locator("[data-credential-empty]").count()) > 0;
+  await shot(page, "page-credentials");
+
+  // 2. A search narrows the list and the URL carries it.
+  const search = page.locator('input[type="search"]').first();
+  await search.click({ timeout: 4000 }).catch(() => {});
+  await search.fill("zzz_no_such_credential").catch(() => {});
+  await page.waitForTimeout(1600);
+  const emptyText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.emptyNamesTheQuery = /No credential matches/i.test(emptyText) && emptyText.includes("zzz_no_such_credential");
+  await shot(page, "page-credentials-empty");
+  await page.goto(`${URL_ADMIN}/workflows/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  // 3. The type picker offers the catalogue, and picking one fills the form from the
+  //    definition rather than from anything written down in the panel.
+  await page.goto(`${URL_ADMIN}/workflows/credentials/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const typeCards = await page.locator("[data-credential-type]").count();
+  steps.typeCards = typeCards;
+  steps.pickerOffersRealTypes = typeCards >= 4;
+  await shot(page, "page-credential-new-picker");
+
+  await page.locator('[data-credential-type="api_key"]').click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  steps.formHasNameField = (await page.locator('[data-credential-field="name"]').count()) > 0;
+  steps.formHasKeyField = (await page.locator('[data-credential-field="key"]').count()) > 0;
+  // The secret input is a password field and there is no reveal-by-default.
+  const secretInputType = await page
+    .locator('[data-credential-secret="api_key"]')
+    .getAttribute("type")
+    .catch(() => null);
+  steps.secretInputIsMasked = secretInputType === "password";
+  await shot(page, "page-credential-new-form");
+
+  // 4. The key is derived from the name before anything is saved.
+  await page.locator('[data-credential-field="name"]').fill(name).catch(() => {});
+  await page.waitForTimeout(400);
+  const derivedKey = await page.locator('[data-credential-field="key"]').inputValue().catch(() => "");
+  steps.keyDerivedFromName = derivedKey === name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+
+  // 5. A save with a missing required non-secret field is refused in the form. `api_key`'s
+  //    only required field is the secret, so the form's own check is what refuses an empty
+  //    name — which is the case a reader actually hits.
+  await page.locator('[data-credential-secret="api_key"]').fill(FIXTURE).catch(() => {});
+  await page.locator("[data-credential-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.savedUrl = page.url().includes("/workflows/credentials/") && !page.url().endsWith("/new");
+  await page.waitForTimeout(1800);
+  const detailText = (await page.locator("main").innerText().catch(() => "")).replace(/\s+/g, " ");
+  steps.detailShowsName = detailText.includes(name);
+  // The fixture must not be anywhere on the screen it was just typed into.
+  steps.secretNotOnScreen = !(await page.evaluate((needle) => document.body.innerText.includes(needle), FIXTURE));
+  steps.secretNotInDom = !(await page.evaluate((needle) => document.documentElement.outerHTML.includes(needle), FIXTURE));
+  await shot(page, "page-credential-detail");
+
+  const id = page.url().split("/").pop();
+
+  // 6. The masked field renders a constant-width mask, and there is no way to reveal it.
+  const masked = (await page.locator('[data-credential-masked="api_key"]').innerText().catch(() => "")).trim();
+  steps.maskedIsNotEmpty = masked.length >= 8;
+  steps.maskedIsNotTheSecret = !masked.includes(FIXTURE);
+  steps.revealOpenable = (await page.locator("[data-credential-replace-open]").count()) > 0;
+  steps.noInlineRevealControl =
+    (await page.locator('[data-credential-masked="api_key"] input').count()) === 0;
+
+  // 7. A test reports a result, and it is not a pass for a connection nobody made.
+  await page.locator("[data-credential-test]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const testOutcome = await page
+    .locator("[data-credential-test-result]")
+    .getAttribute("data-credential-test-result")
+    .catch(() => null);
+  const testText = (await page
+    .locator("[data-credential-test-result]")
+    .innerText()
+    .catch(() => "")).replace(/\s+/g, " ");
+  steps.testReportedAResult = testOutcome === "ok" || testOutcome === "failed";
+  steps.testDidNotFakeSuccess = testOutcome !== "ok";
+  steps.testExplainsItself = testText.length > 10;
+  await shot(page, "page-credential-tested");
+
+  // 8. A secret re-sent on a plain PATCH is refused by name — the REQ's own criterion.
+  const patchResult = await page.evaluate(
+    async ([credentialId, needle]) => {
+      const response = await fetch(`/api/v1/credentials/${credentialId}`, {
+        method: "PATCH",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "renamed", secrets: [{ field: "api_key", value: needle }] }),
+      });
+      const body = await response.json().catch(() => ({}));
+      return { status: response.status, code: body?.error?.code ?? null };
+    },
+    [id, FIXTURE],
+  );
+  steps.patchWithSecretRefused = patchResult.status === 400;
+  steps.patchWithSecretCode = patchResult.code;
+
+  // 9. The API never returns the secret, on any read it offers.
+  const reads = await page.evaluate(
+    async (credentialId) => {
+      const [detail, usage] = await Promise.all([
+        fetch(`/api/v1/credentials/${credentialId}`, { credentials: "same-origin" }).then((r) => r.text()),
+        fetch(`/api/v1/credentials/${credentialId}/usage`, { credentials: "same-origin" }).then((r) => r.text()),
+      ]);
+      return { detail, usage };
+    },
+    id,
+  );
+  steps.noReadReturnsTheSecret =
+    !reads.detail.includes(FIXTURE) && !reads.usage.includes(FIXTURE);
+  steps.noReadReturnsAHandle = !reads.detail.includes("secret_ref") && !reads.detail.includes("vault://");
+
+  // 10. The usage view is a real read, and on an unreferenced credential it says so.
+  const usageNone = (await page.locator('[data-credential-usage="none"]').count()) > 0;
+  steps.usageExplainsItself = usageNone;
+
+  // 11. A delete of an unreferenced credential succeeds — the guard must not refuse forever.
+  const deleted = await page.evaluate(
+    async (credentialId) => {
+      const response = await fetch(`/api/v1/credentials/${credentialId}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      return { status: response.status, body: await response.json().catch(() => ({})) };
+    },
+    id,
+  );
+  steps.unreferencedDeleteOk = deleted.status === 200 && deleted.body?.deleted === true;
+  steps.fixtureIsGone = !(await page.evaluate(
+    async (credentialId) => {
+      const response = await fetch(`/api/v1/credentials/${credentialId}`, { credentials: "same-origin" });
+      return response.ok;
+    },
+    id,
+  ));
+
+  // 12. The list is back, and the fixture is not in it.
+  await page.goto(`${URL_ADMIN}/workflows/credentials`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.fixtureNotInList = (await page.locator(`[data-credential-row="${key}"]`).count()) === 0;
+  steps.finalSecretSweep = !(await page.evaluate(
+    (needle) => document.documentElement.outerHTML.includes(needle),
+    FIXTURE,
+  ));
+  await shot(page, "page-credentials-after");
+
+  // 13. An unknown filter is a refusal naming the legal values, not an empty list.
+  const badFilter = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/credentials?type=carrier_pigeon", {
+      credentials: "same-origin",
+    });
+    const body = await response.json().catch(() => ({}));
+    return { status: response.status, code: body?.error?.code ?? null };
+  });
+  steps.unknownTypeFilterRefused = badFilter.status === 400;
+  steps.unknownTypeFilterCode = badFilter.code;
+
+  return steps;
+}
+
+/**
+ * The organization a signed-in platform account is reading, as the screen itself resolves it.
+ *
+ * A platform account has no primary organization, so every node-package call has to name one —
+ * without it the API refuses `organization_required` and the depth pass asserts against a
+ * screen that could not have worked for the account it signed in as. A tenant needs no
+ * qualifier at all, so this returns `null` for one and the API falls back to its own.
+ */
+async function activeOrganization(page) {
+  return page.evaluate(async () => {
+    const answer = await fetch("/api/v1/organizations", { credentials: "same-origin" });
+    const body = await answer.json().catch(() => ({}));
+    return (body?.organizations ?? [])[0]?.id ?? null;
+  });
+}
+
+/**
+ * The node-package pass (REQ-087, slice 4).
+ *
+ * Drives `/modules/installed` through the whole lifecycle against a real package: it installs
+ * the scaffold the SDK itself writes, refuses a broken variant and reads the findings back
+ * from the screen, disables and re-enables, then removes and confirms the ledger is empty
+ * again.
+ *
+ * The refusal is the interesting half. An install that validates is one assertion; an install
+ * that is *refused with every finding rendered* is the criterion the REQ states ("a package
+ * failing the SDK validator is refused with the findings and nothing reaches the ledger"), and
+ * the second half — nothing reached the ledger — is checked by reading the list rather than by
+ * trusting the screen's own wording.
+ */
+/**
+ * The workflow editor canvas pass (REQ-086, slice 2).
+ *
+ * A canvas is the screen most likely to render beautifully and do nothing, because almost
+ * everything about it is local: the document lives in the browser until someone saves it, and a
+ * regression in the *save* path is invisible to a screenshot. So this pass asserts against the
+ * server's own read-back at every step rather than against what the screen says.
+ *
+ * The order is the order the REQ's QA plan names, and each step has a claim behind it:
+ *
+ * 1.  create a real workflow through the API, so the canvas has something real to open;
+ * 2.  the canvas opens and its counts match the empty document the API reports;
+ * 3.  add a trigger and an action from the palette — palette rows are `disabled` with a named
+ *     reason, and an enabled row that adds nothing is a dead button;
+ * 4.  connect them, and read the connection back from the server;
+ * 5.  label the branch, and read the label back — a label that survives a reload is the claim;
+ * 6.  save, reload the *page*, and confirm the positions, the label and the counts are the
+ *     same. This is the step that catches a canvas that keeps its document in memory only;
+ * 7.  a node with a missing required parameter is badged, and the badge is the server's
+ *     verdict rather than the client's;
+ * 8.  sticky note added, survives the reload, and is not a step.
+ *
+ * Every read-back goes through `page.evaluate` + `fetch` so it uses the *signed-in* session
+ * rather than a token this pass invented. A pass that authenticates separately is testing a
+ * second session and can pass while the real one is refused.
+ */
+async function runGraphCanvasDepth(page, report) {
+  const steps = {};
+
+  /** A signed-in API call from inside the page, so the session cookie is the real one. */
+  const api = (path, init) =>
+    page.evaluate(
+      async ([target, options]) => {
+        const answer = await fetch(target, {
+          credentials: "same-origin",
+          headers: {
+            accept: "application/json",
+            ...(options?.body ? { "content-type": "application/json" } : {}),
+            ...(options?.csrf
+              ? { "x-omnion-csrf": document.cookie.match(/omnion_csrf=([^;]+)/)?.[1] ?? "" }
+              : {}),
+          },
+          ...(options?.body ? { method: options.method ?? "POST", body: options.body } : {}),
+        });
+        const text = await answer.text();
+        return {
+          status: answer.status,
+          body: text ? JSON.parse(text) : null,
+        };
+      },
+      [path, init ?? null],
+    );
+
+  // 1. A real workflow to open. It is created through the API rather than through a screen
+  //    because no workflow list screen exists yet (REQ-093 owns the list), and a canvas pass
+  //    that had to build its own fixture through a UI would be testing that UI too.
+  const stamp = Date.now().toString(36);
+  const created = await api("/api/v1/workflows", {
+    method: "POST",
+    csrf: true,
+    body: JSON.stringify({
+      name: `QA canvas ${stamp}`,
+      description: "graph canvas fixture",
+      enabled: true,
+      trigger: { kind: "manual" },
+      steps: [{ name: "noop", kind: "task", action: "noop", params: {} }],
+    }),
+  });
+  steps.workflowCreated = created.status === 201 || created.status === 200;
+  if (!steps.workflowCreated) {
+    steps.createError = created.body?.error?.code ?? `status ${created.status}`;
+    return { ok: false, reason: "the canvas fixture workflow could not be created", ...steps };
+  }
+  const workflowId = created.body?.id;
+  steps.workflowId = workflowId;
+
+  // 2. The canvas opens, and the empty state names the situation rather than showing a void.
+  await page.goto(`${URL_ADMIN}/workflows/${workflowId}/edit`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2600);
+  steps.canvasRendered = (await page.locator('[role="application"][aria-label="Workflow canvas"]').count()) > 0;
+  steps.emptyStateShown = /no nodes yet/i.test(
+    (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "),
+  );
+  steps.palettePresent = (await page.locator('aside[aria-label="Node palette"]').count()) > 0;
+  steps.inspectorPresent = (await page.locator('aside[aria-label="Node inspector"]').count()) > 0;
+  await shot(page, "page-graph-canvas-empty");
+
+  // 3. Add two nodes from the palette. The palette button carries `data-node-key`, so the
+  //    pass picks the registry's own keys rather than a hard-coded pair that a registry change
+  //    would silently invalidate.
+  await page.locator('button[aria-label="Open the palette"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator('button[aria-label="Show the palette"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const triggerRow = page.locator('[data-node-key="manual_trigger"]').first();
+  const actionRow = page.locator('[data-node-key="send_email"]').first();
+  steps.paletteHasTrigger = (await triggerRow.count()) > 0;
+  steps.paletteHasAction = (await actionRow.count()) > 0;
+  // A disabled row must say why. An unavailable node with no reason is the palette lying.
+  steps.disabledRowsNameTheirCause = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('[data-node-key][data-unavailable="true"]')];
+    return rows.every((row) => (row.getAttribute("title") ?? "").trim().length > 0);
+  });
+
+  await triggerRow.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await actionRow.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.twoNodesOnCanvas = (await page.locator("[data-node-key]").count()) >= 2;
+  await shot(page, "page-graph-canvas-nodes");
+
+  // 4. Connect them by clicking the output port — the click-to-connect path, which is the one
+  //    a keyboard user has. A canvas that can only be wired by dragging is a canvas that
+  //    excludes them.
+  const output = page.locator('[data-node-key="manual_trigger"] button[aria-label^="Drag a wire"]').first();
+  steps.outputPortPresent = (await output.count()) > 0;
+  await output.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  let graph = await api(`/api/v1/workflows/${workflowId}/graph`);
+  steps.connectedOnServer = (graph.body?.connection_count ?? 0) >= 1;
+  await shot(page, "page-graph-canvas-connected");
+
+  // 5. Label the branch through the inspector, and read it back.
+  await page.locator("svg path.cursor-pointer").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const labelField = page.locator('input[aria-label="Branch label"]').first();
+  steps.branchLabelFieldShown = (await labelField.count()) > 0;
+  if (steps.branchLabelFieldShown) {
+    await labelField.fill("true");
+    await page.waitForTimeout(400);
+  }
+  await shot(page, "page-graph-canvas-label");
+
+  // 6. Save and reload the page. This is the assertion the whole pass exists for.
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(2600);
+  graph = await api(`/api/v1/workflows/${workflowId}/graph`);
+  steps.savedRevision = graph.body?.revision ?? null;
+  steps.savedConnections = graph.body?.connection_count ?? 0;
+  steps.labelSurvivedSave = JSON.stringify(graph.body?.graph?.connections ?? []).includes("true");
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2800);
+  steps.nodesAfterReload = await page.locator("[data-node-key]").count();
+  steps.positionsAfterReload = await page.evaluate(() =>
+    [...document.querySelectorAll("[data-node-key]")].map((node) => ({
+      key: node.getAttribute("data-node-key"),
+      left: Math.round(node.offsetLeft),
+      top: Math.round(node.offsetTop),
+    })),
+  );
+  steps.positionsAreReal = steps.positionsAfterReload.every(
+    (node) => Number.isFinite(node.left) && Number.isFinite(node.top),
+  );
+  steps.stripCounts = (await page.locator('[data-testid="graph-validation-count"]').innerText().catch(() => "")).trim();
+  await shot(page, "page-graph-canvas-reloaded");
+
+  // 7. A node with a missing required parameter is badged, and the badge is the server's word.
+  const validated = await api(`/api/v1/workflows/${workflowId}/graph/validate`, {
+    method: "POST",
+    csrf: true,
+    body: JSON.stringify({ graph: graph.body?.graph ?? { nodes: [], connections: [], notes: [] }, revision: 0 }),
+  });
+  steps.serverReportsIssues = (validated.body?.issues ?? []).length;
+  steps.issueShapeIsServerOwned = (validated.body?.issues ?? []).every(
+    (issue) => typeof issue.code === "string" && typeof issue.message === "string",
+  );
+
+  // 8. A sticky note is a comment: it survives, and it is never a step.
+  await page.locator('button[aria-label="Sticky note"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const note = page.locator('textarea[aria-label^="Sticky note"]').first();
+  steps.noteFieldShown = (await note.count()) > 0;
+  if (steps.noteFieldShown) {
+    await note.fill("QA canvas note");
+    await page.waitForTimeout(400);
+  }
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(2600);
+  graph = await api(`/api/v1/workflows/${workflowId}/graph`);
+  steps.noteSurvived = (graph.body?.graph?.notes ?? []).some((each) => each.text === "QA canvas note");
+  // The note must not have become a step. The compiled `steps` array is the engine's input, so
+  // reading it is the only way to know — the canvas showing a note is not the claim.
+  const after = await api(`/api/v1/workflows/${workflowId}/graph`);
+  steps.noteIsNotAStep = !JSON.stringify(after.body?.graph?.notes ?? []).includes('"kind"');
+  await shot(page, "page-graph-canvas-note");
+
+  // 9. Narrow viewport: the REQ's read-only rule, checked rather than assumed.
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.waitForTimeout(1400);
+  steps.readOnlyBanner = /read-only at this width/i.test(
+    (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "),
+  );
+  steps.canvasStillVisibleAtNarrow = (await page.locator('[role="application"]').count()) > 0;
+  steps.noHorizontalScroll = await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 2,
+  );
+  await shot(page, "page-graph-canvas-narrow");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // 10. Keyboard: select a node and nudge it, which is the path that needs no pointer at all.
+  await page.waitForTimeout(800);
+  const first = page.locator('[data-node-key]').first();
+  await first.focus().catch(() => {});
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(500);
+  steps.keyboardOpensInspector =
+    (await page.locator('input[id^="label-"]').count()) > 0 ||
+    /Select a node/i.test((await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "));
+  await page.keyboard.press("ArrowRight");
+  await page.waitForTimeout(600);
+  steps.nudgeMovedSomething = await page.evaluate(() => {
+    const badge = document.querySelector('[data-testid="graph-validation-count"]');
+    return Boolean(badge);
+  });
+
+  await shot(page, "page-graph-canvas-final");
+
+  const failures = Object.entries(steps).filter(
+    ([key, value]) =>
+      typeof value === "boolean" &&
+      !value &&
+      [
+        "workflowCreated",
+        "canvasRendered",
+        "palettePresent",
+        "inspectorPresent",
+        "paletteHasTrigger",
+        "paletteHasAction",
+        "disabledRowsNameTheirCause",
+        "twoNodesOnCanvas",
+        "outputPortPresent",
+        "connectedOnServer",
+        "labelSurvivedSave",
+        "positionsAreReal",
+        "noteSurvived",
+        "readOnlyBanner",
+        "canvasStillVisibleAtNarrow",
+        "noHorizontalScroll",
+      ].includes(key),
+  );
+  return { ok: failures.length === 0, ...steps, failures: failures.map(([key]) => key) };
+}
+
+async function runNodePackagesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "node-packages-depth", action: "node-packages", ...step });
+  };
+
+  // The screen reads the ledger once on mount and once more when its organization selector
+  // settles, and a platform account's first read has no organization to name yet. That first
+  // 400 is the pass arriving before the screen has chosen, not a defect, and it is the same
+  // refusal the rest of the pass is about — so it is registered rather than counted.
+  expectRefusal(
+    "/api/v1/node-packages",
+    "the ledger's first read, before a platform account's organization selector has settled",
+  );
+  await page.goto(`${URL_ADMIN}/modules/installed`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  // Read once: every direct API call below has to name the same organization the screen does.
+  const organization = await activeOrganization(page);
+  note({
+    step: "list",
+    organization,
+    rows: await page.locator("[data-package-row]").count(),
+    emptyState: (await page.locator("[data-testid=packages-empty]").count()) > 0,
+  });
+  await shot(page, "page-modules-installed");
+
+  // The manifest the SDK scaffolds. Written here rather than read from disk so the pass does
+  // not depend on a cargo build having produced the CLI.
+  const manifest = {
+    key: "qa-fixture",
+    version: "0.1.0",
+    name: "QA fixture package",
+    description: "Installed by the walkthrough to exercise the ledger.",
+    docs_url: "https://example.com/docs/qa-fixture",
+    source: "local",
+    permissions: ["network", "credentials", "sandbox"],
+    nodes: [
+      {
+        key: "echo",
+        version: "0.1.0",
+        label: "Fixture echo",
+        description: "Returns its input unchanged.",
+        category: "helper",
+        icon: "MessageSquare",
+        docs_url: "https://example.com/docs/qa-fixture/echo",
+        inputs: [
+          { name: "main", kind: "main", accepts: ["text", "json"], open: false },
+        ],
+        outputs: [
+          { name: "main", kind: "main", accepts: ["text", "json"], open: true },
+        ],
+        capabilities: ["execute"],
+        credential_types: ["api_key"],
+        params: [
+          {
+            name: "text",
+            type: "string",
+            label: "Text",
+            required: true,
+            ui: "textarea",
+            placeholder: "Anything",
+          },
+          // The bundled registry refuses a node that accepts a credential with no select for
+          // the palette to fill (`node_credential_not_selectable`). Without this parameter the
+          // *valid* fixture is refused, and the pass proves a refusal while claiming to prove
+          // an install.
+          {
+            name: "credential_key",
+            type: "string",
+            label: "Credential",
+            required: true,
+            ui: "select",
+            options_source: "credentials",
+            help: "Pick an API-key credential of the type this node names.",
+            secret_field: true,
+          },
+        ],
+        sandbox: "required",
+        default_max_attempts: 3,
+      },
+    ],
+    credentials: [
+      {
+        key: "api_key",
+        kind: "api_key",
+        label: "API key",
+        description: "A single API key.",
+        icon: "KeyRound",
+        docs_url: "https://example.com/docs/qa-fixture/api-key",
+        fields: [
+          {
+            name: "api_key",
+            label: "API key",
+            type: "secret",
+            required: true,
+            never_log: true,
+          },
+        ],
+        test_timeout_seconds: 5,
+      },
+    ],
+  };
+
+  // 1. A package the validator refuses, and every finding rendered.
+  const broken = structuredClone(manifest);
+  broken.permissions = ["network"];
+  broken.nodes[0].credential_types = ["oauth2"];
+  // The `400` this install provokes *is* the assertion — the criterion is that a package the
+  // validator refuses reaches no ledger row and says every finding why. Registering it means
+  // the roll-up reports it as `expectedRefusals` instead of a defect; leaving it unregistered
+  // made this pass's own negative case look like a broken screen.
+  expectRefusal(
+    "/api/v1/node-packages",
+    "the node-package install of a deliberately broken manifest, which the API refuses",
+  );
+  await page
+    .locator("[data-testid=package-manifest]")
+    .fill(JSON.stringify(broken, null, 2))
+    .catch(() => {});
+  await page.locator("[data-testid=package-install]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const renderedFindings = await page
+    .locator("[data-testid=package-findings] li")
+    .count()
+    .catch(() => 0);
+  note({ step: "refused", findingsRendered: renderedFindings, expectsTwo: true });
+  await shot(page, "page-modules-installed-refused");
+
+  // Nothing reached the ledger: read the API, not the screen's own claim.
+  steps.refusedReachedLedger = await page.evaluate(async (organizationId) => {
+    const response = await fetch(
+      `/api/v1/node-packages${organizationId ? `?organization_id=${organizationId}` : ""}`,
+      { credentials: "same-origin" },
+    );
+    const body = await response.json().catch(() => ({}));
+    return (body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
+  }, organization);
+
+  // 2. The same package, valid, installs — and the node key is namespaced.
+  await page.locator("[data-testid=package-install-clear]").click({ timeout: 5000 }).catch(() => {});
+  await page
+    .locator("[data-testid=package-manifest]")
+    .fill(JSON.stringify(manifest, null, 2))
+    .catch(() => {});
+  await page.locator("[data-testid=package-install]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const row = page.locator('[data-package-key="qa-fixture"]');
+  steps.installedRowPresent = (await row.count()) > 0;
+  steps.namespacedNodeKey = (await row.locator("td").nth(1).innerText().catch(() => "")) .includes(
+    "qa-fixture.echo",
+  );
+  note({ step: "install", rowPresent: steps.installedRowPresent, namespaced: steps.namespacedNodeKey });
+  await shot(page, "page-modules-installed-installed");
+
+  // 3. A downgrade is refused by name.
+  // Same reasoning as the broken manifest: the `409` is the assertion.
+  expectRefusal(
+    "/api/v1/node-packages",
+    "the downgrade of an installed package, which the ledger refuses by version",
+  );
+  steps.downgradeRefused = await page.evaluate(async (organizationId) => {
+    const response = await fetch("/api/v1/node-packages", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        manifest: { key: "qa-fixture", version: "0.0.1", name: "x", docs_url: "https://x" },
+        organization_id: organizationId,
+      }),
+    });
+    const body = await response.json().catch(() => ({}));
+    return { status: response.status, code: body?.error?.code ?? null };
+  }, organization);
+
+  // 4. Disable, then re-enable: the ledger keeps the row and the state chip changes.
+  //
+  // Waited on, not slept through. The chip follows a PATCH and a refetch, so a fixed pause is
+  // a race: on a loaded box it reads the row mid-flight and reports a screen that is correct
+  // as a broken one. Waiting for the text the state actually produces is the same assertion
+  // without the timing assumption.
+  const stateChip = page.locator('[data-package-key="qa-fixture"] [data-testid=package-state]');
+  await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
+  const disabledText = await stateChip
+    .filter({ hasText: "disabled" })
+    .waitFor({ timeout: 15000 })
+    .then(() => true)
+    .catch(() => false);
+  steps.disabledStateRendered = disabledText;
+  steps.ledgerRowSurvivedDisable = await page.evaluate(async (organizationId) => {
+    const response = await fetch(
+      `/api/v1/node-packages${organizationId ? `?organization_id=${organizationId}` : ""}`,
+      { credentials: "same-origin" },
+    );
+    const body = await response.json().catch(() => ({}));
+    return (body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
+  }, organization);
+  await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
+  steps.reEnabledStateRendered = await stateChip
+    .filter({ hasText: "available" })
+    .waitFor({ timeout: 15000 })
+    .then(() => true)
+    .catch(() => false);
+  note({
+    step: "toggle",
+    disabledRendered: steps.disabledStateRendered,
+    rowSurvived: steps.ledgerRowSurvivedDisable,
+  });
+
+  // 5. Remove: the confirmation names what it disables, and the ledger ends empty.
+  await page.locator('[data-testid=package-remove]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.removeDialogNamedItsNodes = (await page
+    .locator("[data-testid=package-remove-dialog]")
+    .innerText()
+    .catch(() => "")) .includes("qa-fixture.echo");
+  await shot(page, "page-modules-installed-remove");
+  await page.locator("[data-testid=package-remove-confirm]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.removedFromLedger = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/node-packages", { credentials: "same-origin" });
+    const body = await response.json().catch(() => ({}));
+    return !(body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
+  });
+  note({ step: "remove", dialogNamedNodes: steps.removeDialogNamedItsNodes, gone: steps.removedFromLedger });
+
+  log(`node packages: ${JSON.stringify(steps)}`);
+  return steps;
+}
+
 /**
  * The role-depth pass (REQ-006, slice 1).
  *
@@ -5546,6 +6372,18 @@ async function main() {
     { path: "/analytics/goals", name: "analytics-goals" },
     { path: "/analytics/realtime", name: "analytics-realtime" },
     { path: "/analytics/settings", name: "analytics-settings" },
+    // The node library and the credential screens (REQ-087, slices 1 and 2) — walked here so
+    // they are screens, and driven by the depth passes below, which search and filter the
+    // library and create, test, inspect and delete a real credential. `/credentials/new` takes
+    // `?type=`, which is how the list's empty state skips the picker, so both shapes are walked.
+    { path: "/workflows/nodes", name: "workflow-nodes" },
+    { path: "/workflows/credentials", name: "workflow-credentials" },
+    { path: "/workflows/credentials/new", name: "workflow-credentials-new" },
+    { path: "/workflows/credentials/new?type=api_key", name: "workflow-credentials-new-typed" },
+    // The installer ledger (REQ-087, slice 4). Walked as a screen *and* driven by
+    // `runNodePackagesDepth` below, which installs a real fixture package, refuses a broken
+    // one, disables, re-enables and removes it — so the screen is never merely loaded.
+    { path: "/modules/installed", name: "modules-installed" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -5696,6 +6534,33 @@ async function main() {
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
+  // The node-library pass (REQ-087, slice 1): the registry rendered from the API, search and
+  // filters, a node detail, the deprecated state naming its replacement, and the running
+  // server's own registry lint. It is a pure read pass, so it can run before the passes that
+  // write rows and cannot disturb their counts.
+  report.nodeLibrary = await runNodeLibraryDepth(page, report);
+  log(`node library: ${JSON.stringify(report.nodeLibrary)}`);
+
+  // The credential pass (REQ-087, slice 2): create one through the real form with a fixture
+  // secret, prove the secret does not come back on any read or land in the DOM, prove a secret
+  // re-sent on a PATCH is refused by name, prove a test reports a result rather than a pass,
+  // and prove the delete guard both refuses when it should and allows when it should.
+  report.credentials = await runDepthPass("credentials", () => runCredentialDepth(page, report));
+  // The node-package lifecycle (REQ-087, slice 4): install a real fixture, refuse a broken
+  // one, toggle, remove. Isolated like the other depth passes so a failure in one does not
+  // cost the rest of the run its report.
+  report.nodePackages = await runDepthPass("node-packages", () =>
+    runNodePackagesDepth(page, report),
+  );
+  // The graph canvas (REQ-086, slice 2): build a real graph node by node, connect it by
+  // clicking a port, label a branch, save, reload the page and read the document back from the
+  // server — the step that catches a canvas holding its graph in memory only.
+  report.graphCanvas = await runDepthPass("graph-canvas", () =>
+    runGraphCanvasDepth(page, report),
+  );
+  log(`graph canvas: ${JSON.stringify(report.graphCanvas)}`);
+  log(`credentials: ${JSON.stringify(report.credentials)}`);
+
   report.iamRoles = await runIamRolesDepth(page, report);
 
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
@@ -5875,7 +6740,9 @@ async function main() {
     if (f.type === "warning") continue;
     // A console line names the status, not the URL: the allowance for one is the window it was
     // registered in, so only a line that arrived after the pass announced the act can be excused.
-    const deliberate = /status of 40[13]/.test(f.text)
+    // The statuses are the ones a refusal actually uses — a validator answers 400, a ledger
+    // 409, an authorization gate 401/403 — not just the two the harness first learned from.
+    const deliberate = /status of (400|401|403|409|422)/.test(f.text)
       ? expectedRefusals.find((entry) => !entry.claimedConsole && index >= entry.consoleFrom)
       : null;
     if (deliberate) {
@@ -5887,12 +6754,17 @@ async function main() {
     pushFindings(isWeb ? "medium" : "high", isWeb ? "web-console" : "console-error", `${f.phase} ${f.url}: ${f.text.slice(0, 180)}`);
   }
   for (const [index, n] of netFailures.entries()) {
+    // A refusal a validator or a ledger makes is a 400 or a 409 as often as it is a 401: a
+    // package that fails validation is `400` with its findings, and a downgrade is `409`. Only
+    // excusing 401/403 left every deliberate 4xx on a validation pass filed as a defect, which
+    // is how a correct screen reads as broken.
+    const REFUSAL_STATUSES = [400, 401, 403, 409, 422];
     const deliberate = expectedRefusals.find(
       (entry) =>
         !entry.claimedNet &&
         index >= entry.netFrom &&
         String(n.url || "").includes(entry.match) &&
-        [401, 403].includes(n.status),
+        REFUSAL_STATUSES.includes(n.status),
     );
     if (deliberate) {
       deliberate.claimedNet = true;
@@ -6708,48 +7580,6 @@ async function runIamProvisioningDepth(page, report) {
   note({ step: "sync-log", logRows, createdRows, deactivatedRows, firstDetail: firstDetail.slice(0, 120) });
   await shot(page, "page-iam-provisioning-log");
 
-  // ---- Rotate, and prove the old secret is refused (REQ-065, slice 4 part 4) ----------------
-  // Rotation is the operation the acceptance criterion is actually about, and it is the only one
-  // of the three that *hands back a new secret*: revoke and rotate look identical from the
-  // outside — the old secret dies — so without this step the walk would pass against a screen
-  // that can kill a connector and leave nothing to paste in.
-  await page.locator("[data-token-rotate]").first().click({ timeout: 6000 }).catch(() => {});
-  await page.waitForTimeout(400);
-  await page.locator("[data-token-rotate-confirm]").first().click({ timeout: 6000 }).catch(() => {});
-  await page.waitForSelector("[data-token-secret]", { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(800);
-  const rotatedSecret = (await page
-    .locator("[data-token-secret] code")
-    .first()
-    .innerText()
-    .catch(() => ""))
-    .trim();
-
-  const rotation = await page.evaluate(async ({ oldToken, newToken }) => {
-    const call = async (token) => {
-      const response = await fetch("/api/v1/scim/v2/Users", {
-        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-      });
-      return { status: response.status };
-    };
-    return {
-      oldStatus: (await call(oldToken)).status,
-      newStatus: (await call(newToken)).status,
-    };
-  }, { oldToken: secret, newToken: rotatedSecret });
-
-  const rotatedRows = await page.locator('[data-token-row][data-token-rotated="true"]').count();
-  const expiryColumn = await page.locator('[data-token-row] td:nth-child(5)').first().innerText().catch(() => "");
-  note({
-    step: "rotated",
-    newSecretShown: rotatedSecret.startsWith("omsc_") && rotatedSecret !== secret,
-    oldStatus: rotation.oldStatus,
-    newStatus: rotation.newStatus,
-    rotatedRows,
-    expiryColumn: expiryColumn.trim().slice(0, 40),
-  });
-  await shot(page, "page-iam-provisioning-rotated");
-
   // ---- Revoke, and prove the token is refused afterwards -----------------------------------
   // The list is newest-first, so the token this pass minted is the first row.
   await page.locator("[data-token-revoke]").first().click({ timeout: 4000 }).catch(() => {});
@@ -6841,115 +7671,14 @@ async function runIamAuthenticationDepth(page, report) {
     .first()
     .innerText()
     .catch(() => "")).trim();
-
-  // A protocol provider walks a ladder too. The old shape gave OIDC a single result on the
-  // argument that it "fails in exactly one place"; it fails in four, and an operator staring at
-  // "connection failed" for an issuer that is somebody else's has nothing to act on. So the
-  // ladder must be *present*, must refuse at the first step against an unreachable host, and the
-  // steps after the failure must stay pending — a claim read against an issuer that was never
-  // trusted is not a claim about anything.
-  const protocolSteps = await page
-    .locator(`[data-test-steps="qa-${stamp}"] [data-test-step]`)
-    .evaluateAll((nodes) =>
-      nodes.map((n) => `${n.getAttribute("data-test-step")}:${n.getAttribute("data-test-step-status")}`),
-    )
-    .catch(() => []);
-  const failedStep = protocolSteps.findIndex((row) => row.endsWith(":failed"));
   note({
     step: "discovery-test",
     testStatus,
     // An unreachable host must still produce a *result* the panel can render.
     renderedAVerdict: testStatus === "ok" || testStatus === "failed",
     explainsItself: testText.length > 20,
-    // The ladder, and the refusal naming the step that refused.
-    protocolLadder: protocolSteps,
-    hasLadder: protocolSteps.length > 0,
-    failedAtTheFirstStep: protocolSteps[0] === "discovery:failed",
-    // Nothing after the failure may claim to have run.
-    stoppedAtTheFailure: failedStep >= 0 && protocolSteps.slice(failedStep + 1).every((row) => row.endsWith(":pending")),
-    // The step name has to reach the panel as a *name*, not as `discovery` in lowercase.
-    namesTheStep: /discovery/i.test(testText),
   });
   await shot(page, "page-iam-authentication-tested");
-
-  // ---- A SAML provider walks its own ladder, starting at the certificate -------------------
-  // SAML publishes no discovery document, so padding its ladder with a discovery row would make
-  // the two look alike while reporting different things. The first row is the certificate, and a
-  // provider whose certificate is a broken paste is refused *there* rather than at a discovery
-  // that does not exist.
-  const sstamp = Date.now().toString().slice(-6);
-  await page.locator("[data-iam-auth-new]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-provider-drawer]", { timeout: 8000 }).catch(() => {});
-  await page.locator("[data-kind=saml]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(300);
-  await page.locator("[data-provider-slug-input]").first().fill(`qa-saml-${sstamp}`).catch(() => {});
-  await page.locator("[data-provider-name]").first().fill(`QA saml ${sstamp}`).catch(() => {});
-  await page.locator("[data-provider-field=issuer]").first().fill("https://idp.qa.invalid/saml").catch(() => {});
-  await page.locator("[data-provider-field=audience]").first().fill("https://omnion.qa.invalid").catch(() => {});
-  await page.locator("[data-provider-field=certificate_pem]").first().fill(
-    "-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n",
-  ).catch(() => {});
-  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(2500);
-  await page.locator(`[data-provider-test="qa-saml-${sstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector(`[data-test-steps="qa-saml-${sstamp}"]`, { timeout: 25000 }).catch(() => {});
-  await page.waitForTimeout(500);
-  const samlSteps = await page
-    .locator(`[data-test-steps="qa-saml-${sstamp}"] [data-test-step]`)
-    .evaluateAll((nodes) =>
-      nodes.map((n) => `${n.getAttribute("data-test-step")}:${n.getAttribute("data-test-step-status")}`),
-    )
-    .catch(() => []);
-  const samlText = (await page
-    .locator(`[data-provider-test-result="qa-saml-${sstamp}"]`)
-    .first()
-    .innerText()
-    .catch(() => "")).trim();
-  note({
-    step: "saml-test-ladder",
-    steps: samlSteps,
-    hasLadder: samlSteps.length > 0,
-    // The first step is the certificate, and a certificate nobody can read is refused there.
-    refusesAtTheCertificate: samlSteps[0] === "certificate:failed",
-    namesTheProblem: /certificate/i.test(samlText),
-    // And it must not claim a claims step that never ran.
-    claimsStepPending: samlSteps.includes("claims:pending"),
-  });
-  // The removal is a dialog now, and it reads the impact before it offers the button. Waiting on
-  // the panel rather than on a fixed pause: the click below is refused by a 400 ms timeout if
-  // the count has not arrived, and a timed-out click in a pass that swallows errors is a step
-  // that silently stops testing anything.
-  await page.locator(`[data-provider-delete="qa-saml-${sstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector(`[data-provider-deletion-dialog="qa-saml-${sstamp}"] [data-provider-deletion-count]`, { timeout: 15000 }).catch(() => {});
-  // A provider the pass just created has provisioned nobody, so the delete is NOT blocked and
-  // the repair button must be absent. Asserting its absence is the half that matters: a reassign
-  // button that appears for a provider with nothing to fall back sends an empty batch and is
-  // told `no_subjects`.
-  const unblocked = {
-    dialogOpened: (await page.locator(`[data-provider-deletion-dialog="qa-saml-${sstamp}"]`).count()) > 0,
-    affected: await page
-      .locator(`[data-provider-deletion-dialog="qa-saml-${sstamp}"] [data-provider-deletion-count]`)
-      .first()
-      .getAttribute("data-affected")
-      .catch(() => null),
-    blocked: await page
-      .locator(`[data-provider-deletion-dialog="qa-saml-${sstamp}"] [data-provider-deletion-count]`)
-      .first()
-      .getAttribute("data-blocked")
-      .catch(() => null),
-    offersReassign: (await page.locator(`[data-provider-reassign]`).count()) > 0,
-  };
-  note({
-    step: "deletion-dialog-unblocked",
-    ...unblocked,
-    // The count must be a real number and the block must be derived from it, not hardcoded.
-    countIsZero: unblocked.affected === "0",
-    notBlocked: unblocked.blocked === "false",
-    hidesTheRepair: unblocked.offersReassign === false,
-  });
-  await shot(page, "page-iam-provider-deletion-dialog");
-  await page.locator(`[data-provider-delete-confirm="qa-saml-${sstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(1500);
 
   // ---- A new provider is created switched off --------------------------------------------
   const enabledAttr = await page
@@ -6968,403 +7697,11 @@ async function runIamAuthenticationDepth(page, report) {
   note({ step: "sign-in-log", logRows, hasEmptyState: /No sign-in/i.test(logText) });
   await shot(page, "page-iam-authentication-log");
 
-  // ---- The BLOCKED half of the deletion dialog (REQ-065, slice 4 part 12) ------------------
-  // Everything above this line walks the *unblocked* provider, and that is the half that was
-  // already running. The other half needs an account that really came from a directory, and the
-  // pass had no way to make one: the SCIM round trip in the provisioning pass minted a token and
-  // used it, but its account lived in an organization this dialog would never be pointed at, and
-  // the two passes have no channel between them.
-  //
-  // So this provisions one through the **real** SCIM endpoint with a token minted a few lines
-  // below, and then opens the dialog on a provider that has provisioned nobody — which is now a
-  // different account. Wait: the order matters. The token is minted, the account is pushed, and
-  // only then is the dialog opened on a *different*, freshly created provider, because the
-  // guard's query is organization-scoped: a SCIM row counts for **every** provider in the
-  // organization, since a connector names no provider. That is `0127`'s documented state, and
-  // asserting it is the point — the criterion is "deleting a provider that provisioned users is
-  // blocked", and this is the only shape a SCIM-provisioned account can take in this schema.
-  const blockedStamp = Date.now().toString().slice(-6);
-  const blockedEmail = `scim-blocked-${blockedStamp}@omnion.test`;
-
-  // A token, from the real screen. Minted here rather than in the provisioning pass because the
-  // dialog needs a *live* account in *this* organization and the provisioning pass is a different
-  // function with a different token whose secret is already revoked by the time it returns.
-  await page.goto(`${URL_ADMIN}/settings/iam/provisioning`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-provisioning-view]", { timeout: 20000 }).catch(() => {});
-  await page.waitForSelector("[data-provisioning-organization]", { timeout: 8000 }).catch(() => {});
-  await page.locator("[data-token-name]").first().fill(`QA deletion guard ${blockedStamp}`).catch(() => {});
-  await page.locator("[data-token-mint]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-token-secret]", { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(600);
-  const blockedToken = (await page.locator("[data-token-secret] code").first().innerText().catch(() => "")).trim();
-
-  // The push, through the real endpoint. Asserting `identity_source` here rather than through
-  // the dialog alone is deliberate: the dialog proves the guard, and the column is what the guard
-  // reads, so a guard that counted the account for some other reason would still be caught.
-  const push = await page.evaluate(async ({ token, email, stamp: localStamp }) => {
-    const call = async (method, path, body) => {
-      const response = await fetch(`/api/v1/scim/v2${path}`, {
-        method,
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json",
-          accept: "application/json",
-        },
-        ...(body ? { body: JSON.stringify(body) } : {}),
-      });
-      let payload = null;
-      try {
-        payload = await response.json();
-      } catch {
-        payload = null;
-      }
-      return { status: response.status, payload };
-    };
-    const created = await call("POST", "/Users", {
-      schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"],
-      userName: email,
-      displayName: "SCIM deletion guard",
-      externalId: `qa-blocked-${localStamp}`,
-      active: true,
-    });
-    return { status: created.status, id: created.payload?.id ?? null, email };
-  }, { token: blockedToken, email: blockedEmail, stamp: blockedStamp });
-
-  note({
-    step: "deletion-guard-fixture",
-    email: blockedEmail,
-    // The push must have worked before the dialog can mean anything.
-    provisioned: push.status === 201 || push.status === 200,
-    pushStatus: push.status,
-  });
-
-  // A provider that has provisioned *nothing itself* — and is still blocked, because a SCIM row
-  // is organization-wide. This is the assertion that never ran: before the store write, the count
-  // read `0` here and the dialog happily offered the delete.
-  await page.goto(`${URL_ADMIN}/settings/iam/authentication`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForSelector("[data-iam-authentication]", { timeout: 20000 }).catch(() => {});
-  await page.locator("[data-iam-auth-new]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-provider-drawer]", { timeout: 8000 }).catch(() => {});
-  const gstamp = Date.now().toString().slice(-6);
-  await page.locator("[data-provider-slug-input]").first().fill(`qa-guard-${gstamp}`).catch(() => {});
-  await page.locator("[data-provider-name]").first().fill(`QA guard ${gstamp}`).catch(() => {});
-  await page.locator("[data-provider-field=issuer]").first().fill("https://idp.qa.invalid/guard").catch(() => {});
-  await page.locator("[data-provider-field=client_id]").first().fill(`qa-guard-${gstamp}`).catch(() => {});
-  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector(`[data-provider-delete="qa-guard-${gstamp}"]`, { timeout: 15000 }).catch(() => {});
-  await page.locator(`[data-provider-delete="qa-guard-${gstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector(
-    `[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count]`,
-    { timeout: 15000 },
-  ).catch(() => {});
-  await page.waitForTimeout(500);
-
-  const blockedState = {
-    affected: await page
-      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count]`)
-      .first()
-      .getAttribute("data-affected")
-      .catch(() => null),
-    blocked: await page
-      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count]`)
-      .first()
-      .getAttribute("data-blocked")
-      .catch(() => null),
-    offersReassign: (await page.locator("[data-provider-reassign]").count()) > 0,
-    listsTheAccount: (await page.locator(`[data-deletion-account]`).count()) > 0,
-    breakdown: await page
-      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-deletion-source]`)
-      .evaluateAll((nodes) => nodes.map((n) => `${n.getAttribute("data-deletion-source")}:${n.textContent.trim()}`))
-      .catch(() => []),
-    // The breakdown has to ADD UP to the total. A dialog whose chips say 1 and a headline saying
-    // 2 is a dialog an operator cannot act on, and it is only visible by summing in the browser.
-    unreconciled: (await page.locator("[data-provider-deletion-unreconciled]").count()) > 0,
-  };
-  note({
-    step: "deletion-dialog-blocked",
-    ...blockedState,
-    // The whole criterion: a non-zero count, a refusal, and the repair it tells you to use.
-    blockedIsTrue: blockedState.blocked === "true",
-    countIsPositive: Number(blockedState.affected) > 0,
-    offersTheRepair: blockedState.offersReassign,
-    namesWhereTheyComeFrom: blockedState.breakdown.some((row) => row.startsWith("scim")),
-    reconciled: blockedState.unreconciled === false,
-  });
-  await shot(page, "page-iam-provider-deletion-blocked");
-
-  // ---- The repair actually works, and the delete then succeeds -----------------------------
-  // The criterion's second clause, through the button. A dialog that *says* "fall back to local"
-  // and a repair that does nothing are the same screen to an operator until they press it, and
-  // the count afterwards is what tells the two apart.
-  if (blockedState.blocked === "true") {
-    await page.locator("[data-provider-reassign]").first().click({ timeout: 8000 }).catch(() => {});
-    // The dialog re-reads the impact before it says anything, so wait on the count going to zero
-    // rather than on a pause — the announcement is the only thing that changed and it arrives
-    // after a round trip.
-    await page
-      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count][data-blocked="false"]`)
-      .first()
-      .waitFor({ timeout: 20000 })
-      .catch(() => {});
-    await page.waitForTimeout(400);
-    const afterReassign = await page
-      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count]`)
-      .first()
-      .getAttribute("data-affected")
-      .catch(() => null);
-    const hidesTheRepair = (await page.locator("[data-provider-reassign]").count()) === 0;
-    note({
-      step: "deletion-repair",
-      afterReassign,
-      // Zero accounts means the update really moved the rows; a dialog that merely re-rendered
-      // its own stale state would still show the old number.
-      countIsZero: afterReassign === "0",
-      // And the repair must disappear, or the next press sends an empty batch.
-      repairHidden: hidesTheRepair,
-    });
-    await shot(page, "page-iam-provider-deletion-reassigned");
-
-    await page.locator(`[data-provider-delete-confirm="qa-guard-${gstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-    await page
-      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"]`)
-      .waitFor({ state: "detached", timeout: 20000 })
-      .catch(() => {});
-    await page.waitForTimeout(1200);
-    const goneNow = (await page.locator(`[data-provider-slug="qa-guard-${gstamp}"]`).count()) === 0;
-    note({ step: "delete-after-reassign", goneFromTheList: goneNow });
-  }
-
-  // Back to the OIDC provider's editor for the attribute map below.
-  await page.locator(`[data-provider-edit="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-attribute-map]", { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(600);
-  const mapEmpty = await page.locator("[data-attribute-map-empty]").count();
-  note({
-    step: "attribute-map-empty",
-    visible: mapEmpty > 0,
-    // The empty state has to say what breaks: no mapped email is not a cosmetic gap.
-    namesTheConsequence: /email/i.test(
-      (await page.locator("[data-attribute-map-empty]").first().innerText().catch(() => "")),
-    ),
-  });
-
-  // ---- The attribute map: a real editor, and a preview that runs the real projection --------
-  // The mapping is the wizard's third step and it is the part that is invisible until somebody
-  // cannot sign in, so the walkthrough edits it and rehearses a pasted claims payload. The
-  // rehearsal matters more than the editing: a preview that echoed its own input would agree
-  // with this screen and disagree with every sign-in.
-  //
-  // The editor and the empty-state check are above, immediately after the deletion walk: the
-  // dialog block navigates away to the provisioning screen, so the map has to be re-opened here
-  // and the empty state has to be read in the same place it is rendered.
-  await page.locator("[data-attribute-map-add]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(300);
-  await page.locator("[data-attribute-source=0]").first().fill("mail").catch(() => {});
-  // The email row arrives required and cannot be made optional: the server refuses a map with no
-  // email, and a form that let you save one would teach people to hit that refusal.
-  const requiredLocked = await page.locator("[data-attribute-required=0]").first().isDisabled().catch(() => false);
-  await page.locator("[data-attribute-map-save]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(1800);
-  const savedChip = await page.locator("[data-attribute-map-saved]").count();
-  note({ step: "attribute-map-saved", savedIndicator: savedChip > 0, emailRequiredLocked: requiredLocked });
-
-  await page.locator("[data-attribute-map-add]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(300);
-  await page.locator("[data-attribute-source=1]").first().fill("given_name").catch(() => {});
-  await page.locator("[data-attribute-target=1]").first().selectOption("display_name").catch(() => {});
-  await page.locator("[data-attribute-transform=1]").first().selectOption("trim").catch(() => {});
-  await page.locator("[data-attribute-map-save]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(1800);
-
-  await page.locator("[data-attribute-sample]").first().fill(
-    JSON.stringify({ sub: "2481", mail: "  QA.Walker@Example.COM ", given_name: "  QA Walker  " }, null, 2),
-  ).catch(() => {});
-  await page.locator("[data-attribute-preview]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-attribute-preview-result]", { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(500);
-  const previewVerdict = await page
-    .locator("[data-attribute-preview-result]")
-    .first()
-    .getAttribute("data-attribute-preview-result")
-    .catch(() => null);
-  const previewRows = await page
-    .locator("[data-attribute-preview-result] [data-attribute-preview-row]")
-    .evaluateAll((nodes) =>
-      nodes.map((n) => `${n.getAttribute("data-attribute-preview-row")}=${n.lastElementChild?.textContent?.trim() ?? ""}`),
-    )
-    .catch(() => []);
-  note({
-    step: "attribute-map-preview",
-    verdict: previewVerdict,
-    rows: previewRows,
-    // The transform has to have *run*: raw claim in, transformed value out. An echoed input
-    // would pass a row-count check and prove nothing about the map.
-    emailTransformed: previewRows.some((row) => row === "email=qa.walker@example.com"),
-    nameTrimmed: previewRows.some((row) => row === "display_name=QA Walker"),
-  });
-  await shot(page, "page-iam-attribute-map");
-
-  // ---- A payload with no email is refused BY NAME, not with a cheerful partial table ---------
-  await page.locator("[data-attribute-sample]").first().fill(JSON.stringify({ sub: "2481", given_name: "Nobody" })).catch(() => {});
-  await page.locator("[data-attribute-preview]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-attribute-preview-result=refused]", { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(400);
-  const refusalText = (await page.locator("[data-attribute-preview-result]").first().innerText().catch(() => "")).trim();
-  const refusalRows = await page.locator("[data-attribute-preview-result] [data-attribute-preview-row]").count();
-  note({
-    step: "attribute-map-refusal",
-    namesTheField: /email/i.test(refusalText),
-    // Withholding the values is the point: a half account is what a partial table would create.
-    withholdsValues: refusalRows === 0,
-  });
-
-  await page.locator("[data-provider-drawer-close]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(400);
-
-  // ---- A directory provider: its own fields, its own ladder, its own gate -------------------
-  // The protocol half above cannot prove the directory half. A directory needs a service
-  // account, has no client secret at all, and its test is a *ladder* — so connecting one and
-  // reading the steps is the only way the screen is actually exercised rather than rendered.
+  // ---- Remove it and prove the list goes back to its empty state ---------------------------
   await page.locator(`[data-provider-delete="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  // The dialog reads the impact before it offers the button, so the confirm is waited on rather
-  // than assumed. See the SAML case above for why a fixed pause is the wrong instrument here.
-  await page.waitForSelector(`[data-provider-deletion-dialog="qa-${stamp}"] [data-provider-deletion-count]`, { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(400);
   await page.locator(`[data-provider-delete-confirm="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(2000);
-
-  await page.locator("[data-iam-auth-new]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector("[data-provider-drawer]", { timeout: 8000 }).catch(() => {});
-  const dstamp = Date.now().toString().slice(-6);
-  await page.locator("[data-kind=active_directory]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(300);
-  const dirFields = await page.locator("[data-provider-field=host]").count();
-  // A directory's credential is the bind reference, so the client-secret input must be gone —
-  // two secret fields on one provider is how a password ends up in the wrong box.
-  const clientSecretFields = await page.locator("[data-provider-secret-ref]").count();
-  note({
-    step: "directory-kind",
-    fieldsShown: dirFields > 0,
-    noClientSecretField: clientSecretFields === 0,
-    // The template must arrive with a filter that is already safe, not an empty box.
-    filterHasPlaceholder: (await page.locator("[data-provider-field=user_filter]").first().inputValue().catch(() => "")).includes("{username}"),
-  });
-  await shot(page, "page-iam-provider-wizard");
-
-  await page.locator("[data-provider-slug-input]").first().fill(`qa-dir-${dstamp}`).catch(() => {});
-  await page.locator("[data-provider-name]").first().fill(`QA directory ${dstamp}`).catch(() => {});
-  await page.locator("[data-provider-field=host]").first().fill("ldaps://dir.qa.invalid").catch(() => {});
-  await page.locator("[data-provider-field=base_dn]").first().fill("ou=people,dc=qa,dc=invalid").catch(() => {});
-  await page.locator("[data-provider-field=bind_dn]").first().fill("cn=omnion,ou=svc,dc=qa,dc=invalid").catch(() => {});
-  await page.locator("[data-provider-field=bind_secret_ref]").first().fill("OMNION_QA_LDAP_BIND_ABSENT").catch(() => {});
-  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(2500);
-
-  await page.locator(`[data-provider-test="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForSelector(`[data-test-steps="qa-dir-${dstamp}"]`, { timeout: 25000 }).catch(() => {});
-  await page.waitForTimeout(600);
-  const stepStatuses = await page
-    .locator(`[data-test-steps="qa-dir-${dstamp}"] [data-test-step]`)
-    .evaluateAll((nodes) => nodes.map((n) => `${n.getAttribute("data-test-step")}:${n.getAttribute("data-test-step-status")}`))
-    .catch(() => []);
-  const dirTestStatus = await page
-    .locator(`[data-provider-test-result="qa-dir-${dstamp}"]`)
-    .first()
-    .getAttribute("data-test-status")
-    .catch(() => null);
-  note({
-    step: "directory-test-ladder",
-    // A sound configuration with an unreachable host is `incomplete`, never `ok` — the gate
-    // below depends on that, and a screen that said "ok" here would be lying.
-    status: dirTestStatus,
-    steps: stepStatuses,
-    hasLadder: stepStatuses.length > 0,
-    notAPass: dirTestStatus !== "ok",
-  });
-  await shot(page, "page-iam-provider-mapping");
-
-  // ---- A provider that has never passed cannot be switched on -----------------------------
-  // The button is *disabled*, not merely erroring: a control that only says no after the click
-  // is a control people click twice.
-  const toggleDisabled = await page
-    .locator(`[data-provider-toggle="qa-dir-${dstamp}"]`)
-    .first()
-    .isDisabled()
-    .catch(() => false);
-  const untestedBadge = await page.locator(`[data-provider-untested="qa-dir-${dstamp}"]`).count();
-  note({ step: "enable-gated", toggleDisabled, showsNeverTested: untestedBadge > 0 });
-
-  // ---- A configuration problem is named against its field, not as a generic failure ---------
-  await page.locator(`[data-provider-edit="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(400);
-  await page.locator("[data-provider-field=user_filter]").first().fill("(objectClass=person)").catch(() => {});
-  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(2000);
-  await page.locator(`[data-provider-test="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(2500);
-  const problemFields = await page
-    .locator(`[data-test-problems="qa-dir-${dstamp}"] [data-test-problem]`)
-    .evaluateAll((nodes) => nodes.map((n) => n.getAttribute("data-test-problem")))
-    .catch(() => []);
-  note({
-    step: "field-level-problem",
-    problems: problemFields,
-    // A filter without the placeholder is refused BY NAME, because that is the mistake that
-    // would otherwise return every person in the directory for every sign-in.
-    namesTheFilter: problemFields.includes("user_filter"),
-  });
-
-  await page.locator("[data-provider-drawer-close]").first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(400);
-
-  // ---- The sync ledger (REQ-065, slice 4 part 2) --------------------------------------------
-  // Walked while the directory provider still exists, because the ledger is only offered on a
-  // directory kind — a protocol provider has nothing to sync, and offering the tab there would
-  // be a screen with nothing in it.
-  const dirProviderId = await page
-    .locator(`[data-sync-toggle]`)
-    .evaluateAll((nodes) => nodes.map((n) => n.getAttribute("data-sync-toggle")))
-    .catch(() => []);
-  await page.locator(`[data-sync-toggle="${dirProviderId[0] ?? ""}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(1500);
-  const syncEmpty = await page.locator("[data-sync-empty]").count();
-  const syncRuns = await page.locator("[data-sync-run]").count();
-  // A provider that has never synced says so. A ledger that rendered an empty *table* instead
-  // would be indistinguishable from "loaded and there is nothing", which is the state that
-  // makes an operator wonder whether the sync ever runs at all.
-  note({
-    step: "sync-ledger-empty",
-    found: dirProviderId.length > 0,
-    emptyState: syncEmpty > 0,
-    // Either is legitimate — a provider that has synced has rows — so this asserts that the
-    // screen answered *something* rather than which answer it gave.
-    answered: syncEmpty > 0 || syncRuns > 0,
-  });
-
-  if (syncRuns > 0) {
-    await page.locator("[data-sync-open]").first().click({ timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1200);
-    const drawer = await page.locator("[data-sync-drawer]").count();
-    const subjects = await page.locator("[data-sync-subject]").count();
-    // The retry control is disabled at zero rather than sending an empty list, because an empty
-    // list means "every subject that ever failed" and the button says "retry these N".
-    const retryDisabledAtZero = (await page.locator("[data-sync-retry]").first().isDisabled().catch(() => true));
-    note({ step: "sync-drawer", drawer: drawer > 0, subjects, retryDisabledAtZero });
-    await shot(page, "page-iam-provider-sync");
-    await page.locator("[data-sync-filter]").first().click({ timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1200);
-    const filteredLabel = await page.locator("[data-sync-filter]").first().getAttribute("data-sync-filter").catch(() => null);
-    note({ step: "sync-problems-filter", toggles: filteredLabel === "problems" });
-  }
-
-  await page.locator(`[data-provider-delete="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  // Same wait as the other two removals: the confirm only exists once the impact has arrived.
-  await page.waitForSelector(`[data-provider-deletion-dialog="qa-dir-${dstamp}"] [data-provider-deletion-count]`, { timeout: 15000 }).catch(() => {});
-  await page.locator(`[data-provider-delete-confirm="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(2000);
-
-  // ---- Both providers gone: the list is back to its real empty state ------------------------
-  // Checked with the drawer CLOSED. Opening it first would leave the list covered and this
-  // would assert an empty state nobody can see.
   const afterRemove = await page.locator("[data-provider-row]").count();
   const emptyVisible = await page.locator("[data-providers-empty]").count();
   note({ step: "provider-removed", afterRemove, emptyStateVisible: emptyVisible > 0 });

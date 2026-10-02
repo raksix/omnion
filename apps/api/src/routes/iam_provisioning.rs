@@ -9,7 +9,6 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use omnion_audit::NewAuditEntry;
-use omnion_events::{NewEvent, bus};
 use omnion_identity::provisioning;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -22,13 +21,6 @@ use crate::error::ApiError;
 use crate::routes::iam::record;
 use crate::scope::{ensure_same_organization, resolve_organization};
 use crate::state::AppState;
-
-/// Record an event without letting a webhook problem fail the caller's request.
-async fn emit(state: &AppState, event: NewEvent) {
-    if let Err(error) = bus::emit(state.db().pool(), event).await {
-        tracing::warn!(error = %error, "the event could not be recorded");
-    }
-}
 
 /// Query of the token list and the log.
 #[derive(Debug, Deserialize)]
@@ -50,9 +42,6 @@ pub struct NewTokenRequest {
     /// Organization to mint in (platform accounts only).
     #[serde(default)]
     pub organization_id: Option<Uuid>,
-    /// Lifetime in days; absent means the store's default rather than "no expiry".
-    #[serde(default)]
-    pub expires_in_days: Option<i64>,
 }
 
 /// One token as the panel reads it.
@@ -66,15 +55,6 @@ fn token_json(token: &provisioning::ProvisioningToken) -> Value {
         "last_used_at": token.last_used_at.map(|value| value.format(&Rfc3339).unwrap_or_default()),
         "revoked_at": token.revoked_at.map(|value| value.format(&Rfc3339).unwrap_or_default()),
         "created_at": token.created_at.format(&Rfc3339).unwrap_or_default(),
-        "expires_at": token.expires_at.map(|value| value.format(&Rfc3339).unwrap_or_default()),
-        "rotated_at": token.rotated_at.map(|value| value.format(&Rfc3339).unwrap_or_default()),
-        // The panel cannot compare timestamps itself, so the store's two columns are turned into
-        // the sentence a reader acts on here. An expired token that still reads as "active" is the
-        // one thing a security panel must never show.
-        "expired": token
-            .expires_at
-            .is_some_and(|value| value <= time::OffsetDateTime::now_utc()),
-        "rotated": token.rotated_at.is_some(),
     })
 }
 
@@ -90,12 +70,6 @@ fn log_json(entry: &provisioning::SyncLogEntry) -> Value {
         "action": entry.action,
         "outcome": entry.outcome,
         "detail": entry.detail,
-        // A number, not a sentence. `detail` above says "3 session(s) ended" in English, and a
-        // panel that wants the figure has to either show the prose or re-parse it — so a second
-        // consumer re-parses it *differently*, and the offboarding review that needs the number
-        // is the one surface that cannot have it. The column is `not null`, so this is always a
-        // value: 0 means this line revoked nothing, which is the true answer for a create.
-        "revoked_sessions": entry.revoked_sessions,
         "created_at": entry.created_at.format(&Rfc3339).unwrap_or_default(),
     })
 }
@@ -123,12 +97,11 @@ pub async fn create_token(
     Json(body): Json<NewTokenRequest>,
 ) -> Result<(axum::http::StatusCode, Json<Value>), ApiError> {
     let organization_id = resolve_organization(&current, body.organization_id)?;
-    let issued = provisioning::create_token_with_ttl(
+    let issued = provisioning::create_token(
         state.db().pool(),
         organization_id,
         &body.name,
         Some(current.user.id),
-        body.expires_in_days,
     )
     .await?;
 
@@ -163,18 +136,10 @@ pub async fn revoke_token(
 ) -> Result<Json<Value>, ApiError> {
     // The row is read first, so the tenancy check runs before anything is written and a token of
     // another organization is invisible rather than revocable.
-    //
-    // The column list is the one the store uses, and that is not tidiness: this query used to
-    // spell out the columns by hand, and when `0124` added `expires_at` and `rotated_at` to
-    // `ProvisioningToken` the list was left behind. sqlx then had no value for two fields of
-    // the struct and the route answered **500 internal_error** for every revoke — on the one
-    // operation an operator reaches for when a credential must die. The identity branch had it
-    // fixed and this one did not, which is what a duplicated column list buys: two places to
-    // forget, and no compiler to notice. A row shape the store owns is a constant, so read it.
-    let token = sqlx::query_as::<_, provisioning::ProvisioningToken>(&format!(
-        "select {} from provisioning_tokens where id = $1",
-        provisioning::TOKEN_COLUMNS
-    ))
+    let token = sqlx::query_as::<_, provisioning::ProvisioningToken>(
+        "select id, organization_id, name, prefix, created_by, last_used_at, revoked_at, \
+         created_at from provisioning_tokens where id = $1",
+    )
     .bind(token_id)
     .fetch_optional(state.db().pool())
     .await
@@ -206,136 +171,6 @@ pub async fn revoke_token(
     Ok(Json(json!({
         "revoked": revoked.is_some(),
         "token": revoked.as_ref().map(token_json),
-    })))
-}
-
-/// Replace a live token with a new one and hand back the new secret (shown exactly once).
-///
-/// This is the operation the acceptance criterion means by "a rotated token refuses the old
-/// value": the old secret is dead the moment this returns, and the response carries the
-/// replacement's secret so the operator can paste it into the connector without minting a second
-/// token and leaving an orphan.
-pub async fn rotate_token(
-    State(state): State<AppState>,
-    current: CurrentSession,
-    address: ClientAddress,
-    Path(token_id): Path<Uuid>,
-) -> Result<Json<Value>, ApiError> {
-    // Read the row first so the tenancy check runs before anything is written, exactly as in
-    // `revoke_token`: a token of another organization must be invisible, not rotatable.
-    //
-    // The refusal is a `404` and not `cross_organization`, and that is the whole point of doing
-    // the check here rather than in `ensure_same_organization`. A "this account may only work
-    // inside its own organization" answer is a *confirmation that the id exists* — a stranger
-    // holding a guessed uuid learns whether it names a real token, and a token is exactly the
-    // kind of row whose existence is worth not confirming. `ensure_same_organization` is right for
-    // a body field the caller supplied; it is wrong for a path id that was never theirs.
-    // The store's column list, like the revoke route above: a second hand-written copy is a
-    // second thing to forget when the row shape changes.
-    let before = match sqlx::query_as::<_, provisioning::ProvisioningToken>(&format!(
-        "select {} from provisioning_tokens where id = $1",
-        provisioning::TOKEN_COLUMNS
-    ))
-    .bind(token_id)
-    .fetch_optional(state.db().pool())
-    .await
-    .map_err(omnion_identity::IdentityError::from)?
-    {
-        Some(row) => row,
-        None => {
-            return Err(ApiError::new(
-                axum::http::StatusCode::NOT_FOUND,
-                "token_not_found",
-                "no such provisioning token",
-            ));
-        }
-    };
-
-    if let Some(own) = current.user.organization_id
-        && own != before.organization_id
-    {
-        // Same answer as "no such token", and for the same reason: the caller may not learn that
-        // this id names anything.
-        return Err(ApiError::new(
-            axum::http::StatusCode::NOT_FOUND,
-            "token_not_found",
-            "no such provisioning token",
-        ));
-    }
-
-    let issued = provisioning::rotate_token(state.db().pool(), token_id, Some(current.user.id))
-        .await
-        .map_err(|error| match error {
-            omnion_identity::IdentityError::InvalidProvisioning(message) => {
-                // A rotation of an already-revoked token is a conflict, not a bad request: the
-                // caller's intent is well-formed, the state they are pointing at has moved on.
-                if message.contains("already revoked") {
-                    ApiError::new(
-                        axum::http::StatusCode::CONFLICT,
-                        "token_not_live",
-                        message,
-                    )
-                } else {
-                    ApiError::bad_request("invalid_request", message)
-                }
-            }
-            other => ApiError::from(other),
-        })?;
-
-    record(
-        &state,
-        NewAuditEntry::by_user(current.user.id, "iam.provisioning.token_rotated")
-            .target("provisioning_token", before.id.to_string())
-            .metadata(json!({
-                "old_prefix": before.prefix,
-                "new_prefix": issued.token.prefix,
-                "name": issued.token.name,
-            }))
-            .ip_address(address.as_text())
-            .organization(Some(before.organization_id)),
-    )
-    .await?;
-
-    emit(
-        &state,
-        NewEvent::new("iam.provisioning.token_rotated")
-            .organization(Some(before.organization_id))
-            .actor(Some(current.user.id))
-            .payload(json!({
-                "old_token_id": before.id,
-                "new_token_id": issued.token.id,
-                "old_prefix": before.prefix,
-                "new_prefix": issued.token.prefix,
-            })),
-    )
-    .await;
-
-    // The replaced token is re-read rather than rendered from the row captured before the
-    // rotation. That row is a *pre-image*: it says `rotated: false` about a token that is now
-    // rotated, and the panel renders exactly this response immediately after the button — so the
-    // one surface that says "this was replaced" would contradict the list it refreshes into. A
-    // response about a write should describe the write, not the state that preceded it.
-    let replaced = sqlx::query_as::<_, provisioning::ProvisioningToken>(&format!(
-        "select {} from provisioning_tokens where id = $1",
-        provisioning::TOKEN_COLUMNS
-    ))
-    .bind(before.id)
-    .fetch_optional(state.db().pool())
-    .await
-    .map_err(omnion_identity::IdentityError::from)?
-    .ok_or_else(|| {
-        ApiError::new(
-            axum::http::StatusCode::NOT_FOUND,
-            "token_not_found",
-            "no such provisioning token",
-        )
-    })?;
-
-    Ok(Json(json!({
-        "rotated": true,
-        "replaced": token_json(&replaced),
-        "token": token_json(&issued.token),
-        "secret": issued.secret,
     })))
 }
 
