@@ -23,6 +23,7 @@ pub mod health_runner;
 pub mod intent_resolver;
 pub mod notification_runner;
 pub mod rate_limit_middleware;
+pub mod request_log_middleware;
 pub mod restore_job_runner;
 pub mod retention_runner;
 pub mod routes;
