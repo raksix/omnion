@@ -10231,3 +10231,67 @@ findings about the machine.
 **Next.** Re-run the focused pass (`--only=workflow-builder`, private `w3` stack, `QA_OUT_ROOT` on
 tmpfs) to read `listener.captureKind` and `closedByEscape` off a live builder, then
 `sentinelsStayApart` and `table-save-survives`.
+
+
+---
+
+## Tick 78 — the pass ran, and it found a chord that could open the list but never open it again
+
+**What.** The focused pass three ticks promised finally ran (`20261001-234917`, private `w3`
+stack, `QA_OUT_ROOT` on tmpfs, `QA_SLOTS=1`) and produced 40 builder rows of real readings. Two
+of them turned a *measured* red into a product defect: `shortcut-help.togglesOnTheSameKey:
+false`, and `edge-delete` clicking a point that was `onEdge: true` and still missing.
+
+**The defect, and it is not in the toggle.** `setHelpOpen((open) => !open)` is correct and the
+chord handler is correct — the handler was *unreachable*. `⌘/` is bound to the canvas
+(`onCanvasKeyDown` is React's `onKeyDown` on the canvas div, and the overlay is a **sibling** of
+it), and the dialog's close button carries `autoFocus`, so focus leaves the canvas the moment the
+list opens; on unmount the browser drops focus to `body`, and from `body` the chord that teaches
+its own shortcut can never be heard again for the rest of the session. One open/close cycle and
+the gesture is dead. Tick 75 fixed the *sibling* half of this exact trap (Escape worked only
+while the canvas held focus) and this is the other half, one `autoFocus` away.
+
+**Two defects in the fix, both found by writing it.** The obvious version calls `.focus()`
+inside the close handler, and React removes the dialog on that same render — the focus lands on a
+node the browser is about to detach and ends up on `body` anyway, i.e. **the wrong code that
+reads correct**. So the restore is an effect keyed on `helpOpen`, re-checking `isConnected` (the
+remembered element can be gone too). Then the handler could not *name* `closeHelp`: it is
+declared ~540 lines later, so listing it in the deps array is a render-time TDZ read — the trap
+`lateActions` was written for. And the half nobody notices: `helpOpen` was already being read
+inside that handler **without being a dependency**, a stale closure that answered "is the list
+open?" with a past value. Both now go through `helpState`, published in the render body, because
+an effect would publish one render late and the opening keydown would still read `false`.
+
+**Proof.**
+- `apps/admin` suite **372/372** (370 before; +2 guards in `builder-help-dialog.test.ts`).
+- **9 mutations, every one red on a NAMED assertion** (`help-focus.mutation.mjs`), file
+  restored **byte-exact** (md5) on every path including the failures. M4 is the inline-focus
+  version above; M8 is publishing from an effect; M2 is capturing the opener on a *close*, which
+  would save the button that is about to be removed.
+- M5 went red but not on its own message, and that was the harness being right to complain:
+  deleting the effect deletes the *text* every assertion in that test reads out of it, so the
+  first one reports. Both messages are now declared acceptable — a named set, not "any red".
+- `cargo test -p omnion-workflows --lib` **157/157**; `tsc --noEmit` clean for both packages,
+  run **directly** (again — `pnpm typecheck` said `cache hit` on files edited minutes earlier).
+- **Two boxes ticked**, both on readings: all five validation classes named on a live graph plus
+  `clean {valid: true, codes: []}` (with the cycle asserted on a *branch*, not only back at the
+  trigger), and two-tab conflict `409 graph_version_conflict` with `reloadOffered: true` while
+  `localNodesKept: 9` — the status alone would have been satisfiable by a canvas that silently
+  reverted, which is the opposite of what the criterion asks.
+
+**The 19 high findings are the probe's own refusals**, read one by one rather than counted: 9×409
++ 7 console echoes of it (the two-tab row), 1×404 `/runs?limit=5` (no run yet), 1×422 on
+`/validate` (the deliberately broken graph), and `/qa-sample` 404. `expectedRefusals` is empty,
+which is a **harness gap worth naming**: the harness has no vocabulary for "this request was
+supposed to fail", so deliberate 409/422 readings land in the same bucket as a defect.
+
+**Still not measured.** The pass died at `stack-gone` (tab closed, 3 concurrent passes) after the
+cleanup row, so `table-save-survives` never ran and `listener` read `panelFound: false` — the
+row never reached its own panel. `edge-delete`'s miss (`blockedBy: "text"`) and the
+`plugin-palette` sentinels (`sentinelsStayApart: false`, the wave-5b seam REQ-121 fills) are the
+two next measurements.
+
+**Next.** Re-run the focused pass on a quieter box to read `table-save-survives` and
+`listener.captureKind`, and re-read `edge-delete` against the hit-test (a probe clicking a point
+the node's own text covers is a *hit-testing* question, not a selection one). Then the ⌘/ row
+against the fix in `92fba4af`, which has not been in a browser.
