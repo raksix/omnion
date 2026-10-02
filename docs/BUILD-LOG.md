@@ -16199,3 +16199,60 @@ from the stored row rather than recomputed from the configuration.
   claim in a real database, which only the Rust walk can produce. Next: the trail line's `reason`
   for a *delivered* claim still reads `sent` rather than the state, so the same line names the
   verdict two ways — one from `Delivery::reason()`, one from `ClaimState`.
+
+- **2026-10-02 · omnion-w8 · REQ-117 slice 47 — one trail line named its verdict twice, and the
+  two names were the sentence an operator scans for.**
+  Slice 45 made `Delivery::sendable()` the single owner of "may this go to the mailer now" and
+  slice 46 put `ClaimState` on the lead timeline. What was left was the same question in a third
+  spelling, and this time the spelling was the one the *trail* shows: `Delivery::reason()` read
+  `Self::Ready(_) => "sent"`. `Ready` is not "handed to the mailer" — `Autoresponder::deliver`
+  returns `Ready(Message { delayed: true, .. })` for every source with a non-zero
+  `delay_minutes`, which is the *reservation* mechanism. So a 45-minute autoresponder wrote a
+  trail line reading `sent` for a reservation no mailer had touched, beside the
+  `ClaimState::Reserved` chip the panel now renders from the same row. **The route compounded
+  it**: the arm that runs when `sendable()` is `None` carries the comment *"A delayed message is
+  the worker's to send … Both leave a line so the detail page can say which"* and passes
+  `outcome.verdict.reason()` — the comment is the specification and the argument is its
+  violation. → `reason()` splits the `Ready` arm the way `sendable()` already did, and `NotYet`
+  joins it: `Ready(_) | NotYet(_) => "delayed"`. The panel stops printing the raw reason on a
+  claim line, because the chip is the authority (read from the stored row; `reason` is a word
+  chosen at decision time and can disagree with what was recorded), so the guard is on the LINE
+  rather than on the string. → `NotYet` is kept, and its doc now says why it has no producer:
+  `deliver` answers a delayed source with `Ready` because a `NotYet` carries no message for the
+  worker to send, so the one variant whose name is the answer was unreachable while the
+  reachable one borrowed the wrong word. **A variant with no producer is not dead code; it is the
+  only thing that made the defect visible.** → `scripts/qa/run-autoresponder-reason.sh` **7 legs
+  / 17 assertions, PROVEN TO FAIL at 4** with the two defects neutralised, and deterministic over
+  three consecutive runs. **Four defects of my own in the gate, the first the worst kind.**
+  (1) **A non-deterministic gate**: every positive check was `printf '%s' "$CODE" | grep -qE …`;
+  under `set -o pipefail`, `grep -q` exits at the first match, the upstream writer dies of
+  SIGPIPE and the pipeline reports 141 — measured over eight identical runs as
+  `0 141 141 0 141 141 0 141`. **The verdict was a function of how much data the writer had
+  buffered**, so four legs reported a defect the code did not have, while the negative controls
+  stayed green because "no match" is the pass there and SIGPIPE cannot reach it. Every check now
+  captures to a variable and tests the variable. (2) A helper whose regex terminated on `
+    }`
+  was handed input `tr` had already collapsed to one line, so it could never match. (3) Two legs
+  grepped the **comment-stripped** text for things that only exist in a comment and in Rust
+  spelling (`insert("reason"` is JavaScript's; Rust writes `.to_string()`), so they could only
+  ever fail. (4) A `$( … )` boundary split a pipeline, and the `awk` outside the paren swallowed
+  the rest of the file. **A gate assertion must be run once against the SHIPPED file, not only
+  against the neutralised one** — a leg that has never been green is indistinguishable from a
+  real defect. → module lib **207** (was 203, +4), `crm_autoresponder` **16/18** over a real
+  database, `omnion-api` lib **327**, `crm_claims` 8, `crm_sla_state` 5, clippy `--all-targets`
+  **0 errors**, admin `tsc --noEmit` exit 0, gate **7/7** twice proven. **A test was asserting the
+  defect**: `a_delayed_autoresponder_is_sent_when_its_time_comes` opened with
+  `assert_eq!(outcome.verdict.reason(), "sent")` — a test named after a promise, asserting its
+  opposite in its first line. The sweep half of that test is the real subject and is unchanged;
+  only the word was corrected, and `!is_sendable()` was added beside it.
+  **The two remaining walk failures are NOT mine and are proven so**: with the slice stashed
+  (`git stash push -- modules/crm-intake apps/admin/…`) the same two fail — `16 passed; 2 failed`
+  on both sides. One of them is a real product bug: `orphaned_reservations_do_not_starve_the_batch_the_worker_takes`
+  reads *"the first sweep reads a full batch of orphans and returns none of them: it carried 1
+  sendable rows, and the live lead was not among them"*, i.e. `due_reservations` fills its batch
+  with rows it then discards, so one orphan starves a live lead. **Left for the owner: it is in
+  slice 46's query and the same walk file, and fixing it needs a decision about whether the batch
+  limit counts rows read or rows returned.** **No browser pass and none claimed** — the QA slot is
+  held by a live sibling pass. Next: `mark_sent` writes `delivered_at`/`sent_at` but `record_skip`
+  writes only `reason`/`source`, so a *skipped* line and a *sent* line carry different keys for
+  the same event kind, and `ClaimState::of` answers `None` for a line with no `sent` key at all.
