@@ -2037,6 +2037,126 @@ async fn the_preview_frame_reads_the_draft_and_filters_it_server_side() {
 /// own page was, and the walkthrough recorded it as `publicRendered: false` on a page that had
 /// in fact published. There is nothing to preview *newer than* the live copy, so the live copy is
 /// the answer.
+/// The two numbers the frame reports were the length of the **top-level** array while the
+/// validator's own `block_count` was counted recursively, so a page whose whole content was
+/// one Columns block reported `1 of 1` and the editor's bar showed a page of one block while
+/// the outline listed seven. Both sides of this walk count the tree the same way, which is
+/// what makes the payload's own arithmetic (`block_count - visible_count`) meaningful.
+#[tokio::test]
+async fn the_frame_counts_nested_blocks_rather_than_top_level_ones() {
+    let Some(mut fixture) = Fixture::new().await else {
+        eprintln!("skipping: the development PostgreSQL is not reachable");
+        return;
+    };
+    let editor = fixture.editor_token().await;
+    let page_id = fixture.page(&editor, "nested-count").await;
+
+    // Two columns, three cells in the first and one in the second: 1 columns + 2 columns +
+    // 4 texts = 7 blocks, and exactly ONE of them is top level.
+    let mut tree = json!([{
+        "id": Uuid::new_v4().to_string(),
+        "type": "columns",
+        "props": { "columns": 2 },
+        "children": [
+            { "id": Uuid::new_v4().to_string(), "type": "column", "props": {},
+              "children": [
+                block("text", json!({ "text": "One" })),
+                block("text", json!({ "text": "Two" })),
+                block("text", json!({ "text": "Three" })),
+              ] },
+            { "id": Uuid::new_v4().to_string(), "type": "column", "props": {},
+              "children": [ block("text", json!({ "text": "Four" })) ] },
+        ],
+    }]);
+
+    // The state BEFORE anything is hidden, so the walk cannot pass on a payload that never
+    // carried the nesting. A count that only becomes right after the hidden block is removed
+    // is a count that was measuring something else.
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": tree.clone() })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+
+    let frame = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/preview"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(frame.status, StatusCode::OK, "{}", frame.body);
+
+    assert_eq!(
+        frame.body["block_count"].as_i64(),
+        Some(7),
+        "the frame reported {:?} for a tree of 7 blocks in 1 top-level entry: {}",
+        frame.body["block_count"],
+        frame.body["visible_blocks"],
+    );
+    assert_eq!(frame.body["visible_count"].as_i64(), Some(7));
+
+    // The same page with one cell hidden on phones: the STORED count is still 7 (the frame
+    // answers "what did I write"), and the drawn count is 6. A payload whose two numbers were
+    // both top-level reported 1 and 1 here and the hidden cell vanished from the arithmetic
+    // entirely — which is the number the frame's own banner subtracts.
+    let mut hide_second_cell = tree.clone();
+    hide_second_cell[0]["children"][0]["children"][1]["meta"] = json!({ "hide_on": "mobile" });
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PATCH,
+            &format!("/api/v1/pages/{page_id}"),
+            Some(&editor),
+            Some(json!({ "blocks": hide_second_cell })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+
+    let phone = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/pages/{page_id}/preview?viewport=mobile"),
+            Some(&editor),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(phone.status, StatusCode::OK, "{}", phone.body);
+    assert_eq!(
+        phone.body["block_count"].as_i64(),
+        Some(7),
+        "hiding a block must not change how many the page HOLDS: {}",
+        phone.body["block_count"],
+    );
+    assert_eq!(
+        phone.body["visible_count"].as_i64(),
+        Some(6),
+        "one cell is hidden from phones: {}",
+        phone.body["visible_count"],
+    );
+
+    // And the difference the banner prints is exactly the number of blocks the author hid.
+    let hidden = phone.body["block_count"].as_i64().unwrap_or(0)
+        - phone.body["visible_count"].as_i64().unwrap_or(0);
+    assert_eq!(
+        hidden, 1,
+        "the frame's own subtraction must name one hidden block"
+    );
+}
+
 #[tokio::test]
 async fn the_preview_frame_survives_a_publish_and_falls_back_to_the_live_revision() {
     let Some(mut fixture) = Fixture::new().await else {

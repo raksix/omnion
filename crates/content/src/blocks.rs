@@ -1055,7 +1055,10 @@ mod fatal_classification {
     fn must_be_refused() -> [(&'static str, Value); 2] {
         [
             ("block_payload_invalid", json!({ "not": "an array" })),
-            ("block_unknown_type", json!([block_value("no_such_block", json!({}))])),
+            (
+                "block_unknown_type",
+                json!([block_value("no_such_block", json!({}))]),
+            ),
         ]
     }
 
@@ -1231,13 +1234,19 @@ pub fn validate(value: &Value) -> BlockValidationReport {
         }
     };
 
-    if blocks.len() > MAX_BLOCKS {
+    // The bound and the reported count are ONE measurement, taken once, on the whole tree.
+    //
+    // Counting only the top level made the bound a rule a single container walked straight
+    // through: one `columns` block with four hundred and one text children is one block long,
+    // so it published, and the same payload's own `block_count` — counted recursively, by the
+    // loop below — reported 403. The author saw a page of one block and the page carried four
+    // hundred. Counting `total` here instead of `blocks.len()` is not a stricter rule; it is the
+    // rule the validator was already printing the number for.
+    total = count_tree(&blocks);
+    if total > MAX_BLOCKS {
         issues.push(BlockIssue::orphan(
             "block_too_many",
-            format!(
-                "a page holds at most {MAX_BLOCKS} blocks, this one has {}",
-                blocks.len()
-            ),
+            format!("a page holds at most {MAX_BLOCKS} blocks, this one has {total}"),
         ));
     }
 
@@ -1245,7 +1254,6 @@ pub fn validate(value: &Value) -> BlockValidationReport {
     // than per branch: the sequence a reader meets is the flattened document order.
     let mut previous_level: Option<u8> = None;
     for (index, block) in blocks.iter().enumerate() {
-        total += count_blocks(block, 1);
         validate_block(block, index, 1, &mut issues, &mut previous_level, None);
     }
 
@@ -1693,7 +1701,28 @@ fn check_heading_order(
     *previous_heading = Some(level);
 }
 
-/// Blocks in a tree, one level and deeper.
+/// Blocks a tree holds, at every depth.
+///
+/// **One definition, because three callers once had three.** The validator's `MAX_BLOCKS` bound
+/// was measured on the length of the top-level array while the `block_count` it reported beside
+/// it was counted recursively, so a page of one `columns` block holding 401 texts passed the
+/// bound and then reported itself as 403 blocks long. The preview route counted the same two
+/// numbers from the top level again, and the editor's status bar — which was handed the
+/// validate route's numbers, not the preview's — showed the count for one while the outline
+/// listed seven.
+///
+/// The bound and the reported count are the same question asked twice ("what does this page
+/// hold?"), so they now have one answer.
+#[must_use]
+pub fn count_tree(blocks: &[Block]) -> usize {
+    blocks
+        .iter()
+        .map(|block| 1 + count_tree(&block.children))
+        .sum()
+}
+
+/// Blocks in a tree, one level and deeper, for callers already accumulating a running total.
+#[cfg(test)]
 fn count_blocks(block: &Block, already: usize) -> usize {
     block
         .children
@@ -2237,6 +2266,84 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == "block_too_many")
         );
+    }
+
+    /// One `columns` block holding `texts` text children, spread over two real `column`
+    /// children so the container rules hold.
+    ///
+    /// The nesting is the whole point of the helper: this is the shape that slipped past the
+    /// bound, because the check ran on the length of the **top-level** array, so a page of one
+    /// block that happened to hold four hundred and one children was one block long and
+    /// reported nothing — while the same payload's own `block_count` said 403, because the
+    /// count that is *reported* is the recursive one. One function, one word, two definitions.
+    fn columns_holding(texts: usize) -> Value {
+        let cell = |n: usize| -> Value {
+            json!({
+                "id": Uuid::new_v4().to_string(),
+                "type": "column",
+                "props": {},
+                "children": (0..n)
+                    .map(|_| block("text", json!({ "text": "x" })))
+                    .collect::<Vec<Value>>(),
+            })
+        };
+        // Split so neither column is empty: an empty column is only a warning, but a test
+        // about the block BOUND should not also be a test about empty columns.
+        let left = texts.div_ceil(2);
+        json!({
+            "id": Uuid::new_v4().to_string(),
+            "type": "columns",
+            "props": { "columns": 2 },
+            "children": [cell(left), cell(texts - left)],
+        })
+    }
+
+    #[test]
+    fn the_block_bound_counts_nested_blocks_not_only_top_level_ones() {
+        let report = validate(&json!([columns_holding(MAX_BLOCKS + 1)]));
+
+        // The bound is about what a page HOLDS, and what a page holds is the whole tree. A
+        // bound measured on the outer array alone is a bound a single container walks straight
+        // through, and the page that breaks it is the one the outline already cannot draw.
+        assert!(
+            report.block_count > MAX_BLOCKS,
+            "the reported count must include nested blocks, got {}",
+            report.block_count
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "block_too_many"),
+            "a tree of {} blocks was accepted; issues: {:?}",
+            report.block_count,
+            report.issues.iter().map(|i| i.code).collect::<Vec<_>>()
+        );
+        assert!(!report.can_publish);
+    }
+
+    #[test]
+    fn a_nested_page_exactly_at_the_bound_still_publishes() {
+        // The other half, and the reason the fix cannot be "anything nested is too deep": a
+        // page nests to the documented depth on purpose, so a tree of exactly `MAX_BLOCKS`
+        // blocks in total must still publish. An off-by-one here would refuse a page the
+        // platform had just declared legal and the editor had just accepted.
+        //
+        // 1 columns + 2 columns + (MAX_BLOCKS - 3) texts == MAX_BLOCKS.
+        let report = validate(&json!([columns_holding(MAX_BLOCKS - 3)]));
+        assert_eq!(
+            report.block_count, MAX_BLOCKS,
+            "the tree holds exactly the bound"
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "block_too_many"),
+            "a tree of exactly MAX_BLOCKS publishes; issues: {:?}",
+            report.issues.iter().map(|i| i.code).collect::<Vec<_>>()
+        );
+        assert!(report.can_publish);
     }
 
     #[test]

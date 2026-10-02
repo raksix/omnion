@@ -46,9 +46,9 @@ pub use blockdiff::{BlockChange, BlockDiff, BlockDiffEntry, PropChange, diff_blo
 pub use blocks::{
     Block, BlockDefinition, BlockIssue, BlockValidationReport, CATEGORIES, HIDE_ON_VALUES,
     MAX_BLOCKS, MAX_DEPTH, PropDef, PropDefault, PropKind, REGISTRY, REGISTRY_VERSION, ReadOn,
-    TreeSanitizeReport, Viewport, block_hide_on, block_is_hidden, blocks_to_value, default_props,
-    definition, filter_for_viewport, is_known, meta_is_meaningful, parse_blocks, registry_document,
-    sanitize_tree, validate,
+    TreeSanitizeReport, Viewport, block_hide_on, block_is_hidden, blocks_to_value, count_tree,
+    default_props, definition, filter_for_viewport, is_known, meta_is_meaningful, parse_blocks,
+    registry_document, sanitize_tree, validate,
 };
 pub use comments::{
     COMMENT_COLUMNS, CommentSource, MAX_COMMENT_BODY, NewRevisionComment, RevisionComment,

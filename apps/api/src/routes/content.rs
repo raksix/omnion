@@ -718,12 +718,23 @@ pub async fn preview_page(
         // make a "hidden on phones" block indistinguishable from a deleted one.
         blocks: omnion_content::blocks_to_value(&parsed),
         visible_blocks: omnion_content::blocks_to_value(&degraded),
-        block_count: parsed.len() as i32,
+        // Both counts are the RECURSIVE ones, and they have to be: the frame's own arithmetic
+        // is `block_count - visible_count` ("how many did I hide?"), and the editor's status bar
+        // compares this page's number against the whole site's. Both were the length of the
+        // top-level array, so a page with one Columns block holding six cells reported `1 of 1`
+        // while the tree it carried held seven blocks — and the editor's bar, which was handed
+        // the same numbers by the validate route, showed a page of one block being edited.
+        //
+        // The validator already owns the one definition of "how many blocks does this tree
+        // hold" and uses it for the bound, so counting here would be a second one. Counting a
+        // `Vec<Block>` is cheap and exact, and the asymmetry that matters is preserved: the
+        // first number is the STORED tree and the second is what this viewport actually draws.
+        block_count: omnion_content::count_tree(&parsed) as i32,
         // The count of what THIS viewport draws, after the degradation — so a phone frame whose
         // gallery lost every file reports zero visible blocks, which is what the author is
         // looking at. Reporting the pre-degradation number beside a tree that no longer has the
         // block is the disagreement the previous pass's `previewDrawnBlocks` keys were reading.
-        visible_count: degraded.len() as i32,
+        visible_count: omnion_content::count_tree(&degraded) as i32,
         body: draft.body.clone(),
         revision_id: draft.id,
         revision_no: draft.revision_no,
