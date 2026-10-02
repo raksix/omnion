@@ -138,8 +138,27 @@ check(
 
 // ---- The pass restores the policy it rewrites -------------------------------------------------------
 
+// A fixed `waitForTimeout` after a click is a HOPE, and two consecutive runs of this pass failed
+// two DIFFERENT claims inside the same walk — the signature of races rather than defects, in a
+// pass whose screenshots showed both screens rendering correctly. So the two waits that follow a
+// write are asserted to be SELECTOR waits: the dialog appearing, and its detaching.
 check(
-  "the pass restores max_depth after saving it",
+  "the revoke dialog is awaited by selector, not by a fixed span",
+      /waitForSelector\("\[data-graphql-revoke-dialog\]", \{ timeout: 15000 \}\)/.test(body),
+      "the claim right after the revoke click is a race — the dialog renders only after its own fetch of the caller count",
+    );
+    check(
+      "the revoke dialog's DISAPPEARANCE is awaited, not slept through",
+      /waitForSelector\("\[data-graphql-revoke-dialog\]", \{ state: "detached", timeout: 20000 \}\)/.test(body),
+      "reading the row's new state after a fixed span measures the race, not the revoke",
+    );
+    check(
+      "the run button is located by its key hint, not by the word Run",
+      body.includes('hasText: /⌘↵/'),
+      "filtering on /^Run/ matches the SECONDARY control, which is correctly enabled on an over-budget document",
+    );
+
+  check("the pass restores max_depth after saving it",
   /fill\("10"\)[\s\S]{0,600}?button\[type='submit'\]/.test(body),
   "the pass rewrites an installation-wide settings row; leaving it changed makes every later pass measure a different platform",
 );

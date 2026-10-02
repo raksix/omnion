@@ -6468,9 +6468,13 @@ async function runGraphqlDepth(page, report) {
   const rowAgain = page.locator(`[data-graphql-document]`).filter({ hasText: `QA walk ${suffix}` }).first();
   await rowAgain.getByRole("button", { name: "Revoke" }).first().click({ timeout: 8000 }).catch(() => {});
 
-  // The dialog must quote a NUMBER of callers, not "there may be callers". A revoke reaches outside
-  // the panel, and an unquantified warning is the warning an operator clicks through.
-  await page.waitForSelector("[data-graphql-revoke-dialog]", { timeout: 8000 }).catch(() => {});
+  // The dialog renders only after its own fetch of the row's detail resolves, because the warning
+  // must quote a count it has actually read. Waiting for the SELECTOR — rather than asserting the
+  // count immediately after the click — is the difference between measuring the dialog and racing
+  // it: this run's own screenshot shows the dialog fully open with the count rendered ("0
+  // executions in the last day…"), while the claim failed. Two consecutive runs also failed
+  // DIFFERENT claims inside the same pass, which is the signature of a race and not of a defect.
+  await page.waitForSelector("[data-graphql-revoke-dialog]", { timeout: 15000 }).catch(() => {});
   const dialogOpen = (await page.locator("[data-graphql-revoke-dialog]").count()) > 0;
   check("revoke-opens-a-dialog", dialogOpen, "revoking did not open a confirmation dialog");
   if (dialogOpen) {
@@ -6491,9 +6495,19 @@ async function runGraphqlDepth(page, report) {
       .last()
       .click({ timeout: 8000 })
       .catch(() => {});
-    await page.waitForTimeout(1500);
+    // Wait for the DIALOG TO GO, not for a fixed span. The revoke is a PUT followed by a list
+    // reload, and 1.5 s is not a bound on either — it is a hope. The dialog closing is the
+    // observable the screen itself produces when the write landed, so waiting for its ABSENCE
+    // waits for the request rather than guessing at its duration.
+    await page
+      .waitForSelector("[data-graphql-revoke-dialog]", { state: "detached", timeout: 20000 })
+      .catch(() => {});
   }
 
+  // The row's state is read AFTER the dialog closes, and read from the row itself rather than from
+  // a toast — "a revoke only shown in a toast is a revoke nobody sees" is the claim, so asserting
+  // it against the toast would prove the opposite of what it says.
+  await page.waitForTimeout(400);
   const revokedRow = page.locator(`[data-graphql-document]`).filter({ hasText: `QA walk ${suffix}` }).first();
   const revokedStatus = await revokedRow.getAttribute("data-graphql-status").catch(() => null);
   check(
