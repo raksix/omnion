@@ -13655,12 +13655,23 @@ note({
       };
     })
     .catch(() => null);
+  // **`hit` is the claim the pointer landed on the curve, not the fact that the pointer was
+  // pressed.** It used to be assigned `true` on the only condition that a point could be measured
+  // at all, which made `hit: true` mean "the probe moved the mouse and pressed it" -- and ticks 78
+  // and 79 each read that number as "the click was on the edge", the first conclusion the field is
+  // not there to support. `onEdge` is the browser's own hit test at the measured point and is the
+  // only one of these three that means what its name says, so the branch that presses the mouse is
+  // now guarded by it: a point that resolved on the desk reports `hit: false`, and the note keeps
+  // the press on the record as `pressed` so a reader can tell "the probe did not try" from "the
+  // probe tried and missed".
   let edgeHit = false;
+  let edgePressed = false;
   if (edgeScreenPoint) {
+    edgePressed = true;
     await page.mouse.move(edgeScreenPoint.x, edgeScreenPoint.y).catch(() => {});
     await page.mouse.down().catch(() => {});
     await page.mouse.up().catch(() => {});
-    edgeHit = true;
+    edgeHit = Boolean(edgeScreenPoint.onEdge);
   }
   await page.waitForTimeout(500);
   const edgeSelected = (await page.locator("[data-edge-selected='true']").count()) > 0;
@@ -13683,6 +13694,11 @@ note({
     note({
       step: "edge-delete",
       hit: edgeHit,
+      pressed: edgePressed,
+      // The hit test beside the number, so `hit` is never the only thing the row has to go on.
+      onEdge: edgeScreenPoint?.onEdge ?? null,
+      blockedBy: edgeScreenPoint?.blockedBy ?? null,
+      inViewport: edgeScreenPoint?.inViewport ?? null,
       edgesBefore,
       after: edgesAfter,
       canvas: afterEdgeDelete,
@@ -13714,6 +13730,7 @@ note({
     note({
       step: "edge-delete",
       hit: edgeHit,
+      pressed: edgePressed,
       selected: false,
       point: edgeScreenPoint,
       reason: edgeScreenPoint ? "the click missed the curve" : "no edge could be measured",
