@@ -7638,3 +7638,87 @@ tick, so the pass is reported as not-run rather than reported as green.
 **One harness note worth keeping:** `QA_ONLY=backups` still ran every `media-*` depth pass.
 `wants()` filters *routes and depth passes*, but the route list itself is walked first, so a
 focused pass is narrower than it looks — and on a box this loaded, the width is what killed it.
+
+### Tick 106 — the destination card, which had one fact about the destination and called it health
+
+Slice 4's status-depth half, and the first thing it turned out to be: **the health card slice 4
+promised did not exist, and the thing that did exist was wrong in a way only a new failure mode
+exposes.** `GET /api/v1/backups/status` carried `writable` and nothing else, and the panel
+rendered that as a card labelled "Destination" with the probe's sentence under it.
+
+`writable` is a 31-byte write succeeding. The probe is right to do it — writing and removing is
+the only probe that catches a filesystem which takes a write and loses it — but it answers a
+narrower question than the card implied. A destination with 4 MB free **passes** this probe on
+every status load and every settings save. The card reads green. The next real run dies partway
+through the media part, and comes back `partial` naming an **object**, with the disk never named
+anywhere in the product. The operator's only signal is a `partial` they have to diagnose as a
+media-object problem, when it was the volume all along.
+
+Four commits, atomic and pushed:
+
+| Commit | What |
+|---|---|
+| `321a8a29` | `statvfs_raw` + a public `free_bytes` beside the existing percentage reader |
+| `5ebcb36b` | `Headroom`, `classify_headroom`, `headroom_for` — the pure verdict and the measurement |
+| `aebe9a34` | `largest_backup_bytes`, the route field, and the walk |
+| `cd72e9e3` | The fifth card and the `BackupHeadroom` type |
+
+**Three findings this tick, and two of them are the ones worth keeping.**
+
+**The `forbid(unsafe_code)` wall was a better answer than the one I was about to write.** The
+first draft put a `statvfs` in `crates/backup` and did not compile. The crate is
+`#![forbid(unsafe_code)]` and `omnion-health` holds the **single** sanctioned block in the
+workspace, with a header that argues for it in detail. Weakening a crate-level promise for one
+function would have been the wrong trade, so the read became `omnion_health::probes::free_bytes`
+and the block was split into `statvfs_raw` with two views on top. The reason to prefer that over
+just adding a second `#[allow]`: a workspace that starts with one sanctioned exception ends with
+thirty, and making the *existing* exception reusable is what keeps it at one. A path dependency
+inside one workspace is the whole price.
+
+**The wiring bug, which every pure test could not see.** The first `headroom_for` measured
+`DestinationReport::probed_path` — the probe's marker **file**. A probe that succeeds has just
+deleted it; that is the entire reason it removes what it wrote. `statvfs` on a deleted path is
+`ENOENT` → `None`, so the card read *"could not be measured"* on **every healthy destination**.
+The classification was right, the message was right, the eleven pure unit tests were green — and
+the feature was dead. It is tick 105's defect (a producer and a verifier describing different
+things) wearing a new costume, and only `headroom_is_measured_where_the_probe_actually_wrote`
+could see it, because that is the one test that touches a real filesystem. Reverting the single
+line that takes `.parent()` turns it red; that regression is proven, not claimed.
+
+**Two of my own assertions were wrong, and in both cases the code was right.** The message test
+demanded `1.0 GB` for 1024³ bytes; the formatter is decimal, and **decimal is correct** here
+because every number an operator compares this against — an S3 quota, a vendor's disk size, a
+cloud console's free-space figure — is decimal. The test now pins the decimal reading so the
+next person to "fix" it to binary sees it fail. The walk demanded two free-space readings be
+*identical*; they differed by 12 KB because the stranger's run really did write to the same
+filesystem. An equality there asserts the platform writes nothing, which is false, and the walk
+would have been red for a reason having nothing to do with the boundary it exists to prove. It is
+a 1 MB tolerance against a 1.6 GB reading — five orders of magnitude below what a leaked maximum
+would inject, so the regression still fails loudly.
+
+**Gates, all run this tick:**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-backup --lib --quiet` | **185 passed**, 0 failed (was 174) |
+| crate | `cargo test -p omnion-health --lib --quiet` | **70 passed**, 0 failed |
+| build | `cargo build -p omnion-api` | exit 0 (pre-existing warnings only) |
+| types | `bun x tsc --noEmit` (apps/admin) | exit 0 |
+| walk | `cargo test -p omnion-api --test backups the_destination_card_reports_room` | **1 passed** in 13.2 s, fresh database, read with `--nocapture` |
+| proven to fail | regressing `classify_headroom` to writability-only | **3 tests FAILED** |
+| proven to fail | regressing `headroom_for` to the marker path | **FAILED** — `the probe's own directory is measurable` |
+| proven to fail | removing `organization_id` from the yardstick | **FAILED** — `left: Some(500000000000)` |
+
+The last one is the interesting regression: with the scope removed, a stranger's 500 GB row makes
+this tenant's card say *"1.5 GB free, less than the largest backup on record (500.0 GB). The next
+backup will not fit here."* A verdict about another company's data, on the card that decides
+whether an operator enlarges a disk. Same class as the media-part leak from tick 99, one layer up.
+
+**Not run: the browser pass.** The shared slot is held live by `w6` (holder pid 2114, `cwd
+=/mnt/apopic/omnion-w6`, verified with `kill -0` and `/proc/<pid>/cwd`), and the box is at load
+~7 with `/` at 99%. Tick 105 established that a pass under those conditions dies three times out
+of three with a `summary.json` containing only `{fatal}` — no counters, no findings, no routes.
+The screen-states box stays open for that reason and **not** for a defect in the code.
+
+**Next:** the browser pass on a free slot with `--only=backups`, then the four-frequency
+schedules form (the only REQ-013 code item left), and the walkthrough criterion.
