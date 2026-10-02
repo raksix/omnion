@@ -9521,3 +9521,59 @@ my own tree (1.0 G, `lsof` showed no holder) which took it to 1.8 G, and stopped
 unrelated functions — eight files, ~200 lines of churn that had nothing to do with this tick.
 Reverted with `git checkout --` and the export line re-applied by hand. Format the file you
 touched, not the crate.
+
+---
+
+## tick 70 — REQ-130 slice 3: the OpenAPI gate, and the empty document it refused to sign
+
+**What.** `crates/graphql/src/openapi.rs` (the emitter, pure) · `apps/api/src/routes/inventory.rs`
+(the `documented!` macro and the process-global inventory) · `apps/api/src/routes/openapi.rs`
+(`GET /api/v1/openapi.json`, `/openapi.json/drift`) · `apps/api/src/bin/openapi_emit.rs` (the
+emitter and the `--check` gate) · `apps/api/src/openapi_emit.rs` (building the real router against a
+lazily-connected pool). Commits `c5c560cb`, `df800f6c`, `d5ae4188`.
+
+**Proof.** `cargo test -p omnion-graphql --lib` 105/105 (10 new) · `cargo test -p omnion-api --lib
+-- --test-threads=1` **390/390** (7 new) · `pnpm typecheck` clean · the gate itself, run for real:
+`openapi-emit: 0 routes… INVENTORY FAILED …` → **exit 1**.
+
+**The finding, and it is the reason this entry is longer than the code.** The acceptance line is
+*"a CI job fails on an undocumented route or a snapshot drift"*. Run for real, it failed on
+**neither**. It reported 0 routes — every route in `routes/mod.rs` registers with
+`.route(get(handler))`, and the inventory is filled by a macro nobody had adopted yet. An **empty
+router has no undocumented routes**, so coverage passed; drift passed against the empty snapshot
+the same run had just written; the binary exited 0 while describing nothing. **Every acceptance line
+in this REQ would have been ticked by `{ "paths": {} }`.** That is not a bug in the gate, it is the
+gate working exactly as written over an input nobody considered: a gate whose pass condition is
+"satisfies no violations" passes vacuously on nothing at all.
+
+So the gate now carries a floor of 100 routes — far above an empty inventory, far below any router
+this platform could plausibly ship — and can only fire when the inventory is not being filled,
+which is the single condition under which the check is worth nothing. Proven by exit 1 with the
+reason on stderr, not by a passing run.
+
+**Two facts only a real run could tell, and neither is in any doc comment:**
+
+1. **`PgPool::connect_lazy` panics with *"this functionality requires a Tokio context"*** outside a
+   runtime. The binary's `main` was sync, so it compiled cleanly and died on the first call; the
+   test was a plain `#[test]` and died the same way, for a reason that has nothing to do with
+   databases. **A panic whose message names a subsystem you are not touching is a compile-time
+   requirement wearing a runtime costume.**
+2. **The inventory must be read AFTER the router is assembled.** Reading first returns an empty
+   list, not an error — and an empty list passes every check the binary makes. The module comment
+   predicted this before it happened, and predicting it did not prevent it; the floor did.
+
+**Axum 0.8.9 cannot be asked what it routes, and that is measured, not assumed.** The request says
+*"generated from the REST routers themselves"*. `Router::routes()` does not exist (E0599 on a
+probe); `PathRouter` holding the match table is `pub(super)` inside axum. So `documented!` records
+the route **in the same expression that registers it**, and the macro does not expand without a
+permission and a summary — which is what makes "an undocumented route" a build failure rather than
+an omission. `routes/mod.rs` has ~400 `.route()` calls; adopting them is the next slice and it is
+mechanical, which is precisely why it should not share a commit with the gate that judges it.
+
+**Not claimed.** No snapshot is committed — an empty one would make `--check` green today and lie
+about every route until the first adoption. No SDK generator, no provenance, no smoke test. The
+document a client would receive today describes zero operations, and saying otherwise would be the
+same class of error the floor exists to catch.
+
+**Next.** Adopt `documented!` across the router and commit the first real snapshot; then the
+TypeScript and Python generators pinned to the document hash.
