@@ -33,9 +33,9 @@
  * gone" and "the record stays".
  */
 import { useEffect, useRef, useState } from "react";
-import { Loader2, Trash2, TriangleAlert, X } from "lucide-react";
+import { Download, Loader2, Trash2, TriangleAlert, X } from "lucide-react";
 
-import { ApiError, deleteProject } from "@/lib/api";
+import { ApiError, deleteProject, downloadProjectExport } from "@/lib/api";
 import type { Project } from "@/lib/types";
 
 export function DeleteProjectDialog({
@@ -56,6 +56,11 @@ export function DeleteProjectDialog({
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The export's own state, separate from `busy`: a download in flight must not spin the *delete*
+  // button or disable it, and sharing one flag would do both — which is the "the message is not
+  // the negation" rule's new instance, on a control rather than on a string.
+  const [exporting, setExporting] = useState(false);
+  const [exportNote, setExportNote] = useState<string | null>(null);
   const panel = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -74,6 +79,32 @@ export function DeleteProjectDialog({
   const isDefault = project.is_default;
   const blocked = workflowCount > 0;
   const ready = matches && !isDefault && !blocked && !busy;
+
+  const download = async () => {
+    setExporting(true);
+    setExportNote(null);
+    try {
+      const { blob, filename } = await downloadProjectExport(project.id);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      setExportNote(`Saved ${filename}. Keep it — it is the only copy of the definitions.`);
+    } catch (cause) {
+      // A failed export is stated, not swallowed: "export first" advice with a button that fails
+      // silently is worse than no advice, because the operator closes the dialog believing they
+      // have a backup.
+      setExportNote(
+        cause instanceof ApiError ? cause.message : "the project could not be exported",
+      );
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const apply = async () => {
     if (!ready) return;
@@ -147,6 +178,47 @@ export function DeleteProjectDialog({
               screen does it and reports what would break. Nothing is deleted until they are gone.
             </span>
           </div>
+        ) : null}
+
+        {/* The REQ's Risks section lists an "export-first hint" as one of the four things that make
+            deleting a project with dependencies safe, and this is it. **It offers the file and
+            names the limit of what the file does**: an export does not unblock a delete — moving
+            the workflows does — and a hint that implied otherwise would send an operator to
+            download a JSON file and then wonder why the button is still refused. So the two
+            remedies are stated separately, in the order that matters, and the export is presented
+            as the record rather than as the fix. */}
+        {!isDefault ? (
+          <div
+            data-delete-export-first
+            className="flex flex-wrap items-center gap-2 rounded-lg border border-line px-3 py-2 text-[12px]"
+          >
+            <Download className="size-3.5 shrink-0 text-muted" aria-hidden />
+            <span className="flex-1 min-w-[14rem]">
+              Export the project first — the key, the members and every workflow definition, as a
+              JSON file. It is a backup, not the thing that unblocks this: only moving the{" "}
+              {workflowCount === 1 ? "workflow" : "workflows"} out does that.
+            </span>
+            <button
+              type="button"
+              data-delete-export-button
+              disabled={busy || exporting}
+              onClick={() => void download()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-line px-2 py-1 text-[11.5px] hover:text-ink disabled:opacity-60"
+            >
+              {exporting ? (
+                <Loader2 className="size-3.5 animate-spin" aria-hidden />
+              ) : (
+                <Download className="size-3.5" aria-hidden />
+              )}
+              Download {project.key}
+            </button>
+          </div>
+        ) : null}
+
+        {exportNote ? (
+          <p role="status" data-delete-export-note className="text-[11.5px] text-muted">
+            {exportNote}
+          </p>
         ) : null}
 
         {!isDefault && !blocked ? (

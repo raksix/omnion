@@ -1869,6 +1869,71 @@ async function runProjectsDepth(page, report) {
       steps.deleteEnabledWithRightKey = !(await confirm.isDisabled().catch(() => true));
       await shot(page, "page-project-delete-dialog");
 
+      // The REQ's Risks section names an "export-first hint" as one of the four things that make
+      // deleting a project with dependencies safe, and slice 20 wrote it. **The assertion is that
+      // the file ARRIVES, not that the button exists**: a button wired to nothing renders exactly
+      // like one wired to the endpoint, so only the download event distinguishes them. Playwright
+      // reports a download through `page.waitForEvent("download")` and a `download` that never
+      // fires is a hang, hence the timeout — which is why this is a race with an explicit loser
+      // rather than a bare await.
+      steps.exportFirstHintPresent =
+        (await page.locator("[data-delete-export-first]").count()) > 0;
+      const downloadPromise = page.waitForEvent("download", { timeout: 15000 }).catch(() => null);
+      await page.locator("[data-delete-export-button]").first().click().catch(() => {});
+      const downloaded = await downloadPromise;
+      steps.exportDownloadStarted = downloaded !== null;
+      steps.exportFilename = downloaded ? downloaded.suggestedFilename() : null;
+      // A download with no filename is a file called "download" — the whole point of deriving the
+      // name from the lowercased key is lost, so the name itself is asserted, not just its presence.
+      steps.exportFilenameIsTheLowerKey =
+        typeof downloaded?.suggestedFilename() === "string" &&
+        downloaded.suggestedFilename() === `${deleteAttempt.key.toLowerCase()}-export-${downloaded.suggestedFilename().split("-export-")[1]}`;
+      steps.exportNoteShown =
+        (await page.locator("[data-delete-export-note]").count()) > 0;
+      await shot(page, "page-project-delete-export-first");
+
+      // And the route itself, from the detail screen's own button — the settings row the REQ
+      // names ("Name, key, description, colour, archive, export, delete") puts export between
+      // archive and delete, and this is that control. Fetched through the page rather than clicked
+      // because a second browser download while one is in flight is racy; the API's own answer
+      // (status, content-type, filename, and whether the body parses) is what the click produces
+      // anyway, and it is measured here without the race.
+      steps.detailExportControlPresent =
+        (await page.locator("[data-project-export]").count()) > 0;
+      const exportProbe = await page.evaluate(async (id) => {
+        const answer = await fetch(`/api/v1/projects/${id}/export`, {
+          credentials: "same-origin",
+          headers: { accept: "application/json" },
+        }).catch(() => null);
+        if (!answer) return { status: 0 };
+        const text = await answer.text();
+        let parsed = null;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = null;
+        }
+        return {
+          status: answer.status,
+          type: answer.headers.get("content-type") ?? "",
+          disposition: answer.headers.get("content-disposition") ?? "",
+          schema: parsed?.schema ?? null,
+          key: parsed?.project?.key ?? null,
+          workflows: Array.isArray(parsed?.project?.workflows)
+            ? parsed.project.workflows.length
+            : null,
+        };
+      }, deleteAttempt.id);
+      steps.exportRouteStatus = exportProbe.status;
+      steps.exportRouteIsJson = exportProbe.type.includes("application/json");
+      steps.exportRouteIsAttachment = exportProbe.disposition.includes("attachment");
+      steps.exportRouteCarriesSchema = exportProbe.schema === "omnion.project-export/1";
+      steps.exportRouteCarriesTheKey = exportProbe.key === deleteAttempt.key;
+      // The workflow count in the file must equal the count on screen — the fixture project's
+      // workflow count is the same number the dialog states. A snapshot of a different project
+      // would still parse and still carry a schema, so the count is what names the mistake.
+      steps.exportRouteWorkflowCount = exportProbe.workflows;
+
       // And the delete actually happens.
       await confirm.click().catch(() => {});
       await page.waitForTimeout(2500);
@@ -1880,6 +1945,25 @@ async function runProjectsDepth(page, report) {
       }, deleteAttempt.id);
       steps.deleteProjectGone = after === 404;
       steps.deleteAnswersNotFoundAfterwards = after;
+
+      record({
+        page: "projects",
+        action: "project-export",
+        rendered: steps.detailExportControlPresent === true,
+        hintPresent: steps.exportFirstHintPresent,
+        downloadStarted: steps.exportDownloadStarted,
+        filename: steps.exportFilename,
+        noteShown: steps.exportNoteShown,
+        routeStatus: steps.exportRouteStatus,
+        routeIsAttachment: steps.exportRouteIsAttachment,
+        routeCarriesSchema: steps.exportRouteCarriesSchema,
+        reason:
+          steps.exportRouteStatus === 200 &&
+          steps.exportDownloadStarted === true &&
+          steps.exportRouteCarriesSchema === true
+            ? undefined
+            : `the export answered ${steps.exportRouteStatus} (schema ${steps.exportRouteCarriesSchema}) and the download event ${steps.exportDownloadStarted ? "fired" : "never fired"} — a button wired to nothing renders exactly like one wired to the endpoint`,
+      });
 
       record({
         page: "projects",

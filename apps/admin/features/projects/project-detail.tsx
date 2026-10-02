@@ -22,12 +22,13 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { ArrowLeft, Archive, ArchiveRestore, ArrowRightLeft, FolderInput, Loader2, Save, Trash2, TriangleAlert, UserPlus } from "lucide-react";
+import { ArrowLeft, Archive, ArchiveRestore, ArrowRightLeft, Download, FolderInput, Loader2, Save, Trash2, TriangleAlert, UserPlus } from "lucide-react";
 
 import { LoadingTable } from "@/components/loading-table";
 import { EmptyState } from "@/components/empty-state";
 import {
   ApiError,
+  downloadProjectExport,
   fetchProject,
   fetchWorkflowsInProject,
   removeProjectMember,
@@ -65,6 +66,9 @@ export function ProjectDetail() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [saved, setSaved] = useState(false);
+  // The export's own confirmation, separate from `error`: "Downloaded ops-export-….json" is not an
+  // error and must not be rendered in the error strip, which is what a single state would force.
+  const [exportNote, setExportNote] = useState<string | null>(null);
 
   // The workflows this project holds, and which one the move dialog is open for. Both are here
   // rather than on a workflows screen because this branch has none: the API is scoped by project
@@ -145,6 +149,35 @@ export function ProjectDetail() {
       await load();
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : "the project could not be changed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exportProject = async () => {
+    if (!project) return;
+    setBusy(true);
+    setError(null);
+    setExportNote(null);
+    try {
+      const { blob, filename } = await downloadProjectExport(project.id);
+      // The anchor is created, clicked and dropped inside the same task, which is the only shape a
+      // browser reliably treats as a user-initiated download. `URL.revokeObjectURL` is immediate
+      // here and deliberate for the *download* (the read has already happened inside `fetch`), so
+      // no blob is retained — but the object URL is still revoked on the next tick rather than
+      // never, because "one leaked object URL per export" is how a long-lived panel loses a few
+      // megabytes a week.
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      setExportNote(`Downloaded ${filename}.`);
+    } catch (cause) {
+      setError(cause instanceof ApiError ? cause.message : "the project could not be exported");
     } finally {
       setBusy(false);
     }
@@ -553,6 +586,31 @@ export function ProjectDetail() {
             )}
             {archived ? "Restore this project" : "Archive this project"}
           </button>
+          ) : null}
+          {/* The word between "archive" and "delete" on the REQ's settings row, and the REQ's own
+              "export-first hint" in its Risks section. **Enabled on an archived project**, which
+              looks wrong next to every other control on this screen and is the deliberate part:
+              archiving is the state an operator reaches precisely when they want the record, and a
+              read-only project that cannot be exported is a read-only project that cannot be
+              archived off a machine. The route is `projects.read`, so a viewer may use it. */}
+          <button
+            type="button"
+            data-project-export
+            disabled={busy}
+            onClick={() => void exportProject()}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-[12.5px] transition hover:text-ink disabled:opacity-60"
+          >
+            <Download className="size-3.5" aria-hidden />
+            Export project
+          </button>
+          {exportNote ? (
+            <span
+              role="status"
+              data-project-export-note
+              className="text-[11.5px] text-muted"
+            >
+              {exportNote}
+            </span>
           ) : null}
           {/* The destructive half of the settings row, and the one the REQ's API table has
               documented since the module shipped without anything behind it. Hidden on the

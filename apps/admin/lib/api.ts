@@ -738,6 +738,57 @@ export function deleteProject(
   );
 }
 
+/**
+ * `GET /api/v1/projects/{id}/export` — a portable snapshot of the project, as a file.
+ *
+ * **Modelled on `downloadAnalyticsExport` rather than invented, and the reuse is the point:** that
+ * function already solved the two things this one has to get right — reading the filename out of
+ * `content-disposition` (so the file the user gets is the one the server named, not a client-side
+ * guess) and turning an error body into an `ApiError` with the server's own code and message.
+ * A second download helper that read the header itself would be a second answer to "what is this
+ * file called" waiting to disagree with the first.
+ *
+ * The route is guarded by `projects.read`, not `projects.manage`, so this is a read — nothing is
+ * locked and nothing is written, which is why a viewer may call it.
+ */
+export async function downloadProjectExport(
+  id: string,
+  organizationId?: string,
+): Promise<{ blob: Blob; filename: string }> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  let response: Response;
+  try {
+    response = await fetch(`/api/v1/projects/${id}/export${query}`, {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    let code = "project_export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(text) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON error body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  // The server's filename is the authority. The fallback is the shape it would have produced
+  // anyway (lower key + stamp) minus the stamp, so a proxy that drops the header still yields a
+  // file that opens — named rather than called "download".
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+
+  return { blob: await response.blob(), filename: match?.[1] ?? "project-export.json" };
+}
+
 /** The sites the account may see, optionally narrowed to one tenant. */
 export async function fetchSites(organizationId?: string): Promise<Site[]> {
   const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
