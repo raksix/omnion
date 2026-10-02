@@ -37,11 +37,13 @@ pub mod assignment_store;
 pub mod autoresponder;
 pub mod autoresponder_store;
 pub mod binding_health;
+pub mod bulk;
 pub mod claims;
 pub mod convert;
 pub mod convert_store;
 pub mod dedupe;
 pub mod error;
+pub mod export;
 pub mod keys;
 pub mod mapping;
 pub mod model;
@@ -81,7 +83,8 @@ pub use model::{
 };
 pub use timestamp::{rfc3339, rfc3339_opt};
 pub use vocabulary::{
-    ASSIGNMENT_TARGETS, DECISIONS, DEDUPE_POLICIES, MAX_BULK_IDS, MAX_PAGE, MAX_PAYLOAD_BYTES,
+    ASSIGNMENT_TARGETS, DECISIONS, DEDUPE_POLICIES, MAX_BULK_IDS, MAX_EXPORT_ROWS, MAX_PAGE,
+    MAX_PAYLOAD_BYTES,
     SOURCE_KINDS, STATUSES, is_decision, is_dedupe_policy, is_open, is_round_robin_target,
     is_source_kind, is_status,
 };

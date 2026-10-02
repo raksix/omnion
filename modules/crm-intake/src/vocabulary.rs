@@ -58,6 +58,16 @@ pub const MAX_PAGE: i64 = 100;
 /// The largest number of ids one bulk action may name.
 pub const MAX_BULK_IDS: usize = 200;
 
+/// How many leads one CSV export may carry.
+///
+/// **A ceiling on the whole filter, not on a page**, and it lives beside [`MAX_PAGE`] because
+/// the two answer different questions about the same list. An export is a document that leaves
+/// the platform and reads as a complete answer, so it climbs the cursor until the filter is
+/// exhausted — which means the only thing standing between an operator and a hundred-megabyte
+/// synchronous response is this number. It is a *refusal* rather than a truncation: a
+/// truncated file is indistinguishable from a complete one at the point where it does damage.
+pub const MAX_EXPORT_ROWS: usize = 50_000;
+
 /// The largest submission the platform will accept, in bytes.
 ///
 /// A refused submission is *refused*, not truncated: a truncated payload produces a lead whose
