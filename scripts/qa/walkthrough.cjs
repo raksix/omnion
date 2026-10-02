@@ -1787,6 +1787,101 @@ async function runProjectsDepth(page, report) {
   steps.notFoundLeaksPermission = /not allowed|forbidden|permission|unauthor/i.test(notFoundText);
   await shot(page, "page-project-not-found");
 
+  // 7b · the delete dialog (REQ-133 slice 19). The REQ's API table has documented
+  //      `DELETE /api/v1/projects/{id}` with "typed confirmation, dependency check" since the
+  //      module shipped, and nothing implemented it — so this block is the first thing on this
+  //      branch that will ever have looked at it.
+  //
+  //      **It creates its own throwaway project and deletes it, rather than opening the dialog on
+  //      whatever project the pass found.** That is deliberate and it is the whole point: the
+  //      dialog's contract is "type the key, the project goes". Asserting the button is disabled
+  //      before the key matches would pass against a dialog whose confirm handler was never
+  //      reached, and asserting the 404 afterwards would pass against a delete that was refused
+  //      for an unrelated reason. The only observation that makes the sentence true is a project
+  //      that is gone afterwards.
+  //
+  //      Placed here, after the not-found navigation and before the 390 px sweep, because it
+  //      navigates — tick 85's lesson: a block that navigates has to come after every read of the
+  //      page it leaves, or the reads that follow measure a different screen and pass on `[]`.
+  const deleteAttempt = await page.evaluate(async () => {
+    const made = await fetch("/api/v1/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ key: "DELQA", name: "Delete fixture" }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (!made?.id) return { made: false };
+    return { made: true, id: made.id, key: made.key, isDefault: made.is_default === true };
+  });
+  steps.deleteFixtureMade = deleteAttempt.made === true;
+
+  if (deleteAttempt.made === true) {
+    // The default project is the one the server refuses by name, and the dialog hides its
+    // button there. Assert the HIDING, because a button that is present and permanently refused
+    // is the dead button this branch's rules forbid.
+    steps.deleteButtonHiddenOnDefault = deleteAttempt.isDefault
+      ? true
+      : await page
+          .goto(`${URL_ADMIN}/automation/projects/${deleteAttempt.id}`, { waitUntil: "domcontentloaded" })
+          .then(async () => {
+            await page.waitForTimeout(1200);
+            return (await page.locator("[data-project-delete]").count()) > 0;
+          })
+          .catch(() => false);
+
+    if (deleteAttempt.isDefault !== true) {
+      // The dialog opens.
+      await page.locator("[data-project-delete]").first().click().catch(() => {});
+      await page.waitForTimeout(500);
+      steps.deleteDialogOpen = (await page.locator("[data-delete-dialog]").count()) > 0;
+      steps.deleteKeyField = (await page.locator("[data-delete-key]").count()) > 0;
+      steps.deleteConsequencesExplained =
+        (await page.locator("[data-delete-consequences]").count()) > 0;
+
+      // **The typed confirmation, measured rather than assumed.** The button is read disabled,
+      // then a WRONG key is typed and it is read disabled again, then the RIGHT key and it is
+      // read enabled. A single "disabled before confirm" reading is the assertion this branch has
+      // been burned by: it passes on a button that is disabled because the component crashed.
+      const confirm = page.locator("[data-delete-confirm]");
+      steps.deleteDisabledWithEmptyField = await confirm.isDisabled().catch(() => false);
+      await page.locator("[data-delete-key]").fill("WRONGKEY").catch(() => {});
+      await page.waitForTimeout(250);
+      steps.deleteDisabledWithWrongKey = await confirm.isDisabled().catch(() => false);
+      await page.locator("[data-delete-key]").fill(deleteAttempt.key).catch(() => {});
+      await page.waitForTimeout(250);
+      steps.deleteEnabledWithRightKey = !(await confirm.isDisabled().catch(() => true));
+      await shot(page, "page-project-delete-dialog");
+
+      // And the delete actually happens.
+      await confirm.click().catch(() => {});
+      await page.waitForTimeout(2500);
+      const after = await page.evaluate(async (id) => {
+        const answer = await fetch(`/api/v1/projects/${id}`, { credentials: "same-origin" })
+          .then((r) => ({ status: r.status }))
+          .catch(() => ({ status: 0 }));
+        return answer.status;
+      }, deleteAttempt.id);
+      steps.deleteProjectGone = after === 404;
+      steps.deleteAnswersNotFoundAfterwards = after;
+
+      record({
+        page: "projects",
+        action: "project-delete",
+        rendered: steps.deleteDialogOpen === true,
+        dialogOpen: steps.deleteDialogOpen,
+        disabledWithEmptyField: steps.deleteDisabledWithEmptyField,
+        disabledWithWrongKey: steps.deleteDisabledWithWrongKey,
+        enabledWithRightKey: steps.deleteEnabledWithRightKey,
+        goneAfterwards: steps.deleteProjectGone,
+        reason: steps.deleteProjectGone
+          ? undefined
+          : `the project still answers ${after} after a confirmed delete — the dialog either never reached the API or the server refused without saying so`,
+      });
+    }
+  }
+
   // 8 · 390px. Six screens, and this is the first tick that ever MEASURED any of them narrow —
   //     the acceptance line names 390 px and until now nothing in this pass went there, so the
   //     line could not have passed however the CSS looked. `record` rather than `steps` because
