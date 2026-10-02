@@ -356,6 +356,16 @@ catalogue! {
     "ai.tool.limited", "ai", Live,
     "A run hit a tool's per-run call cap.",
     [("run_id", Uuid, opt), ("tool_key", String, req), ("cap", Integer, opt)];
+    // The tool telemetry roll-up (REQ-107 slice 4). This is the one event in the AI group that
+    // fires **from a scheduler rather than from a request**: the daily roll-up compares a tool's
+    // success rate against its own trailing week and publishes the fall. Nothing in a call path
+    // can know whether a drop is a regression, because "regression" is a statement about time —
+    // which is why it lives with the task that owns the days.
+    "ai.telemetry.tool.degraded", "ai", Live,
+    "A tool's success rate fell at least five points below its own trailing seven-day rate.",
+    [("tool", String, req), ("day", String, req), ("calls", Integer, req),
+     ("success_percent", Json, req), ("baseline_percent", Json, req),
+     ("drop_points", Json, req)];
     "ai.identity.created", "ai", Live,
     "An AI identity — a named set of tool grants — was created.",
     [("identity_id", Uuid, req), ("key", String, req)];

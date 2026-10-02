@@ -9,6 +9,7 @@ pub mod ai_agent_runner;
 pub mod ai_eval_runner;
 pub mod ai_health_runner;
 pub mod ai_log_runner;
+pub mod ai_telemetry_runner;
 pub mod analytics_runner;
 pub mod auth;
 pub mod automation_runner;

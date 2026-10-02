@@ -741,6 +741,22 @@ pub struct AiHubConfig {
     /// minute anyway, and a sweep that reads every enabled suite is a query per suite per tick —
     /// cheap once a minute, not four times a second.
     pub eval_scheduler_ms: u64,
+    /// Whether this process rolls up the per-tool telemetry (`OMNION_AI_TELEMETRY_RUNNER`).
+    ///
+    /// **A sixth switch, and this one is about writes rather than calls.** Every runner above
+    /// dials a provider, scores a suite or deletes rows; this one only re-reads `ai_tool_calls`
+    /// and upserts a roll-up row per tool per day. That makes it the cheapest background task in
+    /// the box by an order of magnitude, and also the one an installation is most likely to
+    /// disable for a reason nobody predicted — an operator who prunes the call log on their own
+    /// schedule does not want a second process reading it, and an operator who restores the
+    /// platform from a snapshot has no use for a roll-up of a window the snapshot predates.
+    ///
+    /// The reader is a **separate** concern from this writer, deliberately: the telemetry screen
+    /// reads `ai_tool_stats_daily` whether or not anything is refreshing it, and an installation
+    /// that turns the runner off still gets the screen — it just gets the numbers the runner last
+    /// wrote. A screen that refused to render because a background task is switched off would
+    /// turn a knob into an outage.
+    pub telemetry_runner_enabled: bool,
 }
 
 impl Default for AiHubConfig {
@@ -755,6 +771,7 @@ impl Default for AiHubConfig {
             eval_runner_enabled: true,
             eval_timeout_seconds: DEFAULT_AI_EVAL_TIMEOUT_SECONDS,
             eval_scheduler_ms: DEFAULT_AI_EVAL_SCHEDULER_MS,
+            telemetry_runner_enabled: true,
         }
     }
 }
@@ -1233,6 +1250,7 @@ impl Config {
             )?
             .max(1) as usize,
             eval_runner_enabled: read_flag(&read, "OMNION_AI_EVAL_RUNNER", true)?,
+            telemetry_runner_enabled: read_flag(&read, "OMNION_AI_TELEMETRY_RUNNER", true)?,
             // The floor of 30 is enforced here rather than trusted from the operator: the number
             // decides when the reaper fails a run, and a value under thirty would fail healthy
             // runs on any provider slower than half a second per case. Clamping is the honest

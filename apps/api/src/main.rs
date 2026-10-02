@@ -11,10 +11,10 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    ai_agent_runner, ai_eval_runner, ai_health_runner, ai_log_runner, analytics_runner,
-    automation_runner,
-    backup_schedule_runner, backup_sweep_runner, restore_job_runner, event_retention_runner,
-    event_runner, notification_runner, search_runner, workflow_runner,
+    ai_agent_runner, ai_eval_runner, ai_health_runner, ai_log_runner, ai_telemetry_runner,
+    analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
+    restore_job_runner, event_retention_runner, event_runner, notification_runner, search_runner,
+    workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -241,6 +241,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _pruner = ai_log_runner::spawn(state.clone());
     } else {
         tracing::info!("the AI decision pruner is disabled (OMNION_AI_LOG_RUNNER=false)");
+    }
+
+    // The per-tool telemetry roll-up (REQ-107, slice 4). It sits after the pruner rather than
+    // beside the eval runner because it is the only one of the four that is neither a spender nor
+    // a deleter: it re-reads the tool-call log and upserts a row per tool per day, which is what
+    // `/ai/telemetry` renders. Without it the roll-up table has no writer and the screen reads
+    // "this tool was never called, forever" — so the runner is not optional polish for the
+    // screen, it is the screen's data source. With it off the screen still answers, from whatever
+    // the runner last wrote, because a reader must not fail closed on a background switch.
+    if state.config().ai_hub.telemetry_runner_enabled {
+        let _telemetry = ai_telemetry_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the tool-telemetry roll-up is disabled (OMNION_AI_TELEMETRY_RUNNER=false)");
     }
 
     // The rate-limit document is read here, once, and handed to the layer the router is about to
