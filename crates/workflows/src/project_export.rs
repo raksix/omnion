@@ -199,11 +199,22 @@ impl ProjectExport {
 /// when they add a field.
 pub const EXPORT_SCHEMA: &str = "omnion.project-export/1";
 
-/// Read the display name and email of a user, falling back to the id when the row is gone.
+/// Read the display name and email of a user.
 ///
 /// Takes a connection so the whole export reads one snapshot. `users` is joined rather than
 /// looked up per member: a member table that performs one round trip per row is how an export of
 /// a two-hundred-member project takes ten seconds.
+///
+/// **A miss here is not a case this function has to handle, and the first version of it did.**
+/// The obvious defensive move is a fallback — an unexplained `uuid` row otherwise — and that
+/// branch was written here first. It is **unreachable**: `automation_project_members.user_id` is
+/// `on delete cascade`, so the database removes the membership the moment the account goes and no
+/// membership can name a user that is not there. The gate
+/// (`a_membership_cannot_outlive_its_account`) asserts that FK on purpose, so if someone ever
+/// changes it to `set null` — a reasonable-looking change, since the project's own `owner_user_id`
+/// is `set null` — **this gate fails and names what has to happen next**: a fallback that says a
+/// sentence instead of showing a bare id. Until then the `expect` is the honest form: a membership
+/// with no account is a broken invariant, not a state to be rendered.
 async fn users_for(
     connection: &mut sqlx::PgConnection,
     ids: &[Uuid],
@@ -283,18 +294,22 @@ pub async fn build_export(pool: &PgPool, project_id: Uuid) -> Result<ProjectExpo
         .iter()
         .map(|row| {
             let user_id = row.get::<Uuid, _>("user_id");
-            // The fallback is a sentence rather than a bare id: a reader of the file is looking at
-            // a name column that says the account is gone, and an unexplained uuid reads as a
-            // broken export.
-            let (display_name, email) = names
-                .get(&user_id)
-                .cloned()
-                .unwrap_or_else(|| (format!("deleted account ({user_id})"), "".to_string()));
+            // The one `expect` in this module, and the reason is in `users_for`: the FK cascades,
+            // so a membership without its account means the schema changed under us. Naming it
+            // here beats rendering "deleted account (3f2a…)" for a row that cannot exist — and the
+            // gate asserts the FK so that a future `set null` forces this line to be rewritten
+            // deliberately rather than discovered in a file somebody has already archived.
+            let (display_name, email) = names.get(&user_id).unwrap_or_else(|| {
+                panic!(
+                    "membership {user_id} has no account row; \
+                     automation_project_members.user_id must be on delete cascade"
+                )
+            });
             ExportedMember {
                 role: row.get::<String, _>("role"),
                 user_id,
-                display_name,
-                email,
+                display_name: display_name.clone(),
+                email: email.clone(),
                 created_at: row.get("created_at"),
             }
         })
