@@ -15,6 +15,8 @@
 //!   detail: it is what stops a field from being gated on a permission the platform does not ship.
 //! * [`schema`] — the per-caller schema composition, and the cache key that keeps one role's
 //!   schema from being served to another.
+//! * [`openapi`] — the OpenAPI document emitted **from the router**, and the two verdicts that
+//!   make a new route or a drifted snapshot a build failure instead of a surprise.
 //! * [`settings`] — what an operator may change, and the validation the playground's cost meter
 //!   and the endpoint share so the meter can refuse before it sends.
 //!
@@ -45,6 +47,7 @@ pub mod cost;
 pub mod document;
 pub mod error;
 pub mod limits;
+pub mod openapi;
 pub mod parity;
 pub mod persisted;
 pub mod schema;
@@ -57,6 +60,10 @@ pub use document::{
 };
 pub use error::{Code, Error, Result};
 pub use limits::{CONTRIBUTOR_COUNT, Limits, Measurement, check, measure_operation};
+pub use openapi::{
+    Annotation, Check as OpenApiCheck, Deprecation, Drift, OPENAPI_VERSION, Registry, RouteEntry,
+    canonical_json, check as check_openapi, document as openapi_document,
+};
 pub use parity::{ALL as KNOWN_PERMISSIONS, Known, PermissionSet, VARIANT_COUNT};
 pub use schema::{CacheKey, ComposedSchema, SchemaCatalogue, TypeDefinition};
 pub use settings::Settings;
