@@ -11413,6 +11413,91 @@ and the keyboard/mobile box stay open for that reason and no other.
 untested screen is accepted, and a route list that omits `/developer` means a pass that is green
 because it never looked. Then the pass itself, then the state boxes, and only then `done`.
 
+## Tick 109 — a gate that had not run for four commits
+
+`git status` at the start of this tick was **dirty**, which the loop contract forbids. It was not
+leftover scratch: a coherent block — the wire-date fix, the expiry walk, the gate widening — sitting
+uncommitted from the previous tick, alongside three commits that never reached the BUILD-LOG.
+
+### The finding that outranks all of it
+
+Running the block's own test target first was meant to be a formality. It was not:
+
+```
+error[E0063]: missing field `headroom` in initializer of `DestinationBody`
+  --> apps/api/tests/wire_dates.rs:142:22
+```
+
+`aebe9a34` (the backups headroom card, three commits back) added `headroom` to `DestinationBody`.
+The wire-date gate constructs that struct. **The test target stopped compiling**, and a test target
+that does not build never runs — so the gate protecting every date in every API response had been
+absent for three commits.
+
+**Nothing reported it**, because "the test did not run" and "the test was green" are
+indistinguishable in any summary that prints counts. And the defect this gate exists to catch had
+already shipped twice underneath it: `KeyView::expires_at` reached a shipped screen as a nine-element
+array last tick, and `UsagePoint::day` as a three-element one before that. Both were found by walks,
+not by the gate. A gate that is absent is worse than no gate, because it is counted.
+
+### Widening it: two real defects, and two wrong versions of the gate
+
+The first widening — "scan every crate that derives `Serialize`" — reported about **30** types. Nearly
+all false. `IpRule`, `PushSubscription`, `ServiceReport` and `ApiKey` are storage types that a route
+**converts** into `RuleBody`, `DeviceBody`, `ServiceBody`, `KeyView`, precisely so the wire shape is
+decided in one place. A gate demanding annotations on those gets muted, and the way it gets muted is
+somebody deleting the field.
+
+The fix is to test **reachability from a wire boundary** — the type name on a `Json<…>` or a `pub`
+field of a route body — not serialisability. `impl From<IpRule>` and `fn f(x: &IpRule)` are not
+boundaries, which is right: those lines are where the shape is still being decided.
+
+The second wrong version came from `CreateKeyBody`: it derives only `Deserialize`, and `time`'s
+*deserialiser* reads a string regardless of the feature set, so flagging it reported a field the
+platform never emits. Serialisation **is** the defect, so a struct must derive `Serialize` on
+either half.
+
+Three findings, one real and two real:
+
+| Type | Screen | Was |
+|---|---|---|
+| `SecretBody::rotated_at` | Secrets → rotation age | nine-element array, renders `—` |
+| `RouteRule::created_at` | Notification router list (`Json<Vec<RouteRule>>`, published verbatim) | three-element array |
+
+Both fixed. `RouteRule` is in a **crate**, which the old `*Body`/`*Query`/`*Response` name filter
+could not reach at all — the widened scan is the only reason it was ever going to be found.
+
+### Proven to fail
+
+Removing the attribute from `RouteRule` turns the gate red naming
+`crates/notifications/src/router.rs:207`. The name filter that missed it is the same filter that
+would have missed the reintroduction, which is why the proof matters more than the count.
+
+### Gates
+
+| Gate | Command | Result |
+|---|---|---|
+| wire dates | `cargo test -p omnion-api --test wire_dates` | **4/4** (was not compiling) |
+| notifications | `cargo test -p omnion-notifications --lib --quiet` | **102 passed** |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **292 passed** |
+| developer walks | `cargo test -p omnion-api --test developer -- --test-threads=1` | **11 passed** in 210 s |
+| types | `pnpm --filter @omnion/admin typecheck` | exit 0 |
+| web build | `next build` | exit 0, all four `/developer` routes emitted |
+| built CSS | `grep` over `.next/static/chunks/*.css` | `text-danger` **0**, `text-caution` 3, `bg-caution-soft` 2, `text-positive` 2 |
+| wiring gate | `node scripts/qa/probe-developer-wiring.cjs` | green |
+| harness gate | `node scripts/qa/probe-developer-harness.cjs` | green (6 claims) |
+
+The walks at **210 s** are the real ones. This suite builds and drops a database per walk, so a run
+that reports 11 passed in 0.02 s is 11 skips — the fourth time this repo has shown that.
+
+**Commits:** `d1706e81` (the gate and the two wire fixes), `82d5e897` (the ticked criterion), pushed.
+
+**Not yet: the browser pass.** Queued behind `w6` (`pid 212963`, `cwd=/mnt/apopic/omnion-w6`,
+verified live), disk 87%. The three screen-state boxes and the keyboard/mobile box stay open until it
+runs — and this is the fourth tick that has said so, which is why the *reason* is now a named gate
+rather than "the pass was slow".
+
+**Next:** the pass, then the state boxes and `done`.
+
 ## Tick 84 (wave3) — a row that could never be green, and a filter that ran wide with a banner saying otherwise
 
 Two defects, both in the acceptance apparatus rather than in a screen, and both found by finally
