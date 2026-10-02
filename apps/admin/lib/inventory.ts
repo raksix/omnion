@@ -373,18 +373,37 @@ export function fetchItems(
   return inventoryRequest<Page<InventoryItem>>(`/api/v1/inventory/items${query(filters)}`);
 }
 
-/** One item, with its per-location stock and totals. */
-export function fetchItem(id: string, historyLimit = 25): Promise<{
-  item: InventoryItem;
-  locations: StockLevel[];
-  on_hand: Quantity;
-  reserved: Quantity;
-  available: Quantity;
-  status: StockStatus;
-  last_movement_at: string | null;
+/**
+ * One item, with its per-location stock and totals.
+ *
+ * **`position` is a named key, not flattened**, and this signature used to say otherwise: it
+ * declared `item`, `locations`, `on_hand` … at the top level beside `history`, which is not the
+ * shape the route answers. `ItemDetail` in `apps/api/src/routes/inventory.rs` nests the position
+ * under its own name precisely so two of its fields cannot collide, and the type here disagreed
+ * with it.
+ *
+ * The disagreement was invisible for one reason: **no caller existed.** A type nothing calls is a
+ * comment, so the screen that calls it (`item-detail-view.tsx`) is what finally compared the two,
+ * and TypeScript is what caught it. The response shape is now declared once, here, as the
+ * module's own `StockPosition` plus the history.
+ */
+export type ItemDetail = {
+  position: {
+    item: InventoryItem;
+    locations: StockLevel[];
+    on_hand: Quantity;
+    reserved: Quantity;
+    available: Quantity;
+    status: StockStatus;
+    last_movement_at: string | null;
+  };
   history: Movement[];
-}> {
-  return inventoryRequest(`/api/v1/inventory/items/${encodeURIComponent(id)}?history_limit=${historyLimit}`);
+};
+
+export function fetchItem(id: string, historyLimit = 25): Promise<ItemDetail> {
+  return inventoryRequest<ItemDetail>(
+    `/api/v1/inventory/items/${encodeURIComponent(id)}?history_limit=${historyLimit}`,
+  );
 }
 
 /** Resolve a scanner's code to an item. A miss is a `404`, not an empty list. */
