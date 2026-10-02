@@ -1,0 +1,11 @@
+{
+  "name": "minimal",
+  "description": "The smallest dataset that boots the panel: one site with a home page. Enough to sign in and see a working installation, and nothing that pretends to be a populated demo.",
+  "row_estimate": 12,
+  "compatible_from": "0001",
+  "statements": [
+    "insert into sites (id, organization_id, key, name, status, theme) select gen_random_uuid(), anchor.organization_id, 'starter', 'Starter site', 'active', 'minimal' from (select id as organization_id from organizations order by created_at desc limit 1) anchor where not exists (select 1 from sites s where s.organization_id = anchor.organization_id and s.key = 'starter')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'home', 'page', 'published' from sites s where s.key = 'starter' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'home')",
+    "insert into pages (site_id, slug, page_type, status) select s.id, 'about', 'page', 'draft' from sites s where s.key = 'starter' and not exists (select 1 from pages p where p.site_id = s.id and p.slug = 'about')"
+  ]
+}

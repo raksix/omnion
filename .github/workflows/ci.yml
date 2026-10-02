@@ -512,3 +512,64 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate development compose stack
         run: docker compose -f infra/compose/docker-compose.dev.yml config --quiet
+
+  release-manifest:
+    # The release gate (REQ-128, slice 3). It runs on EVERY commit, not only on a tag, and
+    # that is the point: a tag is the moment the pipeline cannot refuse anything cheaply, and
+    # every rule here is a rule about repository facts that are already committed — the
+    # Dockerfiles, the chart, the migration list, the versions five files declare. A drift
+    # between those is findable in seconds on a commit and is only findable after the fact
+    # once an image has been pushed under a tag somebody believes is immutable.
+    name: Release — manifest contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Manifest unit tests
+        run: python3 release/tests/test_release_manifest.py
+      - name: Release pipeline unit tests
+        run: python3 release/tests/test_release_pipeline.py
+      - name: Environment bundle unit tests
+        run: python3 release/tests/test_release_bundle.py
+      # The upgrade helper. Same reasoning as the bundle above, and the property it guards is
+      # the one this slice exists for: a plan must not claim a database rollback nobody has
+      # verified, and its checklist must not render complete with a destructive migration
+      # unacknowledged. Both refusals are properties of committed files (the migration
+      # markers, the absence of REQ-129's policy), so they are checkable on a commit.
+      - name: Upgrade plan unit tests
+        run: python3 release/tests/test_release_upgrade.py
+      # The gate mutates the manifest nineteen ways and requires every one to be caught. A
+      # green run therefore means two things at once: the builder works, and the checks are
+      # capable of failing.
+      - name: Manifest gate (with mutations)
+        run: bash scripts/qa/release-manifest.sh
+      # The pipeline's decision layer: a dry run that reports what it could not build, and
+      # a publish check that refuses. It runs here for the same reason as the gate above —
+      # the refusals are properties of committed files, findable on a commit, and only
+      # findable after the fact once a tag has been pushed under a name people trust.
+      - name: Release pipeline gate (with mutations)
+        run: bash scripts/qa/release-pipeline.sh
+      # The bundle generator: three kinds of install file, the acceptance criterion that none
+      # of them carries a credential, and the refusals for a caller who passes one. It runs
+      # on the commit rather than on the download, because a bundle is generated at the moment
+      # an operator is about to trust it — the worst possible time to discover it carries a
+      # secret-shaped string.
+      - name: Environment bundle gate (with mutations)
+        run: bash scripts/qa/release-bundle.sh
+      # The upgrade gate. Six mutations, all differential: each one loads the real module
+      # and the mutated copy in separate interpreters and requires the behaviour to DIFFER,
+      # because a mutation with a live sibling check can leave the fixture caught and prove
+      # nothing about the check it removed.
+      - name: Upgrade plan gate (with mutations)
+        run: bash scripts/qa/release-upgrade.sh
+      # The migration reversal gate (REQ-129). It splits deliberately: the half that proves the
+      # comparison can CATCH a hand-broken down script is pure and needs no services, so it
+      # runs on every commit; the half that proves a reversal actually executes needs a
+      # PostgreSQL and skips itself when there is none. A gate that only ran the second half
+      # would be dark on exactly the configuration where the first one matters.
+      - name: Migration reversal gate
+        run: bash scripts/qa/migration-down-gate.sh
+      - name: Chart renders and lints
+        run: bash scripts/qa/helm-chart.sh

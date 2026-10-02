@@ -172,36 +172,33 @@ pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<
         .map_err(IdentityError::from)
 }
 
-/// Attach an account to the organization it administers.
+/// Set an account's **primary organization** and answer the updated row.
 ///
-/// The first run creates the organization *after* the owner, and the owner is deliberately
-/// platform-level (`organization_id = null`) — an Owner runs the platform, not one tenant.
-/// Nothing ever moved it afterwards, so the account that finished the wizard owned an
-/// organization it was not a member of: `users.organization_id` stayed `null` and no
-/// organization-scoped binding existed, and every organization-scoped surface then answered
-/// `no_organization`. The wizard completed, the panel loaded, and the first business screen
-/// a new installation ever opens was refused.
+/// ## Why this exists, and why onboarding needs it
 ///
-/// `null` is the only value accepted here, and it is accepted for a reason: this is the
-/// first run's "the platform owner also runs this tenant" statement, not a transfer. A second
-/// call is a no-op rather than a silent move, because moving a running account between
-/// tenants is a different operation with its own permission and its own audit line.
-pub async fn attach_to_organization(pool: &PgPool, id: Uuid, organization_id: Uuid) -> Result<User> {
+/// `User.organization_id` is the primary organization, and `scope::resolve_organization` reads it
+/// on every org-scoped route: an account with `None` and no requested organization is answered
+/// `400 organization_required`. The first-run flow wrote the new organization to **`onboarding_state`
+/// only** — `onboarding::state::set_organization` updates the singleton row and nothing else — so
+/// the owner's account kept `organization_id = NULL` for the entire life of the installation.
+///
+/// That is invisible in the first-run UI, which reads `onboarding_state`, and fatal everywhere
+/// else: the wizard finished "successfully", and then `GET /api/v1/sites`, `GET /api/v1/deployment/
+/// artifacts` and every other org-scoped read answered 400. `onboarding_state` is a progress
+/// record; `users.organization_id` is tenancy. Writing only the first is a setup that reports
+/// itself complete and hands the operator an installation they cannot use.
+///
+/// `None` means no such account, matching `set_status`.
+pub async fn set_organization(pool: &PgPool, id: Uuid, organization_id: Option<Uuid>) -> Result<Option<User>> {
     let sql = format!(
-        "update users set organization_id = $2, updated_at = now() \
-         where id = $1 and organization_id is null returning {USER_COLUMNS}"
+        "update users set organization_id = $2 where id = $1 returning {USER_COLUMNS}"
     );
     sqlx::query_as::<_, User>(&sql)
         .bind(id)
         .bind(organization_id)
         .fetch_optional(pool)
         .await
-        .map_err(IdentityError::from)?
-        .ok_or_else(|| {
-            IdentityError::InvalidUser(format!(
-                "account {id} does not exist, or already belongs to an organization"
-            ))
-        })
+        .map_err(IdentityError::from)
 }
 
 /// Look an account up by email address.

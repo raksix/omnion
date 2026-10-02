@@ -1,0 +1,73 @@
+# Omnion — tuning knobs (REQ-128, slice 1/2).
+#
+# This file is NOT a stack. It is the example of what a `-f` override looks like, and it is
+# committed as `docker-compose.override.example.yml` rather than `docker-compose.override.yml`
+# on purpose: compose loads `override.yml` AUTOMATICALLY, from the directory, with no flag and
+# no way to notice. An example that quietly became a real override would change the shape of
+# every deployment on the box, which is the opposite of what an example is for.
+#
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#   docker compose -f docker-compose.prod.yml -f docker-compose.override.yml up -d
+#
+# Merge semantics, stated because they decide what an override can and cannot do: scalars and
+# sequences are REPLACED, maps are MERGED key by key, and a value here cannot remove a key set
+# in the base file. To drop something the base defines, set it to null (`logging: null`) — which
+# is also why `x-logging` exists in the base: an override that wants different log rotation
+# restates the whole map rather than editing one key.
+
+services:
+  # ---------------------------------------------------------------------------------------------
+  # A host that is short on RAM: two API replicas and a smaller pool, with the datastores given
+  # explicit ceilings so a spike in uploads cannot push the database into the OOM killer.
+  # ---------------------------------------------------------------------------------------------
+  api:
+    environment:
+      OMNION_DB_MAX_CONNECTIONS: "10"
+      OMNION_LOG: warn
+    # Log rotation restated WHOLE rather than edited one key at a time. Compose merges maps
+    # key by key, so an override that set only `max-size` would keep the base file's
+    # `max-file` and the operator would believe they had changed the window.
+    #
+    # It is also the only reason this service is declared once: a second `api:` key in the same
+    # mapping is a DUPLICATE, and a YAML parser that takes the last one silently discards
+    # everything above it — the environment, the replicas and the limits, with no warning. The
+    # example is the wrong place to teach that; merging the blocks avoids it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+
+  admin:
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 512m
+
+  web:
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 512m
+
+  postgres:
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    # A statement timeout turns a runaway query into a cancelled one rather than a connection
+    # pool that never returns. Raising the timeout instead is how a small host disappears.
+    command:
+      - postgres
+      - -c
+      - statement_timeout=60s
+      - -c
+      - max_connections=100

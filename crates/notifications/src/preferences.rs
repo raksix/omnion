@@ -709,21 +709,13 @@ mod tests {
 
     #[test]
     fn the_parser_reads_every_spelling_of_a_clock_the_platform_produces() {
-        assert_eq!(
-            parse_clock(Some("22:00")),
-            Some(22 * 60),
-            "the form's own shape"
-        );
+        assert_eq!(parse_clock(Some("22:00")), Some(22 * 60), "the form's own shape");
         assert_eq!(
             parse_clock(Some("22:00:00")),
             Some(22 * 60),
             "Postgres `::text` on a time column — the shape the store used to hand back"
         );
-        assert_eq!(
-            parse_clock(Some(" 22:00 ")),
-            Some(22 * 60),
-            "a hand-written client"
-        );
+        assert_eq!(parse_clock(Some(" 22:00 ")), Some(22 * 60), "a hand-written client");
         assert_eq!(parse_clock(Some("7:05")), Some(7 * 60 + 5), "unpadded hour");
         assert_eq!(parse_clock(Some("00:00")), Some(0), "midnight");
     }
@@ -756,11 +748,7 @@ mod tests {
             );
             // And the two always-past or always-future edges, because `22:00` is the default
             // the form offers and a parser that read it but not `00:00` would be bizarre.
-            assert_eq!(
-                written.len(),
-                5,
-                "the platform's clock shape is HH:MM, five characters"
-            );
+            assert_eq!(written.len(), 5, "the platform's clock shape is HH:MM, five characters");
         }
     }
 

@@ -424,10 +424,6 @@ async fn prune(transaction: &mut Transaction<'_, Postgres>, spec: &ProviderSpec)
                  where d.entity_id = t.id::text and btrim(t.value) <> '' \
              )"
         }
-        "workflows" => {
-            "delete from search_documents d where d.provider = 'workflows' \
-             and not exists (select 1 from workflows w where w.id::text = d.entity_id)"
-        }
         "settings" => {
             "delete from search_documents d where d.provider = 'settings' \
              and not exists (select 1 from organizations o where d.entity_id = o.id::text)"
@@ -465,7 +461,6 @@ const UPSERT_TAIL: &str = "\
 on conflict (provider, entity_type, entity_id) do update set \
     organization_id = excluded.organization_id, \
     site_id = excluded.site_id, \
-    project_id = excluded.project_id, \
     title = excluded.title, \
     subtitle = excluded.subtitle, \
     url = excluded.url, \
@@ -694,38 +689,6 @@ from sites s \
 where true {filter} \
 ";
 
-/// Upsert of the workflow provider: one document per automation, carrying the **project it
-/// belongs to**.
-///
-/// This is the provider that makes the project clause in `query.rs` mean anything, and it is
-/// deliberately the first project-scoped domain in the index. Without it a search can only ever
-/// return rows that belong to no project, so a scoping filter would narrow nothing and every
-/// test written against it would pass while leaking nothing — the greenest possible lie. The
-/// column list names `project_id` explicitly and the shared conflict tail refreshes it, because
-/// a workflow moved between projects (REQ-133's move surface) would otherwise keep answering
-/// under its old project's membership.
-const WORKFLOWS_UPSERT: &str = "\
-insert into search_documents \
-    (organization_id, site_id, project_id, provider, entity_type, entity_id, title, subtitle, \
-     url, owner_user_id, tags, body, entity_updated_at, document) \
-select w.organization_id, w.site_id, w.project_id, 'workflows', 'workflow', w.id::text, \
-       w.name, \
-       concat_ws(' · ', p.name, w.trigger_kind, \
-                 case when w.enabled then 'enabled' else 'disabled' end), \
-       '/workflows?focus=' || w.id::text, \
-       w.created_by, \
-       array[w.trigger_kind]::text[], \
-       left(w.description, 400), \
-       w.updated_at, \
-       setweight(to_tsvector('simple', w.name), 'A') || \
-       setweight(to_tsvector('simple', w.trigger_kind), 'B') || \
-       setweight(to_tsvector('simple', concat_ws(' ', p.name, w.trigger_kind)), 'C') || \
-       setweight(to_tsvector('simple', coalesce(w.description, '')), 'D') \
-from workflows w \
-join automation_projects p on p.id = w.project_id \
-where true {filter} \
-";
-
 /// Build a provider's upsert statement: the SQL above, the optional single-entity filter and the
 /// shared conflict tail.
 #[must_use]
@@ -737,7 +700,6 @@ pub fn upsert_statement(provider_key: &str, entity_id: Option<Uuid>) -> Option<S
         "sites" => (SITES_UPSERT, "s.id"),
         "translations" => (TRANSLATIONS_UPSERT, "t.id"),
         "settings" => (SETTINGS_UPSERT, "o.id"),
-        "workflows" => (WORKFLOWS_UPSERT, "w.id"),
         // Activity rows are two sources behind one entity id (`audit-12` / `event-9`), and nothing
         // addresses one of them by uuid: the only way in is a full pass, so a single-entity upsert
         // writes nothing rather than guessing at a row. That also keeps `index_entity` harmless

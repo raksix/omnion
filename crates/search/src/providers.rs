@@ -88,14 +88,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         route: "/pages",
     },
     ProviderSpec {
-        key: "workflows",
-        title: "Workflows",
-        entity_type: "workflow",
-        permission: "workflows.read",
-        hint: "The automations of the projects you are a member of",
-        route: "/workflows",
-    },
-    ProviderSpec {
         key: "settings",
         title: "Settings",
         entity_type: "setting",

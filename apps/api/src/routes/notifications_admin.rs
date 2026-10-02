@@ -26,21 +26,15 @@ use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use omnion_notifications::push::{
-    MAX_OUTBOX_PAGE, OutboxCounts, OutboxQuery, OutboxRow, OutboxScope, PushSubscription,
+    MAX_OUTBOX_PAGE, OUTBOX_RETENTION_DAYS, OutboxCounts, OutboxQuery, OutboxRow, PushSubscription,
     RegisterOutcome, RegisterReport, RetryOutcome,
 };
-use omnion_notifications::retention::{self, MAX_RETENTION_DAYS, MIN_RETENTION_DAYS, RetentionRun};
 use omnion_notifications::router::{RecipientRule, RouteReport, RouteRule, RoutedEvent};
-use omnion_audit::NewAuditEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-use time::UtcOffset;
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
-use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -283,68 +277,24 @@ pub async fn list_outbox(
     session: CurrentSession,
     RawQuery(query): RawQuery,
 ) -> Result<Json<OutboxBody>, ApiError> {
-    // An account nobody ever attached to a tenant is refused rather than handed a scope: the
-    // old signature took `Option<Uuid>` and its `None` branch meant "everything stamped to no
-    // tenant", which is a *different* question from the one an orgless session is asking.
-    let scope = outbox_scope(&session)?;
     let parsed = parse_outbox_query(query.as_deref());
-    let rows = omnion_notifications::push::list_outbox(state.db().pool(), scope, &parsed)
-        .await
-        .map_err(map_push)?;
-    let counts = omnion_notifications::push::outbox_counts(state.db().pool(), scope)
-        .await
-        .map_err(map_push)?;
+    let rows = omnion_notifications::push::list_outbox(
+        state.db().pool(),
+        session.user.organization_id,
+        &parsed,
+    )
+    .await
+    .map_err(map_push)?;
+    let counts =
+        omnion_notifications::push::outbox_counts(state.db().pool(), session.user.organization_id)
+            .await
+            .map_err(map_push)?;
 
     Ok(Json(OutboxBody {
         rows: rows.iter().map(OutboxRowBody::from).collect(),
         counts: OutboxCountsBody::from(counts),
-        // **The organization's OWN window, read from the column the sweep reads.**
-        //
-        // This answer was the published constant for the whole life of the screen, and the
-        // constant is the *fallback* — the number an installation with no row gets. The moment
-        // a tenant set its own window, this route kept telling it "The log goes back 60 days"
-        // while the sweep deleted that tenant's rows on its own shorter clock: the sentence and
-        // the sweeper disagreed, and the one the administrator could see was the wrong one. A
-        // log that describes a floor it does not hold is worse than one that states none.
-        //
-        // The platform arm reads the same way: an orgless session's `None` finds no row, so it
-        // gets the published default — which is exactly what the sweep's work list binds for it.
-        retention_days: retention::retention_window(state.db().pool(), scope.organization())
-            .await
-            .map_err(map_push)?,
+        retention_days: OUTBOX_RETENTION_DAYS,
     }))
-}
-
-/// What one session may read out of the delivery log.
-///
-/// **The one caller that knows what an orgless session means.** `OutboxScope::for_session`
-/// returns `None` rather than guessing between "the platform's traffic" and "no tenant at
-/// all", because a guess here is what let the list and the counts drift apart in the first
-/// place. The two cases are genuinely different:
-///
-/// * a session with an organization gets [`OutboxScope::Organization`] and cannot name
-///   anybody else's;
-/// * a session with **no** organization is an account nobody ever attached to a tenant, and
-///   is handed [`OutboxScope::Platform`] — the rows stamped to no tenant.
-///
-/// **So an orgless session is never refused, and this function has no error arm on purpose.**
-/// The old signature took the caller's organization as a *parameter*, and its `None` branch
-/// read "every row stamped to no tenant" — which is what the platform arm still means, so the
-/// one thing this changed is that no caller can spell "a tenant's rows" without naming that
-/// tenant. An earlier draft of this comment claimed the orgless case was refused and the
-/// function returned `Ok(Platform)`; a doc that says "refused" above a function that answers
-/// is the same defect as a counts query that disagrees with its list, one layer up.
-///
-/// The `Result` stays because the signature is the seam: the decision is now one named
-/// function instead of an `if` at each of the two call sites, and a future caller that must
-/// refuse has somewhere obvious to put it.
-pub(crate) fn outbox_scope(session: &CurrentSession) -> Result<OutboxScope, ApiError> {
-    Ok(
-        match omnion_notifications::push::OutboxScope::for_session(session.user.organization_id) {
-            Some(scope) => scope,
-            None => OutboxScope::Platform,
-        },
-    )
 }
 
 /// The outbox answer: the rows, the counts for the chips, and how far back the log reaches.
@@ -496,15 +446,10 @@ fn percent_decode(value: &str) -> String {
 /// somebody, and a `pending` row is already queued. Both would be a second copy of a message.
 pub async fn retry_outbox(
     State(state): State<AppState>,
-    session: CurrentSession,
+    _session: CurrentSession,
     Path(id): Path<Uuid>,
 ) -> Result<Json<RetryResult>, ApiError> {
-    // The same scope the list uses, so the button is addressable exactly when the row is
-    // visible. A row outside it answers `not-retryable`, not `404` — this endpoint's existing
-    // contract already answers anything that is not a retryable row with a state rather than
-    // an existence, and inventing a second one for tenancy would leak which ids are real.
-    let scope = outbox_scope(&session)?;
-    let outcome = omnion_notifications::push::retry_delivery(state.db().pool(), scope, id)
+    let outcome = omnion_notifications::push::retry_delivery(state.db().pool(), id)
         .await
         .map_err(map_push)?;
     Ok(Json(RetryResult { outcome }))
@@ -514,169 +459,6 @@ pub async fn retry_outbox(
 pub struct RetryResult {
     /// `requeued` or `not-retryable`.
     pub outcome: RetryOutcome,
-}
-
-// ---------------------------------------------------------------------------------------------
-// The log's own retention
-// ---------------------------------------------------------------------------------------------
-
-/// `PATCH /api/v1/notifications/outbox/retention` — set this organization's window.
-///
-/// **A platform account is refused by name rather than handed a `200` that changes nothing.** It
-/// has no organization row, so there is no window to keep on: the sweep's work list binds the
-/// published default for that arm and no setter can move it. This is the same refusal the event
-/// bus gives, and for the same reason — an endpoint that answers `200` and writes nothing is
-/// worse than one that says which account shape it wants.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SetRetentionBody {
-    /// New window in days. Refused outside the range rather than clamped: a clamp answers
-    /// `200` with a number the operator did not ask for.
-    pub window_days: i32,
-}
-
-/// `GET /api/v1/notifications/outbox/retention` — the window, the counts and the last sweep.
-pub async fn outbox_retention(
-    State(state): State<AppState>,
-    session: CurrentSession,
-) -> Result<Json<RetentionBody>, ApiError> {
-    let organization_id = session.user.organization_id;
-    let status = retention::retention_status(state.db().pool(), organization_id, lease_seconds(&state))
-        .await
-        .map_err(map_push)?;
-    Ok(Json(RetentionBody {
-        organization_id,
-        window_days: status.window_days,
-        min_days: MIN_RETENTION_DAYS,
-        max_days: MAX_RETENTION_DAYS,
-        rows: status.rows,
-        due: status.due,
-        last_run: status.last_run.as_ref().map(RetentionRunBody::build),
-    }))
-}
-
-/// `PATCH /api/v1/notifications/outbox/retention` — set the window.
-pub async fn set_outbox_retention(
-    State(state): State<AppState>,
-    session: CurrentSession,
-    address: ClientAddress,
-    Json(body): Json<SetRetentionBody>,
-) -> Result<Json<RetentionBody>, ApiError> {
-    let Some(organization_id) = session.user.organization_id else {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "retention_scope_required",
-            "a delivery-log window belongs to an organization; this account is platform level",
-        ));
-    };
-
-    // **The previous value is read before the write, and written into the audit row.** "The
-    // window went from 60 to 7" is the sentence an operator needs on the day a customer's
-    // evidence disappears; "the window is 7" answers nothing about what caused it.
-    let previous = retention::retention_window(state.db().pool(), Some(organization_id))
-        .await
-        .map_err(map_push)?;
-    retention::set_retention_window(state.db().pool(), organization_id, body.window_days)
-        .await
-        .map_err(map_push)?;
-
-    record(
-        &state,
-        NewAuditEntry::by_user(session.user.id, "notification.retention.changed")
-            .target("organization", organization_id.to_string())
-            .metadata(json!({
-                "previous_window_days": previous,
-                "window_days": body.window_days,
-            }))
-            .ip_address(address.as_text())
-            .organization(Some(organization_id)),
-    )
-    .await?;
-
-    // **The answer is re-read, not assembled from the request.** Every other write on this
-    // surface returns what the caller asked for; this one returns what the database holds,
-    // which is the number that will be published on the outbox from this moment on.
-    outbox_retention(State(state), session).await
-}
-
-/// The delivery log's retention, as the screen renders it.
-#[derive(Debug, Serialize)]
-pub struct RetentionBody {
-    pub organization_id: Option<Uuid>,
-    /// How many days of history this organization keeps.
-    pub window_days: i32,
-    /// The bounds the API accepts, so the input is bounded by the server's own rule rather
-    /// than by a second copy of it in the panel.
-    pub min_days: i32,
-    pub max_days: i32,
-    /// How many delivery rows the log holds.
-    pub rows: i64,
-    /// How many the next sweep would remove — the sweep's own predicate, so the two cannot
-    /// disagree about what "due" means.
-    pub due: i64,
-    /// The last finished sweep. `None` is a real answer: the sweep has never run here.
-    pub last_run: Option<RetentionRunBody>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RetentionRunBody {
-    pub id: Uuid,
-    pub started_at: String,
-    pub finished_at: String,
-    pub window_days: i32,
-    pub cutoff: String,
-    pub deliveries_deleted: i32,
-    pub devices_deleted: i32,
-    pub failed: bool,
-    pub error: Option<String>,
-}
-
-impl RetentionRunBody {
-    fn build(run: &RetentionRun) -> Self {
-        // **`.to_offset(UtcOffset::UTC)` rather than a bare `.to_offset()`**, and the reason is
-        // worth writing down because the compiler will not: sqlx hands back a `time::
-        // OffsetDateTime`, whose `to_offset` takes the offset to convert *to*. Omitting it
-        // reads as a no-op conversion and does not compile — and the fix a reflex reaches for,
-        // `to_offset(UtcOffset::UTC)`, silently reinterprets the instant in UTC, which is wrong
-        // for any organization whose clock is not. **A timestamp the caller chooses a zone for is
-        // a decision; the platform's own vocabulary is UTC everywhere else**, so this renders
-        // exactly like `iam_approvals`' `format(&Rfc3339)` and disagrees with it by no amount.
-        let stamp = |instant: OffsetDateTime| {
-            instant.to_offset(UtcOffset::UTC).format(&Rfc3339).unwrap_or_default()
-        };
-        Self {
-            id: run.id,
-            started_at: stamp(run.started_at),
-            finished_at: stamp(run.finished_at),
-            window_days: run.window_days,
-            cutoff: stamp(run.cutoff),
-            deliveries_deleted: run.deliveries_deleted,
-            devices_deleted: run.devices_deleted,
-            failed: run.failed > 0,
-            error: run.error.clone(),
-        }
-    }
-}
-
-/// The same lease the delivery queue and the sweeper use, so "recently claimed" means one thing.
-///
-/// **Read from the config rather than written here as a number**, for the reason the delivery
-/// runner's own lease is: "recently claimed" has to mean the same thing in the queue, in
-/// `settle_not_ready` and in the `due` count on this screen, and three copies of a number is how
-/// two of them drift. `retention_counts` is then handed exactly what `run_pass` is handed.
-fn lease_seconds(state: &AppState) -> f64 {
-    state.config().events.lease_seconds as f64
-}
-
-/// Write an audit row; a privileged action is not reported as successful without one.
-///
-/// The identical three-line helper eight other route modules keep verbatim. It is duplicated
-/// rather than hoisted because this module's call sites do not justify a shared import, and the
-/// cost of one more copy is smaller than the cost of a route module depending on another route
-/// module's internals.
-async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
-    omnion_audit::record(state.db().pool(), entry).await?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -820,7 +602,6 @@ pub async fn run_route(
                 "created": report.created,
                 "deduped": report.deduped,
                 "unmatched_rules": report.unmatched_rules,
-                "dropped_recipients": report.dropped_recipients,
             })),
     )
     .await

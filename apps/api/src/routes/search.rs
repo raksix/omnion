@@ -19,7 +19,6 @@ use omnion_events::{NewEvent, bus};
 use omnion_permissions::effective_permissions;
 use omnion_search::indexer;
 use omnion_search::providers;
-use omnion_workflows::projects;
 use omnion_search::query::{
     self, DEFAULT_PER_PAGE, HitPage, MAX_PER_PAGE, Query as SearchQuery, SearchFilters,
     SearchRequest, Sort, UpdatedRange,
@@ -715,12 +714,10 @@ pub async fn suggest(
     }
 
     let providers = readable_providers(&state, &current).await?;
-    let project_ids = visible_projects(&state, &current).await?;
     let rows = query::suggest(
         state.db().pool(),
         current.user.organization_id,
         &providers,
-        project_ids.as_deref(),
         &prefix,
     )
     .await?;
@@ -1037,7 +1034,6 @@ async fn search_request(
         filters: filters_from(params)?,
         providers,
         organization_id: current.user.organization_id,
-        project_ids: visible_projects(state, current).await?,
         user_id: current.user.id,
         page: params.page.unwrap_or(1).max(1),
         per_page: params
@@ -1046,36 +1042,6 @@ async fn search_request(
             .clamp(1, MAX_PER_PAGE),
         sort,
     })
-}
-
-/// The projects whose documents this caller may see, or `None` when that is all of them.
-///
-/// This is the whole of REQ-133's search half, and it is one call for a reason: the palette's
-/// suggestion query and the results screen are **two different statements** over the same index,
-/// so scoping only the results screen leaves the first paint of the ⌘K box answering with a
-/// workflow from a project the caller is not a member of — the leak survives in the path people
-/// touch first. Both ask this function.
-///
-/// `None` (no filtering) is reserved for an instance administrator and is decided by the same
-/// `is_instance_admin` the automation surfaces use, so `projects.admin` cannot mean two things
-/// on one branch.
-async fn visible_projects(
-    state: &AppState,
-    current: &CurrentSession,
-) -> Result<Option<Vec<Uuid>>, ApiError> {
-    let Some(organization_id) = current.user.organization_id else {
-        // A platform-level account has no organization to scope projects by. It holds the
-        // instance-wide keys the other project surfaces require, and filtering it by "the
-        // projects it is a member of" would refuse a search an administrator is entitled to.
-        return Ok(None);
-    };
-    let caller = super::automation_projects::caller_for(state, current, organization_id).await;
-    Ok(projects::visible_project_filter(
-        state.db().pool(),
-        organization_id,
-        caller,
-    )
-    .await?)
 }
 
 /// The providers the caller's own read permissions cover **and** the installation has enabled,

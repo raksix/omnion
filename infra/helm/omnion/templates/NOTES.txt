@@ -1,0 +1,3 @@
+{{- /* Rendered by helm install/upgrade; the text itself is in _notes.tpl so the QA gate can
+       render it without a cluster. */ -}}
+{{ include "omnion.notes" . }}

@@ -1,0 +1,93 @@
+{{- if .Values.migration.enabled }}
+{{/*
+The migration Job is a Helm HOOK, not a release object. That is the whole mechanism behind
+"migrations finish before new pods roll": a `pre-install`/`pre-upgrade` hook Job is run to
+completion before Helm starts applying the rest of the release, so the schema is already at the
+new version by the time the first new pod is created. The failure this replaces is the one the
+compose stack also has to guard against with `service_completed_successfully` — an API that
+migrates on boot races its own replicas.
+
+`migration.enabled: false` is honoured here rather than documented and ignored: an operator who
+turns the hook off (to run migrations by hand, say) must get a release with no Job in it, not a
+release with a Job nobody can explain.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "omnion.fullname" . }}-migrate
+  labels:
+    {{- include "omnion.componentLabels" (list "migrate" .) | nindent 4 }}
+  annotations:
+    {{- include "omnion.migrationHookAnnotations" . | nindent 4 }}
+spec:
+  # 1 replica, always: two migrations running against one schema is the failure this hook exists
+  # to make impossible, so the Job never sets `parallelism` or `completions` above 1.
+  completions: 1
+  parallelism: 1
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  # A migration that has not finished in this long is not going to. Without the deadline a hung
+  # migration holds the `pre-upgrade` hook and therefore the whole release until an operator kills
+  # it by hand — and nothing in `helm upgrade` output says which pod to kill.
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "omnion.componentLabels" (list "migrate" .) | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          {{/* The API image, by way of the shared helper: `--migrate-only` is a MODE of that
+               binary, so the job and the pods cannot ship different schema code, and an empty
+               `migration.image.tag` inherits the release tag rather than falling back to
+               `appVersion`. */}}
+          image: {{ include "omnion.image" (dict "root" . "component" "migrate") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --migrate-only
+            {{- with .Values.migration.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: OMNION_ENV
+              value: production
+            - name: DATABASE_URL
+              valueFrom:
+                {{- include "omnion.secretKeyRef" (dict "key" (or .Values.postgresql.existingSecretKey .Values.secrets.keys.databaseUrl) "name" (or .Values.postgresql.existingSecret .Values.secrets.existingSecret) "required" .Values.secrets.required) | nindent 16 }}
+            - name: REDIS_URL
+              valueFrom:
+                {{- include "omnion.secretKeyRef" (dict "key" (or .Values.redis.existingSecretKey .Values.secrets.keys.redisUrl) "name" (or .Values.redis.existingSecret .Values.secrets.existingSecret) "required" .Values.secrets.required) | nindent 16 }}
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          {{/* readOnlyRootFilesystem is inherited from containerSecurityContext, so the Job needs
+               the same writable /tmp the Deployments get. Without it the pod dies at startup with
+               EROFS on the first write — which for a `--migrate-only` run is exactly when it is
+               least diagnosable, because the failure is in the pre-upgrade hook and the release
+               has not started. */}}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+{{- end }}

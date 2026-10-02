@@ -1,0 +1,137 @@
+# Omnion alert rules for Prometheus (REQ-126, slice 4).
+#
+# The same rules the panel seeds into `obs_alert_rules` with `source = 'bundled'`, written in
+# PromQL for a Prometheus that has a query engine. Run them HERE if you want Alertmanager's
+# routing and silences; run them in Omnion if you want the panel's timeline. Running both means
+# two notifications per incident — set `OMNION_ALERTS_EVALUATOR=false` to turn off the built-in
+# loop.
+#
+# Every expression here uses only families the registry declares, and only labels those families
+# declare. **That is checked, not asserted**: `crates/telemetry/src/bundle_rules.rs` parses this
+# file and fails the build when a rule names a family this build does not emit, when a matcher
+# names a label the family does not have (which matches the empty set — the rule imports, reviews
+# clean, and can never fire), or when a rule the panel runs is missing from here. The first draft
+# of that check said this file was "the same four rules the panel seeds"; it was ten, and nothing
+# had noticed.
+#
+# The file is the RICHER set. The panel evaluates its own rules against the in-process registry
+# using a deliberately small grammar (`<family> {labels} <op> <number>`), so expressions like the
+# `histogram_quantile` below cannot be expressed there. The panel's four are the same thresholds
+# in the simpler form — see `BUNDLED_RULES` in `crates/telemetry/src/alert_loop.rs`, and the
+# cross-check that keeps the two sets from drifting apart.
+
+groups:
+  - name: omnion-api
+    interval: 30s
+    rules:
+      # The error ratio, not the error count. A count fires on a busy instance and stays quiet on
+      # a quiet one, which is the wrong way round: 500 errors an hour out of two million requests
+      # is a rounding error, and fifty out of five hundred is an outage.
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(omnion_http_requests_total{status="5xx"}[5m]))
+            / clamp_min(sum(rate(omnion_http_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 5% of requests answered 5xx over the last 5 minutes.
+
+      - alert: SlowRequests
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(omnion_http_request_duration_seconds_bucket[5m])) by (le)) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: p95 request latency is above 1.5 seconds.
+
+      # A queue that is not draining. `omnion_queue_depth` is a gauge, so this is the level
+      # itself rather than a rate: a queue at 500 and falling is healthy, a queue at 500 and
+      # rising is not, and only the level with a long `for` tells the two apart without also
+      # paging on every burst.
+      - alert: QueueBacklog
+        expr: omnion_queue_depth > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A queue is holding more than 100 items.
+
+      # Telemetry is being lost. Deliberately `for: 0`: this is a counter that only moves when
+      # something is already wrong, and every minute of dwell is a minute of data nobody has.
+      - alert: ExporterDroppingTelemetry
+        expr: increase(omnion_exporter_dropped_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: A telemetry exporter dropped data because its buffer filled up.
+
+      # The registry is folding samples into its `other` series. This is the failure mode that
+      # grows silently: nothing breaks, the numbers get coarser, and the operator finds out
+      # months later that a per-tenant label was never broken out.
+      - alert: CardinalityBudgetExceeded
+        expr: increase(omnion_registry_budget_exceeded[15m]) > 0
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: Metric samples are being folded into overflow series.
+
+      # A drain that hit its deadline. Informational on purpose: the process exits 0 either way,
+      # and this is the signal that requests are being cut off at deploy time.
+      - alert: ShutdownHitDeadline
+        expr: increase(omnion_shutdowns_total{outcome="timed_out"}[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: A shutdown reached its drain deadline with requests still running.
+
+  - name: omnion-dependencies
+    interval: 30s
+    rules:
+      # The pool is measured in three states, and the one that matters is `idle` running out.
+      # `idle` is the headroom; `acquired` sitting high with `idle` at zero means every request is
+      # waiting for a connection, which is a different incident with a different fix.
+      - alert: DatabasePoolExhausted
+        expr: omnion_db_pool_connections{state="idle"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: The database pool has no idle connections left.
+
+      - alert: SlowDatabaseQueries
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(omnion_db_query_duration_seconds_bucket[5m])) by (le, statement)) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: A database statement is taking longer than 500ms at p95.
+
+      # The circuit family is a gauge at 1 when open. Open is not itself a fault — a provider
+      # being down is exactly what the circuit is for — so this alerts on it staying open, not on
+      # it opening.
+      - alert: ProviderCircuitStuckOpen
+        expr: omnion_circuit_state == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A provider circuit has been open for 15 minutes.
+
+      # A webhook that fails a third of its deliveries is usually a misconfigured endpoint rather
+      # than a broken one, and it is the single most common "why is nothing arriving" answer.
+      - alert: WebhookFailureRatio
+        expr: |
+          sum(rate(omnion_webhook_deliveries_total{result="failed"}[10m]))
+            / clamp_min(sum(rate(omnion_webhook_deliveries_total[10m])), 0.001) > 0.33
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than a third of webhook deliveries are failing.

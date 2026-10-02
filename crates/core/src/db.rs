@@ -15,40 +15,25 @@ use crate::error::{CoreError, Result};
 /// without shipping the SQL files next to it (docs/04-MONOREPO.md: `database/migrations`).
 static MIGRATOR: Migrator = sqlx::migrate!("../../database/migrations");
 
-/// The transaction flag of every embedded migration, keyed by version.
+/// The migration bundle this binary embeds.
 ///
-/// ## Why this is a function rather than a comment
+/// Public so the CLI, the deploy job and the panel all read the SAME set the runner applies —
+/// a second copy of this `static` would be a second answer to "which migrations does this binary
+/// carry", and the divergence would show up as a plan preview describing statements no deploy will
+/// ever run.
+pub fn migrator() -> &'static Migrator {
+    &MIGRATOR
+}
+
+/// A [`DatabaseConfig`] pointing at `name` on the same server as this one.
 ///
-/// sqlx decides at COMPILE time whether a migration runs inside the runner's transaction, from
-/// one predicate (`sqlx-core/src/migrate/source.rs`):
-///
-/// ```text
-/// let no_tx = sql.starts_with("-- no-transaction");
-/// ```
-///
-/// and bakes the answer into the constant above. So "the SQL file is right" and "the binary
-/// knows it" are **two different facts**, and only this function can see the second. That gap
-/// is not hypothetical: `0200_crm_intake_source_key_lookup.sql` shipped with
-/// `create index concurrently`, no directive, and a comment that named the resulting install
-/// failure and then declared it somebody else's problem. Every fresh installation could not
-/// boot.
-///
-/// Keyed by version rather than by description because the description is the *file name with
-/// separators normalised* (`0200_crm_intake_source_key_lookup.sql` reads as
-/// `"crm intake source key lookup"`, with no version and no extension) — a key a caller has to
-/// reconstruct by hand is a key that will be typed wrong.
-///
-/// A migration reading correctly on disk is therefore not evidence, and `omnion doctor`
-/// reporting a migration set is not evidence either — it reports the same constant this
-/// function reads. The gate that closes it is
-/// `scripts/qa/run-migration-installs.sh`, which installs an empty database with the real
-/// runner; this accessor is what lets the cheap half of that check run in CI.
-#[must_use]
-pub fn migration_flags() -> std::collections::BTreeMap<i64, bool> {
-    MIGRATOR
-        .iter()
-        .map(|migration| (migration.version, migration.no_tx))
-        .collect()
+/// Built from the existing config rather than parsed from a flag so a scratch database inherits
+/// the operator's credentials, pool size and host — and so `--scratch` can carry a bare database
+/// name as easily as a full URL. `url` is required to be a real PostgreSQL URL, so this is a
+/// *different database on the same server*, never a different server.
+pub fn same_server_url(url: &str, name: &str) -> Option<String> {
+    let cut = url.rfind('/')?;
+    Some(format!("{}/{name}", &url[..cut]))
 }
 
 /// Upper bound for a health ping so readiness probes answer quickly.
@@ -74,6 +59,22 @@ impl Db {
     pub fn connect_lazy(config: &DatabaseConfig) -> Result<Self> {
         let pool = pool_options(config).connect_lazy(&config.url)?;
         Ok(Self { pool })
+    }
+
+    /// Wrap a pool this process already built.
+    ///
+    /// `connect` and `connect_lazy` both read the URL and the pool options out of
+    /// [`DatabaseConfig`], which is right for a running service and useless for a test that needs
+    /// a database which **cannot answer** — a reserved port, a closed socket, a two-connection
+    /// ceiling. Building the pool by hand and handing it over keeps the timeouts under the
+    /// caller's control, and a test that must fail fast cannot use a five-second acquire timeout
+    /// and still call itself quick.
+    ///
+    /// No verification happens here, which is the whole difference from `connect`: a pool built
+    /// this way may point at nothing at all, and the first query is what discovers it.
+    #[must_use]
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Apply every pending migration.

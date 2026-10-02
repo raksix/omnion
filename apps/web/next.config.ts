@@ -9,6 +9,15 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   /**
+   * Standalone output (REQ-128, slice 1).
+   *
+   * Same reasoning as the admin panel: the renderer's runtime image ships this directory instead
+   * of the workspace, which is what keeps it inside the documented size budget. The renderer
+   * runs as a plain origin behind the public host, so `output: "standalone"` also makes the
+   * unversioned `public/` and `.next/static` copies explicit steps rather than a coincidence.
+   */
+  output: "standalone",
+  /**
    * The floating Next.js badge is a framework artifact, not part of the product: it sits in the
    * bottom-left corner of every development page. Development only — a production build renders
    * no indicator either way.

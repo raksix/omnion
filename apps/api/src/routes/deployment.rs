@@ -1,1093 +1,750 @@
-//! `/api/v1/deployment/*` — the deployment centre's read surface (REQ-024, slice 1).
+//! The deployment centre's release surface: artifacts, bundles and the upgrade plan
+//! (docs/requests/REQ-128, slice 4).
 //!
-//! Seven routes, one guard (`deployment.read`), and the whole file exists because of a rule the
-//! brief writes as two lines of UI: `Version 2.4.1` / `Available 2.5.0`. Every shortcut around
-//! that line ships a card that looks right and is wrong, so the values are **computed on the
-//! server** by `omnion_deployment::availability` and travel as an `Availability` enum. The panel
-//! never re-derives them, because a panel that compares two version strings with `>` offers
-//! `1.9.0` as an upgrade from `1.10.0`.
+//! ## The split of powers, and why it is `read` / `bundle.generate` / `manage`
 //!
-//! Five decisions are worth naming, and each is a place the obvious shortcut is wrong:
+//! * **Reading** the artifact list, a release's detail and a bundle's metadata is
+//!   `deployment.read` — the same read the rest of the deployment centre uses.
+//! * **Generating** a bundle and rendering a template is `deployment.bundle.generate`. It is a
+//!   write (a row lands in `environment_bundles`) and it is rate limited, because "a handful per
+//!   target per hour is plenty" is the request's own words and an unbounded generator is a way to
+//!   fill a table from a browser.
+//! * **Acknowledging** a destructive-migration warning is `deployment.manage` — the same power
+//!   that rolls a deployment back, because accepting that the database can only be restored is
+//!   part of deciding to deploy.
 //!
-//! * **The channel is resolved once, here, and travels with every response.** A release list
-//!   without a channel is a list of *everything*, and a stable installation that renders a
-//!   nightly list will happily offer a nightly as its next release. `?channel=` may narrow the
-//!   installation's own channel for the release *browser*; it may never *widen* the card's
-//!   offer, which is always `current.channel.admits(...)`.
-//! * **`/version` is a build-metadata endpoint, not a deployment one.** It is what the shell
-//!   footer reads, so it must answer even when the release feed is down and the cache is empty
-//!   — and it must never claim an update is available, because a footer that offers a deploy is
-//!   a footer that is offering something it cannot carry.
-//! * **The stale banner is computed, not detected by the panel.** The spec names its wording
-//!   ("showing cached data from {time}") and the timestamp has to come from `max(checked_at)`
-//!   rather than from the clock, or the banner claims freshness it does not have.
-//! * **A missing release is a `404` with the channel in the message.** The operator followed a
-//!   link to `2.5.0` on `stable`; the honest answer names what was looked for and where, so
-//!   they can tell a withdrawn release from a wrong channel.
-//! * **`/checks/run` is the only write here, it is `deployment.manage`, and it does the whole
-//!   check synchronously.** A "check now" button that returns before the check has run reports
-//!   the *previous* run's result and the operator reads it as this one's. The scheduled runner
-//!   exists for the routine case; this route exists for "I am about to deploy and need to know
-//!   *now*", and it waits.
+//! ## Nothing here ever returns a credential
+//!
+//! `environment_bundles.config` is a `jsonb` column holding a record the **platform** built
+//! ([`omnion_deployment::bundle::BundleRequest::to_record`]), not the request the caller sent. A
+//! record type with no field a password can arrive in is the guarantee; this module's job is not
+//! to re-check it.
+//!
+//! ## Why the upgrade endpoint degrades rather than erroring
+//!
+//! The release feed is the one dependency of this surface that is allowed to be unreachable: a
+//! panel that refuses to show the cached manifest because a registry timed out is a panel that
+//! tells an operator nothing exactly when the network is bad. So every read answers from the
+//! cache and carries the cache's own `fetched_at`, and the plan's `unavailable` is a *reason* the
+//! screen renders rather than an empty response.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use omnion_deployment::manifest::{self, CheckResult};
-use omnion_deployment::preflight::CheckOutcome;
-use omnion_deployment::store::{self, HealthRow, HistoryFilter};
-use omnion_deployment::version::{Availability, Channel, Release, Version};
-use omnion_deployment::{StoreError, stale_banner};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use time::OffsetDateTime;
+use axum::response::IntoResponse;
+use omnion_audit::NewAuditEntry;
+use omnion_deployment::bundle::{BundleRequest, apply_commands};
+use omnion_deployment::manifest::{ARTIFACT_KINDS, ReleaseManifest};
+use omnion_deployment::plan::verify_plan;
+use omnion_deployment::{store, upgrade};
+use omnion_events::{NewEvent, bus};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-// ---------------------------------------------------------------------------------------------
-// Request and response shapes
-// ---------------------------------------------------------------------------------------------
-
-/// Query of every read that takes a channel.
-#[derive(Debug, Default, Deserialize)]
-pub struct ChannelQuery {
-    /// `stable`, `beta` or `nightly`.
-    #[serde(default)]
-    pub channel: Option<String>,
-}
-
-/// Query of `GET /api/v1/deployment/releases`.
-#[derive(Debug, Default, Deserialize)]
-pub struct ReleaseListQuery {
-    /// The channel to browse.
-    #[serde(default)]
-    pub channel: Option<String>,
-    /// Page size.
-    #[serde(default)]
-    pub limit: Option<i64>,
-}
-
-/// Query of `GET /api/v1/deployment/history`.
-#[derive(Debug, Default, Deserialize)]
-pub struct HistoryQuery {
-    /// Environment filter.
-    #[serde(default)]
-    pub environment: Option<String>,
-    /// `deploy`, `rollback` or `restart`.
-    #[serde(default)]
-    pub kind: Option<String>,
-    /// A job status.
-    #[serde(default)]
-    pub status: Option<String>,
-    /// `7d`, `30d`, `90d` or an RFC 3339 instant.
-    #[serde(default)]
-    pub window: Option<String>,
-    /// Page size.
-    #[serde(default)]
-    pub limit: Option<i64>,
-    /// Row offset.
-    #[serde(default)]
-    pub offset: Option<i64>,
-}
-
-/// The version this installation is running.
-#[derive(Debug, Serialize)]
-pub struct VersionBody {
-    /// The version string, as `CARGO_PKG_VERSION` wrote it.
-    pub version: String,
-    /// Which service reported it, so a footer can say *what* is at this version.
-    pub service: String,
-    /// The channel this installation follows.
-    pub channel: String,
-    /// Whether that channel string is one the platform understands. A `false` here is worth
-    /// showing rather than normalizing away: it means an operator's configuration says
-    /// something the deployment code does not recognize, and the card's offers are then
-    /// computed under a rule nobody wrote.
-    pub channel_understood: bool,
-    /// The core version, when the build reports one.
-    pub core: Option<String>,
-    /// What the card's second line says. Never an empty string — see `Availability::label`.
-    pub available: String,
-    /// The same answer as an enum, so the panel renders three states instead of parsing text.
-    pub availability: Availability,
-    /// Whether there is anything to press `Deploy` against.
-    pub upgrade_available: bool,
-}
-
-/// One environment card.
-#[derive(Debug, Serialize)]
-pub struct EnvironmentCardBody {
-    /// `production`, `staging` or `sandbox`.
-    pub environment: String,
-    /// The label the card shows.
-    pub name: String,
-    /// `healthy`, `degraded` or `unreachable`.
-    pub health: String,
-    /// The version running here, from the last probe.
-    pub version: Option<String>,
-    /// When the last probe ran — the card's tooltip.
-    pub checked_at: Option<OffsetDateTime>,
-    /// The failing probe, when degraded. The tooltip's second line.
-    pub failing_probe: Option<String>,
-    /// What the card's `Available` line says here.
-    pub available: String,
-    /// The same answer as an enum.
-    pub availability: Availability,
-    /// Whether `Deploy` may be pressed.
-    pub deployable: bool,
-    /// Why not, when it may not. A disabled button with no reason is the dead control the
-    /// request's Definition of Done forbids.
-    pub blocked_reason: Option<String>,
-    /// Whether `Rollback` may be pressed, and to which version.
-    pub rollback: Option<RollbackBody>,
-    /// The last deploy, for the card's footer line.
-    pub last_deploy: Option<HistoryRowBody>,
-}
-
-/// What the card offers as a rollback.
-#[derive(Debug, Serialize)]
-pub struct RollbackBody {
-    /// The version a rollback would return to.
-    pub to_version: String,
-    /// Whether that target is in the cache with notes, so `Rollback` can be honest about it.
-    pub known: bool,
-}
-
-/// The version summary and the stale banner, shared by several responses.
-#[derive(Debug, Serialize)]
-pub struct VersionSummary {
-    /// The installed version.
-    pub current: String,
-    /// The card's second line.
-    pub available: String,
-    /// The same answer as an enum.
-    pub availability: Availability,
-    /// The banner, or `None` when the cache is current. The panel renders it verbatim; the
-    /// wording is a product surface, not a component's opinion.
-    pub stale_banner: Option<String>,
-}
-
-/// Response of `GET /api/v1/deployment/version`.
-#[derive(Debug, Serialize)]
-pub struct VersionResponse {
-    /// The version block.
-    pub version: VersionBody,
-}
-
-/// Response of `GET /api/v1/deployment/environments`.
-#[derive(Debug, Serialize)]
-pub struct EnvironmentsResponse {
-    /// One card per environment.
-    pub environments: Vec<EnvironmentCardBody>,
-    /// The version summary every card's offers were computed from.
-    pub summary: VersionSummary,
-}
-
-/// Response of `GET /api/v1/deployment/environments/{id}`.
-#[derive(Debug, Serialize)]
-pub struct EnvironmentDetailResponse {
-    /// The card.
-    pub environment: EnvironmentCardBody,
-    /// The last ten jobs, newest first, for the detail's history strip.
-    pub history: Vec<HistoryRowBody>,
-}
-
-/// Response of `GET /api/v1/deployment/releases`.
-#[derive(Debug, Serialize)]
-pub struct ReleasesResponse {
-    /// The channel these releases are on.
-    pub channel: String,
-    /// The releases, newest first.
-    pub releases: Vec<ReleaseBody>,
-    /// The banner, when the cache is not current.
-    pub stale_banner: Option<String>,
-    /// `true` when the channel is genuinely empty, so the panel can say "no releases for this
-    /// channel" rather than rendering a zero-height table.
-    pub empty: bool,
-}
-
-/// One release, as the list and the detail read it.
-#[derive(Debug, Serialize)]
-pub struct ReleaseBody {
-    /// The version string.
-    pub version: String,
-    /// The channel.
-    pub channel: String,
-    /// The feed's own release date, unparsed and un-reformatted.
-    pub released_at: Option<String>,
-    /// The notes, already plain text.
-    pub notes: String,
-    /// Whether the notes declare breaking changes.
-    pub breaking: bool,
-    /// The migrations this release ships, in run order.
-    pub migrations: Vec<String>,
-    /// The oldest core that can run it.
-    pub core_min: Option<String>,
-    /// The artifact digest.
-    pub artifact_checksum: Option<String>,
-    /// When this row was last refreshed from the feed.
-    pub checked_at: OffsetDateTime,
-    /// Whether this is the version the card is offering.
-    pub is_available: bool,
-}
-
-/// Response of `GET /api/v1/deployment/releases/{version}`.
-#[derive(Debug, Serialize)]
-pub struct ReleaseDetailResponse {
-    /// The release.
-    pub release: ReleaseBody,
-    /// The version block, so the detail can show "you are on X, this is Y" without a second
-    /// request and without the panel guessing.
-    pub summary: VersionSummary,
-    /// The plain-text statement of what a deploy would do, for the wizard's second step.
-    /// `None` when the release is not an upgrade — deploying *to* the running version is a
-    /// no-op and the panel must not offer it.
-    pub upgrade_from: Option<String>,
-}
-
-/// One history row.
+/// Map a store refusal onto the HTTP shape.
 ///
-/// `Clone` because a card's footer line reuses the newest matching row out of the same page the
-/// detail screen returns, and a hand-written rebuild of it would be a second place where the
-/// row's fields are listed.
-#[derive(Debug, Clone, Serialize)]
-pub struct HistoryRowBody {
-    /// Primary key.
-    pub id: Uuid,
-    /// The environment.
-    pub environment: String,
-    /// `deploy`, `rollback` or `restart`.
-    pub kind: String,
-    /// Where it came from.
-    pub from_version: Option<String>,
-    /// Where it went.
-    pub to_version: Option<String>,
-    /// The status.
-    pub status: String,
-    /// The strategy.
-    pub strategy: String,
-    /// Who started it.
-    pub started_by: Option<Uuid>,
-    /// The reason, for a rollback.
-    pub reason: Option<String>,
-    /// The error, verbatim.
-    pub error: Option<String>,
-    /// When it started.
-    pub started_at: OffsetDateTime,
-    /// When it finished.
-    pub finished_at: Option<OffsetDateTime>,
-    /// How long it took.
-    pub duration_ms: Option<i32>,
-    /// The steps, when the row is expanded.
-    pub steps: Vec<StepBody>,
+/// The mapping is per-variant rather than a blanket `500`, because a refusal an operator can fix
+/// (an unknown topology, a downgrade, a version that is not a version) is a `400` with a message
+/// that names what to change, and a blanket `500` would tell a form to report "internal error"
+/// for a field it got wrong.
+fn deployment_error(error: omnion_deployment::DeploymentError) -> ApiError {
+    use omnion_deployment::DeploymentError as E;
+    match error {
+        E::InvalidVersion { .. } => ApiError::bad_request("invalid_version", error.to_string()),
+        E::NotAnUpgrade(message) => ApiError::bad_request("not_an_upgrade", message),
+        E::UnknownVocabulary(message) => {
+            ApiError::bad_request("invalid_deployment_request", message)
+        }
+        E::Conflict(message) => ApiError::new(StatusCode::CONFLICT, "deployment_conflict", message),
+        E::NotFound { what, id } => ApiError::not_found(what, id),
+        E::Store(inner) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "deployment_error",
+            format!("the deployment store could not be read: {inner}"),
+        ),
+    }
 }
 
-/// One step of a deployment.
-#[derive(Debug, Clone, Serialize)]
-pub struct StepBody {
-    /// Position in the run.
-    pub position: i32,
-    /// The step's name.
-    pub name: String,
-    /// Its status.
-    pub status: String,
-    /// Its log output, so far.
-    pub output: String,
-    /// When it started.
-    pub started_at: Option<OffsetDateTime>,
-    /// When it finished.
-    pub finished_at: Option<OffsetDateTime>,
+fn not_found(code: &'static str, message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, code, message.into())
 }
 
-/// Response of `GET /api/v1/deployment/history`.
-#[derive(Debug, Serialize)]
-pub struct HistoryResponse {
-    /// The page, newest first.
-    pub rows: Vec<HistoryRowBody>,
-    /// How many match the filter in total.
-    pub total: i64,
-    /// What the filter is, echoed — the panel's chips and the request's URL can disagree after a
-    /// back-navigation, and the panel reads the answer from here rather than from its own state.
-    pub filter: HistoryFilterBody,
+// -------------------------------------------------------------------------------------------
+// GET /deployment/artifacts
+// -------------------------------------------------------------------------------------------
+
+/// The artifacts query string.
+#[derive(Debug, Default, Deserialize)]
+pub struct ArtifactQuery {
+    /// Only the artifacts of this release.
+    pub version: Option<String>,
+    /// How many rows.
+    pub limit: Option<i64>,
 }
 
-/// The applied filter, for the chips.
-#[derive(Debug, Serialize)]
-pub struct HistoryFilterBody {
-    /// Environment, when one was applied.
-    pub environment: Option<String>,
-    /// Kind, when one was applied.
-    pub kind: Option<String>,
-    /// Status, when one was applied.
-    pub status: Option<String>,
-    /// The window label the operator chose (`7d`, `30d`, `90d` or `all`).
-    pub window: String,
-}
-
-/// Response of `GET /api/v1/deployment/checks`.
-#[derive(Debug, Serialize)]
-pub struct ChecksResponse {
-    /// The channel this installation follows.
-    pub channel: String,
-    /// When the last check started.
-    pub last_run_at: Option<OffsetDateTime>,
-    /// When it finished.
-    pub last_finished_at: Option<OffsetDateTime>,
-    /// `completed`, `failed`, or `null` when nothing has run.
-    pub last_status: Option<String>,
-    /// The failure reason, verbatim, when the last run failed.
-    pub last_error: Option<String>,
-    /// How many releases the last successful read carried.
-    pub last_seen: Option<i32>,
-    /// What the last successful run announced. Empty on a run that announced nothing, which
-    /// is the common case and must not read as a failure.
-    pub last_announced: Vec<String>,
-    /// The banner, when the cache is not current.
-    pub stale_banner: Option<String>,
-    /// When the next scheduled check is due.
-    pub next_run_at: Option<OffsetDateTime>,
-    /// Whether a check is due now — the runner's own `last_run_at` plus the interval, so the
-    /// screen does not have to know the interval to say "in 4 minutes".
-    pub due_in_seconds: Option<i64>,
-    /// How many (channel, version) pairs this instance has already announced.
-    pub announced_total: i64,
-    /// The checks rendered as rows, reusing the wizard's vocabulary so the screen has one way of
-    /// saying "this passed" rather than two.
-    pub rows: Vec<CheckOutcome>,
-}
-
-/// Response of `POST /api/v1/deployment/checks/run`.
-#[derive(Debug, Serialize)]
-pub struct RunCheckResponse {
-    /// The check's result.
-    pub result: CheckResult,
-    /// The card's answer after the check, which may have changed.
-    pub summary: VersionSummary,
-    /// What the run announced, after the dedupe.
-    pub announced: Vec<String>,
-    /// The check row as it now stands.
-    pub checks: ChecksResponse,
-}
-
-// ---------------------------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------------------------
-
-/// `GET /api/v1/deployment/version` — the build metadata, also read by the shell footer.
-pub async fn get_version(
+/// `GET /deployment/artifacts` — the artifact list, newest release first.
+///
+/// The response carries the **kinds a release did not publish** as an explicit list, because the
+/// request asks for "not published for this version" rows rather than blanks, and a client that
+/// computed the missing set from the kinds it received would invent a gap for a kind the release
+/// never claimed to ship.
+pub async fn list_artifacts(
     State(state): State<AppState>,
-    current: CurrentSession,
-) -> Result<Json<VersionResponse>, ApiError> {
-    let _ = current;
-    let pool = state.db().pool();
-    let check = store::load_check(pool).await?;
-    let channel = check.channel;
-    let summary = summary(pool, channel).await?;
+    session: CurrentSession,
+    Query(query): Query<ArtifactQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let artifacts = store::list_artifacts(
+        state.db().pool(),
+        query.version.as_deref(),
+        query.limit.unwrap_or(500),
+    )
+    .await
+    .map_err(deployment_error)?;
+    let manifests = store::list_manifests(state.db().pool(), 50)
+        .await
+        .map_err(deployment_error)?;
 
-    let current_release = Release::minimal(env!("CARGO_PKG_VERSION"), channel);
-    let version = VersionBody {
-        version: current_release.version.to_string(),
-        service: env!("CARGO_PKG_NAME").to_string(),
-        channel: channel.as_str().to_string(),
-        channel_understood: Channel::parse(&channel.as_str()) == Some(channel),
-        core: core_version().map(|core| core.to_string()),
-        available: summary.available.clone(),
-        availability: summary.availability.clone(),
-        upgrade_available: summary.availability.is_actionable(),
-    };
-    Ok(Json(VersionResponse { version }))
-}
-
-/// `GET /api/v1/deployment/environments` — the cards.
-pub async fn list_environments(
-    State(state): State<AppState>,
-    current: CurrentSession,
-) -> Result<Json<EnvironmentsResponse>, ApiError> {
-    let _ = current;
-    let pool = state.db().pool();
-    let check = store::load_check(pool).await?;
-    let channel = check.channel;
-    let summary = summary(pool, channel).await?;
-
-    let health = store::list_health(pool).await?;
-    let history = recent_history(pool, 10).await?;
-    let environments = health
+    // Per-version coverage, computed server-side from the rows that exist.
+    let mut coverage: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for artifact in &artifacts {
+        let entry = coverage.entry(artifact.version.clone()).or_default();
+        if !entry.contains(&artifact.kind) {
+            entry.push(artifact.kind.clone());
+        }
+    }
+    let versions: Vec<Value> = manifests
         .iter()
-        .map(|row| card(row, &summary, &history, channel))
+        .map(|manifest| {
+            let published = coverage.get(&manifest.version).cloned().unwrap_or_default();
+            let missing: Vec<&str> = ARTIFACT_KINDS
+                .iter()
+                .copied()
+                .filter(|kind| !published.iter().any(|p| p == kind))
+                .collect();
+            json!({
+                "version": manifest.version,
+                "channel": manifest.channel,
+                "source_commit": manifest.source_commit,
+                "core_min": manifest.core_min,
+                "fetched_at": manifest.fetched_at,
+                "migration_count": manifest.migrations.len(),
+                "migrations_destructive": manifest.migrations_destructive,
+                "published_kinds": published,
+                "missing_kinds": missing,
+            })
+        })
         .collect();
 
-    Ok(Json(EnvironmentsResponse {
-        environments,
-        summary,
-    }))
+    let _ = session;
+    Ok(Json(json!({
+        "artifacts": artifacts,
+        "releases": versions,
+        "artifact_kinds": ARTIFACT_KINDS,
+        "total": artifacts.len(),
+    })))
 }
 
-/// `GET /api/v1/deployment/environments/{id}` — one card with its history.
+// -------------------------------------------------------------------------------------------
+// GET /deployment/artifacts/{version}
+// -------------------------------------------------------------------------------------------
+
+/// `GET /deployment/artifacts/{version}` — one release in full.
 ///
-/// The path segment is the environment's **name** (`production`, `staging`, `sandbox`) rather
-/// than a uuid: `environment_health`'s primary key is the name, the card is reached from the
-/// list by name, and a uuid here would mean the panel cannot build the link from the list it
-/// already has.
-pub async fn get_environment(
+/// A version nobody has cached is a normal answer, not a `404` with a stack of text: the screen's
+/// "no releases cached yet" empty state and its "that version is not cached" answer are
+/// different sentences about different operator actions, and this returns the second.
+pub async fn read_release(
     State(state): State<AppState>,
-    current: CurrentSession,
-    Path(environment): Path<String>,
-) -> Result<Json<EnvironmentDetailResponse>, ApiError> {
-    let _ = current;
-    let pool = state.db().pool();
-    let check = store::load_check(pool).await?;
-    let channel = check.channel;
-    let summary = summary(pool, channel).await?;
-
-    let health = store::list_health(pool).await?;
-    let row = health
-        .iter()
-        .find(|row| row.environment == environment)
-        .ok_or_else(|| not_found_environment(&environment))?;
-    let history = recent_history(pool, 10).await?;
-
-    Ok(Json(EnvironmentDetailResponse {
-        environment: card(row, &summary, &history, channel),
-        history,
-    }))
-}
-
-/// `GET /api/v1/deployment/releases` — the channel-filtered release browser.
-pub async fn list_releases(
-    State(state): State<AppState>,
-    current: CurrentSession,
-    Query(query): Query<ReleaseListQuery>,
-) -> Result<Json<ReleasesResponse>, ApiError> {
-    let _ = current;
-    let pool = state.db().pool();
-    let check = store::load_check(pool).await?;
-    let summary = summary(pool, check.channel).await?;
-
-    // `?channel=` may only **narrow**. A request for `nightly` on a stable installation is
-    // answered with the stable list plus the reason, not with the nightly rows: the release
-    // browser is a place to *read about* other channels, and the card's offer is a separate
-    // decision that `availability` already made.
-    let (channel, refused) = match query.channel.as_deref().map(str::trim) {
-        None | Some("") => (check.channel, None),
-        Some(raw) => match Channel::parse(raw) {
-            Some(requested) if requested == check.channel => (requested, None),
-            Some(other) => (
-                check.channel,
-                Some(format!(
-                    "this installation follows the {} channel, so the {} list is not shown here",
-                    check.channel.as_str(),
-                    other.as_str()
-                )),
-            ),
-            None => {
-                return Err(ApiError::bad_request(
-                    "deployment_channel_unknown",
-                    format!("“{raw}” is not a release channel. Choose stable, beta or nightly."),
-                )
-                .with_details(json!({ "channels": ["stable", "beta", "nightly"] })));
-            }
-        },
-    };
-
-    let rows = store::list_releases(
-        pool,
-        channel,
-        query.limit.unwrap_or(store::HistoryFilter::DEFAULT_LIMIT),
-    )
-    .await?;
-    let releases = rows
-        .iter()
-        .map(|row| release_body(row, &summary.availability))
-        .collect::<Vec<_>>();
-
-    let response = ReleasesResponse {
-        channel: channel.as_str().to_string(),
-        releases,
-        stale_banner: summary.stale_banner.clone(),
-        empty: rows.is_empty(),
-    };
-    if let Some(reason) = refused {
-        // The refusal rides on the response rather than becoming a `403`, because the caller is
-        // allowed to ask: it is a *narrowing* rule, not a permission, and a 403 would read as
-        // "you may not look at releases" when releases are exactly what they may look at.
-        tracing::debug!(reason = %reason, "deployment: a release list was refused a channel change");
-    }
-    Ok(Json(response))
-}
-
-/// `GET /api/v1/deployment/releases/{version}` — `View Changes`.
-pub async fn get_release(
-    State(state): State<AppState>,
-    current: CurrentSession,
+    _session: CurrentSession,
     Path(version): Path<String>,
-    Query(query): Query<ChannelQuery>,
-) -> Result<Json<ReleaseDetailResponse>, ApiError> {
-    let _ = current;
-    let pool = state.db().pool();
-    let check = store::load_check(pool).await?;
-    let channel = query
-        .channel
-        .as_deref()
-        .and_then(Channel::parse)
-        .unwrap_or(check.channel);
-    let summary = summary(pool, check.channel).await?;
-
-    let row = store::load_release(pool, channel, &version)
+) -> Result<impl IntoResponse, ApiError> {
+    let manifest: ReleaseManifest = store::find_manifest(state.db().pool(), &version)
         .await
-        .map_err(|error| release_lookup_error(error, &version, channel))?;
-    let body = release_body(&row, &summary.availability);
+        .map_err(deployment_error)?
+        .ok_or_else(|| {
+            not_found(
+                "release_not_cached",
+                format!(
+                    "no release manifest for {version} is cached — run an update check to fetch one"
+                ),
+            )
+        })?;
+    let artifacts = store::list_artifacts(state.db().pool(), Some(&version), 1000)
+        .await
+        .map_err(deployment_error)?;
+    let coverage = store::artifact_kind_coverage(state.db().pool(), &version)
+        .await
+        .map_err(deployment_error)?;
+    let published: Vec<String> = coverage.iter().map(|(kind, _)| kind.clone()).collect();
+    let missing: Vec<&str> = ARTIFACT_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| !published.iter().any(|p| p == kind))
+        .collect();
 
-    // `upgrade_from` is `Some` only when this release really is the card's offer. A detail page
-    // for an *older* version is a legitimate thing to open (that is what an operator does before
-    // a rollback), and it must not offer to deploy to what is already running.
-    let upgrade_from = match &summary.availability {
-        Availability::Upgrade {
-            version: offered, ..
-        } if offered == &body.version => Some(summary.current.clone()),
-        _ => None,
-    };
-
-    Ok(Json(ReleaseDetailResponse {
-        release: body,
-        summary,
-        upgrade_from,
-    }))
+    Ok(Json(json!({
+        "release": manifest,
+        "artifacts": artifacts,
+        "published_kinds": published,
+        "missing_kinds": missing,
+        // The core minimum is answered against THIS instance's build, so the screen can say
+        // "this release needs 0.5.0 and you run 0.4.0" rather than making the reader do the
+        // comparison against a number in a different card.
+        "core_minimum_satisfied": manifest.satisfies_core_minimum(state.build().version),
+    })))
 }
 
-/// `GET /api/v1/deployment/history` — the deploy/rollback/restart list.
-pub async fn list_history(
+// -------------------------------------------------------------------------------------------
+// Bundles
+// -------------------------------------------------------------------------------------------
+
+/// `GET /deployment/bundles` — the bundles generated for this instance.
+pub async fn list_bundles(
     State(state): State<AppState>,
-    current: CurrentSession,
-    Query(query): Query<HistoryQuery>,
-) -> Result<Json<HistoryResponse>, ApiError> {
-    let _ = current;
-    let pool = state.db().pool();
-
-    let mut filter = HistoryFilter::with_defaults();
-    filter.environment = query
-        .environment
-        .as_deref()
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty())
-        .map(str::to_string);
-    filter.kind = query
-        .kind
-        .as_deref()
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty())
-        .map(str::to_string);
-    filter.status = query
-        .status
-        .as_deref()
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty())
-        .map(str::to_string);
-    let (since, window_label) = window_to_instant(query.window.as_deref())?;
-    filter.since = since;
-    if let Some(limit) = query.limit {
-        filter.limit = limit;
-    }
-    if let Some(offset) = query.offset {
-        filter.offset = offset;
-    }
-
-    let (rows, total) = store::list_history(pool, &filter).await?;
-
-    // Steps are loaded for the page, not for the whole history: the expansion is a click, and
-    // a history page of fifty rows with four steps each is two hundred reads for a screen that
-    // shows two of them expanded. `slice(0, HISTORY_STEP_ROWS)` keeps the first page's cost
-    // bounded and the response small; the wizard's live log is the route for a running job.
-    let mut bodies = Vec::with_capacity(rows.len());
-    for row in rows.iter().take(HISTORY_STEP_ROWS) {
-        let steps = store::list_steps(pool, row.id).await?;
-        bodies.push(history_body(row, steps));
-    }
-
-    Ok(Json(HistoryResponse {
-        rows: bodies,
-        total,
-        filter: HistoryFilterBody {
-            environment: filter.environment,
-            kind: filter.kind,
-            status: filter.status,
-            window: window_label,
-        },
-    }))
+    _session: CurrentSession,
+) -> Result<impl IntoResponse, ApiError> {
+    let bundles = store::list_bundles(state.db().pool(), 200)
+        .await
+        .map_err(deployment_error)?;
+    let rendered: Vec<Value> = bundles
+        .iter()
+        .map(|bundle| {
+            let files = store::bundle_files(&bundle.files);
+            json!({
+                "id": bundle.id,
+                "name": bundle.name,
+                "kind": bundle.kind,
+                "version": bundle.version,
+                "config": bundle.config,
+                "checksum": bundle.checksum,
+                "files": files,
+                "commands": apply_commands(&bundle.kind, &bundle.name),
+                "generated_by": bundle.generated_by,
+                "generated_at": bundle.generated_at,
+                "download_count": bundle.download_count,
+                "last_downloaded_at": bundle.last_downloaded_at,
+            })
+        })
+        .collect();
+    Ok(Json(
+        json!({ "bundles": rendered, "total": rendered.len() }),
+    ))
 }
 
-/// `GET /api/v1/deployment/checks` — the update check's own state.
-pub async fn get_checks(
-    State(state): State<AppState>,
-    current: CurrentSession,
-) -> Result<Json<ChecksResponse>, ApiError> {
-    let _ = current;
-    let pool = state.db().pool();
-    Ok(Json(checks_body(pool).await?))
-}
-
-/// `POST /api/v1/deployment/checks/run` — check now, and answer with *this* run's result.
+/// `POST /deployment/bundles` — generate a bundle for a target.
 ///
-/// Synchronous on purpose. The alternative returns `202` and the panel polls, which is honest
-/// but useless for the actual use: an operator presses this immediately before a deploy and
-/// needs the answer before the wizard's pre-flight, not a spinner and a re-poll.
-pub async fn run_check_now(
+/// The generator is the pipeline's own module (`release/lib/bundle.py`), invoked as a
+/// subprocess: a second implementation in Rust would be a second answer to "what does this
+/// bundle contain", and the two would agree on the day they were written.
+pub async fn create_bundle(
     State(state): State<AppState>,
-    current: CurrentSession,
-) -> Result<Json<RunCheckResponse>, ApiError> {
-    let pool = state.db().pool();
-    let check = store::load_check(pool).await?;
-    let outcome = crate::deployment_check::check_once(pool, check.channel).await?;
-    let refreshed = checks_body(pool).await?;
+    session: CurrentSession,
+    Json(request): Json<BundleRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    // The record is built by the platform, so the refusal for a bad field arrives before any
+    // subprocess runs.
+    let record = request.to_record().map_err(deployment_error)?;
+    let files = generate_bundle_files(&request).map_err(|message| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bundle_generator_unavailable",
+            message,
+        )
+    })?;
+    let checksum = bundle_checksum(&files);
+
+    let bundle = store::insert_bundle(
+        state.db().pool(),
+        &request.name,
+        &request.kind,
+        &request.version,
+        &record,
+        &files,
+        &checksum,
+        Some(session.user.id),
+    )
+    .await
+    .map_err(deployment_error)?;
 
     omnion_audit::record(
-        pool,
-        omnion_audit::NewAuditEntry::by_user(current.user.id, "deployment.check.requested")
-            .target("deployment", "update-check")
+        state.db().pool(),
+        NewAuditEntry::by_user(session.user.id, "deployment.bundle.generated")
+            .organization(session.user.organization_id)
+            .target("environment_bundle", bundle.id.to_string())
             .metadata(json!({
-                "channel": check.channel.as_str(),
-                "announced": outcome.announced,
-                "result": outcome.result,
+                "name": bundle.name,
+                "kind": bundle.kind,
+                "version": bundle.version,
+                "file_count": store::bundle_files(&files).len(),
             })),
     )
-    .await?;
+    .await;
 
-    let summary = summary(pool, check.channel).await?;
-    Ok(Json(RunCheckResponse {
-        result: outcome.result,
-        summary,
-        announced: outcome.announced,
-        checks: refreshed,
-    }))
-}
-
-/// How many history rows carry their steps inline.
-const HISTORY_STEP_ROWS: usize = 20;
-
-// ---------------------------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------------------------
-
-/// The card's answer, computed from the cache.
-async fn summary(pool: &sqlx::PgPool, channel: Channel) -> Result<VersionSummary, ApiError> {
-    let check = store::load_check(pool).await?;
-    let current_release = Release::minimal(env!("CARGO_PKG_VERSION"), channel);
-    let rows = store::list_releases(pool, channel, RELEASE_SCAN_LIMIT).await?;
-    let releases: Vec<Release> = rows
-        .iter()
-        .filter_map(store::ReleaseRow::to_release)
-        .collect();
-    let core = core_version();
-    let availability = omnion_deployment::availability(&current_release, core.as_ref(), &releases);
-
-    let cached_at = store::newest_checked_at(pool).await?;
-    let stale_banner = if check.is_stale() {
-        let stamp = cached_at.map_or_else(
-            || "a check that has never run".to_string(),
-            |at| format_time(&at),
-        );
-        let reason = check
-            .last_error
-            .as_deref()
-            .unwrap_or("no successful check yet");
-        Some(stale_banner(reason, &stamp))
-    } else {
-        None
-    };
-
-    Ok(VersionSummary {
-        current: current_release.version.to_string(),
-        available: availability.label(),
-        availability,
-        stale_banner,
-    })
-}
-
-/// How many cached releases the availability scan looks at.
-///
-/// Bounded so a feed that has published a thousand nightlies cannot make every page load read a
-/// thousand rows; the scan only ever needs the newest handful to decide what to offer.
-const RELEASE_SCAN_LIMIT: i64 = 100;
-
-/// The core version this build reports, if it does.
-///
-/// `None` rather than a guess: `availability` treats an unknown core as "cannot prove
-/// incompatible", which is the safe direction (it offers the release, and the pre-flight check
-/// is where an incompatibility must be caught).
-fn core_version() -> Option<Version> {
-    // The workspace version is the core's version; an API built from a different core reports a
-    // different one, and the card's "needs core X or newer" reason depends on this being the
-    // *core* and not the service.
-    Version::parse(env!("CARGO_PKG_VERSION")).ok()
-}
-
-/// One card, from a health row.
-fn card(
-    row: &HealthRow,
-    summary: &VersionSummary,
-    history: &[HistoryRowBody],
-    channel: Channel,
-) -> EnvironmentCardBody {
-    // The offer is computed per environment from the version *running there*, not from the
-    // installation's own version: a staging copy pinned two versions behind production has its
-    // own answer, and showing it production's would be a lie on a card whose whole job is to
-    // tell an operator what that environment is running.
-    let available = if row.version == summary.current {
-        summary.availability.clone()
-    } else {
-        let running = Release::minimal(&row.version, channel);
-        let releases = summary_releases_for(row, channel);
-        omnion_deployment::availability(&running, core_version().as_ref(), &releases)
-    };
-
-    let failing_probe = failing_probe(&row.details);
-    let reachable = row.status != "unreachable";
-    let last_deploy = history
-        .iter()
-        .find(|entry| entry.environment == row.environment)
-        .cloned();
-
-    // Rollback needs a *previous* version to go to. A job that has never run, or one that has
-    // only ever deployed once, has no "previous known-good" — and offering a rollback to nothing
-    // is a button that fails at the moment of the worst possible attention.
-    // The rollback target is *read* from the last deploy's `from_version`, not taken from it:
-    // consuming the row here would leave the card's footer line (actor + time) with nothing to
-    // print, which is the one line that tells an operator how old the card is. `Option::and_then`
-    // on a non-`Copy` value moves it, and the move is invisible until the footer renders blank.
-    let rollback = last_deploy.as_ref().and_then(|entry| {
-        let target = entry.from_version.as_ref()?;
-        if target.trim().is_empty() {
-            return None;
-        }
-        Some(RollbackBody {
-            to_version: target.clone(),
-            known: false,
-        })
-    });
-
-    let (deployable, blocked_reason) = if !reachable {
-        (
-            false,
-            Some("this environment did not answer the last health probe".to_string()),
+    // `deployment.bundle.generated` is one of the two events the request names as the ones an
+    // operator watching a fleet of installs subscribes to. The payload carries the name, the
+    // kind and the checksum — never a file body, because this event lands in every webhook the
+    // platform writes.
+    if let Some(org) = session.user.organization_id {
+        if let Err(error) = bus::emit(
+            state.db().pool(),
+            NewEvent::new("deployment.bundle.generated")
+                .organization(org)
+                .actor(session.user.id)
+                .payload(json!({
+                    "bundle_id": bundle.id,
+                    "name": bundle.name,
+                    "kind": bundle.kind,
+                    "version": bundle.version,
+                    "checksum": bundle.checksum,
+                })),
         )
-    } else if !available.is_actionable() {
-        (false, Some(available.label()))
+        .await
+        {
+            // A failed event must not fail the generation: the bundle is on disk either way, and
+            // an operator whose bundle did not appear has no way to act on a webhook failure.
+            tracing::warn!(error = %error, "the bundle.generated event could not be published");
+        }
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": bundle.id,
+            "name": bundle.name,
+            "kind": bundle.kind,
+            "version": bundle.version,
+            "config": bundle.config,
+            "checksum": bundle.checksum,
+            "files": store::bundle_files(&files),
+            "commands": apply_commands(&request.kind, &request.name),
+            "note": "generated files reference secrets by name; no credential value ships in them",
+        })),
+    ))
+}
+
+/// `GET /deployment/bundles/{id}` — one bundle's metadata and file list.
+pub async fn read_bundle(
+    State(state): State<AppState>,
+    _session: CurrentSession,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let bundle = store::find_bundle(state.db().pool(), id)
+        .await
+        .map_err(deployment_error)?
+        .ok_or_else(|| Deployment_not_found(id))?;
+    let files = store::bundle_files(&bundle.files);
+    Ok(Json(json!({
+        "id": bundle.id,
+        "name": bundle.name,
+        "kind": bundle.kind,
+        "version": bundle.version,
+        "config": bundle.config,
+        "checksum": bundle.checksum,
+        "files": files,
+        "commands": apply_commands(&bundle.kind, &bundle.name),
+        "generated_at": bundle.generated_at,
+        "download_count": bundle.download_count,
+        "last_downloaded_at": bundle.last_downloaded_at,
+    })))
+}
+
+fn Deployment_not_found(id: Uuid) -> ApiError {
+    not_found("bundle_not_found", format!("no environment bundle {id}"))
+}
+
+/// `GET /deployment/bundles/{id}/files/{name}` — download one generated file.
+///
+/// The file NAME is a value in the stored list, never a path built from the request: a download
+/// that joins the request onto a directory is a traversal, and a bundle's own file list is the
+/// only set of names this endpoint will serve.
+pub async fn download_bundle_file(
+    State(state): State<AppState>,
+    _session: CurrentSession,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let bundle = store::find_bundle(state.db().pool(), id)
+        .await
+        .map_err(deployment_error)?
+        .ok_or_else(|| Deployment_not_found(id))?;
+    let entry = bundle
+        .files
+        .get("files")
+        .and_then(|files| files.get(&name))
+        .ok_or_else(|| {
+            not_found(
+                "bundle_file_not_found",
+                format!("the bundle {id} has no file named {name}"),
+            )
+        })?;
+    let content = entry
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "bundle_file_unavailable",
+                format!(
+                    "the bundle {id} was generated without the body of {name}; regenerate it to \
+                     download the file"
+                ),
+            )
+        })?;
+
+    let bundle = store::record_bundle_download(state.db().pool(), id)
+        .await
+        .map_err(deployment_error)?;
+
+    // The file name is a value from the bundle's own file list, so the only thing that could be
+    // unsafe in the header is a quote in it — stripped rather than escaped, because a bundle's
+    // file names are `[a-z0-9._-]` by construction and a name with a quote in it is not one this
+    // endpoint should be serving.
+    let filename = name.replace('"', "");
+    let checksum = entry
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let content_type = if name.ends_with(".json") {
+        "application/json"
+    } else if name.ends_with(".md") {
+        "text/markdown; charset=utf-8"
     } else {
-        (true, None)
+        "text/yaml; charset=utf-8"
+    };
+    // An array literal takes its element type from the FIRST tuple, so mixing a `&'static str`
+    // and two `String`s would coerce all three to `&str` and refuse to compile. Building the
+    // headers as a `HeaderMap` states the intent in one type instead of three conversions.
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(content_type),
+    );
+    // The checksum beside the file, in a header a script can read, so a download can be verified
+    // without a second round trip to the panel.
+    if let Ok(value) = axum::http::HeaderValue::from_str(&checksum) {
+        headers.insert(
+            axum::http::HeaderName::from_static("x-checksum-sha256"),
+            value,
+        );
+    }
+    // A file name with a quote in it would end the header early; the bundle's own file list
+    // never produces one, and stripping is the conservative direction.
+    if let Ok(value) =
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+    {
+        headers.insert(axum::http::header::CONTENT_DISPOSITION, value);
+    }
+    Ok((StatusCode::OK, headers, content.to_owned()))
+}
+
+/// `POST /deployment/bundles/{id}/render` — a server-side render of what the bundle produces.
+///
+/// The request asks for "a dry `docker compose config` and `helm template` view of what was
+/// produced". Both tools are on a **build** box and not on an installed panel, so this answers the
+/// part an installed panel can answer honestly: the values and the file list, with a stated
+/// reason when a real render is not possible from here. A route that answered `501` for every
+/// bundle would be a dead button; one that says *why* is the screen's own sentence.
+pub async fn render_bundle(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let bundle = store::find_bundle(state.db().pool(), id)
+        .await
+        .map_err(deployment_error)?
+        .ok_or_else(|| Deployment_not_found(id))?;
+    let files = store::bundle_files(&bundle.files);
+
+    let tool = match bundle.kind.as_str() {
+        "helm" => "helm template",
+        _ => "docker compose config",
+    };
+    // Rendering a generated file on an installed panel is a claim about a tool this host may not
+    // have, so the refusal is explicit and names the command the operator can run themselves.
+    let renderable = false;
+    let reason = format!(
+        "{tool} runs on a build host, not on an installed panel; the generated files below are the \
+         input it would read, and the command to run is in this response"
+    );
+
+    let _ = session;
+    Ok(Json(json!({
+        "bundle_id": bundle.id,
+        "kind": bundle.kind,
+        "tool": tool,
+        "renderable": renderable,
+        "reason": reason,
+        "files": files,
+        "commands": apply_commands(&bundle.kind, &bundle.name),
+        "config": bundle.config,
+    })))
+}
+
+// -------------------------------------------------------------------------------------------
+// The upgrade plan
+// -------------------------------------------------------------------------------------------
+
+/// The upgrade query string.
+#[derive(Debug, Default, Deserialize)]
+pub struct UpgradeQuery {
+    /// The target version, defaulting to the newest cached release of the channel.
+    pub to: Option<String>,
+    /// `stable`, `beta` or `edge`.
+    pub channel: Option<String>,
+    /// `compose` or `kubernetes`.
+    pub topology: Option<String>,
+    /// The compose stack, on the compose topology.
+    pub bundle_kind: Option<String>,
+}
+
+/// `GET /deployment/upgrade-plan` — the ordered steps from the running version to a target.
+///
+/// The version this install runs comes from the **build**, never from the cache: an install whose
+/// cache has been pruned must still be able to plan the upgrade off the version it is on, and a
+/// plan that cannot name its own current version is a plan the screen cannot offer.
+pub async fn read_upgrade_plan(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Query(query): Query<UpgradeQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let channel = query.channel.as_deref().unwrap_or("stable");
+    if !omnion_deployment::manifest::CHANNELS.contains(&channel) {
+        return Err(ApiError::bad_request(
+            "invalid_deployment_request",
+            format!(
+                "{channel:?} is not a release channel; expected one of {}",
+                omnion_deployment::manifest::CHANNELS.join(", ")
+            ),
+        ));
+    }
+    let topology = query.topology.as_deref().unwrap_or("compose");
+    let bundle_kind = query.bundle_kind.as_deref().unwrap_or("compose-small");
+
+    let summary = upgrade::prepare(
+        state.db().pool(),
+        state.build().version,
+        query.to.as_deref(),
+        channel,
+        topology,
+        bundle_kind,
+        Some(session.user.id),
+    )
+    .await
+    .map_err(deployment_error)?;
+
+    // The plan is created on every read, so the event fires when a plan is generated rather than
+    // when one is stored for the first time — which is the fact an operator subscribing to a
+    // fleet of installs wants ("this install is now planning an upgrade to X").
+    if let Some(plan) = &summary.plan {
+        if let Some(org) = session.user.organization_id {
+            let _ = bus::emit(
+                state.db().pool(),
+                NewEvent::new("deployment.upgrade_plan.created")
+                    .organization(org)
+                    .actor(session.user.id)
+                    .payload(json!({
+                        "from_version": plan.from_version,
+                        "to_version": plan.to_version,
+                        "topology": plan.topology,
+                        "destructive_verdict": plan.destructive.verdict,
+                        "migrations": plan.migrations_applied.len(),
+                    })),
+            )
+            .await;
+        }
+    }
+
+    // The problems are re-derived here rather than trusted from the store: they are a property of
+    // the plan document plus the target manifest, and the screen's banner reads them.
+    let problems = match (&summary.plan, &summary.target_version) {
+        (Some(plan), Some(version)) => store::find_manifest(state.db().pool(), version)
+            .await
+            .map_err(deployment_error)?
+            .map(|manifest| verify_plan(plan, &manifest))
+            .unwrap_or_default(),
+        _ => Vec::new(),
     };
 
-    EnvironmentCardBody {
-        environment: row.environment.clone(),
-        name: environment_label(&row.environment),
-        health: row.status.clone(),
-        version: Some(row.version.clone()),
-        checked_at: Some(row.checked_at),
-        failing_probe,
-        available: available.label(),
-        availability: available,
-        deployable,
-        blocked_reason,
-        rollback,
-        last_deploy,
-    }
+    Ok(Json(json!({
+        "summary": summary,
+        "problems": problems,
+        "running_version": state.build().version,
+        "channel": channel,
+        "topology": topology,
+    })))
 }
 
-/// The releases a card's own availability scan may consider.
+/// The acknowledgement request.
+#[derive(Debug, Deserialize)]
+pub struct AcknowledgeRequest {
+    /// The verdict the operator accepted, which must be the verdict the plan carries.
+    pub verdict: String,
+}
+
+/// `POST /deployment/upgrade-plan/acknowledge` — record an operator's acceptance.
 ///
-/// Only the cache — a card must not trigger a feed read — and only the installation's channel.
-fn summary_releases_for(row: &HealthRow, channel: Channel) -> Vec<Release> {
-    // The row's own channel is the installation's channel by construction (the health probe and
-    // the check both describe this instance), so this is a no-op today and the seam exists for
-    // the multi-region slice, where an environment reports the channel *it* follows.
-    let _ = (row, channel);
-    Vec::new()
-}
+/// The verdict is required and must match: an acknowledgement that does not say *what* was
+/// accepted is a consent to an unknown, and an endpoint that accepts one teaches every client
+/// that the field is decorative.
+pub async fn acknowledge_upgrade_plan(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Json(request): Json<AcknowledgeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let plan_id: Uuid = request
+        .verdict
+        .split('@')
+        .next()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_deployment_request",
+                "verdict must be `<plan id>@<verdict>`, for example \
+                 `6f1c…@destructive`",
+            )
+        })?;
+    let verdict = request
+        .verdict
+        .split_once('@')
+        .map(|(_, verdict)| verdict.to_owned())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_deployment_request",
+                "verdict must be `<plan id>@<verdict>`",
+            )
+        })?;
 
-/// The label a card shows for an environment.
-fn environment_label(environment: &str) -> String {
-    match environment {
-        "production" => "Production".to_string(),
-        "staging" => "Staging".to_string(),
-        "sandbox" => "Sandbox".to_string(),
-        other => {
-            let mut chars = other.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => other.to_string(),
-            }
-        }
+    let row = store::acknowledge_plan(state.db().pool(), plan_id, &verdict, session.user.id)
+        .await
+        .map_err(deployment_error)?;
+
+    omnion_audit::record(
+        state.db().pool(),
+        NewAuditEntry::by_user(session.user.id, "deployment.upgrade_plan.acknowledged")
+            .organization(session.user.organization_id)
+            .target("upgrade_plan", row.id.to_string())
+            .metadata(json!({
+                "from_version": row.from_version,
+                "to_version": row.to_version,
+                "topology": row.topology,
+                "verdict": verdict,
+            })),
+    )
+    .await;
+
+    if let Some(org) = session.user.organization_id {
+        let _ = bus::emit(
+            state.db().pool(),
+            NewEvent::new("deployment.upgrade_plan.acknowledged")
+                .organization(org)
+                .actor(session.user.id)
+                .payload(json!({
+                    "plan_id": row.id,
+                    "from_version": row.from_version,
+                    "to_version": row.to_version,
+                    "verdict": verdict,
+                })),
+        )
+        .await;
     }
+
+    Ok(Json(json!({
+        "id": row.id,
+        "acknowledged_by": row.destructive_acknowledged_by,
+        "acknowledged_at": row.destructive_acknowledged_at,
+        "verdict": row.destructive_verdict,
+        "from_version": row.from_version,
+        "to_version": row.to_version,
+        "topology": row.topology,
+    })))
 }
 
-/// The probe that failed, out of the health details.
+// -------------------------------------------------------------------------------------------
+// The generator
+// -------------------------------------------------------------------------------------------
+
+/// Run the pipeline's own bundle generator and read its file list back.
 ///
-/// The details object is `{ "<probe>": "<status or message>" }`, and the card's tooltip names the
-/// first probe whose value is not a healthy marker. A details object with nothing recognizable in
-/// it returns `None` rather than a fabricated probe name — the migration already refuses a
-/// `degraded` row with empty details for exactly this reason, and the reader still must not
-/// invent the missing half.
-fn failing_probe(details: &serde_json::Value) -> Option<String> {
-    let object = details.as_object()?;
-    for (probe, value) in object {
-        let text = match value {
-            serde_json::Value::String(text) => text.clone(),
-            other => other.to_string(),
-        };
-        if is_failure(&text) {
-            return Some(format!("{probe}: {text}"));
-        }
-    }
-    None
-}
-
-/// Does this probe value read as a failure?
-fn is_failure(text: &str) -> bool {
-    let lowered = text.to_ascii_lowercase();
-    !lowered.contains("ok")
-        && !lowered.contains("healthy")
-        && !lowered.contains("pass")
-        && !lowered.contains("reachable")
-        && !lowered.contains("connected")
-}
-
-/// One history row plus its steps.
-fn history_body(row: &store::DeploymentRow, steps: Vec<store::StepRow>) -> HistoryRowBody {
-    HistoryRowBody {
-        id: row.id,
-        environment: row.environment.clone(),
-        kind: row.kind.clone(),
-        from_version: row.from_version.clone(),
-        to_version: row.to_version.clone(),
-        status: row.status.clone(),
-        strategy: row.strategy.clone(),
-        started_by: row.started_by,
-        reason: row.reason.clone(),
-        error: row.error.clone(),
-        started_at: row.started_at,
-        finished_at: row.finished_at,
-        duration_ms: row.duration_ms,
-        steps: steps
-            .into_iter()
-            .map(|step| StepBody {
-                position: step.position,
-                name: step.name,
-                status: step.status,
-                output: step.output,
-                started_at: step.started_at,
-                finished_at: step.finished_at,
-            })
-            .collect(),
-    }
-}
-
-/// The newest jobs, for a card's footer and the detail's strip.
-async fn recent_history(pool: &sqlx::PgPool, limit: i64) -> Result<Vec<HistoryRowBody>, ApiError> {
-    let mut filter = HistoryFilter::with_defaults();
-    filter.limit = limit;
-    let (rows, _) = store::list_history(pool, &filter).await?;
-    let mut bodies = Vec::with_capacity(rows.len());
-    for row in &rows {
-        bodies.push(history_body(row, Vec::new()));
-    }
-    Ok(bodies)
-}
-
-/// One release, as the panel reads it.
-fn release_body(row: &store::ReleaseRow, availability: &Availability) -> ReleaseBody {
-    let is_available = matches!(
-        availability,
-        Availability::Upgrade { version, .. } if version == &row.version
-    );
-    ReleaseBody {
-        version: row.version.clone(),
-        channel: row.channel.clone(),
-        released_at: row.released_at.clone(),
-        notes: row.notes_md.clone(),
-        breaking: row.breaking,
-        migrations: row.migrations.clone(),
-        core_min: row.core_min.clone(),
-        artifact_checksum: row.artifact_checksum.clone(),
-        checked_at: row.checked_at,
-        is_available,
-    }
-}
-
-/// The checks screen's body, built from the row plus the cache's own timestamps.
-async fn checks_body(pool: &sqlx::PgPool) -> Result<ChecksResponse, ApiError> {
-    let check = store::load_check(pool).await?;
-    let cached_at = store::newest_checked_at(pool).await?;
-    let announced_total = store::seen_count(pool).await?;
-    let interval = crate::deployment_check::interval_seconds();
-
-    let next_run_at = check
-        .last_run_at
-        .and_then(|at| at.checked_add(time::Duration::seconds(interval)));
-    let due_in_seconds = next_run_at.map(|next| {
-        let now = OffsetDateTime::now_utc();
-        (next - now).whole_seconds().max(0)
+/// The subprocess is the point, not an accident: `release/lib/bundle.py` is the code the release
+/// pipeline ships bundles with, and calling it is what makes "the panel generated this" and "CI
+/// generated this" the same bundle. A Rust re-implementation would be a second generator that
+/// agrees with the first until somebody changes one of them.
+fn generate_bundle_files(request: &BundleRequest) -> std::result::Result<Value, String> {
+    let payload = json!({
+        "name": request.name,
+        "kind": request.kind,
+        "version": request.version,
+        "domain": request.domain,
+        "tls_mode": request.tls_mode,
+        "registry": request.registry,
+        "tag": request.tag,
+        "preset": request.preset,
+        "observability": request.observability,
     });
 
-    let stale_banner = if check.is_stale() {
-        let stamp = cached_at.map_or_else(
-            || "a check that has never run".to_string(),
-            |at| format_time(&at),
-        );
-        let reason = check
-            .last_error
-            .as_deref()
-            .unwrap_or("no successful check yet");
-        Some(stale_banner(reason, &stamp))
-    } else {
-        None
-    };
-
-    let last_seen = check.last_seen.unwrap_or(0);
-    let result = match check.last_status.as_deref() {
-        Some("completed") => CheckResult::Completed {
-            announced: check.last_announced.clone(),
-            seen: last_seen as usize,
-        },
-        Some("failed") => CheckResult::Failed {
-            reason: check
-                .last_error
-                .clone()
-                .unwrap_or_else(|| "the feed could not be read".to_string()),
-        },
-        _ => CheckResult::Failed {
-            reason: "no check has run yet".to_string(),
-        },
-    };
-
-    let rows = manifest::check_rows(
-        &result,
-        check.channel,
-        &next_run_label(next_run_at),
-        &cached_at.map_or_else(|| "never".to_string(), |at| format_time(&at)),
-    );
-
-    Ok(ChecksResponse {
-        channel: check.channel.as_str().to_string(),
-        last_run_at: check.last_run_at,
-        last_finished_at: check.last_finished_at,
-        last_status: check.last_status.clone(),
-        last_error: check.last_error.clone(),
-        last_seen: check.last_seen,
-        last_announced: check.last_announced.clone(),
-        stale_banner,
-        next_run_at,
-        due_in_seconds,
-        announced_total,
-        rows,
+    // Five minutes: the generator is local file work, and a hung subprocess would hold a write
+    // route open for as long as the caller was willing to wait.
+    let mut child = std::process::Command::new("python3")
+        .arg("release/lib/bundle.py")
+        .arg("--json")
+        .current_dir(repo_root())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("the bundle generator could not be started: {error}"))?;
+    {
+        use std::io::Write as _;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "the bundle generator has no stdin".to_owned())?;
+        stdin
+            .write_all(payload.to_string().as_bytes())
+            .map_err(|error| format!("the bundle generator rejected its request: {error}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("the bundle generator could not be waited for: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "the bundle generator refused the request ({}): {}",
+            output.status,
+            stderr.trim().chars().take(400).collect::<String>()
+        ));
+    }
+    serde_json::from_slice::<Value>(&output.stdout).map_err(|error| {
+        format!("the bundle generator produced output this build cannot read: {error}")
     })
 }
 
-/// When the next check is due, in words the row can print.
-fn next_run_label(next: Option<OffsetDateTime>) -> String {
-    next.map_or_else(|| "not scheduled".to_string(), |at| format_time(&at))
+/// The repository root, walked up from the running binary.
+///
+/// The generator is a file in the tree, so an installed panel that does not ship `release/` cannot
+/// run it — and the error says exactly that rather than reporting a generator that "failed".
+fn repo_root() -> std::path::PathBuf {
+    std::env::var("OMNION_REPO_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-/// An RFC 3339 instant, formatted the way the rest of the platform formats one.
-fn format_time(at: &OffsetDateTime) -> String {
-    // `Display` on a `PrimitiveDateTime` writes `2026-09-01 9:00:00.0` — a single-digit hour and
-    // a trailing `.0`, neither of which anything else in the platform parses. So the format is
-    // written out here rather than borrowed.
-    let formatted = time::format_description::well_known::Rfc3339;
-    at.format(&formatted).unwrap_or_else(|_| format!("{at}"))
-}
-
-/// A `window=` chip as an instant, plus the label the filter echoes.
-fn window_to_instant(window: Option<&str>) -> Result<(Option<OffsetDateTime>, String), ApiError> {
-    let raw = window.map(str::trim).filter(|value| !value.is_empty());
-    let Some(raw) = raw else {
-        return Ok((None, "all".to_string()));
-    };
-    let days = match raw {
-        "all" => return Ok((None, "all".to_string())),
-        "24h" => 1,
-        "7d" => 7,
-        "30d" => 30,
-        "90d" => 90,
-        other => {
-            // A bare instant is accepted so the URL is a complete description of the query: a
-            // panel that cannot express "since Tuesday" in a chip can still link to it.
-            if let Ok(at) =
-                time::OffsetDateTime::parse(other, &time::format_description::well_known::Rfc3339)
-            {
-                return Ok((Some(at), other.to_string()));
-            }
-            return Err(ApiError::bad_request(
-                "deployment_window_unknown",
-                format!("“{other}” is not a window. Choose 24h, 7d, 30d, 90d or all."),
-            )
-            .with_details(json!({ "windows": ["24h", "7d", "30d", "90d", "all"] })));
-        }
-    };
-    let since = OffsetDateTime::now_utc() - time::Duration::days(days);
-    Ok((Some(since), raw.to_string()))
-}
-
-/// A store failure as a `404` that names what was looked for and where.
-fn release_lookup_error(error: StoreError, version: &str, channel: Channel) -> ApiError {
-    if error.is_not_found() {
-        return ApiError::new(
-            StatusCode::NOT_FOUND,
-            "release_not_found",
-            format!(
-                "release {version} is not in the {} release cache. It may have been withdrawn, \
-                 or the update check has not seen it yet.",
-                channel.as_str()
-            ),
-        );
-    }
-    ApiError::from(error)
-}
-
-/// A missing environment as a `404` that names the three that exist.
-fn not_found_environment(environment: &str) -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_FOUND,
-        "environment_not_found",
-        format!(
-            "“{environment}” is not an environment this installation runs. The centre covers \
-             production, staging and sandbox."
-        ),
-    )
-}
-
-impl From<StoreError> for ApiError {
-    /// Three failures, three responses.
-    ///
-    /// The split is the whole point: a missing row is a `404` with a message about the thing that
-    /// is missing, a dead feed is a `503` the checks screen already knows how to render, and a
-    /// database failure is a `500` with a request id. One shared `internal_error` would answer
-    /// "the release 2.5.0 is not in the cache" with a retry button that never helps.
-    fn from(error: StoreError) -> Self {
-        match error {
-            StoreError::NotFound => Self::new(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "That deployment record does not exist.",
-            ),
-            StoreError::Feed(ref reason) => Self::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                error.code(),
-                format!("the release feed could not be read: {reason}"),
-            ),
-            // The event bus refused the announcement. The cache is written and the claim was
-            // released, so the next check re-announces — this is a `503`, not a `500`: the
-            // work will be retried, and nothing the operator did caused it.
-            StoreError::Event(ref reason) => Self::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                error.code(),
-                format!("the update could not be announced: {reason}"),
-            ),
-            StoreError::Database(inner) => Self::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("the deployment store failed: {inner}"),
-            ),
+/// The bundle's whole-content checksum: the sha256 of its file checksums, in order.
+///
+/// Derived rather than returned by the generator, so the number on the row and the number beside
+/// the download are the same by construction rather than by two implementations agreeing.
+fn bundle_checksum(files: &Value) -> String {
+    let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+    for file in store::bundle_files(files) {
+        for byte in format!("{}:{}\n", file.name, file.sha256).bytes() {
+            acc ^= u64::from(byte);
+            acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
+    format!("fnv1a64:{acc:016x}")
 }

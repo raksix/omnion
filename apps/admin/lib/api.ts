@@ -49,13 +49,6 @@ import type {
   SignInProtectionSaved,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
-  Project,
-  ProjectAudit,
-  ProjectLimits,
-  ProjectLimitsSave,
-  ProjectMember,
-  ProjectRole,
-  ProjectSwitcher,
   WebhookEndpoint,
   WebhookList,
   WebhookRedeliverBatch,
@@ -132,7 +125,6 @@ import type {
   NotificationPreferencesSaved,
   NotificationPushKey,
   NotificationPushOutcome,
-  NotificationRetention,
   NotificationRouteReport,
   NotificationRouteRule,
   NotificationRow,
@@ -141,7 +133,6 @@ import type {
   Site,
   User,
 } from "./types";
-import type { MoveReport, Workflow } from "./types";
 // The portal's own shapes live in their own module rather than in `types.ts`, because they come
 // with a *rule* attached (only `IssuedDeveloperKey` may hold a token) that is worth reading
 // next to the type itself rather than one of two hundred lines of a shared list.
@@ -284,12 +275,14 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 /**
- * The one request every client function goes through.
+ * The panel's one fetch: same-origin, JSON in and out, the session cookie always sent, the CSRF
+ * header added on a write, and a thrown {@link ApiError} carrying the API's own code and message.
  *
- * Exported for the module clients that live in their own files (`crm-intake-api.ts`): a second
- * copy of this would produce a second `ApiError` class, and a screen that catches `ApiError`
- * from here would not catch that one — an error state that silently never renders is worse
- * than a duplicated function.
+ * Exported because a surface with its own module (the deployment centre's release client in
+ * `deployment-api.ts`) must speak through THIS function rather than re-implementing it — a second
+ * fetch that forgets the CSRF header would make every write on that surface fail with a 403 that
+ * reads like a permissions problem, and one that forgets `credentials` would sign an operator out
+ * on the first read.
  */
 export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
@@ -458,335 +451,6 @@ export function updateSite(
 export async function fetchOrganizations(): Promise<Organization[]> {
   const body = await request<{ organizations: Organization[] }>("/api/v1/organizations");
   return body.organizations;
-}
-
-// -- Automation projects (REQ-133, slice 1) ------------------------------------------------
-//
-// Every function here narrows nothing on the caller's behalf: the API is the only place that
-// knows which projects an account may see, and a client-side filter over a list that is
-// already scoped is how the two drift. `mine: true` is the switcher's own question, and it is
-// asked of the server rather than answered here.
-
-/**
- * The switcher's list (REQ-133, acceptance 3).
- *
- * Its own endpoint rather than a filter over `fetchProjects`, and the reason is in the server's
- * comment: the recents ranking, the caller's per-row role and the stored selection are three
- * answers `/api/v1/projects` does not carry, so a client-side filter would have had to reconstruct
- * all three — and would have drifted the first time an instance administrator opened it.
- */
-export async function fetchProjectSwitcher(
-  organizationId?: string,
-  linkedProjectId?: string | null,
-): Promise<ProjectSwitcher> {
-  const query = new URLSearchParams({ mine: "1" });
-  if (organizationId) query.set("organization_id", organizationId);
-  // The shared link's project travels with the request so the SERVER can say whether this person
-  // may see it. Deciding visibility in the browser would mean comparing an id against a list the
-  // browser already has, which is a second answer to a question the store answers once.
-  if (linkedProjectId) query.set("project", linkedProjectId);
-  return request<ProjectSwitcher>(`/api/v1/projects/switcher?${query.toString()}`);
-}
-
-/**
- * Switch into a project, or — with `null` — into "All projects".
- *
- * One POST for both directions, so the panel cannot get the two out of step by forgetting the
- * clear. A project the caller may not see answers `404` like every other project read, and
- * `request` raises it as a normal error rather than as something the panel has to special-case.
- */
-export function selectProject(
-  projectId: string | null,
-  organizationId?: string,
-  linkedProjectId?: string | null,
-): Promise<ProjectSwitcher> {
-  const query = new URLSearchParams();
-  if (organizationId) query.set("organization_id", organizationId);
-  // Sent on the write as well as the read, so both handlers resolve the link through ONE function.
-  // Two handlers each deciding for themselves is how the button and the address bar disagree.
-  if (linkedProjectId) query.set("project", linkedProjectId);
-  const suffix = query.toString() ? `?${query.toString()}` : "";
-  return request<ProjectSwitcher>(`/api/v1/projects/switcher${suffix}`, {
-    method: "POST",
-    body: JSON.stringify({ project_id: projectId }),
-  });
-}
-
-/** The projects the caller may see, in the API's own order. */
-export async function fetchProjects(organizationId?: string): Promise<Project[]> {
-  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
-  const body = await request<{ projects: Project[] }>(`/api/v1/projects${query}`);
-  return body.projects;
-}
-
-/**
- * One project with its members, the owner first.
- *
- * A `404` here is the documented answer for a project the caller may not see, and `request`
- * raises it as a normal error: the panel renders the not-found state, never a permission
- * message, because "you are not allowed" would confirm the row exists.
- */
-export async function fetchProject(id: string): Promise<{ project: Project; members: ProjectMember[] }> {
-  const body = await request<Project & { members: ProjectMember[] }>(`/api/v1/projects/${id}`);
-  return { project: body, members: body.members };
-}
-
-/** Create a project and its first owner membership. */
-export function createProject(input: {
-  key: string;
-  name: string;
-  description?: string;
-  color?: string;
-  icon?: string;
-  owner_user_id?: string;
-  organization_id?: string;
-}): Promise<Project> {
-  return request<Project>("/api/v1/projects", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Update a project's own fields. Omitted fields are left alone. */
-export function updateProject(
-  id: string,
-  input: { key?: string; name?: string; description?: string; color?: string; icon?: string },
-): Promise<Project> {
-  return request<Project>(`/api/v1/projects/${id}`, {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
-}
-
-/**
- * Archive or restore a project.
- *
- * Archiving is not deletion: the history stays and the restore puts it back. The typed
- * confirmation is the caller's, not the form's -- the API takes `confirm` so a script cannot
- * skip it by omitting a field the UI happens to send.
- */
-export function setProjectArchived(id: string, archived: boolean, confirm?: string): Promise<Project> {
-  const verb = archived ? "archive" : "restore";
-  return request<Project>(`/api/v1/projects/${id}/${verb}`, {
-    method: "POST",
-    body: JSON.stringify(archived ? { confirm: confirm ?? id } : {}),
-  });
-}
-
-/** Add a member, or change an existing member's role -- the API treats them as one upsert. */
-export function setProjectMember(
-  id: string,
-  userId: string,
-  role: ProjectRole,
-): Promise<{ user_id: string; display_name: string; email: string; role: ProjectRole; created_at: string }> {
-  return request(`/api/v1/projects/${id}/members`, {
-    method: "POST",
-    body: JSON.stringify({ user_id: userId, role }),
-  });
-}
-
-/** Remove a membership. The API refuses the one that would leave nobody owning the project. */
-export function removeProjectMember(id: string, userId: string): Promise<void> {
-  return request<void>(`/api/v1/projects/${id}/members/${userId}`, { method: "DELETE" });
-}
-
-/**
- * The workflows in one project, for the move dialog's host screen (REQ-133 slice 3).
- *
- * The API already accepts a `project_id` filter and already scopes the result to the projects the
- * caller may see, so this passes the project rather than filtering client-side: a client-side
- * filter over an unscoped list would show a workflow the API deliberately hid.
- */
-export function fetchWorkflowsInProject(
-  projectId: string,
-  organizationId?: string,
-): Promise<{ workflows: Workflow[] }> {
-  const query = new URLSearchParams({ project_id: projectId });
-  if (organizationId) query.set("organization_id", organizationId);
-  return request<{ workflows: Workflow[] }>(`/api/v1/workflows?${query.toString()}`);
-}
-
-/**
- * Report on a move, or make it. One call for both (REQ-133 slice 3).
- *
- * `dryRun` is a flag rather than a second endpoint because the report the dialog renders and the
- * decision the move is made on come from the same detection -- two endpoints would be two
- * implementations that could disagree, and the disagreement would only show up as a move that
- * behaves unlike its own preview.
- */
-export function moveWorkflow(
-  workflowId: string,
-  toProjectId: string,
-  dryRun: boolean,
-  organizationId?: string,
-): Promise<MoveReport> {
-  return request<MoveReport>(`/api/v1/workflows/${workflowId}/move`, {
-    method: "POST",
-    body: JSON.stringify({
-      organization_id: organizationId,
-      to_project_id: toProjectId,
-      dry_run: dryRun,
-    }),
-  });
-}
-
-/**
- * The limits screen's payload: caps, today's counters, the series and the warnings (REQ-133
- * slice 4).
- *
- * One read rather than four. The screen renders bars, a series and warnings that must agree with
- * each other, and four reads would let a run land between them — a bar at 3 of 5 beside a series
- * that says 2, with nothing on the page to explain the difference.
- */
-export function fetchProjectLimits(
-  projectId: string,
-  organizationId?: string,
-  days = 30,
-): Promise<ProjectLimits> {
-  const query = new URLSearchParams({ days: String(days) });
-  if (organizationId) query.set("organization_id", organizationId);
-  return request<ProjectLimits>(`/api/v1/projects/${projectId}/limits?${query.toString()}`);
-}
-
-/**
- * Replace a project's limit overrides.
- *
- * `0` means unlimited, and the API says so in its own refusal when a negative value arrives, so
- * this client does not re-validate: a second copy of the rule is a second copy that can disagree.
- */
-export function saveProjectLimits(
-  projectId: string,
-  body: ProjectLimitsSave,
-  organizationId?: string,
-): Promise<ProjectLimits> {
-  return request<ProjectLimits>(`/api/v1/projects/${projectId}/limits`, {
-    method: "PUT",
-    body: JSON.stringify({ ...body, organization_id: organizationId }),
-  });
-}
-
-/**
- * The project-scoped audit trail (REQ-133 slice 4).
- *
- * `action` is passed to the API rather than filtered here: the server owns the filter, and a
- * client-side filter over a truncated page would quietly report "nothing happened" for the rows
- * the page never fetched.
- */
-export function fetchProjectAudit(
-  projectId: string,
-  action: string,
-  organizationId?: string,
-  limit = 200,
-): Promise<ProjectAudit> {
-  const query = new URLSearchParams({ action, limit: String(limit) });
-  if (organizationId) query.set("organization_id", organizationId);
-  return request<ProjectAudit>(`/api/v1/projects/${projectId}/audit?${query.toString()}`);
-}
-
-/**
- * Hand the project to a new owner, with both confirmations.
- *
- * The two booleans are the REQ's two sentences, and the API refuses a request that carries only
- * one. **The caller passes them; this function must not supply them.** Hardcoding `true` here --
- * which is what the first version did -- makes `ownership_transfer_unconfirmed` unreachable from
- * every client path: the dialog's two checkboxes gated its own button and then sent the same
- * body as a caller who ticked nothing, so the acknowledgements were collected, discarded, and
- * replaced by a constant. A server rule that only one client can violate, by construction, is a
- * rule no gate can prove and a panel that cannot honour it.
- */
-export function transferProjectOwnership(
-  projectId: string,
-  toUserId: string,
-  confirmations: { owner: boolean; audit: boolean },
-  organizationId?: string,
-): Promise<{ previous_owner_user_id: string | null; owner_user_id: string | null; key: string }> {
-  return request(`/api/v1/projects/${projectId}/transfer-ownership`, {
-    method: "POST",
-    body: JSON.stringify({
-      organization_id: organizationId,
-      to_user_id: toUserId,
-      confirm_owner: confirmations.owner,
-      confirm_audit: confirmations.audit,
-    }),
-  });
-}
-
-/**
- * Delete a project for good (REQ-133) — the destructive half of the settings screen.
- *
- * **The confirmation travels in the query string, and that is the server's decision, not this
- * client's.** `DELETE` with a request body is a shape that proxies, gateways and HTTP client
- * libraries all handle differently, and a typed confirmation that arrives through a mechanism half
- * the ecosystem may drop is a confirmation that vanishes on the request that matters. So the key
- * is a query parameter, and the server answers an absent one with a named refusal
- * (`project_delete_confirmation_mismatch`) rather than a shape error.
- *
- * The caller passes the project's **key**, not its id: the key is the short form an operator
- * writes in a ticket, and typing `PAY` when the project is `PAYROLL` has to fail — that is the
- * whole point of asking somebody to type it.
- */
-export function deleteProject(
-  id: string,
-  confirmKey: string,
-  organizationId?: string,
-): Promise<{ project_id: string; project_key: string; removed_members: number; retained_audit_rows: number }> {
-  const query = new URLSearchParams({ confirm: confirmKey });
-  if (organizationId) query.set("organization_id", organizationId);
-  return request<{ project_id: string; project_key: string; removed_members: number; retained_audit_rows: number }>(
-    `/api/v1/projects/${id}?${query.toString()}`,
-    { method: "DELETE" },
-  );
-}
-
-/**
- * `GET /api/v1/projects/{id}/export` — a portable snapshot of the project, as a file.
- *
- * **Modelled on `downloadAnalyticsExport` rather than invented, and the reuse is the point:** that
- * function already solved the two things this one has to get right — reading the filename out of
- * `content-disposition` (so the file the user gets is the one the server named, not a client-side
- * guess) and turning an error body into an `ApiError` with the server's own code and message.
- * A second download helper that read the header itself would be a second answer to "what is this
- * file called" waiting to disagree with the first.
- *
- * The route is guarded by `projects.read`, not `projects.manage`, so this is a read — nothing is
- * locked and nothing is written, which is why a viewer may call it.
- */
-export async function downloadProjectExport(
-  id: string,
-  organizationId?: string,
-): Promise<{ blob: Blob; filename: string }> {
-  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
-  let response: Response;
-  try {
-    response = await fetch(`/api/v1/projects/${id}/export${query}`, {
-      credentials: "same-origin",
-      headers: { accept: "application/json" },
-    });
-  } catch {
-    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
-  }
-
-  if (!response.ok) {
-    const text = await response.text();
-    let code = "project_export_failed";
-    let message = `The export answered with status ${response.status}.`;
-    try {
-      const body = JSON.parse(text) as ErrorBody;
-      code = body.error?.code ?? code;
-      message = body.error?.message ?? message;
-    } catch {
-      // A non-JSON error body is still an error; the status stays in the message.
-    }
-    throw new ApiError(response.status, code, message);
-  }
-
-  // The server's filename is the authority. The fallback is the shape it would have produced
-  // anyway (lower key + stamp) minus the stamp, so a proxy that drops the header still yields a
-  // file that opens — named rather than called "download".
-  const disposition = response.headers.get("content-disposition") ?? "";
-  const match = /filename="?([^";]+)"?/.exec(disposition);
-
-  return { blob: await response.blob(), filename: match?.[1] ?? "project-export.json" };
 }
 
 /** The sites the account may see, optionally narrowed to one tenant. */
@@ -4731,31 +4395,6 @@ export function retryNotificationDelivery(id: string): Promise<{ outcome: string
   });
 }
 
-/**
- * The delivery log's retention window, the counts it would act on, and the last sweep.
- *
- * Read separately from the page rather than folded into it: the page is what an administrator
- * filters, this is what they *configure*, and a slow count query failing should not empty the
- * table above it.
- */
-export function fetchNotificationRetention(): Promise<NotificationRetention> {
-  return request<NotificationRetention>("/api/v1/notifications/outbox/retention");
-}
-
-/**
- * Set the window.
- *
- * **The server's refusal is rendered verbatim, not summarised** — `notification_retention_days
- * must be between 1 and 3650, and 0 is not` names the field and the two bounds, and an operator
- * who has just deleted their own evidence needs to know which end of the range they crossed.
- */
-export function setNotificationRetention(windowDays: number): Promise<NotificationRetention> {
-  return request<NotificationRetention>("/api/v1/notifications/outbox/retention", {
-    method: "PATCH",
-    body: JSON.stringify({ window_days: windowDays }),
-  });
-}
-
 /** This person's registered browsers. The endpoint itself is never in the answer. */
 export function fetchNotificationDevices(): Promise<NotificationDevice[]> {
   return request<NotificationDevice[]>("/api/v1/notifications/push-subscriptions");
@@ -5214,6 +4853,1360 @@ export function importSecurityReport(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Observability (REQ-126) and secrets (REQ-125)
+// ---------------------------------------------------------------------------------------------
+//
+// Two surfaces share this section because they share one rule: **this client never receives a
+// secret value.** A credential row carries a name, a kind, a provider and a validation state; a
+// lease row carries a name, a version and a redemption budget. The single exception is
+// `createDeploymentKey`, which answers the key exactly once at creation and nowhere else — the
+// response type is named `CreatedDeploymentKey` rather than `DeploymentKey` for that reason, and
+// the value is not cached in the module or in any store.
+//
+// Every type below mirrors a Rust view in `apps/api/src/routes/{observability,observability_
+// traces,observability_alerts,secrets,secrets_audit,secrets_credentials,secrets_leases}.rs`. When
+// a field exists on screen and not here, the screen is wrong; when it exists here and not on
+// screen, the client is carrying a field no operator can act on. Both have happened.
+
+/* ── metrics (REQ-126 slice 2) ────────────────────────────────────────────────────────────── */
+
+/** One documented metric family, as the catalogue records it. */
+export type MetricFamily = {
+  /** The exposition name, e.g. `omnion_http_requests_total`. */
+  name: string;
+  /** `counter`, `gauge` or `histogram`. */
+  kind: string;
+  /** The unit shown next to the chart. */
+  unit: string;
+  /** The one-sentence description, so a name is never the only documentation. */
+  description: string;
+  /** The label names, positionally. */
+  labels: string[];
+  /** `core`, `module` or `worker`. */
+  source: string;
+  /** The series the registry holds right now. */
+  cardinality_estimate: number;
+  /** The cap this family is held to. */
+  cardinality_budget: number;
+  /** Whether the cap is enforced for this family. */
+  budgeted: boolean;
+  /** When the family last recorded a sample, if it ever has. `null` and an old date are different. */
+  last_seen_at: string | null;
+  /** `true` when this build emits the family. */
+  live: boolean;
+  /** `true` when the family is folding samples into its `other` series. */
+  over_budget: boolean;
+};
+
+/**
+ * The label values the registry has actually seen for one family.
+ *
+ * The selector builder is fed from this rather than from a hardcoded list, so a label an operator
+ * cannot select is never offered — which is the difference between a filter and a guessing game.
+ */
+export type MetricLabelCatalogue = {
+  metric: string;
+  labels: string[];
+  values: string[];
+  bounded_set_cap: number;
+};
+
+/** The catalogue response. */
+export type MetricCatalogResponse = {
+  families: MetricFamily[];
+  label_catalogues: MetricLabelCatalogue[];
+  over_budget: string[];
+  global_budget: number;
+  max_points: number;
+};
+
+/** One point of a series: the instant and the value. */
+export type MetricPoint = {
+  /** RFC 3339 instant of the bucket. */
+  at: string;
+  /** The value in the family's unit. */
+  value: number;
+};
+
+/** One line of a multi-series chart. */
+export type MetricSeries = {
+  /** The label values, positionally, matching the family's `labels`. */
+  labels: string[];
+  /** The running total, which a rate is computed from. */
+  total: number;
+  /** How many samples the buckets cover. */
+  observations: number;
+  /** The buckets, oldest first. */
+  points: MetricPoint[];
+};
+
+/** A chart's worth of data, for one catalogue selector. */
+export type MetricQueryResponse = {
+  metric: string;
+  kind: string;
+  unit: string;
+  labels: string[];
+  window_minutes: number;
+  max_points: number;
+  series: MetricSeries[];
+  /** PromQL for the same selection, ready to paste into a dashboard. */
+  promql: string;
+  /**
+   * `true` when the family is declared but has never recorded a sample.
+   *
+   * This is a third state next to "no samples in this window": a blank graph and an idle metric
+   * and an undeclared-in-this-build family look identical unless one of them says so.
+   */
+  no_samples: boolean;
+};
+
+/** `GET /api/v1/observability/metrics/catalog` — the documented families. */
+export function fetchMetricCatalog(): Promise<MetricCatalogResponse> {
+  return request<MetricCatalogResponse>("/api/v1/observability/metrics/catalog");
+}
+
+/**
+ * `GET /api/v1/observability/overview` — the landing screen (docs/requests/REQ-126).
+ *
+ * Every headline is `number | null` and the difference is load-bearing: `null` means "this
+ * family has no samples in the window", which on a fresh install is every one of them, and `0`
+ * means "the counter is genuinely at zero". The screen renders the first as "—" with an
+ * explanation and the second as a number, because a panel of zeroes on an instance that has
+ * served nothing is indistinguishable from a healthy flat line.
+ *
+ * `unavailable` names the sources that could not be read. It exists because the screen is
+ * assembled defensively server-side: a tile whose source is unreadable degrades to `null` and
+ * adds its name here rather than failing the whole read, since the operator opening this page
+ * during an incident must not get an error page.
+ */
+export interface ObservabilityOverview {
+  window_minutes: number;
+  requests_total: number | null;
+  error_ratio: number | null;
+  p95_latency_seconds: number | null;
+  queue_depth: number | null;
+  ai_cost_micros_today: number | null;
+  exporters: OverviewExporter[];
+  alerts: OverviewAlerts | null;
+  unavailable: string[];
+  no_traffic: boolean;
+}
+
+/** One exporter's chip and the drop count that says whether to trust it. */
+export interface OverviewExporter {
+  name: string;
+  health: string;
+  dropped_total: number;
+  buffered: number;
+}
+
+/** The alert surface in one count per state, plus the newest firing incident. */
+export interface OverviewAlerts {
+  firing: number;
+  pending: number;
+  latest_firing: OverviewIncident | null;
+}
+
+/**
+ * The newest firing incident.
+ *
+ * `rule` is nullable because the event stores a rule id and the rule may since have been
+ * deleted; the incident stays linkable by `rule_id` either way.
+ */
+export interface OverviewIncident {
+  id: string;
+  rule_id: string;
+  rule: string | null;
+  started_at: string;
+}
+
+/** `GET /api/v1/observability/overview`. */
+export function fetchObservabilityOverview(): Promise<ObservabilityOverview> {
+  return request<ObservabilityOverview>("/api/v1/observability/overview");
+}
+
+/**
+ * `GET /api/v1/observability/metrics/query` — a bounded chart for one family.
+ *
+ * `metric` is required: the API refuses an unknown family with `unknown_metric` rather than
+ * answering an empty series, so a wrong name is a named error and never a blank graph.
+ */
+export function fetchMetricQuery(
+  metric: string,
+  windowMinutes: number,
+): Promise<MetricQueryResponse> {
+  const query = new URLSearchParams({
+    metric,
+    window_minutes: String(windowMinutes),
+  });
+  return request<MetricQueryResponse>(`/api/v1/observability/metrics/query?${query}`);
+}
+
+/** `POST /api/v1/observability/metrics/sync` — re-seed the catalogue from the live registry. */
+export function syncMetricCatalog(): Promise<MetricCatalogResponse> {
+  return request<MetricCatalogResponse>("/api/v1/observability/metrics/sync", { method: "POST" });
+}
+
+/* ── the log explorer (REQ-126 slice 1) ────────────────────────────────────────────────── */
+
+/**
+ * One stored line, in the panel's shape.
+ *
+ * Every field here is a **column** of `obs_log_entries` except `fields`, which was redacted at
+ * write time — this client never receives a value to mask, so there is no second rule here to
+ * keep in sync with the one in `crates/telemetry::redact`. A screen that wanted to "show the raw
+ * message" would find nothing to show, which is the point.
+ */
+export type LogEntry = {
+  id: number;
+  /** RFC 3339 instant the line was emitted. */
+  ts: string;
+  /** `trace`, `debug`, `info`, `warn` or `error` — the set is closed and the API rejects anything else. */
+  level: string;
+  /** The Rust module path, so a line can be narrowed to one module. */
+  target: string;
+  /** The message. Redacted before it was ever stored. */
+  message: string;
+  request_id: string | null;
+  trace_id: string | null;
+  user_id: string | null;
+  organization_id: string | null;
+  /** The route TEMPLATE (`/api/v1/secrets/{id}`), never a raw path. */
+  route: string | null;
+  method: string | null;
+  status: number | null;
+  duration_ms: number | null;
+  /** Which process emitted it: `api`, `worker` or `cli`. */
+  source: string;
+  host: string | null;
+  version: string | null;
+  /** Structured detail, already redacted. */
+  fields: unknown;
+};
+
+/**
+ * The explorer's query string.
+ *
+ * `level` is an array because the screen's control is a multi-select, and `?level=info` also
+ * works for a hand-typed link — the API takes both forms. `requestId` is a separate field rather
+ * than a text search because it routes to `/logs/requests/{id}`, which returns the lines in the
+ * opposite order (a timeline, not a list) and covers the workers as well as the API.
+ */
+export type LogFilters = {
+  levels?: string[];
+  target?: string;
+  requestId?: string;
+  traceId?: string;
+  /** RFC 3339 lower bound. */
+  since?: string;
+  /** RFC 3339 upper bound. */
+  until?: string;
+  /** `api`, `worker` or `cli`. */
+  source?: string;
+  /** Substring of the message. */
+  text?: string;
+  limit?: number;
+};
+
+/**
+ * The explorer response.
+ *
+ * `levels` and `targets` come from the store rather than from a constant, so the filter's chips
+ * are the values this instance has actually recorded — a hard-coded level list offers an option
+ * that can never return a row, which is how a filter becomes a guessing game.
+ */
+export type LogListResponse = {
+  /** The rows, newest first — except through `fetchRequestLines`, which is oldest first. */
+  entries: LogEntry[];
+  levels: string[];
+  targets: string[];
+  /** How many lines the store holds in total, so an empty page is not an empty store. */
+  stored_total: number;
+  /** The window the store will answer, in days. */
+  max_window_days: number;
+  /** The cap on one search, in rows. */
+  max_rows: number;
+};
+
+/**
+ * `GET /api/v1/observability/logs` — the bounded explorer.
+ *
+ * An empty parameter is dropped rather than sent blank: `?target=` is a filter for the empty
+ * string, and the difference between "no target filter" and "the target is ''" is one the store
+ * answers differently.
+ */
+export function fetchLogs(filters: LogFilters = {}): Promise<LogListResponse> {
+  const query = new URLSearchParams();
+  for (const level of filters.levels ?? []) query.append("level", level);
+  if (filters.target) query.set("target", filters.target);
+  if (filters.traceId) query.set("trace_id", filters.traceId);
+  if (filters.since) query.set("since", filters.since);
+  if (filters.until) query.set("until", filters.until);
+  if (filters.source) query.set("source", filters.source);
+  if (filters.text) query.set("text", filters.text);
+  if (filters.limit) query.set("limit", String(filters.limit));
+
+  // A request id takes the dedicated route rather than this one: the ordering is the opposite and
+  // a caller who has to remember `&order=asc` to read a timeline will eventually get it wrong.
+  if (filters.requestId) return fetchRequestLines(filters.requestId);
+
+  const suffix = query.toString();
+  return request<LogListResponse>(`/api/v1/observability/logs${suffix ? `?${suffix}` : ""}`);
+}
+
+/**
+ * `GET /api/v1/observability/logs/requests/{id}` — **one request's lines, oldest first**.
+ *
+ * This is the route an error banner is for: every line the request produced, across the API and
+ * the workers, in the order it happened. The same response type is returned deliberately — the
+ * shape of a line does not change with the direction of the list.
+ */
+export function fetchRequestLines(requestId: string): Promise<LogListResponse> {
+  return request<LogListResponse>(
+    `/api/v1/observability/logs/requests/${encodeURIComponent(requestId)}`,
+  );
+}
+
+/**
+ * The one log settings row, as the explorer reads it.
+ *
+ * `max_retention_days` is carried so the screen can say WHY a number is refused rather than only
+ * that it was — "must be 14 or less" without the cap in hand is a validation message that reads
+ * as an arbitrary rule, and an operator who cannot see the cap will not know whether to argue
+ * with the value or the operator.
+ */
+export type LogSettingsView = {
+  /** The level a module logs at unless it is raised. */
+  log_level_default: string;
+  /** Per-module raises, including the ones that have already expired. */
+  log_level_overrides: Record<string, unknown>;
+  /** How many days are kept. */
+  logs_retention_days: number;
+  /** When the row was last written, RFC 3339. */
+  updated_at: string;
+  /** The cap retention is allowed to reach. */
+  max_retention_days: number;
+};
+
+/**
+ * `GET /api/v1/observability/logs/settings` — the one settings row, read-only from here.
+ *
+ * `PUT /logs/settings` is a separate route under `observability.manage` and is the whole settings
+ * screen's job; this client deliberately does not wrap it, so a log explorer cannot silently
+ * change retention. The screen shows the retention window so "the store only goes back N days"
+ * is visible next to the results it is limiting.
+ */
+export function fetchLogSettings(): Promise<LogSettingsView> {
+  return request<LogSettingsView>("/api/v1/observability/logs/settings");
+}
+
+/* ── traces and exporters (REQ-126 slice 3) ───────────────────────────────────────────────── */
+
+/** The trace list's filter. `undefined` means "no filter on this column", never "match nothing". */
+export type TraceFilters = {
+  request_id?: string;
+  route?: string;
+  /** `ok` or `error`. */
+  status?: string;
+  min_duration_ms?: number;
+  window_minutes?: number;
+  limit?: number;
+};
+
+/** One row of the trace list. */
+export type TraceSummary = {
+  trace_id: string;
+  root_name: string;
+  route: string | null;
+  request_id: string | null;
+  started_at: string;
+  duration_ms: number;
+  span_count: number;
+  /** The spans the platform kept; lower than `span_count` when the trace was truncated. */
+  spans_kept: number;
+  /** `true` when the waterfall on screen is incomplete, so the screen must say so. */
+  spans_truncated: boolean;
+  status: string;
+  /** The sampling decision, so an operator can tell "fast" from "unsampled". */
+  sampling: string;
+};
+
+/** The trace list response. */
+export type TracesResponse = {
+  traces: TraceSummary[];
+  total: number;
+  window_minutes: number;
+};
+
+/** One span of a waterfall. */
+export type TraceSpan = {
+  span_id: string;
+  parent_span_id: string | null;
+  name: string;
+  service: string;
+  offset_ms: number;
+  duration_ms: number;
+  attributes: Record<string, unknown>;
+  failed: boolean;
+  root: boolean;
+};
+
+/** One trace with its waterfall. */
+export type TraceDetail = TraceSummary & {
+  service: string;
+  /** Where the full trace lives in the operator's tracing backend, when one is configured. */
+  backend_trace_url: string | null;
+  spans: TraceSpan[];
+};
+
+/** `GET /api/v1/observability/traces`. */
+export function fetchTraces(filters: TraceFilters = {}): Promise<TracesResponse> {
+  const query = new URLSearchParams();
+  // Only the filters that were set travel: an empty string in a query parameter is a filter that
+  // matches nothing, which is why the screens normalise blanks to `undefined` before calling.
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    query.set(key, String(value));
+  }
+  const suffix = query.toString();
+  return request<TracesResponse>(`/api/v1/observability/traces${suffix ? `?${suffix}` : ""}`);
+}
+
+/**
+ * `GET /api/v1/observability/traces/{trace_id}`.
+ *
+ * A trace that is not in the index is `404 trace_not_found` — an unsampled trace and an expired
+ * one are both "not here", and the message says which the operator should expect.
+ */
+export function fetchTrace(traceId: string): Promise<TraceDetail> {
+  return request<TraceDetail>(`/api/v1/observability/traces/${encodeURIComponent(traceId)}`);
+}
+
+/** One configured exporter, with its live health and drop counters. */
+export type ExporterRow = {
+  id: string;
+  name: string;
+  kind: string;
+  endpoint: string;
+  protocol: string | null;
+  /** `true` when an auth credential is referenced — never the credential itself. */
+  auth_configured: boolean;
+  batch_ms: number;
+  timeout_ms: number;
+  enabled: boolean;
+  /** `healthy`, `degraded`, `disabled` or `unknown` before this process loaded it. */
+  health: string;
+  buffered: number;
+  capacity: number;
+  dropped_total: number;
+  last_flush_at: string | null;
+  last_error: string | null;
+};
+
+/** The exporter form's body. Every field is what the API's `ExporterInput` accepts. */
+export type ExporterInput = {
+  name: string;
+  kind: string;
+  endpoint: string;
+  protocol?: string | null;
+  /**
+   * Omitted on an edit that leaves the box empty.
+   *
+   * An empty box means "keep the current reference", so it is not sent at all: sending `null`
+   * would silently de-authenticate the exporter over a typo.
+   */
+  auth_secret_id?: string;
+  batch_ms?: number;
+  timeout_ms?: number;
+  enabled?: boolean;
+};
+
+/** The exporter list response. */
+export type ExportersResponse = {
+  exporters: ExporterRow[];
+  kinds: string[];
+  /** The sentence about what leaves this instance, stated on the payload and not only in a component. */
+  egress_notice: string;
+};
+
+/**
+ * The result of a test send.
+ *
+ * A failed send is a `200` carrying the backend's own words, not an error page: a `Test` button
+ * that renders an error page has told the operator nothing they could not have learned by waiting.
+ */
+export type ExporterTestResult = {
+  name: string;
+  kind: string;
+  ok: boolean;
+  detail: string;
+  health: string;
+};
+
+/** `GET /api/v1/observability/exporters`. */
+export function fetchExporters(): Promise<ExportersResponse> {
+  return request<ExportersResponse>("/api/v1/observability/exporters");
+}
+
+/** `POST /api/v1/observability/exporters` — answers `201` with the new row's id and name. */
+export function createExporter(input: ExporterInput): Promise<{ id: string; name: string }> {
+  return request<{ id: string; name: string }>("/api/v1/observability/exporters", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `PATCH /api/v1/observability/exporters/{id}`. */
+export function updateExporter(
+  id: string,
+  input: ExporterInput,
+): Promise<{ id: string; name: string }> {
+  return request<{ id: string; name: string }>(
+    `/api/v1/observability/exporters/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/** `DELETE /api/v1/observability/exporters/{id}`. */
+export function deleteExporter(id: string): Promise<null> {
+  return request<null>(`/api/v1/observability/exporters/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+/** `POST /api/v1/observability/exporters/{id}/test` — a real send of a synthetic batch. */
+export function testExporter(id: string): Promise<ExporterTestResult> {
+  return request<ExporterTestResult>(
+    `/api/v1/observability/exporters/${encodeURIComponent(id)}/test`,
+    { method: "POST" },
+  );
+}
+
+/* ── alert rules, alerts and silences (REQ-126 slice 4) ────────────────────────────────────── */
+
+/** One rule, with the live evaluation state the catalogue does not hold. */
+export type AlertRuleRow = {
+  id: string;
+  name: string;
+  expr: string;
+  parsed: string | null;
+  severity: string;
+  for_seconds: number;
+  summary: string;
+  runbook_url: string | null;
+  labels: Record<string, unknown>;
+  /** `built_in` for the rules the platform ships, `custom` for an operator's own. */
+  source: string;
+  enabled: boolean;
+  state: string | null;
+  value: number | null;
+  silenced: boolean;
+  silenced_until: string | null;
+  /** Whether the expression parsed. A rule that does not parse is stored, and flagged. */
+  expression_valid: boolean;
+  expression_error: string | null;
+};
+
+/** The rule list response. */
+export type AlertRulesResponse = {
+  rules: AlertRuleRow[];
+  families: string[];
+  severities: string[];
+  max_for_seconds: number;
+};
+
+/** The rule form's body. */
+export type AlertRuleInput = {
+  name: string;
+  expr: string;
+  severity: string;
+  for_seconds: number;
+  summary: string;
+  runbook_url?: string | null;
+  labels?: Record<string, unknown>;
+};
+
+/** The rule patch. Every field is optional, and a misspelled one is refused by the API. */
+export type AlertRulePatch = Partial<AlertRuleInput> & { enabled?: boolean };
+
+/** One firing, pending or resolved alert. */
+export type AlertEventRow = {
+  id: number;
+  rule_id: string;
+  state: string;
+  value: number | null;
+  /** The value at the moment it crossed, which is not always the current one. */
+  firing_value: number | null;
+  started_at: string;
+  ended_at: string | null;
+  fired_at: string | null;
+  notified: boolean;
+  reason: string;
+  context: Record<string, unknown>;
+};
+
+/** One suppression window. */
+export type SilenceRow = {
+  id: string;
+  rule_id: string | null;
+  reason: string;
+  starts_at: string | null;
+  ends_at: string;
+  active: boolean;
+  minutes_remaining: number;
+};
+
+/** The alerts response, with the counts the header strip reads. */
+export type AlertsResponse = {
+  firing: AlertEventRow[];
+  pending: AlertEventRow[];
+  resolved: AlertEventRow[];
+  silences: SilenceRow[];
+  counts: {
+    firing: number;
+    pending: number;
+    silenced: number;
+    worst_severity: string | null;
+  };
+};
+
+/** What an expression evaluates to right now, before it is saved. */
+export type AlertPreview = {
+  /** The expression as the evaluator understood it. */
+  rendered: string;
+  family: string;
+  value: number | null;
+  series: number;
+  breaching: boolean;
+  /** `true` when the family has no samples, so `breaching: false` means "no data". */
+  no_data: boolean;
+};
+
+/** `GET /api/v1/observability/alert-rules`. */
+export function fetchAlertRules(): Promise<AlertRulesResponse> {
+  return request<AlertRulesResponse>("/api/v1/observability/alert-rules");
+}
+
+/** `POST /api/v1/observability/alert-rules` — answers `201`, like every other create here. */
+export function createAlertRule(input: AlertRuleInput): Promise<AlertRuleRow> {
+  return request<AlertRuleRow>("/api/v1/observability/alert-rules", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `PATCH /api/v1/observability/alert-rules/{id}` — the enable/disable toggle lives here. */
+export function updateAlertRule(id: string, patch: AlertRulePatch): Promise<AlertRuleRow> {
+  return request<AlertRuleRow>(
+    `/api/v1/observability/alert-rules/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(patch) },
+  );
+}
+
+/** `DELETE /api/v1/observability/alert-rules/{id}` — answers `204`. */
+export function deleteAlertRule(id: string): Promise<null> {
+  return request<null>(`/api/v1/observability/alert-rules/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+/** `POST /api/v1/observability/alert-rules/preview` — evaluate without saving. */
+export function previewAlertRule(expr: string): Promise<AlertPreview> {
+  return request<AlertPreview>("/api/v1/observability/alert-rules/preview", {
+    method: "POST",
+    body: JSON.stringify({ expr }),
+  });
+}
+
+/** `GET /api/v1/observability/alerts`. */
+export function fetchAlerts(): Promise<AlertsResponse> {
+  return request<AlertsResponse>("/api/v1/observability/alerts");
+}
+
+/** The silence form's body. `rule_id: null` silences every rule, which the screen states. */
+export type SilenceInput = {
+  rule_id: string | null;
+  reason: string;
+  ends_at: string;
+  starts_at?: string | null;
+};
+
+/** `POST /api/v1/observability/silences` — answers `201`. */
+export function createSilence(input: SilenceInput): Promise<SilenceRow> {
+  return request<SilenceRow>("/api/v1/observability/silences", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `DELETE /api/v1/observability/silences/{id}` — answers `204`. */
+export function deleteSilence(id: string): Promise<null> {
+  return request<null>(`/api/v1/observability/silences/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+/* ── observability settings and the probe contract (REQ-126 slice 4) ──────────────────────── */
+
+/** The caps the settings screen enforces client-side, so a refusal is a field message. */
+export type ObservabilityCaps = {
+  logs_retention_max: number;
+  traces_retention_max: number;
+  sampling_max: number;
+  cardinality_max: number;
+  log_levels: string[];
+};
+
+/** One module's level override. */
+export type LogLevelOverrideRow = {
+  target: string;
+  level: string;
+  expires_at: string | null;
+  /** `true` once the override lapsed — it is still listed so the screen can offer a clean-up. */
+  expired: boolean;
+};
+
+/** The one settings row. */
+export type ObservabilitySettings = {
+  /** The share of non-error requests whose trace is kept. Errors are always kept. */
+  sampling_ratio: number;
+  logs_retention_days: number;
+  traces_retention_days: number;
+  log_level_default: string;
+  log_level_overrides: Record<string, unknown>;
+  cardinality_budget: number;
+  prometheus_public: boolean;
+  caps: ObservabilityCaps;
+  /** The sentence about egress, stated on the payload so it can be audited. */
+  egress_note: string;
+  level_overrides: LogLevelOverrideRow[];
+};
+
+/** The settings form's body. */
+export type ObservabilitySettingsInput = {
+  sampling_ratio: number;
+  logs_retention_days: number;
+  traces_retention_days: number;
+  log_level_default: string;
+  log_level_overrides: Record<string, unknown>;
+  cardinality_budget: number;
+  prometheus_public: boolean;
+};
+
+/** Where this process is in its own shutdown, and the probe paths that describe it. */
+export type LifecycleResponse = {
+  draining: boolean;
+  in_flight: number;
+  drain_timeout_ms: number;
+  probes: {
+    liveness: { path: string; alias: string; fails_on_drain: boolean };
+    readiness: { path: string; alias: string; fails_on_drain: boolean };
+  };
+  /** Why liveness deliberately does not report the drain. */
+  note: string;
+  summary: Record<string, unknown>;
+};
+
+/** `GET /api/v1/observability/settings`. */
+export function fetchObservabilitySettings(): Promise<ObservabilitySettings> {
+  return request<ObservabilitySettings>("/api/v1/observability/settings");
+}
+
+/** `PUT /api/v1/observability/settings` — a write, and audited like one. */
+export function saveObservabilitySettings(
+  input: ObservabilitySettingsInput,
+): Promise<ObservabilitySettings> {
+  return request<ObservabilitySettings>("/api/v1/observability/settings", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `GET /api/v1/observability/lifecycle` — the probe contract, as data. */
+export function fetchLifecycle(): Promise<LifecycleResponse> {
+  return request<LifecycleResponse>("/api/v1/observability/lifecycle");
+}
+
+/* ── credentials (REQ-125) ───────────────────────────────────────────────────────────────── */
+
+/** One credential, described without ever carrying its value. */
+export type Credential = {
+  id: string;
+  name: string;
+  kind: string;
+  kind_description: string;
+  /** `true` when the kind can be checked without a network call. */
+  offline_checkable: boolean;
+  /** The masked values, for display only. */
+  fields: Record<string, unknown>;
+  /** The non-secret fields as `[name, value]` pairs, for the detail row. */
+  field_pairs: [string, string][];
+  validation_state: string;
+  validation_message: string;
+  validation_checked_at: string | null;
+  validation_interval_days: number;
+  next_validation_at: string | null;
+  provider: string;
+  provider_locator: string | null;
+  read_only: boolean;
+  version: number;
+  created_at: string;
+  slots: string[];
+};
+
+/** One of the five credential kinds, with the fields it wants. */
+export type CredentialKindOption = {
+  kind: string;
+  description: string;
+  fields: string[];
+  offline: boolean;
+};
+
+/** The credential list response. */
+export type CredentialsResponse = {
+  credentials: Credential[];
+  kinds: CredentialKindOption[];
+  total: number;
+  valid: number;
+  invalid: number;
+  unknown: number;
+};
+
+/** What a validation run answered. */
+export type CredentialValidation = {
+  id: string;
+  validation_state: string;
+  validation_message: string;
+  checked_at: string;
+  valid: boolean;
+};
+
+/** `GET /api/v1/secrets/credentials`. */
+export function fetchCredentials(): Promise<CredentialsResponse> {
+  return request<CredentialsResponse>("/api/v1/secrets/credentials");
+}
+
+/**
+ * `POST /api/v1/secrets/{id}/validate` — check a credential against its provider.
+ *
+ * A failed check is still a `200` carrying the provider's own words; only a broken store is an
+ * error, because "the check failed" is the answer an operator asked for.
+ */
+export function validateCredential(id: string): Promise<CredentialValidation> {
+  return request<CredentialValidation>(`/api/v1/secrets/${encodeURIComponent(id)}/validate`, {
+    method: "POST",
+  });
+}
+
+/** The typed profile body: a kind and its non-secret fields. */
+export type CredentialProfileInput = {
+  kind: string;
+  fields: Record<string, unknown>;
+};
+
+/**
+ * `POST /api/v1/secrets/{id}/credential` — pin a secret to a kind — answers `201`.
+ *
+ * `fields` is a `Record` on purpose: the five kinds want different field names, and a fixed shape
+ * would force a screen to know the union of all of them to send one.
+ */
+export function attachCredentialProfile(
+  secretId: string,
+  kind: string,
+  fields: Record<string, unknown>,
+): Promise<Credential> {
+  return request<Credential>(`/api/v1/secrets/${encodeURIComponent(secretId)}/credential`, {
+    method: "POST",
+    body: JSON.stringify({ kind, fields }),
+  });
+}
+
+/* ── credential slots (REQ-125) ──────────────────────────────────────────────────────────── */
+
+/** One slot's definition, independent of any scope. */
+export type SlotDef = {
+  slot: string;
+  description: string;
+  /** Which parts of the platform read this slot, so the cost of leaving it empty is legible. */
+  consumers: string;
+};
+
+/** One assignment row. */
+export type CredentialSlot = {
+  id: string;
+  scope_type: string;
+  scope_id: string;
+  slot: string;
+  description: string;
+  consumers: string;
+  primary_secret_id: string | null;
+  primary_name: string | null;
+  primary_version: number | null;
+  fallback_secret_id: string | null;
+  fallback_name: string | null;
+  fallback_version: number | null;
+  last_resolved_by: string | null;
+  last_resolved_at: string | null;
+  /** Why an empty slot is empty — "unassigned" is not an answer an operator can act on. */
+  empty_reason: string;
+};
+
+/** A credential that may be assigned to a slot. */
+export type AssignableCredential = {
+  id: string;
+  name: string;
+  kind: string;
+  read_only: boolean;
+  provider: string;
+};
+
+/** The slot matrix response. */
+export type SlotsResponse = {
+  slots: CredentialSlot[];
+  catalog: SlotDef[];
+  assignable: AssignableCredential[];
+  assigned: number;
+};
+
+/** What a consumer would actually get, without pretending to be one. */
+export type SlotResolution = {
+  scope_type: string;
+  scope_id: string;
+  slot: string;
+  secret_id: string;
+  name: string;
+  version: number;
+  /** `true` when the primary was unavailable and the fallback answered instead. */
+  fell_back: boolean;
+  summary: string;
+};
+
+/** `GET /api/v1/credential-slots` — the assignment matrix. */
+export function fetchSlots(): Promise<SlotsResponse> {
+  return request<SlotsResponse>("/api/v1/credential-slots");
+}
+
+/**
+ * `PUT /api/v1/credential-slots/{scope}/{slot}` — assign a scope's slot.
+ *
+ * `primary` and `fallback` are `string | null` rather than optional: passing `null` is how a slot
+ * is *cleared*, and omitting the argument is not the same intent. A slot that points at itself is
+ * refused by the API with `credential_slot_self_reference`, which belongs next to the field.
+ */
+export function assignSlot(
+  scopeType: string,
+  slot: string,
+  scopeId: string,
+  primary: string | null,
+  fallback: string | null,
+): Promise<CredentialSlot> {
+  return request<CredentialSlot>(
+    `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(slot)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        scope_id: scopeId,
+        primary_secret_id: primary,
+        fallback_secret_id: fallback,
+      }),
+    },
+  );
+}
+
+/** `GET /api/v1/credential-slots/{scope}/{slot}/resolve/{scope_id}` — show a resolution. */
+export function resolveSlot(
+  scopeType: string,
+  slot: string,
+  scopeId: string,
+): Promise<SlotResolution> {
+  return request<SlotResolution>(
+    `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(
+      slot,
+    )}/resolve/${encodeURIComponent(scopeId)}`,
+  );
+}
+
+/* ── leases and deployment keys (REQ-125) ───────────────────────────────────────────────── */
+
+/** One lease. A lease is a live copy of a credential, which is why it has a redemption budget. */
+export type SecretLease = {
+  id: string;
+  secret_id: string;
+  name: string;
+  consumer: string;
+  environment: string;
+  state: string;
+  max_uses: number;
+  uses: number;
+  expires_in_seconds: number;
+  expires_at: string;
+  issued_at: string;
+  revoked_at: string | null;
+  revoke_reason: string | null;
+  last_redeemed_at: string | null;
+  /**
+   * The address the last redemption came from.
+   *
+   * This is the column an operator reads to find a leak, and it is written by the redemption
+   * itself — a keyless loopback redemption writes no use-log row, so this is the only place the
+   * answer exists.
+   */
+  last_address: string | null;
+  deployment_key_id: string | null;
+  version: number;
+};
+
+/** The lease list response. */
+export type LeasesResponse = {
+  leases: SecretLease[];
+  total: number;
+  live: number;
+  spent: number;
+  revoked: number;
+  environments: string[];
+};
+
+/** `GET /api/v1/secret-leases`. */
+export function fetchSecretLeases(): Promise<LeasesResponse> {
+  return request<LeasesResponse>("/api/v1/secret-leases");
+}
+
+/**
+ * `POST /api/v1/secret-leases/{id}/revoke` — with a reason.
+ *
+ * The reason is mandatory in spirit and optional in shape because the API stores it either way;
+ * a bare "revoked" is not worth keeping, and the screen asks for it for that reason.
+ */
+export function revokeLease(id: string, reason: string): Promise<SecretLease> {
+  return request<SecretLease>(`/api/v1/secret-leases/${encodeURIComponent(id)}/revoke`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/** One deployment key, described without the key. */
+export type DeploymentKey = {
+  id: string;
+  name: string;
+  environment: string;
+  /** Credential scopes with a `prefix.*` wildcard — not permission names. */
+  scopes: string[];
+  state: string;
+  expires_at: string;
+  expires_in_seconds: number;
+  uses: number;
+  last_used_at: string | null;
+  allowed_ips: string[];
+  /** The visible prefix, so an operator can tell two keys apart without either of them. */
+  key_prefix: string;
+  fingerprint: string;
+  created_at: string;
+  revoked_at: string | null;
+  revoke_reason: string | null;
+  /** `false` while a key is live: a live key can only be revoked, not deleted. */
+  deletable: boolean;
+};
+
+/** The deployment key list response, with the header a caller must send. */
+export type DeploymentKeysResponse = {
+  keys: DeploymentKey[];
+  total: number;
+  active: number;
+  expired: number;
+  revoked: number;
+  header: string;
+  guidance: string;
+};
+
+/**
+ * The one response in this file that carries a value.
+ *
+ * The key is answered here, at creation, and nowhere else — not on the list, not on the detail,
+ * not in any store on this side. The name says so, so a reader can see the exception in the type.
+ */
+export type CreatedDeploymentKey = DeploymentKey & {
+  value: string;
+  header: string;
+};
+
+/** One use of a deployment key. */
+export type DeploymentKeyUse = {
+  action: string;
+  lease_id: string | null;
+  identity: string;
+  address: string | null;
+  result: string;
+  created_at: string;
+};
+
+/** The deployment key form's body. */
+export type DeploymentKeyInput = {
+  name: string;
+  environment: string;
+  scopes: string[];
+  /** RFC 3339. A backdated key is refused at creation — "dead on arrival" is caught early. */
+  expires_at: string;
+  allowed_ips?: string | null;
+};
+
+/** `GET /api/v1/deployment-keys`. */
+export function fetchDeploymentKeys(): Promise<DeploymentKeysResponse> {
+  return request<DeploymentKeysResponse>("/api/v1/deployment-keys");
+}
+
+/** `POST /api/v1/deployment-keys` — answers `201` and the value, exactly once. */
+export function createDeploymentKey(input: DeploymentKeyInput): Promise<CreatedDeploymentKey> {
+  return request<CreatedDeploymentKey>("/api/v1/deployment-keys", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `POST /api/v1/deployment-keys/{id}/revoke` — answers `204`. */
+export function revokeDeploymentKey(id: string, reason: string): Promise<null> {
+  return request<null>(`/api/v1/deployment-keys/${encodeURIComponent(id)}/revoke`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/** `DELETE /api/v1/deployment-keys/{id}` — a revoked key's record; answers `204`. */
+export function deleteDeploymentKey(id: string): Promise<null> {
+  return request<null>(`/api/v1/deployment-keys/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+/** `GET /api/v1/deployment-keys/{id}/uses` — the use log, as a bare array. */
+export function fetchDeploymentKeyUses(id: string): Promise<DeploymentKeyUse[]> {
+  return request<DeploymentKeyUse[]>(
+    `/api/v1/deployment-keys/${encodeURIComponent(id)}/uses`,
+  );
+}
+
+/* ── the secrets audit trail and its detectors (REQ-125) ─────────────────────────────────── */
+
+/** The audit filter. `undefined` means "no filter", never "match nothing". */
+export type SecretAuditFilter = {
+  actions?: string[];
+  secret_id?: string;
+  actor_user_id?: string;
+  address?: string;
+  request_id?: string;
+  since?: string;
+  limit?: number;
+};
+
+/** One trail entry. Metadata is a `Record` because each action documents different fields. */
+export type SecretAuditEntry = {
+  id: number;
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  actor_user_id: string | null;
+  /** `user`, `deployment_key` or `system` — who acted is never inferred from the row. */
+  actor_type: string;
+  ip_address: string | null;
+  request_id: string | null;
+  lease_id: string | null;
+  deployment_key_id: string | null;
+  /** Which lifecycle the action belongs to, for the filter chips. */
+  pipeline: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+/** One flag a detector raised. Flags are advisory: acknowledging one deletes nothing. */
+export type SecretAnomaly = {
+  id: number;
+  pattern: string;
+  severity: string;
+  secret_id: string | null;
+  secret_name: string | null;
+  actor_user_id: string | null;
+  address: string | null;
+  detail: Record<string, unknown>;
+  request_id: string | null;
+  created_at: string;
+  acknowledged: boolean;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+};
+
+/** The audit response. */
+export type SecretAuditResponse = {
+  entries: SecretAuditEntry[];
+  open_anomalies: number;
+  filters: string[];
+  detectors: {
+    business_hours_start: number;
+    business_hours_end: number;
+    reveal_burst_per_hour: number;
+    detect_new_network: boolean;
+    /** `true` when the platform refuses a reveal outright, not merely flags it. */
+    hard_rule_enforced: boolean;
+    explanation: string;
+  };
+  local_hour: number;
+};
+
+/** `GET /api/v1/secrets/audit`. */
+export function fetchSecretAudit(filter: SecretAuditFilter = {}): Promise<SecretAuditResponse> {
+  const query = new URLSearchParams();
+  // The API accepts `?action=a&action=b` for the multi-select; a repeated key is the only
+  // encoding that carries a list without inventing an envelope the server does not have.
+  for (const action of filter.actions ?? []) query.append("action", action);
+  for (const [key, value] of [
+    ["secret_id", filter.secret_id],
+    ["actor_user_id", filter.actor_user_id],
+    ["address", filter.address],
+    ["request_id", filter.request_id],
+    ["since", filter.since],
+    ["limit", filter.limit],
+  ] as const) {
+    if (value === undefined || value === null || value === "") continue;
+    query.set(key, String(value));
+  }
+  const suffix = query.toString();
+  return request<SecretAuditResponse>(`/api/v1/secrets/audit${suffix ? `?${suffix}` : ""}`);
+}
+
+/** `GET /api/v1/secrets/audit/anomalies` — the flags, unacknowledged first. */
+export function fetchSecretAnomalies(): Promise<{ anomalies: SecretAnomaly[] }> {
+  return request<{ anomalies: SecretAnomaly[] }>("/api/v1/secrets/audit/anomalies");
+}
+
+/**
+ * `PATCH /api/v1/secrets/audit/anomalies/{id}/acknowledge` — clear one flag.
+ *
+ * The answer distinguishes "cleared" from "already cleared", because a second click on an
+ * acknowledged row is a normal thing to do and should say so rather than report a change that did
+ * not happen.
+ */
+export function acknowledgeSecretAnomaly(
+  id: number,
+): Promise<{ state: "acknowledged" | "already_acknowledged"; id: number }> {
+  return request<{ state: "acknowledged" | "already_acknowledged"; id: number }>(
+    `/api/v1/secrets/audit/anomalies/${id}/acknowledge`,
+    { method: "PATCH", body: JSON.stringify({}) },
+  );
+}
+
+/**
+ * `GET /api/v1/secrets/audit/export` — the SIEM feed, as **text**.
+ *
+ * This is the one call here that does not go through `request()`: the endpoint answers
+ * newline-delimited JSON, not a JSON document, and running it through the JSON reader would turn
+ * a real export into `null`. A read is still audited by the server, and the read itself is
+ * therefore an event an operator can find in the trail.
+ */
+export async function downloadSecretAuditExport(filter: SecretAuditFilter = {}): Promise<string> {
+  const query = new URLSearchParams();
+  for (const action of filter.actions ?? []) query.append("action", action);
+  for (const [key, value] of [
+    ["secret_id", filter.secret_id],
+    ["actor_user_id", filter.actor_user_id],
+    ["address", filter.address],
+    ["request_id", filter.request_id],
+    ["limit", filter.limit],
+  ] as const) {
+    if (value === undefined || value === null || value === "") continue;
+    query.set(key, String(value));
+  }
+  const suffix = query.toString();
+  const response = await fetch(
+    `/api/v1/secrets/audit/export${suffix ? `?${suffix}` : ""}`,
+    { credentials: "same-origin", headers: { accept: "application/x-ndjson" } },
+  );
+  if (!response.ok) {
+    // Shaped like every other refusal so the screen's error path needs no second code path.
+    const body = (await readJson(response)) as ErrorBody;
+    throw new ApiError(
+      response.status,
+      body.error?.code ?? "unknown_error",
+      body.error?.message ?? `The export failed with status ${response.status}.`,
+      body.error?.details ?? null,
+    );
+  }
+  return response.text();
+}
+
+/* ── the root key and its rewrap jobs (REQ-125) ──────────────────────────────────────────── */
+
+/** One key version. A fingerprint, never material. */
+export type RootKey = {
+  key_id: string;
+  status: string;
+  fingerprint: string;
+  version_count: number;
+  created_at: string;
+  retired_at: string | null;
+  retired_reason: string | null;
+};
+
+/** Whether the sealed versions can still be opened, and what to do when they cannot. */
+export type RootKeySeal = {
+  healthy: boolean;
+  sealed: number;
+  /** `(key_id, source)` pairs: which key and which file refused to unseal. */
+  unsealed: [string, string][];
+  source: string | null;
+  guidance: string;
+};
+
+/** One rewrap job — the ceremony that moves sealed versions onto a new key. */
+export type RewrapJob = {
+  id: string;
+  status: string;
+  from_key_id: string;
+  to_key_id: string;
+  rewrapped_count: number;
+  total_count: number;
+  /** 0..1. A job that paused reports its progress so the screen can say how far it got. */
+  progress: number;
+  resume_note: string | null;
+  pause_reason: string | null;
+  last_error: string | null;
+  started_at: string;
+  completed_at: string | null;
+};
+
+/** The whole root-key state, as one read. */
+export type RootKeyState = {
+  keys: RootKey[];
+  seal: RootKeySeal;
+  /** The job in flight, if any. */
+  job: RewrapJob | null;
+  recent_jobs: RewrapJob[];
+  versions_to_rewrap: number;
+  has_active_key: boolean;
+};
+
+/** `GET /api/v1/secrets/root-key`. */
+export function fetchRootKeyState(): Promise<RootKeyState> {
+  return request<RootKeyState>("/api/v1/secrets/root-key");
+}
+
+/** `POST /api/v1/secrets/root-key/rotate` — start the ceremony. */
+export function rotateRootKey(): Promise<RewrapJob> {
+  return request<RewrapJob>("/api/v1/secrets/root-key/rotate", { method: "POST" });
+}
+
+/** `POST /api/v1/secrets/root-key/rewrap-jobs/{id}/pause`. */
+export function pauseRewrapJob(id: string): Promise<RewrapJob> {
+  return request<RewrapJob>(
+    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}/pause`,
+    { method: "POST" },
+  );
+}
+
+/** `POST /api/v1/secrets/root-key/rewrap-jobs/{id}/resume`. */
+export function resumeRewrapJob(id: string): Promise<RewrapJob> {
+  return request<RewrapJob>(
+    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}/resume`,
+    { method: "POST" },
+  );
+}
 // Security centre (REQ-012, slice 2) — the header policy
 // ---------------------------------------------------------------------------------------------
 
@@ -5719,6 +6712,316 @@ export function saveBackupSettings(input: {
   });
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// REQ-127 — the platform-wide rate limiter (slice 1)
+//
+// Every function here talks to `/api/v1/reliability/rate-limits/*`, which is a DIFFERENT surface
+// from `/api/v1/security/rate-limits`: the security one is the gateway's per-route document
+// (REQ-040) and the reliability one is the platform-wide budgets (user / organization / IP /
+// route). Both can refuse the same caller, so both exist, and every refusal the reliability
+// layer writes names which of the two answered.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One policy, in resolution order, with the ceiling already added.
+ *
+ * `enforced_here` is the field that stops a stored-but-unspent row from reading as protection:
+ * a `route`-scoped policy is stored and listed, but the platform limiter runs before the router
+ * publishes a matched route and has no template to match on, so the panel says so on the row
+ * rather than leaving the operator to find out from a caller that was never refused.
+ */
+export interface ReliabilityPolicy {
+  id: string | null;
+  name: string;
+  scope: string;
+  target_id: string | null;
+  route_pattern: string | null;
+  limit_count: number;
+  window_seconds: number;
+  burst: number;
+  /** `limit_count + burst`, computed by the API so a table never makes the reader add it up. */
+  ceiling: number;
+  priority: number;
+  is_default: boolean;
+  enabled: boolean;
+  enforced_here: boolean;
+}
+
+/** The policy list: the rows, the scope vocabulary and this deployment's failure mode. */
+export interface ReliabilityPolicies {
+  policies: ReliabilityPolicy[];
+  vocabulary: string[];
+  limiter: string;
+  /** Whether an unreadable counter fails open (availability) or closed (protection). */
+  fail_mode: string;
+}
+
+/** A write. The API owns every range; the client sends numbers and shows what came back. */
+export interface ReliabilityPolicyInput {
+  name: string;
+  scope: string;
+  target_id?: string | null;
+  route_pattern?: string | null;
+  limit_count: number;
+  window_seconds: number;
+  burst?: number;
+  priority?: number;
+  enabled?: boolean;
+}
+
+/** The dry-run's input: the same four facts the middleware reads off a request. */
+export interface ReliabilityEvaluateInput {
+  scope?: string | null;
+  user_id?: string | null;
+  ip?: string | null;
+  route?: string | null;
+  /** The counter to assume, for explaining a refusal a caller is already seeing. */
+  count?: number | null;
+}
+
+/**
+ * The dry-run's verdict, as the API's `Verdict` enum actually serialises: an externally tagged
+ * enum, so the variant is the KEY and its fields are the value.
+ *
+ * It is an enum rather than a flat answer because the four shapes are genuinely different and a
+ * client-side "allowed + remaining" collapses the two that matter:
+ *
+ * - `Unlimited` — no policy applies. The request proceeds and there is **no budget number at
+ *   all**; rendering it as "0 remaining" sends an operator hunting for a policy that does not
+ *   exist.
+ * - `Uncounted` — a policy applies, the counter was unreadable, the deployment fails **open**.
+ *   The request proceeds and nothing was counted, so `remaining` is absent on purpose: a number
+ *   here would be a measurement nobody took.
+ * - `RefusedUncounted` — the same outage with the deployment failing **closed**. Refused, with
+ *   no `retry_after`, because a wait the platform cannot compute is not a promise.
+ * - `Allowed` / `Limited` — the two answers that carry a real measurement, and the only two the
+ *   middleware is allowed to write `X-RateLimit-*` headers for.
+ */
+/**
+ * The dry-run's verdict, as the API's `Verdict` actually serialises.
+ *
+ * It is `#[serde(tag = "decision", rename_all = "snake_case")]` — internally tagged, so every
+ * variant carries a `decision` KEY with the variant name in snake_case, and the variant's own
+ * fields sit alongside it. A client written against serde's *external* tagging (the variant as
+ * the key) parses nothing here, and nothing about the response looks wrong: every field is
+ * simply `undefined`.
+ *
+ * It is an enum rather than a flat answer because the five shapes are genuinely different and a
+ * client-side "allowed + remaining" collapses the two that matter:
+ *
+ * - `unlimited` — no policy applies. The request proceeds and there is **no budget number at
+ *   all**; rendering it as "0 remaining" sends an operator hunting for a policy that does not
+ *   exist.
+ * - `uncounted` — a policy applies, the counter was unreadable, the deployment fails **open**.
+ *   The request proceeds and nothing was counted, so `remaining` is absent on purpose: a number
+ *   here would be a measurement nobody took.
+ * - `refused_uncounted` — the same outage failing **closed**. Refused, with no `retry_after`,
+ *   because a wait the platform cannot compute is not a promise.
+ * - `allowed` / `limited` — the two answers that carry a real measurement, and the only two the
+ *   middleware is allowed to write `X-RateLimit-*` headers for.
+ */
+export interface ReliabilityVerdictBase {
+  decision: "allowed" | "limited" | "unlimited" | "uncounted" | "refused_uncounted";
+  policy_id: string | null;
+  /** Which scope answered, or `null` when no policy matched at all. */
+  scope: string | null;
+  /** Requests left in the window. Present only on the two answers with a real measurement. */
+  remaining?: number;
+  limit?: number;
+  ceiling?: number;
+  retry_after?: number;
+}
+
+export type ReliabilityVerdict = ReliabilityVerdictBase;
+
+/** The variant name, which is what the screen renders and what a test asserts on. */
+export function reliabilityVerdictKind(verdict: ReliabilityVerdict): string {
+  return verdict?.decision ?? "unknown";
+}
+
+export interface ReliabilityEvaluated {
+  policy: ReliabilityPolicy | null;
+  verdict: ReliabilityVerdict;
+  counted: { count: number; authoritative: boolean };
+  window_start: string | null;
+  counter_key: string | null;
+  fail_mode: string;
+}
+
+/** One refusal rollup: a scope, a route and one window. */
+export interface ReliabilityRefusal {
+  scope: string;
+  target_id: string | null;
+  route: string;
+  window_start: string;
+  refusals: number;
+  last_refusal_at: string;
+}
+
+export interface ReliabilityRefusals {
+  refusals: ReliabilityRefusal[];
+  last_24_hours: number;
+}
+
+/**
+ * The policies, in the order the resolver walks them.
+ *
+ * `no-store`: a cached table is a screen that says "600 per minute" while the platform enforces
+ * something else, and the whole value of the screen is that the two agree.
+ */
+export function fetchReliabilityPolicies(): Promise<ReliabilityPolicies> {
+  return request<ReliabilityPolicies>("/api/v1/reliability/rate-limits", { cache: "no-store" });
+}
+
+/** Create a policy. The body never carries an id — the route decides which row it writes. */
+export function createReliabilityPolicy(
+  input: ReliabilityPolicyInput,
+): Promise<ReliabilityPolicy> {
+  return request<ReliabilityPolicy>("/api/v1/reliability/rate-limits", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Edit a policy. A default row is edited in place; deleting one disables it instead. */
+export function updateReliabilityPolicy(
+  id: string,
+  input: ReliabilityPolicyInput,
+): Promise<ReliabilityPolicy> {
+  return request<ReliabilityPolicy>(`/api/v1/reliability/rate-limits/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Remove a custom policy.
+ *
+ * A default row is **disabled, not removed** — the shipped budgets are the document that
+ * protects a deployment nobody has configured yet, and a delete that dropped them would turn an
+ * install with no configuration into one with no protection. The API reports which it did.
+ */
+export function deleteReliabilityPolicy(
+  id: string,
+): Promise<{ id: string; disabled: boolean; message: string }> {
+  return request<{ id: string; disabled: boolean; message: string }>(
+    `/api/v1/reliability/rate-limits/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * Dry-run one request through the limiter.
+ *
+ * A **server** call on purpose: the acceptance criterion is that the tool names the same policy
+ * the middleware resolves, and only the server holds that resolver. A client-side reimplementation
+ * agrees on the day it is written and drifts the first time somebody tunes a limit — which is
+ * the day somebody is relying on it. It also does not spend the budget it measures.
+ */
+export function evaluateReliabilityLimit(
+  input: ReliabilityEvaluateInput,
+): Promise<ReliabilityEvaluated> {
+  return request<ReliabilityEvaluated>("/api/v1/reliability/rate-limits/evaluate", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** The refusal rollups — one row per scope, route and window, never one per request. */
+export function fetchReliabilityRefusals(limit = 50): Promise<ReliabilityRefusals> {
+  return request<ReliabilityRefusals>(
+    `/api/v1/reliability/rate-limits/refusals?limit=${encodeURIComponent(String(limit))}`,
+    { cache: "no-store" },
+  );
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// REQ-127 — the keyed-write ledger (slice 2)
+//
+// Every function here talks to `/api/v1/reliability/idempotency/*`. The read routes are the
+// caller's OWN keys: a key is `(scope, subject, key)`, so "the key abc" is one row per subject
+// and the screen shows the account that is signed in, never the platform's table.
+//
+// The detail route returns stored-response METADATA and never the body — that is the API's
+// contract, not a client choice, and the type below has no body field so that a future edit
+// cannot quietly add one.
+// ---------------------------------------------------------------------------------------------
+
+/** One key as the ledger lists it. `has_response` is not the same as being `completed`. */
+export interface IdempotencyKey {
+  key: string;
+  scope: string;
+  state: string;
+  replay_count: number;
+  expires_at: string;
+  completed_at: string | null;
+  has_response: boolean;
+}
+
+/** The list, with the two counts the header tiles read. */
+export interface IdempotencyKeys {
+  keys: IdempotencyKey[];
+  total: number;
+  in_progress: number;
+  state_filter: string | null;
+}
+
+/**
+ * One key's stored-response metadata.
+ *
+ * There is no `response_body` field, and that omission is the reason the request is phrased as
+ * "metadata": the store must never become a second request archive, so a read route that handed
+ * back a write's payload would be the archive.
+ */
+export interface IdempotencyKeyDetail {
+  key: string;
+  scope: string;
+  state: string;
+  method: string;
+  path: string;
+  response_status: number | null;
+  stored_body: boolean;
+  stored_body_bytes: number | null;
+  inline_cap_bytes: number;
+  response_body_ref: string | null;
+  replay_count: number;
+  original_request_id: string | null;
+  created_expires_at: string;
+  completed_at: string | null;
+  next_attempt: string;
+}
+
+/** The release answer: what happened, in the API's words, so the notice is not invented. */
+export interface IdempotencyReleased {
+  key: string;
+  scope: string;
+  state: string;
+  released: boolean;
+  message: string;
+}
+
+/**
+ * The caller's keys, newest first.
+ *
+ * `no-store`, and the state filter is a QUERY parameter rather than a client-side filter: the
+ * tile next to the list says how many are stuck, and that number has to come from the same
+ * filtered read the table is showing or the two disagree the moment the page is more than one
+ * window old.
+ */
+export function fetchIdempotencyKeys(options: {
+  state?: string | null;
+  limit?: number;
+} = {}): Promise<IdempotencyKeys> {
+  const params = new URLSearchParams();
+  if (options.state) params.set("state", options.state);
+  params.set("limit", String(options.limit ?? 100));
+  return request<IdempotencyKeys>(`/api/v1/reliability/idempotency?${params.toString()}`, {
+    cache: "no-store",
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // System health (REQ-014).
 //
@@ -5748,11 +7051,181 @@ export function runHealthChecks(): Promise<HealthOverview> {
   });
 }
 
+/** One key's metadata. Metadata only — the body is not on this surface. */
+export function fetchIdempotencyKey(key: string): Promise<IdempotencyKeyDetail> {
+  return request<IdempotencyKeyDetail>(
+    `/api/v1/reliability/idempotency/${encodeURIComponent(key)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Release a stuck `in_progress` key so the next attempt of that write runs again.
+ *
+ * The reason is not optional: the API refuses an empty one, and a release with nobody to explain
+ * it is a release nobody can audit. The screen asks for it in a dialog rather than defaulting it.
+ */
+export function releaseIdempotencyKey(
+  key: string,
+  reason: string,
+): Promise<IdempotencyReleased> {
+  return request<IdempotencyReleased>(
+    `/api/v1/reliability/idempotency/${encodeURIComponent(key)}`,
+    { method: "DELETE", body: JSON.stringify({ reason }) },
+  );
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// REQ-127 — retry policies, the attempt ledger and the outbound breakers (slice 3)
+// ---------------------------------------------------------------------------------------------
+//
+// Every function here talks to `/api/v1/reliability/retry-*` and `/api/v1/reliability/breakers`.
+//
+// Two shapes in this file are NOT interchangeable and the screens must not blur them:
+//
+// - `delay_preview` is the policy's **ceiling** curve (the server computed it with draw = 1.0).
+//   With `full` jitter the real delay is a random point at or below it. Rendering it as "the
+//   schedule" would promise timings the platform does not keep, so the screens label it as the
+//   worst case.
+// - `stored: false` means the subsystem has no row and the shipped in-process default is in
+//   force. It is NOT an unconfigured subsystem, and treating it as one is how an operator
+//   deletes a policy that was never written.
+
+export interface ReliabilityRetryPolicy {
+  subsystem: string;
+  /** `null` for the subsystem default; a provider's name for an override. */
+  provider_override: string | null;
+  max_attempts: number;
+  base_delay_ms: number;
+  factor: number;
+  jitter: string;
+  max_elapse_ms: number;
+  retry_on: string[];
+  enabled: boolean;
+  /** Whether a row exists, as opposed to the shipped default being in force. */
+  stored: boolean;
+  /** The ceiling curve for attempts 1-8. A real delay is at or below this, never above. */
+  delay_preview: number[];
+  /** The cumulative preview runs past the policy's own elapsed budget. */
+  exceeds_budget: boolean;
+}
+
+export interface ReliabilityRetryPolicies {
+  policies: ReliabilityRetryPolicy[];
+  subsystems: string[];
+  jitter_modes: string[];
+}
+
+export interface ReliabilityRetryPolicyInput {
+  provider_override?: string | null;
+  max_attempts: number;
+  base_delay_ms: number;
+  factor: number;
+  jitter: string;
+  max_elapse_ms: number;
+  retry_on?: string[];
+  enabled?: boolean;
+}
+
+/** One attempt row of the ledger. `next_attempt_at` is what a restarted worker reads. */
+export interface ReliabilityAttempt {
+  id: number;
+  subsystem: string;
+  subject_kind: string;
+  subject_id: string | null;
+  attempt: number;
+  scheduled_at: string | null;
+  executed_at: string | null;
+  outcome: string;
+  error_class: string | null;
+  next_delay_ms: number | null;
+  dead_letter: boolean;
+  next_attempt_at: string | null;
+  created_at: string;
+}
+
+export interface ReliabilityAttempts {
+  attempts: ReliabilityAttempt[];
+  dead_letters: ReliabilityAttempt[];
+  /** How many sequences are owed an attempt right now — the scheduler's own predicate. */
+  due_now: number;
+  /** Named so the counter can be traced to the worklist that spends it. */
+  scheduler: string;
+  subsystems: string[];
+}
+
+export interface ReliabilityBreaker {
+  key: string;
+  name: string;
+  state: string;
+  forced_open: boolean;
+  failure_threshold: number;
+  window_seconds: number;
+  cooldown_seconds: number;
+  half_open_probes: number;
+  success_threshold: number;
+  failures_in_window: number;
+  successes_in_half_open: number;
+  trips_total: number;
+  opened_at: string | null;
+  state_changed_at: string;
+  /** Seconds until a probe is allowed; `null` while held open deliberately. */
+  retry_after: number | null;
+}
+
+export interface ReliabilityBreakerEvent {
+  id: number;
+  key: string;
+  from_state: string;
+  to_state: string;
+  reason: string | null;
+  failure_rate: number | null;
+  created_at: string;
+}
+
+export interface ReliabilityBreakers {
+  breakers: ReliabilityBreaker[];
+  state_counts: [string, number][];
+  states: string[];
+  recent_events: ReliabilityBreakerEvent[];
+}
+
+export function fetchReliabilityRetryPolicies(): Promise<ReliabilityRetryPolicies> {
+  return request<ReliabilityRetryPolicies>("/api/v1/reliability/retry-policies", {
+    cache: "no-store",
+  });
+}
+
 /** One service, with the checks it ran and the metrics it has published. */
 export function fetchHealthService(key: string): Promise<HealthServiceDetail> {
   return request<HealthServiceDetail>(`/api/v1/health/services/${encodeURIComponent(key)}`, {
     cache: "no-store",
   });
+}
+
+/**
+ * Save a subsystem policy or one provider's override.
+ *
+ * `PUT` on `(subsystem, provider_override)`, which is the table's uniqueness constraint — so this
+ * creates on the first call and replaces on the second, and a double-click cannot produce two
+ * competing rows.
+ */
+export function saveReliabilityRetryPolicy(
+  subsystem: string,
+  input: ReliabilityRetryPolicyInput,
+): Promise<ReliabilityRetryPolicy> {
+  return request<ReliabilityRetryPolicy>(
+    `/api/v1/reliability/retry-policies/${encodeURIComponent(subsystem)}`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+export function fetchReliabilityAttempts(limit = 50): Promise<ReliabilityAttempts> {
+  return request<ReliabilityAttempts>(
+    `/api/v1/reliability/retry-attempts?limit=${encodeURIComponent(String(limit))}`,
+    { cache: "no-store" },
+  );
 }
 
 /**
@@ -5767,6 +7240,7 @@ export function fetchHealthService(key: string): Promise<HealthServiceDetail> {
  * the same window with two spellings, and the second one travels into the CSV
  * filename, so there must be exactly one.
  */
+
 export function fetchHealthSamples(
   service: string,
   metric: string,
@@ -5806,6 +7280,234 @@ export function fetchHealthMetrics(
   return request<HealthMetricsReport>(
     `/api/v1/health/metrics?range=${encodeURIComponent(range)}`,
     { cache: "no-store" },
+  );
+}
+
+/**
+ * Requeue one dead letter.
+ *
+ * The API **appends** an attempt rather than clearing the flag, so the failure stays in the
+ * timeline an operator reads afterwards. The screens must not claim the row is "fixed" — it is
+ * requeued, and the original failure is still there by design.
+ */
+export function retryNow(id: number): Promise<ReliabilityAttempt> {
+  return request<ReliabilityAttempt>(
+    `/api/v1/reliability/retry-attempts/${encodeURIComponent(String(id))}/retry-now`,
+    { method: "POST" },
+  );
+}
+
+export function fetchReliabilityBreakers(): Promise<ReliabilityBreakers> {
+  return request<ReliabilityBreakers>("/api/v1/reliability/breakers", { cache: "no-store" });
+}
+
+/**
+ * Retune a breaker's thresholds.
+ *
+ * Every field is optional: the form sends what the operator changed, and a `PATCH` that sent
+ * the whole row would overwrite a threshold somebody else moved while the form was open.
+ */
+export function updateReliabilityBreaker(
+  key: string,
+  input: Partial<
+    Pick<
+      ReliabilityBreaker,
+      | "name"
+      | "failure_threshold"
+      | "window_seconds"
+      | "cooldown_seconds"
+      | "half_open_probes"
+      | "success_threshold"
+    >
+  >,
+): Promise<ReliabilityBreaker> {
+  return request<ReliabilityBreaker>(
+    `/api/v1/reliability/breakers/${encodeURIComponent(key)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/**
+ * Close a breaker by hand. The reason is required by the API and asked for in the dialog.
+ *
+ * A reset clears `forced_open` as well as `state` — the two are separate columns, and a breaker
+ * that renders `closed` while the flag is set would refuse every call while looking healthy.
+ */
+export function resetReliabilityBreaker(
+  key: string,
+  reason: string,
+): Promise<ReliabilityBreaker> {
+  return request<ReliabilityBreaker>(
+    `/api/v1/reliability/breakers/${encodeURIComponent(key)}/reset`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
+
+/** Drain a provider until somebody says otherwise: the flag outranks the cooldown. */
+export function forceOpenReliabilityBreaker(
+  key: string,
+  reason: string,
+): Promise<ReliabilityBreaker> {
+  return request<ReliabilityBreaker>(
+    `/api/v1/reliability/breakers/${encodeURIComponent(key)}/force-open`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
+
+// Every function here talks to `/api/v1/reliability/intake` and `/api/v1/reliability/intake/*`
+// (REQ-127, slice 4). The screen is the one an integrator opens after a provider says `401` and
+// the platform says the signature is invalid, so three shapes in this block are NOT
+// interchangeable and the UI must not blur them:
+//
+// - `has_secret: true` with a `secret_id` is a **reference**, never a value. Nothing in this
+//   file can return a signing key, because nothing in the API can: a client that could show the
+//   key is a client every future bug in this area can exfiltrate through.
+// - `reason_counts` is the whole-table rollup and the `rejections` list is one page of it. They
+//   are rendered from the same call so a chip can never claim a different number than the log
+//   beneath it — a screen where those two disagree sends the operator to the wrong filter.
+// - `detail` on a `SampleVerdict` is a sentence written for a person. It never carries the
+//   payload and never carries the secret, and that is a property of the route rather than a
+//   promise this client makes.
+
+export interface ReliabilityIntakeEndpoint {
+  id: string;
+  path: string;
+  name: string;
+  hmac_scheme: string;
+  signature_header: string;
+  timestamp_header: string | null;
+  tolerance_seconds: number;
+  secret_id: string | null;
+  /** Whether a secret is referenced. The VALUE is never on this surface. */
+  has_secret: boolean;
+  max_payload_bytes: number;
+  sanitize_profile: string;
+  enabled: boolean;
+  created_at: string;
+  rejection_count: number;
+  last_rejection_at: string | null;
+}
+
+export interface ReliabilityIntake {
+  endpoints: ReliabilityIntakeEndpoint[];
+  schemes: string[];
+  profiles: string[];
+  reasons: string[];
+  reason_counts: [string, number][];
+}
+
+export interface ReliabilityIntakeRejection {
+  id: number;
+  endpoint_id: string | null;
+  /** The declared path, resolved on read so a renamed endpoint does not orphan its log. */
+  path: string | null;
+  reason: string;
+  source_ip: string | null;
+  request_id: string | null;
+  body_bytes: number;
+  created_at: string;
+}
+
+export interface ReliabilityIntakeSample {
+  valid: boolean;
+  /** One of the declared reasons, or `null` for an accepted sample. */
+  reason: string | null;
+  detail: string;
+  /** What the sanitisation pass would change, or `null` when the sample was refused first. */
+  changes: string[] | null;
+  body_bytes: number;
+}
+
+export function fetchReliabilityIntake(): Promise<ReliabilityIntake> {
+  return request<ReliabilityIntake>("/api/v1/reliability/intake", { cache: "no-store" });
+}
+
+export function fetchReliabilityIntakeRejections(params: {
+  endpointId?: string;
+  reason?: string;
+  limit?: number;
+}): Promise<{ rejections: ReliabilityIntakeRejection[]; reasons: string[] }> {
+  const query = new URLSearchParams();
+  if (params.endpointId) query.set("endpoint_id", params.endpointId);
+  if (params.reason) query.set("reason", params.reason);
+  if (params.limit) query.set("limit", String(params.limit));
+  const suffix = query.toString();
+  return request<{ rejections: ReliabilityIntakeRejection[]; reasons: string[] }>(
+    `/api/v1/reliability/intake/rejections${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/** Declare a path. The only fields required are the ones the guard cannot default. */
+export function createReliabilityIntakeEndpoint(input: {
+  path: string;
+  name: string;
+  hmac_scheme: string;
+  signature_header: string;
+  timestamp_header?: string | null;
+  tolerance_seconds?: number;
+  secret_id?: string | null;
+  max_payload_bytes?: number;
+  sanitize_profile?: string;
+  enabled?: boolean;
+}): Promise<ReliabilityIntakeEndpoint> {
+  return request<ReliabilityIntakeEndpoint>("/api/v1/reliability/intake", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Every field is optional, so the form sends what changed and nothing else. */
+export function updateReliabilityIntakeEndpoint(
+  id: string,
+  input: Partial<{
+    path: string;
+    name: string;
+    hmac_scheme: string;
+    signature_header: string;
+    timestamp_header: string | null;
+    tolerance_seconds: number;
+    secret_id: string | null;
+    max_payload_bytes: number;
+    sanitize_profile: string;
+    enabled: boolean;
+  }>,
+): Promise<ReliabilityIntakeEndpoint> {
+  return request<ReliabilityIntakeEndpoint>(
+    `/api/v1/reliability/intake/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/**
+ * Remove a declaration. The reason is required by the API and by the dialog: removing a
+ * declaration turns a guarded door into an open one, and that is a change somebody reading the
+ * audit log has to be able to explain.
+ */
+export function deleteReliabilityIntakeEndpoint(
+  id: string,
+  reason: string,
+): Promise<void> {
+  return request<void>(`/api/v1/reliability/intake/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/**
+ * Ask the platform whether a signature is right.
+ *
+ * This is the SAME guard the request path runs — that is the entire value of the action, and it
+ * is why the client sends the payload to the server rather than computing an HMAC in the
+ * browser. A tester that verifies locally would need the secret in the browser.
+ */
+export function verifyReliabilityIntakeSample(
+  id: string,
+  input: { payload: string; signature: string },
+): Promise<ReliabilityIntakeSample> {
+  return request<ReliabilityIntakeSample>(
+    `/api/v1/reliability/intake/${encodeURIComponent(id)}/verify-sample`,
+    { method: "POST", body: JSON.stringify(input) },
   );
 }
 

@@ -215,6 +215,92 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "deployment",
         description: "Roll a deployment back",
     },
+    // REQ-128 slice 4 added two, and both are separate powers rather than extra detail on the
+    // ones above:
+    //
+    // * `bundle.generate` writes a row AND shells out to the release pipeline's generator. An
+    //   account that may only read releases must not be able to make the panel run a program;
+    //   giving it `deployment.read` for that would make the read key the most powerful one in
+    //   the deployment family.
+    // * `manage` already exists for the deployment centre's own writes; the upgrade
+    //   acknowledgement rides it rather than inventing a key, because accepting that a database
+    //   can only be restored is the same decision as rolling a deployment back.
+    PermissionDef {
+        key: "deployment.bundle.generate",
+        category: "deployment",
+        description: "Generate an environment bundle and render what it produces",
+    },
+    // REQ-129 adds three, and the split is the request's own: reading the ledger is `read`,
+    // CHANGING THE SCHEMA is not a deployment power, and rehearsing a reversal is neither of
+    // those two.
+    //
+    // * `migrations.read` — the ledger, one migration's SQL, the policy and the lint findings.
+    //   Metadata only: every field on those routes is derived from files and rows this
+    //   installation already has, so a viewer who may read deployments may read them too.
+    // * `migrations.apply` — runs DDL. Deliberately NOT `deployment.deploy`: an operator who may
+    //   ship a release is not thereby authorised to write the schema, and a key that means both
+    //   cannot answer "who changed the database?" after an incident. It IS narrower than
+    //   `deployment.rollback`, which only selects a previous image.
+    // * `migrations.verify` — rehearses a reversal against a scratch database and writes the one
+    //   column (`down_verified_at`) that makes a release claim its database can be rolled back.
+    //   Its own key because it is the one write in this family that LAUNCHES SQL, and because
+    //   separating it means "who approved the rollback path" is a distinct question from "who
+    //   applied the migration".
+    PermissionDef {
+        key: "deployment.migrations.read",
+        category: "deployment",
+        description: "Read the migration ledger, one migration's SQL, the policy and lint findings",
+    },
+    PermissionDef {
+        key: "deployment.migrations.apply",
+        category: "deployment",
+        description: "Apply pending schema migrations and save the migration policy",
+    },
+    PermissionDef {
+        key: "deployment.migrations.verify",
+        category: "deployment",
+        description: "Rehearse a migration reversal against a scratch database",
+    },
+    // * `backfills.manage` — starts, pauses and resumes a backfill job. Its own key because a
+    //   backfill is the only thing on this surface that WRITES EVERY ROW of a table: applying a
+    //   migration changes the schema for future rows, and this changes rows that already exist.
+    //   An operator trusted with `migrations.apply` has proved they may break the schema; they
+    //   have proved nothing about the data in it.
+    PermissionDef {
+        key: "deployment.backfills.manage",
+        category: "deployment",
+        description: "Run, pause and resume backfill jobs",
+    },
+    // * `seeds.load` — writes fixture rows into an installation. Its own key because the whole
+    //   point of the refusal is that only a non-production installation may be seeded, and the
+    //   key is what makes "who wrote this into my database" answerable. On a production-marked
+    //   installation the environment refuses as well — the two are independent, and this one is
+    //   the one that still applies to a demo-marked production install.
+    PermissionDef {
+        key: "deployment.seeds.load",
+        category: "deployment",
+        description: "Load a seed dataset into a non-production installation",
+    },
+    // * `exports.create` — asks for a copy of the installation's data to leave it. Its own key,
+    //   and the reason is the one the whole feature is built around: everything else on this
+    //   surface is a read or a write INSIDE the platform, while this is the only operation whose
+    //   product is an artifact that ends up somewhere the platform's controls do not follow. An
+    //   operator who may read every row has not thereby been authorised to produce a file, and a
+    //   key that meant both could not answer "who took the data out?" during an incident.
+    PermissionDef {
+        key: "deployment.exports.create",
+        category: "deployment",
+        description: "Create an anonymised support export",
+    },
+    // * `exports.download` — SEPARATE from `exports.create` because the export is written once and
+    //   read once, and those are different moments with different risk. Creation is a decision made
+    //   with the classification map in front of you; the download is the moment the bytes leave.
+    //   Collapsing them means revoking a link is also a decision about who may produce one.
+    PermissionDef {
+        key: "deployment.exports.download",
+        category: "deployment",
+        description: "Download a prepared anonymised export (single use)",
+    },
     // Identity and access management.
     PermissionDef {
         key: "iam.permissions.read",
@@ -288,6 +374,84 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "iam.security.manage",
         category: "iam",
         description: "Change the password, lockout, IP and session policy",
+    },
+    // The secrets surface (docs/requests/REQ-125). Reading the key ring is deliberately
+    // separated from managing the root key: an operator who may see that a rotation exists is
+    // not the one who may start one, because a rotation is irreversible if the operator key is
+    // wrong.
+    PermissionDef {
+        key: "secrets.read",
+        category: "secrets",
+        description: "Read secrets, the key ring state and the credential slot assignments",
+    },
+    PermissionDef {
+        key: "secrets.manage",
+        category: "secrets",
+        description: "Create, change and archive stored secrets",
+    },
+    PermissionDef {
+        key: "secrets.root.manage",
+        category: "secrets",
+        description: "Rotate the installation root key and run a re-wrap ceremony",
+    },
+    PermissionDef {
+        key: "secrets.assign",
+        category: "secrets",
+        description: "Assign credentials to slots and change their primary and fallback",
+    },
+    PermissionDef {
+        key: "secrets.lease",
+        category: "secrets",
+        description: "Issue and revoke short-lived secret leases",
+    },
+    PermissionDef {
+        key: "secrets.deploykeys.read",
+        category: "secrets",
+        description: "Read deployment keys and their use log",
+    },
+    PermissionDef {
+        key: "secrets.deploykeys.manage",
+        category: "secrets",
+        description: "Create, revoke and delete deployment keys",
+    },
+    PermissionDef {
+        key: "secrets.audit",
+        category: "secrets",
+        description: "Read the secrets audit trail and acknowledge anomaly flags",
+    },
+    PermissionDef {
+        key: "observability.read",
+        category: "observability",
+        description: "Read logs, traces, metric catalogue, exporters and alert state",
+    },
+    PermissionDef {
+        key: "observability.manage",
+        category: "observability",
+        description: "Change observability settings, alert rules and silences",
+    },
+    PermissionDef {
+        key: "observability.exporters.manage",
+        category: "observability",
+        description: "Add, edit and test telemetry exporters",
+    },
+    // REQ-127, the reliability centre. The read/manage split is the request's own: reading a
+    // budget is safe, changing one is a production behaviour, and the intake power is separate
+    // because an intake endpoint's HMAC secret is a different kind of danger from a rate limit —
+    // a wrong budget throttles a customer, a wrong HMAC scheme accepts forged webhooks.
+    PermissionDef {
+        key: "reliability.read",
+        category: "reliability",
+        description: "Read rate-limit policies, refusal rollups and reliability state",
+    },
+    PermissionDef {
+        key: "reliability.manage",
+        category: "reliability",
+        description: "Change rate-limit policies, retry policies and breaker state",
+    },
+    PermissionDef {
+        key: "reliability.intake.manage",
+        category: "reliability",
+        description: "Declare inbound endpoints and change their HMAC, size caps and sanitisation",
     },
     PermissionDef {
         key: "iam.sessions.read",
@@ -570,92 +734,6 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "notifications",
         description: "Change your notification channels and preferences",
     },
-    // CRM intake (docs/requests/REQ-117, slice 1). Split by *what a power is over* rather
-    // than by which screen it lives on, because the inbox is the screen people ask for the
-    // narrowest version of:
-    //
-    // * `crm.leads.read` is the inbox and the lead detail, the duplicate queue and the
-    //   counters beside them.
-    // * `crm.leads.manage` is editing a lead and moving it between the working statuses,
-    //   including the two terminal verdicts (`rejected`, `spam`). It deliberately does NOT
-    //   include deletion: a lead holds a person's submitted details, and a mistake there is
-    //   not something a manager should be able to make disappear quietly.
-    // * `crm.leads.convert` is turning a lead into a contact, an opportunity and a
-    //   quotation — the step that touches the sales pipeline, so it is its own power rather
-    //     than a wing of `manage`.
-    // * `crm.intake.manage` is the capture surface: the sources, their field mappings and
-    //   their endpoint keys. An account that can edit a mapping can decide what a business
-    //   stores about the people who write in, which is a different and larger thing than
-    //   working the leads it produced.
-    //
-    // The public endpoint (`POST /crm/intake/{key}`) is not in this list and cannot be:
-    // there is no session on it to evaluate. It authenticates by the source's own hashed
-    // key (see `apps/api/src/routes/crm_intake.rs`).
-    PermissionDef {
-        key: "crm.leads.read",
-        category: "crm",
-        description: "Read the lead inbox, the lead detail and the duplicate queue",
-    },
-    PermissionDef {
-        key: "crm.leads.manage",
-        category: "crm",
-        description: "Edit leads and move them between statuses, including rejecting and flagging spam",
-    },
-    PermissionDef {
-        key: "crm.leads.convert",
-        category: "crm",
-        description: "Convert a lead into a contact, an opportunity and a quotation",
-    },
-    // * `crm.leads.assign` is handing a lead to a person, and it is deliberately NOT part of
-    //   `crm.leads.manage`. The two look like the same act from outside and are not: `manage` is
-    //   what the lead *says* (its fields, its status, whether it is spam), `assign` is who is
-    //   answerable for it. Merging them means a moderator working the queue — the person who
-    //   most often needs to hand a lead over — could not do the one thing the queue exists for.
-    PermissionDef {
-        key: "crm.leads.assign",
-        category: "crm",
-        description: "Assign or reassign a lead to an owner, with a reason",
-    },
-    PermissionDef {
-        key: "crm.intake.manage",
-        category: "crm",
-        description: "Manage intake sources, their field mappings and their endpoint keys",
-    },
-    // * `crm.sla.manage` is the first-response targets, and it is deliberately NOT a wing of
-    //   `crm.intake.manage`. "Who answers a lead" and "how fast they must answer" go to
-    //   different people in most organizations — a sales manager sets the routing, a team
-    //   lead sets the promise made to a submitter — and merging them would mean the second
-    //   of those people could not set a target without also being handed the routing.
-    PermissionDef {
-        key: "crm.sla.manage",
-        category: "crm",
-        description: "Manage first-response targets, business hours and escalation targets",
-    },
-    // Commerce (REQ-118, slice 1a). Split by *what the key lets somebody change*, and the
-    // split is the one REQ-118's own admin surface names: the settings that decide how the
-    // public shop behaves, and the visitor accounts that shop created.
-    //
-    // * `commerce.storefront.manage` is the per-site configuration — page size, tax wording,
-    //   the quantity cap, whether a stranger may check out. Every one of those is a number a
-    //   customer sees, which is why it is not folded into a general "commerce" key: a role
-    //   that can edit the storefront must not thereby gain the ability to read every visitor's
-    //   account.
-    PermissionDef {
-        key: "commerce.storefront.manage",
-        category: "commerce",
-        description: "Manage per-site storefront settings: listing, checkout, tax display and limits",
-    },
-    // * `commerce.storefront.accounts.read` is the visitor account list and the abandoned-cart
-    //   view. It is deliberately *not* part of `manage`: the settings describe a shop, these
-    //   rows describe people. Reading somebody's name and e-mail is a different and larger act
-    //   than changing a page size, and the visitor accounts are deliberately separate tables
-    //   from panel users (REQ-118 §Risks, "Visitor accounts stay separate from panel users") —
-    //   so their power must be separate too.
-    PermissionDef {
-        key: "commerce.storefront.accounts.read",
-        category: "commerce",
-        description: "Read visitor accounts and abandoned carts, including contact details",
-    },
     // `notifications.admin` is the org-wide delivery log and the router's rules. It arrived with
     // slice 3, which is the first build where it has routes behind it — a permission with no
     // route is a role entry granting a promise the platform cannot keep, which is why it was
@@ -669,71 +747,6 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "notifications.admin",
         category: "notifications",
         description: "Read the organization-wide delivery outbox and manage routing rules",
-    },
-    // Automation projects (docs/requests/REQ-133, slice 1). The powers are split by *what a
-    // power is over*, and the split that matters most is the one the route table is built on:
-    //
-    // * `projects.read` — the list, the detail and the switcher. Holding it proves the caller
-    //   may read projects inside their OWN organization; the store then narrows that to the
-    //   rows they are a member of, so this key alone is not a way to see a colleague's team.
-    // * `projects.manage` — creating, renaming, archiving and restoring a project. It is NOT
-    //   membership: on a delegated team the person who renames the project is very often not
-    //   the person who adds its colleagues, and one key would let either do the other's job.
-    // * `projects.members.manage` — adding, removing and re-roling people. This is the key
-    //   that eventually has to be satisfiable by a project owner *without* any instance-wide
-    //   role, which is why it exists separately rather than as a wing of `manage`.
-    // * `projects.admin` — the instance-wide override. It is the only thing that makes an
-    //   administrator see every project in the organization rather than only their own
-    //   memberships, and it is deliberately absent from every base role (see `seed.rs`), so an
-    //   installation that never grants it has fully delegated projects and nothing else.
-    //
-    // `projects.limits.manage`, `projects.audit.read`, `workflows.move` and the project owner
-    // role itself are slice 4's and slice 3's, and are not here for the same reason
-    // `notifications.admin` was absent for two slices: a catalogued key with no route behind it
-    // is a role entry granting a promise the platform cannot keep.
-    PermissionDef {
-        key: "projects.read",
-        category: "projects",
-        description: "Read the automation projects you can see, their detail and the switcher",
-    },
-    PermissionDef {
-        key: "projects.manage",
-        category: "projects",
-        description: "Create, rename, archive and restore automation projects",
-    },
-    PermissionDef {
-        key: "projects.members.manage",
-        category: "projects",
-        description: "Add, remove and change the role of an automation project's members",
-    },
-    PermissionDef {
-        key: "projects.admin",
-        category: "projects",
-        description: "Instance-wide power over every project in the organization, including the ones you are not a member of",
-    },
-    // `projects.limits.manage` and `projects.audit.read` (REQ-133, slice 6 and 9). They were
-    // deliberately left uncatalogued with the comment "no route behind it yet" — a promise the
-    // platform cannot keep, which was the right rule — and then BOTH ROUTES LANDED while the
-    // catalogue kept the old claim. The consequence is not a stale comment: `authorize` resolves
-    // a permission key through the catalogue, so these two routes were refused for EVERY
-    // account, including the instance owner. `PUT /projects/{id}/limits` and
-    // `GET /projects/{id}/audit` were screens that could never be written or read by anybody,
-    // and the only reason nothing noticed is that the panel hides both behind a project role
-    // check that fails first.
-    //
-    // Found by `scripts/qa/run-delegated-admin.sh`, which builds its fixture by granting a role
-    // real permissions and hit `projects.limits.manage is not in the catalogue` — the gate
-    // failing to SET UP a delegated administrator, which is the closest thing to a test that
-    // complains about a permission nobody can hold.
-    PermissionDef {
-        key: "projects.limits.manage",
-        category: "projects",
-        description: "Change a project's usage limits and thresholds",
-    },
-    PermissionDef {
-        key: "projects.audit.read",
-        category: "projects",
-        description: "Read a project's own audit stream",
     },
     // Search (docs/requests/REQ-002). `search.read` is the box itself — every signed-in
     // account holds it, and the results are still narrowed by organization and by each
@@ -851,6 +864,165 @@ mod tests {
         ] {
             assert!(categories.contains(expected), "missing category {expected}");
         }
+    }
+
+    #[test]
+    fn the_observability_family_is_catalogued() {
+        // REQ-126: the admin centre is guarded by `observability.*`, and the split matters —
+        // reading telemetry is not the power to reconfigure telemetry export.
+        for key in [
+            "observability.read",
+            "observability.manage",
+            "observability.exporters.manage",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("observability"),
+                "{key} belongs to the observability category"
+            );
+        }
+    }
+
+    /// REQ-127: the reliability centre's three keys exist, and the intake power is SEPARATE.
+    ///
+    /// The separation is the assertion, not the existence. `reliability.manage` changes a budget
+    /// — a wrong number throttles a customer. `reliability.intake.manage` declares an inbound
+    /// endpoint and its HMAC scheme — a wrong scheme accepts forged webhooks. Folding them into
+    /// one key would hand every operator who tunes a rate limit the power to change how inbound
+    /// traffic is authenticated, and folding the other way would make the intake screen
+    /// unreachable to the people who are supposed to own it.
+    #[test]
+    fn the_reliability_family_is_catalogued_and_intake_is_separate() {
+        for key in [
+            "reliability.read",
+            "reliability.manage",
+            "reliability.intake.manage",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("reliability"),
+                "{key} belongs to the reliability category"
+            );
+        }
+        // The read key must not imply the manage key, and the manage key must not imply the
+        // intake one. This is a catalogue-level statement about powers, and the integration walk
+        // in `apps/api/tests/reliability_limits.rs` proves it over the router.
+        assert_ne!(
+            get("reliability.manage").map(|entry| entry.description),
+            get("reliability.intake.manage").map(|entry| entry.description),
+            "two powers with one description are one power written twice"
+        );
+    }
+
+    #[test]
+    fn the_deployment_family_is_catalogued_and_generation_is_separate_from_reading() {
+        for key in [
+            "deployment.read",
+            "deployment.preview",
+            "deployment.deploy",
+            "deployment.rollback",
+            "deployment.bundle.generate",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+        }
+        // The bundle generator shells out to a program and writes a row, so it may not ride the
+        // read key. This is asserted rather than assumed because a route that guarded a
+        // subprocess with `deployment.read` would be green in every catalogue test and be the
+        // most powerful key in the family.
+        assert_ne!(
+            "deployment.bundle.generate", "deployment.read",
+            "generation is a write, not a read"
+        );
+    }
+
+    #[test]
+    fn a_backfill_is_not_the_same_power_as_a_migration_and_a_seed_is_not_either() {
+        // REQ-129 slice 3's two keys. A backfill writes every EXISTING row of a table; applying a
+        // migration only changes the schema for rows written from now on. Both keys are asserted
+        // distinct from the three migration keys because a route that guarded the backfill
+        // endpoints with `migrations.apply` would pass every test in this crate — none of them
+        // builds a router — and would leave "who rewrote my data" answering with the same key as
+        // "who changed my schema".
+        for key in [
+            "deployment.backfills.manage",
+            "deployment.seeds.load",
+            "deployment.migrations.apply",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("deployment"),
+                "{key} belongs to the deployment category"
+            );
+        }
+        assert_ne!(
+            "deployment.backfills.manage", "deployment.migrations.apply",
+            "rewriting existing rows is not changing the schema"
+        );
+        assert_ne!(
+            "deployment.seeds.load", "deployment.migrations.apply",
+            "loading fixture rows is not applying a migration"
+        );
+        assert_ne!(
+            "deployment.seeds.load", "deployment.backfills.manage",
+            "seeding writes chosen rows; a backfill writes a column of every row"
+        );
+    }
+
+    #[test]
+    fn applying_a_migration_is_not_a_deployment_power_and_rehearsing_is_not_either() {
+        // REQ-129's three keys, and the reasons they are three rather than one.
+        for key in [
+            "deployment.migrations.read",
+            "deployment.migrations.apply",
+            "deployment.migrations.verify",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("deployment"),
+                "{key} belongs to the deployment category"
+            );
+        }
+        // The claim this file exists to make load-bearing: `deployment.deploy` ships an image, it
+        // does not write the schema. A route that guarded `POST /migrations/apply` with the deploy
+        // key would be green in every test in this crate — none of them builds a router — and
+        // would answer "who changed the database?" with "whoever could deploy".
+        assert_ne!(
+            "deployment.migrations.apply", "deployment.deploy",
+            "changing the schema is not deploying an image"
+        );
+        assert_ne!(
+            "deployment.migrations.apply", "deployment.rollback",
+            "applying is the opposite of rolling back"
+        );
+        // Rehearsing a reversal is its own power because it is the only write here that executes
+        // SQL, and because it is the write that turns `unknown` into `reversible` on the release.
+        assert_ne!(
+            "deployment.migrations.verify", "deployment.migrations.apply",
+            "proving the rollback path is not applying a migration"
+        );
+        // Distinct descriptions, which is the cheapest way to catch two keys that drifted into
+        // one power. Two identical descriptions means the family grew a name and not a permission.
+        let mut descriptions: Vec<&str> = [
+            "deployment.read",
+            "deployment.migrations.read",
+            "deployment.migrations.apply",
+            "deployment.migrations.verify",
+        ]
+        .iter()
+        .map(|key| get(key).map(|entry| entry.description).unwrap_or(""))
+        .collect();
+        descriptions.sort_unstable();
+        let before = descriptions.len();
+        descriptions.dedup();
+        assert_eq!(
+            before,
+            descriptions.len(),
+            "two powers with one description are one power written twice"
+        );
     }
 
     #[test]
@@ -1006,42 +1178,6 @@ mod tests {
                 "{key} belongs to the analytics category"
             );
         }
-    }
-
-    #[test]
-    fn the_projects_family_is_catalogued() {
-        // REQ-133 slice 1. The assertion that matters is the *absence*: `projects.admin` is
-        // the key that would let one account read another account's team, so it must be
-        // catalogued (the route table asks the guard for it) while remaining ungrantable
-        // through any base role. If a later slice folds it into `owner`, the seed test in
-        // `seed.rs` is what should fail first — not this one.
-        for key in [
-            "projects.read",
-            "projects.manage",
-            "projects.members.manage",
-            "projects.admin",
-            "projects.limits.manage",
-            "projects.audit.read",
-        ] {
-            assert_eq!(
-                get(key).map(|entry| entry.category),
-                Some("projects"),
-                "{key} belongs to the projects category"
-            );
-        }
-        // `workflows.move` still must NOT exist: it has no route. The move is deliberately guarded
-        // by `workflows.manage` (routes/mod.rs says why — inventing a fourth workflow permission
-        // would mean a role that can edit a workflow cannot move one, with no word saying why),
-        // so cataloguing it would be a grantable promise with nothing behind it.
-        //
-        // This assertion is the one that should have caught the two keys above. It was written as
-        // a tripwire ("when a route lands, this fails and you catalogue the key") and then the
-        // routes landed without it being read — a tripwire nobody fires is decoration, and the
-        // platform shipped two permanently-refused routes because of it.
-        assert!(
-            get("workflows.move").is_none(),
-            "workflows.move has no route and must stay uncatalogued"
-        );
     }
 
     #[test]

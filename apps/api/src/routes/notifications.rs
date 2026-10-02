@@ -685,48 +685,27 @@ pub async fn emit(
     // costs the caller the four good rows and returns a 500 that quotes the constraint name
     // to whoever is holding the response. The list is the same fact said in a sentence, and
     // the caller is told *which* id is wrong so it can drop that one and send the rest.
-    //
-    // **Two questions, and this route used to ask only one of them.** "Is this a real
-    // account" is the *access* system's question. "Is this somebody in my organization" is
-    // *tenancy*'s, and `users.organization_id` is nullable, so the two come apart for exactly
-    // the population that matters: another tenant's user, and the platform's own. An account
-    // holding `notifications.send` could therefore name any id on the platform and write a row
-    // into a stranger's inbox, stamped with the **sending** organization — the same leak the
-    // SLA worker's recipient guard had, one route up, with the leak in the *insert* rather
-    // than in the pre-check. [`omnion_notifications::audience`] is the rule; the two lookups
-    // below are its access half and its tenancy half.
-    let organizations =
-        omnion_notifications::store::recipient_organizations(state.db().pool(), &body.user_ids)
-            .await
-            .map_err(map_store)?;
-    let refused = omnion_notifications::refused_recipients(
-        session.user.organization_id,
-        &body.user_ids,
-        &|id| organizations.get(&id).copied(),
-    );
-    if !refused.is_empty() {
-        let refused: Vec<String> = refused.iter().map(|id| id.to_string()).collect();
+    let known = omnion_notifications::store::existing_users(state.db().pool(), &body.user_ids)
+        .await
+        .map_err(map_store)?;
+    if known.len() != body.user_ids.len() {
+        let unknown: Vec<String> = body
+            .user_ids
+            .iter()
+            .filter(|id| !known.contains(id))
+            .map(|id| id.to_string())
+            .collect();
         return Err(ApiError::bad_request(
             "unknown_recipient",
             format!(
                 "{} of {} recipients are not accounts: {}",
-                refused.len(),
+                unknown.len(),
                 body.user_ids.len(),
-                refused.join(", ")
+                unknown.join(", ")
             ),
         ));
     }
 
-    // **Each row carries its RECIPIENT's organization, not the sender's.** The notification
-    // belongs to the tenant whose people are being told — that is the column every admin read
-    // filters on, and stamping the sender's instead makes a platform announcement invisible in
-    // the tenant's delivery log while being perfectly visible in that user's bell. It was also
-    // the column that made the leak look correct in a query: the row said ORG_B and the
-    // recipient belonged to ORG_A, and nothing in the table contradicted the other.
-    //
-    // A sender who is *inside* a tenant only ever reaches that tenant, so the two columns
-    // agree for every row this route can write after the guard above; they differ exactly in
-    // the platform case, which is what makes the expression right rather than merely safe.
     let mut created = 0u64;
     let mut deduped = 0u64;
     for user_id in &body.user_ids {
@@ -750,23 +729,9 @@ pub async fn emit(
             draft = draft.with_dedupe_key(key.clone());
         }
 
-        let recipient_organization = match organizations.get(user_id) {
-            // Unreachable: the guard above refused every id that is not in this map. Reading it
-            // as the sender's own organization would be the old bug wearing a new comment, so
-            // it is a 500 that says what it is rather than a silent fallback.
-            None => {
-                return Err(ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "recipient_organization_missing",
-                    "a recipient passed the audience guard without an organization to stamp",
-                ));
-            }
-            Some(recipient_organization) => *recipient_organization,
-        };
-
         if omnion_notifications::store::record_with_deliveries(
             state.db().pool(),
-            recipient_organization,
+            session.user.organization_id,
             Some(session.user.id),
             &draft,
         )

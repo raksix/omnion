@@ -1,27 +1,20 @@
 [package]
 name = "omnion-deployment"
-description = "Omnion deployment centre: version and channel rules, release metadata, pre-flight checks and the deployment job model."
+description = "Omnion deployment tooling: the release manifest cache, artifact rows, environment bundles and upgrade plans."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
+# Infrastructure like `omnion-telemetry` and `omnion-audit`: it knows what a release manifest
+# is and what an upgrade plan must refuse to claim, and nothing about any one cloud. The
+# decision layer (which steps, in what order, with what verdict) is a property of the release
+# contract, so it lives here rather than in the HTTP layer that renders it.
 serde.workspace = true
 serde_json.workspace = true
-# `store.rs` is the only module that touches the database, and it is optional behind this
-# feature so the crate's decision types (version, channel, pre-flight, job) can be unit-tested
-# without a pool. `apps/api` enables it.
-sqlx = { workspace = true, optional = true }
-# `macros` is for one `format_description!`: a feed entry may carry a datetime with no offset,
-# which no well-known description reads, and hand-assembling a FormatDescription for a single
-# layout costs more lines than the feature does.
-time = { workspace = true, features = ["macros"] }
+sqlx.workspace = true
 thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
 uuid.workspace = true
-
-[features]
-default = []
-# Enabled by `apps/api`. `error.rs` is unconditional because its `NotFound`/`Feed` split is a
-# decision, not storage, and the API's error mapping reads it.
-store = ["dep:sqlx"]

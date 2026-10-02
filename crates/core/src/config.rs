@@ -115,68 +115,6 @@ pub const DEFAULT_RETENTION_MAX_SITES: i64 = 50;
 /// parses into a `u64` and refuses a negative or zero value.
 const DEFAULT_RETENTION_MAX_SITES_U64: u64 = 50;
 
-/// How often the CRM autoresponder worker sends what has come due (REQ-117, slice 3).
-///
-/// A send delay is a promise measured in minutes, so the tick is measured in minutes: a
-/// source configured to answer after ten minutes must not be waiting for a nightly sweep.
-pub const DEFAULT_CRM_AUTORESPONDER_POLL_MS: u64 = 60_000;
-
-/// How often the CRM SLA worker escalates breached leads and reminds owners (REQ-117,
-/// slice 3).
-///
-/// **The same reasoning as the autoresponder, and for the same reason.** A first-response
-/// target is a promise measured in minutes — a 60-minute policy that escalates on a nightly
-/// sweep is a policy nobody believes after the first overnight lead. A tick that finds nothing
-/// is one indexed read against a partial index (`crm_leads_sla_idx`, which holds only live
-/// clocks), so a broken worker shows up within the tick rather than the next morning.
-pub const DEFAULT_CRM_SLA_POLL_MS: u64 = 60_000;
-
-/// How many organizations the CRM SLA worker walks in one pass. Ten thousand tenants at a few
-/// statements each is a maintenance window, and the organizations that wait for the next tick
-/// are the ones whose deadlines are oldest — so the bound is a real cost, not a formality, which
-/// is why the read is ordered rather than arbitrary.
-pub const DEFAULT_CRM_SLA_MAX_ORGANIZATIONS: i64 = 100;
-
-/// [`DEFAULT_CRM_SLA_MAX_ORGANIZATIONS`] as the unsigned value the env reader hands back.
-///
-/// The environment gives strings and the reader returns `u64`, so a signed constant needs a
-/// twin — the same pairing `DEFAULT_RETENTION_MAX_SITES_U64` already exists for, and the
-/// reason it is a `const` rather than a literal `100` at the call site is that the two numbers
-/// must not drift: a default of 100 in one place and 10 in the other is a worker that reads
-/// ten times slower than its own documentation says.
-const DEFAULT_CRM_SLA_MAX_ORGANIZATIONS_U64: u64 = 100;
-
-/// How often the project limit notice worker runs (REQ-133, slice 4).
-///
-/// A limit crossing is not a deadline, so a minute is generosity rather than a requirement: the
-/// run counters move on a run, and a subscriber to the warning is an operations team rather than
-/// an on-call pager. A tick that finds nothing is one partial-index read over the projects that
-/// have a cap, so a broken worker shows up within the tick.
-pub const DEFAULT_PROJECT_LIMIT_POLL_MS: u64 = 60_000;
-
-/// A day, for the delivery-log sweeper. Long because a sweep that finds nothing costs a
-/// handful of statements and the rows are the bulk of the outbox.
-pub const DEFAULT_NOTIFICATION_RETENTION_POLL_MS: u64 = 86_400_000;
-
-/// How many organizations one delivery-log sweep walks.
-pub const DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS: i64 = 100;
-
-/// [`DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS`] as the unsigned value the env reader
-/// hands back.
-const DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS_U64: u64 = 100;
-
-/// How many capped projects one pass walks. A pass is four counts and up to four claims per
-/// project, so a thousand projects is a maintenance window; the read is ordered by id so the
-/// projects that wait for the next tick are the same ones every time rather than a rotating
-/// subset that can starve a project for ever.
-pub const DEFAULT_PROJECT_LIMIT_MAX_PROJECTS: i64 = 50;
-
-/// [`DEFAULT_PROJECT_LIMIT_MAX_PROJECTS`] as the unsigned value the env reader hands back.
-///
-/// The environment gives strings and the reader returns `u64`, so a signed constant needs a twin
-/// — the same pairing as the CRM SLA pair above, for the same reason: a default of 50 in one
-/// place and 5 in the other is a worker that reads ten times slower than it says.
-const DEFAULT_PROJECT_LIMIT_MAX_PROJECTS_U64: u64 = 50;
 /// How often the backup retention sweep runs (REQ-013, slice 3).
 ///
 /// Six hours, and the number is chosen from the feature rather than from taste: the sweep
@@ -523,6 +461,88 @@ impl Default for SearchConfig {
     }
 }
 
+/// Secret key-ring knobs (docs/requests/REQ-125).
+///
+/// The re-wrap walk is the one long-running writer in the secrets store, so its batch is small
+/// and its poll is bounded below by the runner itself. Both default to values that finish a
+/// small installation's rotation in seconds without ever holding a lock a lease redemption
+/// needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretsConfig {
+    /// Whether this process walks a live re-wrap job (`OMNION_SECRETS_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two re-wrap ticks (`OMNION_SECRETS_POLL_MS`).
+    pub rewrap_poll_ms: u64,
+    /// Versions one tick may re-seal (`OMNION_SECRETS_REWRAP`).
+    pub rewrap_batch: usize,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            rewrap_poll_ms: DEFAULT_SECRETS_POLL_MS,
+            rewrap_batch: DEFAULT_SECRETS_REWRAP_BATCH,
+        }
+    }
+}
+
+/// Default re-wrap poll interval: a small ring finishes in seconds, a large one never blocks.
+const DEFAULT_SECRETS_POLL_MS: u64 = 2_000;
+
+/// Default versions per re-wrap batch — a write window a redemption can queue behind.
+const DEFAULT_SECRETS_REWRAP_BATCH: usize = 25;
+
+/// The telemetry exporter loop (docs/requests/REQ-126).
+///
+/// The loop is the half of the exporter pipeline that MOVES data: it drains each configured
+/// exporter's bounded buffer on that row's `batch_ms` and sends it. It is a flag rather than a
+/// constant because an operator who wants telemetry to stop leaving the instance should be able
+/// to say so in the deployment rather than deleting every exporter row — the rows are the
+/// configuration, and the switch is the temporary decision.
+///
+/// Note what the flag does NOT control: the fan-out. Turning the loop off stops sending; the
+/// request path still fills the buffers, and their drop counter still rises, which is exactly
+/// what an operator wants to see before turning it back on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    /// Whether this process drains exporter buffers (`OMNION_EXPORTER_FLUSH`).
+    pub exporter_flush_enabled: bool,
+    /// Whether this process evaluates the alert rules (`OMNION_ALERTS_EVALUATOR`).
+    ///
+    /// The switch an operator uses when the same rules run in Prometheus — the bundle ships them
+    /// as `alerts.yml` so Alertmanager's routing and silences can own the notification. Running
+    /// both is how an operator gets two pages for one incident, and the flag is the documented way
+    /// to avoid that rather than deleting the bundled rules.
+    pub alerts_evaluator_enabled: bool,
+    /// Whether this process prunes telemetry past its retention window
+    /// (`OMNION_RETENTION_SWEEP`).
+    ///
+    /// The switch an operator uses when they would rather run the same deletion from their own
+    /// cron. Two jobs deleting the same rows is harmless — every prune is `delete where ts <
+    /// cutoff` — but two jobs holding *different* retention values is not, and the flag is the
+    /// documented way to make that impossible rather than a comment asking people to remember.
+    pub retention_sweep_enabled: bool,
+    /// How long a drain waits for in-flight requests, in milliseconds
+    /// (`OMNION_DRAIN_TIMEOUT_MS`).
+    ///
+    /// It has to fit inside the deployment's termination grace period with room for the telemetry
+    /// flush that follows, which is why it is configuration rather than a constant: the number
+    /// that is right for a 30-second Kubernetes grace period is wrong for a 5-second one.
+    pub drain_timeout_ms: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            exporter_flush_enabled: true,
+            alerts_evaluator_enabled: true,
+            retention_sweep_enabled: true,
+            drain_timeout_ms: 10_000,
+        }
+    }
+}
+
 /// Analytics collection and rollup knobs (docs/requests/REQ-007).
 ///
 /// The rollup worker of `apps/api` reads these: it rebuilds the recent hourly and daily buckets
@@ -606,120 +626,6 @@ impl Default for RetentionConfig {
             backup_sweep_poll_ms: DEFAULT_BACKUP_SWEEP_POLL_MS,
             backup_sweep_max_tenants: DEFAULT_BACKUP_SWEEP_MAX_TENANTS,
             backup_schedule_poll_ms: DEFAULT_BACKUP_SCHEDULE_POLL_MS,
-        }
-    }
-}
-
-/// The CRM autoresponder worker of `apps/api` reads these: each tick sends the reservations
-/// whose configured send delay has elapsed (REQ-117, slice 3).
-///
-/// The worker exists because a send delay is a promise about *when*, and a promise with no
-/// clock behind it is a promise nobody keeps. A source configured to answer after an hour
-/// reserves the slot at capture and relies on this worker to complete it, so the tick is
-/// minutes rather than days: the worst case an operator can observe is one tick of lateness
-/// on a delay they chose, never a reply that never arrives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CrmAutoresponderConfig {
-    /// Whether this process sends due autoresponders (`OMNION_CRM_AUTORESPONDER_RUNNER`).
-    pub runner_enabled: bool,
-    /// Delay between two passes (`OMNION_CRM_AUTORESPONDER_POLL_MS`).
-    pub poll_ms: u64,
-}
-
-impl Default for CrmAutoresponderConfig {
-    fn default() -> Self {
-        Self {
-            runner_enabled: true,
-            poll_ms: DEFAULT_CRM_AUTORESPONDER_POLL_MS,
-        }
-    }
-}
-
-/// Knobs of the CRM SLA worker (REQ-117, slice 3).
-///
-/// The SLA worker is a *separate* process-level switch from the autoresponder's rather than a
-/// second field on it. They answer two different promises — "somebody answers the visitor" and
-/// "somebody answers the lead" — and an installation that wants to stop emailing acknowledgements
-/// while keeping its escalation timer running is a configuration mistake, not a reason to couple
-/// the two flags. (The same reasoning already separates the retention, search and analytics
-/// workers, each of which has its own `runner_enabled`.)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CrmSlaConfig {
-    /// Whether this process escalates breaches and sends reminders
-    /// (`OMNION_CRM_SLA_RUNNER`).
-    pub runner_enabled: bool,
-    /// Delay between two passes (`OMNION_CRM_SLA_POLL_MS`).
-    pub poll_ms: u64,
-    /// How many organizations one pass walks (`OMNION_CRM_SLA_MAX_ORGANIZATIONS`).
-    ///
-    /// Bounded because a pass is several statements per organization: an installation with
-    /// thousands of tenants must not hold thousands of them open in one tick, and the bound is
-    /// on the *query* so the truncation is visible in the log as a count rather than as a
-    /// silent slice.
-    pub max_organizations: i64,
-}
-
-impl Default for CrmSlaConfig {
-    fn default() -> Self {
-        Self {
-            runner_enabled: true,
-            poll_ms: DEFAULT_CRM_SLA_POLL_MS,
-            max_organizations: DEFAULT_CRM_SLA_MAX_ORGANIZATIONS,
-        }
-    }
-}
-
-/// The automation project limit notice worker (REQ-133, slice 4).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectLimitConfig {
-    /// Whether this process emits the project's limit crossings
-    /// (`OMNION_PROJECT_LIMIT_RUNNER`).
-    ///
-    /// **On by default, and a second process is safe.** The once-ness is a claim in the
-    /// database, not a property of one worker, so two API nodes both sweeping cannot both
-    /// notify — which is why this is a switch rather than a singleton decision.
-    pub runner_enabled: bool,
-    /// Delay between two passes (`OMNION_PROJECT_LIMIT_POLL_MS`).
-    pub poll_ms: u64,
-    /// How many capped projects one pass walks (`OMNION_PROJECT_LIMIT_MAX_PROJECTS`).
-    pub max_projects: i64,
-}
-
-impl Default for ProjectLimitConfig {
-    fn default() -> Self {
-        Self {
-            runner_enabled: true,
-            poll_ms: DEFAULT_PROJECT_LIMIT_POLL_MS,
-            max_projects: DEFAULT_PROJECT_LIMIT_MAX_PROJECTS,
-        }
-    }
-}
-
-/// The notification delivery-log sweeper (REQ-021, slice 7).
-///
-/// **Its own flag, and the reason is that it deletes rather than sends.** The delivery runner
-/// and this one share the events cadence today, which is right while this worker does not
-/// exist; a deletion and a delivery in one switch means an installation that drains the queue
-/// from a dedicated worker also has to forget retention, and vice versa — the same argument
-/// `0123` makes for why the event sweeper has its own flag next to the event runner's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NotificationRetentionConfig {
-    /// Whether this process sweeps the delivery log
-    /// (`OMNION_NOTIFICATION_RETENTION_RUNNER`).
-    pub runner_enabled: bool,
-    /// Delay between two sweeps (`OMNION_NOTIFICATION_RETENTION_POLL_MS`).
-    pub poll_ms: u64,
-    /// How many organizations one sweep walks
-    /// (`OMNION_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS`).
-    pub max_organizations: i64,
-}
-
-impl Default for NotificationRetentionConfig {
-    fn default() -> Self {
-        Self {
-            runner_enabled: true,
-            poll_ms: DEFAULT_NOTIFICATION_RETENTION_POLL_MS,
-            max_organizations: DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS,
         }
     }
 }
@@ -1030,17 +936,15 @@ pub struct Config {
     pub automation: AutomationConfig,
     /// Search indexer knobs (REQ-002).
     pub search: SearchConfig,
+    /// The secret re-wrap walk (docs/requests/REQ-125).
+    pub secrets: SecretsConfig,
     /// Analytics collection and rollup knobs (REQ-007).
     pub analytics: AnalyticsConfig,
+    /// The telemetry exporter flush loop (REQ-126).
+    pub telemetry: TelemetryConfig,
+
     /// Retention worker knobs (REQ-010, slice 4).
     pub retention: RetentionConfig,
-    /// CRM autoresponder worker knobs (REQ-117, slice 3).
-    pub crm_autoresponder: CrmAutoresponderConfig,
-    /// CRM SLA worker knobs (REQ-117, slice 3).
-    pub crm_sla: CrmSlaConfig,
-    /// The project limit notice worker (REQ-133, slice 4).
-    pub project_limit: ProjectLimitConfig,
-    pub notification_retention: NotificationRetentionConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// The installation's Web Push identity (REQ-021, slice 6).
@@ -1215,6 +1119,29 @@ impl Config {
             batch: read_count(&read, "OMNION_SEARCH_BATCH", DEFAULT_SEARCH_BATCH)?,
         };
 
+        // The re-wrap walk (docs/requests/REQ-125): a small batch by default, because a batch is
+        // a write window a lease redemption has to queue behind.
+        let secrets = SecretsConfig {
+            runner_enabled: read_flag(&read, "OMNION_SECRETS_RUNNER", true)?,
+            rewrap_poll_ms: read_positive(
+                &read,
+                "OMNION_SECRETS_POLL_MS",
+                DEFAULT_SECRETS_POLL_MS,
+            )?,
+            rewrap_batch: read_count(&read, "OMNION_SECRETS_REWRAP", DEFAULT_SECRETS_REWRAP_BATCH)?,
+        };
+
+        let telemetry = TelemetryConfig {
+            exporter_flush_enabled: read_flag(&read, "OMNION_EXPORTER_FLUSH", true)?,
+            alerts_evaluator_enabled: read_flag(&read, "OMNION_ALERTS_EVALUATOR", true)?,
+            retention_sweep_enabled: read_flag(&read, "OMNION_RETENTION_SWEEP", true)?,
+            // Clamped rather than refused: a drain timeout of zero would skip every in-flight
+            // request, and a hand-typed negative would be a `u64` parse error at boot — neither is
+            // a useful way to learn the setting exists. The floor is one second, which is the
+            // smallest wait that can drain a real request.
+            drain_timeout_ms: read_positive(&read, "OMNION_DRAIN_TIMEOUT_MS", 10_000)?.max(1_000),
+        };
+
         // Read here so a malformed value is a configuration error at boot rather than a
         // worker that silently keeps its default — the same treatment every other knob gets.
         let retention = RetentionConfig {
@@ -1253,53 +1180,6 @@ impl Config {
             )?,
         };
 
-        let crm_autoresponder = CrmAutoresponderConfig {
-            runner_enabled: read_flag(&read, "OMNION_CRM_AUTORESPONDER_RUNNER", true)?,
-            poll_ms: read_positive(
-                &read,
-                "OMNION_CRM_AUTORESPONDER_POLL_MS",
-                DEFAULT_CRM_AUTORESPONDER_POLL_MS,
-            )?,
-        };
-
-        let crm_sla = CrmSlaConfig {
-            runner_enabled: read_flag(&read, "OMNION_CRM_SLA_RUNNER", true)?,
-            poll_ms: read_positive(&read, "OMNION_CRM_SLA_POLL_MS", DEFAULT_CRM_SLA_POLL_MS)?,
-            max_organizations: i64::try_from(read_positive(
-                &read,
-                "OMNION_CRM_SLA_MAX_ORGANIZATIONS",
-                DEFAULT_CRM_SLA_MAX_ORGANIZATIONS_U64,
-            )?)
-            .unwrap_or(DEFAULT_CRM_SLA_MAX_ORGANIZATIONS),
-        };
-
-        let project_limit = ProjectLimitConfig {
-            runner_enabled: read_flag(&read, "OMNION_PROJECT_LIMIT_RUNNER", true)?,
-            poll_ms: read_positive(&read, "OMNION_PROJECT_LIMIT_POLL_MS", DEFAULT_PROJECT_LIMIT_POLL_MS)?,
-            max_projects: i64::try_from(read_positive(
-                &read,
-                "OMNION_PROJECT_LIMIT_MAX_PROJECTS",
-                DEFAULT_PROJECT_LIMIT_MAX_PROJECTS_U64,
-            )?)
-            .unwrap_or(DEFAULT_PROJECT_LIMIT_MAX_PROJECTS),
-        };
-
-
-        let notification_retention = NotificationRetentionConfig {
-            runner_enabled: read_flag(&read, "OMNION_NOTIFICATION_RETENTION_RUNNER", true)?,
-            poll_ms: read_positive(
-                &read,
-                "OMNION_NOTIFICATION_RETENTION_POLL_MS",
-                DEFAULT_NOTIFICATION_RETENTION_POLL_MS,
-            )?,
-            max_organizations: i64::try_from(read_positive(
-                &read,
-                "OMNION_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS",
-                DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS_U64,
-            )?)
-            .unwrap_or(DEFAULT_NOTIFICATION_RETENTION_MAX_ORGANIZATIONS),
-        };
-
         let analytics = AnalyticsConfig {
             runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
             poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
@@ -1336,6 +1216,7 @@ impl Config {
         let csrf = CsrfSecret::new(read("OMNION_CSRF_SECRET"));
 
         let config = Self {
+            secrets,
             env,
             http: HttpConfig { host, port },
             database,
@@ -1346,11 +1227,8 @@ impl Config {
             automation,
             search,
             analytics,
+            telemetry,
             retention,
-            crm_autoresponder,
-            crm_sla,
-            project_limit,
-            notification_retention,
             mail,
             push,
             csrf,
@@ -1390,12 +1268,11 @@ impl Default for Config {
             events: EventsConfig::default(),
             automation: AutomationConfig::default(),
             search: SearchConfig::default(),
+            secrets: SecretsConfig::default(),
             analytics: AnalyticsConfig::default(),
+            telemetry: TelemetryConfig::default(),
+
             retention: RetentionConfig::default(),
-            crm_autoresponder: CrmAutoresponderConfig::default(),
-            crm_sla: CrmSlaConfig::default(),
-            project_limit: ProjectLimitConfig::default(),
-            notification_retention: NotificationRetentionConfig::default(),
             mail: MailConfig::default(),
             push: PushConfig::default(),
             // No secret by default, which is the honest default: a default key would be a key
@@ -1490,106 +1367,6 @@ mod tests {
         assert_eq!(
             config.http.bind_address().expect("default host must bind"),
             "0.0.0.0:8080".parse().expect("literal address")
-        );
-    }
-
-    #[test]
-    fn the_autoresponder_worker_ticks_in_minutes_not_days() {
-        // The worker's whole reason to exist is a promise measured in minutes: a source
-        // configured to answer after ten minutes must be inside a tick, not inside a nightly
-        // sweep. A default of an hour would make the feature work on paper and never in use.
-        let config = config_from(&[]).expect("defaults are valid");
-        assert_eq!(
-            config.crm_autoresponder.poll_ms,
-            DEFAULT_CRM_AUTORESPONDER_POLL_MS
-        );
-        assert!(
-            config.crm_autoresponder.poll_ms <= 5 * 60_000,
-            "a send delay of minutes must be honoured within minutes, got {}ms",
-            config.crm_autoresponder.poll_ms
-        );
-        assert!(config.crm_autoresponder.runner_enabled);
-    }
-
-    #[test]
-    fn a_malformed_autoresponder_tick_is_a_boot_error_not_a_silent_default() {
-        // A worker that silently keeps its default after being told to tick every second is
-        // a worker that hammers the database for ever, and nothing in the log says so.
-        let error = config_from(&[("OMNION_CRM_AUTORESPONDER_POLL_MS", "0")])
-            .expect_err("a zero tick must be refused");
-        assert_eq!(error.key, "OMNION_CRM_AUTORESPONDER_POLL_MS");
-    }
-
-    #[test]
-    fn the_autoresponder_worker_can_be_switched_off_without_touching_the_others() {
-        let config = config_from(&[
-            ("OMNION_CRM_AUTORESPONDER_RUNNER", "false"),
-            ("OMNION_RETENTION_RUNNER", "true"),
-        ])
-        .expect("flags are valid");
-        assert!(!config.crm_autoresponder.runner_enabled);
-        assert!(config.retention.runner_enabled);
-    }
-
-    #[test]
-    fn the_sla_worker_ticks_in_minutes_because_a_first_response_target_is_measured_in_them() {
-        // The SLA worker's promise is the same *kind* of promise as the autoresponder's, and it
-        // fails the same way if the default is wrong: a 60-minute target escalated by a daily
-        // sweep is a target that has already been missed by the time anybody hears about it,
-        // and the screen keeps saying "on track" the whole time. The assertion is the bound,
-        // not the value — a future reader who wants 5 minutes should be able to without
-        // having to argue with this test.
-        let config = config_from(&[]).expect("defaults are valid");
-        assert_eq!(config.crm_sla.poll_ms, DEFAULT_CRM_SLA_POLL_MS);
-        assert!(
-            config.crm_sla.poll_ms <= 5 * 60_000,
-            "an escalation must arrive inside the window it is escalating about, got {}ms",
-            config.crm_sla.poll_ms
-        );
-        assert!(config.crm_sla.runner_enabled);
-    }
-
-    #[test]
-    fn the_sla_worker_is_a_separate_switch_from_the_autoresponder() {
-        // The trap this pins: the two workers look like one feature ("the CRM sends things on a
-        // timer"), so a later reader folds them into one flag. An installation that stops
-        // emailing acknowledgements and silently stops escalating its own overdue leads is a
-        // failure with no log line, and it is exactly what a shared flag would produce.
-        let config = config_from(&[
-            ("OMNION_CRM_AUTORESPONDER_RUNNER", "false"),
-            ("OMNION_CRM_SLA_RUNNER", "true"),
-        ])
-        .expect("flags are valid");
-        assert!(!config.crm_autoresponder.runner_enabled);
-        assert!(config.crm_sla.runner_enabled);
-
-        let swapped = config_from(&[
-            ("OMNION_CRM_AUTORESPONDER_RUNNER", "true"),
-            ("OMNION_CRM_SLA_RUNNER", "false"),
-        ])
-        .expect("flags are valid");
-        assert!(swapped.crm_autoresponder.runner_enabled);
-        assert!(!swapped.crm_sla.runner_enabled);
-    }
-
-    #[test]
-    fn a_malformed_sla_knob_is_a_boot_error_not_a_silent_default() {
-        // Same treatment as every other knob: told to tick every millisecond and quietly
-        // keeping a default means a worker hammering the database for ever with nothing in the
-        // log to say so.
-        let zero = config_from(&[("OMNION_CRM_SLA_POLL_MS", "0")])
-            .expect_err("a zero tick must be refused");
-        assert_eq!(zero.key, "OMNION_CRM_SLA_POLL_MS");
-
-        let orgs = config_from(&[("OMNION_CRM_SLA_MAX_ORGANIZATIONS", "0")])
-            .expect_err("walking zero organizations is a worker that never walks");
-        assert_eq!(orgs.key, "OMNION_CRM_SLA_MAX_ORGANIZATIONS");
-
-        // And the unsigned/signed twin of the bound must agree, or the documented default is
-        // a different number from the one the process runs with.
-        assert_eq!(
-            u64::try_from(DEFAULT_CRM_SLA_MAX_ORGANIZATIONS).unwrap(),
-            DEFAULT_CRM_SLA_MAX_ORGANIZATIONS_U64
         );
     }
 
@@ -1795,6 +1572,26 @@ mod tests {
         let error = config_from(&[("OMNION_EVENTS_RUNNER", "maybe")])
             .expect_err("an unknown boolean is refused");
         assert_eq!(error.key, "OMNION_EVENTS_RUNNER");
+    }
+
+    #[test]
+    fn the_exporter_flush_loop_runs_by_default_and_can_be_switched_off() {
+        // The loop is ON by default: an exporter row an operator configured should start working
+        // without a second environment change, and "telemetry is configured but nothing arrives"
+        // is the failure the request names. The switch exists for the opposite decision — stop
+        // sending, keep the rows — and it must parse strictly, like every other boolean here, so a
+        // typo in a compose file is an error at boot rather than a loop that silently keeps going.
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.telemetry.exporter_flush_enabled);
+
+        let off = config_from(&[("OMNION_EXPORTER_FLUSH", "false")]).expect("the switch loads");
+        assert!(!off.telemetry.exporter_flush_enabled);
+
+        // "yes" is deliberately NOT the fixture: the platform's boolean reader accepts it, so a
+        // test that used it would assert the opposite of what it claims to check.
+        let error = config_from(&[("OMNION_EXPORTER_FLUSH", "maybe")])
+            .expect_err("an unknown boolean is refused");
+        assert_eq!(error.key, "OMNION_EXPORTER_FLUSH");
     }
 
     #[test]

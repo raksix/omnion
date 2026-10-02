@@ -101,15 +101,20 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, code, message)
     }
 
-    /// `404` — the addressed thing does not exist.
+    /// `404` — the addressed row does not exist, named in the message.
     ///
-    /// The one caller that reaches for this on purpose is a read of a resource the caller may not
-    /// see (REQ-133's project scoping): the message must then say nothing about permissions,
-    /// because a `404` that reads "you are not allowed" tells the caller the row exists. Build it
-    /// from a phrase about the resource, never from the reason for the refusal.
+    /// The `what` and the `id` are both in the message on purpose. A `404` with the body
+    /// `{"code":"not_found"}` tells a form nothing about which of its rows vanished, and the
+    /// one case worth naming is a double-submit: the row was deleted, the second write answers
+    /// `404`, and the operator needs to know that is what happened rather than that the
+    /// identifier was malformed.
     #[must_use]
-    pub fn not_found(code: &'static str, message: impl Into<String>) -> Self {
-        Self::new(StatusCode::NOT_FOUND, code, message)
+    pub fn not_found(what: &'static str, id: impl std::fmt::Display) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("no {what} with the id {id}"),
+        )
     }
 
     /// Map a core error onto the API surface.
@@ -151,6 +156,13 @@ impl ApiError {
         self.code
     }
 
+    /// The human-readable message.
+    ///
+    /// Read-only by design: the message is what a screen shows and what a test asserts on when it
+    /// needs to know that a refusal *names* the thing it refused over (a cap, an accepted set).
+    /// There is deliberately no setter — a message that can be rewritten after construction is a
+    /// message no longer derived from the code that produced it.
+    ///
     /// The human-readable explanation, for assertions and for a log line.
     ///
     /// The companion of [`ApiError::code`]: the code is what a client branches on and the
@@ -160,6 +172,30 @@ impl ApiError {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The structured explanation of a refusal, when it has one.
+    ///
+    /// Added for the reliability limiter, whose acceptance criterion is about **wire behaviour**
+    /// rather than about a function's return value: "`429` carries `Retry-After`,
+    /// `X-RateLimit-Limit/Remaining/Reset` and the standard error code", and a `429` body that
+    /// names only the scope cannot say which of the two limiters refused it. The accessors existed
+    /// for status, code and message and not for details, which meant the one field a refusal adds
+    /// most — the thing that makes it explainable — was the one field no test could read.
+    #[must_use]
+    pub fn details(&self) -> Option<&Value> {
+        self.details.as_ref()
+    }
+
+    /// The wait this error attaches, in seconds.
+    ///
+    /// `None` for every error that is not a refusal with a window behind it, and `None` for a
+    /// refusal whose window **cannot** be computed — a counter that could not be read. Both are
+    /// the same answer for the same reason: a `Retry-After` is a promise, and there is nothing to
+    /// promise when the platform does not know when its window rolls.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<u64> {
+        self.retry_after
     }
 }
 

@@ -1,0 +1,37 @@
+{{- define "omnion.service" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "omnion.fullname" .root }}-{{ .component }}
+  labels:
+    {{- include "omnion.componentLabels" (list .component .root) | nindent 4 }}
+spec:
+  type: {{ if eq .component "api" }}{{ .root.Values.api.service.type }}{{ else }}{{ ternary "ClusterIP" "ClusterIP" true }}{{ end }}
+  ports:
+    - name: http
+      {{- if eq .component "api" }}
+      port: {{ .root.Values.api.service.port }}
+      targetPort: http
+      protocol: TCP
+      {{- else }}
+      port: 3000
+      targetPort: http
+      protocol: TCP
+      {{- end }}
+  selector:
+    {{- include "omnion.componentSelectorLabels" (list .component .root) | nindent 4 }}
+
+{{- end }}
+
+{{- $root := . }}
+{{- range $component := list "api" "admin" "web" }}
+{{- if not (hasKey $.Values $component) }}{{ continue }}{{- end }}
+{{/* The separator must sit on its OWN line and be followed by a newline. `---` glued to the
+     first key of the next document is not a separator at all: `---apiVersion: apps/v1` parses
+     as a scalar named `---apiVersion`, and helm reports it as an invalid document separator
+     four lines away from the cause. `helm template` joins documents itself and tolerated all
+     three of these; `helm lint` parses each file and did not. **A tool that passed is not a
+     tool that ran** — see the note in the chart's own README about which gates are real. */}}
+---
+{{ include "omnion.service" (dict "component" $component "root" $root) }}
+{{- end }}

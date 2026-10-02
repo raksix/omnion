@@ -1,208 +1,85 @@
 #!/usr/bin/env python3
-"""Merge two append-only BUILD-LOG halves.
+"""Merge an append-only BUILD-LOG across a merge conflict, and PROVE nothing was dropped.
 
-    keep every base entry (repaired)  ->  append each side's new entries.
+Both sides append, so a merge that keeps only one side silently deletes the other
+writer's whole tick history. Textual `git merge` gives a conflict; taking one side
+"because it is bigger" is a guess.
 
-The first design diffed the two sides to find "where each side appended" and spliced
-at those offsets. Four attempts, four ways that was wrong:
+The merge is a splice: every line the two sides INSERTED onto the common base is
+re-inserted, in each side's own order, at the position it took on that side.
 
-1. Line-level diffing is catastrophic. SequenceMatcher matches the tail of one side
-   against an unrelated region of the other, and the base between them vanishes -
-   444 lines on attempt 1.
-2. Block-level diffing is better but still wrong, for the reason that cost attempt 3:
-   **a heading is not a unique key.** Two writers can title two different entries
-   "REQ-016 slice 2". Keyed by heading, one whole body is silently dropped. The log
-   is append-only, so *every* new entry belongs at the END, whatever its title.
-3. The verification is what saved it each time, and its shape matters. A line COUNT
-   passes while whole entries are gone. What an append-only log must actually satisfy:
-     (a) no base entry lost, (b) base order unchanged, (c) every entry a side has and
-     base lacks is present verbatim, (d) no entry lost a PROSE line it had.
-4. A body that is a strict SUBSET of base's is damage, not an edit - an earlier
-   line-level merge on this branch ate part of an entry. Repair by taking the superset.
+Verification is a MULTISET check, not a line count. `base + ours + theirs == merged`
+holds for a merge that duplicated a block and dropped another; it is the count that
+lies, which is exactly why a sibling writer's history can vanish under it. Instead:
 
-Split entries on '# ' and '## ' only: every entry ends in a '### Lessons' subsection,
-and treating those as entries glued unrelated bodies together under one heading.
+  * every line of `ours` and of `theirs` must be present in `merged` at least as
+    many times as it appears in that side (nothing dropped),
+  * every `## ` heading of both sides must survive (a dropped tick is a lost day),
+  * the base's own line multiset must still be covered (nothing rewritten).
 """
 import subprocess
 import sys
 from collections import Counter
+from difflib import SequenceMatcher
 
-PATH = "docs/BUILD-LOG.md"
-
-
-def stage(n):
-    return subprocess.run(
-        ["git", "show", f":{n}:{PATH}"], capture_output=True, text=True, check=True
-    ).stdout
+path = sys.argv[1] if len(sys.argv) > 1 else "docs/BUILD-LOG.md"
 
 
-def blocks(text):
-    out, cur = [], []
-    for line in text.splitlines(keepends=True):
-        if (line.startswith("# ") or line.startswith("## ")) and cur:
-            out.append(tuple(cur))
-            cur = [line]
-        else:
-            cur.append(line)
-    if cur:
-        out.append(tuple(cur))
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+
+
+def lines(text):
+    return text.splitlines(keepends=True)
+
+
+base = lines(git("show", f":1:{path}"))
+ours = lines(git("show", f":2:{path}"))
+theirs = lines(git("show", f":3:{path}"))
+
+
+def inserted(side):
+    """Lines side added relative to base, grouped into the blocks it added them in."""
+    sm = SequenceMatcher(None, base, side, autojunk=False)
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("insert", "replace") and j2 > j1:
+            out.append((i1, side[j1:j2]))
     return out
 
 
-def head(b):
-    return b[0].strip() if b and b[0].startswith("#") else "(preamble)"
+# Splice both sides' insertions into the base, ordered by where they attach.
+chunks = [(pos, blk, "ours") for pos, blk in inserted(ours)]
+chunks += [(pos, blk, "theirs") for pos, blk in inserted(theirs)]
+chunks.sort(key=lambda c: (c[0], 0 if c[2] == "ours" else 1))
 
+merged = []
+cursor = 0
+for pos, blk, _side in chunks:
+    if pos < cursor:  # overlapping edit region: keep the earlier block, skip the overlap
+        pos = cursor
+    merged.extend(base[cursor:pos])
+    merged.extend(blk)
+    cursor = pos
+merged.extend(base[cursor:])
 
-def content(b):
-    """Prose lines: a blank is not history, and neither is a `---` rule."""
-    return [l for l in b
-            if l.strip() and l.strip() not in ("---", "***", "___", "===")]
+mc, oc, tc, bc = Counter(merged), Counter(ours), Counter(theirs), Counter(base)
+missing = {s: sum((c - mc).values()) for s, c in (("ours", oc), ("theirs", tc), ("base", bc))}
 
+head_base = [l for l in base if l.startswith("## ")]
+head_ours = [l for l in ours if l.startswith("## ")]
+head_theirs = [l for l in theirs if l.startswith("## ")]
+lost_heads = [h for h in set(head_ours) | set(head_theirs) if h not in mc]
 
-def contains(big, small):
-    it = iter(big)
-    return all(any(x == s for x in it) for s in small)
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write("".join(merged))
 
-
-base_t, ours_t, theirs_t = stage(1), stage(2), stage(3)
-base, ours, theirs = blocks(base_t), blocks(ours_t), blocks(theirs_t)
-print(f"entries base={len(base)} ours={len(ours)} theirs={len(theirs)}")
-
-# 1. Repair base entries a side has superseded with a strict superset of the same
-#    heading. A strict subset is a truncation an earlier merge caused.
-index = {}
-for side, arr in (("ours", ours), ("theirs(main)", theirs)):
-    for b in arr:
-        index.setdefault(head(b), []).append((side, b))
-
-repaired, diverged = [], []
-resolved = []
-for b in base:
-    cands = [c for _, c in index.get(head(b), [])]
-    best = b
-    for c in cands:
-        if contains(best, c) and len(c) > len(best):
-            best = c
-    if best != b:
-        side = next(s for s, c in index[head(b)] if c == best)
-        repaired.append((head(b)[:60], len(b), len(best), side))
-    elif cands and not all(contains(c, b) for c in cands):
-        diverged.append(head(b)[:70])
-    resolved.append(best)
-
-for h, a, c, side in repaired:
-    print(f"  REPAIRED {a:>4} -> {c:<4} lines  {h!r}  (from {side})")
-for h in diverged:
-    print(f"  DIVERGED (base kept, human should look): {h!r}")
-
-# 2. Append whatever a side has and base lacks, by CONTENT and not by heading: two
-#    entries may share a title, and both are history.
-#    Each side gets its OWN copy of the base multiset. Sharing one depleted counter
-#    made ours' 67 matches consume main's slots, and main's 70 base entries came out
-#    "new" - which is how a 6783-line log became 11335 lines.
-#    A side can carry a TRUNCATED copy of an entry base has in full -- an earlier
-#    line-level merge ate part of it, and the damage rode along ever since. Step 1
-#    repairs the base entry from the side holding the superset, but the damaged copy
-#    then fails to match `resolved` by content, is classified "new", and is appended
-#    as if it were another writer's tick. The log grows, the entry exists twice, and
-#    the truncation detector at the bottom fires on the damage *this script* just
-#    wrote. A block whose heading is a base heading and whose prose is a strict subset
-#    of that base entry is not history; it is a wound.
-merged = list(resolved)
-appended = []
-base_by_head = {}
-for b in base:
-    base_by_head.setdefault(head(b), []).append(b)
-
-
-def is_damaged_copy(b):
-    if head(b) not in base_by_head:
-        return False
-    return any(contains(c, b) and content(c) != content(b)
-               for c in base_by_head[head(b)])
-
-
-for side, arr in (("ours", ours), ("theirs(main)", theirs)):
-    have = Counter(resolved)
-    fresh, dropped = [], []
-    for b in arr:
-        if have[b] > 0:
-            have[b] -= 1
-        elif is_damaged_copy(b):
-            dropped.append(head(b)[:70])
-        else:
-            fresh.append(b)
-    merged.extend(fresh)
-    appended.extend(fresh)
-    print(f"  {side}: {len(fresh)} new entries appended at the end"
-          + (f", {len(dropped)} damaged copies dropped" if dropped else ""))
-    for h in dropped:
-        print(f"    DROPPED truncated copy of an entry base holds in full: {h!r}")
-
-# (a)+(b) no base entry lost, base order unchanged.
-hb = [head(b) for b in base]
-hm = [head(b) for b in merged]
-it = iter(hm)
-lost = [h for h in hb if not any(x == h for x in it)]
-if lost:
-    print("BASE ENTRIES LOST OR REORDERED:", lost[:5])
+print(
+    f"base={len(base)} ours={len(ours)} theirs={len(theirs)} merged={len(merged)}\n"
+    f"missing lines: {missing}\n"
+    f"lost headings: {len(lost_heads)}"
+)
+for h in lost_heads[:10]:
+    print("  LOST", h.strip())
+if any(missing.values()) or lost_heads:
     sys.exit(1)
-
-# (c) every entry a side has and base lacks is present verbatim -- except a damaged
-#     copy, which step 2 deliberately dropped. Dropping is only allowed where the
-#     merged file still holds that entry in FULL: otherwise "dropped" would be a
-#     quieter way to lose history, and this check is the one that catches it.
-for side, arr in (("ours", ours), ("theirs(main)", theirs)):
-    for b in arr:
-        if any(b == x for x in base) or b in merged:
-            continue
-        if is_damaged_copy(b) and any(
-                head(x) == head(b) and contains(content(x), content(b))
-                for x in merged if head(x) == head(b)):
-            continue
-        print(f"APPENDED ENTRY LOST [{side}]: {head(b)[:70]!r}")
-        sys.exit(1)
-
-# (d) truncation detector, on prose.
-# A LENGTH comparison against "the base entry with this heading" is wrong, and this
-# script's own docstring says why: a heading is not a unique key. Two entries can
-# share one -- base holds two different "Tick 77 addendum" entries (21 and 23 prose
-# lines, neither a subset of the other), so the dict kept the 23-line one and called
-# the 21-line one truncated. Truncation is a SUBSET relation, not a length relation:
-# an entry is a wound exactly when its prose is a strict subset of a same-heading
-# base entry, which is the `is_damaged_copy` predicate steps 2 and 3 already share.
-trunc = [(head(b)[:60], len(content(b)), len(max(base_by_head[head(b)], key=len)))
-         for b in merged if is_damaged_copy(b)]
-if trunc:
-    print("ENTRIES LOST PROSE LINES:", trunc[:5])
-    sys.exit(1)
-
-text = "".join("".join(b) for b in merged)
-# Markers must be on a line of their OWN: the log QUOTES them inside a sentence,
-# because an earlier tick's entry documents this very bug.
-for bad in ("<<<<<<<", ">>>>>>>"):
-    stray = [l for l in text.splitlines() if l.strip().startswith(bad)]
-    if stray:
-        print("CONFLICT MARKER SURVIVED:", stray[:3])
-        sys.exit(1)
-
-# Nothing from either side may be absent. This is a SUBSET check per side, not a
-# multiset of the two sides summed: both sides carry the shared base entries, so
-# summing wants each shared line twice and reports the merged file - which has it once
-# - as missing. That false alarm is what kept the previous run from writing.
-# The damaged copies step 2 dropped are subtracted first, by the same predicate that
-# dropped them -- a third copy of the rule is how it drifted out of sync with the two
-# above in the first place.
-for side, arr in (("ours", ours), ("theirs(main)", theirs)):
-    arr = [b for b in arr if b in merged or not is_damaged_copy(b)]
-    missing = Counter(arr) - Counter(merged)
-    if missing:
-        for line, n in list(missing.items())[:8]:
-            print(f"MISSING FROM {side}", n, repr("".join(line)[:95]))
-        sys.exit(1)
-    print(f"  {side}: every entry line present in the merge")
-
-with open(PATH, "w") as f:
-    f.write(text)
-print(f"OK {len(hm)} entries | base intact+ordered | nothing truncated | "
-      f"no line from either side missing | {len(repaired)} repaired | {len(diverged)} diverged")

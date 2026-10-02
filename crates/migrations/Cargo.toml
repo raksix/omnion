@@ -1,0 +1,30 @@
+[package]
+name = "omnion-migrations"
+description = "Omnion migration safety: the ledger, the run journal, the policy, the banned-shape lint and the reversibility gate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dev-dependencies]
+# The crate takes a `&Migrator` as an argument rather than embedding its own bundle, so the ONLY
+# place it needs `omnion-core` is the test that reads the REAL bundle — which is the point of that
+# test: a fixture shaped like a migration agrees with the parser by construction, and the whole
+# class of bug this slice found was exactly that.
+omnion-core = { path = "../core" }
+
+[dependencies]
+# Infrastructure like `omnion-deployment` and `omnion-telemetry`: it knows what a migration is,
+# whether its reversal has been rehearsed, and what a policy forbids — and nothing about any one
+# deployment pipeline. The decision layer is a property of the schema contract, so it lives here
+# rather than in the CLI or the HTTP layer that renders it.
+hex.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true

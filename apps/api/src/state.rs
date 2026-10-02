@@ -42,6 +42,37 @@ impl AppState {
         }
     }
 
+    /// Build state around a pool the caller already owns.
+    ///
+    /// Exists for the tests that need a database which **cannot answer** — a reserved port, a
+    /// closed socket — because `Default` can only build the pool `Config` describes and `Config`
+    /// is read from the environment, and this crate denies `unsafe` `set_var` under edition 2024.
+    /// It takes a pool rather than a URL so the caller keeps control of the timeouts: a test that
+    /// must fail fast cannot use a five-second acquire timeout and call itself quick.
+    ///
+    /// It takes the raw pool so the caller owns the timeouts, which a URL-driven constructor
+    /// would not allow.
+    ///
+    /// `#[doc(hidden)]` rather than a plain public method because it is not part of the service's
+    /// surface: a production caller would be building state the configuration does not describe,
+    /// which is exactly the mistake this constructor exists to let tests make.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_pool(pool: sqlx::PgPool) -> Self {
+        let db = omnion_core::db::Db::from_pool(pool);
+        let config = Config::default();
+        let redis = RedisClient::new(&config.redis.url).expect("the default redis URL is valid");
+        let storage = Storage::from_config(&StorageConfig::default())
+            .expect("the default storage configuration is valid");
+        Self::new(
+            BuildInfo::new("omnion-api", env!("CARGO_PKG_VERSION")),
+            config,
+            db,
+            redis,
+            storage,
+        )
+    }
+
     /// Build metadata of the running service.
     #[must_use]
     pub fn build(&self) -> BuildInfo {

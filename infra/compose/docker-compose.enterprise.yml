@@ -1,0 +1,174 @@
+# Omnion — enterprise topology (REQ-128, slice 2).
+#
+#   docker compose -f infra/compose/docker-compose.enterprise.yml up -d
+#
+# The same four application images as the small-company stack, pointed at services the
+# organisation already runs. **No database, cache or object-store container is defined here** —
+# that is the whole difference between the two topologies, and it is deliberate: an enterprise
+# install brings its own PostgreSQL, its own Redis and its own S3, and a compose file that also
+# starts a `postgres` service is a file that will start a `postgres` service on the day someone
+# runs `up` without reading which file they are in.
+#
+# The gate `scripts/qa/deployment-artifacts.sh` asserts that absence, because a datastore
+# container appearing here is the kind of regression that is invisible until a deployment quietly
+# writes production data into a throwaway volume.
+#
+# What is different from the small-company stack, and why:
+#
+#   * Worker replicas are separate services. The API serves requests; the runners (workflows,
+#     automation, events, retention, notifications, search) are inside the API process today, so
+#     this file scales `api` for request capacity and documents that a runner-dedicated service
+#     is the next step rather than pretending one exists.
+#   * Every endpoint is a REFERENCE — the `:?` form, spelled with the braces apart on
+#     purpose, because compose interpolates comments too — never a default that
+#     silently points at localhost and turns an enterprise install into a single-host one.
+#   * `deploy.replicas` is set, so `docker compose up --scale` and an orchestrator reading this
+#     file agree on the intended shape.
+name: omnion-ent
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# -----------------------------------------------------------------------------------------------
+# Shared application environment. The endpoints are external by contract — see the header.
+# -----------------------------------------------------------------------------------------------
+x-app-env: &app-env
+  OMNION_ENV: production
+  OMNION_HOST: 0.0.0.0
+  OMNION_PORT: "8080"
+  OMNION_DATABASE_URL: ${OMNION_EXTERNAL_POSTGRES_DSN:?set OMNION_EXTERNAL_POSTGRES_DSN to the external PostgreSQL DSN}
+  OMNION_DB_MAX_CONNECTIONS: "${OMNION_DB_MAX_CONNECTIONS:-40}"
+  OMNION_REDIS_URL: ${OMNION_EXTERNAL_REDIS_URL:?set OMNION_EXTERNAL_REDIS_URL to the external Redis URL}
+  OMNION_S3_ENDPOINT: ${OMNION_EXTERNAL_S3_ENDPOINT:?set OMNION_EXTERNAL_S3_ENDPOINT to the external S3 endpoint}
+  OMNION_S3_ACCESS_KEY: ${OMNION_S3_ACCESS_KEY:?set OMNION_S3_ACCESS_KEY for the external object store}
+  OMNION_S3_SECRET_KEY: ${OMNION_S3_SECRET_KEY:?set OMNION_S3_SECRET_KEY for the external object store}
+  OMNION_S3_BUCKET: ${OMNION_S3_BUCKET:?set OMNION_S3_BUCKET for the external object store}
+  OMNION_S3_REGION: ${OMNION_S3_REGION:-us-east-1}
+  OMNION_STORAGE_DRIVER: s3
+  OMNION_PUBLIC_URL: ${OMNION_PUBLIC_URL:?set OMNION_PUBLIC_URL in .env}
+  OMNION_LOG_FORMAT: json
+  OMNION_LOG: info
+  OMNION_CSRF_SECRET: ${OMNION_CSRF_SECRET:?set OMNION_CSRF_SECRET in .env}
+  OMNION_ADMIN_EMAIL: ${OMNION_ADMIN_EMAIL:?set OMNION_ADMIN_EMAIL in .env}
+  OMNION_ADMIN_PASSWORD: ${OMNION_ADMIN_PASSWORD:?set OMNION_ADMIN_PASSWORD in .env}
+  OMNION_DRAIN_TIMEOUT_MS: "${OMNION_DRAIN_TIMEOUT_MS:-10000}"
+
+services:
+  # -------------------------------------------------------------------------------------------
+  # Migrations — one-shot, against the external database, before any replica starts.
+  # -------------------------------------------------------------------------------------------
+  migrate:
+    <<: *restart
+    image: ${OMNION_IMAGE_REPO:-ghcr.io/raksix/omnion}/api:${OMNION_VERSION:-0.1.0}
+    command: ["--migrate-only"]
+    environment:
+      <<: *app-env
+      OMNION_DB_MAX_CONNECTIONS: "4"
+    # Nothing to wait for locally: the external database is the organisation's to start, so a
+    # local healthcheck would assert something this file does not own. A deployment that wants
+    # ordering runs the job itself (the Helm chart does, as a pre-upgrade hook).
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks: [omnion]
+    logging: *logging
+
+  # -------------------------------------------------------------------------------------------
+  # API replicas
+  # -------------------------------------------------------------------------------------------
+  api:
+    <<: *restart
+    image: ${OMNION_IMAGE_REPO:-ghcr.io/raksix/omnion}/api:${OMNION_VERSION:-0.1.0}
+    environment:
+      <<: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # Behind an external load balancer or ingress, so the replicas are not published to the host
+    # here; `expose` documents the port for the network without binding it.
+    expose:
+      - "8080"
+    networks: [omnion]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    stop_grace_period: ${OMNION_STOP_GRACE_PERIOD:-30s}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/omnion-api", "--healthcheck"]
+      interval: 15s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    deploy:
+      replicas: ${OMNION_API_REPLICAS:-3}
+      resources:
+        limits:
+          cpus: "${OMNION_API_CPUS:-2.0}"
+          memory: ${OMNION_API_MEMORY:-2g}
+    logging: *logging
+
+  # -------------------------------------------------------------------------------------------
+  # Panel and renderer
+  # -------------------------------------------------------------------------------------------
+  admin:
+    <<: *restart
+    image: ${OMNION_IMAGE_REPO:-ghcr.io/raksix/omnion}/admin:${OMNION_VERSION:-0.1.0}
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      OMNION_API_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "3000"
+    networks: [omnion]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    stop_grace_period: 20s
+    deploy:
+      replicas: ${OMNION_ADMIN_REPLICAS:-2}
+      resources:
+        limits:
+          cpus: "${OMNION_ADMIN_CPUS:-1.0}"
+          memory: ${OMNION_ADMIN_MEMORY:-1g}
+    logging: *logging
+
+  web:
+    <<: *restart
+    image: ${OMNION_IMAGE_REPO:-ghcr.io/raksix/omnion}/web:${OMNION_VERSION:-0.1.0}
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      OMNION_API_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    expose:
+      - "3000"
+    networks: [omnion]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    stop_grace_period: 20s
+    deploy:
+      replicas: ${OMNION_WEB_REPLICAS:-2}
+      resources:
+        limits:
+          cpus: "${OMNION_WEB_CPUS:-1.0}"
+          memory: ${OMNION_WEB_MEMORY:-1g}
+    logging: *logging
+
+networks:
+  omnion:
+    driver: bridge

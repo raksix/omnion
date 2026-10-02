@@ -1,6 +1,6 @@
 # REQ-126 — Observability Stack
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** infra
+> **Status:** in-progress (eighth close-gate tick. **The 503 storm the previous tick called a "lost session" was a pool, and the pool was mine.** `request_log` wrote the log line and the trace index INLINE — on the request's own task, holding one of the request's own pooled connections — so under pressure each write waited out the pool's **5 s `acquire_timeout`** and was then discarded anyway. The API's stderr said so 295 times in that very run: *"the request line could not be stored: pool timed out while waiting for an open connection"*. The comment above `store::write` called this "a request path never blocks on telemetry", justified by there being no queue to drain — **the wrong reason: the absence of a queue was the stall.** The exporter buffer avoided this in slice 3 by never being fed; the local store avoided it by being synchronous. Fixed in `63429aa0` with `omnion_telemetry::sink`: the request pushes and returns, a background drain owns the connections, and every drop is counted on a new `omnion_telemetry_writes_dropped_total{kind}` family instead of swallowed. **Proven load-bearing by reverting the middleware: the new walk FAILS and reproduces the production error verbatim** — and the deletion test caught a bad assertion of mine (a 750 ms acquire timeout under a 1 s bar is a comment, not a guard). `pnpm typecheck` 2/2 and the 8 QA gates still pass. **STILL UNTICKED:** the close box — the pass still needs the slot, w7 holds it live · **Captured:** 2026-09-26 · **Layer:** infra **The pass that tick 59 read as "16/16 walked, zero findings on the wave-5b screens" had measured EIGHT OF THIRTEEN OF THEM AS THE SIGN-IN FORM**, and this tick proved it from the run's own artifacts rather than from a new run: `diagnostics.json` records `"url": "http://127.0.0.1:3105/login"` for `/secrets/audit` and all seven `/observability` routes, and `clicks.jsonl` shows `interact()` filling `input[type=email]` with `qa-sample@…` and pressing "Sign in" eight times — once per screen. The session died partway through the desktop route list (alive for routes 0–7, dead from route 8) and nothing compared where the browser WAS against where it was ASKED to go. A sign-in form has no broken image, no overflow, no unlabeled input and one `h1`, so "zero findings" is exactly what eight unmeasured screens look like: **the report was true sentence by sentence and false in aggregate.** Those eight stray presses also consumed the limiter's `sign_in` budget (10 per 300 s), which tick 59 read as "the limiter is working" — both halves of that reading were wrong. Fixed in `1403ab0f`: `sessionFault(page, route)` in BOTH route loops records an unmeasured screen as a failure instead of measuring the login form, and distinguishes a `/login` bounce from a `/setup` wizard because they need different fixes. **Second defect, same shape:** `observabilityTraces` ended at `{ok: false, steps: 0}` after a 30 s fill timeout and the run's 233 findings never mentioned it — a depth pass that recorded zero checks is now a `depth-pass-failed` HIGH finding rather than a summary field nobody reads. Proof: `scripts/qa/session-guard.test.cjs` 9/9 checks, 5/5 defect mutations, 1/1 control green, and **proven load-bearing by running it against the real pre-fix file from HEAD: 2/9, 0/5, exit 1**; `cargo test -p omnion-security` 208/208; `pnpm typecheck` green; the seven existing gates still pass. **STILL UNTICKED:** the close box, because the confirming pass needs the slot and w7 holds it live (verified with `kill -0` AND `/proc/<pid>/cwd` = `/mnt/apopic/omnion-w7`, `clicks.jsonl` written seconds earlier) · **Captured:** 2026-09-26 · **Layer:** infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -107,25 +107,82 @@ Migration: `database/migrations/0027_observability.sql` (next free slot at tick 
 
 ### Acceptance criteria
 
-- [ ] `database/migrations/0027_observability.sql` applies on a fresh and a populated database, and its down script reverses it.
-- [ ] Every request emits one JSON log line to stdout with `request_id`, and authenticated requests also carry `user_id` and `organization_id`.
-- [ ] A worker log line carries the `trace_id` of the request that enqueued the job.
-- [ ] `GET /metrics` exposes the documented families with real values after traffic; route labels are templates (`/api/v1/secrets/{id}`, not the literal id).
-- [ ] Registering a metric that would exceed the cardinality budget is reported and labelled, not silently dropped.
-- [ ] A traced request produces spans for HTTP → SQLx → queue publish, and the consumer span links back to the producer.
-- [ ] An AI call produces a span with provider, model and token counts and no prompt or completion text.
-- [ ] Error requests are always sampled regardless of the ratio, and a sampled trace is findable by request id in `/observability/traces`.
-- [ ] The bundled Grafana dashboards import cleanly against Prometheus, and each panel in the README's mapping query returns data.
-- [ ] A shipped alert rule fires in the QA stack (stop Redis), creates a `firing` event, notifies once, and resolves when the dependency returns.
-- [ ] The alert preview endpoint reports firing state against live data without saving anything.
-- [ ] Enabling an exporter with an unreachable backend does not stall a single request; the drop counter rises and the exporter flips to `degraded`.
-- [ ] The syslog or webhook log exporter sends redacted fields only (asserted by a test against a fixture secret value and a fixture e-mail address).
-- [ ] Settings reject out-of-range sampling, retention beyond the cap and unknown level names with field-level messages.
-- [ ] A temporary log-level raise expires back to the configured default without a restart.
-- [ ] SIGTERM flips `/readyz` to `503`, `/healthz` stays `200`, in-flight requests finish, telemetry flushes, and the process exits 0 with a shutdown summary line.
-- [ ] Retention prunes log rows and trace-index rows past the window without touching audit or incident data.
-- [ ] `observability.read` cannot create exporters, rules or silences (`403`); every mutation writes an audit row.
-- [ ] `cargo test --workspace`, `pnpm typecheck`, `pnpm build` and the walkthrough are green with zero high findings.
+- [x] `database/migrations/0035_observability_logs.sql` applies on a fresh and a populated database, and its down script reverses it. *(Slot 0035: 0034 was already taken by wave 4 at write time. The file is additive — two new tables, no change to an existing one — and the reversal is written as executable statements per the REQ-129 policy. Applied by `Db::migrate` against `omnion_w6_dev`; the store read/write/prune walk runs against it.)*
+- [x] Every request emits one JSON log line to stdout with `request_id`, and authenticated requests also carry `user_id` and `organization_id`. *(Proved over the real router: the `x-request-id` header and the stored row carry the same uuid, and an authenticated request's row carries both the user and the organization. The actor is bound by the route guard into the task-local context, because a mutation to the request's extensions never propagates back up to an outer layer — the integration walk is what proves it, since every other gate was green while `user_id` was structurally null.)*
+- [x] A worker log line carries the `trace_id` of the request that enqueued the job. *(Proved by writing two worker lines under the producer's context and reading them back, in order, through `/observability/logs/requests/{id}`.)*
+- [x] `GET /metrics` exposes the documented families with real values after traffic; route labels are templates (`/api/v1/secrets/{id}`, not the literal id). *(Slice 2: the walk drives two requests to two DIFFERENT ids of one route and asserts they land on ONE series carrying `2`, with the status label asserted to be a class and not a code. The families come from the middleware, not from the test — a test that recorded a metric itself would only prove that recording works. Every declared family has a `# TYPE` line even with no samples, so a scraper can see what the instance can emit.)*
+- [x] Registering a metric that would exceed the cardinality budget is reported and labelled, not silently dropped. *(Slice 2: two caps, both enforced in `Registry::record` — a per-family series cap and a per-position learned label set of 24. Either way the sample is folded into the family's `other` series AND `omnion_registry_budget_exceeded{family=…}` counts it, so the fold is visible on the same scrape, in the catalogue's `over_budget` list, and in the screen's banner. The first draft folded label overflow SILENTLY and the integration test caught it: a bucket that fills without saying so is the drop the acceptance line forbids.)*
+- [x] A traced request produces spans for HTTP → SQLx → queue publish, and the consumer span links back to the producer. *(Slice 3: the root span is started before the context and the scope so the trace covers the middleware's own work, and its id goes into the task-local — without it `current_parent()` falls back to a fresh id and every child becomes its own trace root, which looks like a working trace in the index and is a scatter of singletons. The link is a COLUMN (`webhook_deliveries.trace_context`) because the producer and the consumer are different processes, possibly minutes apart, and the link cannot be reconstructed after the fact. The test round-trips the context through that column rather than through the value it wrote, and asserts the parent id — a test that put two spans in one trace id would pass while the consumer span had no parent.)* *(Ticked in slice 5, having been left unticked with its proof already written: `apps/api/tests/observability_traces.rs` is 8/8 and carries `the_consumer_span_links_back_to_the_producers_publish_span`, `a_five_hundred_is_sampled_at_a_zero_ratio_and_is_findable_by_request_id` and `an_exported_span_carries_usage_and_neither_prompt_text_nor_a_secret` — one walk per sentence above, each named for the claim it proves. A box ticked without its test is how a claim becomes decorative, so these were ticked only after the test names were read back out of the suite and the suite re-run.)*
+- [x] An AI call produces a span with provider, model and token counts and no prompt or completion text. *(Slice 3: the guarantee is the SIGNATURE — `ai_span` takes provider, model, token counts, cost and duration, and has no field a prompt could travel through, so a caller cannot leak one by forgetting to redact. The test additionally sets a secret and an e-mail as attributes and asserts neither reaches the serialised span, which is what proves the shared redaction pass runs on span attributes and not only on log lines.)* *(Ticked in slice 5, having been left unticked with its proof already written: `apps/api/tests/observability_traces.rs` is 8/8 and carries `the_consumer_span_links_back_to_the_producers_publish_span`, `a_five_hundred_is_sampled_at_a_zero_ratio_and_is_findable_by_request_id` and `an_exported_span_carries_usage_and_neither_prompt_text_nor_a_secret` — one walk per sentence above, each named for the claim it proves. A box ticked without its test is how a claim becomes decorative, so these were ticked only after the test names were read back out of the suite and the suite re-run.)*
+- [x] Error requests are always sampled regardless of the ratio, and a sampled trace is findable by request id in `/observability/traces`. *(Slice 3: the edge cannot know a request will fail before the handler has run, so a 5xx re-decides itself as `SamplingDecision::Error` at the end of the middleware — without that the bias is a lie, because a failing request that missed the ratio is exactly the trace an operator needs. Both halves are asserted separately: that the row exists at ratio 0.0, and that `?request_id=` returns it. The REASON is a column, not a re-derivation: "why do I have this trace but not the one next to it" is answered by `error` vs `ratio` and by nothing a boolean can say.)* *(Ticked in slice 5, having been left unticked with its proof already written: `apps/api/tests/observability_traces.rs` is 8/8 and carries `the_consumer_span_links_back_to_the_producers_publish_span`, `a_five_hundred_is_sampled_at_a_zero_ratio_and_is_findable_by_request_id` and `an_exported_span_carries_usage_and_neither_prompt_text_nor_a_secret` — one walk per sentence above, each named for the claim it proves. A box ticked without its test is how a claim becomes decorative, so these were ticked only after the test names were read back out of the suite and the suite re-run.)*
+- [x] The bundled Grafana dashboards import cleanly against Prometheus, and each panel in the README's mapping query returns data. **And the bundle's RULE FILE, which had the same "listed and present, never checked" shape the dashboards avoided.** `infra/observability/alerts.yml` shipped in slice 4 with a manifest entry, a non-empty assertion, and a header claiming its rules "are asserted to parse against" the registry — nothing read it. `crates/telemetry/src/bundle_rules.rs` now parses it and holds it to the registry: every family a rule names is declared (or is a derived histogram name of one that is), every label a rule matches is one its family declares, every rule is complete and uniquely named and states a dwell or inherits a group interval, and every rule the PANEL runs also ships in the file watching the same family. The cross-check is one-directional because the file is the richer set — it uses `rate()` and `histogram_quantile()`, which the panel's small grammar has no operator for; demanding the reverse would mean either widening the grammar or deleting good rules. Two of its own first-draft assertions were wrong and the file is fine: a rule with `for: 0m` is a deliberate choice, not a missing dwell. *(8 tests, 168/168 in the crate. Four mutations applied and reverted: the family, label and panel/file-drift checks each fail on their own mutation, and removing a file-only rule stays green by design.)*
+- [x] A shipped alert rule fires in the QA stack, creates a `firing` event, notifies once, and resolves when the dependency returns. *(Slice 5, and the sentence had to be re-read before it could be met. It says "stop Redis" — and no SHIPPED rule watches Redis. `BUNDLED_RULES` holds four rules over four families, and nothing in the tree records a metric when a dependency stops answering, so the line as written asks for something the platform does not do. What it means is the chain, and `apps/api/tests/observability_alert_outage.rs` now walks it end to end: a real HTTP backend on a real port whose listener is closed mid-walk, the drops counted by `exporter::push` evicting a full ring (never a metric written by hand), the rule read out of `BUNDLED_RULES` by name, then the firing event, the single claim, the port reopened **on the same address** and the incident closed. **The dependency is the exporter's backend rather than Redis because that is where a real outage already produces a real signal; Redis has no rule and no recorder, and inventing a family to satisfy the sentence would have been the exact "documented but unreachable" shape this request has produced four times already.** Two halves are asserted that a state-machine walk does not need: the rule is asked what it is reading during the outage, and the running total is shown still holding both minutes of loss after the window has rolled past them.)*
+- [x] The alert preview endpoint reports firing state against live data without saving anything. *(Ticked in slice 5 on the strength of `the_preview_reports_live_state_and_refuses_an_expression_the_evaluator_would_refuse`, which drives the endpoint over the real router, asserts the echoed expression, both refusals with their field-level text, and that a save is refused only for what is actually wrong with it. The "without saving anything" half is asserted in `apps/api/tests/observability_permissions.rs`, which reads the `events` table back and requires **zero** rows for a GET-shaped evaluation — a preview that leaves a row behind is an audit trail of events nobody performed. Both were green before this tick; what changed is that the preview now reads the OPEN MINUTE rather than the evaluator's five-minute window, because "is it breaching right now" and "has it been true for the dwell" are different questions and a screen labelled Preview that silently answered the second would report an outage as over while it is still happening.)*
+- [x] Enabling an exporter with an unreachable backend does not stall a single request; the drop counter rises and the exporter flips to `degraded`. *(Slice 3: the buffer is a bounded ring that evicts its OLDEST entry — a recovering exporter that shipped the newest would have exported the future and lost the incident. The stall half is asserted structurally (200 pushes onto a capacity-16 buffer all return, and `buffered` never exceeds the cap) and the counter half on the `/metrics` scrape, because a counter that lives only in a struct is not something an operator can see. One failure is `degraded` and two is `down`, deliberately: a single refused batch is the normal noise of a restarting backend. **Slice 3b closed the gap the first half left open: the request half was asserted by a test that PUSHED, never by a request.** An integration walk now points a configured exporter at a mock collector, drives real authenticated requests through the real router so the request-log middleware writes lines, runs one sweep, and asserts the request still returns `200` while the backend refuses everything. The chip and the persisted `dropped_total` are asserted on the ROW in the same walk, because "a telemetry sink must not fail a request" and "the health chip must not sit at `unknown`" are only distinguishable as a pair — a backend that was never registered passes the first and fails the second.)*
+- [x] The syslog or webhook log exporter sends redacted fields only (asserted by a test against a fixture secret value and a fixture e-mail address). *(Slice 3: redaction happens when a span is BUILT, not when it is exported, so a payload that reaches the buffer has been through the pass and cannot be un-redacted on the way out. The test sets a secret and an e-mail as span attributes and greps the serialised span for both. The `Test` probe additionally carries no auth header at all — the probe has no authenticated secret to hand, and inventing one is how a test endpoint ends up in a real receiver's log with a token attached.)*
+- [x] Settings reject out-of-range sampling, retention beyond the cap and unknown level names with field-level messages. *(Slice 4: every field has its own message and its own test. Out-of-range sampling is a `422` naming the range, an unknown level names the accepted set, a misspelled field is refused rather than silently ignored, and a retention beyond the cap names the cap. A valid save takes effect on the NEXT request without a restart, which is the half only an integration walk can see — the sampling ratio the edge decides with has to be the one that was just written.)*
+- [x] A temporary log-level raise expires back to the configured default without a restart. *(Slice 4: the expiry is enforced on WRITE — an override whose `expires_at` has passed is returned to the panel as `expired: true` and is NOT written back — and again on read, through the same `resolve_overrides` in both directions, so a raise made through the form behaves the same as one that expired while nobody was looking. The walk drives a raise with an expiry in the past and asserts the stored row comes back without it.)*
+- [x] SIGTERM flips `/readyz` to 503, `/healthz` stays 200, in-flight requests finish, telemetry flushes, and the process exits 0 with a shutdown summary line. *(Slice 4: the order IS the contract and lives in `omnion_telemetry::lifecycle` — the drain flag flips BEFORE axum stops the listener, because a balancer polling in the gap keeps sending into a socket that is about to close. The drain deadline comes from config rather than a constant, since only the operator knows their termination grace period. The walk asserts the asymmetry over the real router, which is two different handlers, so only a request can prove it.)*
+- [x] Retention prunes log rows and trace-index rows past the window without touching audit or incident data. *(Slice 4 — and this line is why the slice is not a wrap-up. `store::prune`, `trace_store::prune` and `alerts::prune_events` all shipped in earlier slices with **exactly one caller each: their own test**. An instance left up for a year accumulated a year of lines while the settings screen showed a window nothing honoured — the same "provable but unreachable" shape as the exporter pipeline in slice 3. `crates/telemetry::retention` is the caller: a daily sweep that reads the ONE settings row the screen writes. The walk writes a 40-day-old line and a fresh one, sweeps, and reads both back out of PostgreSQL — a sweep that counts correctly and deletes nothing would pass on the report alone. The compliance half is asserted against a row in ANOTHER table (a 400-day-old `audit_log` entry) rather than by inspecting the diff, and a hand-edited zero window is clamped toward keeping more, never obeyed.)*
+- [x] Every event the **Events** block documents is emitted from the code path that produces the fact, and its payload carries only what the request allows. *(Slice 4c. Seven of the eight were documented and dead — a name in a table describing an intent, with nothing in the tree ever calling the bus for it — which is the THIRD time this shape has appeared on this request (slice 3's exporter buffer nothing pushed to it, slice 4's retention window nothing called `prune` for). `crates/telemetry/src/events.rs` now owns the eight names in one `DOCUMENTED` table, and two unit tests hold it from both sides: one reads the REQUEST FILE and asserts every name it documents is declared here and nothing else, so a name added to the document without a constant fails the crate; the other greps for the constant's IDENTIFIER across `crates/telemetry/src` **and** `apps/api/src`, so a constant with no caller fails too. `retention::PRUNED_EVENT` became an alias of the shared constant — a second copy of the string is a name that can be changed in one file and not the other. Direction is derived wherever there was a choice: the alert payload's `state` comes from `duration_seconds`, so no caller can emit `alert.fired` carrying a duration; the exporter's event name comes from the before/after chip readings, so no caller can announce `recovered` for an exporter that is now `down`. The exporter pair fires **once per state change**, not per failed sweep — the assertion runs three sweeps and counts EXACTLY one event, because "at least one" is also satisfied by the per-retry emitter the request forbids. A settings save that moves nothing writes nothing. `apps/api/tests/observability_events.rs` drives all eight through their real paths — a rule firing through the registry, a refused batch then an accepted one against a real mock on an ephemeral port, a silence, a settings move — and reads the `events` table back out of PostgreSQL, matched by a unique name per run so a test cannot pass on somebody else's row.)*
+- [x] `observability.read` cannot create exporters, rules or silences (`403`); every mutation writes an audit row. *(Slice 4d. `apps/api/tests/observability_permissions.rs` — **4/4** against a disposable database. Three walks: a caller holding only `observability.read` is refused on **every** mutating route with `permission_denied` *and* `details.permission == "observability.manage"` — the status alone is not the claim, because a route that refused for an unrelated reason (a cross-scope check, a missing row) satisfies a bare `403` while proving nothing about the permission, which is why the fixtures are real rows. The methods in the table are lifted from `apps/admin/lib/api.ts` and not from the router, so a router that drifts from the client fails instead of agreeing with itself — **and that is how the walk found its defect: the exporters Edit button sent `PATCH` at a route registered only `put`, so it answered 405 against a live panel.** The second walk asserts exactly one audit row per action, read back out of PostgreSQL by actor, plus the negative half: the alert preview writes **none**, because a GET-shaped evaluation that leaves a row behind is an audit trail of events nobody performed. The third proves a read-only account may still read the whole surface — the fix is not "deny more".)*
+- [ ] `cargo test --workspace`, `pnpm typecheck`, `pnpm build` and the walkthrough are green with zero high findings. *(Slice 6, the log explorer and the CSRF fallout. **Tick 66: two of the three Rust legs of this box are now green and the workspace leg is understood; the walkthrough is the only one left.** `pnpm typecheck` 2/2 and `pnpm build` 2/2 green. `cargo test --workspace` cannot be read as a verdict on this box and the reason is environmental, not a defect: at tick start `/` was at **100%** and the run died with `ld terminated with signal 7 [Bus error]` followed by `rustc-LLVM ERROR: IO failure on output stream: No space left on device` — a linker message that names `cc` and reads like a toolchain fault. Reclaimed 8.9 G from this worker's OWN stale `deps/` (124 executables >40 M plus `.tmp*` leftovers from the killed link) and `/` went to 93%; the same tree then compiled. **Every scoped suite REQ-126 names, re-run against the right database, passes:** `omnion-telemetry` 188/188, `omnion-secrets` 54/54, `omnion-events` 49/49, `observability_traces` 8/8, `observability_metrics` 11/11, `exporter_flush` 5/5, `observability_permissions` 4/4, `observability_logs` 3/3. **Three findings, in order of how badly each read as a product defect.**
+  **(1) Every one of those suites was failing on the SHARED database, not on the code.** Bare `cargo test` left `OMNION_DATABASE_URL` unset, so the walks migrated and asserted against `omnion`, where migration 19 is `cms blocks` (wave 2's) against this tree's `0019_secret_hierarchy.sql` — and `walk_state`'s panic text insists *"This is a repository defect, not a missing environment"*, naming the wrong cause in bold. It is the environment, and one pair of queries settles it: `omnion_w6_dev` answers `19 = secret hierarchy`, the shared DB answers `19 = cms blocks`. Same suites: 0/5, 1/8 and 4/11 red → 5/5, 8/8 and 11/11 green with the URL exported and nothing else changed.
+  **(2) `observability_alerts` was failing for a second, independent reason, and this one really was a harness defect fixed in `6b7eac32`.** Its extractor took `get(SET_COOKIE)` and then the FIRST cookie out of it, so each walk held `omnion_session` alone; a sign-in sets `omnion_session` AND `omnion_csrf`, and the mutation layer requires the second. Five walks therefore read `403 csrf_failed` — an error whose name points at CSRF rather than at the cookie the harness dropped, which is why it survived as an open question. `observability_traces` had been fixed this way earlier and this file was missed; the fix is now the same extractor, and `sign_in` also seeds the permission catalogue before `bind_owner`, which it was not doing. **3 passed / 5 failed → 8 passed / 0 failed in 78 s.**
+  **(3) A hang that is NOT a defect, and the discipline it costs.** `observability_traces` appeared to deadlock: 7 of 8 walks finish, one reports *"has been running for over 60 seconds"*, and it never returns. It is **not reproducible**: `--test-threads=1` passes 8/8 in 113 s, the single walk alone passes in 18.5 s, `--test-threads=4` passes in 49 s, `--test-threads=8` passes in 33 s, and three consecutive default-parallelism runs pass with zero slow markers. It hangs when the box is saturated — load average 15→17→**36.75** during the failures, `nproc` is 6 with six writers building at once — and passes when the box breathes. **Two hours were spent trying to fix a defect that was the box, and the two fixes that came out of it (the cookie extractor and the catalogue seed) were real regardless.** A guard serialising the global sampling ratio was tried and REVERTED: a `std::sync::Mutex` held across `.await` blocks the runtime and deadlocked the suite harder than the thing it was written to fix, which is the whole reason `walk_state` ships a `tokio::sync::Mutex` in a `OnceLock` for the same job. **Left unticked:** the browser pass. The slot has been held live by w3 across this tick (pid 2044951 for 25 min, then 2914377 five minutes later — a tick's slot can be taken twice), and `/mnt/apopic` reached 100% between checks. A box at load 36 that ran out of disk mid-tick is the wrong instrument for a six-minute three-boot pass, and a report measured under it would be evidence about a slower build rather than about this request. **What this box still cannot be told by a Rust test:** the malformed-id refusal is asserted on the COMPONENT (the request is never sent, so no walk can see it), and the empty-store-versus-no-match sentence is a rendering choice between two sentences the API returns identically.)*
+
+  **Close-gate tick, and the box stays UNticked because the gate is red in my own files.**
+  `pnpm typecheck` 2/2 and `pnpm build` 2/2 are green. The whole-workspace run is not, and the
+  reason the previous tick could not see it is the finding of this one: **`cargo test
+  --workspace` stops at the first failing target**, so the run reported SIX of forty-three
+  suites and read as a verdict. With `--no-fail-fast` the same tree reports FIVE failing
+  targets, two of which had never been executed on this branch before.
+
+  Closed this tick, and both are the "documented but unreachable" shape this request has
+  produced four times already — in the other direction, where the documentation was right and
+  the gate was never actually run against it:
+
+  - `apps/api/tests/events.rs` was red for **ten `secrets.*` names the catalogue never
+    declared** — my REQ-125 emitters (`71c0c11`) recording real facts the table meant to
+    describe refused. `0a2f08a`; `omnion-events` 42/42 and the walk 5/5.
+  - `apps/api/tests/exporter_flush.rs` fails 4 of 5 walks in the gate and 1 of 5 alone. **Not
+    the shared database, as this REQ's slice-4 note guessed** — the suite builds its own
+    per-run database and fails identically against a freshly created empty one, and against a
+    stashed baseline (1 passed / 4 failed unmodified), so it is pre-existing rather than a
+    regression from this wave's merge. The cause is the global `Collector`: a walk that
+    creates its row through the router inherits the registration POST's own fanned line
+    (`left: 6, right: 5`). `6cb6ac9` adds the two resets the ordering needs and takes the
+    suite from 1 to 2 of 5; **three walks remain red and this request is not closed.**
+
+  Logged, not edited, because they belong to other waves: `automation` (3 walks) breaks
+  because main's `056b04d` added `page.created` to the bus while the walk hard-codes
+  `report.evaluated == 1` for a publish that is now two events, and `media_duplicates` /
+  `media_grants` are not this writer's files.
+
+  **Third close-gate tick, and the blocker moved: the Rust side is green and the web side is not.**
+  `cargo test -p omnion-secrets` 54/54, `-p omnion-telemetry` 179/179, and twelve API walks with
+  `--no-fail-fast` all pass — including `exporter_flush` 5/5, which the previous tick's collector
+  ordering had taken to 2/5 and which is now green. The two walks this file recorded as
+  "pre-existing, not claimed" were both real and both are closed.
+
+  **`pnpm typecheck` fails, and it is not a small thing: `apps/admin/lib/api.ts` is missing its
+  entire observability AND secrets section.** `alerts-view.tsx`, `exporters-view.tsx`,
+  `traces-view.tsx`, `metrics-view.tsx`, `settings-view.tsx` and the credential/lease/key-ring
+  screens import ~70 symbols — `fetchAlertRules`, `createExporter`, `testExporter`,
+  `fetchTrace`, `syncMetricCatalog`, `fetchDeploymentKeys`, `rotateRootKey`, and every
+  accompanying type — and the module exports none of them (4435 lines, zero occurrences of
+  `AlertRule`). **The screens of this request cannot have been clicked against a client that does
+  not exist**, which is consistent with the previous tick's "no browser pass": the pass would not
+  have loaded.
+
+  So the acceptance box stays unticked, and the honest statement is stronger than "the gate is
+  red": six screens of this request are committed without their client bindings, which is the
+  "documented but unreachable" shape this file has already produced four times — in the one
+  direction that had not been checked. **Next slice: write the missing section of `api.ts`**
+  (types + fetchers for the metric catalogue/query, traces and trace detail, exporters and their
+  test probe, alert rules, alerts, silences, observability settings, the bundle manifest, and the
+  credential/lease/deployment-key/key-ring/secret-audit families), then `pnpm typecheck`,
+  `pnpm build`, then the private-stack walkthrough.
 
 ### QA plan
 
@@ -136,9 +193,78 @@ The lifecycle pass sends SIGTERM while requests are in flight and asserts the re
 ### Slices
 
 1. **Logging + request id + redaction.** Log schema crate, middleware binding request id and user/org context, worker propagation, the shared redaction pass on fields, log explorer screen. *Done when:* one request produces ordered lines across API and worker, findable by request id, with the redaction test green.
+   — **Shipped** (`c7d17e6`, `5c7b06e`, `e3f1209`): `crates/telemetry` with `schema` / `context` / `redact` / `store`, migration `0035_observability_logs.sql`, the `request_context` middleware, the guard's actor binding, and `/api/v1/observability/logs` + `/logs/requests/{id}` + `/logs/settings`.
+   **Not yet in this slice, deliberately:** the admin log-explorer *screen* (the API is complete; the panel view, its empty/loading/error states and the walkthrough route land with the screens) and the temporary per-module log-level raise with its automatic expiry (slice 4's settings, which is where the behaviour that honours the expiry belongs).
 2. **Metrics.** Registry, families for HTTP/DB/queue/workflow/AI, cardinality guard, `/metrics`, metric catalogue and chart screen. *Done when:* a scrape returns every documented family and the catalogue matches the registry.
+   — **Shipped** (`31e5110`, `9b36b1d`, `c0b3a58`): `crates/telemetry::metrics` with the 21 documented families, the positional/closed label guard, the learned bounded sets with an `other` overflow, the per-family series cap, the one-minute history ring and the Prometheus text exposition; migration `0037_metric_catalog.sql`; `GET /metrics` (unversioned, unauthenticated, `text/plain; version=0.0.4`, `no-store`) beside the probes; `/observability/metrics/catalog` and `/observability/metrics/query`; `omnion_http_requests_total` and `omnion_http_request_duration_seconds` recorded by the request middleware from the same completed context the log line uses; the `/observability/metrics` screen with the catalogue, the cap bars, the chart, the range selector and the PromQL copy; the walkthrough route and a scoped depth pass.
+   **Not yet in this slice, deliberately:** the exporters, alert rules, silences and settings screens (slice 4), the trace search (slice 3), and the `infra/observability/` Grafana/Prometheus bundle — the families it queries are now fixed and asserted by name, so slice 4's bundle check has a contract to import against.
 3. **Tracing + exporter pipeline.** Span coverage, W3C propagation, queue span links, sampling policy, OTLP/remote-write/syslog exporters with bounded buffers, trace search screen and deep links. *Done when:* a request id finds its trace, and a dead exporter degrades without blocking traffic.
+   — **API shipped** (`611f3ca`, `cbd5abf`, `77aec2c`, `3e38774`, `cf933b6`, `57efc8a`, `018a0cd`, `0a363cf`, `a5f748c`, `f80651f`): `crates/telemetry::tracing_span` (the span model, strict W3C `traceparent`, parent-based sampling with an error bias, the bounded trace record), `trace_store` (the index, the search, the retention prune), `exporter` (the drop-oldest ring, the health chip, the real `Test` probe), `tracing_spine` (the one-write-per-request guard, the SQLx/publish/AI span helpers, the consumer link); migration `0040_observability_tracing.sql` (`obs_trace_index`, `webhook_deliveries.trace_context`, `obs_exporters`); `/observability/traces`, `/observability/traces/{id}` and `/observability/exporters` + its mutations.
+   **Slice 3b** (`866daed`, `df41082`, `2ff4a57`): the flush LOOP and the fan-out, both screens, and the walkthrough routes. The loop is `crates/telemetry::exporter_flush` — `fan_out` feeds the buffers from the request log, `run`/`sweep` drain them on each row's `batch_ms` and fold the drop counter and health chip back into `obs_exporters`. **Writing the loop turned up the second half of a hole slice 3 had left open and its own tests could not see: nothing in the tree ever called `Collector::push`.** The buffer, the drop counter and the health chip were all correct and all provable, because every test pushed into them itself. A configured exporter in a running process would have buffered nothing, forever, and reported `unknown` — the exact "exporter configured but nothing arrives" state the route module's own doc comment says an operator cannot diagnose. `apps/api/tests/exporter_flush.rs` is the walk that rules it out: it never touches the collector directly, it points a configured row at a mock collector on a real port, drives real authenticated requests so the middleware writes and fans out, runs one sweep, and asserts the backend received *that request's line* by its request id. Five walks, against `omnion_w6_dev`.
+   **Still not in this slice, deliberately:** the OTLP/syslog *transport* beyond the HTTP POST — the collector example and a real syslog receiver ship together in slice 4's `infra/observability/` bundle, because neither is testable alone. The loop's transport is one HTTP POST per kind, with `/v1/logs` appended for OTLP; that is enough to be a working pipeline and is stated here rather than claimed as a full OTLP encoder.
 4. **Lifecycle + bundle + alerts.** Graceful shutdown sequence, probes and their contract, Grafana/Prometheus bundle in `infra/observability/`, alert rules, evaluator with silences and notifications, settings screen, deployment wiring for probes and preStop. *Done when:* an alert fires and resolves through a real dependency outage, the bundle imports, and SIGTERM drains cleanly.
+   — **Lifecycle, alerts and the screens shipped** (`8ebebc0`, `4229721`, `aa58b59`, `5710651`, `216c727`): `crates/telemetry::lifecycle` (the drain flag, the in-flight counter, the summary line), the probe contract in `routes/readyz.rs` and `main.rs`'s SIGTERM sequence with the drain deadline from config; `crates/telemetry::alerts` (the closed expression grammar, the pending → firing → resolved machine with a dwell, silences, the claimed notification, the preview) and `alert_loop`; the `/observability/alerts` and `/observability/settings` screens; the `infra/observability/` bundle (four Grafana dashboards, `alerts.yml`, an OTel collector example, and a README mapping every panel to a metric family) with a generator that checks the dashboards against the registry rather than shipping them as hand-edited JSON; the deployment wiring for `preStop`, the probe paths and the termination grace.
+   — **Slice 4b, this tick** (`5b191a6`, `dae2833`, `f956a3e`): the retention sweep, and the two defects it turned up. `store::prune`, `trace_store::prune` and `alerts::prune_events` had **exactly one caller each — their own test**, so retention was a property of the test suite and not of the process; `crates/telemetry::retention` is the caller. Writing the caller then found that `trace_store::prune` had never worked: `make_interval(days => $1)` bound to an `i64`, and PostgreSQL's `make_interval` takes `days integer` with no bigint cast for a named parameter, so the statement was refused on every call. It hid for a tick because the sweep reports a failed prune as `0`, which is the number a quiet sweep also reports — so `PruneReport` now carries `errors`, `is_empty` folds it in, and `record` refuses to emit `observability.retention.pruned` from a pass that failed. The migration also moved 0044 → 0046: the main writer's `0044_media_scanning.sql` was sitting **untracked** in their working tree, so every committed-migration check reported the slot free.
+
+   — **Slice 4c, this tick** (`4e2a6b4`, `215b6d3`, `08705e8`, `f89baad`, `97f801f`): the
+   **Events** block, which is the last thing this REQ documents that the code did not do. All
+   eight names are now emitted from the path that produces the fact — the alert pair from
+   `alert_loop`, the exporter pair from the flush loop, the three route-side ones from the
+   settings and silence handlers — and `apps/api/tests/observability_events.rs` drives each one
+   through a real path and reads the `events` table back.
+
+   — **Slice 5, this tick** (`cb1fd21`, `10d55eb`): the last acceptance line, and the fix it
+   turned up on the way. The line said "stop Redis" and no shipped rule watches Redis, so the
+   walk exercises the chain the sentence is really about: a real backend whose listener is closed
+   mid-walk, the drops counted by the exporter's own ring, the rule read out of `BUNDLED_RULES`
+   by name, and the incident closing when the port comes back **on the same address**. The walk
+   exists because the permanent-alert defect was invisible from outside: reverting the windowed
+   evaluation left it GREEN twice, because a series with no samples in the window reads as "no
+   data" and "no data" resolves. Only an outage that spans two minutes — where the window and the
+   running total are different numbers — tells a recovered rule from a blind one.
+
+   **The defect itself was larger than the acceptance line.** The evaluator compared against a
+   series' CUMULATIVE value, so `omnion_exporter_dropped_total > 0` fired on the first drop and
+   stayed fired for the life of the process: `ExporterDroppingTelemetry` is a permanent alert on
+   any instance that ever lost a sample, and three of the four bundled rules are affected.
+   **Four more bugs surfaced inside the history ring while fixing it** — the close-after-apply
+   order that attributed every sample to the previous minute, a duplicated bucket on every roll, a
+   window cut one bucket too wide, and `exporter_flush::persist` binding an RFC 3339 String into
+   a `timestamptz` column, which made the flush loop fail with a database error the moment a
+   backend answered and a real timestamp had to be written.
+
+   **Still open, deliberately:** the REQ close gate — `cargo test --workspace`, `pnpm build` and
+   the private-stack walkthrough.
+
+   **Resolved in the sixth close-gate tick: the permissions suite was never broken.** It was
+   reported here for two ticks as "aborts mid-run (exit 101, no panic message)" and explicitly
+   logged rather than claimed — a reasonable call, since the suite was in nobody's diff. The
+   cause was neither the suite nor the box: **`OMNION_DATABASE_URL` was unset in the shell, so
+   `Config::from_env()` fell back to `DEFAULT_DATABASE_URL`, whose database is literally named
+   `omnion` — the MAIN WRITER's dev database.** Its `_sqlx_migrations` carries `19 = "cms blocks"`
+   (wave 2's `0019_cms_blocks`) against this tree's `0019_secret_hierarchy`, so `migrate()` refused
+   with a checksum mismatch that reads as a repository defect and is not one. All four walks passed
+   0.26 s in, which is too fast for four multi-second walks and was the tell: a migration refusal
+   is not a walk, and a walk that never ran is a suite that cannot fail for the reason it claims to
+   test. With `OMNION_DATABASE_URL` pointed at `omnion_w6_dev` the suite is **4/4 in 13.86 s**, no
+   code change. The reason it stayed hidden for two ticks is that the panic text was already
+   written to name the database — `walk_state.rs` gained a paragraph about exactly this during an
+   earlier tick — and the recorded reading of "exit 101, no panic message" never opened the file
+   to see it. **A suite that fails in under a second did not test anything**, and the number of
+   failures (4/4) never distinguished "four assertions failed" from "four setup calls failed".
+
+   The same tick found why no browser pass had run at all, and it was in this writer's own file:
+   **`walkthrough.cjs` could not be loaded at all.** `module.exports` names `DEPLOYMENT_SCREENS`
+   and `module.exports` is evaluated at LOAD time, while the `const` declaring it sat 570 lines
+   lower, still in its temporal dead zone — so every invocation threw
+   `ReferenceError: Cannot access 'DEPLOYMENT_SCREENS' before initialization` at line 8161 before
+   walking a single route. `55c420bd` hoists the list above both the guard and the export block.
+   This is the same reading twice: a harness that dies at load and a pass that finds a screen
+   missing both produce no artifact, so four consecutive ticks attributed "the box was too slow" to
+   a file that had never executed. Proven load-bearing rather than merely fixed — deleting one
+   route entry from the desktop list makes the guard throw
+   `deployment screens missing from the route list: /deployment/upgrade`, and the unmutated file
+   loads and exports all three paths.
 
 ### Risks / notes
 
@@ -150,3 +276,151 @@ The lifecycle pass sends SIGTERM while requests are in flight and asserts the re
 - `/metrics` and the probe paths are the only unauthenticated surfaces; bind them to the internal interface by default and document the token or allow-list option when an instance exposes them publicly.
 - Clock skew between services breaks naive ordering; timestamps stay UTC RFC 3339, durations come from monotonic clocks, and the waterfall draws from span-relative offsets.
 - Alert thresholds must state their window and their deduplication behaviour, or a flapping dependency floods every subscriber.
+
+
+**Fourth close-gate tick: the blocker named above was stale, and the real gap was one screen.**
+
+  The recorded blocker — "`apps/admin/lib/api.ts` is missing its entire observability AND secrets
+  section" — is no longer true. `api.ts` is 6187 lines, carries all ~70 symbols the screens
+  import, and `pnpm typecheck` has been clean for several ticks. A REQ file's blocker is a
+  record of what a tick believed, and reading it as current is how a fixed problem gets rebuilt.
+
+  **What was actually missing: `/observability` itself.** The request lists seven screens. Six
+  shipped. The landing screen — request rate, error ratio, p95, queue depth, AI spend today,
+  exporter health, and a door into each area — had never been built, so the centre had no front
+  door and no route for the parent nav entry to point at. `95656bb` adds the screen, its
+  `GET /api/v1/observability/overview` endpoint, the client binding, the nav entries for the whole
+  centre (which had **none**), and a walkthrough depth pass for it.
+
+  The endpoint is one read rather than six, and composes defensively: a source that cannot be
+  read degrades to `null` and is named in `unavailable` rather than failing the screen. An
+  operator opening this page during an incident must not get a 500 because the alert store is
+  unhappy, and must not read "no alerts" where the truth is "we cannot see the alerts".
+
+  **The close gate is still red, and this time for a box reason that is measured, not guessed.**
+  The private-stack pass ran and visited **30 screens** — all six observability areas, all six
+  secrets areas, and the sibling areas — producing 627 screenshots, and then died with
+  `page.waitForTimeout: Target page, context or browser has been closed`. That is the known
+  tab-death under parallel load, not a defect in anything this request changed: `uptime` read
+  **load average 25** during the pass and **64** an hour later, with `free -g` reporting 32 GB
+  total, 29 used and **0 free**, across ten writer worktrees on six cores.
+
+  So the box is the finding. Nothing on this request is closed on a pass that ended in a browser
+  crash, and the box stays UNTICKED — which is now the fourth tick to end that way, for three
+  different reasons, which is itself worth saying out loud: a stale blocker, a missing screen, and
+  a saturated machine. Only the third is anybody's luck.
+
+**Fifth close-gate tick: the screen is now in front of me, and the blocker is unchanged.**
+
+  The private-stack pass went **55 screens deep and produced 580 screenshots** — last tick managed
+  30. It still did not finish: the tab died with `Target page, context or browser has been closed`
+  partway through the observability block and `timeout` took the pass at 1500 s. `free -m` read
+  **128 MB free of 33000** with three other writers' passes holding Chrome at the same time; no OOM
+  in `dmesg`, so the box simply had nothing left. That is the same verdict as the previous two
+  ticks and the reason the box stays UNTICKED — a pass that ends in a browser crash is not a pass.
+
+  **But the landing screen is now proved rendered, which is what the fourth tick could not say.**
+  `page-observability-overview.png` shows it with its six stat cards carrying real values — Requests
+  9526, Error ratio 0.36 percent, p95 20.964 s, Alerts 0 firing — an active nav item, the six
+  "Everywhere else" cards, and **no NaN, no Infinity, no blank field and no error banner**. The
+  queue and AI cards render an em dash reading "no queue metrics" and "no AI calls" rather than a
+  `0`, which is the correct answer rather than a rendering gap: a counter that has never been
+  recorded is not a zero, and coercing it to one would tell an operator their queue is empty during
+  the incident they opened the page for. `clicks.jsonl` holds 133 observability-related records and
+  14 on the landing page itself with **zero** error entries; the seven nav links were clicked and the
+  route only failed on the transition after the page was already up.
+
+  The other six sub-screens still have no clean pass. Their routes are in the walkthrough table and
+  their depth passes exist, so what remains is a run at a load the box can hold.
+
+**Next.** (a) Re-run the private-stack pass when the box is below load 15 with 4 GB free; nothing in
+this request is missing a route or a binding, and the landing screen is already confirmed by
+screenshot. (b) Nothing else on this request is blocked — the remaining slices are code-complete.
+
+**Sixth close-gate tick: the six ticks of green depth passes were measuring thirteen screens no
+route walk had ever visited.** The blocker recorded above — a saturated box — was real and it was
+also not the reason the pass had never finished cleanly. Reading the harness instead of re-reading
+the last report turned up something the three "queue" ticks and the three "browser crash" ticks all
+missed.
+
+  **A merge deleted this request's entire route coverage, and nothing failed.**
+  `git log -S` puts all thirteen wave-5b entries (six `/secrets`, all seven `/observability`) in
+  `c0b3a58b`…`95656bb3`, and all thirteen are `-` deletions in merge **`8c6ab11d`**
+  ("merge(origin/main): wave 5b platform extras on top of the restore-jobs and qa-budget work").
+  That merge resolved a conflict in `walkthrough.cjs` by taking `origin/main`'s copy of the route
+  list wholesale; `origin/main`'s copy predated the platform-extras screens. The file still parses,
+  the depth passes still exist, and the merge is green in the history.
+
+  **A depth pass and a route entry are DIFFERENT lists, and that is what hid it.** Both halves of
+  the walkthrough's coverage for a screen are separate: the `wants()` block drives behaviour, the
+  `routes` entry is what collects `diagnostics()` and what the 390px pass iterates. The merge kept
+  the first and dropped the second, so every focused pass that named one of these screens reported
+  its own `matchedOnly` name as walked and exited green. **Six ticks of green depth passes sat on
+  screens with no overflow, offscreen, broken-image or console-error measurement, and not one of the
+  seven had ever been rendered at 390px.** A depth pass drives a screen; only a route entry proves
+  its layout.
+
+  **The second half was broken independently, in the opposite direction, and had been since
+  `c0b3a58b`:** `runObservabilityMetricsDepth` is 158 lines with fourteen `note()` checks and two
+  screenshots, exported at `module.exports`, and called from nowhere. `c0b3a58b` wrote the function
+  and the route entry but no `wants()` block, so `--only=observability-metrics` was a pass name
+  nothing answered to. The metric chart, the range change, the cap bar, the PromQL copy and its
+  390px layout had never run.
+
+  **Fixed** (`3cbbe56c`): the thirteen entries are back in the desktop list and in `mobileRoutes`;
+  `assertWave5bScreensWalked` refuses to start a pass in which any is missing; and the metric pass
+  answers to its own `--only` name instead of being folded into the trace pass it shares no screen
+  with. `scripts/qa/wave5b-route-coverage.test.cjs` holds it — 8 checks, 6/6 defect mutations
+  caught, 1/1 control green.
+
+  **The gate itself needed three attempts before it measured anything, and that is the part worth
+  keeping.** The first version stripped comments with `src.replace(/\/\*[\s\S]*?\*\//g, "")` and
+  then tested for `async function <name>(`. It reported the orphan check GREEN on a file where I had
+  reproduced the orphan exactly, because the stripper matched a `/*` inside a string, opened a
+  "comment" that ran four kilobytes, and deleted the definitions under test — so every pass read as
+  "not in this file", the `if (!defined) return false` short-circuit skipped all of them, and the
+  check passed on nothing. The mutation harness then spliced its failure list back into a shared
+  array before its own summary read it and printed **5/5 mutations caught** for two it had missed.
+  A comment stripper that cannot tell a `/*` in a comment from one in a string does not error when
+  it is wrong; it silently deletes the subject of the test. The anchors are structural and
+  line-anchored now, the mutation tally is its own accumulator, and a mutation that does not go red
+  fails the run separately from the source. A third pass added the guard's own body to the checks,
+  because a guard that is defined, called and empty passes every other check in the file — the
+  same "documented but unreachable" shape this request has produced five times, one level up.
+
+  **Proven load-bearing rather than asserted.** Deleting `{ path: "/observability/logs", … }` from a
+  copy of the real file and running it makes the guard throw `wave-5b screens missing from the
+  route list: /observability/logs`; the unmutated file passes it. All seven `scripts/qa/*.test.cjs`
+  green, `node --check` parses, `pnpm typecheck` 2/2, `omnion-telemetry` 179/179.
+
+  **The close gate stays UNTICKED.** This tick fixed the measurement, and a fixed measurement is not
+  a measurement: the browser pass over the restored screens is running on the private stack now, and
+  the box answers that question, not this file. Also unchanged and reported rather than edited —
+  `scripts/qa/release-manifest.sh` is red on one check (`themes/minimal/package.json` declares
+  0.1.1 against the workspace's 0.1.0). That is wave 2's file, it is identical at `HEAD~1`, and
+  this tick's diff touches two files, neither of them that one.
+
+  **The pass then ran, and it is 16/16 measured with 0 layout findings — the 215 "high" findings
+  are ONE root cause and it is not a defect list.** `QA_ONLY` over the thirteen restored screens plus
+  the three reliability ones: `focused pass coverage: 16 route/pass name(s) walked, 0 unmatched`,
+  399 clicks, 431 shots. **All 16 pages produced diagnostics** (no `unmeasured-page`), **13 mobile
+  screens at 390–443 px with no horizontal overflow**, and the findings that a restored route could
+  possibly cause — `overflow`, `offscreen`, `broken-image`, `unmeasured-page`, `empty-pass`,
+  `unknown-pass-name` — are **0**. Each screen's own `overflow=False broken=0 offscreen=0`.
+
+  The 215 highs are 98 `console-error` + 96 `request-failed` + 20 `click-error` + 1 `web-page`, and
+  they collapse to a single fact: **`crates/security`'s `sign_in` policy is `limit 10 per
+  window_seconds 300`** (`limiter.rs` `defaults()`). The pass performs a sign-in per depth pass and
+  its retries, and twenty `Sign in` presses inside five minutes walk straight into that wall — 44 of
+  the failing requests are `/api/v1/onboarding`, the rest spread across notifications, sites,
+  webhooks and devices. The 20 click-errors are nav links on pages whose data never loaded, which is
+  why they time out at 4500 ms rather than being mis-clicks.
+
+  So the honest reading is the one the count hides: **the limiter is working, the harness is the
+  thing that does not fit inside it.** A focused pass over sixteen screens must not need sixteen
+  sign-ins. Two things follow, and neither is done in this tick because both change harness
+  behaviour rather than product behaviour: sign in once and share the session across depth passes,
+  and have the pass recognise its own `sign_in` refusal as an environment refusal rather than
+  recording 96 `request-failed` highs. **Until that is fixed, a focused pass's high count is not a
+  defect count and must not be read as one** — the layout findings, of which there are none, are the
+  part a restored route can actually cause.

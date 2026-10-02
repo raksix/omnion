@@ -66,8 +66,16 @@ reap() {
 }
 reap
 
+# A holder can die WHILE the queue is waiting, and the reaper above already ran before
+# the loop started. So a place whose owner crashed mid-pass was never reclaimed: every
+# later waiter counted it, printed "waiting for a QA slot" and sat until its own
+# deadline — on this box twenty-two waiters behind one dead holder, each holding a
+# loop's tick open for the full hour. Reaping once more per poll makes the queue a
+# function of who is ALIVE rather than of who was alive when the waiter started, and
+# it costs one `kill -0` per place per fifteen seconds.
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
@@ -83,12 +91,6 @@ while :; do
     echo "[qa-slot] place taken ($(( count + 1 ))/$MAX)" >&2
     exit 0
   fi
-  # **The reaper has to run in the loop, not only on entry.** It is called once above, which
-  # reclaims a place whose holder was already gone when *this* script started — and misses the
-  # case that actually costs a pass its whole tick: the holder dies while this script is already
-  # waiting. A pass that crashed two minutes ago keeps its place until the next pass starts, and
-  # on a nine-writer box that is every other waiting pass.
-  reap
   if [ "$(date +%s)" -ge "$deadline" ]; then
     echo "[qa-slot] no place after ${WAIT}s, proceeding without one" >&2
     exit 0

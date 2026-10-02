@@ -34,11 +34,6 @@ struct Harness {
 struct TestResponse {
     status: StatusCode,
     set_cookie: Option<String>,
-    /// Every cookie the response set, in order. Sign-in sets *two* — the session and the CSRF
-    /// token — and keeping only the first silently dropped the second, which is why every
-    /// cookie-authenticated POST in this suite answered `403 csrf_failed` after the guard
-    /// landed: a header set cannot hold both, so the token was discarded rather than refused.
-    set_cookies: Vec<String>,
     body: Value,
 }
 
@@ -91,14 +86,18 @@ impl Harness {
             .expect("router must answer");
 
         let status = response.status();
-        let set_cookies: Vec<String> = response
+        // EVERY `Set-Cookie`, joined. `HeaderMap::get` answers the first header only, and a
+        // sign-in sends two — the session, then the CSRF token APPENDED after it. Reading one
+        // made the token structurally invisible to this suite, which then reported "the cookie is
+        // not set" about a cookie the server had sent on every single sign-in.
+        let set_cookie = response
             .headers()
             .get_all(header::SET_COOKIE)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .map(str::to_owned)
-            .collect();
-        let set_cookie = set_cookies.first().cloned();
+            .collect::<Vec<_>>()
+            .join("\n");
+        let set_cookie = (!set_cookie.is_empty()).then_some(set_cookie);
         let bytes = response
             .into_body()
             .collect()
@@ -114,24 +113,19 @@ impl Harness {
         TestResponse {
             status,
             set_cookie,
-            set_cookies,
             body,
         }
     }
 
     /// Create an account directly (bypassing the wizard) and sign it in.
+    /// Create an account and a session for it WITHOUT going through `/auth/login`, so the two
+    /// cookies a browser gets (session + readable CSRF) are minted here instead.
     ///
-    /// Create an account directly (bypassing the wizard) and sign it in.
-    ///
-    /// The session is created through the store rather than through `POST /auth/login`, so no
-    /// CSRF cookie is minted. That is the point: the caller gets a session token **only**, and
-    /// every mutation it makes is refused at the CSRF guard.
-    ///
-    /// Which is a trap for a test that wants to prove something *else* about the account — one
-    /// that asserts a stranger cannot finish the first run would otherwise be asserting the
-    /// CSRF guard, and would keep passing if the ownership check were deleted. A caller that
-    /// needs a usable session signs in over HTTP with [`sign_in`].
-    async fn direct_account(&self, email: &str) -> (Uuid, String) {
+    /// The CSRF token is not optional on a cookie-authenticated write: the layer answers
+    /// `403 csrf_failed` before the handler runs, so a helper that returns only the session
+    /// produces requests that can never succeed — and the assertions downstream then measure the
+    /// refusal rather than the behaviour.
+    async fn direct_account(&self, email: &str) -> (Uuid, Session) {
         let user = users::create_user(
             self.db.pool(),
             NewUser {
@@ -143,17 +137,26 @@ impl Harness {
         )
         .await
         .expect("the direct account must be created");
-        // An account that arrives from outside the wizard is still an account of a platform
-        // whose roles may not be seeded yet — the API bootstraps the first user, and this is
-        // the shape that produces. Seeding here mirrors what the API does at boot, so a test
-        // about the *first run* is not really a test about an unseeded installation.
-        omnion_permissions::seed::ensure(self.db.pool())
-            .await
-            .expect("the permission catalogue must be seedable");
-        let (_, token) = sessions::create_session(self.db.pool(), user.id, None, None)
+        let (session, token) = sessions::create_session(self.db.pool(), user.id, None, None)
             .await
             .expect("the direct session must be created");
-        (user.id, token)
+        // The SAME derivation `cookies::csrf_cookie_for` uses, from the same one place in the
+        // codebase: `derive_csrf_token(secret, session_id)`. Copying the shape instead of calling
+        // it would be a second implementation of the rule the CSRF layer checks, which is exactly
+        // how the two drift.
+        //
+        // The secret comes from the CONFIG this harness built with (`Config::from_env`), not from a
+        // literal here: a hard-coded key in the test would agree with the layer on the day it was
+        // written and disagree the first time someone ran the suite with a different
+        // `OMNION_CSRF_SECRET` — and the disagreement reads as "the CSRF layer is broken".
+        let Some(secret) = self.state.config().csrf.as_bytes().map(<[u8]>::to_vec) else {
+            panic!(
+                "this suite exercises cookie-authenticated writes, so OMNION_CSRF_SECRET must be set \
+                 in the environment it runs in"
+            );
+        };
+        let csrf = omnion_security::derive_csrf_token(&secret, &session.id.to_string());
+        (user.id, Session { token, csrf })
     }
 
     /// Drop the throwaway database.
@@ -171,69 +174,49 @@ impl Harness {
 
 /// The session token a `Set-Cookie` header carries.
 fn token_of(response: &TestResponse) -> String {
-    let cookie = response
-        .set_cookie
-        .as_deref()
-        .expect("the response must set a cookie");
-    cookie
-        .split(';')
-        .next()
-        .expect("cookie has a value")
-        .split_once('=')
-        .expect("cookie is name=value")
-        .1
-        .to_owned()
+    cookie_value(response, "omnion_session").expect("the response must set a session cookie")
 }
 
-/// The CSRF cookie a sign-in set, if it set one.
-fn csrf_of(response: &TestResponse) -> Option<String> {
-    response
-        .set_cookies
-        .iter()
-        .filter_map(|cookie| cookie.split(';').next())
-        .find_map(|cookie| {
-            cookie
-                .strip_prefix("omnion_csrf=")
-                .map(str::to_owned)
-        })
+/// The value of one named cookie out of a response's `Set-Cookie` list.
+fn cookie_value(response: &TestResponse, name: &str) -> Option<String> {
+    response.set_cookie.as_deref()?.lines().find_map(|line| {
+        let pair = line.split(';').next()?.trim();
+        let (key, value) = pair.split_once('=')?;
+        (key.trim() == name).then(|| value.to_owned())
+    })
 }
 
-/// A cookie header carrying the session *and* the CSRF token sign-in issued.
-///
-/// The middleware treats a session cookie as ambient authority, so a cookie-authenticated
-/// mutation must present the token too. Before this, the suite sent the session alone and every
-/// step after the owner answered `403 csrf_failed` — four tests red on a change that landed in
-/// `main` and not here, and the failure text pointed at the CSRF guard rather than at the
-/// request builder that dropped the cookie.
-fn session_cookie(response: &TestResponse) -> String {
-    let session = token_of(response);
-    match csrf_of(response) {
-        Some(csrf) => format!("{session}; omnion_csrf={csrf}"),
-        None => session,
-    }
-}
-
-/// A GET request, optionally with the caller's cookies.
-///
-/// The value is a *cookie string*, not a session token: [`session_cookie`] builds
-/// `token; omnion_csrf=token` and the header carries it verbatim.
+/// A GET request, optionally with a session cookie.
 fn get(uri: &str, cookie: Option<&str>) -> Request<Body> {
     let builder = Request::builder().method("GET").uri(uri);
     let builder = match cookie {
-        Some(cookies) => builder.header(header::COOKIE, format!("omnion_session={cookies}")),
+        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
         None => builder,
     };
     builder.body(Body::empty()).expect("request must build")
 }
 
-/// A POST request with a JSON body, optionally with the caller's cookies.
+/// A POST request with a JSON body, optionally with a session cookie.
+///
+/// ## The CSRF header is not optional on a cookie-authenticated write
+///
+/// This suite went red before it went wrong: it POSTs with a session cookie and no CSRF token, and
+/// the API answers `403 csrf_failed` — *before the handler runs*, so every assertion about what the
+/// handler did was measuring a refusal. The four tests failed identically and the file's own
+/// comments still described a working first run, which is the worst combination available: an
+/// assertion about behaviour, sitting on a request that never reached the behaviour.
+///
+/// The token is the readable `omnion_csrf` cookie the owner POST set, read by
+/// [`TestResponse::set_cookie`] and echoed in `x-omnion-csrf` — the same two-hop the panel's own
+/// client does. `create_owner` now returns BOTH values, because the cookie is only on that one
+/// response and every later step needs it.
 fn post(uri: &str, body: &Value, cookie: Option<&str>) -> Request<Body> {
     let builder = Request::builder()
         .method("POST")
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json");
     let builder = match cookie {
-        Some(cookies) => builder.header(header::COOKIE, format!("omnion_session={cookies}")),
+        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
         None => builder,
     };
     builder
@@ -241,29 +224,43 @@ fn post(uri: &str, body: &Value, cookie: Option<&str>) -> Request<Body> {
         .expect("request must build")
 }
 
-/// Sign an account in over HTTP and return a cookie string a mutation can carry.
-///
-/// The store-level [`Harness::direct_account`] deliberately mints no CSRF token, so a test that
-/// needs to *reach* a later check has to sign in the way a browser does.
-async fn sign_in(harness: &Harness, email: &str) -> String {
-    let response = harness
-        .call(post(
-            "/api/v1/auth/login",
-            &json!({ "email": email, "password": PASSWORD }),
-            None,
-        ))
-        .await;
-    assert_eq!(
-        response.status,
-        StatusCode::OK,
-        "the account must be able to sign in: {:?}",
-        response.body
-    );
-    session_cookie(&response)
+/// The readable CSRF token out of a response's `Set-Cookie` list, if it set one.
+fn csrf_of(response: &TestResponse) -> Option<String> {
+    cookie_value(response, "omnion_csrf")
 }
 
-/// Create the owner account and return its session token.
-async fn create_owner(harness: &Harness, email: &str) -> String {
+/// A POST carrying the session cookie **and** the CSRF token, as a browser would.
+fn post_authed(uri: &str, body: &Value, session: &Session) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, format!("omnion_session={}", session.token))
+        .header("x-omnion-csrf", &session.csrf)
+        .body(Body::from(body.to_string()))
+        .expect("request must build")
+}
+
+/// A DELETE carrying the session cookie and the CSRF token.
+fn delete_authed(uri: &str, session: &Session) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header(header::COOKIE, format!("omnion_session={}", session.token))
+        .header("x-omnion-csrf", &session.csrf)
+        .body(Body::empty())
+        .expect("request must build")
+}
+
+/// The owner's session: the cookie AND the CSRF token, which arrive on the same response.
+#[derive(Clone)]
+struct Session {
+    token: String,
+    csrf: String,
+}
+
+/// Create the owner account and answer its session: the cookie **and** the CSRF token.
+async fn create_owner(harness: &Harness, email: &str) -> Session {
     let response = harness
         .call(post(
             "/api/v1/onboarding/owner",
@@ -281,7 +278,13 @@ async fn create_owner(harness: &Harness, email: &str) -> String {
         "the owner step must create the account: {:?}",
         response.body
     );
-    session_cookie(&response)
+    // Refuse here rather than three tests later: every subsequent step's 403 `csrf_failed` would
+    // otherwise be a mystery with this line's name nowhere near it.
+    let csrf = csrf_of(&response).expect(
+        "the owner POST must set the readable omnion_csrf cookie — without it every later step is \
+         refused by the CSRF layer before its handler runs",
+    );
+    Session { token: token_of(&response), csrf }
 }
 
 #[tokio::test]
@@ -316,22 +319,25 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
     );
 
     // The owner step signs the account in right away.
-    let owner = harness
+    let created = harness
         .call(post(
             "/api/v1/onboarding/owner",
             &json!({ "display_name": "Ada Lovelace", "email": &email, "password": PASSWORD }),
             None,
         ))
         .await;
-    assert_eq!(owner.status, StatusCode::CREATED, "{:?}", owner.body);
-    assert_eq!(owner.body["user"]["email"], json!(email.to_lowercase()));
-    assert_eq!(owner.body["onboarding"]["steps"]["owner"], json!(true));
-    assert_eq!(owner.body["onboarding"]["needs_setup"], json!(false));
-    assert_eq!(owner.body["onboarding"]["in_progress"], json!(true));
-    let token = session_cookie(&owner);
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    assert_eq!(created.body["user"]["email"], json!(email.to_lowercase()));
+    assert_eq!(created.body["onboarding"]["steps"]["owner"], json!(true));
+    assert_eq!(created.body["onboarding"]["needs_setup"], json!(false));
+    assert_eq!(created.body["onboarding"]["in_progress"], json!(true));
+    let owner = Session {
+        token: token_of(&created),
+        csrf: csrf_of(&created).expect("the owner POST sets the readable omnion_csrf cookie"),
+    };
 
     // The session works and the account is platform-level.
-    let me = harness.call(get("/api/v1/me", Some(&token))).await;
+    let me = harness.call(get("/api/v1/me", Some(&owner.token))).await;
     assert_eq!(me.status, StatusCode::OK);
     assert_eq!(me.body["user"]["email"], json!(email.to_lowercase()));
     assert_eq!(me.body["user"]["organization_id"], Value::Null);
@@ -358,11 +364,7 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
 
     let organization = harness
-        .call(post(
-            "/api/v1/onboarding/organization",
-            &json!({ "name": "Acme Corporation", "slug": "acme" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/organization", &json!({ "name": "Acme Corporation", "slug": "acme" }), &owner))
         .await;
     assert_eq!(
         organization.status,
@@ -377,11 +379,7 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
     );
 
     let site = harness
-        .call(post(
-            "/api/v1/onboarding/site",
-            &json!({ "name": "Acme Site", "key": "main", "domain": "acme.test" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/site", &json!({ "name": "Acme Site", "key": "main", "domain": "acme.test" }), &owner))
         .await;
     assert_eq!(site.status, StatusCode::OK, "{:?}", site.body);
     assert_eq!(site.body["steps"]["site"], json!(true));
@@ -389,21 +387,13 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
 
     // The theme has to be one of the bundled ones.
     let unknown = harness
-        .call(post(
-            "/api/v1/onboarding/theme",
-            &json!({ "theme": "neon-void" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/theme", &json!({ "theme": "neon-void" }), &owner))
         .await;
     assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
     assert_eq!(unknown.body["error"]["code"], "unknown_theme");
 
     let theme = harness
-        .call(post(
-            "/api/v1/onboarding/theme",
-            &json!({ "theme": "minimal" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/theme", &json!({ "theme": "minimal" }), &owner))
         .await;
     assert_eq!(theme.status, StatusCode::OK, "{:?}", theme.body);
     assert_eq!(theme.body["steps"]["theme"], json!(true));
@@ -411,50 +401,34 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
 
     // The AI step records the skip (providers arrive with the AI Hub).
     let provider = harness
-        .call(post(
-            "/api/v1/onboarding/ai-provider",
-            &json!({ "provider": "openai" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/ai-provider", &json!({ "provider": "openai" }), &owner))
         .await;
     assert_eq!(provider.status, StatusCode::CONFLICT);
     assert_eq!(provider.body["error"]["code"], "ai_hub_pending");
 
     let ai = harness
-        .call(post(
-            "/api/v1/onboarding/ai-provider",
-            &json!({}),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/ai-provider", &json!({}), &owner))
         .await;
     assert_eq!(ai.status, StatusCode::OK, "{:?}", ai.body);
     assert_eq!(ai.body["steps"]["ai"], json!(true));
 
     // Closing the run.
     let completed = harness
-        .call(post(
-            "/api/v1/onboarding/complete",
-            &json!({}),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/complete", &json!({}), &owner))
         .await;
     assert_eq!(completed.status, StatusCode::OK, "{:?}", completed.body);
     assert_eq!(completed.body["completed"], json!(true));
     assert_eq!(completed.body["in_progress"], json!(false));
 
     let after = harness
-        .call(post(
-            "/api/v1/onboarding/organization",
-            &json!({ "name": "Later" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/organization", &json!({ "name": "Later" }), &owner))
         .await;
     assert_eq!(after.status, StatusCode::CONFLICT);
     assert_eq!(after.body["error"]["code"], "onboarding_complete");
 
     // A working admin: the owner sees the tenant and the site through the regular API.
     let organizations = harness
-        .call(get("/api/v1/organizations", Some(&token)))
+        .call(get("/api/v1/organizations", Some(&owner.token)))
         .await;
     assert_eq!(
         organizations.status,
@@ -470,12 +444,50 @@ async fn the_first_run_walks_a_fresh_database_to_a_signed_in_owner() {
         1
     );
 
-    let sites = harness.call(get("/api/v1/sites", Some(&token))).await;
+    let sites = harness.call(get("/api/v1/sites", Some(&owner.token))).await;
     assert_eq!(sites.status, StatusCode::OK);
     let sites = sites.body["sites"].as_array().expect("sites are a list");
     assert_eq!(sites.len(), 1);
     assert_eq!(sites[0]["key"], json!("main"));
     assert_eq!(sites[0]["theme"], json!("minimal"));
+
+    // The owner's ACCOUNT now carries the organization — and this is the assertion that was
+    // missing for the whole life of the bug.
+    //
+    // `GET /api/v1/sites` and `GET /api/v1/organizations` above both passed on a database where
+    // `users.organization_id` was still NULL: those two routes resolve the tenant from the single
+    // organization row, not from the account. `scope::resolve_organization` is the function that
+    // DOES read the account — and it answers `400 organization_required` for an account with
+    // `None`. So every org-scoped route on a *platform* read worked, which is why the wizard
+    // "succeeded", and the 400 appeared only on the deployment centre and its siblings.
+    //
+    // Removing the `users::set_organization` call from `onboarding::steps::create_organization`
+    // leaves every assertion in this test green — measured, not assumed — and this one red.
+    let owner_account: Option<Uuid> =
+        sqlx::query_scalar("select organization_id from users where email = $1")
+            .bind(&email)
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the owner row must be readable");
+    let organization_id: Uuid = sqlx::query_scalar("select id from organizations limit 1")
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the organization row must be readable");
+    assert_eq!(
+        owner_account,
+        Some(organization_id),
+        "the owner's account must point at the organization, or every org-scoped read is refused \
+         with 400 organization_required"
+    );
+
+    // And through the API the account itself is asked, not the database.
+    let me_after = harness.call(get("/api/v1/me", Some(&owner.token))).await;
+    assert_eq!(me_after.status, StatusCode::OK);
+    assert_eq!(
+        me_after.body["user"]["organization_id"],
+        json!(organization_id.to_string()),
+        "/api/v1/me must report the account's organization"
+    );
 
     // The public renderer sees the site's theme too.
     let page = harness
@@ -522,31 +534,33 @@ async fn only_the_account_that_owns_the_first_run_may_finish_it() {
         return;
     };
     let owner_email = format!("owner-{}@omnion.test", Uuid::new_v4().simple());
-    let token = create_owner(&harness, &owner_email).await;
+    let owner = create_owner(&harness, &owner_email).await;
 
-    // A second account exists (invited later) but is not the owner. It signs in properly, so
-    // the refusal below is the *ownership* check and not the CSRF guard standing in front of
-    // it — a test that cannot tell those two apart proves nothing about either.
-    let stranger = format!("other-{}@omnion.test", Uuid::new_v4().simple());
-    harness.direct_account(&stranger).await;
-    let intruder = sign_in(&harness, &stranger).await;
+    // A second account exists (invited later, created directly here) but is not the owner.
+    let (_, intruder) = harness
+        .direct_account(&format!("other-{}@omnion.test", Uuid::new_v4().simple()))
+        .await;
 
+    // The intruder carries a valid session AND a valid CSRF token on purpose. Without the token
+    // the request is refused by the CSRF layer for a reason that has nothing to do with
+    // ownership — and `403` would still be the answer, so the assertion below would pass against
+    // the wrong refusal and the ownership check would never have been exercised.
     let refused = harness
-        .call(post(
+        .call(post_authed(
             "/api/v1/onboarding/organization",
             &json!({ "name": "Not Mine" }),
-            Some(&intruder),
+            &intruder,
         ))
         .await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN);
-    assert_eq!(refused.body["error"]["code"], "not_onboarding_owner");
+    assert_eq!(
+        refused.body["error"]["code"], "not_onboarding_owner",
+        "the refusal must come from the ownership check, not from CSRF: {:?}",
+        refused.body
+    );
 
     let allowed = harness
-        .call(post(
-            "/api/v1/onboarding/organization",
-            &json!({ "name": "Mine" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/organization", &json!({ "name": "Mine" }), &owner))
         .await;
     assert_eq!(allowed.status, StatusCode::OK, "{:?}", allowed.body);
     assert_eq!(allowed.body["steps"]["organization"], json!(true));
@@ -559,7 +573,7 @@ async fn the_flow_refuses_what_it_still_needs() {
     let Some(harness) = Harness::fresh().await else {
         return;
     };
-    let token = create_owner(
+    let owner = create_owner(
         &harness,
         &format!("owner-{}@omnion.test", Uuid::new_v4().simple()),
     )
@@ -567,21 +581,13 @@ async fn the_flow_refuses_what_it_still_needs() {
 
     // No site yet: a theme has nothing to belong to and the run cannot close.
     let theme = harness
-        .call(post(
-            "/api/v1/onboarding/theme",
-            &json!({ "theme": "minimal" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/theme", &json!({ "theme": "minimal" }), &owner))
         .await;
     assert_eq!(theme.status, StatusCode::CONFLICT);
     assert_eq!(theme.body["error"]["code"], "site_missing");
 
     let complete = harness
-        .call(post(
-            "/api/v1/onboarding/complete",
-            &json!({}),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/complete", &json!({}), &owner))
         .await;
     assert_eq!(complete.status, StatusCode::CONFLICT);
     assert_eq!(complete.body["error"]["code"], "setup_incomplete");
@@ -595,29 +601,17 @@ async fn the_flow_refuses_what_it_still_needs() {
 
     // A site is created once; a second attempt is refused instead of duplicating.
     let organization = harness
-        .call(post(
-            "/api/v1/onboarding/organization",
-            &json!({ "name": "Acme" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/organization", &json!({ "name": "Acme" }), &owner))
         .await;
     assert_eq!(organization.status, StatusCode::OK);
     let site = harness
-        .call(post(
-            "/api/v1/onboarding/site",
-            &json!({ "name": "Acme Site" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/site", &json!({ "name": "Acme Site" }), &owner))
         .await;
     assert_eq!(site.status, StatusCode::OK, "{:?}", site.body);
     assert_eq!(site.body["steps"]["site"], json!(true));
 
     let twice = harness
-        .call(post(
-            "/api/v1/onboarding/site",
-            &json!({ "name": "Another" }),
-            Some(&token),
-        ))
+        .call(post_authed("/api/v1/onboarding/site", &json!({ "name": "Another" }), &owner))
         .await;
     assert_eq!(twice.status, StatusCode::CONFLICT);
     assert_eq!(twice.body["error"]["code"], "step_already_done");
@@ -632,13 +626,10 @@ async fn an_installation_with_accounts_keeps_its_own_first_run() {
     };
 
     // An installation whose first account came from the environment bootstrap (or the API).
-    // It signs in over HTTP because the step below is a mutation, and a store-level session
-    // carries no CSRF token — the guard would refuse it first and the assertion below would be
-    // about the guard rather than about the first run.
-    let bootstrap_email = format!("boot-{}@omnion.test", Uuid::new_v4().simple());
-    let (account, _token) = harness.direct_account(&bootstrap_email).await;
+    let (account, bootstrap) = harness
+        .direct_account(&format!("boot-{}@omnion.test", Uuid::new_v4().simple()))
+        .await;
     let _account = account;
-    let token = sign_in(&harness, &bootstrap_email).await;
 
     let status = harness.call(get("/api/v1/onboarding", None)).await;
     assert_eq!(status.status, StatusCode::OK);
@@ -647,22 +638,26 @@ async fn an_installation_with_accounts_keeps_its_own_first_run() {
     assert_eq!(status.body["steps"]["owner"], json!(true));
 
     // Creating a "first" owner is refused: this installation already has accounts.
-    let owner = harness
+    let late = harness
         .call(post(
             "/api/v1/onboarding/owner",
             &json!({ "display_name": "Late", "email": "late@omnion.test", "password": PASSWORD }),
             None,
         ))
         .await;
-    assert_eq!(owner.status, StatusCode::CONFLICT);
-    assert_eq!(owner.body["error"]["code"], "already_installed");
+    assert_eq!(late.status, StatusCode::CONFLICT);
+    assert_eq!(late.body["error"]["code"], "already_installed");
 
-    // The oldest account may still finish the first run through the wizard.
+    // The account that is already there may still finish the first run through the wizard — and it
+    // is `bootstrap`, not the refused response above. The first draft of this rewrite passed
+    // `&owner` (a `TestResponse` for a 409) and got a type error; had it type-checked by
+    // borrowing, the write would have been refused with no session and the assertion below would
+    // have read that refusal as "the wizard cannot close".
     let organization = harness
-        .call(post(
+        .call(post_authed(
             "/api/v1/onboarding/organization",
             &json!({ "name": "Bootstrap Ltd" }),
-            Some(&token),
+            &bootstrap,
         ))
         .await;
     assert_eq!(
@@ -683,127 +678,6 @@ async fn an_installation_with_accounts_keeps_its_own_first_run() {
     );
 
     harness.dispose().await;
-}
-
-/// The account that creates the organization must be able to *use* it.
-///
-/// The first run creates the owner platform-level on purpose — an Owner runs the platform, not
-/// one tenant — and `set_organization` only ever wrote the onboarding-state singleton. So after
-/// a complete, successful wizard the owner still had `users.organization_id = null` and no
-/// organization-scoped binding, and every organization-scoped surface answered
-/// `no_organization`: the lead inbox, the media library, the analytics. The wizard reported
-/// success and the overview loaded, so the failure surfaced on the first *business* screen a
-/// new installation ever opens.
-///
-/// Two assertions, because either one alone is satisfied by a broken fix: the row must carry
-/// the organization, and an organization-scoped Owner binding must exist. The second is the
-/// one a fix that only sets the column would miss.
-#[tokio::test]
-async fn the_owner_of_the_first_run_belongs_to_the_organization_it_created() {
-    let Some(harness) = Harness::fresh().await else {
-        eprintln!(
-            "skipping: the compose stack is not running \
-             (`docker compose -f infra/compose/docker-compose.dev.yml up -d`)"
-        );
-        return;
-    };
-
-    let token = create_owner(&harness, "owner@omnion.test").await;
-
-    // Before the organization step the account is deliberately platform-level.
-    let before: Option<Uuid> =
-        sqlx::query_scalar("select organization_id from users where email = 'owner@omnion.test'")
-            .fetch_one(harness.db.pool())
-            .await
-            .expect("the owner row must be readable");
-    assert_eq!(
-        before, None,
-        "the owner is platform-level until the organization exists"
-    );
-
-    let organization = harness
-        .call(post(
-            "/api/v1/onboarding/organization",
-            &json!({ "name": "Acme Corporation", "slug": "acme" }),
-            Some(&token),
-        ))
-        .await;
-    assert_eq!(organization.status, StatusCode::OK, "{:?}", organization.body);
-    // The step answers with the *status*, not the organization, so the id is read where the
-    // row is. Asking the response for it would be a test of a field the route does not claim.
-    let organization_id: Uuid = sqlx::query_scalar("select id from organizations where slug = 'acme'")
-        .fetch_one(harness.db.pool())
-        .await
-        .expect("the organization must exist");
-
-    // 1. The account is a member of the organization it just created.
-    let after: Option<Uuid> =
-        sqlx::query_scalar("select organization_id from users where email = 'owner@omnion.test'")
-            .fetch_one(harness.db.pool())
-            .await
-            .expect("the owner row must be readable");
-    assert_eq!(
-        after,
-        Some(organization_id),
-        "the owner must belong to the organization it created, or every \
-         organization-scoped screen answers no_organization"
-    );
-
-    // 2. And it holds Owner *at that organization*, which is what makes a tenant-scoped
-    //    permission check succeed rather than merely resolve to a tenant.
-    let scoped: i64 = sqlx::query_scalar(
-        "select count(*) from role_bindings b join roles r on r.id = b.role_id \
-         where b.subject_type = 'user' and b.subject_id = \
-             (select id from users where email = 'owner@omnion.test') \
-           and r.key = 'owner' and b.scope_type = 'organization' \
-           and b.organization_id = $1 and b.revoked_at is null",
-    )
-    .bind(organization_id)
-    .fetch_one(harness.db.pool())
-    .await
-    .expect("the bindings must be readable");
-    assert_eq!(
-        scoped, 1,
-        "the owner needs an organization-scoped Owner binding, not only a global one"
-    );
-
-    // 3. The global binding survives: this attaches the account to a tenant, it does not
-    //    demote it from the platform.
-    let global: i64 = sqlx::query_scalar(
-        "select count(*) from role_bindings b join roles r on r.id = b.role_id \
-         where b.subject_type = 'user' and b.subject_id = \
-             (select id from users where email = 'owner@omnion.test') \
-           and r.key = 'owner' and b.scope_type = 'global' and b.revoked_at is null",
-    )
-    .fetch_one(harness.db.pool())
-    .await
-    .expect("the bindings must be readable");
-    assert_eq!(global, 1, "the platform Owner binding must not be replaced");
-
-    // 4. Idempotent: a retried first run must not move the account, because the attach only
-    //    fires on a `null` organization and a second call would otherwise be a silent transfer
-    //    between tenants — a different operation with its own permission.
-    let error = omnion_identity::users::attach_to_organization(
-        harness.db.pool(),
-        uuid_of_owner(&harness).await,
-        Uuid::new_v4(),
-    )
-    .await
-    .expect_err("a second attach must be refused, not applied");
-    assert!(
-        error.to_string().contains("already belongs"),
-        "the refusal must say why: {error}"
-    );
-
-    harness.dispose().await;
-}
-
-/// The id of the owner account the first run created.
-async fn uuid_of_owner(harness: &Harness) -> Uuid {
-    sqlx::query_scalar("select id from users where email = 'owner@omnion.test'")
-        .fetch_one(harness.db.pool())
-        .await
-        .expect("the owner row must be readable")
 }
 
 /// Connect to the compose PostgreSQL; `None` means the stack is not running.

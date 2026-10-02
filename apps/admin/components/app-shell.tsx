@@ -6,12 +6,11 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Code2, Copy, FileText, Fingerprint, FolderKanban, GitBranch, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, ShoppingBag, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, ArrowUpCircle, BarChart3, Bell, BellRing, Blocks, Bot, Boxes, CalendarClock, ClipboardCheck, Code2, Database, FileCode2, FileDown, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Radio, Route, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Waypoints, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { SiteSwitcher } from "@/components/site-switcher";
-import { ProjectSwitcher } from "@/features/projects/project-switcher";
 import { GlobalSearch } from "@/components/global-search";
 import { NotificationBell } from "@/components/notification-bell";
 import { useDeveloperAccess } from "@/lib/developer-access";
@@ -38,31 +37,56 @@ const NAV = [
   // platform think happened" and "who was told" — and an operator chasing a missing webhook
   // needs both on the same shelf.
   { href: "/events", label: "Events", icon: Activity },
-  // Projects (REQ-133). It sits with the automation surfaces rather than under Settings, because
-  // it is not a setting: a project is the bucket the other three of those screens are filed into,
-  // and an entry buried in a settings sub-path reads as a preference. Until this tick the whole
-  // feature had four screens and no navigation entry, so the switcher this slice adds had exactly
-  // one reachable host and a reader had to know the URL.
-  { href: "/automation/projects", label: "Projects", icon: FolderKanban },
   // The endpoints and their delivery history (REQ-016, slice 2). It sits next to Events
   // rather than under Settings because the two are the same investigation from both ends:
   // the feed says what happened, this says who was told and whether they got it.
   { href: "/webhooks", label: "Webhooks", icon: Webhook },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
-  // The CRM's two entry points. The duplicate queue is a sibling rather than a filter of the
-  // inbox: it answers "which verdicts can I still reverse", and burying it in a dropdown is how
-  // a wrong dedupe verdict becomes permanent.
-  { href: "/crm/leads", label: "Lead inbox", icon: UserCog },
-  { href: "/crm/leads/duplicates", label: "Duplicate leads", icon: Copy },
-  { href: "/crm/settings/intake", label: "Intake sources", icon: KeyRound },
-  { href: "/crm/settings/assignment", label: "Assignment rules", icon: GitBranch },
-  { href: "/crm/settings/sla", label: "Response targets", icon: Timer },
-  // The shop's own configuration (REQ-118, slice 1a). It sits after the CRM entries rather
-  // than next to Sites because it is not a site editor: it is the set of numbers the public
-  // storefront reads on every request, and an operator changing the stepper cap is doing
-  // something to their customers' baskets, not to their site record.
-  { href: "/commerce/storefront", label: "Storefront", icon: ShoppingBag },
+  // The observability centre (REQ-126) and its six areas. It sits beside Events rather than
+  // under Settings: Events answers "what does the platform think happened", this answers "what
+  // is it doing right now and what did it drop" — and both are read during the same incident.
+  // The parent links to the overview rather than to any one area, because the landing screen is
+  // the one that knows which area holds the answer; deep-linking an operator into the log
+  // explorer when they asked "is anything wrong" is the wrong default.
+  { href: "/observability", label: "Observability", icon: Gauge },
+  { href: "/observability/logs", label: "Observability logs", icon: ScrollText },
+  { href: "/observability/traces", label: "Traces", icon: Route },
+  { href: "/observability/metrics", label: "Metric catalogue", icon: BarChart3 },
+  { href: "/observability/exporters", label: "Exporters", icon: Radio },
+  { href: "/observability/alerts", label: "Alert rules", icon: BellRing },
+  { href: "/observability/settings", label: "Observability settings", icon: SlidersHorizontal },
+  // The deployment centre's release surface (REQ-128, slice 4). It sits beside System Health
+  // rather than under Settings because the three answers are the same operator question asked at
+  // three moments: "what am I running" (artifacts), "how do I install this somewhere else"
+  // (install) and "how do I get to the next version, and what does it cost me if I have to go
+  // back" (upgrade). An upgrade helper filed under a settings sub-path is a helper nobody opens
+  // at 2am, which is exactly when it is needed.
+  { href: "/deployment/artifacts", label: "Release artifacts", icon: Package },
+  { href: "/deployment/install", label: "Install bundle", icon: Boxes },
+  { href: "/deployment/upgrade", label: "Upgrade helper", icon: ArrowUpCircle },
+  // The migration ledger (REQ-129, slice 1) belongs beside them, not under Settings: an operator
+  // asking "what changed my database" is mid-deploy, and the answer they need is the pending set
+  // and the rehearsed/unrehearsed column — the same three questions the other two answer.
+  { href: "/deployment/migrations", label: "Migration ledger", icon: Database },
+  // Anonymised exports sit with the ledger rather than under Settings: a support dump is asked
+  // for in the middle of an incident, and the two questions beside it are the same one — "what
+  // does this installation know, and what may it hand over".
+  { href: "/deployment/exports", label: "Anonymised exports", icon: FileDown },
+  // The developer portal's GraphQL surface (REQ-130, slice 2). It sits beside the deployment
+  // release surface rather than under a settings sub-path because both answer the same integrator
+  // question — "what can a client of this installation do, and what does it cost me" — and an
+  // integrator never goes looking under Settings for it. The playground is the entry, the registry
+  // beside it, and the schema explorer under it because those two are read together.
+  { href: "/developer/graphql", label: "GraphQL playground", icon: Waypoints },
+  { href: "/developer/graphql/documents", label: "Persisted documents", icon: FileCode2 },
+  { href: "/developer/graphql/schema", label: "GraphQL schema", icon: Blocks },
+  { href: "/developer/graphql/settings", label: "GraphQL settings", icon: SlidersHorizontal },
+  // The versioned API policy (REQ-130, slice 4). Beside the GraphQL settings rather than
+  // under them: a sunset is a DATE an integrator reads, and Settings is where nobody goes
+  // looking for a deadline. The screen and the response headers read the same rows, so an
+  // operator who changes a date here has changed what the API says.
+  { href: "/developer/api/deprecations", label: "API deprecations", icon: CalendarClock },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
@@ -113,9 +137,7 @@ function visible(item: NavItem, canOpen: boolean | null): boolean {
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
 /// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
-/// `/crm/leads/duplicates` is here for the same reason — without it the inbox entry would
-/// light up on the queue, and two highlighted items at once reads as a broken sidebar.
-const EXACT_MATCH_ONLY = new Set<string>(["/settings/iam", "/crm/leads/duplicates"]);
+const EXACT_MATCH_ONLY = new Set<string>(["/settings/iam"]);
 
 /** `true` when a navigation entry belongs to the screen that is open. */
 function isActive(href: string, pathname: string): boolean {
@@ -280,11 +302,6 @@ export function AppShell({ title, description, children }: AppShellProps) {
             <GlobalSearch title={title} className="order-last w-full lg:order-none lg:w-80" />
             <NotificationBell />
             <SiteSwitcher />
-            {/* The project switcher renders itself only on the screens where a project scopes the
-                content, so the header can carry it unconditionally: on `/pages` it renders `null`
-                rather than a disabled pill, because a visible control that does nothing teaches the
-                reader that pages are filed in projects. */}
-            <ProjectSwitcher />
           </div>
         </header>
         <main className="flex-1 px-4 py-6 sm:px-6">{children}</main>

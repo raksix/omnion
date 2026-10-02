@@ -13,12 +13,3 @@ thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-# The project-scoped search gate (tests/project_scoped_search.rs) needs to ask the workflow
-# project store which projects an account may see, and to await a database. `omnion-workflows` is
-# a dev-dependency rather than a dependency on purpose: the search engine takes a list of project
-# ids as a *value* and must never grow a reason to know what a project is.
-omnion-workflows = { path = "../workflows" }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-

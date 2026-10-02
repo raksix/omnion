@@ -1,6 +1,5 @@
 //! Audit entries: append-only rows describing who did what, to which target.
 
-use serde::Serialize;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -34,7 +33,7 @@ impl ActorType {
 }
 
 /// A stored audit row.
-#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct AuditEntry {
     /// Creation order (identity column).
     pub id: i64,
@@ -52,14 +51,16 @@ pub struct AuditEntry {
     pub target_id: Option<String>,
     /// Structured detail; never carries secrets.
     pub metadata: serde_json::Value,
-    /// Peer address of the actor, when known.
+    /// Peer address of the actor.
     pub ip_address: Option<String>,
-    /// The automation project the action happened inside, when it happened inside one.
-    ///
-    /// **`None` for a platform-level row, and that is data rather than absence.** The project
-    /// audit screen filters on this column, and a reader asking "what happened to this project"
-    /// must not be shown a role creation from the same tenant.
-    pub project_id: Option<Uuid>,
+    /// The request id handed to the caller, echoed back so a refusal is joinable (REQ-125).
+    pub request_id: Option<Uuid>,
+    /// The credential lease the operation touched, when it was one.
+    pub lease_id: Option<Uuid>,
+    /// The machine identity that spent the operation, when a deployment key was the actor.
+    pub deployment_key_id: Option<Uuid>,
+    /// The pipeline identity the machine presented, as text.
+    pub pipeline: Option<String>,
     /// When the action was recorded.
     pub created_at: OffsetDateTime,
 }
@@ -86,6 +87,18 @@ pub struct NewAuditEntry {
     pub metadata: serde_json::Value,
     /// Peer address of the actor.
     pub ip_address: Option<String>,
+    /// The request id handed to the caller, so a refusal joins to the row explaining it.
+    ///
+    /// Null on every row written before REQ-125 slice 4 — the honest value for "this action was
+    /// not part of a request that was ever refused", and the reason the column is nullable with
+    /// no default rather than a backfilled uuid.
+    pub request_id: Option<Uuid>,
+    /// The credential lease the operation touched, when it was one.
+    pub lease_id: Option<Uuid>,
+    /// The machine identity that spent the operation, when a deployment key was the actor.
+    pub deployment_key_id: Option<Uuid>,
+    /// The pipeline identity the machine presented, as text.
+    pub pipeline: Option<String>,
 }
 
 impl NewAuditEntry {
@@ -101,6 +114,10 @@ impl NewAuditEntry {
             target_id: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             ip_address: None,
+            request_id: None,
+            lease_id: None,
+            deployment_key_id: None,
+            pipeline: None,
         }
     }
 
@@ -116,6 +133,10 @@ impl NewAuditEntry {
             target_id: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             ip_address: None,
+            request_id: None,
+            lease_id: None,
+            deployment_key_id: None,
+            pipeline: None,
         }
     }
 
@@ -148,58 +169,76 @@ impl NewAuditEntry {
         self
     }
 
+    /// Attach the request id the caller was handed in its error banner (REQ-125, slice 4).
+    ///
+    /// This is the field that makes a *refusal* joinable: the caller holds a request id and the
+    /// row explaining it is found by filtering on exactly that value. Without it the id in the
+    /// error banner is decoration — a human-readable string that no query can match.
+    ///
+    /// It is a setter rather than a constructor argument because a null here is the honest value
+    /// for the overwhelming majority of rows in the platform: the vast majority of actions are not
+    /// part of a lease, a deployment key or a secret operation, and making every caller think
+    /// about it would be four arguments of `None` on every call site in the codebase.
+    #[must_use]
+    pub fn request_id(mut self, request_id: impl Into<Option<Uuid>>) -> Self {
+        self.request_id = request_id.into();
+        self
+    }
+
+    /// Attach the credential lease this operation touched.
+    #[must_use]
+    pub fn lease_id(mut self, lease_id: impl Into<Option<Uuid>>) -> Self {
+        self.lease_id = lease_id.into();
+        self
+    }
+
+    /// Attach the machine identity that spent the operation, when a deployment key was the actor.
+    #[must_use]
+    pub fn deployment_key_id(mut self, deployment_key_id: impl Into<Option<Uuid>>) -> Self {
+        self.deployment_key_id = deployment_key_id.into();
+        self
+    }
+
+    /// Attach the pipeline identity the machine presented.
+    ///
+    /// Text, not a relation: a leaked deployment key has to be traced to a *pipeline name* the
+    /// operator recognises, and a name is not a row in any table.
+    #[must_use]
+    pub fn pipeline(mut self, pipeline: impl Into<Option<String>>) -> Self {
+        self.pipeline = pipeline.into();
+        self
+    }
+
+    /// The lease, machine identity and pipeline in one call, which is how a redemption writes.
+    #[must_use]
+    pub fn machine(
+        mut self,
+        deployment_key_id: Option<Uuid>,
+        pipeline: Option<String>,
+        lease_id: Option<Uuid>,
+    ) -> Self {
+        self.deployment_key_id = deployment_key_id;
+        self.pipeline = pipeline;
+        self.lease_id = lease_id;
+        self
+    }
 }
 
 /// Columns read back from `audit_log`, with `inet` rendered as text.
 const AUDIT_COLUMNS: &str = "id, organization_id, actor_user_id, actor_type, action, \
-     target_type, target_id, metadata, ip_address::text as ip_address, project_id, created_at";
-
-/// Columns an entry writes. `project_id` is a *separate* parameter rather than part of
-/// [`AUDIT_COLUMNS`]: the column arrived with migration 0164, nullable, and every writer that
-/// does not name a project leaves it null — which is the correct answer for a platform-level row
-/// and the reason a project audit screen has to filter on it rather than on `organization_id`.
-///
-/// Before it existed, the project-scoped mutations (REQ-133) wrote rows that were indistinguishable
-/// from platform rows: `organization_id` was the same, and the trail could not answer "what
-/// happened to this project". A filter over an `organization_id` would have been worse than no
-/// filter, because it would have shown a project the whole tenant's history.
-const AUDIT_INSERT_COLUMNS: &str = "organization_id, actor_user_id, actor_type, action, \
-     target_type, target_id, metadata, ip_address, project_id";
+     target_type, target_id, metadata, ip_address::text as ip_address, created_at, request_id, \
+     lease_id, deployment_key_id, pipeline";
 
 /// Append an entry to the audit trail.
 ///
 /// Callers treat a failure as a failure of the action itself: an unrecorded privileged action
 /// is worse than a reported one, because the trail is what the operator audits afterwards.
 pub async fn record(pool: &PgPool, entry: NewAuditEntry) -> Result<AuditEntry> {
-    write(pool, entry, None).await
-}
-
-/// Append an entry **inside an automation project**, for the project audit screen (REQ-133).
-///
-/// **A second function rather than a field on [`NewAuditEntry`].** The column arrived with
-/// migration 0164 and every writer that does not belong to a project leaves it null, so the
-/// interesting fact is not "the entry has no project" but "this entry has *this* project" — a
-/// distinction a null cannot carry. A field would have said the same thing, and it would have
-/// broken every struct-literal construction of the entry in the workspace (two of them live in
-/// files other waves own), which is a merge hazard dressed as an audit decision. The platform's
-/// own rows keep calling [`record`] and keep their null.
-pub async fn record_for_project(
-    pool: &PgPool,
-    entry: NewAuditEntry,
-    project_id: Uuid,
-) -> Result<AuditEntry> {
-    write(pool, entry, Some(project_id)).await
-}
-
-/// The one insert both entry points share.
-async fn write(
-    pool: &PgPool,
-    entry: NewAuditEntry,
-    project_id: Option<Uuid>,
-) -> Result<AuditEntry> {
     let sql = format!(
-        "insert into audit_log ({AUDIT_INSERT_COLUMNS}) \
-         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet), $9) returning {AUDIT_COLUMNS}"
+        "insert into audit_log (organization_id, actor_user_id, actor_type, action, target_type, \
+         target_id, metadata, ip_address, request_id, lease_id, deployment_key_id, pipeline) \
+         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet), $9, $10, $11, $12) \
+         returning {AUDIT_COLUMNS}"
     );
 
     let stored: AuditEntry = sqlx::query_as(&sql)
@@ -211,55 +250,11 @@ async fn write(
         .bind(entry.target_id.as_deref())
         .bind(entry.metadata)
         .bind(entry.ip_address.as_deref())
-        .bind(project_id)
+        .bind(entry.request_id)
+        .bind(entry.lease_id)
+        .bind(entry.deployment_key_id)
+        .bind(entry.pipeline.as_deref())
         .fetch_one(pool)
-        .await?;
-
-    Ok(stored)
-}
-
-/// Append an entry **inside a caller's open transaction**, for a mutation that must be auditable
-/// atomically (REQ-133's project deletion).
-///
-/// **Why this exists and why it is a separate function rather than a pool one.** Deleting a
-/// project takes a row lock on the project (`for update`), checks its dependencies and then
-/// deletes it. The audit row has to be written by that same transaction for two reasons, and
-/// neither is about tidiness:
-///
-/// 1. **`audit_log.project_id` is `on delete set null`.** A trail row written by a *pool* write
-///    after the delete commits is a row with a null project — and the project audit screen it was
-///    written for no longer exists to be read from. The instance-wide stream would show
-///    "somebody deleted a project" with no project to point at, which is exactly the row the
-///    operator is looking for after the fact.
-/// 2. **A delete with no trail is the worst possible gap in a trail.** Every other writer on this
-///    module records after its write through the pool, which is fine for a row that still exists;
-///    for the one action that removes the thing, the write and the record have to commit or roll
-///    back together.
-///
-/// The entry is otherwise built exactly as [`record_for_project`] builds it — same columns, same
-/// `project_id` — so the row is indistinguishable from every other project-scoped entry, which is
-/// what keeps `run-project-audit.sh` measuring the same stream.
-pub async fn record_for_project_in(
-    connection: &mut sqlx::PgConnection,
-    entry: NewAuditEntry,
-    project_id: Uuid,
-) -> Result<AuditEntry> {
-    let sql = format!(
-        "insert into audit_log ({AUDIT_INSERT_COLUMNS}) \
-         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet), $9) returning {AUDIT_COLUMNS}"
-    );
-
-    let stored: AuditEntry = sqlx::query_as(&sql)
-        .bind(entry.organization_id)
-        .bind(entry.actor_user_id)
-        .bind(entry.actor_type.as_str())
-        .bind(entry.action)
-        .bind(entry.target_type)
-        .bind(entry.target_id.as_deref())
-        .bind(entry.metadata)
-        .bind(entry.ip_address.as_deref())
-        .bind(project_id)
-        .fetch_one(&mut *connection)
         .await?;
 
     Ok(stored)
@@ -317,38 +312,6 @@ pub async fn for_target(
     let entries: Vec<AuditEntry> = sqlx::query_as(&sql)
         .bind(target_id)
         .bind(target_types)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-
-    Ok(entries)
-}
-
-/// Every entry recorded **inside one project**, newest first (REQ-133 slice 4).
-///
-/// The project audit screen is this function, and the reason it exists rather than a filter on
-/// [`recent`] is that `organization_id` cannot answer the question: every project mutation carries
-/// the tenant id, so filtering on it hands the reader the whole installation's history and calls it
-/// a project. `project_id` is the only column that is narrow enough to be a boundary.
-///
-/// `action` narrows further (the REQ's "with filters"), and an empty string means every action
-/// rather than none -- a screen whose filter defaults to "show nothing" is indistinguishable from a
-/// project where nothing happened.
-pub async fn for_project(
-    pool: &PgPool,
-    project_id: Uuid,
-    action: Option<&str>,
-    limit: i64,
-) -> Result<Vec<AuditEntry>> {
-    let sql = format!(
-        "select {AUDIT_COLUMNS} from audit_log \
-         where project_id = $1 and ($2 = '' or action = $2) \
-         order by created_at desc, id desc limit $3"
-    );
-
-    let entries: Vec<AuditEntry> = sqlx::query_as(&sql)
-        .bind(project_id)
-        .bind(action.unwrap_or_default())
         .bind(limit)
         .fetch_all(pool)
         .await?;

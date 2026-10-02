@@ -14,7 +14,6 @@ cd "$ROOT"
 
 TS="$(date -u +%Y%m%d-%H%M%S)"
 OUT="$ROOT/qa-artifacts/$TS"
-mkdir -p "$OUT"
 
 API_PORT="${QA_API_PORT:-18080}"
 ADMIN_PORT="${QA_ADMIN_PORT:-3100}"
@@ -45,29 +44,12 @@ step() { printf '\n[qa] %s\n' "$*"; }
 
 wait_http() { # url, seconds
   local url="$1" deadline=$(( $(date +%s) + ${2:-120} ))
-  local last=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local code
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)"
-    last="$code"
-    # "Something answered" is the readiness test, and 000 is the only answer that means it did
-    # not: a closed port, or a process that has not bound yet. A 5xx is the exception that matters
-    # — a Next dev server answering 500 is still compiling its first route, and treating that as
-    # ready produced a walkthrough fatal ("admin panel unreachable ... responded 500") that read
-    # as a product failure and was invented entirely by the check. The same panel answered 200
-    # seconds later.
-    #
-    # 404 is accepted on purpose: the public renderer answers 404 for "/" until the pass seeds the
-    # site, and that 404 is the proof the server compiled and is routing requests. Requiring 2xx
-    # there failed a perfectly healthy renderer, which is the mirror image of the bug above — a
-    # readiness check that is wrong in the direction that hides nothing and breaks everything.
-    case "$code" in
-      000|5*) : ;;
-      *) return 0 ;;
-    esac
+    if [ -n "$code" ] && [ "$code" != "000" ]; then return 0; fi
     sleep 2
   done
-  echo "[qa] $url never answered (last: ${last:-none})" >&2
   return 1
 }
 
@@ -75,16 +57,99 @@ wait_http() { # url, seconds
 # side by side. Take a slot first so the passes queue instead of all landing on the
 # machine at once; the wait is bounded and then the pass proceeds regardless.
 # One pass at a time on this box: it is the difference between load 20 and load 6.
+#
+# A pass that never reached the walkthrough has to be able to say so. The artifact
+# directory used to be created on the first line of the script, BEFORE this wait and
+# before any trap was installed, so a pass that was killed while queued left an empty
+# `qa-artifacts/<ts>/` behind. An empty directory reads exactly like a pass that started
+# and died: `ls -1t qa-artifacts` shows the newest entry either way, and the next tick
+# spends itself deciding which of the two it is looking at. On 2026-09-30 five of nine
+# worktrees had empty artifact directories, two of them mine, and two ticks were lost to
+# directories that were never passes.
+#
+# So the directory is created BEFORE the wait, stamped as a queued record, and converted
+# into a real pass only once this script has a QA slot and is about to do real work. A pass
+# killed while queued therefore leaves a summary that declares itself void instead of an
+# empty directory that claims a walkthrough happened.
+mkdir -p "$OUT"
+write_queued_record() {
+  # The stack name is expanded on purpose. Escaping the `$` (which a heredoc does not need for
+  # anything else on these lines) leaves the literal text `${QA_STACK:-main}` in the record, so
+  # every artifact says it belongs to a stack called `${QA_STACK:-main}` and none of them name
+  # the stack they actually wrote to — which is the one field that makes a void record useful.
+  local stack_label="${QA_STACK:-main}"
+  cat > "$OUT/QUEUED.md" <<EOF
+# QA pass queued, not run
+
+- When: $TS · stack: $stack_label
+- This pass was created and never reached the browser walkthrough.
+
+The artifact directory is created before the QA slot is taken, so a pass killed while
+queued would otherwise leave an empty directory that reads like a pass that ran. This file
+is the record of the queue; \`summary.json\` marks the pass void until the walkthrough runs.
+EOF
+  python3 - "$OUT/summary.json" <<'PY'
+import json, sys
+json.dump(
+    {
+        "void": True,
+        "reason": "queued-and-never-ran",
+        "detail": "the pass did not reach the browser walkthrough; it was killed or timed out while waiting for a QA slot",
+        "counts": {"clicks": 0, "screenshots": 0, "shotFailures": 0},
+        "findings": [],
+    },
+    open(sys.argv[1], "w"),
+    indent=2,
+)
+PY
+}
+write_queued_record
+# Stamped as soon as this pass owns a place and is about to do real work. `release` below
+# is the only trap once a place is held; this one exists for the window before that.
+QA_PASS_STARTED=0
+queued_exit() {
+  [ "${QA_PASS_STARTED:-0}" = "1" ] && return 0
+  printf '[qa] queued pass never reached the walkthrough; void record kept in %s\n' "$OUT" >&2
+}
+trap queued_exit EXIT INT TERM
+
 QA_SLOT_PID=""
+# A typo in the focused-pass filter costs a WHOLE TICK if it is discovered at the end.
+#
+# `--only` takes route and depth-pass NAMES (`observability-traces`), not paths and not the plural
+# group (`observability`), so the obvious spelling of "all the observability screens" matches
+# nothing. `walkthrough.cjs` does report that — as `empty-pass` / `unknown-pass-name` findings —
+# but from its report roll-up, which runs LAST. By then this pass has queued for the box's single
+# QA slot (up to 25 min), reset a QA database and booted three servers, and has walked no route at
+# all: a green-looking artifact directory that proves nothing, with the slot held the whole time.
+# On a box where seven writers queue for one pass, that is the most expensive possible place to
+# discover a typo. This check runs against the same source file, one second, no slot.
+if [ -n "${QA_ONLY:-}" ]; then
+  step "validating the focused-pass filter (--only=$QA_ONLY)"
+  if ! node "$(dirname "${BASH_SOURCE[0]}")/check-only-filter.cjs" "$QA_ONLY"; then
+    echo "[qa] refusing to start: the focused-pass filter matches no route and no depth pass." >&2
+    echo "[qa] route and depth-pass names are hyphenated; run:" >&2
+    echo "[qa]   grep -oE 'name: \"[a-z0-9-]+\"' scripts/qa/walkthrough.cjs | sort -u" >&2
+    exit 2
+  fi
+fi
+
+# Free the place whenever this pass ends, however it ends.
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
   QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
-# Free the place whenever this pass ends, however it ends.
+
 if [ -n "$QA_SLOT_PID" ]; then
   trap 'kill "$QA_SLOT_PID" 2>/dev/null || true' EXIT INT TERM
 fi
+
+# The pass has a place and is about to do real work, so the queued record is retired: the
+# walkthrough owns `summary.json` from here, and a stale void summary next to a real one is
+# the same ambiguity this change exists to remove.
+QA_PASS_STARTED=1
+rm -f "$OUT/QUEUED.md"
 
 # The QA servers are disposable: a pass starts them, walks, and the next pass can
 # start them again. Leaving seven stacks of three servers running between passes cost
@@ -167,7 +232,7 @@ printf '%s\n' "$BASHPID" >&9
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
-step "API on :$API_PORT (database omnion_qa)"
+step "API on :$API_PORT (database $QA_DB)"
 # A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
@@ -193,16 +258,8 @@ fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
-  # `OMNION_CSRF_SECRET` is not optional on this stack. The middleware refuses every
-  # cookie-authenticated mutation without one (`403 csrf_unavailable`), and the panel signs in
-  # with a cookie, so an API started without it turns every save, create and delete in the
-  # walkthrough into a refusal — the IAM depth pass reported a role that "could not be created"
-  # because of it. A fixed value is correct here: the token is an HMAC over the session id
-  # inside this one process, so nothing is shared with another stack and there is nothing to
-  # keep secret between passes.
   OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
-  OMNION_CSRF_SECRET="qa-stack-${STACK}-csrf-secret-not-a-production-value" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
   OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-pass-throwaway-secret-not-a-real-key}" \
@@ -210,6 +267,51 @@ else
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
+
+# The precondition every org-scoped screen in this report depends on, checked BEFORE the walk
+# rather than inferred from it afterwards. A pass that runs with no organization answers every
+# `/sites`, `/notifications`, `/organizations` and `/reliability/*` read with 403, and still
+# produces a complete report: per-page diagnostics, a vision review, a high-finding count. The
+# screens render their shell, their title and their `h1` regardless, so each page looks healthy
+# while every number under it was refused — which is how a pass can measure three new screens and
+# report "clean" about a tenant that does not exist.
+#
+# It is one query, and it is the difference between failing in the first thirty seconds and
+# spending an hour measuring an installation that has no tenant.
+qa_scalar() {
+  docker exec "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB" -t -A -c "$1" 2>/dev/null || echo ""
+}
+# The guard below is correct — and it had no way to be satisfied. The only thing that created the
+# organization was the browser's first-run wizard, and the wizard is the exact thing this branch's
+# own `wizard-gate.test.cjs` exists because it does not always reach its submit on a cold dev
+# server. So the pass reset the database, required a tenant, and could not make one: every pass
+# aborted at the guard before measuring a single screen. A precondition with no way to be met is a
+# harness that can only fail.
+#
+# The seed runs BEFORE the guard, over the API and through the same endpoints the wizard calls —
+# never by inserting rows. A SQL-inserted organization would satisfy the count while leaving
+# `onboarding_state`, the membership row and the site row unwritten, and each of those is what an
+# org-scoped read joins against: the pass would measure screens answering 403 and report it as the
+# product's answer, which is the precise failure the guard was added to catch.
+if [ "$(qa_scalar 'select count(*) from organizations')" = "0" ]; then
+  step "seeding the QA tenant (the wizard creates it in a browser; this does it over the API)"
+  node scripts/qa/ensure-organization.mjs || {
+    echo "[qa] FATAL: the QA tenant could not be seeded, so the walk below would measure 403s."
+    echo "[qa] Check the API log for the reason; the seeder prints the status and body it got."
+    exit 1
+  }
+fi
+
+QA_ORGS="$(qa_scalar 'select count(*) from organizations')"
+QA_USERS="$(qa_scalar 'select count(*) from users')"
+if [ "$QA_ORGS" = "0" ] || [ -z "$QA_ORGS" ]; then
+  echo "[qa] FATAL: ${QA_DB} has ${QA_USERS:-0} user(s) and ${QA_ORGS:-no} organization(s)."
+  echo "[qa] The browser creates the organization through the first-run wizard; if it did not run,"
+  echo "[qa] every org-scoped screen below is answered 403 and the report describes nothing."
+  echo "[qa] Check the wizard's POST /api/v1/onboarding/organization in the API log."
+  exit 1
+fi
+step "precondition ok: ${QA_USERS} user(s), ${QA_ORGS} organization(s) in ${QA_DB}"
 
 step "admin panel on :$ADMIN_PORT"
 NEXT_ADMIN="$ROOT/apps/admin/node_modules/next/dist/bin/next"
@@ -219,7 +321,7 @@ else
   OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_ADMIN" --name "$ADMIN_NAME" --cwd "$ROOT/apps/admin" --time -- dev --port "$ADMIN_PORT" --hostname 127.0.0.1 >/dev/null
 fi
-wait_http "http://127.0.0.1:$ADMIN_PORT/login" 300 || { echo "[qa] admin panel did not answer"; pm2 logs "$ADMIN_NAME" --lines 20 --nostream || true; exit 1; }
+wait_http "http://127.0.0.1:$ADMIN_PORT/login" 150 || { echo "[qa] admin panel did not answer"; pm2 logs "$ADMIN_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "public renderer on :$WEB_PORT"
 NEXT_WEB="$ROOT/apps/web/node_modules/next/dist/bin/next"
@@ -229,7 +331,7 @@ else
   OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
 fi
-wait_http "http://127.0.0.1:$WEB_PORT/" 300 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
+wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
 # `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
 # them, which is the right thing for a full acceptance run and the wrong thing for a loop that

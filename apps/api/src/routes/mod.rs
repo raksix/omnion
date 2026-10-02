@@ -8,7 +8,13 @@
 //! account, and `GET /api/v1/iam/effective-permissions` resolves the caller's own set without a
 //! permission because it answers "what may I do here".
 //!
-//! The tenancy surface (`/organizations`, `/sites`) is guarded by the `organizations.*`,
+//! The reliability surface (`/reliability/rate-limits`, docs/requests/REQ-127) is the
+//! PLATFORM-WIDE budget — user, organization, ip and route scopes an operator edits, with a
+//! dry-run that resolves the same policy the middleware resolves. It is deliberately separate
+//! from the security centre's per-route limiter, which is the gateway's own budget: two layers,
+//! two documents, and every refusal names which one answered.
+//!
+//! The tenancy surface (`/organizations`, `/sites`) is guarded
 //! `sites.*` and `domains.manage` permissions and additionally scoped in the handlers
 //! (`crate::scope`): organization accounts only ever see and change their own organization.
 //!
@@ -73,13 +79,28 @@ pub mod ai;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
-pub mod automation_projects;
 pub mod backups;
 pub mod commands;
 pub mod content;
-pub mod crm_assignment;
-pub mod crm_intake;
-pub mod storefront;
+pub mod restore_jobs;
+// Deployment tooling (REQ-128, slice 4). The release cache, the artifact list, the bundle
+// generator and the upgrade plan.
+pub mod backfills;
+pub mod deployment;
+// Anonymised support exports (REQ-129, slice 4). Its own module rather than more of
+// `backfills.rs` because the two halves of that file are `migration_backfills` state and
+// `seed_datasets`, and an export is neither — it is the only artifact on this surface that leaves
+// the platform, and burying it at the end of a file about jobs would make that invisible.
+pub mod exports;
+pub mod graphql;
+pub mod inventory;
+pub mod openapi;
+pub mod graphql_deprecations;
+pub mod graphql_deprecation_routes;
+pub mod graphql_documents;
+pub mod graphql_manager;
+pub mod graphql_schema;
+pub mod graphql_settings;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -103,15 +124,27 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
+pub mod migrations;
 pub mod notifications;
 pub mod notifications_admin;
 pub mod notifications_test;
+pub mod observability;
+pub mod observability_alerts;
+pub mod observability_overview;
+pub mod observability_traces;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
-pub mod restore_jobs;
+pub mod reliability_idempotency;
+pub mod reliability_intake;
+pub mod reliability_limits;
+pub mod reliability_retries;
 pub mod scim;
 pub mod search;
+pub mod secrets;
+pub mod secrets_audit;
+pub mod secrets_credentials;
+pub mod secrets_leases;
 pub mod security;
 pub mod security_events;
 pub mod security_headers;
@@ -126,278 +159,65 @@ pub mod workflows;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::http::Method;
 use axum::routing::MethodRouter;
 use axum::routing::{delete, get, patch, post, put};
 
 use std::convert::Infallible;
 
+use crate::documented;
 use crate::guards;
 use crate::state::AppState;
 
-/// The automation project surface (REQ-133, slice 1).
-///
-/// The powers are split by what they are over, not by which screen lives on them:
-///
-/// * `projects.read` — the list, the detail, the switcher. A member reads their projects; an
-///   instance administrator reads the organization's.
-/// * `projects.manage` — creating, renaming and archiving a project. `projects.members.manage`
-///   is deliberately *not* folded into it: on a delegated team the person who may rename the
-///   project is very often not the person who may add its colleagues, and one key would let
-///   either of them do the other's job.
-/// * `projects.admin` — the instance-wide power the guard does not grant on its own: it is what
-///   makes an administrator see every project rather than only their memberships. It is absent
-///   from the base roles, so an installation that never grants it has fully delegated projects.
-///
-/// Reads answer `404` for a project the caller may not see, inside the handler
-/// (`automation_projects::find_visible`): the guard proves the caller holds `projects.read` in
-/// their own organization, and the store decides which projects inside it they may see.
-fn automation_projects_surface(state: &AppState) -> Router<AppState> {
-    Router::new()
-        .route(
-            "/projects",
-            get(automation_projects::list_projects)
-                .layer(guards::require(state, "projects.read"))
-                .merge(post(automation_projects::create_project)),
-        )
-        .route(
-            "/projects/{id}",
-            get(automation_projects::get_project)
-                .layer(guards::require(state, "projects.read"))
-                .merge(
-                    put(automation_projects::update_project)
-                        .layer(guards::require(state, "projects.manage")),
-                )
-                // The one destructive route on this surface, and the REQ's API table has carried it
-                // since the module shipped. `projects.manage` rather than a key of its own: the
-                // membership matrix already answers "may administer this project" for the owner
-                // role, and a separate permission would be a second way to say the same thing.
-                .merge(
-                    delete(automation_projects::delete_project)
-                        .layer(guards::require(state, "projects.manage")),
-                ),
-        )
-        // `/archive` and `/restore` are literal segments under `/projects/{id}/…`, and axum ranks
-        // a static segment ahead of the parameter route above it.
-        .route(
-            "/projects/{id}/archive",
-            post(automation_projects::archive_project)
-                .layer(guards::require(state, "projects.manage")),
-        )
-        .route(
-            "/projects/{id}/restore",
-            post(automation_projects::restore_project)
-                .layer(guards::require(state, "projects.manage")),
-        )
-        // The export the settings row has named since slice 1 and the REQ's Risks section names
-        // again as the "export-first hint" that makes deleting a project with dependencies safe.
-        //
-        // `projects.read`, not `projects.manage`, and that is the load-bearing choice: the handler
-        // writes nothing and locks nothing, so requiring management would mean a viewer may read
-        // every workflow on screen and may not read them in a file — "read it here but not there"
-        // is the split (`visible_project_ids` vs `find_visible`) this surface has already paid for
-        // once. Project visibility itself is resolved in the handler through `find_visible`, so a
-        // foreign project is a `404` whose body never names it.
-        .route(
-            "/projects/{id}/export",
-            get(automation_projects::export_project)
-                .layer(guards::require(state, "projects.read")),
-        )
-        // `/workflows/{id}/move` lives under workflows, not projects: the path names what is
-        // being moved and the project is the destination. Declared here beside the other project
-        // routes so the one permission that guards it is visible with the rest of the surface.
-        //
-        // `workflows.manage`, NOT a new `workflows.move`: this surface already names three
-        // workflow permissions and inventing a fourth means a role that could edit a workflow
-        // could not move one, with no word anywhere saying why. Inside the handler the project
-        // capability is checked on both ends, so the workflow permission stays coarse on purpose.
-        .route(
-            "/workflows/{id}/move",
-            post(automation_projects::move_workflow)
-                .layer(guards::require(state, "workflows.manage")),
-        )
-        // Limits and usage. `projects.limits.manage` writes and `projects.read` reads, matching the
-        // REQ's table — an editor can see where the project stands, only an owner moves the caps.
-        .route(
-            "/projects/{id}/limits",
-            get(automation_projects::get_limits)
-                .layer(guards::require(state, "projects.read"))
-                .merge(
-                    put(automation_projects::put_limits)
-                        .layer(guards::require(state, "projects.limits.manage")),
-                ),
-        )
-        .route(
-            "/projects/{id}/usage",
-            get(automation_projects::get_limits)
-                .layer(guards::require(state, "projects.read")),
-        )
-        .route(
-            "/projects/{id}/transfer-ownership",
-            post(automation_projects::transfer_ownership)
-                .layer(guards::require(state, "projects.manage")),
-        )
-        // The project audit stream. `projects.audit.read` rather than `projects.read`: reading a
-        // project's history is what an auditor is for, and a project owner who is not an auditor
-        // can manage the project without being able to read everybody else's actions in it.
-        // Inside the handler the project is resolved through `find_visible` first, so the id is
-        // not a way to read another tenant's trail.
-        .route(
-            "/projects/{id}/audit",
-            get(automation_projects::project_audit)
-                .layer(guards::require(state, "projects.audit.read")),
-        )
-        .route(
-            "/projects/{id}/members",
-            post(automation_projects::upsert_member)
-                .layer(guards::require(state, "projects.members.manage")),
-        )
-        .route(
-            "/projects/{id}/members/{user_id}",
-            delete(automation_projects::remove_member)
-                .layer(guards::require(state, "projects.members.manage")),
-        )
-        // The switcher (REQ-133, acceptance 3). A separate path rather than `?mine=1` on
-        // `/projects`, and the comment is the reason: the REQ's API table documents
-        // `GET /api/v1/projects?mine=1`, and the parameter was declared on the query struct for
-        // five slices without a reader. A dedicated path cannot be reached by a query string that
-        // a later writer silently ignores, and the switcher's own answer is not the project list
-        // with a flag turned on — it carries the recents rank, the caller's role and the stored
-        // selection, and a client that got `/projects` and filtered it client-side would have had
-        // to reconstruct all three.
-        //
-        // `projects.read` on both verbs, deliberately. Choosing a project changes what *this
-        // person* sees, not the project: an editor who may read every project they are in needs
-        // the switcher, and a permission for "which bucket am I looking at" would be a third way
-        // to say "can read", and this branch already learned that two spellings of one power
-        // drift. The store still refuses a project the caller cannot *see*, so a wider guard
-        // cannot become a wider reach.
-        .route(
-            "/projects/switcher",
-            get(automation_projects::switcher)
-                .layer(guards::require(state, "projects.read"))
-                .merge(
-                    post(automation_projects::set_selection)
-                        .layer(guards::require(state, "projects.read")),
-                ),
-        )
-}
-
 /// Build the application router around the shared [`AppState`].
-/// The CRM assignment and SLA surface.
-///
-/// The rules and the policies carry `crm.intake.manage`; the simulator carries
-/// `crm.leads.read`. It is a function rather than an inline `Router` so the two layers are
-/// declared once, here, and cannot be quietly merged into one permission by a later edit.
-fn crm_assignment_surface(state: &AppState) -> Router<AppState> {
-    let assignment = Router::new()
-        .route(
-            "/crm/assignment/rules",
-            get(crm_assignment::list_rules).merge(post(crm_assignment::create_rule)),
-        )
-        // `/order` is static and must be declared before `/rules/{id}` so axum ranks it
-        // ahead of the parameter route — "order" read as a rule id is a 400, not a reorder.
-        .route(
-            "/crm/assignment/rules/order",
-            put(crm_assignment::reorder_rules),
-        )
-        .route(
-            "/crm/assignment/rules/{id}",
-            get(crm_assignment::get_rule)
-                .merge(patch(crm_assignment::update_rule))
-                .merge(delete(crm_assignment::delete_rule)),
-        )
-        .route("/crm/assignment/targets", get(crm_assignment::list_targets))
-        .route_layer(guards::require(state, "crm.intake.manage"));
-    let sla = Router::new()
-        .route(
-            "/crm/sla/policies",
-            get(crm_assignment::list_policies).merge(post(crm_assignment::create_policy)),
-        )
-        .route(
-            "/crm/sla/policies/{id}",
-            get(crm_assignment::get_policy)
-                .merge(patch(crm_assignment::update_policy))
-                .merge(delete(crm_assignment::delete_policy)),
-        )
-        .route_layer(guards::require(state, "crm.sla.manage"));
-    let simulate = Router::new()
-        .route("/crm/assignment/simulate", post(crm_assignment::simulate))
-        .route_layer(guards::require(state, "crm.leads.read"));
-    assignment.merge(sla).merge(simulate)
-}
-
-/// The storefront configuration surface (REQ-118, slice 1a).
-///
-/// One router, one permission, and **only the routes whose tables exist**. The catalogue, the
-/// cart and the checkout are a surface over the commerce engine (REQ-008), which is unbuilt —
-/// declaring a route here that reads `commerce_products` would be a route that 500s on every
-/// request, so they ship with the commerce engine rather than ahead of it.
-///
-/// `/vocabulary` is declared **before** `/{site_id}` for the same reason the CRM router
-/// declares `/order` first: axum ranks static segments ahead of parameters, but the explicit
-/// ordering means the intent is in the file rather than inferred from a matcher.
-fn storefront_surface(state: &AppState) -> Router<AppState> {
-    Router::new()
-        .route("/commerce/storefront", get(storefront::list_sites))
-        .route(
-            "/commerce/storefront/vocabulary",
-            get(storefront::vocabulary),
-        )
-        .route(
-            "/commerce/storefront/{site_id}",
-            get(storefront::get_settings).merge(put(storefront::update_settings)),
-        )
-        .route_layer(guards::require(state, "commerce.storefront.manage"))
-}
-
 pub fn router(state: AppState) -> Router {
-    let roles = get(iam::list_roles)
+    let roles: MethodRouter<AppState, Infallible> = get(iam::list_roles)
         .layer(guards::require(&state, "iam.roles.read"))
         .merge(post(iam::create_role).layer(guards::require(&state, "iam.roles.manage")));
 
     // Role depth (REQ-006, slice 1): reading a role and its history is `iam.roles.read`, while
     // editing, cloning, previewing and deleting are `iam.roles.manage`.
-    let role_detail = get(iam::get_role)
+    let role_detail: MethodRouter<AppState, Infallible> = get(iam::get_role)
         .layer(guards::require(&state, "iam.roles.read"))
         .merge(patch(iam::update_role).layer(guards::require(&state, "iam.roles.manage")))
         .merge(delete(iam::delete_role).layer(guards::require(&state, "iam.roles.manage")));
 
-    let role_versions =
+    let role_versions: MethodRouter<AppState, Infallible> =
         get(iam::list_role_versions).layer(guards::require(&state, "iam.roles.read"));
 
-    let role_members = get(iam::list_role_members).layer(guards::require(&state, "iam.roles.read"));
+    let role_members: MethodRouter<AppState, Infallible> = get(iam::list_role_members).layer(guards::require(&state, "iam.roles.read"));
 
-    let role_duplicate =
+    let role_duplicate: MethodRouter<AppState, Infallible> =
         post(iam::duplicate_role).layer(guards::require(&state, "iam.roles.manage"));
 
-    let role_preview =
+    let role_preview: MethodRouter<AppState, Infallible> =
         post(iam::preview_role_permissions).layer(guards::require(&state, "iam.roles.manage"));
 
-    let bindings = get(iam::list_bindings)
+    let bindings: MethodRouter<AppState, Infallible> = get(iam::list_bindings)
         .layer(guards::require(&state, "iam.bindings.read"))
         .merge(post(iam::create_binding).layer(guards::require(&state, "iam.bindings.manage")));
 
-    let binding_detail =
+    let binding_detail: MethodRouter<AppState, Infallible> =
         delete(iam::delete_binding).layer(guards::require(&state, "iam.bindings.manage"));
 
     // Subjects, scopes, groups, machine identities and the simulator (REQ-006, slice 2):
     // reading a screen is its read key, every mutation its manage key, and the simulator asks
     // with `iam.simulate` because it exposes the decision path.
-    let iam_users = get(iam_subjects::list_users)
+    let iam_users: MethodRouter<AppState, Infallible> = get(iam_subjects::list_users)
         .layer(guards::require(&state, "users.read"))
         .merge(post(iam_subjects::create_user).layer(guards::require(&state, "users.create")));
 
-    let iam_user = get(iam_subjects::get_user)
+    let iam_user: MethodRouter<AppState, Infallible> = get(iam_subjects::get_user)
         .layer(guards::require(&state, "users.read"))
         .merge(patch(iam_subjects::update_user).layer(guards::require(&state, "users.update")));
 
-    let iam_groups = get(iam_subjects::list_groups)
+    let iam_groups: MethodRouter<AppState, Infallible> = get(iam_subjects::list_groups)
         .layer(guards::require(&state, "iam.groups.read"))
         .merge(
             post(iam_subjects::create_group).layer(guards::require(&state, "iam.groups.manage")),
         );
 
-    let iam_group = get(iam_subjects::get_group)
+    let iam_group: MethodRouter<AppState, Infallible> = get(iam_subjects::get_group)
         .layer(guards::require(&state, "iam.groups.read"))
         .merge(
             patch(iam_subjects::update_group).layer(guards::require(&state, "iam.groups.manage")),
@@ -406,87 +226,87 @@ pub fn router(state: AppState) -> Router {
             delete(iam_subjects::delete_group).layer(guards::require(&state, "iam.groups.manage")),
         );
 
-    let iam_group_members =
+    let iam_group_members: MethodRouter<AppState, Infallible> =
         put(iam_subjects::set_group_members).layer(guards::require(&state, "iam.groups.manage"));
 
-    let iam_service_accounts = get(iam_subjects::list_service_accounts)
+    let iam_service_accounts: MethodRouter<AppState, Infallible> = get(iam_subjects::list_service_accounts)
         .layer(guards::require(&state, "iam.serviceaccounts.read"))
         .merge(
             post(iam_subjects::create_service_account)
                 .layer(guards::require(&state, "iam.serviceaccounts.manage")),
         );
 
-    let iam_service_account = get(iam_subjects::get_service_account)
+    let iam_service_account: MethodRouter<AppState, Infallible> = get(iam_subjects::get_service_account)
         .layer(guards::require(&state, "iam.serviceaccounts.read"))
         .merge(
             delete(iam_subjects::delete_service_account)
                 .layer(guards::require(&state, "iam.serviceaccounts.manage")),
         );
 
-    let iam_service_account_keys = post(iam_subjects::issue_service_account_key)
+    let iam_service_account_keys: MethodRouter<AppState, Infallible> = post(iam_subjects::issue_service_account_key)
         .layer(guards::require(&state, "iam.serviceaccounts.manage"));
 
-    let iam_service_account_key = delete(iam_subjects::revoke_service_account_key)
+    let iam_service_account_key: MethodRouter<AppState, Infallible> = delete(iam_subjects::revoke_service_account_key)
         .layer(guards::require(&state, "iam.serviceaccounts.manage"));
 
-    let iam_simulations = post(iam_subjects::run_simulation)
+    let iam_simulations: MethodRouter<AppState, Infallible> = post(iam_subjects::run_simulation)
         .layer(guards::require_or_machine(&state, "iam.simulate"));
 
-    let iam_overview = get(iam_subjects::overview).layer(guards::require(&state, "iam.roles.read"));
+    let iam_overview: MethodRouter<AppState, Infallible> = get(iam_subjects::overview).layer(guards::require(&state, "iam.roles.read"));
 
     // ABAC policies (REQ-006, slice 4a): the list, the builder's save and the dry run. Reading a
     // policy and testing one touch nothing (`iam.policies.read`); saving and removing do
     // (`iam.policies.manage`).
-    let iam_policies = get(iam_policy::list_policies)
+    let iam_policies: MethodRouter<AppState, Infallible> = get(iam_policy::list_policies)
         .layer(guards::require(&state, "iam.policies.read"))
         .merge(
             post(iam_policy::create_policy).layer(guards::require(&state, "iam.policies.manage")),
         );
 
-    let iam_policy = get(iam_policy::get_policy)
+    let iam_policy: MethodRouter<AppState, Infallible> = get(iam_policy::get_policy)
         .layer(guards::require(&state, "iam.policies.read"))
         .merge(put(iam_policy::update_policy).layer(guards::require(&state, "iam.policies.manage")))
         .merge(
             delete(iam_policy::delete_policy).layer(guards::require(&state, "iam.policies.manage")),
         );
 
-    let iam_policy_versions =
+    let iam_policy_versions: MethodRouter<AppState, Infallible> =
         get(iam_policy::list_policy_versions).layer(guards::require(&state, "iam.policies.read"));
 
-    let iam_policy_test =
+    let iam_policy_test: MethodRouter<AppState, Infallible> =
         post(iam_policy::test_policy).layer(guards::require(&state, "iam.policies.read"));
 
     // Permission requests and approvals (REQ-006, slice 4b): asking needs only a session, the
     // inbox needs `iam.approvals.read` and deciding needs `iam.approvals.decide`.
-    let iam_approvals =
+    let iam_approvals: MethodRouter<AppState, Infallible> =
         get(iam_approvals::list_approvals).layer(guards::require(&state, "iam.approvals.read"));
-    let iam_approval_decide =
+    let iam_approval_decide: MethodRouter<AppState, Infallible> =
         post(iam_approvals::decide_approval).layer(guards::require(&state, "iam.approvals.decide"));
-    let iam_requests =
+    let iam_requests: MethodRouter<AppState, Infallible> =
         get(iam_approvals::list_my_requests).merge(post(iam_approvals::create_request));
 
     // SCIM 2.0 provisioning (REQ-006, slice 4b): authenticated by a provisioning token, so the
     // surface sits outside the session guard and verifies its own bearer credential.
-    let scim_users = get(scim::list_users).merge(post(scim::create_user));
-    let scim_user = get(scim::get_user)
+    let scim_users: MethodRouter<AppState, Infallible> = get(scim::list_users).merge(post(scim::create_user));
+    let scim_user: MethodRouter<AppState, Infallible> = get(scim::get_user)
         .merge(put(scim::replace_user))
         .merge(patch(scim::patch_user))
         .merge(delete(scim::delete_user));
-    let scim_groups = get(scim::list_groups).merge(post(scim::create_group));
-    let scim_group = get(scim::get_group)
+    let scim_groups: MethodRouter<AppState, Infallible> = get(scim::list_groups).merge(post(scim::create_group));
+    let scim_group: MethodRouter<AppState, Infallible> = get(scim::get_group)
         .merge(patch(scim::patch_group))
         .merge(delete(scim::delete_group));
-    let scim_config = get(scim::service_provider_config);
-    let scim_schemas = get(scim::schemas);
+    let scim_config: MethodRouter<AppState, Infallible> = get(scim::service_provider_config);
+    let scim_schemas: MethodRouter<AppState, Infallible> = get(scim::schemas);
 
     // Provisioning tokens and their sync log (REQ-006, slice 4b): one management key covers the
     // tokens and the log, because both describe how the directory talks to this platform.
-    let iam_provisioning_tokens = get(iam_provisioning::list_tokens)
+    let iam_provisioning_tokens: MethodRouter<AppState, Infallible> = get(iam_provisioning::list_tokens)
         .merge(post(iam_provisioning::create_token))
         .layer(guards::require(&state, "iam.provisioning.manage"));
-    let iam_provisioning_token = delete(iam_provisioning::revoke_token)
+    let iam_provisioning_token: MethodRouter<AppState, Infallible> = delete(iam_provisioning::revoke_token)
         .layer(guards::require(&state, "iam.provisioning.manage"));
-    let iam_provisioning_log =
+    let iam_provisioning_log: MethodRouter<AppState, Infallible> =
         get(iam_provisioning::list_log).layer(guards::require(&state, "iam.provisioning.manage"));
 
     // Enterprise sign-in providers (REQ-006, slice 4b-2): reading the connected providers is
@@ -494,14 +314,14 @@ pub fn router(state: AppState) -> Router {
     // The browser half of the same feature (`/auth/sso/...`) is public by nature — it *is* the
     // sign-in — and lives in `crate::routes::sso`, which re-derives its own trust from the
     // single-use challenge rather than from a session.
-    let iam_providers = get(iam_providers::list_providers)
+    let iam_providers: MethodRouter<AppState, Infallible> = get(iam_providers::list_providers)
         .layer(guards::require(&state, "iam.providers.read"))
         .merge(
             post(iam_providers::create_provider)
                 .layer(guards::require(&state, "iam.providers.manage")),
         );
 
-    let iam_provider = get(iam_providers::get_provider)
+    let iam_provider: MethodRouter<AppState, Infallible> = get(iam_providers::get_provider)
         .layer(guards::require(&state, "iam.providers.read"))
         .merge(
             patch(iam_providers::update_provider)
@@ -512,89 +332,89 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "iam.providers.manage")),
         );
 
-    let iam_provider_test =
+    let iam_provider_test: MethodRouter<AppState, Infallible> =
         post(iam_providers::test_provider).layer(guards::require(&state, "iam.providers.manage"));
 
-    let iam_provider_events = get(iam_providers::list_provider_events)
+    let iam_provider_events: MethodRouter<AppState, Infallible> = get(iam_providers::list_provider_events)
         .layer(guards::require(&state, "iam.providers.read"));
 
     // The public sign-in surface: no guard, because there is no session yet — the same reason
     // `auth/login` and `auth/mfa/verify` carry none. `sso/{slug}/saml` is the panel page a SAML
     // provider posts the assertion back from, and `sso/{slug}/callback` answers both a `code`
     // query and a posted assertion.
-    let sso_providers = get(sso::list_providers);
-    let sso_start = get(sso::start);
-    let sso_saml_page = get(sso::saml_page);
-    let sso_callback = get(sso::callback);
-    let sso_saml_callback = post(sso::saml_callback);
+    let sso_providers: MethodRouter<AppState, Infallible> = get(sso::list_providers);
+    let sso_start: MethodRouter<AppState, Infallible> = get(sso::start);
+    let sso_saml_page: MethodRouter<AppState, Infallible> = get(sso::saml_page);
+    let sso_callback: MethodRouter<AppState, Infallible> = get(sso::callback);
+    let sso_saml_callback: MethodRouter<AppState, Infallible> = post(sso::saml_callback);
 
     // Security policy, sessions, devices and second factors (REQ-006, slice 3). Reading a list
     // needs its read key; every mutation carries its own, and the dangerous ones (resetting
     // factors, revoking sessions) additionally demand a fresh step-up inside the handler.
-    let iam_security_policy = get(iam_security::get_security_policy)
+    let iam_security_policy: MethodRouter<AppState, Infallible> = get(iam_security::get_security_policy)
         .layer(guards::require(&state, "iam.security.read"))
         .merge(
             put(iam_security::update_security_policy)
                 .layer(guards::require(&state, "iam.security.manage")),
         );
 
-    let iam_sessions =
+    let iam_sessions: MethodRouter<AppState, Infallible> =
         get(iam_security::list_sessions).layer(guards::require(&state, "iam.sessions.read"));
 
-    let iam_session =
+    let iam_session: MethodRouter<AppState, Infallible> =
         delete(iam_security::revoke_session).layer(guards::require(&state, "iam.sessions.revoke"));
 
-    let iam_sign_out_all =
+    let iam_sign_out_all: MethodRouter<AppState, Infallible> =
         post(iam_security::sign_out_all).layer(guards::require(&state, "iam.sessions.revoke"));
 
-    let iam_devices =
+    let iam_devices: MethodRouter<AppState, Infallible> =
         get(iam_security::list_devices).layer(guards::require(&state, "iam.devices.read"));
 
-    let iam_device_trust =
+    let iam_device_trust: MethodRouter<AppState, Infallible> =
         post(iam_security::trust_device).layer(guards::require(&state, "iam.devices.manage"));
 
-    let iam_device =
+    let iam_device: MethodRouter<AppState, Infallible> =
         delete(iam_security::forget_device).layer(guards::require(&state, "iam.devices.manage"));
 
     // A factor belongs to an account, so the routes read with `users.read` and write with
     // `users.update` — the same keys that guard editing the account itself.
-    let iam_user_mfa = get(iam_security::list_factors)
+    let iam_user_mfa: MethodRouter<AppState, Infallible> = get(iam_security::list_factors)
         .layer(guards::require(&state, "users.read"))
         .merge(post(iam_security::enroll_totp).layer(guards::require(&state, "users.update")));
 
-    let iam_user_mfa_confirm =
+    let iam_user_mfa_confirm: MethodRouter<AppState, Infallible> =
         post(iam_security::confirm_totp).layer(guards::require(&state, "users.update"));
 
-    let iam_user_mfa_reset =
+    let iam_user_mfa_reset: MethodRouter<AppState, Infallible> =
         post(iam_security::reset_mfa).layer(guards::require(&state, "users.update"));
 
-    let iam_user_factor =
+    let iam_user_factor: MethodRouter<AppState, Infallible> =
         delete(iam_security::revoke_factor).layer(guards::require(&state, "users.update"));
 
     // The second factor of a sign-in is a public route (the sign-in is half done; there is no
     // session yet), and the step-up route needs the session it is improving.
-    let auth_mfa_verify = post(iam_security::verify_mfa_login);
-    let auth_step_up = post(iam_security::step_up);
+    let auth_mfa_verify: MethodRouter<AppState, Infallible> = post(iam_security::verify_mfa_login);
+    let auth_step_up: MethodRouter<AppState, Infallible> = post(iam_security::step_up);
 
     // Passkeys (REQ-006, slice 3b): enrolment runs behind the caller's own session (a passkey
     // belongs to the account at the keyboard), and the sign-in half sits beside `auth/mfa/verify`
     // — a half-finished sign-in that a verified assertion turns into a session.
-    let webauthn_passkeys = get(webauthn::list_passkeys);
-    let webauthn_passkey = delete(webauthn::revoke_passkey);
-    let webauthn_register_begin = post(webauthn::register_begin);
-    let webauthn_register_complete = post(webauthn::register_complete);
-    let auth_webauthn_begin = post(webauthn::authenticate_begin);
-    let auth_webauthn_complete = post(webauthn::authenticate_complete);
+    let webauthn_passkeys: MethodRouter<AppState, Infallible> = get(webauthn::list_passkeys);
+    let webauthn_passkey: MethodRouter<AppState, Infallible> = delete(webauthn::revoke_passkey);
+    let webauthn_register_begin: MethodRouter<AppState, Infallible> = post(webauthn::register_begin);
+    let webauthn_register_complete: MethodRouter<AppState, Infallible> = post(webauthn::register_complete);
+    let auth_webauthn_begin: MethodRouter<AppState, Infallible> = post(webauthn::authenticate_begin);
+    let auth_webauthn_complete: MethodRouter<AppState, Infallible> = post(webauthn::authenticate_complete);
 
     // Tenancy: reading needs a read permission, every mutation its own key.
-    let organizations = get(tenancy::list_organizations)
+    let organizations: MethodRouter<AppState, Infallible> = get(tenancy::list_organizations)
         .layer(guards::require(&state, "organizations.read"))
         .merge(
             post(tenancy::create_organization)
                 .layer(guards::require(&state, "organizations.manage")),
         );
 
-    let organization = get(tenancy::get_organization)
+    let organization: MethodRouter<AppState, Infallible> = get(tenancy::get_organization)
         .layer(guards::require(&state, "organizations.read"))
         .merge(
             patch(tenancy::update_organization)
@@ -605,54 +425,54 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "organizations.manage")),
         );
 
-    let sites = get(tenancy::list_sites)
+    let sites: MethodRouter<AppState, Infallible> = get(tenancy::list_sites)
         .layer(guards::require(&state, "sites.read"))
         .merge(post(tenancy::create_site).layer(guards::require(&state, "sites.create")));
 
-    let site = get(tenancy::get_site)
+    let site: MethodRouter<AppState, Infallible> = get(tenancy::get_site)
         .layer(guards::require(&state, "sites.read"))
         .merge(patch(tenancy::update_site).layer(guards::require(&state, "sites.update")))
         .merge(delete(tenancy::delete_site).layer(guards::require(&state, "sites.delete")));
 
-    let domains = get(tenancy::list_domains)
+    let domains: MethodRouter<AppState, Infallible> = get(tenancy::list_domains)
         .layer(guards::require(&state, "sites.read"))
         .merge(post(tenancy::add_domain).layer(guards::require(&state, "domains.manage")));
 
-    let domain = delete(tenancy::remove_domain).layer(guards::require(&state, "domains.manage"));
+    let domain: MethodRouter<AppState, Infallible> = delete(tenancy::remove_domain).layer(guards::require(&state, "domains.manage"));
 
-    let domain_primary =
+    let domain_primary: MethodRouter<AppState, Infallible> =
         post(tenancy::set_primary_domain).layer(guards::require(&state, "domains.manage"));
 
     // Content: pages and their revision history (docs/05-VERSIONING.md §4–§7). Reading the
     // history needs the read key; every mutation carries its own.
-    let pages = get(content::list_pages)
+    let pages: MethodRouter<AppState, Infallible> = get(content::list_pages)
         .layer(guards::require(&state, "content.pages.read"))
         .merge(post(content::create_page).layer(guards::require(&state, "content.pages.create")));
 
-    let page = get(content::get_page)
+    let page: MethodRouter<AppState, Infallible> = get(content::get_page)
         .layer(guards::require(&state, "content.pages.read"))
         .merge(patch(content::update_page).layer(guards::require(&state, "content.pages.update")))
         .merge(delete(content::delete_page).layer(guards::require(&state, "content.pages.delete")));
 
-    let page_publish =
+    let page_publish: MethodRouter<AppState, Infallible> =
         post(content::publish_page).layer(guards::require(&state, "content.pages.publish"));
 
-    let page_restore =
+    let page_restore: MethodRouter<AppState, Infallible> =
         post(content::restore_revision).layer(guards::require(&state, "content.pages.restore"));
 
-    let page_revisions =
+    let page_revisions: MethodRouter<AppState, Infallible> =
         get(content::list_revisions).layer(guards::require(&state, "content.pages.read"));
 
-    let page_revision =
+    let page_revision: MethodRouter<AppState, Infallible> =
         get(content::get_revision).layer(guards::require(&state, "content.pages.read"));
 
-    let page_revision_comments =
+    let page_revision_comments: MethodRouter<AppState, Infallible> =
         get(content::list_revision_comments).layer(guards::require(&state, "content.pages.read"));
 
-    let page_translations =
+    let page_translations: MethodRouter<AppState, Infallible> =
         get(content::list_translations).layer(guards::require(&state, "content.pages.read"));
 
-    let page_translation =
+    let page_translation: MethodRouter<AppState, Infallible> =
         put(content::set_translations).layer(guards::require(&state, "content.pages.update"));
 
     // Media: the library of a site (docs/01-VISION.md §5). Reading the library and removing a
@@ -662,15 +482,21 @@ pub fn router(state: AppState) -> Router {
     let media_upload = Router::new()
         .route(
             "/media",
-            post(media::upload_media).layer(guards::require(&state, "media.upload")),
+            documented!(
+                Method::POST,
+                "/media",
+                { post(media::upload_media).layer(guards::require(&state, "media.upload")) },
+                "media.upload",
+                "POST media"
+            ),
         )
         .layer(DefaultBodyLimit::max(
             omnion_media::MAX_UPLOAD_BYTES as usize + media::UPLOAD_BODY_SLACK,
         ));
 
-    let media = get(media::list_media).layer(guards::require(&state, "media.read"));
+    let media: MethodRouter<AppState, Infallible> = get(media::list_media).layer(guards::require(&state, "media.read"));
 
-    let media_entry = get(media::get_media)
+    let media_entry: MethodRouter<AppState, Infallible> = get(media::get_media)
         .layer(guards::require(&state, "media.read"))
         .merge(delete(media::delete_media).layer(guards::require(&state, "media.delete")));
 
@@ -688,33 +514,33 @@ pub fn router(state: AppState) -> Router {
     // creating, renaming or moving a folder, moving or deleting files, emptying the trash — needs
     // `media.manage`, which is the folder-and-storage power the catalogue already grants to an
     // editor. The trash routes are `media.manage` too: emptying it is irreversible.
-    let media_folders = get(media_files::folder_tree).layer(guards::require(&state, "media.read"));
-    let media_folder_create =
+    let media_folders: MethodRouter<AppState, Infallible> = get(media_files::folder_tree).layer(guards::require(&state, "media.read"));
+    let media_folder_create: MethodRouter<AppState, Infallible> =
         post(media_files::create_folder).layer(guards::require(&state, "media.manage"));
-    let media_folder = patch(media_files::move_folder)
+    let media_folder: MethodRouter<AppState, Infallible> = patch(media_files::move_folder)
         .merge(delete(media_files::delete_folder))
         .layer(guards::require(&state, "media.manage"));
 
-    let media_files_route =
+    let media_files_route: MethodRouter<AppState, Infallible> =
         get(media_files::list_files).layer(guards::require(&state, "media.read"));
     // The uploader filter's candidates, on the same key as the listing they filter. It is a
     // separate route because it is a separate question, and because a `media.read` account must
     // not need `users.read` to see who uploaded the files it is already allowed to read.
-    let media_uploaders =
+    let media_uploaders: MethodRouter<AppState, Infallible> =
         get(media_files::list_uploaders).layer(guards::require(&state, "media.read"));
-    let media_file = get(media_files::get_file)
+    let media_file: MethodRouter<AppState, Infallible> = get(media_files::get_file)
         .layer(guards::require(&state, "media.read"))
         .merge(patch(media_files::update_file).layer(guards::require(&state, "media.update")))
         .merge(delete(media_files::trash_file).layer(guards::require(&state, "media.delete")));
-    let media_file_restore =
+    let media_file_restore: MethodRouter<AppState, Infallible> =
         post(media_files::restore_file).layer(guards::require(&state, "media.update"));
-    let media_file_purge =
+    let media_file_purge: MethodRouter<AppState, Infallible> =
         post(media_files::purge_file).layer(guards::require(&state, "media.manage"));
 
-    let media_trash = get(media_files::list_trash).layer(guards::require(&state, "media.read"));
-    let media_trash_empty =
+    let media_trash: MethodRouter<AppState, Infallible> = get(media_files::list_trash).layer(guards::require(&state, "media.read"));
+    let media_trash_empty: MethodRouter<AppState, Infallible> =
         post(media_files::empty_trash).layer(guards::require(&state, "media.manage"));
-    let media_bulk = post(media_files::bulk_action).layer(guards::require(&state, "media.manage"));
+    let media_bulk: MethodRouter<AppState, Infallible> = post(media_files::bulk_action).layer(guards::require(&state, "media.manage"));
     // The version history (REQ-010, slice 2). Reading a version is `media.read`; replacing the
     // bytes and restoring an old one are `media.upload` / `media.update`, the same power an
     // ordinary upload carries — a restore *is* an upload of bytes that already exist.
@@ -735,18 +561,24 @@ pub fn router(state: AppState) -> Router {
         // mounted one level too high".
         .route(
             "/media/{id}/versions",
-            post(media_versions::create_version).layer(guards::require(&state, "media.upload")),
+            documented!(
+                Method::POST,
+                "/media/{id}/versions",
+                { post(media_versions::create_version).layer(guards::require(&state, "media.upload")) },
+                "media.upload",
+                "POST versions"
+            ),
         )
         .layer(DefaultBodyLimit::max(
             omnion_media::MAX_UPLOAD_BYTES as usize + media::UPLOAD_BODY_SLACK,
         ));
-    let media_versions =
+    let media_versions: MethodRouter<AppState, Infallible> =
         get(media_versions::list_versions).layer(guards::require(&state, "media.read"));
-    let media_version_restore =
+    let media_version_restore: MethodRouter<AppState, Infallible> =
         post(media_versions::restore_version).layer(guards::require(&state, "media.update"));
-    let media_version_raw =
+    let media_version_raw: MethodRouter<AppState, Infallible> =
         get(media_versions::raw_version).layer(guards::require(&state, "media.read"));
-    let media_version_download =
+    let media_version_download: MethodRouter<AppState, Infallible> =
         get(media_versions::download_version).layer(guards::require(&state, "media.read"));
 
     // Transformation presets (REQ-010, slice 3). Reading the list is `media.read`, because the
@@ -790,7 +622,7 @@ pub fn router(state: AppState) -> Router {
 
     // The public token route carries no guard and no session, because the token *is* the
     // credential — that is what a share link is. Everything it checks is about the token.
-    let public_media_shared = get(media_shares::public_shared);
+    let public_media_shared: MethodRouter<AppState, Infallible> = get(media_shares::public_shared);
 
     // Duplicate detection and merge (REQ-010, slice 3). Reading the report is `media.read` —
     // knowing what a site stores twice costs nothing and helps everybody. Merging is
@@ -949,87 +781,87 @@ pub fn router(state: AppState) -> Router {
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
-    let public_pages = get(public::get_published_page);
+    let public_pages: MethodRouter<AppState, Infallible> = get(public::get_published_page);
 
     // A published page points at its own assets, so the library's read side is public too.
-    let public_media = get(media::public_media);
+    let public_media: MethodRouter<AppState, Infallible> = get(media::public_media);
 
     // Workflows: the definitions and their run history (docs/requests/REQ-003). Reading needs
     // `workflows.read`, writing a definition `workflows.manage`, and starting or cancelling a
     // run `workflows.run`; every handler applies the tenancy scope rule through the workflow's
     // organization.
-    let workflows = get(workflows::list_workflows)
+    let workflows: MethodRouter<AppState, Infallible> = get(workflows::list_workflows)
         .layer(guards::require(&state, "workflows.read"))
         .merge(post(workflows::create_workflow).layer(guards::require(&state, "workflows.manage")));
 
-    let workflow = get(workflows::get_workflow)
+    let workflow: MethodRouter<AppState, Infallible> = get(workflows::get_workflow)
         .layer(guards::require(&state, "workflows.read"))
         .merge(put(workflows::update_workflow).layer(guards::require(&state, "workflows.manage")))
         .merge(
             delete(workflows::delete_workflow).layer(guards::require(&state, "workflows.manage")),
         );
 
-    let workflow_run =
+    let workflow_run: MethodRouter<AppState, Infallible> =
         post(workflows::run_workflow).layer(guards::require(&state, "workflows.run"));
 
-    let workflow_executions =
+    let workflow_executions: MethodRouter<AppState, Infallible> =
         get(workflows::list_executions).layer(guards::require(&state, "workflows.read"));
 
-    let workflow_execution =
+    let workflow_execution: MethodRouter<AppState, Infallible> =
         get(workflows::get_execution).layer(guards::require(&state, "workflows.read"));
 
-    let workflow_execution_cancel =
+    let workflow_execution_cancel: MethodRouter<AppState, Infallible> =
         post(workflows::cancel_execution).layer(guards::require(&state, "workflows.run"));
 
     // Onboarding: the first-run flow (REQ-050). No permission guard — the flow itself decides
     // who may act, and it must be reachable before any account, role or binding exists.
-    let onboarding_owner = post(onboarding::create_owner);
-    let onboarding_organization = post(onboarding::create_organization);
-    let onboarding_site = post(onboarding::create_site);
-    let onboarding_theme = post(onboarding::choose_theme);
-    let onboarding_ai = post(onboarding::decide_ai);
-    let onboarding_complete = post(onboarding::complete);
+    let onboarding_owner: MethodRouter<AppState, Infallible> = post(onboarding::create_owner);
+    let onboarding_organization: MethodRouter<AppState, Infallible> = post(onboarding::create_organization);
+    let onboarding_site: MethodRouter<AppState, Infallible> = post(onboarding::create_site);
+    let onboarding_theme: MethodRouter<AppState, Infallible> = post(onboarding::choose_theme);
+    let onboarding_ai: MethodRouter<AppState, Infallible> = post(onboarding::decide_ai);
+    let onboarding_complete: MethodRouter<AppState, Infallible> = post(onboarding::complete);
 
     // AI Hub (docs/06-AI-HUB.md): connecting a provider is `ai.providers.manage`, reading the
     // registry `ai.providers.read`, and using the chat its own key — so a team can talk to the
     // platform's AI without being able to point it at another endpoint.
-    let ai_providers = get(ai::list_providers)
+    let ai_providers: MethodRouter<AppState, Infallible> = get(ai::list_providers)
         .layer(guards::require(&state, "ai.providers.read"))
         .merge(post(ai::create_provider).layer(guards::require(&state, "ai.providers.manage")));
 
-    let ai_provider = patch(ai::update_provider)
+    let ai_provider: MethodRouter<AppState, Infallible> = patch(ai::update_provider)
         .layer(guards::require(&state, "ai.providers.manage"))
         .merge(delete(ai::delete_provider).layer(guards::require(&state, "ai.providers.manage")));
 
-    let ai_provider_models =
+    let ai_provider_models: MethodRouter<AppState, Infallible> =
         put(ai::replace_provider_models).layer(guards::require(&state, "ai.providers.manage"));
 
-    let ai_provider_discover =
+    let ai_provider_discover: MethodRouter<AppState, Infallible> =
         post(ai::discover_provider_models).layer(guards::require(&state, "ai.providers.manage"));
 
-    let ai_models = get(ai::list_models).layer(guards::require(&state, "ai.providers.read"));
+    let ai_models: MethodRouter<AppState, Infallible> = get(ai::list_models).layer(guards::require(&state, "ai.providers.read"));
 
-    let ai_model = patch(ai::update_model).layer(guards::require(&state, "ai.providers.manage"));
+    let ai_model: MethodRouter<AppState, Infallible> = patch(ai::update_model).layer(guards::require(&state, "ai.providers.manage"));
 
-    let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
+    let ai_chat: MethodRouter<AppState, Infallible> = post(ai::chat).layer(guards::require(&state, "ai.chat"));
 
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
     // history is `webhooks.read`, connecting, changing, testing and removing them is
     // `webhooks.manage`, and the platform's event feed is read with `events.read`. Every
     // handler applies the tenancy scope rule through the endpoint's organization.
-    let webhooks = get(webhooks::list_webhooks)
+    let webhooks: MethodRouter<AppState, Infallible> = get(webhooks::list_webhooks)
         .layer(guards::require(&state, "webhooks.read"))
         .merge(post(webhooks::create_webhook).layer(guards::require(&state, "webhooks.manage")));
 
-    let webhook = get(webhooks::get_webhook)
+    let webhook: MethodRouter<AppState, Infallible> = get(webhooks::get_webhook)
         .layer(guards::require(&state, "webhooks.read"))
         .merge(patch(webhooks::update_webhook).layer(guards::require(&state, "webhooks.manage")))
         .merge(delete(webhooks::delete_webhook).layer(guards::require(&state, "webhooks.manage")));
 
-    let webhook_deliveries =
+    let webhook_deliveries: MethodRouter<AppState, Infallible> =
         get(webhooks::list_deliveries).layer(guards::require(&state, "webhooks.read"));
 
-    let webhook_test =
+    let webhook_test: MethodRouter<AppState, Infallible> =
         post(webhooks::test_webhook).layer(guards::require(&state, "webhooks.manage"));
 
     // The delivery operations (REQ-016 slice 2). Reading an endpoint's history and its summary
@@ -1037,29 +869,29 @@ pub fn router(state: AppState) -> Router {
     // again is not: a replay is an outbound request to somebody else's server, so it is
     // `webhooks.manage` and never `webhooks.read`. A read-only auditor must not be able to make
     // the platform POST to a third party by pressing a button.
-    let webhook_stats =
+    let webhook_stats: MethodRouter<AppState, Infallible> =
         get(webhooks::endpoint_stats).layer(guards::require(&state, "webhooks.read"));
 
-    let webhook_secret_rotate =
+    let webhook_secret_rotate: MethodRouter<AppState, Infallible> =
         post(webhooks::rotate_secret).layer(guards::require(&state, "webhooks.manage"));
 
     // Declared before the single-delivery path on purpose: `/deliveries/redeliver` is a literal
     // segment and `/deliveries/{delivery_id}/redeliver` would read `redeliver` as an id if the
     // two were registered the other way round, answering `404 no such delivery` for a request
     // that is perfectly valid.
-    let webhook_redeliver_batch =
+    let webhook_redeliver_batch: MethodRouter<AppState, Infallible> =
         post(webhooks::redeliver_many).layer(guards::require(&state, "webhooks.manage"));
 
-    let webhook_redeliver_one =
+    let webhook_redeliver_one: MethodRouter<AppState, Infallible> =
         post(webhooks::redeliver_one).layer(guards::require(&state, "webhooks.manage"));
 
-    let events = get(webhooks::list_events).layer(guards::require(&state, "events.read"));
+    let events: MethodRouter<AppState, Infallible> = get(webhooks::list_events).layer(guards::require(&state, "events.read"));
 
     // The catalogue is the platform's own registry of event names (REQ-016 slice 1), read with
     // the same key as the feed: describing what an event means is reading the bus, not
     // administering an endpoint. It is a sibling of `/events`, not a child, so the literal
     // `catalogue` segment can never be read as an event id.
-    let event_catalogue =
+    let event_catalogue: MethodRouter<AppState, Infallible> =
         get(webhooks::list_catalogue).layer(guards::require(&state, "events.read"));
 
     // The event bus's own retention (REQ-016 slice 3). Reading the window, the counts and the
@@ -1070,7 +902,7 @@ pub fn router(state: AppState) -> Router {
     // Declared before `/events/{id}` for the same reason `/events/catalogue` is: `retention`
     // is a literal segment, and a parameterised sibling registered first would read it as an
     // event id and answer `404 no such event` for a request that is perfectly valid.
-    let event_retention = get(webhooks::retention_status)
+    let event_retention: MethodRouter<AppState, Infallible> = get(webhooks::retention_status)
         .layer(guards::require(&state, "events.read"))
         // The PATCH rides the same router as the GET because the two are one read/write pair on
         // one path; a separate `patch(...)` bound to `/events/retention` would need a second
@@ -1080,23 +912,46 @@ pub fn router(state: AppState) -> Router {
         // reaches the GET and is refused on the PATCH — which is exactly the split the two
         // powers are for.
         .merge(patch(webhooks::set_retention).layer(guards::require(&state, "webhooks.manage")));
-    let event_retention_sweep =
+    let event_retention_sweep: MethodRouter<AppState, Infallible> =
         post(webhooks::sweep_retention).layer(guards::require(&state, "webhooks.manage"));
 
     // Automations (docs/requests/REQ-003, P13): a rule is an event-triggered workflow, so its
     // read and write powers are the workflow keys the engine already defines — being allowed to
     // define an automation and being allowed to run it are the same two powers a workflow
     // carries. The handler checks the tenancy scope through the rule's organization.
-    let automations = get(automation::list_automations)
+    let automations: MethodRouter<AppState, Infallible> = get(automation::list_automations)
         .layer(guards::require(&state, "workflows.read"))
         .merge(
-            post(automation::create_automation).layer(guards::require(&state, "workflows.manage")),
+            post(automation::create_automation)
+                // The keyed layer goes FIRST, so it is the INNERMOST of the two: `.layer` wraps
+                // what is already built, so the LAST call is the OUTERMOST. This ordering is the
+                // acceptance criterion, not a style choice —
+                // "a keyed request that is refused by a permission check never consumes an
+                // idempotency key" is true here because the guard answers before the code that
+                // inserts a key row is ever reached. There is no rollback branch to be wrong, and
+                // a rollback would be a second bug: releasing the key on a refusal would let a
+                // refused request delete the WINNER's `in_progress` row, which is a different
+                // request running concurrently.
+                //
+                // The other half of the same ordering is what the keyed layer reads: it takes
+                // the subject from the `CurrentSession` the guard writes into the request's
+                // extensions. Outermost, that map is empty, the layer declines to claim, and the
+                // key silently does nothing — which is exactly what the first run of this walk
+                // showed, and is the reason the walk asserts the header rather than the 201.
+                .layer(crate::idempotency_middleware::require(&state))
+                // The guard is OUTSIDE the keyed layer, so it is the LAST `.layer` call and the
+                // first thing a request meets. `POST /automations` is also the FIRST endpoint to
+                // opt into the contract, chosen deliberately: it is a **job submission** — the
+                // request names the case itself — and the write a client is most likely to retry,
+                // because a dropped connection after a `201` and a `201` for a rule that already
+                // exists are the same end state and two different experiences.
+                .layer(guards::require(&state, "workflows.manage")),
         );
 
-    let automation_catalogue =
+    let automation_catalogue: MethodRouter<AppState, Infallible> =
         get(automation::get_catalogue).layer(guards::require(&state, "workflows.read"));
 
-    let automation_entry = get(automation::get_automation)
+    let automation_entry: MethodRouter<AppState, Infallible> = get(automation::get_automation)
         .layer(guards::require(&state, "workflows.read"))
         .merge(
             put(automation::update_automation).layer(guards::require(&state, "workflows.manage")),
@@ -1110,20 +965,20 @@ pub fn router(state: AppState) -> Router {
     // `search.read` — the box every signed-in account holds — and the handler narrows the
     // answer to the providers the caller's own read permissions cover; rebuilding the index
     // is the separate `search.manage`. See `crate::routes::search`.
-    let search_route = get(search::search).layer(guards::require(&state, "search.read"));
-    let search_suggest = get(search::suggest).layer(guards::require(&state, "search.read"));
-    let search_status = get(search::status).layer(guards::require(&state, "search.read"));
-    let search_reindex = post(search::reindex).layer(guards::require(&state, "search.manage"));
+    let search_route: MethodRouter<AppState, Infallible> = get(search::search).layer(guards::require(&state, "search.read"));
+    let search_suggest: MethodRouter<AppState, Infallible> = get(search::suggest).layer(guards::require(&state, "search.read"));
+    let search_status: MethodRouter<AppState, Infallible> = get(search::status).layer(guards::require(&state, "search.read"));
+    let search_reindex: MethodRouter<AppState, Infallible> = post(search::reindex).layer(guards::require(&state, "search.manage"));
     // Exporting is reading: the file holds exactly the rows the same caller may already see.
-    let search_export = get(search::export).layer(guards::require(&state, "search.read"));
+    let search_export: MethodRouter<AppState, Infallible> = get(search::export).layer(guards::require(&state, "search.read"));
     // Reading the settings is `search.read`; changing them is the separate `search.manage`, so
     // the two halves carry their own guards.
-    let search_settings_read = get(search::settings).layer(guards::require(&state, "search.read"));
-    let search_settings_write =
+    let search_settings_read: MethodRouter<AppState, Infallible> = get(search::settings).layer(guards::require(&state, "search.read"));
+    let search_settings_write: MethodRouter<AppState, Infallible> =
         put(search::save_settings).layer(guards::require(&state, "search.manage"));
     // The caller's own history: session-scoped by construction — it needs no permission of its
     // own beyond being signed in.
-    let search_recent = get(search::recent).merge(delete(search::clear_recent));
+    let search_recent: MethodRouter<AppState, Infallible> = get(search::recent).merge(delete(search::clear_recent));
 
     // Command centre (docs/requests/REQ-032): the palette's own surface — the commands the
     // caller may run (projected through their effective permissions), the suggestions for the
@@ -1134,14 +989,14 @@ pub fn router(state: AppState) -> Router {
     // `content.pages.create`, …), so the handler re-checks the one the registry names — and it
     // refuses a navigation command outright, because a command that opens a screen is not a job.
     // See `crate::routes::commands`.
-    let commands_route = get(commands::list_commands).layer(guards::require(&state, "search.read"));
-    let command_resolve = post(commands::resolve).layer(guards::require(&state, "search.read"));
-    let command_context = get(commands::context).layer(guards::require(&state, "search.read"));
-    let command_recent = get(commands::recent)
+    let commands_route: MethodRouter<AppState, Infallible> = get(commands::list_commands).layer(guards::require(&state, "search.read"));
+    let command_resolve: MethodRouter<AppState, Infallible> = post(commands::resolve).layer(guards::require(&state, "search.read"));
+    let command_context: MethodRouter<AppState, Infallible> = get(commands::context).layer(guards::require(&state, "search.read"));
+    let command_recent: MethodRouter<AppState, Infallible> = get(commands::recent)
         .merge(post(commands::record))
         .merge(delete(commands::clear))
         .layer(guards::require(&state, "search.read"));
-    let command_run = post(commands::run);
+    let command_run: MethodRouter<AppState, Infallible> = post(commands::run);
 
     // Notifications (docs/requests/REQ-021, slice 1). Two powers, split by *whose* inbox:
     // `notifications.read` is a person's own (owner-scoped in the store, so it grants nothing
@@ -1151,27 +1006,27 @@ pub fn router(state: AppState) -> Router {
     //
     // The static segments are declared before `/notifications/{id}` so axum ranks them ahead
     // of the parameter route — the same reason `/media/settings` is spelled as a literal.
-    let notifications_list =
+    let notifications_list: MethodRouter<AppState, Infallible> =
         get(notifications::list).layer(guards::require(&state, "notifications.read"));
-    let notifications_summary =
+    let notifications_summary: MethodRouter<AppState, Infallible> =
         get(notifications::summary).layer(guards::require(&state, "notifications.read"));
-    let notifications_bulk =
+    let notifications_bulk: MethodRouter<AppState, Infallible> =
         post(notifications::bulk).layer(guards::require(&state, "notifications.read"));
-    let notifications_mark_all =
+    let notifications_mark_all: MethodRouter<AppState, Infallible> =
         post(notifications::mark_all_read).layer(guards::require(&state, "notifications.read"));
-    let notifications_emit =
+    let notifications_emit: MethodRouter<AppState, Infallible> =
         post(notifications::emit).layer(guards::require(&state, "notifications.send"));
-    let notifications_entry = get(notifications::get)
+    let notifications_entry: MethodRouter<AppState, Infallible> = get(notifications::get)
         .layer(guards::require(&state, "notifications.read"))
         .merge(delete(notifications::delete).layer(guards::require(&state, "notifications.read")));
-    let notifications_read =
+    let notifications_read: MethodRouter<AppState, Infallible> =
         post(notifications::set_read).layer(guards::require(&state, "notifications.read"));
     // Slice 2's own surface: the reader's own channel configuration, which is a *different*
     // power from reading one's own inbox. `notifications.read` is granted to every role
     // because it grants nothing about anybody else; `notifications.manage` changes what the
     // organization will send this person and how, so it is deliberately absent from the base
     // role and belongs to a person who has been given it on purpose.
-    let notifications_preferences = get(notifications::get_preferences)
+    let notifications_preferences: MethodRouter<AppState, Infallible> = get(notifications::get_preferences)
         .layer(guards::require(&state, "notifications.manage"))
         .merge(
             put(notifications::put_preferences)
@@ -1195,67 +1050,108 @@ pub fn router(state: AppState) -> Router {
     let notifications_push = Router::new()
         .route(
             "/notifications/push-subscriptions",
-            post(notifications_admin::register_push).merge(get(notifications_admin::list_push)),
+            documented!(
+                Method::POST,
+                "/notifications/push-subscriptions",
+                { post(notifications_admin::register_push) },
+                "notifications.manage",
+                "POST push subscriptions"
+            )
+            .merge(documented!(
+                Method::GET,
+                "/notifications/push-subscriptions",
+                { get(notifications_admin::list_push) },
+                "notifications.manage",
+                "GET push subscriptions"
+            )),
         )
         .route(
             "/notifications/push-subscriptions/{id}",
-            delete(notifications_admin::remove_push),
+            documented!(
+                Method::DELETE,
+                "/notifications/push-subscriptions/{id}",
+                { delete(notifications_admin::remove_push) },
+                "notifications.manage",
+                "DELETE id"
+            ),
         )
         .route_layer(guards::require(&state, "notifications.manage"));
-    let notifications_channels =
+    let notifications_channels: MethodRouter<AppState, Infallible> =
         get(notifications_admin::channels).layer(guards::require(&state, "notifications.manage"));
     // The installation's VAPID public key: what a browser subscribes with. `notifications.manage`
     // for the same reason the device list is — a person who can manage their own notifications
     // needs the key to register the browser they are sitting in front of, and the key is public
     // by definition (it is the half the push service sees). Declared beside `channels` and
     // before the `{id}` routes so the literal segment wins the rank.
-    let notifications_push_key =
+    let notifications_push_key: MethodRouter<AppState, Infallible> =
         get(notifications_admin::push_key).layer(guards::require(&state, "notifications.manage"));
     // The settings screen's per-channel `Test delivery`. Declared next to the other
     // `notifications.manage` surface and, like `preferences` above, before the `{id}` routes:
     // `POST /notifications/preferences/test` is two static segments, and axum ranks static
     // ahead of parameter, so the order only matters as a promise that the literal keeps
     // winning. Guarded by the same key as the preferences it tests.
-    let notifications_test = post(notifications_test::test_delivery)
+    let notifications_test: MethodRouter<AppState, Infallible> = post(notifications_test::test_delivery)
         .layer(guards::require(&state, "notifications.manage"));
     let notifications_outbox = Router::new()
         .route(
             "/notifications/outbox",
-            get(notifications_admin::list_outbox),
+            documented!(
+                Method::GET,
+                "/notifications/outbox",
+                { get(notifications_admin::list_outbox) },
+                "notifications.admin",
+                "GET outbox"
+            ),
         )
         .route(
             "/notifications/outbox/{id}/retry",
-            post(notifications_admin::retry_outbox),
-        )
-        // **Read and write are one permission, not two.** `notifications.admin` already means
-        // "the organization-wide delivery log and the router's rules" (catalogue `notifications.
-        // admin`), so a window that decides how long that log keeps its rows is part of the same
-        // surface — splitting it would need a new catalogued key, and a key with no route behind
-        // it is a promise the platform cannot keep (the catalogue's own note, on
-        // `notifications.admin` itself, which sat uncatalogued for two slices).
-        //
-        // The window is set by `PATCH` and read by `GET` on the SAME path, which is why the
-        // handler for the write delegates to the read rather than re-assembling the answer: two
-        // bodies describing one fact is the defect class this branch keeps meeting.
-        .route(
-            "/notifications/outbox/retention",
-            get(notifications_admin::outbox_retention)
-                .merge(patch(notifications_admin::set_outbox_retention)),
+            documented!(
+                Method::POST,
+                "/notifications/outbox/{id}/retry",
+                { post(notifications_admin::retry_outbox) },
+                "notifications.admin",
+                "POST retry"
+            ),
         )
         .route_layer(guards::require(&state, "notifications.admin"));
     let notifications_routes = Router::new()
         .route(
             "/notifications/routes",
-            get(notifications_admin::list_routes).merge(post(notifications_admin::create_route)),
+            documented!(
+                Method::GET,
+                "/notifications/routes",
+                { get(notifications_admin::list_routes) },
+                "notifications.admin",
+                "GET routes"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/notifications/routes",
+                { post(notifications_admin::create_route) },
+                "notifications.admin",
+                "POST routes"
+            )),
         )
         .route(
             "/notifications/routes/{id}",
-            delete(notifications_admin::delete_route),
+            documented!(
+                Method::DELETE,
+                "/notifications/routes/{id}",
+                { delete(notifications_admin::delete_route) },
+                "notifications.admin",
+                "DELETE id"
+            ),
         )
         // Running one event through the router is an administrator's *proof*, not a feature:
         // the claim of slice 3 is that a bus fact becomes a notification with no direct call
         // between the two modules, and this is the only way to show that from a browser.
-        .route("/notifications/route", post(notifications_admin::run_route))
+        .route("/notifications/route", documented!(
+                Method::POST,
+                "/notifications/route",
+                { post(notifications_admin::run_route) },
+                "notifications.admin",
+                "POST route"
+            ))
         .route_layer(guards::require(&state, "notifications.admin"));
 
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
@@ -1263,12 +1159,14 @@ pub fn router(state: AppState) -> Router {
     // resolve the site through the caller's own organization. The collection endpoint is the
     // public half — a site's own script posts beacons to it — so it carries no guard; the body
     // cap below is the one limit the router itself enforces.
-    let analytics_settings_read =
+    let analytics_settings_read: MethodRouter<AppState, Infallible> =
         get(analytics::get_settings).layer(guards::require(&state, "analytics.read"));
-    let analytics_settings_write =
+    let analytics_settings_write: MethodRouter<AppState, Infallible> =
         put(analytics::put_settings).layer(guards::require(&state, "analytics.settings.manage"));
-    let analytics_snippet =
-        get(analytics::snippet).layer(guards::require(&state, "analytics.read"));
+    // `analytics_snippet` no longer has a `let` of its own: the route it served is registered
+    // through `documented!` (see below), which needs the handler INLINE because the macro has to
+    // read the permission off the very expression that installs the guard. A `let` would hide the
+    // guard from the inventory and the emitted document would record a route with no key.
 
     // The reports (docs/requests/REQ-007, slice 2): reading them is `analytics.read`, and taking
     // one out as a file is the separate `analytics.export` — a screen that may read a report and
@@ -1306,6 +1204,13 @@ pub fn router(state: AppState) -> Router {
     // actually needs, so nesting it under a broader builder would add a permission the route
     // never asked for. The guards are split by blast radius — reading a key list is not
     // issuing a credential, and neither is reading the traffic record.
+    // Every route below registers through `documented!` (REQ-130 slice 3) rather than a bare
+    // `.route(...)`, for the same reason every other route on this router does: the inventory
+    // reads the permission off the very expression that installs the guard, so a `let` in front
+    // of the handler hides the key and the emitted OpenAPI document records a route that answers
+    // 403 for everyone with nothing to explain why. Merging main brought nine of these in
+    // unwrapped; the drift gate counted them as undocumented, which is exactly the finding it
+    // exists to produce.
     let developer_routes = Router::new()
         // The overview's card row (REQ-022, slice 2). `developer.read` rather than a narrower
         // key: the screen exists to be the first thing a key author sees, and a permission
@@ -1318,35 +1223,83 @@ pub fn router(state: AppState) -> Router {
         // read a key author needs before they have a key.
         .route(
             "/developer/scopes",
-            get(developer::list_scopes).layer(guards::require(&state, "developer.read")),
+            documented!(
+                Method::GET,
+                "/developer/scopes",
+                { get(developer::list_scopes).layer(guards::require(&state, "developer.read")) },
+                "developer.read",
+                "GET scopes"
+            )
         )
         .route(
             "/developer/api-keys",
-            get(developer::list_keys).layer(guards::require(&state, "developer.keys.read")),
+            documented!(
+                Method::GET,
+                "/developer/api-keys",
+                { get(developer::list_keys).layer(guards::require(&state, "developer.keys.read")) },
+                "developer.keys.read",
+                "GET keys"
+            )
         )
         .route(
             "/developer/api-keys",
-            post(developer::create_key).layer(guards::require(&state, "developer.keys.manage")),
+            documented!(
+                Method::POST,
+                "/developer/api-keys",
+                { post(developer::create_key).layer(guards::require(&state, "developer.keys.manage")) },
+                "developer.keys.manage",
+                "POST key"
+            )
         )
         .route(
             "/developer/api-keys/{id}",
-            get(developer::get_key).layer(guards::require(&state, "developer.keys.read")),
+            documented!(
+                Method::GET,
+                "/developer/api-keys/{id}",
+                { get(developer::get_key).layer(guards::require(&state, "developer.keys.read")) },
+                "developer.keys.read",
+                "GET key"
+            )
         )
         .route(
             "/developer/api-keys/{id}",
-            delete(developer::revoke_key).layer(guards::require(&state, "developer.keys.manage")),
+            documented!(
+                Method::DELETE,
+                "/developer/api-keys/{id}",
+                { delete(developer::revoke_key).layer(guards::require(&state, "developer.keys.manage")) },
+                "developer.keys.manage",
+                "DELETE key"
+            )
         )
         .route(
             "/developer/api-keys/{id}/rotate",
-            post(developer::rotate_key).layer(guards::require(&state, "developer.keys.manage")),
+            documented!(
+                Method::POST,
+                "/developer/api-keys/{id}/rotate",
+                { post(developer::rotate_key).layer(guards::require(&state, "developer.keys.manage")) },
+                "developer.keys.manage",
+                "POST rotate"
+            )
         )
         .route(
             "/developer/logs",
-            get(developer::list_logs).layer(guards::require(&state, "developer.logs.read")),
+            documented!(
+                Method::GET,
+                "/developer/logs",
+                { get(developer::list_logs).layer(guards::require(&state, "developer.logs.read")) },
+                "developer.logs.read",
+                "GET logs"
+            )
         )
         .route(
             "/developer/logs/{id}",
-            get(developer::get_log).layer(guards::require(&state, "developer.logs.read")),
+            documented!(
+                Method::GET,
+                "/developer/logs/{id}",
+                { get(developer::get_log).layer(guards::require(&state, "developer.logs.read")) },
+                "developer.logs.read",
+                "GET log"
+            )
         );
     // One guarded route deliberately accepts a developer key, because the REQ's own acceptance
     // criterion is "a key authenticates on a guarded endpoint and is rejected after
@@ -1356,10 +1309,20 @@ pub fn router(state: AppState) -> Router {
     // rather than a purpose-made one.
     let developer_guarded = Router::new().route(
         "/developer/sandbox/probe",
-        get(developer::sandbox_probe).layer(guards::require_or_developer_key(
-            &state,
+        // The key recorded in the document is the one the guard actually enforces, not the
+        // function's name: `require_or_developer_key` accepts a session OR a key with that same
+        // permission, so a client reading the document needs the real key to get a 403 rather
+        // than a surprise 200.
+        documented!(
+            Method::GET,
+            "/developer/sandbox/probe",
+            { get(developer::sandbox_probe).layer(guards::require_or_developer_key(
+                &state,
+                "content.pages.read",
+            )) },
             "content.pages.read",
-        )),
+            "GET sandbox probe"
+        )
     );
 
     let security_reports = Router::new()
@@ -1389,41 +1352,95 @@ pub fn router(state: AppState) -> Router {
         // (see `crate::routes::health` and `crate::routes::readyz`).
         .route(
             "/health/overview",
-            get(health_panel::overview).layer(guards::require(&state, "health.read")),
+            documented!(
+                Method::GET,
+                "/health/overview",
+                { get(health_panel::overview).layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET overview"
+            ),
         )
         .route(
             "/health/checks/run",
-            post(health_panel::run_checks).layer(guards::require(&state, "health.manage")),
+            documented!(
+                Method::POST,
+                "/health/checks/run",
+                { post(health_panel::run_checks).layer(guards::require(&state, "health.manage")) },
+                "health.manage",
+                "POST run"
+            ),
         )
         .route(
             "/health/services/{key}",
-            get(health_panel::service).layer(guards::require(&state, "health.read")),
+            documented!(
+                Method::GET,
+                "/health/services/{key}",
+                { get(health_panel::service).layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET key"
+            ),
         )
         .route(
             "/health/samples",
-            get(health_panel::samples).layer(guards::require(&state, "health.read")),
+            documented!(
+                Method::GET,
+                "/health/samples",
+                { get(health_panel::samples).layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET samples"
+            ),
         )
         .route(
             "/health/host",
-            get(health_panel::host_metrics).layer(guards::require(&state, "health.read")),
+            documented!(
+                Method::GET,
+                "/health/host",
+                { get(health_panel::host_metrics).layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET host"
+            ),
         )
         .route(
             "/health/summary",
-            get(health_panel::summary).layer(guards::require(&state, "health.read")),
+            documented!(
+                Method::GET,
+                "/health/summary",
+                { get(health_panel::summary).layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET summary"
+            ),
         )
         .route(
             "/health/metrics",
-            get(health_panel::metrics).layer(guards::require(&state, "health.read")),
+            documented!(
+                Method::GET,
+                "/health/metrics",
+                { get(health_panel::metrics).layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET metrics"
+            ),
         )
         .route(
             "/health/metrics.csv",
-            get(health_panel::metrics_csv).layer(guards::require(&state, "health.read")),
+            documented!(
+                Method::GET,
+                "/health/metrics.csv",
+                { get(health_panel::metrics_csv).layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET metrics.csv"
+            ),
         )
         // Pruning is destructive and irreversible, so it is a POST behind the managing key
         // and not a side effect of a settings save.
         .route(
             "/health/maintenance/prune",
-            post(health_panel::prune).layer(guards::require(&state, "health.manage")),
+            documented!(
+                Method::POST,
+                "/health/maintenance/prune",
+                { post(health_panel::prune).layer(guards::require(&state, "health.manage")) },
+                "health.manage",
+                "POST prune"
+            ),
         )
         // -------------------------------------------------------------------------------------
         // Incidents and threshold policy (REQ-014 slice 3).
@@ -1437,69 +1454,554 @@ pub fn router(state: AppState) -> Router {
         // -------------------------------------------------------------------------------------
         .route(
             "/health/incidents",
-            get(health_incidents::incidents).layer(guards::require(&state, "health.read")),
+            documented!(
+                Method::GET,
+                "/health/incidents",
+                { get(health_incidents::incidents).layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET incidents"
+            ),
         )
         .route(
             "/health/incidents/{id}",
-            get(health_incidents::incident)
-                .layer(guards::require(&state, "health.read"))
-                .merge(
-                    patch(health_incidents::patch_incident)
-                        .layer(guards::require(&state, "health.manage")),
-                ),
+            documented!(
+                Method::GET,
+                "/health/incidents/{id}",
+                { get(health_incidents::incident)
+                .layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/health/incidents/{id}",
+                { patch(health_incidents::patch_incident)
+                        .layer(guards::require(&state, "health.manage")) },
+                "health.manage",
+                "PATCH id"
+            )),
         )
         // Settings split the same way: `GET` shows the policy, `PUT` changes it. A single
         // route cannot, because the reader is exactly the person who should see *which*
         // thresholds are configured without being able to rewrite them.
         .route(
             "/health/settings",
-            get(health_incidents::get_settings)
-                .layer(guards::require(&state, "health.read"))
-                .merge(
-                    put(health_incidents::put_settings)
-                        .layer(guards::require(&state, "health.manage")),
-                ),
+            documented!(
+                Method::GET,
+                "/health/settings",
+                { get(health_incidents::get_settings)
+                .layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET settings"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/health/settings",
+                { put(health_incidents::put_settings)
+                        .layer(guards::require(&state, "health.manage")) },
+                "health.manage",
+                "PUT settings"
+            )),
         )
         .route(
             "/health/maintenance-windows",
-            get(health_incidents::list_windows)
-                .layer(guards::require(&state, "health.read"))
-                // Creating a window is a write even though it only *suppresses* alerts: an
-                // operator who can silence a whole service has to be the operator who can
-                // change its thresholds, or the screen is a mute button for anyone with a
-                // login.
-                .merge(
-                    post(health_incidents::create_window)
-                        .layer(guards::require(&state, "health.manage")),
-                ),
+            documented!(
+                Method::GET,
+                "/health/maintenance-windows",
+                { get(health_incidents::list_windows)
+                .layer(guards::require(&state, "health.read")) },
+                "health.read",
+                "GET maintenance windows"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/health/maintenance-windows",
+                { post(health_incidents::create_window)
+                        .layer(guards::require(&state, "health.manage")) },
+                "health.manage",
+                "POST maintenance windows"
+            )),
         )
         .route(
             "/health/maintenance-windows/{id}",
-            delete(health_incidents::delete_window).layer(guards::require(&state, "health.manage")),
+            documented!(
+                Method::DELETE,
+                "/health/maintenance-windows/{id}",
+                { delete(health_incidents::delete_window).layer(guards::require(&state, "health.manage")) },
+                "health.manage",
+                "DELETE id"
+            ),
+        )
+        // The deployment centre's release surface (REQ-128, slice 4).
+        //
+        // Three permissions, and the split is the one the request draws: reading what this
+        // install is running and what releases exist is `deployment.read`; GENERATING a bundle
+        // writes a row and shells out to the pipeline's generator, so it is its own key and it
+        // is rate limited; acknowledging a destructive-migration warning is `deployment.deploy`,
+        // the same power that rolls the workloads, because accepting that the database can only
+        // be restored is part of deciding to deploy.
+        //
+        // `deployment.deploy` and NOT a `deployment.manage`: the family has `read`, `preview`,
+        // `deploy` and `rollback`, and a guard naming a key outside the catalogue refuses EVERY
+        // account in the installation — the acknowledgement route would have answered 403 to the
+        // instance owner, and every unit test in `omnion-deployment` would still have been green
+        // because none of them builds a router. The integration walk caught it on its first run.
+        //
+        // `/deployment/upgrade-plan/acknowledge` is registered BEFORE `/deployment/artifacts/{version}`
+        // would ever shadow it — axum's router prefers a literal segment over a capture, so the
+        // order here is documentation rather than a requirement, and the comment says so rather
+        // than implying the position matters.
+        .route(
+            "/deployment/artifacts",
+            documented!(
+                Method::GET,
+                "/deployment/artifacts",
+                { get(deployment::list_artifacts).layer(guards::require(&state, "deployment.read")) },
+                "deployment.read",
+                "GET artifacts"
+            ),
+        )
+        .route(
+            "/deployment/artifacts/{version}",
+            documented!(
+                Method::GET,
+                "/deployment/artifacts/{version}",
+                { get(deployment::read_release).layer(guards::require(&state, "deployment.read")) },
+                "deployment.read",
+                "GET version"
+            ),
+        )
+        .route(
+            "/deployment/bundles",
+            documented!(
+                Method::GET,
+                "/deployment/bundles",
+                { get(deployment::list_bundles)
+                .layer(guards::require(&state, "deployment.read")) },
+                "deployment.read",
+                "GET bundles"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/deployment/bundles",
+                { post(deployment::create_bundle)
+                        .layer(guards::require(&state, "deployment.bundle.generate")) },
+                "deployment.bundle.generate",
+                "POST bundles"
+            )),
+        )
+        .route(
+            "/deployment/bundles/{id}",
+            documented!(
+                Method::GET,
+                "/deployment/bundles/{id}",
+                { get(deployment::read_bundle).layer(guards::require(&state, "deployment.read")) },
+                "deployment.read",
+                "GET id"
+            ),
+        )
+        .route(
+            "/deployment/bundles/{id}/files/{name}",
+            documented!(
+                Method::GET,
+                "/deployment/bundles/{id}/files/{name}",
+                { get(deployment::download_bundle_file).layer(guards::require(&state, "deployment.read")) },
+                "deployment.read",
+                "GET name"
+            ),
+        )
+        .route(
+            "/deployment/bundles/{id}/render",
+            documented!(
+                Method::POST,
+                "/deployment/bundles/{id}/render",
+                { post(deployment::render_bundle)
+                .layer(guards::require(&state, "deployment.bundle.generate")) },
+                "deployment.bundle.generate",
+                "POST render"
+            ),
+        )
+        .route(
+            "/deployment/upgrade-plan",
+            documented!(
+                Method::GET,
+                "/deployment/upgrade-plan",
+                { get(deployment::read_upgrade_plan).layer(guards::require(&state, "deployment.read")) },
+                "deployment.read",
+                "GET upgrade plan"
+            ),
+        )
+        .route(
+            "/deployment/upgrade-plan/acknowledge",
+            documented!(
+                Method::POST,
+                "/deployment/upgrade-plan/acknowledge",
+                { post(deployment::acknowledge_upgrade_plan)
+                .layer(guards::require(&state, "deployment.deploy")) },
+                "deployment.deploy",
+                "POST acknowledge"
+            ),
+        )
+        // The migration ledger (REQ-129, slice 1). Three powers, and the split is the one the
+        // request draws:
+        //
+        // * `migrations.read` — the ledger, one migration's SQL, the lint findings, the policy and
+        //   the lock state. All of it is derived from files and rows this installation already has,
+        //   so it carries nothing a release reviewer should not see.
+        // * `migrations.apply` — DDL, and NOT `deployment.deploy`. A key that both ships an image
+        //   and writes the schema cannot answer "who changed the database?" after an incident,
+        //   and every unit test in `omnion-permissions` would still be green with the guard on
+        //   either key because none of them builds a router. The integration walk proves the split
+        //   over the real one.
+        // * `migrations.verify` — rehearsing a reversal against a scratch database. Its own key
+        //   because it is the only write here that EXECUTES SQL, and because it is the write that
+        //   turns a release's rollback path from `unknown` into `reversible`.
+        //
+        // `/deployment/migrations/{version}` is registered AFTER `/deployment/migrations/lock`,
+        // `/policy` and `/violations` would ever shadow it — axum prefers a literal segment over a
+        // capture, so the order is documentation rather than a requirement, and this says so
+        // instead of implying the position matters.
+        .route(
+            "/deployment/migrations",
+            documented!(
+                Method::GET,
+                "/deployment/migrations",
+                { get(migrations::list_migrations)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET migrations"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/deployment/migrations",
+                { post(migrations::apply_migrations)
+                        .layer(guards::require(&state, "deployment.migrations.apply")) },
+                "deployment.migrations.apply",
+                "POST migrations"
+            )),
+        )
+        .route(
+            "/deployment/migrations/plan",
+            documented!(
+                Method::POST,
+                "/deployment/migrations/plan",
+                { post(migrations::plan_migrations)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "POST plan"
+            ),
+        )
+        .route(
+            "/deployment/migrations/lock",
+            documented!(
+                Method::GET,
+                "/deployment/migrations/lock",
+                { get(migrations::read_lock).layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET lock"
+            ),
+        )
+        .route(
+            "/deployment/migrations/violations",
+            documented!(
+                Method::GET,
+                "/deployment/migrations/violations",
+                { get(migrations::read_violations)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET violations"
+            ),
+        )
+        .route(
+            "/deployment/migrations/violations/{id}/waive",
+            documented!(
+                Method::POST,
+                "/deployment/migrations/violations/{id}/waive",
+                { post(migrations::waive_violation)
+                .layer(guards::require(&state, "deployment.migrations.apply")) },
+                "deployment.migrations.apply",
+                "POST waive"
+            ),
+        )
+        .route(
+            "/deployment/migrations/policy",
+            documented!(
+                Method::GET,
+                "/deployment/migrations/policy",
+                { get(migrations::read_policy)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET policy"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/deployment/migrations/policy",
+                { put(migrations::save_policy)
+                        .layer(guards::require(&state, "deployment.migrations.apply")) },
+                "deployment.migrations.apply",
+                "PUT policy"
+            )),
+        )
+        .route(
+            "/deployment/migrations/{version}",
+            documented!(
+                Method::GET,
+                "/deployment/migrations/{version}",
+                { get(migrations::read_migration)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET version"
+            ),
+        )
+        .route(
+            "/deployment/migrations/{version}/verify-down",
+            documented!(
+                Method::POST,
+                "/deployment/migrations/{version}/verify-down",
+                { post(migrations::rehearse_reversal)
+                .layer(guards::require(&state, "deployment.migrations.verify")) },
+                "deployment.migrations.verify",
+                "POST verify down"
+            ),
+        )
+        // Backfill jobs (REQ-129, slice 3). `read` is `migrations.read` — a backfill is a
+        // migration that has not finished, and an operator reading the ledger needs to see the
+        // jobs that release registered. `backfills.manage` is a SEPARATE key from
+        // `migrations.apply`, and the reason is the whole point of the split: applying a migration
+        // changes the schema for rows written from now on, while a backfill REWRITES EVERY
+        // EXISTING ROW of a table. An operator trusted to break the schema has proved nothing
+        // about the data in it.
+        //
+        // `/deployment/backfills/{id}` is registered AFTER `/deployment/backfills` and before the
+        // `{id}/…` action routes only for the usual axum reason — a literal segment and a capture
+        // segment cannot be siblings without the capture eating the literal.
+        .route(
+            "/deployment/backfills",
+            documented!(
+                Method::GET,
+                "/deployment/backfills",
+                { get(backfills::list_backfills)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET backfills"
+            ),
+        )
+        .route(
+            "/deployment/backfills/{id}",
+            documented!(
+                Method::GET,
+                "/deployment/backfills/{id}",
+                { get(backfills::read_backfill)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET id"
+            ),
+        )
+        .route(
+            "/deployment/backfills/{id}/run",
+            documented!(
+                Method::POST,
+                "/deployment/backfills/{id}/run",
+                { post(backfills::run_batch)
+                .layer(guards::require(&state, "deployment.backfills.manage")) },
+                "deployment.backfills.manage",
+                "POST run"
+            ),
+        )
+        .route(
+            "/deployment/backfills/{id}/pause",
+            documented!(
+                Method::POST,
+                "/deployment/backfills/{id}/pause",
+                { post(backfills::pause_backfill)
+                .layer(guards::require(&state, "deployment.backfills.manage")) },
+                "deployment.backfills.manage",
+                "POST pause"
+            ),
+        )
+        .route(
+            "/deployment/backfills/{id}/resume",
+            documented!(
+                Method::POST,
+                "/deployment/backfills/{id}/resume",
+                { post(backfills::resume_backfill)
+                .layer(guards::require(&state, "deployment.backfills.manage")) },
+                "deployment.backfills.manage",
+                "POST resume"
+            ),
+        )
+        // Seed datasets. The READ is `migrations.read` — the datasets and this installation's
+        // load history are release metadata — and the LOAD is `seeds.load`, its own key, because
+        // it is the only write on this surface that puts fixture rows into an operator's database.
+        // The environment refusal is separate from the key and both apply: the key says who, and
+        // the environment says where — the same split `migrations.apply` has.
+        .route(
+            "/deployment/seeds",
+            documented!(
+                Method::GET,
+                "/deployment/seeds",
+                { get(backfills::list_seeds).layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET seeds"
+            ),
+        )
+        .route(
+            "/deployment/seeds/{name}/load",
+            documented!(
+                Method::POST,
+                "/deployment/seeds/{name}/load",
+                { post(backfills::load_seed).layer(guards::require(&state, "deployment.seeds.load")) },
+                "deployment.seeds.load",
+                "POST load"
+            ),
+        )
+        // Anonymised exports (REQ-129, slice 4). Three keys and NOT two, and the split is the
+        // point: `migrations.read` sees the ledger of what was asked for (an operator reading the
+        // migration surface needs to know a support dump left the platform), `exports.create` is
+        // the decision to make one, and `exports.download` is the moment the bytes leave. A single
+        // "exports.manage" key would answer none of those questions — and the third of them is the
+        // one an incident is actually about.
+        //
+        // `/deployment/exports/classifications` is registered BEFORE `/deployment/exports/{id}`
+        // for the usual axum reason: a literal segment cannot be a sibling of a capture segment,
+        // or `{id}` would swallow the word.
+        .route(
+            "/deployment/exports/classifications",
+            documented!(
+                Method::GET,
+                "/deployment/exports/classifications",
+                { get(exports::read_classifications)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET classifications"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/deployment/exports/classifications",
+                { axum::routing::put(exports::classify_column)
+                        .layer(guards::require(&state, "deployment.migrations.apply")) },
+                "deployment.migrations.apply",
+                "PUT classifications"
+            )),
+        )
+        .route(
+            "/deployment/exports",
+            documented!(
+                Method::GET,
+                "/deployment/exports",
+                { get(exports::list_exports)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET exports"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/deployment/exports",
+                { post(exports::create_export)
+                        .layer(guards::require(&state, "deployment.exports.create")) },
+                "deployment.exports.create",
+                "POST exports"
+            )),
+        )
+        .route(
+            "/deployment/exports/{id}",
+            documented!(
+                Method::GET,
+                "/deployment/exports/{id}",
+                { get(exports::read_export)
+                .layer(guards::require(&state, "deployment.migrations.read")) },
+                "deployment.migrations.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/deployment/exports/{id}",
+                { axum::routing::delete(exports::revoke_export)
+                        .layer(guards::require(&state, "deployment.exports.create")) },
+                "deployment.exports.create",
+                "DELETE id"
+            )),
+        )
+        .route(
+            "/deployment/exports/{id}/run",
+            documented!(
+                Method::POST,
+                "/deployment/exports/{id}/run",
+                { post(exports::run_export).layer(guards::require(&state, "deployment.exports.create")) },
+                "deployment.exports.create",
+                "POST run"
+            ),
+        )
+        .route(
+            "/deployment/exports/{id}/download",
+            documented!(
+                Method::GET,
+                "/deployment/exports/{id}/download",
+                { get(exports::download_export)
+                .layer(guards::require(&state, "deployment.exports.download")) },
+                "deployment.exports.download",
+                "GET download"
+            ),
         )
         .route(
             "/security/overview",
-            get(security::overview).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::GET,
+                "/security/overview",
+                { get(security::overview).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET overview"
+            ),
         )
         .route(
             "/security/checks/run",
-            post(security::run_checks).layer(guards::require(&state, "security.scan")),
+            documented!(
+                Method::POST,
+                "/security/checks/run",
+                { post(security::run_checks).layer(guards::require(&state, "security.scan")) },
+                "security.scan",
+                "POST run"
+            ),
         )
         .route(
             "/security/findings/import",
-            post(security::import).layer(guards::require(&state, "security.scan")),
+            documented!(
+                Method::POST,
+                "/security/findings/import",
+                { post(security::import).layer(guards::require(&state, "security.scan")) },
+                "security.scan",
+                "POST import"
+            ),
         )
         .route(
             "/security/findings/bulk",
-            post(security::bulk).layer(guards::require(&state, "security.manage")),
+            documented!(
+                Method::POST,
+                "/security/findings/bulk",
+                { post(security::bulk).layer(guards::require(&state, "security.manage")) },
+                "security.manage",
+                "POST bulk"
+            ),
         )
         .route(
             "/security/findings.csv",
-            get(security::export).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::GET,
+                "/security/findings.csv",
+                { get(security::export).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET findings.csv"
+            ),
         )
         .route(
             "/security/findings",
-            get(security::list).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::GET,
+                "/security/findings",
+                { get(security::list).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET findings"
+            ),
         )
         // Header policy (REQ-012, slice 2). Reading the policy is `security.read` — it is the
         // same read the overview's CSP row already makes. Changing it is `security.manage`, the
@@ -1509,11 +2011,23 @@ pub fn router(state: AppState) -> Router {
         // quietly un-look.
         .route(
             "/security/headers",
-            get(security_headers::get).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::GET,
+                "/security/headers",
+                { get(security_headers::get).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET headers"
+            ),
         )
         .route(
             "/security/headers",
-            put(security_headers::put).layer(guards::require(&state, "security.manage")),
+            documented!(
+                Method::PUT,
+                "/security/headers",
+                { put(security_headers::put).layer(guards::require(&state, "security.manage")) },
+                "security.manage",
+                "PUT headers"
+            ),
         )
         // Rate limiting and sign-in protection (REQ-012, slice 3).
         //
@@ -1529,38 +2043,288 @@ pub fn router(state: AppState) -> Router {
         // is needed.
         .route(
             "/security/rate-limits",
-            get(security_limiter::get_rate_limits)
-                .layer(guards::require(&state, "security.read"))
-                .merge(
-                    put(security_limiter::put_rate_limits)
-                        .layer(guards::require(&state, "security.manage")),
-                ),
+            documented!(
+                Method::GET,
+                "/security/rate-limits",
+                { get(security_limiter::get_rate_limits)
+                .layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET rate limits"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/security/rate-limits",
+                { put(security_limiter::put_rate_limits)
+                        .layer(guards::require(&state, "security.manage")) },
+                "security.manage",
+                "PUT rate limits"
+            )),
         )
         .route(
             "/security/rate-limits/test",
-            post(security_limiter::test_rate_limit).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::POST,
+                "/security/rate-limits/test",
+                { post(security_limiter::test_rate_limit).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "POST test"
+            ),
+        )
+        // The reliability centre's limits (REQ-127 slice 1). Deliberately BESIDE the security
+        // centre's limiter above rather than merged into it: the gateway owns a per-route budget
+        // and this owns the platform-wide user/organization/ip budgets, and an operator who
+        // cannot tell which document a `429` came from cannot fix it. Every refusal below names
+        // its limiter in `details.limiter`, which is what makes the two joinable.
+        //
+        // The dry-run sits behind `reliability.manage` rather than `reliability.read`, which
+        // reads backwards: it changes nothing. It reads live counters, and the panel shows the
+        // winning policy's identity, the remaining budget and the Redis key — that is a map of
+        // the limiter's internals, and `security.read` was explicitly not granted it by REQ-012's
+        // own comment. So the same reasoning, one power stricter.
+        .route(
+            "/reliability/rate-limits",
+            documented!(
+                Method::GET,
+                "/reliability/rate-limits",
+                { get(reliability_limits::list_policies)
+                .layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "GET rate limits"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/reliability/rate-limits",
+                { post(reliability_limits::create_policy)
+                        .layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "POST rate limits"
+            )),
+        )
+        .route(
+            "/reliability/rate-limits/evaluate",
+            documented!(
+                Method::POST,
+                "/reliability/rate-limits/evaluate",
+                { post(reliability_limits::evaluate).layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "POST evaluate"
+            ),
+        )
+        .route(
+            "/reliability/rate-limits/refusals",
+            documented!(
+                Method::GET,
+                "/reliability/rate-limits/refusals",
+                { get(reliability_limits::list_refusals)
+                .layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "GET refusals"
+            ),
+        )
+        .route(
+            "/reliability/rate-limits/{id}",
+            documented!(
+                Method::PATCH,
+                "/reliability/rate-limits/{id}",
+                { patch(reliability_limits::update_policy)
+                .layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "PATCH id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/reliability/rate-limits/{id}",
+                { delete(reliability_limits::delete_policy)
+                        .layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "DELETE id"
+            )),
+        )
+        .route(
+            "/reliability/idempotency",
+            documented!(
+                Method::GET,
+                "/reliability/idempotency",
+                { get(reliability_idempotency::list_keys)
+                .layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "GET idempotency"
+            ),
+        )
+        .route(
+            "/reliability/idempotency/{key}",
+            documented!(
+                Method::GET,
+                "/reliability/idempotency/{key}",
+                { get(reliability_idempotency::get_key)
+                .layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "GET key"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/reliability/idempotency/{key}",
+                { delete(reliability_idempotency::release_key)
+                        .layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "DELETE key"
+            )),
+        )
+        // Retries and breakers (REQ-127 slice 3). The two screens a worker is read through at
+        // 03:00: what is the policy, what has been tried, what is dead-lettered, and which
+        // providers the platform is refusing to call right now.
+        .route(
+            "/reliability/retry-policies",
+            documented!(
+                Method::GET,
+                "/reliability/retry-policies",
+                { get(reliability_retries::list_policies)
+                .layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "GET retry policies"
+            ),
+        )
+        .route(
+            "/reliability/retry-policies/{subsystem}",
+            documented!(
+                Method::PUT,
+                "/reliability/retry-policies/{subsystem}",
+                { put(reliability_retries::save_policy)
+                .layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "PUT subsystem"
+            ),
+        )
+        .route(
+            "/reliability/retry-attempts",
+            documented!(
+                Method::GET,
+                "/reliability/retry-attempts",
+                { get(reliability_retries::list_attempts)
+                .layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "GET retry attempts"
+            ),
+        )
+        .route(
+            "/reliability/retry-attempts/{id}/retry-now",
+            documented!(
+                Method::POST,
+                "/reliability/retry-attempts/{id}/retry-now",
+                { post(reliability_retries::retry_now)
+                .layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "POST retry now"
+            ),
+        )
+        .route(
+            "/reliability/breakers",
+            documented!(
+                Method::GET,
+                "/reliability/breakers",
+                { get(reliability_retries::list_breakers)
+                .layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "GET breakers"
+            ),
+        )
+        .route(
+            "/reliability/breakers/{key}",
+            documented!(
+                Method::PATCH,
+                "/reliability/breakers/{key}",
+                { patch(reliability_retries::update_breaker)
+                .layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "PATCH key"
+            ),
+        )
+        .route(
+            "/reliability/breakers/{key}/reset",
+            documented!(
+                Method::POST,
+                "/reliability/breakers/{key}/reset",
+                { post(reliability_retries::reset_breaker)
+                .layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "POST reset"
+            ),
+        )
+        .route(
+            "/reliability/breakers/{key}/force-open",
+            documented!(
+                Method::POST,
+                "/reliability/breakers/{key}/force-open",
+                { post(reliability_retries::force_open_breaker)
+                .layer(guards::require(&state, "reliability.manage")) },
+                "reliability.manage",
+                "POST force open"
+            ),
+        )
+        // The gate every outbound subsystem's client calls. `reliability.read` rather than
+        // `manage` because observing a breaker is what a caller DOES, not what an operator
+        // edits — and gating it behind `manage` would mean the AI hub's runtime token cannot
+        // record that a provider is down.
+        .route(
+            "/reliability/breakers/{key}/observe",
+            documented!(
+                Method::POST,
+                "/reliability/breakers/{key}/observe",
+                { post(reliability_retries::observe_breaker)
+                .layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "POST observe"
+            ),
         )
         .route(
             "/security/sign-in-protection",
-            get(security_limiter::get_sign_in_protection)
-                .layer(guards::require(&state, "security.read"))
-                .merge(
-                    put(security_limiter::put_sign_in_protection)
-                        .layer(guards::require(&state, "security.manage")),
-                ),
+            documented!(
+                Method::GET,
+                "/security/sign-in-protection",
+                { get(security_limiter::get_sign_in_protection)
+                .layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET sign in protection"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/security/sign-in-protection",
+                { put(security_limiter::put_sign_in_protection)
+                        .layer(guards::require(&state, "security.manage")) },
+                "security.manage",
+                "PUT sign in protection"
+            )),
         )
         .route(
             "/security/sign-in-protection/probe",
-            post(security_limiter::probe_lockout).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::POST,
+                "/security/sign-in-protection/probe",
+                { post(security_limiter::probe_lockout).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "POST probe"
+            ),
         )
         .route(
             "/security/locked-accounts",
-            get(security_limiter::get_locked_accounts)
-                .layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::GET,
+                "/security/locked-accounts",
+                { get(security_limiter::get_locked_accounts)
+                .layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET locked accounts"
+            ),
         )
         .route(
             "/security/locked-accounts/{user_id}/unlock",
-            post(security_limiter::unlock).layer(guards::require(&state, "security.manage")),
+            documented!(
+                Method::POST,
+                "/security/locked-accounts/{user_id}/unlock",
+                { post(security_limiter::unlock).layer(guards::require(&state, "security.manage")) },
+                "security.manage",
+                "POST unlock"
+            ),
         )
         // IP access lists (REQ-012 slice 4). Reading them is `security.read` — the same read the
         // overview's IP-allow-list check already makes, and the same read an operator needs to
@@ -1571,22 +2335,44 @@ pub fn router(state: AppState) -> Router {
         // CEO's office — a grant nobody would think twice about.
         .route(
             "/security/ip-rules",
-            get(security_ip::get)
-                .layer(guards::require(&state, "security.read"))
-                .merge(
-                    post(security_ip::post).layer(guards::require(&state, "security.ip.manage")),
-                ),
+            documented!(
+                Method::GET,
+                "/security/ip-rules",
+                { get(security_ip::get)
+                .layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET ip rules"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/security/ip-rules",
+                { post(security_ip::post).layer(guards::require(&state, "security.ip.manage")) },
+                "security.ip.manage",
+                "POST ip rules"
+            )),
         )
         .route(
             "/security/ip-rules/test",
             // The tester changes nothing, so it is `security.read` — the same reasoning as the
             // rate-limit tester: an operator diagnosing a refusal must not need the power to
             // change the policy in order to be told what the policy says.
-            post(security_ip::test).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::POST,
+                "/security/ip-rules/test",
+                { post(security_ip::test).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "POST test"
+            ),
         )
         .route(
             "/security/ip-rules/{id}",
-            delete(security_ip::delete).layer(guards::require(&state, "security.ip.manage")),
+            documented!(
+                Method::DELETE,
+                "/security/ip-rules/{id}",
+                { delete(security_ip::delete).layer(guards::require(&state, "security.ip.manage")) },
+                "security.ip.manage",
+                "DELETE id"
+            ),
         )
         // Security-event timeline (REQ-012 slice 4). `security.read` for both, including the
         // CSV: an export changes nothing, and an operator who is allowed to read the trail must
@@ -1603,37 +2389,119 @@ pub fn router(state: AppState) -> Router {
         // a secret, and rotating one means replacing a value in an environment and redeploying.
         .route(
             "/security/secrets",
-            get(security_secrets::get).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::GET,
+                "/security/secrets",
+                { get(security_secrets::get).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET secrets"
+            ),
         )
         .route(
             "/security/events",
-            get(security_events::get).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::GET,
+                "/security/events",
+                { get(security_events::get).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET events"
+            ),
         )
         .route(
             "/security/events.csv",
-            get(security_events::export).layer(guards::require(&state, "security.read")),
+            documented!(
+                Method::GET,
+                "/security/events.csv",
+                { get(security_events::export).layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET events.csv"
+            ),
         )
         .route(
             "/security/findings/{id}",
-            get(security::get)
-                .layer(guards::require(&state, "security.read"))
-                .merge(
-                    patch(security::patch_status).layer(guards::require(&state, "security.manage")),
-                ),
+            documented!(
+                Method::GET,
+                "/security/findings/{id}",
+                { get(security::get)
+                .layer(guards::require(&state, "security.read")) },
+                "security.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/security/findings/{id}",
+                { patch(security::patch_status).layer(guards::require(&state, "security.manage")) },
+                "security.manage",
+                "PATCH id"
+            )),
         );
     let analytics_reports = Router::new()
-        .route("/analytics/overview", get(analytics::overview))
-        .route("/analytics/pages", get(analytics::pages))
-        .route("/analytics/pages/series", get(analytics::page_series))
-        .route("/analytics/sources", get(analytics::sources))
-        .route("/analytics/audience", get(analytics::audience))
-        .route("/analytics/events", get(analytics::events))
-        .route("/analytics/events/{name}", get(analytics::event_detail))
-        .route("/analytics/downloads", get(analytics::downloads))
-        .route("/analytics/forms", get(analytics::forms))
+        .route("/analytics/overview", documented!(
+                Method::GET,
+                "/analytics/overview",
+                { get(analytics::overview) },
+                "analytics.read",
+                "GET overview"
+            ))
+        .route("/analytics/pages", documented!(
+                Method::GET,
+                "/analytics/pages",
+                { get(analytics::pages) },
+                "analytics.read",
+                "GET pages"
+            ))
+        .route("/analytics/pages/series", documented!(
+                Method::GET,
+                "/analytics/pages/series",
+                { get(analytics::page_series) },
+                "analytics.read",
+                "GET series"
+            ))
+        .route("/analytics/sources", documented!(
+                Method::GET,
+                "/analytics/sources",
+                { get(analytics::sources) },
+                "analytics.read",
+                "GET sources"
+            ))
+        .route("/analytics/audience", documented!(
+                Method::GET,
+                "/analytics/audience",
+                { get(analytics::audience) },
+                "analytics.read",
+                "GET audience"
+            ))
+        .route("/analytics/events", documented!(
+                Method::GET,
+                "/analytics/events",
+                { get(analytics::events) },
+                "analytics.read",
+                "GET events"
+            ))
+        .route("/analytics/events/{name}", documented!(
+                Method::GET,
+                "/analytics/events/{name}",
+                { get(analytics::event_detail) },
+                "analytics.read",
+                "GET name"
+            ))
+        .route("/analytics/downloads", documented!(
+                Method::GET,
+                "/analytics/downloads",
+                { get(analytics::downloads) },
+                "analytics.read",
+                "GET downloads"
+            ))
+        .route("/analytics/forms", documented!(
+                Method::GET,
+                "/analytics/forms",
+                { get(analytics::forms) },
+                "analytics.read",
+                "GET forms"
+            ))
         .route_layer(guards::require(&state, "analytics.read"));
 
-    let analytics_export =
+    let analytics_export: MethodRouter<AppState, Infallible> =
         get(analytics::export).layer(guards::require(&state, "analytics.export"));
 
     // Goals and realtime (docs/requests/REQ-007, slice 3): reading a goal, its funnel and the
@@ -1641,562 +2509,3216 @@ pub fn router(state: AppState) -> Router {
     // separate `analytics.goals.manage` — an editor who may read the numbers should not be able
     // to silence a conversion by accident.
     let analytics_goals_read = Router::new()
-        .route("/analytics/goals", get(analytics::goals_index))
-        .route("/analytics/goals/{id}", get(analytics::goal_get))
-        .route("/analytics/goals/{id}/funnel", get(analytics::goal_funnel))
-        .route("/analytics/realtime", get(analytics::realtime))
+        .route("/analytics/goals", documented!(
+                Method::GET,
+                "/analytics/goals",
+                { get(analytics::goals_index) },
+                "analytics.read",
+                "GET goals"
+            ))
+        .route("/analytics/goals/{id}", documented!(
+                Method::GET,
+                "/analytics/goals/{id}",
+                { get(analytics::goal_get) },
+                "analytics.read",
+                "GET id"
+            ))
+        .route("/analytics/goals/{id}/funnel", documented!(
+                Method::GET,
+                "/analytics/goals/{id}/funnel",
+                { get(analytics::goal_funnel) },
+                "analytics.read",
+                "GET funnel"
+            ))
+        .route("/analytics/realtime", documented!(
+                Method::GET,
+                "/analytics/realtime",
+                { get(analytics::realtime) },
+                "analytics.read",
+                "GET realtime"
+            ))
         .route(
             "/analytics/realtime/stream",
-            get(analytics::realtime_stream),
+            documented!(
+                Method::GET,
+                "/analytics/realtime/stream",
+                { get(analytics::realtime_stream) },
+                "analytics.read",
+                "GET stream"
+            ),
         )
         .route_layer(guards::require(&state, "analytics.read"));
 
     let analytics_goals_write = Router::new()
-        .route("/analytics/goals", post(analytics::goal_create))
-        .route("/analytics/goals/{id}", patch(analytics::goal_patch))
-        .route("/analytics/goals/{id}", delete(analytics::goal_delete))
+        .route("/analytics/goals", documented!(
+                Method::POST,
+                "/analytics/goals",
+                { post(analytics::goal_create) },
+                "analytics.goals.manage",
+                "POST goals"
+            ))
+        .route("/analytics/goals/{id}", documented!(
+                Method::PATCH,
+                "/analytics/goals/{id}",
+                { patch(analytics::goal_patch) },
+                "analytics.goals.manage",
+                "PATCH id"
+            ))
+        .route("/analytics/goals/{id}", documented!(
+                Method::DELETE,
+                "/analytics/goals/{id}",
+                { delete(analytics::goal_delete) },
+                "analytics.goals.manage",
+                "DELETE id"
+            ))
         .route_layer(guards::require(&state, "analytics.goals.manage"));
 
     // The privacy operations (docs/requests/REQ-007, slice 4): running the retention purge and
     // erasing one visitor change what is stored, which is the settings permission — a reader who
     // may look at the numbers is not the one who decides how long they live.
     let analytics_privacy = Router::new()
-        .route("/analytics/purge", post(analytics::purge))
+        .route("/analytics/purge", documented!(
+                Method::POST,
+                "/analytics/purge",
+                { post(analytics::purge) },
+                "analytics.settings.manage",
+                "POST purge"
+            ))
         .route(
             "/analytics/visitors/{hash}",
-            delete(analytics::erase_visitor),
+            documented!(
+                Method::DELETE,
+                "/analytics/visitors/{hash}",
+                { delete(analytics::erase_visitor) },
+                "analytics.settings.manage",
+                "DELETE hash"
+            ),
         )
         .route_layer(guards::require(&state, "analytics.settings.manage"));
 
     let analytics_collect = Router::new()
-        .route("/public/analytics/collect", post(analytics::collect))
+        .route("/public/analytics/collect", documented!(
+                Method::POST,
+                "/public/analytics/collect",
+                { post(analytics::collect) },
+                "",
+                "POST collect"
+            ))
         .layer(DefaultBodyLimit::max(
             omnion_module_analytics::collect::MAX_BODY_BYTES,
         ));
 
+    // The intake guard (REQ-127 slice 4). TWO routers, deliberately not one:
+    //
+    // * `intake_panel` sits inside the versioned tree with its permission guards. Declaring a
+    //   path is `reliability.intake.manage`, which the catalogue keeps SEPARATE from
+    //   `reliability.manage` because a budget is a number and a declaration is a door.
+    // * `intake_ingress` is the guarded request itself, on a path that does not exist until an
+    //   operator declares it. It carries NO session extractor and NO guard: a provider posting a
+    //   signed webhook has no account, and the signature IS the credential. Its body limit is
+    //   the platform maximum, not an endpoint's cap — the per-endpoint cap is enforced by
+    //   `intake::evaluate` on the bytes that actually arrived, which is the only measurement
+    //   that cannot be lied about with a `content-length` header. An outer limit set BELOW the
+    //   declared cap would refuse a legitimate large export with a bare `413` and no
+    //   `payload_too_large` code, which is exactly the answer the acceptance criteria require
+    //   this guard to be able to give itself.
+    let intake_ingress = Router::new()
+        .route(
+            "/public/intake/{id}",
+            documented!(
+                Method::POST,
+                "/public/intake/{id}",
+                { post(reliability_intake::guarded_request) },
+                "",
+                "POST id"
+            ),
+        )
+        .layer(DefaultBodyLimit::max(
+            omnion_reliability::intake::MAX_PAYLOAD_BYTES as usize,
+        ));
+
+    let intake_panel = Router::new()
+        .route(
+            "/reliability/intake",
+            documented!(
+                Method::GET,
+                "/reliability/intake",
+                { get(reliability_intake::list)
+                .layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "GET intake"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/reliability/intake",
+                { post(reliability_intake::create)
+                        .layer(guards::require(&state, "reliability.intake.manage")) },
+                "reliability.intake.manage",
+                "POST intake"
+            )),
+        )
+        .route(
+            "/reliability/intake/rejections",
+            documented!(
+                Method::GET,
+                "/reliability/intake/rejections",
+                { get(reliability_intake::rejections).layer(guards::require(&state, "reliability.read")) },
+                "reliability.read",
+                "GET rejections"
+            ),
+        )
+        .route(
+            "/reliability/intake/{id}",
+            documented!(
+                Method::PATCH,
+                "/reliability/intake/{id}",
+                { patch(reliability_intake::update)
+                .layer(guards::require(&state, "reliability.intake.manage")) },
+                "reliability.intake.manage",
+                "PATCH id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/reliability/intake/{id}",
+                { delete(reliability_intake::remove)
+                        .layer(guards::require(&state, "reliability.intake.manage")) },
+                "reliability.intake.manage",
+                "DELETE id"
+            )),
+        )
+        .route(
+            "/reliability/intake/{id}/verify-sample",
+            documented!(
+                Method::POST,
+                "/reliability/intake/{id}/verify-sample",
+                { post(reliability_intake::verify_sample)
+                .layer(guards::require(&state, "reliability.intake.manage")) },
+                "reliability.intake.manage",
+                "POST verify sample"
+            ),
+        );
+
+    // The key ring and the rotation ceremony (docs/requests/REQ-125, slice 1). Reading the
+    // ring is `secrets.read`; starting a rotation, pausing and resuming its walk is
+    // `secrets.root.manage`, because a rotation is the one irreversible operation on the ring.
+    let secrets_root_key = Router::new()
+        .route("/secrets/root-key", documented!(
+                Method::GET,
+                "/secrets/root-key",
+                { get(secrets::read_root_key) },
+                "secrets.read",
+                "GET root key"
+            ))
+        .route(
+            "/secrets/root-key/rewrap-jobs/{id}",
+            documented!(
+                Method::GET,
+                "/secrets/root-key/rewrap-jobs/{id}",
+                { get(secrets::read_rewrap_job) },
+                "secrets.read",
+                "GET id"
+            ),
+        )
+        .route_layer(guards::require(&state, "secrets.read"));
+
+    let secrets_rotation = Router::new()
+        .route("/secrets/root-key/rotate", documented!(
+                Method::POST,
+                "/secrets/root-key/rotate",
+                { post(secrets::rotate_root_key) },
+                "secrets.root.manage",
+                "POST rotate"
+            ))
+        .route(
+            "/secrets/root-key/rewrap-jobs/{id}/pause",
+            documented!(
+                Method::POST,
+                "/secrets/root-key/rewrap-jobs/{id}/pause",
+                { post(secrets::pause_rewrap_job) },
+                "secrets.root.manage",
+                "POST pause"
+            ),
+        )
+        .route(
+            "/secrets/root-key/rewrap-jobs/{id}/resume",
+            documented!(
+                Method::POST,
+                "/secrets/root-key/rewrap-jobs/{id}/resume",
+                { post(secrets::resume_rewrap_job) },
+                "secrets.root.manage",
+                "POST resume"
+            ),
+        )
+        .route_layer(guards::require(&state, "secrets.root.manage"));
+
+    // Typed credential profiles and the slots consumers resolve through (docs/requests/REQ-125,
+    // slice 2). Reading them is `secrets.read`; typing a secret and running a validator is
+    // `secrets.manage`; changing an assignment is `secrets.assign`, kept separate from both
+    // because a slot swap silently changes what a running production workload is using.
+    let secrets_credentials_read = Router::new()
+        .route(
+            "/secrets/credentials",
+            documented!(
+                Method::GET,
+                "/secrets/credentials",
+                { get(secrets_credentials::read_credentials) },
+                "secrets.read",
+                "GET credentials"
+            ),
+        )
+        .route(
+            "/secrets/credentials/{id}",
+            documented!(
+                Method::GET,
+                "/secrets/credentials/{id}",
+                { get(secrets_credentials::read_credential) },
+                "secrets.read",
+                "GET id"
+            ),
+        )
+        .route("/credential-slots", documented!(
+                Method::GET,
+                "/credential-slots",
+                { get(secrets_credentials::read_slots) },
+                "secrets.read",
+                "GET credential slots"
+            ))
+        .route(
+            "/credential-slots/{scope}/{slot}/resolve/{scope_id}",
+            documented!(
+                Method::GET,
+                "/credential-slots/{scope}/{slot}/resolve/{scope_id}",
+                { get(secrets_credentials::resolve_slot_route) },
+                "secrets.read",
+                "GET scope id"
+            ),
+        )
+        .route_layer(guards::require(&state, "secrets.read"));
+
+    let secrets_credentials_write = Router::new()
+        .route(
+            "/secrets/{id}/credential",
+            documented!(
+                Method::POST,
+                "/secrets/{id}/credential",
+                { post(secrets_credentials::attach_credential_profile) },
+                "secrets.manage",
+                "POST credential"
+            ),
+        )
+        .route(
+            "/secrets/{id}/validate",
+            documented!(
+                Method::POST,
+                "/secrets/{id}/validate",
+                { post(secrets_credentials::validate_credential) },
+                "secrets.manage",
+                "POST validate"
+            ),
+        )
+        .route_layer(guards::require(&state, "secrets.manage"));
+
+    // The assignment write carries its own permission: `secrets.assign`, deliberately not the
+    // read permission, because a slot swap silently changes what a running workload is using.
+    let secrets_slot_assign = Router::new()
+        .route(
+            "/credential-slots/{scope}/{slot}",
+            documented!(
+                Method::PUT,
+                "/credential-slots/{scope}/{slot}",
+                { put(secrets_credentials::put_slot) },
+                "secrets.assign",
+                "PUT slot"
+            ),
+        )
+        .route_layer(guards::require(&state, "secrets.assign"));
+
+    // slice 3. Reading leases and keys is a read; issuing, revoking and deleting is its own
+    // permission, because each of those hands out or takes back the power to read a value.
+    let secrets_leases_read = Router::new()
+        .route("/secret-leases", documented!(
+                Method::GET,
+                "/secret-leases",
+                { get(secrets_leases::read_leases) },
+                "secrets.read",
+                "GET secret leases"
+            ))
+        .route(
+            "/deployment-keys",
+            documented!(
+                Method::GET,
+                "/deployment-keys",
+                { get(secrets_leases::read_deployment_keys) },
+                "secrets.read",
+                "GET deployment keys"
+            ),
+        )
+        .route(
+            "/deployment-keys/{id}/uses",
+            documented!(
+                Method::GET,
+                "/deployment-keys/{id}/uses",
+                { get(secrets_leases::read_deployment_key_uses) },
+                "secrets.read",
+                "GET uses"
+            ),
+        )
+        .route_layer(guards::require(&state, "secrets.read"));
+
+    // The lease writes are `secrets.lease`; the deployment-key writes are
+    // `secrets.deploykeys.manage`. A deployment key is a machine credential, so managing one
+    // is a strictly bigger deal than managing a lease and gets its own name.
+    let secrets_lease_write = Router::new()
+        .route("/secrets/{id}/lease", documented!(
+                Method::POST,
+                "/secrets/{id}/lease",
+                { post(secrets_leases::issue_lease) },
+                "secrets.lease",
+                "POST lease"
+            ))
+        .route(
+            "/secret-leases/{id}/revoke",
+            documented!(
+                Method::POST,
+                "/secret-leases/{id}/revoke",
+                { post(secrets_leases::revoke_lease) },
+                "secrets.lease",
+                "POST revoke"
+            ),
+        )
+        .route_layer(guards::require(&state, "secrets.lease"));
+
+    let secrets_deploy_key_write = Router::new()
+        .route(
+            "/deployment-keys",
+            documented!(
+                Method::POST,
+                "/deployment-keys",
+                { post(secrets_leases::create_deployment_key) },
+                "secrets.deploykeys.manage",
+                "POST deployment keys"
+            ),
+        )
+        .route(
+            "/deployment-keys/{id}/revoke",
+            documented!(
+                Method::POST,
+                "/deployment-keys/{id}/revoke",
+                { post(secrets_leases::revoke_deployment_key) },
+                "secrets.deploykeys.manage",
+                "POST revoke"
+            ),
+        )
+        .route(
+            "/deployment-keys/{id}",
+            documented!(
+                Method::DELETE,
+                "/deployment-keys/{id}",
+                { delete(secrets_leases::delete_deployment_key) },
+                "secrets.deploykeys.manage",
+                "DELETE id"
+            ),
+        )
+        .route_layer(guards::require(&state, "secrets.deploykeys.manage"));
+
+    // slice 4. The audit surface is its own permission (`secrets.audit`) and deliberately not
+    // `secrets.read`: reading which secrets an account has touched, from which address and
+    // under which request id is a bigger question than reading the list of secrets, and one
+    // operator should be able to grant the first without the second.
+    let secrets_audit = Router::new()
+        .route("/secrets/audit", documented!(
+                Method::GET,
+                "/secrets/audit",
+                { get(secrets_audit::read_audit) },
+                "secrets.audit",
+                "GET audit"
+            ))
+        .route("/secrets/audit/export", documented!(
+                Method::GET,
+                "/secrets/audit/export",
+                { get(secrets_audit::export_audit) },
+                "secrets.audit",
+                "GET export"
+            ))
+        .route(
+            "/secrets/audit/anomalies",
+            documented!(
+                Method::GET,
+                "/secrets/audit/anomalies",
+                { get(secrets_audit::read_anomalies) },
+                "secrets.audit",
+                "GET anomalies"
+            ),
+        )
+        .route(
+            "/secrets/audit/anomalies/{id}/acknowledge",
+            documented!(
+                Method::PATCH,
+                "/secrets/audit/anomalies/{id}/acknowledge",
+                { patch(secrets_audit::acknowledge_anomaly) },
+                "secrets.audit",
+                "PATCH acknowledge"
+            ),
+        )
+        .route_layer(guards::require(&state, "secrets.audit"));
+
+    // The persisted-document manager (REQ-130 slice 2).
+    //
+    // Split into THREE routers rather than one route per verb with a `.layer()` each, because a
+    // `.layer()` on a `get().post()` pair applies ONE permission to BOTH verbs — the first draft
+    // guarded `GET /documents` with the manage key, which would have made the read list refuse the
+    // very people the manager exists to inform. Two separate routers is the shape the rest of this
+    // file uses (see `secrets_audit` above and the observability writers below), and it is the
+    // only shape in which the read guard and the write guard can differ.
+    //
+    // `content.pages.read` for reads and `deployment.migrations.manage` for writes — both REAL
+    // catalogue keys. The request's table names `developer.read` and `developer.graphql.manage`,
+    // and this repository ships **no `developer.*` key at all**; an uncatalogued key resolves to no
+    // permission, so a route guarded on one answers 403 for every caller including the instance
+    // owner while looking perfectly healthy. See `graphql_manager.rs` for each substitution's
+    // reasoning and a test that reads the catalogue to hold them.
+    let graphql_documents_read = Router::new()
+        .route("/graphql/documents", documented!(
+                Method::GET,
+                "/graphql/documents",
+                { get(graphql_manager::list) },
+                "content.pages.read",
+                "GET documents"
+            ))
+        .route("/graphql/documents/prunable", documented!(
+                Method::GET,
+                "/graphql/documents/prunable",
+                { get(graphql_manager::prunable) },
+                "content.pages.read",
+                "GET prunable"
+            ))
+        .route("/graphql/documents/{id}", documented!(
+                Method::GET,
+                "/graphql/documents/{id}",
+                { get(graphql_manager::detail) },
+                "content.pages.read",
+                "GET id"
+            ))
+        .route_layer(guards::require(&state, graphql_manager::READ_PERMISSION));
+
+    let graphql_documents_write = Router::new()
+        .route("/graphql/documents", documented!(
+                Method::POST,
+                "/graphql/documents",
+                { post(graphql_manager::register) },
+                "deployment.migrations.apply",
+                "POST documents"
+            ))
+        .route(
+            "/graphql/documents/{id}",
+            documented!(
+                Method::PUT,
+                "/graphql/documents/{id}",
+                { put(graphql_manager::set_status) },
+                "deployment.migrations.apply",
+                "PUT id"
+            ),
+        )
+        .route_layer(guards::require(&state, graphql_manager::MANAGE_PERMISSION));
+
+    // The endpoint's own settings. Read with the read guard and written with the write guard, for
+    // the same reason: an operator who may read the policy may see it, and only an operator who
+    // may manage the release shape may change it.
+    let graphql_settings_routes = Router::new()
+        .route("/graphql/settings", documented!(
+                Method::GET,
+                "/graphql/settings",
+                { get(graphql_manager::read_settings) },
+                "content.pages.read",
+                "GET settings"
+            ))
+        .route_layer(guards::require(&state, graphql_manager::READ_PERMISSION));
+    let graphql_settings_writes = Router::new()
+        .route("/graphql/settings", documented!(
+                Method::PUT,
+                "/graphql/settings",
+                { put(graphql_manager::save_settings) },
+                "deployment.migrations.apply",
+                "PUT settings"
+            ))
+        .route_layer(guards::require(&state, graphql_manager::MANAGE_PERMISSION));
+
+    // The schema explorer (REQ-130 slice 2). Reads only — it changes nothing, so it needs no write
+    // guard, and its two routes are one router rather than a pair because both are `get` on keys
+    // the caller already holds. `graphql_schema::READ_PERMISSION` is the endpoint's own read key, so
+    // an administrator who can use the playground can also see the schema that playground validates
+    // against; a different key here would let somebody read a schema they could not query.
+    let graphql_schema = Router::new()
+        .route("/graphql/schema", documented!(
+                Method::GET,
+                "/graphql/schema",
+                { get(graphql_schema::read) },
+                "",
+                "GET schema"
+            ))
+        .route("/graphql/schema/diff", documented!(
+                Method::GET,
+                "/graphql/schema/diff",
+                { get(graphql_schema::diff) },
+                "",
+                "GET diff"
+            ))
+        .route_layer(guards::require(&state, graphql_schema::READ_PERMISSION));
+
+    // The deprecation screen (REQ-130, slice 4). Two routers, because the reads and the writes
+    // are guarded by different keys: `developer.read` for the list an integrator-facing operator
+    // reads, `developer.keys.manage` for the four actions that change what integrators may call.
+    // One `.layer()` over a get/post pair would apply ONE key to both verbs, which is invisible in
+    // review and makes the list refuse the very readers it exists to inform.
+    let deprecation_reads = Router::new()
+        .route("/api/deprecations", documented!(
+                Method::GET,
+                "/api/deprecations",
+                { get(graphql_deprecation_routes::list) },
+                "developer.read",
+                "List deprecations"
+            ))
+        .route("/api/deprecations/{id}", documented!(
+                Method::GET,
+                "/api/deprecations/{id}",
+                { get(graphql_deprecation_routes::detail) },
+                "developer.read",
+                "GET id"
+            ))
+        .route_layer(guards::require(&state, graphql_deprecation_routes::READ_PERMISSION));
+    let deprecation_writes = Router::new()
+        .route("/api/deprecations", documented!(
+                Method::POST,
+                "/api/deprecations",
+                { post(graphql_deprecation_routes::announce) },
+                "developer.keys.manage",
+                "POST deprecations"
+            ))
+        .route("/api/deprecations/{id}/extend", documented!(
+                Method::POST,
+                "/api/deprecations/{id}/extend",
+                { post(graphql_deprecation_routes::extend) },
+                "developer.keys.manage",
+                "POST extend"
+            ))
+        .route("/api/deprecations/{id}/withdraw", documented!(
+                Method::POST,
+                "/api/deprecations/{id}/withdraw",
+                { post(graphql_deprecation_routes::withdraw) },
+                "developer.keys.manage",
+                "POST withdraw"
+            ))
+        .route("/api/deprecations/{id}/notified", documented!(
+                Method::POST,
+                "/api/deprecations/{id}/notified",
+                { post(graphql_deprecation_routes::notify) },
+                "developer.keys.manage",
+                "POST notified"
+            ))
+        .route_layer(guards::require(&state, graphql_deprecation_routes::MANAGE_PERMISSION));
+
+    // The API document and the live drift verdict (REQ-130 slice 3). Two reads of the same
+    // generated bytes with two different audiences: the document is what an integrator loads into
+    // a generator, and the verdict is what whoever changed the router asks the running server so
+    // they learn the answer from the server instead of from a red pipeline. The read guard is the
+    // developer portal's real catalogue key — this repository ships no `developer.*` key, and an
+    // uncatalogued key answers 403 for everyone including the instance owner.
+    let openapi_routes = Router::new()
+        .route("/openapi.json", documented!(
+                Method::GET,
+                "/openapi.json",
+                { get(openapi::read) },
+                "",
+                "GET openapi.json"
+            ))
+        .route("/openapi.json/drift", documented!(
+                Method::GET,
+                "/openapi.json/drift",
+                { get(openapi::drift) },
+                "",
+                "GET drift"
+            ))
+        .route_layer(guards::require(&state, openapi::READ_PERMISSION));
+
+    // Redemption is the ONE handler with no session guard. It is authenticated by the
+    // deployment key in the header instead, so it lives on its own router and is never
+    // reachable by a cookie: a browser cannot redeem a lease, which is the property the whole
+    // request rests on.
+    // The observability surface (`/observability/*`, docs/requests/REQ-126). Reading telemetry is
+    // `observability.read`; changing what the platform records, and for how long, is
+    // `observability.manage` — a different power on purpose, because "see what happened" and
+    // "decide what gets recorded" are not the same authority. Slice 1 ships the log explorer and
+    // its settings; the exporters, alert rules and trace search arrive in slices 3 and 4.
+    let observability_read = Router::new()
+        .route("/observability/logs", documented!(
+                Method::GET,
+                "/observability/logs",
+                { get(observability::read_logs) },
+                "observability.read",
+                "GET logs"
+            ))
+        .route(
+            "/observability/logs/requests/{request_id}",
+            documented!(
+                Method::GET,
+                "/observability/logs/requests/{request_id}",
+                { get(observability::read_request_lines) },
+                "observability.read",
+                "GET request id"
+            ),
+        )
+        .route(
+            "/observability/logs/settings",
+            documented!(
+                Method::GET,
+                "/observability/logs/settings",
+                { get(observability::read_settings) },
+                "observability.read",
+                "GET settings"
+            ),
+        )
+        // The metric catalogue and the chart behind it (REQ-126, slice 2). Both are reads of
+        // telemetry, so both are `observability.read`; a caller who may see what happened may see
+        // what the instance counts.
+        // The landing screen (REQ-126). It is a read of the same sources the tiles below read,
+        // so it is `observability.read` — a caller who may see what happened may see the summary
+        // of it. It writes nothing, so it records no audit entry: a screen that leaves a row
+        // behind on every page view is an audit trail of navigation.
+        .route(
+            "/observability/overview",
+            documented!(
+                Method::GET,
+                "/observability/overview",
+                { get(observability_overview::read_overview) },
+                "observability.read",
+                "GET overview"
+            ),
+        )
+        .route(
+            "/observability/metrics/catalog",
+            documented!(
+                Method::GET,
+                "/observability/metrics/catalog",
+                { get(observability::read_catalog) },
+                "observability.read",
+                "GET catalog"
+            ),
+        )
+        .route(
+            "/observability/metrics/query",
+            documented!(
+                Method::GET,
+                "/observability/metrics/query",
+                { get(observability::read_metric_query) },
+                "observability.read",
+                "GET query"
+            ),
+        )
+        // The trace search and its detail (REQ-126, slice 3). Both are reads of telemetry, so
+        // both are `observability.read` — a caller who may see what happened may see how long it
+        // took and which span failed.
+        .route(
+            "/observability/traces",
+            documented!(
+                Method::GET,
+                "/observability/traces",
+                { get(observability_traces::read_traces) },
+                "observability.read",
+                "GET traces"
+            ),
+        )
+        .route(
+            "/observability/traces/{trace_id}",
+            documented!(
+                Method::GET,
+                "/observability/traces/{trace_id}",
+                { get(observability_traces::read_trace) },
+                "observability.read",
+                "GET trace id"
+            ),
+        )
+        .route(
+            "/observability/exporters",
+            documented!(
+                Method::GET,
+                "/observability/exporters",
+                { get(observability_traces::read_exporters) },
+                "observability.read",
+                "GET exporters"
+            ),
+        )
+        // The alert surface and the settings screen (REQ-126, slice 4). Reading a rule is
+        // `observability.read` for the same reason reading an exporter is: what the instance is
+        // configured to watch is as readable as what it recorded.
+        .route(
+            "/observability/alert-rules",
+            documented!(
+                Method::GET,
+                "/observability/alert-rules",
+                { get(observability_alerts::read_alert_rules) },
+                "observability.read",
+                "GET alert rules"
+            ),
+        )
+        .route(
+            "/observability/alerts",
+            documented!(
+                Method::GET,
+                "/observability/alerts",
+                { get(observability_alerts::read_alerts) },
+                "observability.read",
+                "GET alerts"
+            ),
+        )
+        .route(
+            "/observability/settings",
+            documented!(
+                Method::GET,
+                "/observability/settings",
+                { get(observability_alerts::read_observability_settings) },
+                "observability.read",
+                "GET settings"
+            ),
+        )
+        // The bundle manifest and the lifecycle contract. Both are reads of static, build-time
+        // facts — which bundle this instance ships, and what its probes do during a drain — and
+        // REQ-128 (deployment tooling) and the deployment centre need them as data rather than
+        // each keeping a hard-coded copy of a contract the process has to honour.
+        .route(
+            "/observability/bundle",
+            documented!(
+                Method::GET,
+                "/observability/bundle",
+                { get(observability_alerts::read_bundle) },
+                "observability.read",
+                "GET bundle"
+            ),
+        )
+        .route(
+            "/observability/lifecycle",
+            documented!(
+                Method::GET,
+                "/observability/lifecycle",
+                { get(observability_alerts::read_lifecycle) },
+                "observability.read",
+                "GET lifecycle"
+            ),
+        )
+        .route_layer(guards::require(&state, "observability.read"));
+
+    let observability_write = Router::new()
+        .route(
+            "/observability/logs/settings",
+            documented!(
+                Method::PUT,
+                "/observability/logs/settings",
+                { put(observability::save_settings) },
+                "",
+                "PUT settings"
+            ),
+        )
+        // Re-seeding the catalogue is a write, not a read: it changes what the panel documents and
+        // it writes an audit row, so it takes `observability.manage` like the other mutations.
+        .route(
+            "/observability/metrics/sync",
+            documented!(
+                Method::POST,
+                "/observability/metrics/sync",
+                { post(observability::sync_catalog) },
+                "",
+                "POST sync"
+            ),
+        )
+        // Exporter management (REQ-126, slice 3). An exporter row is a standing instruction to
+        // send this instance's telemetry somewhere, so it takes `observability.manage` — a
+        // different power from `observability.read` on purpose, and every mutation writes an
+        // audit row.
+        .route(
+            "/observability/exporters",
+            documented!(
+                Method::POST,
+                "/observability/exporters",
+                { post(observability_traces::create_exporter) },
+                "",
+                "POST exporters"
+            ),
+        )
+        // PATCH, not PUT: the request's API table documents `PATCH /exporters/{id}` and the panel
+        // sends exactly that, so registering only `put` left the exporters screen's Edit button
+        // answering 405 on a method the router does not have. `apps/api/tests/observability_permissions.rs`
+        // now drives every mutating route with the method the CLIENT sends, which is the only
+        // check that can see this class of defect.
+        .route(
+            "/observability/exporters/{id}",
+            documented!(
+                Method::PATCH,
+                "/observability/exporters/{id}",
+                { axum::routing::patch(observability_traces::update_exporter) },
+                "",
+                "PATCH id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/observability/exporters/{id}",
+                { delete(observability_traces::delete_exporter) },
+                "",
+                "DELETE id"
+            )),
+        )
+        .route(
+            "/observability/exporters/{id}/test",
+            documented!(
+                Method::POST,
+                "/observability/exporters/{id}/test",
+                { post(observability_traces::test_exporter) },
+                "",
+                "POST test"
+            ),
+        )
+        // Alert rules, silences and the settings row (REQ-126, slice 4). All three change what
+        // the instance tells an operator and when it interrupts them, so all three take
+        // `observability.manage` and all three write an audit row. The preview is a POST
+        // because it evaluates a caller-supplied expression — a GET would be replayed by every
+        // cache in the path.
+        .route(
+            "/observability/alert-rules",
+            documented!(
+                Method::POST,
+                "/observability/alert-rules",
+                { post(observability_alerts::create_alert_rule) },
+                "",
+                "POST alert rules"
+            ),
+        )
+        .route(
+            "/observability/alert-rules/preview",
+            documented!(
+                Method::POST,
+                "/observability/alert-rules/preview",
+                { post(observability_alerts::preview_alert_rule) },
+                "",
+                "POST preview"
+            ),
+        )
+        .route(
+            "/observability/alert-rules/{id}",
+            documented!(
+                Method::PATCH,
+                "/observability/alert-rules/{id}",
+                { axum::routing::patch(observability_alerts::update_alert_rule) },
+                "",
+                "PATCH id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/observability/alert-rules/{id}",
+                { delete(observability_alerts::delete_alert_rule) },
+                "",
+                "DELETE id"
+            )),
+        )
+        .route(
+            "/observability/silences",
+            documented!(
+                Method::POST,
+                "/observability/silences",
+                { post(observability_alerts::create_silence) },
+                "",
+                "POST silences"
+            ),
+        )
+        .route(
+            "/observability/silences/{id}",
+            documented!(
+                Method::DELETE,
+                "/observability/silences/{id}",
+                { axum::routing::delete(observability_alerts::delete_silence) },
+                "",
+                "DELETE id"
+            ),
+        )
+        .route(
+            "/observability/settings",
+            documented!(
+                Method::PUT,
+                "/observability/settings",
+                { put(observability_alerts::save_observability_settings) },
+                "",
+                "PUT settings"
+            ),
+        );
+
+    let secrets_lease_redeem = Router::new().route(
+        "/secret-leases/{id}/redeem",
+        documented!(
+                Method::POST,
+                "/secret-leases/{id}/redeem",
+                { post(secrets_leases::redeem_lease) },
+                "",
+                "POST redeem"
+            ),
+    );
+
     let v1 = Router::new()
-        .route("/auth/login", post(auth::login))
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/sso/providers", sso_providers)
-        .route("/auth/sso/{slug}/start", sso_start)
-        .route("/auth/sso/{slug}/saml", sso_saml_page)
+        .route("/auth/login", documented!(
+                Method::POST,
+                "/auth/login",
+                { post(auth::login) },
+                "",
+                "POST login"
+            ))
+        .route("/auth/logout", documented!(
+                Method::POST,
+                "/auth/logout",
+                { post(auth::logout) },
+                "",
+                "POST logout"
+            ))
+        .route("/auth/sso/providers", documented!(
+                Method::GET,
+                "/auth/sso/providers",
+                { get(sso::list_providers) },
+                "",
+                "GET providers"
+            ))
+        .route("/auth/sso/{slug}/start", documented!(
+                Method::GET,
+                "/auth/sso/{slug}/start",
+                { get(sso::start) },
+                "",
+                "GET start"
+            ))
+        .route("/auth/sso/{slug}/saml", documented!(
+                Method::GET,
+                "/auth/sso/{slug}/saml",
+                { get(sso::saml_page) },
+                "",
+                "GET saml"
+            ))
         .route(
             "/auth/sso/{slug}/callback",
-            sso_callback.merge(sso_saml_callback),
+            documented!(
+                Method::GET,
+                "/auth/sso/{slug}/callback",
+                { get(sso::callback) },
+                "",
+                "GET callback"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/auth/sso/{slug}/callback",
+                { post(sso::saml_callback) },
+                "",
+                "POST callback"
+            )),
         )
-        .route("/auth/mfa/verify", auth_mfa_verify)
-        .route("/auth/step-up", auth_step_up)
-        .route("/auth/webauthn/passkeys", webauthn_passkeys)
-        .route("/auth/webauthn/passkeys/{factor_id}", webauthn_passkey)
-        .route("/auth/webauthn/register/begin", webauthn_register_begin)
+        .route("/auth/mfa/verify", documented!(
+                Method::POST,
+                "/auth/mfa/verify",
+                { post(iam_security::verify_mfa_login) },
+                "",
+                "POST verify"
+            ))
+        .route("/auth/step-up", documented!(
+                Method::POST,
+                "/auth/step-up",
+                { post(iam_security::step_up) },
+                "",
+                "POST step up"
+            ))
+        .route("/auth/webauthn/passkeys", documented!(
+                Method::GET,
+                "/auth/webauthn/passkeys",
+                { get(webauthn::list_passkeys) },
+                "",
+                "GET passkeys"
+            ))
+        .route("/auth/webauthn/passkeys/{factor_id}", documented!(
+                Method::DELETE,
+                "/auth/webauthn/passkeys/{factor_id}",
+                { delete(webauthn::revoke_passkey) },
+                "",
+                "DELETE factor id"
+            ))
+        .route("/auth/webauthn/register/begin", documented!(
+                Method::POST,
+                "/auth/webauthn/register/begin",
+                { post(webauthn::register_begin) },
+                "",
+                "POST begin"
+            ))
         .route(
             "/auth/webauthn/register/complete",
-            webauthn_register_complete,
+            documented!(
+                Method::POST,
+                "/auth/webauthn/register/complete",
+                { post(webauthn::register_complete) },
+                "",
+                "POST complete"
+            ),
         )
-        .route("/auth/webauthn/authenticate/begin", auth_webauthn_begin)
+        .route("/auth/webauthn/authenticate/begin", documented!(
+                Method::POST,
+                "/auth/webauthn/authenticate/begin",
+                { post(webauthn::authenticate_begin) },
+                "",
+                "POST begin"
+            ))
         .route(
             "/auth/webauthn/authenticate/complete",
-            auth_webauthn_complete,
+            documented!(
+                Method::POST,
+                "/auth/webauthn/authenticate/complete",
+                { post(webauthn::authenticate_complete) },
+                "",
+                "POST complete"
+            ),
         )
-        .route("/me", get(me::me))
-        .route("/search", search_route)
-        .route("/search/suggest", search_suggest)
-        .route("/search/status", search_status)
-        .route("/search/reindex", search_reindex)
-        .route("/search/export", search_export)
+        .route("/me", documented!(
+                Method::GET,
+                "/me",
+                { get(me::me) },
+                "",
+                "GET me"
+            ))
+        .route("/search", documented!(
+                Method::GET,
+                "/search",
+                { get(search::search).layer(guards::require(&state, "search.read")) },
+                "search.read",
+                "GET search"
+            ))
+        .route("/search/suggest", documented!(
+                Method::GET,
+                "/search/suggest",
+                { get(search::suggest).layer(guards::require(&state, "search.read")) },
+                "search.read",
+                "GET suggest"
+            ))
+        .route("/search/status", documented!(
+                Method::GET,
+                "/search/status",
+                { get(search::status).layer(guards::require(&state, "search.read")) },
+                "search.read",
+                "GET status"
+            ))
+        .route("/search/reindex", documented!(
+                Method::POST,
+                "/search/reindex",
+                { post(search::reindex).layer(guards::require(&state, "search.manage")) },
+                "search.manage",
+                "POST reindex"
+            ))
+        .route("/search/export", documented!(
+                Method::GET,
+                "/search/export",
+                { get(search::export).layer(guards::require(&state, "search.read")) },
+                "search.read",
+                "GET export"
+            ))
         .route(
             "/search/settings",
-            search_settings_read.merge(search_settings_write),
+            documented!(
+                Method::GET,
+                "/search/settings",
+                { get(search::settings).layer(guards::require(&state, "search.read")) },
+                "search.read",
+                "GET settings"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/search/settings",
+                { put(search::save_settings).layer(guards::require(&state, "search.manage")) },
+                "search.manage",
+                "PUT settings"
+            )),
         )
-        .route("/search/recent", search_recent)
-        .route("/commands", commands_route)
-        .route("/commands/{id}/run", command_run)
-        .route("/command-center/context", command_context)
-        .route("/command-center/resolve", command_resolve)
-        .route("/command-center/recent", command_recent)
+        .route("/search/recent", documented!(
+                Method::GET,
+                "/search/recent",
+                { get(search::recent) },
+                "",
+                "GET recent"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/search/recent",
+                { delete(search::clear_recent) },
+                "",
+                "DELETE recent"
+            )))
+        .merge(secrets_root_key)
+        .merge(secrets_rotation)
+        .merge(secrets_credentials_read)
+        .merge(secrets_credentials_write)
+        .merge(secrets_slot_assign)
+        .merge(secrets_leases_read)
+        .merge(secrets_audit)
+        .merge(graphql_documents_read)
+        .merge(graphql_documents_write)
+        .merge(graphql_settings_routes)
+        .merge(graphql_settings_writes)
+        .merge(graphql_schema)
+        .merge(deprecation_reads)
+        .merge(deprecation_writes)
+        .merge(secrets_lease_write)
+        .merge(secrets_deploy_key_write)
+        .merge(secrets_lease_redeem)
+        .merge(openapi_routes)
+        .merge(observability_read)
+        .merge(observability_write.layer(guards::require(&state, "observability.manage")))
+        .route("/commands", documented!(
+                Method::GET,
+                "/commands",
+                { get(commands::list_commands).layer(guards::require(&state, "search.read")) },
+                "search.read",
+                "GET commands"
+            ))
+        .route("/commands/{id}/run", documented!(
+                Method::POST,
+                "/commands/{id}/run",
+                { post(commands::run) },
+                "",
+                "POST run"
+            ))
+        .route("/command-center/context", documented!(
+                Method::GET,
+                "/command-center/context",
+                { get(commands::context).layer(guards::require(&state, "search.read")) },
+                "search.read",
+                "GET context"
+            ))
+        .route("/command-center/resolve", documented!(
+                Method::POST,
+                "/command-center/resolve",
+                { post(commands::resolve).layer(guards::require(&state, "search.read")) },
+                "search.read",
+                "POST resolve"
+            ))
+        .route("/command-center/recent", documented!(
+                Method::GET,
+                "/command-center/recent",
+                { get(commands::recent) },
+                "search.read",
+                "GET recent"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/command-center/recent",
+                { post(commands::record) },
+                "search.read",
+                "POST recent"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/command-center/recent",
+                { delete(commands::clear)
+        .layer(guards::require(&state, "search.read")) },
+                "search.read",
+                "DELETE recent"
+            )))
         // Notifications (REQ-021, slice 1). The static segments (`summary`, `bulk`,
         // `mark-all-read`, `emit`) are declared before the `{id}` routes, which is what makes
         // axum rank them ahead of the parameter route.
-        .route("/notifications", notifications_list)
-        .route("/notifications/summary", notifications_summary)
-        .route("/notifications/bulk", notifications_bulk)
-        .route("/notifications/mark-all-read", notifications_mark_all)
-        .route("/notifications/emit", notifications_emit)
+        .route("/notifications", documented!(
+                Method::GET,
+                "/notifications",
+                { get(notifications::list).layer(guards::require(&state, "notifications.read")) },
+                "notifications.read",
+                "GET notifications"
+            ))
+        .route("/notifications/summary", documented!(
+                Method::GET,
+                "/notifications/summary",
+                { get(notifications::summary).layer(guards::require(&state, "notifications.read")) },
+                "notifications.read",
+                "GET summary"
+            ))
+        .route("/notifications/bulk", documented!(
+                Method::POST,
+                "/notifications/bulk",
+                { post(notifications::bulk).layer(guards::require(&state, "notifications.read")) },
+                "notifications.read",
+                "POST bulk"
+            ))
+        .route("/notifications/mark-all-read", documented!(
+                Method::POST,
+                "/notifications/mark-all-read",
+                { post(notifications::mark_all_read).layer(guards::require(&state, "notifications.read")) },
+                "notifications.read",
+                "POST mark all read"
+            ))
+        .route("/notifications/emit", documented!(
+                Method::POST,
+                "/notifications/emit",
+                { post(notifications::emit).layer(guards::require(&state, "notifications.send")) },
+                "notifications.send",
+                "POST emit"
+            ))
         // Slice 2. `preferences` is a *literal* segment and is declared before the `{id}`
         // routes for exactly the reason `summary` is above: axum ranks a static segment ahead
         // of a parameter one, and `PUT /notifications/preferences` would otherwise be parsed
         // as a `PUT` on an id called "preferences" — which is a `400` a reader would report
         // as "the settings screen is broken".
-        .route("/notifications/preferences", notifications_preferences)
-        .route("/notifications/preferences/test", notifications_test)
+        .route("/notifications/preferences", documented!(
+                Method::GET,
+                "/notifications/preferences",
+                { get(notifications::get_preferences)
+        .layer(guards::require(&state, "notifications.manage")) },
+                "notifications.manage",
+                "GET preferences"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/notifications/preferences",
+                { put(notifications::put_preferences)
+                .layer(guards::require(&state, "notifications.manage")) },
+                "notifications.manage",
+                "PUT preferences"
+            )))
+        .route("/notifications/preferences/test", documented!(
+                Method::POST,
+                "/notifications/preferences/test",
+                { post(notifications_test::test_delivery)
+        .layer(guards::require(&state, "notifications.manage")) },
+                "notifications.manage",
+                "POST test"
+            ))
         // Slice 3's four sub-routers, merged rather than spelled out route by route. Each is a
         // `Router` with its own `route_layer`, so the guard travels with the group and a future
         // fifth endpoint joins the right one by being added inside its block.
         .merge(notifications_push)
-        .route("/notifications/channels", notifications_channels)
-        .route("/notifications/push-key", notifications_push_key)
+        .route("/notifications/channels", documented!(
+                Method::GET,
+                "/notifications/channels",
+                { get(notifications_admin::channels).layer(guards::require(&state, "notifications.manage")) },
+                "notifications.manage",
+                "GET channels"
+            ))
+        .route("/notifications/push-key", documented!(
+                Method::GET,
+                "/notifications/push-key",
+                { get(notifications_admin::push_key).layer(guards::require(&state, "notifications.manage")) },
+                "notifications.manage",
+                "GET push key"
+            ))
         .merge(notifications_outbox)
         .merge(notifications_routes)
-        .route("/notifications/{id}", notifications_entry)
-        .route("/notifications/{id}/read", notifications_read)
-        // CRM intake (REQ-117, slice 1). The public capture endpoint carries no guard: it
-        // authenticates by the source's own hashed key, and the panel surface splits into
-        // three powers — reading the inbox, working a lead, and editing the capture surface
-        // that decides what is stored about the people who write in.
-        //
-        // `/leads/duplicates` is declared before `/leads/{id}` because axum ranks static
-        // segments ahead of parameters, and "duplicates" read as a lead id would be a `400`
-        // a panel shows as "this screen is broken".
-        .route("/crm/intake/{source_key}", post(crm_intake::capture))
-        .route(
-            "/crm/intake/sources",
-            get(crm_intake::list_sources)
-                .layer(guards::require(&state, "crm.intake.manage"))
-                .merge(
-                    post(crm_intake::create_source)
-                        .layer(guards::require(&state, "crm.intake.manage")),
-                ),
-        )
-        .route(
-            "/crm/intake/sources/{id}",
-            get(crm_intake::get_source)
-                .layer(guards::require(&state, "crm.intake.manage"))
-                .merge(
-                    patch(crm_intake::update_source)
-                        .layer(guards::require(&state, "crm.intake.manage")),
-                )
-                .merge(
-                    delete(crm_intake::delete_source)
-                        .layer(guards::require(&state, "crm.intake.manage")),
-                ),
-        )
-        .route(
-            "/crm/intake/sources/{id}/rotate-key",
-            post(crm_intake::rotate_key).layer(guards::require(&state, "crm.intake.manage")),
-        )
-        .route(
-            "/crm/intake/sources/{id}/test",
-            post(crm_intake::test_mapping).layer(guards::require(&state, "crm.intake.manage")),
-        )
-        .route(
-            "/crm/intake/autoresponder/templates",
-            get(crm_intake::autoresponder_templates)
-                .layer(guards::require(&state, "crm.intake.manage")),
-        )
-        .route(
-            "/crm/intake/autoresponder/preview",
-            post(crm_intake::preview_autoresponder)
-                .layer(guards::require(&state, "crm.intake.manage")),
-        )
-        .route(
-            "/crm/leads",
-            get(crm_intake::list_leads).layer(guards::require(&state, "crm.leads.read")),
-        )
-        .route(
-            "/crm/leads/duplicates",
-            get(crm_intake::duplicates).layer(guards::require(&state, "crm.leads.read")),
-        )
-        // The counters on their own. Declared **before** `/crm/leads/{id}`: axum prefers the
-        // literal segment, and a uuid parse of the word "metrics" is a 400 a panel renders as a
-        // broken screen rather than as the route it is. The same reason `duplicates` sits above.
-        .route(
-            "/crm/leads/metrics",
-            get(crm_intake::metrics).layer(guards::require(&state, "crm.leads.read")),
-        )
-        .route(
-            "/crm/leads/{id}",
-            get(crm_intake::get_lead)
-                .layer(guards::require(&state, "crm.leads.read"))
-                .merge(
-                    patch(crm_intake::patch_lead)
-                        .layer(guards::require(&state, "crm.leads.manage")),
-                )
-                .merge(
-                    delete(crm_intake::delete_lead)
-                        .layer(guards::require(&state, "crm.leads.manage")),
-                ),
-        )
-        .route(
-            "/crm/leads/{id}/respond",
-            post(crm_intake::respond).layer(guards::require(&state, "crm.leads.manage")),
-        )
-        // Assignment is its own key, not a wing of `crm.leads.manage`: what a lead *says* and
-        // who is answerable for it are different decisions, and the person who most often needs
-        // to hand a lead over is usually the one who may edit it.
-        // The duplicate verdict is reversed through a named endpoint, not a PATCH on the
-        // lead: only the store knows which contact the dedupe matched, so an endpoint that
-        // took a `contact_id` from the panel would either make the panel guess or accept an
-        // id for a row it has not matched. `crm.leads.manage` — the same power as rejecting
-        // a lead, because it changes what a lead is.
-        .route(
-            "/crm/leads/{id}/duplicate-decision",
-            post(crm_intake::duplicate_decision)
-                .layer(guards::require(&state, "crm.leads.manage")),
-        )
-        .route(
-            "/crm/leads/{id}/assign",
-            post(crm_intake::assign).layer(guards::require(&state, "crm.leads.assign")),
-        )
-        // Conversion is its own key, not `crm.leads.manage`: turning a lead into a contact,
-        // an opportunity and eventually a customer is a promise to somebody outside the
-        // panel, and a support agent who may edit a lead row has no business making that
-        // promise.
-        //
-        // There is deliberately no `/crm/leads/flow` here. It answered "which of the flow's
-        // modules is installed" as a second read, and the stepper never made it: the lead
-        // detail already returns the four steps computed, each `Blocked` step naming the
-        // module it is waiting for. A second read of the same fact is a second place the
-        // answer and the screen can disagree, and a client free to prefer it is a client
-        // free to render a stepper the server did not write.
-        .route(
-            "/crm/leads/{id}/convert",
-            post(crm_intake::convert).layer(guards::require(&state, "crm.leads.convert")),
-        )
-        // The hand-over roster. `crm.leads.read`, not `crm.leads.assign`: the inbox already
-        // shows who owns what, and a screen that shows an owner column while hiding the list
-        // of owners teaches the reader that the column is an id.
-        .route(
-            "/crm/leads/owners",
-            get(crm_intake::owners).layer(guards::require(&state, "crm.leads.read")),
-        )
-        // The bulk hand-over. `crm.leads.assign`, because a batch of twenty hand-overs is
-        // twenty hand-overs and no more powerful than the one it replaces.
-        .route(
-            "/crm/leads/bulk-assign",
-            post(crm_intake::bulk_assign).layer(guards::require(&state, "crm.leads.assign")),
-        )
-        // The bulk bar's other three verbs, in ONE endpoint rather than three.
-        //
-        // `crm.leads.manage` — the same key `/{id}/respond`, `/{id}/spam` and `/{id}/reject`
-        // already carry, one row at a time. A batch needing a *different* key would mean the
-        // power was cheap per row and expensive in bulk, which is a privilege nobody was
-        // granted and no operator expects. The verb is a closed enum in the body, so a typo is
-        // a `400` naming the three real names rather than an `else` arm that "responded" twenty
-        // leads.
-        .route(
-            "/crm/leads/bulk-action",
-            post(crm_intake::bulk_action).layer(guards::require(&state, "crm.leads.manage")),
-        )
-        // The export. `crm.leads.read`: it writes one audit row and downloads a document of
-        // what the caller may already read, which is the same contract as every other export
-        // on this platform (the security findings CSV is exactly this shape).
-        //
-        // Declared here, before `/crm/leads/{id}`, and so is `bulk-assign` — axum ranks a
-        // static segment ahead of a parameter, so both would match anyway; the ordering puts
-        // the intent in the file rather than leaving it to a matcher.
-        .route(
-            "/crm/leads/export",
-            get(crm_intake::export_leads).layer(guards::require(&state, "crm.leads.read")),
-        )
-        .route(
-            "/crm/leads/retention/sweep",
-            post(crm_intake::retention_sweep).layer(guards::require(&state, "crm.leads.manage")),
-        )
-        .route(
-            "/crm/leads/{id}/reject",
-            post(crm_intake::reject).layer(guards::require(&state, "crm.leads.manage")),
-        )
-        .route(
-            "/crm/leads/{id}/spam",
-            post(crm_intake::mark_spam).layer(guards::require(&state, "crm.leads.manage")),
-        )
-        // CRM assignment and SLA (docs/requests/REQ-117, slice 2). Three powers, split by
-        // what they are over rather than by which screen they live on:
-        //
-        // * `crm.intake.manage` — the assignment chain. Editing a rule decides, for every
-        //   lead from now on, which person answers it, so it is the same power as editing
-        //   the intake sources themselves and carries that key.
-        // * `crm.sla.manage` — the response targets. A policy is a promise to a submitter
-        //   about how fast somebody answers, and it is its own key because "who answers"
-        //   and "how fast" go to different people in most organizations: a team lead sets
-        //   the target, a sales manager sets the routing.
-        // * `crm.leads.read` — the simulator, and only the simulator. It reads the rules,
-        //   answers a hypothetical, writes nothing and advances no cursor, so it needs no
-        //   management power. That is what lets a support lead ask "who would get this"
-        //   without being able to change who gets it.
-        //
-        // The rules themselves are ONE router with two layers rather than two routers: the
-        // chain and the policies are different tables but the same screen, and splitting
-        // them into separate `.merge()`s would let a later edit give one of them the other's
-        // key without anybody noticing.
-        .merge(crm_assignment_surface(&state))
-        .merge(storefront_surface(&state))
+        .route("/notifications/{id}", documented!(
+                Method::GET,
+                "/notifications/{id}",
+                { get(notifications::get)
+        .layer(guards::require(&state, "notifications.read")) },
+                "notifications.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/notifications/{id}",
+                { delete(notifications::delete).layer(guards::require(&state, "notifications.read")) },
+                "notifications.read",
+                "DELETE id"
+            )))
+        .route("/notifications/{id}/read", documented!(
+                Method::POST,
+                "/notifications/{id}/read",
+                { post(notifications::set_read).layer(guards::require(&state, "notifications.read")) },
+                "notifications.read",
+                "POST read"
+            ))
         .route(
             "/analytics/settings",
-            analytics_settings_read.merge(analytics_settings_write),
+            documented!(
+                Method::GET,
+                "/analytics/settings",
+                { get(analytics::get_settings).layer(guards::require(&state, "analytics.read")) },
+                "analytics.read",
+                "GET settings"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/analytics/settings",
+                { put(analytics::put_settings).layer(guards::require(&state, "analytics.settings.manage")) },
+                "analytics.settings.manage",
+                "PUT settings"
+            )),
         )
-        .route("/analytics/snippet", analytics_snippet)
+        .route("/analytics/snippet", documented!(
+                Method::GET,
+                "/analytics/snippet",
+                { get(analytics::snippet).layer(guards::require(&state, "analytics.read")) },
+                "analytics.read",
+                "GET snippet"
+            ))
         .merge(developer_routes)
         .merge(developer_guarded)
         .merge(security_reports)
         .merge(analytics_reports)
-        .route("/analytics/export", analytics_export)
+        .route("/analytics/export", documented!(
+                Method::GET,
+                "/analytics/export",
+                { get(analytics::export).layer(guards::require(&state, "analytics.export")) },
+                "analytics.export",
+                "GET export"
+            ))
         .merge(analytics_goals_read)
         .merge(analytics_goals_write)
         .merge(analytics_privacy)
         .merge(analytics_collect)
+        // The intake guard's two routers. The panel half joins the guarded tree beside the
+        // breakers above; the ingress half is the *request* path and carries no session.
+        .merge(intake_panel)
+        .merge(intake_ingress)
         .route(
             "/iam/permissions",
-            get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),
+            documented!(
+                Method::GET,
+                "/iam/permissions",
+                { get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")) },
+                "iam.permissions.read",
+                "GET permissions"
+            ),
         )
-        .route("/iam/roles", roles)
-        .route("/iam/roles/{id}", role_detail)
-        .route("/iam/roles/{id}/versions", role_versions)
-        .route("/iam/roles/{id}/members", role_members)
-        .route("/iam/roles/{id}/duplicate", role_duplicate)
-        .route("/iam/roles/{id}/preview", role_preview)
+        .route("/iam/roles", documented!(
+                Method::GET,
+                "/iam/roles",
+                { get(iam::list_roles)
+        .layer(guards::require(&state, "iam.roles.read")) },
+                "iam.roles.read",
+                "GET roles"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/roles",
+                { post(iam::create_role).layer(guards::require(&state, "iam.roles.manage")) },
+                "iam.roles.manage",
+                "POST roles"
+            )))
+        .route("/iam/roles/{id}", documented!(
+                Method::GET,
+                "/iam/roles/{id}",
+                { get(iam::get_role)
+        .layer(guards::require(&state, "iam.roles.read")) },
+                "iam.roles.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/iam/roles/{id}",
+                { patch(iam::update_role).layer(guards::require(&state, "iam.roles.manage")) },
+                "iam.roles.manage",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/iam/roles/{id}",
+                { delete(iam::delete_role).layer(guards::require(&state, "iam.roles.manage")) },
+                "iam.roles.manage",
+                "DELETE id"
+            )))
+        .route("/iam/roles/{id}/versions", documented!(
+                Method::GET,
+                "/iam/roles/{id}/versions",
+                { get(iam::list_role_versions).layer(guards::require(&state, "iam.roles.read")) },
+                "iam.roles.read",
+                "GET versions"
+            ))
+        .route("/iam/roles/{id}/members", documented!(
+                Method::GET,
+                "/iam/roles/{id}/members",
+                { get(iam::list_role_members).layer(guards::require(&state, "iam.roles.read")) },
+                "iam.roles.read",
+                "GET members"
+            ))
+        .route("/iam/roles/{id}/duplicate", documented!(
+                Method::POST,
+                "/iam/roles/{id}/duplicate",
+                { post(iam::duplicate_role).layer(guards::require(&state, "iam.roles.manage")) },
+                "iam.roles.manage",
+                "POST duplicate"
+            ))
+        .route("/iam/roles/{id}/preview", documented!(
+                Method::POST,
+                "/iam/roles/{id}/preview",
+                { post(iam::preview_role_permissions).layer(guards::require(&state, "iam.roles.manage")) },
+                "iam.roles.manage",
+                "POST preview"
+            ))
         .route(
             "/iam/roles/{id}/permissions",
-            put(iam::set_role_permissions).layer(guards::require(&state, "iam.roles.manage")),
+            documented!(
+                Method::PUT,
+                "/iam/roles/{id}/permissions",
+                { put(iam::set_role_permissions).layer(guards::require(&state, "iam.roles.manage")) },
+                "iam.roles.manage",
+                "PUT permissions"
+            ),
         )
-        .route("/iam/bindings", bindings)
-        .route("/iam/bindings/{id}", binding_detail)
-        .route("/iam/overview", iam_overview)
-        .route("/iam/users", iam_users)
-        .route("/iam/users/{id}", iam_user)
-        .route("/iam/groups", iam_groups)
-        .route("/iam/groups/{id}", iam_group)
-        .route("/iam/groups/{id}/members", iam_group_members)
-        .route("/iam/service-accounts", iam_service_accounts)
-        .route("/iam/service-accounts/{id}", iam_service_account)
-        .route("/iam/service-accounts/{id}/keys", iam_service_account_keys)
+        .route("/iam/bindings", documented!(
+                Method::GET,
+                "/iam/bindings",
+                { get(iam::list_bindings)
+        .layer(guards::require(&state, "iam.bindings.read")) },
+                "iam.bindings.read",
+                "GET bindings"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/bindings",
+                { post(iam::create_binding).layer(guards::require(&state, "iam.bindings.manage")) },
+                "iam.bindings.manage",
+                "POST bindings"
+            )))
+        .route("/iam/bindings/{id}", documented!(
+                Method::DELETE,
+                "/iam/bindings/{id}",
+                { delete(iam::delete_binding).layer(guards::require(&state, "iam.bindings.manage")) },
+                "iam.bindings.manage",
+                "DELETE id"
+            ))
+        .route("/iam/overview", documented!(
+                Method::GET,
+                "/iam/overview",
+                { get(iam_subjects::overview).layer(guards::require(&state, "iam.roles.read")) },
+                "iam.roles.read",
+                "GET overview"
+            ))
+        .route("/iam/users", documented!(
+                Method::GET,
+                "/iam/users",
+                { get(iam_subjects::list_users)
+        .layer(guards::require(&state, "users.read")) },
+                "users.read",
+                "GET users"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/users",
+                { post(iam_subjects::create_user).layer(guards::require(&state, "users.create")) },
+                "users.create",
+                "POST users"
+            )))
+        .route("/iam/users/{id}", documented!(
+                Method::GET,
+                "/iam/users/{id}",
+                { get(iam_subjects::get_user)
+        .layer(guards::require(&state, "users.read")) },
+                "users.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/iam/users/{id}",
+                { patch(iam_subjects::update_user).layer(guards::require(&state, "users.update")) },
+                "users.update",
+                "PATCH id"
+            )))
+        .route("/iam/groups", documented!(
+                Method::GET,
+                "/iam/groups",
+                { get(iam_subjects::list_groups)
+        .layer(guards::require(&state, "iam.groups.read")) },
+                "iam.groups.read",
+                "GET groups"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/groups",
+                { post(iam_subjects::create_group).layer(guards::require(&state, "iam.groups.manage")) },
+                "iam.groups.manage",
+                "POST groups"
+            )))
+        .route("/iam/groups/{id}", documented!(
+                Method::GET,
+                "/iam/groups/{id}",
+                { get(iam_subjects::get_group)
+        .layer(guards::require(&state, "iam.groups.read")) },
+                "iam.groups.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/iam/groups/{id}",
+                { patch(iam_subjects::update_group).layer(guards::require(&state, "iam.groups.manage")) },
+                "iam.groups.manage",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/iam/groups/{id}",
+                { delete(iam_subjects::delete_group).layer(guards::require(&state, "iam.groups.manage")) },
+                "iam.groups.manage",
+                "DELETE id"
+            )))
+        .route("/iam/groups/{id}/members", documented!(
+                Method::PUT,
+                "/iam/groups/{id}/members",
+                { put(iam_subjects::set_group_members).layer(guards::require(&state, "iam.groups.manage")) },
+                "iam.groups.manage",
+                "PUT members"
+            ))
+        .route("/iam/service-accounts", documented!(
+                Method::GET,
+                "/iam/service-accounts",
+                { get(iam_subjects::list_service_accounts)
+        .layer(guards::require(&state, "iam.serviceaccounts.read")) },
+                "iam.serviceaccounts.read",
+                "GET service accounts"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/service-accounts",
+                { post(iam_subjects::create_service_account)
+                .layer(guards::require(&state, "iam.serviceaccounts.manage")) },
+                "iam.serviceaccounts.manage",
+                "POST service accounts"
+            )))
+        .route("/iam/service-accounts/{id}", documented!(
+                Method::GET,
+                "/iam/service-accounts/{id}",
+                { get(iam_subjects::get_service_account)
+        .layer(guards::require(&state, "iam.serviceaccounts.read")) },
+                "iam.serviceaccounts.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/iam/service-accounts/{id}",
+                { delete(iam_subjects::delete_service_account)
+                .layer(guards::require(&state, "iam.serviceaccounts.manage")) },
+                "iam.serviceaccounts.manage",
+                "DELETE id"
+            )))
+        .route("/iam/service-accounts/{id}/keys", documented!(
+                Method::POST,
+                "/iam/service-accounts/{id}/keys",
+                { post(iam_subjects::issue_service_account_key)
+        .layer(guards::require(&state, "iam.serviceaccounts.manage")) },
+                "iam.serviceaccounts.manage",
+                "POST keys"
+            ))
         .route(
             "/iam/service-accounts/{id}/keys/{key_id}",
-            iam_service_account_key,
+            documented!(
+                Method::DELETE,
+                "/iam/service-accounts/{id}/keys/{key_id}",
+                { delete(iam_subjects::revoke_service_account_key)
+        .layer(guards::require(&state, "iam.serviceaccounts.manage")) },
+                "iam.serviceaccounts.manage",
+                "DELETE key id"
+            ),
         )
-        .route("/iam/simulations", iam_simulations)
-        .route("/iam/policies", iam_policies)
-        .route("/iam/policies/{id}", iam_policy)
-        .route("/iam/policies/{id}/versions", iam_policy_versions)
-        .route("/iam/policies/{id}/test", iam_policy_test)
-        .route("/iam/approvals", iam_approvals)
-        .route("/iam/approvals/{id}/decide", iam_approval_decide)
-        .route("/iam/requests", iam_requests)
-        .route("/iam/provisioning/tokens", iam_provisioning_tokens)
-        .route("/iam/provisioning/tokens/{id}", iam_provisioning_token)
-        .route("/iam/provisioning/log", iam_provisioning_log)
-        .route("/iam/providers", iam_providers)
-        .route("/iam/providers/{id}", iam_provider)
-        .route("/iam/providers/{id}/test", iam_provider_test)
-        .route("/iam/providers/{id}/events", iam_provider_events)
-        .route("/scim/v2/ServiceProviderConfig", scim_config)
-        .route("/scim/v2/Schemas", scim_schemas)
-        .route("/scim/v2/Users", scim_users)
-        .route("/scim/v2/Users/{id}", scim_user)
-        .route("/scim/v2/Groups", scim_groups)
-        .route("/scim/v2/Groups/{id}", scim_group)
-        .route("/iam/security-policies", iam_security_policy)
-        .route("/iam/sessions", iam_sessions)
-        .route("/iam/sessions/{id}", iam_session)
-        .route("/iam/users/{id}/sign-out-all", iam_sign_out_all)
-        .route("/iam/devices", iam_devices)
-        .route("/iam/devices/{id}/trust", iam_device_trust)
-        .route("/iam/devices/{id}", iam_device)
-        .route("/iam/users/{id}/mfa", iam_user_mfa)
+        .route("/iam/simulations", documented!(
+                Method::POST,
+                "/iam/simulations",
+                { post(iam_subjects::run_simulation)
+        .layer(guards::require_or_machine(&state, "iam.simulate")) },
+                "iam.simulate",
+                "POST simulations"
+            ))
+        .route("/iam/policies", documented!(
+                Method::GET,
+                "/iam/policies",
+                { get(iam_policy::list_policies)
+        .layer(guards::require(&state, "iam.policies.read")) },
+                "iam.policies.read",
+                "GET policies"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/policies",
+                { post(iam_policy::create_policy).layer(guards::require(&state, "iam.policies.manage")) },
+                "iam.policies.manage",
+                "POST policies"
+            )))
+        .route("/iam/policies/{id}", documented!(
+                Method::GET,
+                "/iam/policies/{id}",
+                { get(iam_policy::get_policy)
+        .layer(guards::require(&state, "iam.policies.read")) },
+                "iam.policies.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/iam/policies/{id}",
+                { put(iam_policy::update_policy).layer(guards::require(&state, "iam.policies.manage")) },
+                "iam.policies.manage",
+                "PUT id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/iam/policies/{id}",
+                { delete(iam_policy::delete_policy).layer(guards::require(&state, "iam.policies.manage")) },
+                "iam.policies.manage",
+                "DELETE id"
+            )))
+        .route("/iam/policies/{id}/versions", documented!(
+                Method::GET,
+                "/iam/policies/{id}/versions",
+                { get(iam_policy::list_policy_versions).layer(guards::require(&state, "iam.policies.read")) },
+                "iam.policies.read",
+                "GET versions"
+            ))
+        .route("/iam/policies/{id}/test", documented!(
+                Method::POST,
+                "/iam/policies/{id}/test",
+                { post(iam_policy::test_policy).layer(guards::require(&state, "iam.policies.read")) },
+                "iam.policies.read",
+                "POST test"
+            ))
+        .route("/iam/approvals", documented!(
+                Method::GET,
+                "/iam/approvals",
+                { get(iam_approvals::list_approvals).layer(guards::require(&state, "iam.approvals.read")) },
+                "iam.approvals.read",
+                "GET approvals"
+            ))
+        .route("/iam/approvals/{id}/decide", documented!(
+                Method::POST,
+                "/iam/approvals/{id}/decide",
+                { post(iam_approvals::decide_approval).layer(guards::require(&state, "iam.approvals.decide")) },
+                "iam.approvals.decide",
+                "POST decide"
+            ))
+        .route("/iam/requests", documented!(
+                Method::GET,
+                "/iam/requests",
+                { get(iam_approvals::list_my_requests) },
+                "",
+                "GET requests"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/requests",
+                { post(iam_approvals::create_request) },
+                "",
+                "POST requests"
+            )))
+        .route("/iam/provisioning/tokens", documented!(
+                Method::GET,
+                "/iam/provisioning/tokens",
+                { get(iam_provisioning::list_tokens) },
+                "iam.provisioning.manage",
+                "GET tokens"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/provisioning/tokens",
+                { post(iam_provisioning::create_token)
+        .layer(guards::require(&state, "iam.provisioning.manage")) },
+                "iam.provisioning.manage",
+                "POST tokens"
+            )))
+        .route("/iam/provisioning/tokens/{id}", documented!(
+                Method::DELETE,
+                "/iam/provisioning/tokens/{id}",
+                { delete(iam_provisioning::revoke_token)
+        .layer(guards::require(&state, "iam.provisioning.manage")) },
+                "iam.provisioning.manage",
+                "DELETE id"
+            ))
+        .route("/iam/provisioning/log", documented!(
+                Method::GET,
+                "/iam/provisioning/log",
+                { get(iam_provisioning::list_log).layer(guards::require(&state, "iam.provisioning.manage")) },
+                "iam.provisioning.manage",
+                "GET log"
+            ))
+        .route("/iam/providers", documented!(
+                Method::GET,
+                "/iam/providers",
+                { get(iam_providers::list_providers)
+        .layer(guards::require(&state, "iam.providers.read")) },
+                "iam.providers.read",
+                "GET providers"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/providers",
+                { post(iam_providers::create_provider)
+                .layer(guards::require(&state, "iam.providers.manage")) },
+                "iam.providers.manage",
+                "POST providers"
+            )))
+        .route("/iam/providers/{id}", documented!(
+                Method::GET,
+                "/iam/providers/{id}",
+                { get(iam_providers::get_provider)
+        .layer(guards::require(&state, "iam.providers.read")) },
+                "iam.providers.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/iam/providers/{id}",
+                { patch(iam_providers::update_provider)
+                .layer(guards::require(&state, "iam.providers.manage")) },
+                "iam.providers.manage",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/iam/providers/{id}",
+                { delete(iam_providers::delete_provider)
+                .layer(guards::require(&state, "iam.providers.manage")) },
+                "iam.providers.manage",
+                "DELETE id"
+            )))
+        .route("/iam/providers/{id}/test", documented!(
+                Method::POST,
+                "/iam/providers/{id}/test",
+                { post(iam_providers::test_provider).layer(guards::require(&state, "iam.providers.manage")) },
+                "iam.providers.manage",
+                "POST test"
+            ))
+        .route("/iam/providers/{id}/events", documented!(
+                Method::GET,
+                "/iam/providers/{id}/events",
+                { get(iam_providers::list_provider_events)
+        .layer(guards::require(&state, "iam.providers.read")) },
+                "iam.providers.read",
+                "GET events"
+            ))
+        .route("/scim/v2/ServiceProviderConfig", documented!(
+                Method::GET,
+                "/scim/v2/ServiceProviderConfig",
+                { get(scim::service_provider_config) },
+                "",
+                "GET ServiceProviderConfig"
+            ))
+        .route("/scim/v2/Schemas", documented!(
+                Method::GET,
+                "/scim/v2/Schemas",
+                { get(scim::schemas) },
+                "",
+                "GET Schemas"
+            ))
+        .route("/scim/v2/Users", documented!(
+                Method::GET,
+                "/scim/v2/Users",
+                { get(scim::list_users) },
+                "",
+                "GET Users"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/scim/v2/Users",
+                { post(scim::create_user) },
+                "",
+                "POST Users"
+            )))
+        .route("/scim/v2/Users/{id}", documented!(
+                Method::GET,
+                "/scim/v2/Users/{id}",
+                { get(scim::get_user) },
+                "",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/scim/v2/Users/{id}",
+                { put(scim::replace_user) },
+                "",
+                "PUT id"
+            ))
+            .merge(documented!(
+                Method::PATCH,
+                "/scim/v2/Users/{id}",
+                { patch(scim::patch_user) },
+                "",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/scim/v2/Users/{id}",
+                { delete(scim::delete_user) },
+                "",
+                "DELETE id"
+            )))
+        .route("/scim/v2/Groups", documented!(
+                Method::GET,
+                "/scim/v2/Groups",
+                { get(scim::list_groups) },
+                "",
+                "GET Groups"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/scim/v2/Groups",
+                { post(scim::create_group) },
+                "",
+                "POST Groups"
+            )))
+        .route("/scim/v2/Groups/{id}", documented!(
+                Method::GET,
+                "/scim/v2/Groups/{id}",
+                { get(scim::get_group) },
+                "",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/scim/v2/Groups/{id}",
+                { patch(scim::patch_group) },
+                "",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/scim/v2/Groups/{id}",
+                { delete(scim::delete_group) },
+                "",
+                "DELETE id"
+            )))
+        .route("/iam/security-policies", documented!(
+                Method::GET,
+                "/iam/security-policies",
+                { get(iam_security::get_security_policy)
+        .layer(guards::require(&state, "iam.security.read")) },
+                "iam.security.read",
+                "GET security policies"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/iam/security-policies",
+                { put(iam_security::update_security_policy)
+                .layer(guards::require(&state, "iam.security.manage")) },
+                "iam.security.manage",
+                "PUT security policies"
+            )))
+        .route("/iam/sessions", documented!(
+                Method::GET,
+                "/iam/sessions",
+                { get(iam_security::list_sessions).layer(guards::require(&state, "iam.sessions.read")) },
+                "iam.sessions.read",
+                "GET sessions"
+            ))
+        .route("/iam/sessions/{id}", documented!(
+                Method::DELETE,
+                "/iam/sessions/{id}",
+                { delete(iam_security::revoke_session).layer(guards::require(&state, "iam.sessions.revoke")) },
+                "iam.sessions.revoke",
+                "DELETE id"
+            ))
+        .route("/iam/users/{id}/sign-out-all", documented!(
+                Method::POST,
+                "/iam/users/{id}/sign-out-all",
+                { post(iam_security::sign_out_all).layer(guards::require(&state, "iam.sessions.revoke")) },
+                "iam.sessions.revoke",
+                "POST sign out all"
+            ))
+        .route("/iam/devices", documented!(
+                Method::GET,
+                "/iam/devices",
+                { get(iam_security::list_devices).layer(guards::require(&state, "iam.devices.read")) },
+                "iam.devices.read",
+                "GET devices"
+            ))
+        .route("/iam/devices/{id}/trust", documented!(
+                Method::POST,
+                "/iam/devices/{id}/trust",
+                { post(iam_security::trust_device).layer(guards::require(&state, "iam.devices.manage")) },
+                "iam.devices.manage",
+                "POST trust"
+            ))
+        .route("/iam/devices/{id}", documented!(
+                Method::DELETE,
+                "/iam/devices/{id}",
+                { delete(iam_security::forget_device).layer(guards::require(&state, "iam.devices.manage")) },
+                "iam.devices.manage",
+                "DELETE id"
+            ))
+        .route("/iam/users/{id}/mfa", documented!(
+                Method::GET,
+                "/iam/users/{id}/mfa",
+                { get(iam_security::list_factors)
+        .layer(guards::require(&state, "users.read")) },
+                "users.read",
+                "GET mfa"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/iam/users/{id}/mfa",
+                { post(iam_security::enroll_totp).layer(guards::require(&state, "users.update")) },
+                "users.update",
+                "POST mfa"
+            )))
         .route(
             "/iam/users/{id}/mfa/{factor_id}/confirm",
-            iam_user_mfa_confirm,
+            documented!(
+                Method::POST,
+                "/iam/users/{id}/mfa/{factor_id}/confirm",
+                { post(iam_security::confirm_totp).layer(guards::require(&state, "users.update")) },
+                "users.update",
+                "POST confirm"
+            ),
         )
-        .route("/iam/users/{id}/mfa/{factor_id}", iam_user_factor)
-        .route("/iam/users/{id}/reset-mfa", iam_user_mfa_reset)
+        .route("/iam/users/{id}/mfa/{factor_id}", documented!(
+                Method::DELETE,
+                "/iam/users/{id}/mfa/{factor_id}",
+                { delete(iam_security::revoke_factor).layer(guards::require(&state, "users.update")) },
+                "users.update",
+                "DELETE factor id"
+            ))
+        .route("/iam/users/{id}/reset-mfa", documented!(
+                Method::POST,
+                "/iam/users/{id}/reset-mfa",
+                { post(iam_security::reset_mfa).layer(guards::require(&state, "users.update")) },
+                "users.update",
+                "POST reset mfa"
+            ))
         .route(
             "/iam/effective-permissions",
-            get(iam::effective_permissions),
+            documented!(
+                Method::GET,
+                "/iam/effective-permissions",
+                { get(iam::effective_permissions) },
+                "",
+                "GET effective permissions"
+            ),
         )
         .route(
             "/iam/audit",
-            get(iam::list_audit).layer(guards::require(&state, "audit.read")),
+            documented!(
+                Method::GET,
+                "/iam/audit",
+                { get(iam::list_audit).layer(guards::require(&state, "audit.read")) },
+                "audit.read",
+                "GET audit"
+            ),
         )
-        .route("/organizations", organizations)
-        .route("/organizations/{id}", organization)
-        .route("/sites", sites)
-        .route("/sites/{id}", site)
-        .route("/sites/{id}/domains", domains)
-        .route("/sites/{id}/domains/{domain_id}", domain)
-        .route("/sites/{id}/domains/{domain_id}/primary", domain_primary)
-        .route("/pages", pages)
-        .route("/pages/{id}", page)
-        .route("/pages/{id}/publish", page_publish)
-        .route("/pages/{id}/restore", page_restore)
-        .route("/pages/{id}/revisions", page_revisions)
-        .route("/pages/{id}/revisions/{revision_id}", page_revision)
+        .route("/organizations", documented!(
+                Method::GET,
+                "/organizations",
+                { get(tenancy::list_organizations)
+        .layer(guards::require(&state, "organizations.read")) },
+                "organizations.read",
+                "GET organizations"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/organizations",
+                { post(tenancy::create_organization)
+                .layer(guards::require(&state, "organizations.manage")) },
+                "organizations.manage",
+                "POST organizations"
+            )))
+        .route("/organizations/{id}", documented!(
+                Method::GET,
+                "/organizations/{id}",
+                { get(tenancy::get_organization)
+        .layer(guards::require(&state, "organizations.read")) },
+                "organizations.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/organizations/{id}",
+                { patch(tenancy::update_organization)
+                .layer(guards::require(&state, "organizations.manage")) },
+                "organizations.manage",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/organizations/{id}",
+                { delete(tenancy::delete_organization)
+                .layer(guards::require(&state, "organizations.manage")) },
+                "organizations.manage",
+                "DELETE id"
+            )))
+        .route("/sites", documented!(
+                Method::GET,
+                "/sites",
+                { get(tenancy::list_sites)
+        .layer(guards::require(&state, "sites.read")) },
+                "sites.read",
+                "GET sites"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/sites",
+                { post(tenancy::create_site).layer(guards::require(&state, "sites.create")) },
+                "sites.create",
+                "POST sites"
+            )))
+        .route("/sites/{id}", documented!(
+                Method::GET,
+                "/sites/{id}",
+                { get(tenancy::get_site)
+        .layer(guards::require(&state, "sites.read")) },
+                "sites.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/sites/{id}",
+                { patch(tenancy::update_site).layer(guards::require(&state, "sites.update")) },
+                "sites.update",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/sites/{id}",
+                { delete(tenancy::delete_site).layer(guards::require(&state, "sites.delete")) },
+                "sites.delete",
+                "DELETE id"
+            )))
+        .route("/sites/{id}/domains", documented!(
+                Method::GET,
+                "/sites/{id}/domains",
+                { get(tenancy::list_domains)
+        .layer(guards::require(&state, "sites.read")) },
+                "sites.read",
+                "GET domains"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/sites/{id}/domains",
+                { post(tenancy::add_domain).layer(guards::require(&state, "domains.manage")) },
+                "domains.manage",
+                "POST domains"
+            )))
+        .route("/sites/{id}/domains/{domain_id}", documented!(
+                Method::DELETE,
+                "/sites/{id}/domains/{domain_id}",
+                { delete(tenancy::remove_domain).layer(guards::require(&state, "domains.manage")) },
+                "domains.manage",
+                "DELETE domain id"
+            ))
+        .route("/sites/{id}/domains/{domain_id}/primary", documented!(
+                Method::POST,
+                "/sites/{id}/domains/{domain_id}/primary",
+                { post(tenancy::set_primary_domain).layer(guards::require(&state, "domains.manage")) },
+                "domains.manage",
+                "POST primary"
+            ))
+        // The GraphQL surface (REQ-130, slice 1).
+        //
+        // **The guard is `content.pages.read`, and that is deliberate.** The endpoint reads the
+        // same surface it exposes, so a caller who may read content may run queries — and the key
+        // is REAL. The first draft guarded it on `developer.graphql.execute`, which this
+        // repository does not ship, and an uncatalogued key resolves to no permission: the route
+        // answers `403` for every caller, the instance owner included, while looking perfectly
+        // healthy. That is the fourth time this defect has cost this repository a tick.
+        //
+        // `require_or_machine`, because a service account integrating with the platform has no
+        // session and the request says so ("session or API key, sandbox keys included"). The two
+        // verbs share one path; the GET leg answers `PERSISTED_QUERY_NOT_FOUND` until slice 2
+        // registers documents.
+        .route(
+            "/graphql",
+            documented!(
+                Method::POST,
+                "/graphql",
+                { post(graphql::execute_graphql) },
+                "content.pages.read",
+                "POST graphql"
+            )
+            .merge(documented!(
+                Method::GET,
+                "/graphql",
+                { get(graphql::execute_persisted)
+                .layer(guards::require_or_machine(&state, "content.pages.read")) },
+                "content.pages.read",
+                "GET graphql"
+            )),
+        )
+        // The persisted-document manager and the endpoint settings (REQ-130 slice 2).
+        //
+        // `content.pages.read` guards the reads and `deployment.migrations.manage` the writes, and
+        // both are REAL catalogue keys. The request's table names `developer.read` and
+        // `developer.graphql.manage`, and **this repository ships no `developer.*` key at all** — an
+        // uncatalogued key resolves to no permission, so the route answers 403 for every caller
+        // including the owner while looking healthy. `graphql_manager.rs` carries the reasoning for
+        // each substitution and a test that reads the catalogue to hold them.
+        .route("/pages", documented!(
+                Method::GET,
+                "/pages",
+                { get(content::list_pages)
+        .layer(guards::require(&state, "content.pages.read")) },
+                "content.pages.read",
+                "GET pages"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/pages",
+                { post(content::create_page).layer(guards::require(&state, "content.pages.create")) },
+                "content.pages.create",
+                "POST pages"
+            )))
+        .route("/pages/{id}", documented!(
+                Method::GET,
+                "/pages/{id}",
+                { get(content::get_page)
+        .layer(guards::require(&state, "content.pages.read")) },
+                "content.pages.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/pages/{id}",
+                { patch(content::update_page).layer(guards::require(&state, "content.pages.update")) },
+                "content.pages.update",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/pages/{id}",
+                { delete(content::delete_page).layer(guards::require(&state, "content.pages.delete")) },
+                "content.pages.delete",
+                "DELETE id"
+            )))
+        .route("/pages/{id}/publish", documented!(
+                Method::POST,
+                "/pages/{id}/publish",
+                { post(content::publish_page).layer(guards::require(&state, "content.pages.publish")) },
+                "content.pages.publish",
+                "POST publish"
+            ))
+        .route("/pages/{id}/restore", documented!(
+                Method::POST,
+                "/pages/{id}/restore",
+                { post(content::restore_revision).layer(guards::require(&state, "content.pages.restore")) },
+                "content.pages.restore",
+                "POST restore"
+            ))
+        .route("/pages/{id}/revisions", documented!(
+                Method::GET,
+                "/pages/{id}/revisions",
+                { get(content::list_revisions).layer(guards::require(&state, "content.pages.read")) },
+                "content.pages.read",
+                "GET revisions"
+            ))
+        .route("/pages/{id}/revisions/{revision_id}", documented!(
+                Method::GET,
+                "/pages/{id}/revisions/{revision_id}",
+                { get(content::get_revision).layer(guards::require(&state, "content.pages.read")) },
+                "content.pages.read",
+                "GET revision id"
+            ))
         .route(
             "/pages/{id}/revisions/{revision_id}/translations",
-            page_translations,
+            documented!(
+                Method::GET,
+                "/pages/{id}/revisions/{revision_id}/translations",
+                { get(content::list_translations).layer(guards::require(&state, "content.pages.read")) },
+                "content.pages.read",
+                "GET translations"
+            ),
         )
         .route(
             "/pages/{id}/revisions/{revision_id}/translations/{language}",
-            page_translation,
+            documented!(
+                Method::PUT,
+                "/pages/{id}/revisions/{revision_id}/translations/{language}",
+                { put(content::set_translations).layer(guards::require(&state, "content.pages.update")) },
+                "content.pages.update",
+                "PUT language"
+            ),
         )
-        .route("/media", media)
+        .route("/media", documented!(
+                Method::GET,
+                "/media",
+                { get(media::list_media).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET media"
+            ))
         .merge(media_upload)
-        .route("/media/{id}", media_entry)
-        .route("/media/{id}/raw", media_raw)
+        .route("/media/{id}", documented!(
+                Method::GET,
+                "/media/{id}",
+                { get(media::get_media)
+        .layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/media/{id}",
+                { delete(media::delete_media).layer(guards::require(&state, "media.delete")) },
+                "media.delete",
+                "DELETE id"
+            )))
+        .route("/media/{id}/raw", documented!(
+                Method::GET,
+                "/media/{id}/raw",
+                { get(media_transform::raw_with_preset).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET raw"
+            ))
         // The file manager's own paths. `/media/files` and `/media/folders` sit beside the v0
         // collection route rather than replacing it, so a client written against `{site_id, media}`
         // keeps working while the browser moves to the file system.
-        .route("/media/files", media_files_route)
-        .route("/media/uploaders", media_uploaders)
-        .route("/media/files/{id}", media_file)
-        .route("/media/files/{id}/restore", media_file_restore)
-        .route("/media/files/{id}/purge", media_file_purge)
-        .route("/media/folders", media_folders)
-        .route("/media/folders", media_folder_create)
-        .route("/media/folders/{id}", media_folder)
-        .route("/media/trash", media_trash)
-        .route("/media/trash/empty", media_trash_empty)
-        .route("/media/bulk", media_bulk)
-        .route("/media/{id}/versions", media_versions)
+        .route("/media/files", documented!(
+                Method::GET,
+                "/media/files",
+                { get(media_files::list_files).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET files"
+            ))
+        .route("/media/uploaders", documented!(
+                Method::GET,
+                "/media/uploaders",
+                { get(media_files::list_uploaders).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET uploaders"
+            ))
+        .route("/media/files/{id}", documented!(
+                Method::GET,
+                "/media/files/{id}",
+                { get(media_files::get_file)
+        .layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/media/files/{id}",
+                { patch(media_files::update_file).layer(guards::require(&state, "media.update")) },
+                "media.update",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/media/files/{id}",
+                { delete(media_files::trash_file).layer(guards::require(&state, "media.delete")) },
+                "media.delete",
+                "DELETE id"
+            )))
+        .route("/media/files/{id}/restore", documented!(
+                Method::POST,
+                "/media/files/{id}/restore",
+                { post(media_files::restore_file).layer(guards::require(&state, "media.update")) },
+                "media.update",
+                "POST restore"
+            ))
+        .route("/media/files/{id}/purge", documented!(
+                Method::POST,
+                "/media/files/{id}/purge",
+                { post(media_files::purge_file).layer(guards::require(&state, "media.manage")) },
+                "media.manage",
+                "POST purge"
+            ))
+        .route("/media/folders", documented!(
+                Method::GET,
+                "/media/folders",
+                { get(media_files::folder_tree).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET folders"
+            ))
+        .route("/media/folders", documented!(
+                Method::POST,
+                "/media/folders",
+                { post(media_files::create_folder).layer(guards::require(&state, "media.manage")) },
+                "media.manage",
+                "POST folders"
+            ))
+        .route("/media/folders/{id}", documented!(
+                Method::PATCH,
+                "/media/folders/{id}",
+                { patch(media_files::move_folder) },
+                "media.manage",
+                "PATCH id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/media/folders/{id}",
+                { delete(media_files::delete_folder)
+        .layer(guards::require(&state, "media.manage")) },
+                "media.manage",
+                "DELETE id"
+            )))
+        .route("/media/trash", documented!(
+                Method::GET,
+                "/media/trash",
+                { get(media_files::list_trash).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET trash"
+            ))
+        .route("/media/trash/empty", documented!(
+                Method::POST,
+                "/media/trash/empty",
+                { post(media_files::empty_trash).layer(guards::require(&state, "media.manage")) },
+                "media.manage",
+                "POST empty"
+            ))
+        .route("/media/bulk", documented!(
+                Method::POST,
+                "/media/bulk",
+                { post(media_files::bulk_action).layer(guards::require(&state, "media.manage")) },
+                "media.manage",
+                "POST bulk"
+            ))
+        .route("/media/{id}/versions", documented!(
+                Method::GET,
+                "/media/{id}/versions",
+                { get(media_versions::list_versions).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET versions"
+            ))
         .merge(media_version_create)
         .route(
             "/media/{id}/versions/{version}/restore",
-            media_version_restore,
+            documented!(
+                Method::POST,
+                "/media/{id}/versions/{version}/restore",
+                { post(media_versions::restore_version).layer(guards::require(&state, "media.update")) },
+                "media.update",
+                "POST restore"
+            ),
         )
-        .route("/media/{id}/versions/{version}/raw", media_version_raw)
+        .route("/media/{id}/versions/{version}/raw", documented!(
+                Method::GET,
+                "/media/{id}/versions/{version}/raw",
+                { get(media_versions::raw_version).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET raw"
+            ))
         // Share links (REQ-010, slice 3). `/media/{id}/shares` is a collection and
         // `/media/{id}/shares/{share_id}` one link, so a revoke addresses a link without
         // touching the rest of the file's links.
-        .route("/media/{id}/shares", media_shares_route)
-        .route("/media/{id}/shares", media_share_create)
-        .route("/media/{id}/shares/revoke-all", media_share_revoke_all)
-        .route("/media/{id}/shares/{share_id}", media_share_revoke)
+        .route("/media/{id}/shares", documented!(
+                Method::GET,
+                "/media/{id}/shares",
+                { get(media_shares::list).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET shares"
+            ))
+        .route("/media/{id}/shares", documented!(
+                Method::POST,
+                "/media/{id}/shares",
+                { post(media_shares::create).layer(guards::require(&state, "media.share")) },
+                "media.share",
+                "POST shares"
+            ))
+        .route("/media/{id}/shares/revoke-all", documented!(
+                Method::POST,
+                "/media/{id}/shares/revoke-all",
+                { post(media_shares::revoke_all).layer(guards::require(&state, "media.share")) },
+                "media.share",
+                "POST revoke all"
+            ))
+        .route("/media/{id}/shares/{share_id}", documented!(
+                Method::DELETE,
+                "/media/{id}/shares/{share_id}",
+                { delete(media_shares::revoke).layer(guards::require(&state, "media.share")) },
+                "media.share",
+                "DELETE share id"
+            ))
         // Usage and activity (REQ-010, slice 4): the two reads the file-detail screen's last
         // two tabs are made of.
-        .route("/media/{id}/references", media_references)
-        .route("/media/{id}/activity", media_activity)
-        .route("/media/transformation-presets", media_presets)
+        .route("/media/{id}/references", documented!(
+                Method::GET,
+                "/media/{id}/references",
+                { get(media_usage::references).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET references"
+            ))
+        .route("/media/{id}/activity", documented!(
+                Method::GET,
+                "/media/{id}/activity",
+                { get(media_usage::activity).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET activity"
+            ))
+        .route("/media/transformation-presets", documented!(
+                Method::GET,
+                "/media/transformation-presets",
+                { get(media_transform::list).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET transformation presets"
+            ))
         // The duplicate report and its merge. `duplicates` is a static segment declared before
         // `/media/{id}/…`, so axum ranks it ahead of the parameter route — same rule the
         // settings row below relies on, and the reason it is a literal here.
-        .route("/media/duplicates", media_duplicates_route)
-        .route("/media/duplicates/merge", media_duplicates_merge)
+        .route("/media/duplicates", documented!(
+                Method::GET,
+                "/media/duplicates",
+                { get(media_duplicates::report).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET duplicates"
+            ))
+        .route("/media/duplicates/merge", documented!(
+                Method::POST,
+                "/media/duplicates/merge",
+                { post(media_duplicates::merge).layer(guards::require(&state, "media.manage")) },
+                "media.manage",
+                "POST merge"
+            ))
         // `/media/settings` is a *static* segment and `/media/{id}/…` is a parameter one.
         // Axum ranks the static match first, so the settings row is never read as a media
         // id — which is why the literal is declared here and not spelled as `{id}`.
-        .route("/media/settings", media_settings_route)
-        .route("/media/settings", media_settings_write)
-        .route("/media/settings/test-connection", media_settings_test)
+        .route("/media/settings", documented!(
+                Method::GET,
+                "/media/settings",
+                { get(media_settings::read).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET settings"
+            ))
+        .route("/media/settings", documented!(
+                Method::PUT,
+                "/media/settings",
+                { put(media_settings::write).layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "PUT settings"
+            ))
+        .route("/media/settings/test-connection", documented!(
+                Method::POST,
+                "/media/settings/test-connection",
+                { post(media_settings::test_connection)
+            .layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "POST test connection"
+            ))
         // Scanning. `scan-settings`, `scan` and `quarantine` are all *static* segments declared
         // here, so axum ranks them ahead of `/media/{id}/…` — the same reason `/media/settings`
         // is spelled as a literal rather than a parameter.
-        .route("/media/scan-settings", media_scan_route)
-        .route("/media/scan-settings", media_scan_write)
-        .route("/media/scan/test", media_scan_test)
-        .route("/media/scan/run", media_scan_run)
-        .route("/media/scan/runs", media_scan_runs_route)
-        .route("/media/quarantine", media_quarantine)
-        .route("/media/quarantine/{id}/release", media_quarantine_release)
-        .route("/media/folders/{id}/grants", media_folder_grants)
-        .route("/media/folders/{id}/grants", media_folder_grant_write)
-        .route("/media/{id}/grants", media_file_grants)
-        .route("/media/{id}/grants", media_file_grant_write)
-        .route("/media/grants/{grant_id}", media_grant_delete)
-        .route("/media/grant-subjects", media_subjects)
-        .route("/media/{id}/grant-effective", media_grant_effective)
+        .route("/media/scan-settings", documented!(
+                Method::GET,
+                "/media/scan-settings",
+                { get(media_scan::read).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET scan settings"
+            ))
+        .route("/media/scan-settings", documented!(
+                Method::PUT,
+                "/media/scan-settings",
+                { put(media_scan::write).layer(guards::require(&state, "media.scan.manage")) },
+                "media.scan.manage",
+                "PUT scan settings"
+            ))
+        .route("/media/scan/test", documented!(
+                Method::POST,
+                "/media/scan/test",
+                { post(media_scan::test_scanner).layer(guards::require(&state, "media.scan.manage")) },
+                "media.scan.manage",
+                "POST test"
+            ))
+        .route("/media/scan/run", documented!(
+                Method::POST,
+                "/media/scan/run",
+                { post(media_scan::run_now).layer(guards::require(&state, "media.scan.manage")) },
+                "media.scan.manage",
+                "POST run"
+            ))
+        .route("/media/scan/runs", documented!(
+                Method::GET,
+                "/media/scan/runs",
+                { get(media_scan::runs).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET runs"
+            ))
+        .route("/media/quarantine", documented!(
+                Method::GET,
+                "/media/quarantine",
+                { get(media_scan::list_held).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET quarantine"
+            ))
+        .route("/media/quarantine/{id}/release", documented!(
+                Method::POST,
+                "/media/quarantine/{id}/release",
+                { post(media_scan::release).layer(guards::require(&state, "media.scan.manage")) },
+                "media.scan.manage",
+                "POST release"
+            ))
+        .route("/media/folders/{id}/grants", documented!(
+                Method::GET,
+                "/media/folders/{id}/grants",
+                { get(media_grants::folder_grants).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET grants"
+            ))
+        .route("/media/folders/{id}/grants", documented!(
+                Method::PUT,
+                "/media/folders/{id}/grants",
+                { put(media_grants::put_folder_grant).layer(guards::require(&state, "media.manage")) },
+                "media.manage",
+                "PUT grants"
+            ))
+        .route("/media/{id}/grants", documented!(
+                Method::GET,
+                "/media/{id}/grants",
+                { get(media_grants::file_grants).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET grants"
+            ))
+        .route("/media/{id}/grants", documented!(
+                Method::PUT,
+                "/media/{id}/grants",
+                { put(media_grants::put_file_grant).layer(guards::require(&state, "media.manage")) },
+                "media.manage",
+                "PUT grants"
+            ))
+        .route("/media/grants/{grant_id}", documented!(
+                Method::DELETE,
+                "/media/grants/{grant_id}",
+                { delete(media_grants::delete_one).layer(guards::require(&state, "media.manage")) },
+                "media.manage",
+                "DELETE grant id"
+            ))
+        .route("/media/grant-subjects", documented!(
+                Method::GET,
+                "/media/grant-subjects",
+                { get(media_grants::subjects).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET grant subjects"
+            ))
+        .route("/media/{id}/grant-effective", documented!(
+                Method::GET,
+                "/media/{id}/grant-effective",
+                { get(media_grants::effective).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET grant effective"
+            ))
         // Retention. `retention`, `retention/runs` and `retention/repair` are *static*
         // segments declared here, so axum ranks them ahead of `/media/{id}/…` — the same
         // reason `/media/scan-settings` is spelled as a literal rather than a parameter.
-        .route("/media/retention", media_retention)
-        .route("/media/retention", media_retention_create)
-        .route("/media/retention/runs", media_retention_runs)
-        .route("/media/retention/run", media_retention_run)
-        .route("/media/retention/repair", media_retention_repair)
-        .route("/media/retention/{id}", media_retention_update)
-        .route("/media/retention/{id}", media_retention_delete)
-        .route("/backups", backups_read)
-        .route("/backups", backups_create)
-        .route("/backups/status", backups_status)
+        .route("/media/retention", documented!(
+                Method::GET,
+                "/media/retention",
+                { get(media_retention::read).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET retention"
+            ))
+        .route("/media/retention", documented!(
+                Method::POST,
+                "/media/retention",
+                { post(media_retention::create).layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "POST retention"
+            ))
+        .route("/media/retention/runs", documented!(
+                Method::GET,
+                "/media/retention/runs",
+                { get(media_retention::runs).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET runs"
+            ))
+        .route("/media/retention/run", documented!(
+                Method::POST,
+                "/media/retention/run",
+                { post(media_retention::run_now).layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "POST run"
+            ))
+        .route("/media/retention/repair", documented!(
+                Method::POST,
+                "/media/retention/repair",
+                { post(media_retention::repair).layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "POST repair"
+            ))
+        .route("/media/retention/{id}", documented!(
+                Method::PUT,
+                "/media/retention/{id}",
+                { put(media_retention::update).layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "PUT id"
+            ))
+        .route("/media/retention/{id}", documented!(
+                Method::DELETE,
+                "/media/retention/{id}",
+                { delete(media_retention::delete).layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "DELETE id"
+            ))
+        .route("/backups", documented!(
+                Method::GET,
+                "/backups",
+                { get(backups::list).layer(guards::require(&state, "backup.read")) },
+                "backup.read",
+                "GET backups"
+            ))
+        .route("/backups", documented!(
+                Method::POST,
+                "/backups",
+                { post(backups::create).layer(guards::require(&state, "backup.create")) },
+                "backup.create",
+                "POST backups"
+            ))
+        .route("/backups/status", documented!(
+                Method::GET,
+                "/backups/status",
+                { get(backups::status).layer(guards::require(&state, "backup.read")) },
+                "backup.read",
+                "GET status"
+            ))
         // Registered BEFORE `/backups/{id}` and not after it. A `POST` against
         // `/backups/sweep` would otherwise match `{id}` and fail to parse `sweep` as a UUID
         // — a 500 that reads like a router bug on the one route whose whole point is to be
         // callable by hand.
-        .route("/backups/sweep", backups_sweep)
-        .route("/backups/{id}", backups_detail)
-        .route("/backups/{id}", backups_delete)
-        .route("/backups/{id}/manifest", backups_manifest)
-        .route("/backups/{id}/restore-preview", backups_restore_preview)
-        .route("/backups/{id}/restore", backups_restore)
-        .route("/backups/{id}/restore-queue", backups_restore_queue)
-        .route("/backups/{id}/restore-jobs", backups_restore_jobs)
+        .route("/backups/sweep", documented!(
+                Method::POST,
+                "/backups/sweep",
+                { post(backups::sweep).layer(guards::require(&state, "backup.manage")) },
+                "backup.manage",
+                "POST sweep"
+            ))
+        .route("/backups/{id}", documented!(
+                Method::GET,
+                "/backups/{id}",
+                { get(backups::detail).layer(guards::require(&state, "backup.read")) },
+                "backup.read",
+                "GET id"
+            ))
+        .route("/backups/{id}", documented!(
+                Method::DELETE,
+                "/backups/{id}",
+                { delete(backups::delete).layer(guards::require(&state, "backup.manage")) },
+                "backup.manage",
+                "DELETE id"
+            ))
+        .route("/backups/{id}/manifest", documented!(
+                Method::GET,
+                "/backups/{id}/manifest",
+                { get(backups::manifest).layer(guards::require(&state, "backup.read")) },
+                "backup.read",
+                "GET manifest"
+            ))
+        .route("/backups/{id}/restore-preview", documented!(
+                Method::GET,
+                "/backups/{id}/restore-preview",
+                { get(backups::restore_preview).layer(guards::require(&state, "backup.read")) },
+                "backup.read",
+                "GET restore preview"
+            ))
+        .route("/backups/{id}/restore", documented!(
+                Method::POST,
+                "/backups/{id}/restore",
+                { post(backups::restore).layer(guards::require(&state, "backup.restore")) },
+                "backup.restore",
+                "POST restore"
+            ))
+        .route("/backups/{id}/restore-queue", documented!(
+                Method::POST,
+                "/backups/{id}/restore-queue",
+                { post(restore_jobs::queue_restore).layer(guards::require(&state, "backup.restore")) },
+                "backup.restore",
+                "POST restore queue"
+            ))
+        .route("/backups/{id}/restore-jobs", documented!(
+                Method::GET,
+                "/backups/{id}/restore-jobs",
+                { get(restore_jobs::list_jobs).layer(guards::require(&state, "backup.read")) },
+                "backup.read",
+                "GET restore jobs"
+            ))
         // A SEPARATE prefix, not `/backups/{id}/…`, because a cancel is addressed by the
         // JOB's id and not the run's — two different resources, and a route that accepted
         // either would let a cancel for one run's job stop another run's restore.
-        .route("/restore-jobs/{id}/cancel", restore_job_cancel)
-        .route("/backups/{id}/verify", backups_verify)
-        .route("/backup-schedules", backup_schedules_read)
-        .route("/backup-schedules", backup_schedules_write)
+        .route("/restore-jobs/{id}/cancel", documented!(
+                Method::POST,
+                "/restore-jobs/{id}/cancel",
+                { post(restore_jobs::cancel_job).layer(guards::require(&state, "backup.restore")) },
+                "backup.restore",
+                "POST cancel"
+            ))
+        .route("/backups/{id}/verify", documented!(
+                Method::POST,
+                "/backups/{id}/verify",
+                { post(backups::verify).layer(guards::require(&state, "backup.create")) },
+                "backup.create",
+                "POST verify"
+            ))
+        .route("/backup-schedules", documented!(
+                Method::GET,
+                "/backup-schedules",
+                { get(backups::list_schedules).layer(guards::require(&state, "backup.read")) },
+                "backup.read",
+                "GET backup schedules"
+            ))
+        .route("/backup-schedules", documented!(
+                Method::POST,
+                "/backup-schedules",
+                { post(backups::create_schedule).layer(guards::require(&state, "backup.manage")) },
+                "backup.manage",
+                "POST backup schedules"
+            ))
         // Registered before any `/backup-schedules/{id}` route, and not after it, for the
         // same reason `/backups/sweep` sits above `/backups/{id}`: a `POST` against a
         // non-UUID segment would otherwise match `{id}` and fail to parse it.
-        .route("/backup-schedules/{id}", backup_schedule)
-        .route("/backup-schedules/{id}", backup_schedule_delete)
-        .route("/backup-schedules/{id}/run", backup_schedule_run)
-        .route("/backup-settings", backup_settings_read)
-        .route("/backup-settings", backup_settings_write)
+        .route("/backup-schedules/{id}", documented!(
+                Method::PUT,
+                "/backup-schedules/{id}",
+                { put(backups::update_schedule).layer(guards::require(&state, "backup.manage")) },
+                "backup.manage",
+                "PUT id"
+            ))
+        .route("/backup-schedules/{id}", documented!(
+                Method::DELETE,
+                "/backup-schedules/{id}",
+                { delete(backups::delete_schedule).layer(guards::require(&state, "backup.manage")) },
+                "backup.manage",
+                "DELETE id"
+            ))
+        .route("/backup-schedules/{id}/run", documented!(
+                Method::POST,
+                "/backup-schedules/{id}/run",
+                { post(backups::run_schedule_now).layer(guards::require(&state, "backup.create")) },
+                "backup.create",
+                "POST run"
+            ))
+        .route("/backup-settings", documented!(
+                Method::GET,
+                "/backup-settings",
+                { get(backups::read_settings).layer(guards::require(&state, "backup.read")) },
+                "backup.read",
+                "GET backup settings"
+            ))
+        .route("/backup-settings", documented!(
+                Method::PUT,
+                "/backup-settings",
+                { put(backups::write_settings).layer(guards::require(&state, "backup.manage")) },
+                "backup.manage",
+                "PUT backup settings"
+            ))
         // The hold is on a *file*, so it lives under the file rather than under the policy.
-        .route("/media/files/{id}/hold", media_file_hold)
-        .route("/media/transformation-presets", media_preset_create)
-        .route("/media/transformation-presets/{id}", media_preset)
+        .route("/media/files/{id}/hold", documented!(
+                Method::PUT,
+                "/media/files/{id}/hold",
+                { put(media_retention::set_file_hold).layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "PUT hold"
+            ))
+        .route("/media/transformation-presets", documented!(
+                Method::POST,
+                "/media/transformation-presets",
+                { post(media_transform::create).layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "POST transformation presets"
+            ))
+        .route("/media/transformation-presets/{id}", documented!(
+                Method::PATCH,
+                "/media/transformation-presets/{id}",
+                { patch(media_transform::update) },
+                "media.settings.manage",
+                "PATCH id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/media/transformation-presets/{id}",
+                { delete(media_transform::delete)
+        .layer(guards::require(&state, "media.settings.manage")) },
+                "media.settings.manage",
+                "DELETE id"
+            )))
         .route(
             "/media/{id}/versions/{version}/download",
-            media_version_download,
+            documented!(
+                Method::GET,
+                "/media/{id}/versions/{version}/download",
+                { get(media_versions::download_version).layer(guards::require(&state, "media.read")) },
+                "media.read",
+                "GET download"
+            ),
         )
-        .route("/public/pages/{slug}", public_pages)
-        .route("/public/media/{id}", public_media)
+        .route("/public/pages/{slug}", documented!(
+                Method::GET,
+                "/public/pages/{slug}",
+                { get(public::get_published_page) },
+                "",
+                "GET slug"
+            ))
+        .route("/public/media/{id}", documented!(
+                Method::GET,
+                "/public/media/{id}",
+                { get(media::public_media) },
+                "",
+                "GET id"
+            ))
         // The share token route: unauthenticated by nature, because the token is the
         // credential. It is a *static* `shared` segment, so it never collides with the
         // `{id}` parameter above it.
-        .route("/public/media/shared/{token}", public_media_shared)
-        .route("/workflows", workflows)
-        .route("/workflows/{id}", workflow)
-        .route("/workflows/{id}/run", workflow_run)
-        .route("/workflows/{id}/executions", workflow_executions)
-        .route("/workflow-executions/{id}", workflow_execution)
+        .route("/public/media/shared/{token}", documented!(
+                Method::GET,
+                "/public/media/shared/{token}",
+                { get(media_shares::public_shared) },
+                "",
+                "GET token"
+            ))
+        .route("/workflows", documented!(
+                Method::GET,
+                "/workflows",
+                { get(workflows::list_workflows)
+        .layer(guards::require(&state, "workflows.read")) },
+                "workflows.read",
+                "GET workflows"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/workflows",
+                { post(workflows::create_workflow).layer(guards::require(&state, "workflows.manage")) },
+                "workflows.manage",
+                "POST workflows"
+            )))
+        .route("/workflows/{id}", documented!(
+                Method::GET,
+                "/workflows/{id}",
+                { get(workflows::get_workflow)
+        .layer(guards::require(&state, "workflows.read")) },
+                "workflows.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/workflows/{id}",
+                { put(workflows::update_workflow).layer(guards::require(&state, "workflows.manage")) },
+                "workflows.manage",
+                "PUT id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/workflows/{id}",
+                { delete(workflows::delete_workflow).layer(guards::require(&state, "workflows.manage")) },
+                "workflows.manage",
+                "DELETE id"
+            )))
+        .route("/workflows/{id}/run", documented!(
+                Method::POST,
+                "/workflows/{id}/run",
+                { post(workflows::run_workflow).layer(guards::require(&state, "workflows.run")) },
+                "workflows.run",
+                "POST run"
+            ))
+        .route("/workflows/{id}/executions", documented!(
+                Method::GET,
+                "/workflows/{id}/executions",
+                { get(workflows::list_executions).layer(guards::require(&state, "workflows.read")) },
+                "workflows.read",
+                "GET executions"
+            ))
+        .route("/workflow-executions/{id}", documented!(
+                Method::GET,
+                "/workflow-executions/{id}",
+                { get(workflows::get_execution).layer(guards::require(&state, "workflows.read")) },
+                "workflows.read",
+                "GET id"
+            ))
         .route(
             "/workflow-executions/{id}/cancel",
-            workflow_execution_cancel,
+            documented!(
+                Method::POST,
+                "/workflow-executions/{id}/cancel",
+                { post(workflows::cancel_execution).layer(guards::require(&state, "workflows.run")) },
+                "workflows.run",
+                "POST cancel"
+            ),
         )
-        .route("/onboarding", get(onboarding::status))
-        .route("/onboarding/owner", onboarding_owner)
-        .route("/onboarding/organization", onboarding_organization)
-        .route("/onboarding/site", onboarding_site)
-        .route("/onboarding/theme", onboarding_theme)
-        .route("/onboarding/ai-provider", onboarding_ai)
-        .route("/onboarding/complete", onboarding_complete)
-        .route("/ai/providers", ai_providers)
-        .route("/ai/providers/{id}", ai_provider)
-        .route("/ai/providers/{id}/models", ai_provider_models)
-        .route("/ai/providers/{id}/discover-models", ai_provider_discover)
-        .route("/ai/models", ai_models)
-        .route("/ai/models/{id}", ai_model)
-        .route("/ai/chat", ai_chat)
-        .route("/webhooks", webhooks)
-        .route("/webhooks/{id}", webhook)
-        .route("/webhooks/{id}/deliveries", webhook_deliveries)
+        .route("/onboarding", documented!(
+                Method::GET,
+                "/onboarding",
+                { get(onboarding::status) },
+                "",
+                "GET onboarding"
+            ))
+        .route("/onboarding/owner", documented!(
+                Method::POST,
+                "/onboarding/owner",
+                { post(onboarding::create_owner) },
+                "",
+                "POST owner"
+            ))
+        .route("/onboarding/organization", documented!(
+                Method::POST,
+                "/onboarding/organization",
+                { post(onboarding::create_organization) },
+                "",
+                "POST organization"
+            ))
+        .route("/onboarding/site", documented!(
+                Method::POST,
+                "/onboarding/site",
+                { post(onboarding::create_site) },
+                "",
+                "POST site"
+            ))
+        .route("/onboarding/theme", documented!(
+                Method::POST,
+                "/onboarding/theme",
+                { post(onboarding::choose_theme) },
+                "",
+                "POST theme"
+            ))
+        .route("/onboarding/ai-provider", documented!(
+                Method::POST,
+                "/onboarding/ai-provider",
+                { post(onboarding::decide_ai) },
+                "",
+                "POST ai provider"
+            ))
+        .route("/onboarding/complete", documented!(
+                Method::POST,
+                "/onboarding/complete",
+                { post(onboarding::complete) },
+                "",
+                "POST complete"
+            ))
+        .route("/ai/providers", documented!(
+                Method::GET,
+                "/ai/providers",
+                { get(ai::list_providers)
+        .layer(guards::require(&state, "ai.providers.read")) },
+                "ai.providers.read",
+                "GET providers"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/ai/providers",
+                { post(ai::create_provider).layer(guards::require(&state, "ai.providers.manage")) },
+                "ai.providers.manage",
+                "POST providers"
+            )))
+        .route("/ai/providers/{id}", documented!(
+                Method::PATCH,
+                "/ai/providers/{id}",
+                { patch(ai::update_provider)
+        .layer(guards::require(&state, "ai.providers.manage")) },
+                "ai.providers.manage",
+                "PATCH id"
+            )
+            .merge(documented!(
+                Method::DELETE,
+                "/ai/providers/{id}",
+                { delete(ai::delete_provider).layer(guards::require(&state, "ai.providers.manage")) },
+                "ai.providers.manage",
+                "DELETE id"
+            )))
+        .route("/ai/providers/{id}/models", documented!(
+                Method::PUT,
+                "/ai/providers/{id}/models",
+                { put(ai::replace_provider_models).layer(guards::require(&state, "ai.providers.manage")) },
+                "ai.providers.manage",
+                "PUT models"
+            ))
+        .route("/ai/providers/{id}/discover-models", documented!(
+                Method::POST,
+                "/ai/providers/{id}/discover-models",
+                { post(ai::discover_provider_models).layer(guards::require(&state, "ai.providers.manage")) },
+                "ai.providers.manage",
+                "POST discover models"
+            ))
+        .route("/ai/models", documented!(
+                Method::GET,
+                "/ai/models",
+                { get(ai::list_models).layer(guards::require(&state, "ai.providers.read")) },
+                "ai.providers.read",
+                "GET models"
+            ))
+        .route("/ai/models/{id}", documented!(
+                Method::PATCH,
+                "/ai/models/{id}",
+                { patch(ai::update_model).layer(guards::require(&state, "ai.providers.manage")) },
+                "ai.providers.manage",
+                "PATCH id"
+            ))
+        .route("/ai/chat", documented!(
+                Method::POST,
+                "/ai/chat",
+                { post(ai::chat).layer(guards::require(&state, "ai.chat")) },
+                "ai.chat",
+                "POST chat"
+            ))
+        .route("/webhooks", documented!(
+                Method::GET,
+                "/webhooks",
+                { get(webhooks::list_webhooks)
+        .layer(guards::require(&state, "webhooks.read")) },
+                "webhooks.read",
+                "GET webhooks"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/webhooks",
+                { post(webhooks::create_webhook).layer(guards::require(&state, "webhooks.manage")) },
+                "webhooks.manage",
+                "POST webhooks"
+            )))
+        .route("/webhooks/{id}", documented!(
+                Method::GET,
+                "/webhooks/{id}",
+                { get(webhooks::get_webhook)
+        .layer(guards::require(&state, "webhooks.read")) },
+                "webhooks.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/webhooks/{id}",
+                { patch(webhooks::update_webhook).layer(guards::require(&state, "webhooks.manage")) },
+                "webhooks.manage",
+                "PATCH id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/webhooks/{id}",
+                { delete(webhooks::delete_webhook).layer(guards::require(&state, "webhooks.manage")) },
+                "webhooks.manage",
+                "DELETE id"
+            )))
+        .route("/webhooks/{id}/deliveries", documented!(
+                Method::GET,
+                "/webhooks/{id}/deliveries",
+                { get(webhooks::list_deliveries).layer(guards::require(&state, "webhooks.read")) },
+                "webhooks.read",
+                "GET deliveries"
+            ))
         .route(
             "/webhooks/{id}/deliveries/redeliver",
-            webhook_redeliver_batch,
+            documented!(
+                Method::POST,
+                "/webhooks/{id}/deliveries/redeliver",
+                { post(webhooks::redeliver_many).layer(guards::require(&state, "webhooks.manage")) },
+                "webhooks.manage",
+                "POST redeliver"
+            ),
         )
         .route(
             "/webhooks/{id}/deliveries/{delivery_id}/redeliver",
-            webhook_redeliver_one,
+            documented!(
+                Method::POST,
+                "/webhooks/{id}/deliveries/{delivery_id}/redeliver",
+                { post(webhooks::redeliver_one).layer(guards::require(&state, "webhooks.manage")) },
+                "webhooks.manage",
+                "POST redeliver"
+            ),
         )
-        .route("/webhooks/{id}/stats", webhook_stats)
-        .route("/webhooks/{id}/secret/rotate", webhook_secret_rotate)
-        .route("/webhooks/{id}/test", webhook_test)
-        .route("/events", events)
-        .route("/events/catalogue", event_catalogue)
-        .route("/events/retention", event_retention)
-        .route("/events/retention/sweep", event_retention_sweep)
-        .route("/automations", automations)
-        .route("/automations/catalogue", automation_catalogue)
-        .route("/automations/{id}", automation_entry)
-        // Automation projects (REQ-133). Declared before `/automations/{id}`'s neighbours by
-        // being its own literal root — `/projects` cannot be read as an automation id.
-        .merge(automation_projects_surface(&state))
+        .route("/webhooks/{id}/stats", documented!(
+                Method::GET,
+                "/webhooks/{id}/stats",
+                { get(webhooks::endpoint_stats).layer(guards::require(&state, "webhooks.read")) },
+                "webhooks.read",
+                "GET stats"
+            ))
+        .route("/webhooks/{id}/secret/rotate", documented!(
+                Method::POST,
+                "/webhooks/{id}/secret/rotate",
+                { post(webhooks::rotate_secret).layer(guards::require(&state, "webhooks.manage")) },
+                "webhooks.manage",
+                "POST rotate"
+            ))
+        .route("/webhooks/{id}/test", documented!(
+                Method::POST,
+                "/webhooks/{id}/test",
+                { post(webhooks::test_webhook).layer(guards::require(&state, "webhooks.manage")) },
+                "webhooks.manage",
+                "POST test"
+            ))
+        .route("/events", documented!(
+                Method::GET,
+                "/events",
+                { get(webhooks::list_events).layer(guards::require(&state, "events.read")) },
+                "events.read",
+                "GET events"
+            ))
+        .route("/events/catalogue", documented!(
+                Method::GET,
+                "/events/catalogue",
+                { get(webhooks::list_catalogue).layer(guards::require(&state, "events.read")) },
+                "events.read",
+                "GET catalogue"
+            ))
+        .route("/events/retention", documented!(
+                Method::GET,
+                "/events/retention",
+                { get(webhooks::retention_status)
+        .layer(guards::require(&state, "events.read")) },
+                "events.read",
+                "GET retention"
+            )
+            .merge(documented!(
+                Method::PATCH,
+                "/events/retention",
+                { patch(webhooks::set_retention).layer(guards::require(&state, "webhooks.manage")) },
+                "webhooks.manage",
+                "PATCH retention"
+            )))
+        .route("/events/retention/sweep", documented!(
+                Method::POST,
+                "/events/retention/sweep",
+                { post(webhooks::sweep_retention).layer(guards::require(&state, "webhooks.manage")) },
+                "webhooks.manage",
+                "POST sweep"
+            ))
+        .route("/automations", documented!(
+                Method::GET,
+                "/automations",
+                { get(automation::list_automations)
+        .layer(guards::require(&state, "workflows.read")) },
+                "workflows.read",
+                "GET automations"
+            )
+            .merge(documented!(
+                Method::POST,
+                "/automations",
+                { post(automation::create_automation)
+                                                                                                
+                                                                                                 
+                                                             
+                                                                                           
+                                                                                               
+                                                                                                  
+                                                                                               
+                                                                                              
+                                                
+                  
+                                                                                              
+                                                                                            
+                                                                                                 
+                                                                                               
+                                                                                             
+                .layer(crate::idempotency_middleware::require(&state))
+                                                                                                
+                                                                                                 
+                                                                                               
+                                                                                                  
+                                                                                                 
+                                                                               
+                .layer(guards::require(&state, "workflows.manage")) },
+                "workflows.manage",
+                "POST automations"
+            )))
+        .route("/automations/catalogue", documented!(
+                Method::GET,
+                "/automations/catalogue",
+                { get(automation::get_catalogue).layer(guards::require(&state, "workflows.read")) },
+                "workflows.read",
+                "GET catalogue"
+            ))
+        .route("/automations/{id}", documented!(
+                Method::GET,
+                "/automations/{id}",
+                { get(automation::get_automation)
+        .layer(guards::require(&state, "workflows.read")) },
+                "workflows.read",
+                "GET id"
+            )
+            .merge(documented!(
+                Method::PUT,
+                "/automations/{id}",
+                { put(automation::update_automation).layer(guards::require(&state, "workflows.manage")) },
+                "workflows.manage",
+                "PUT id"
+            ))
+            .merge(documented!(
+                Method::DELETE,
+                "/automations/{id}",
+                { delete(automation::delete_automation)
+                .layer(guards::require(&state, "workflows.manage")) },
+                "workflows.manage",
+                "DELETE id"
+            )))
         .route(
             "/pages/{id}/revisions/{revision_id}/comments",
-            page_revision_comments,
+            documented!(
+                Method::GET,
+                "/pages/{id}/revisions/{revision_id}/comments",
+                { get(content::list_revision_comments).layer(guards::require(&state, "content.pages.read")) },
+                "content.pages.read",
+                "GET comments"
+            ),
         )
         // The request log is the INNERMOST layer of the API (REQ-022, slice 2), installed here —
         // at the **end** of the `v1` chain rather than the start, and that position is load
@@ -2246,17 +5768,63 @@ pub fn router(state: AppState) -> Router {
     // built without one (the in-process test harnesses) falls back to the shipped defaults rather
     // than to no limiter at all, which is the failure mode this whole layer exists to remove.
     let limiter_layer = crate::rate_limit_middleware::ensure_installed(&state);
+    // The platform-wide budget (REQ-127 slice 1), installed beside the gateway limiter rather
+    // than merged into it. The in-process harnesses that build a router without a `main.rs` get
+    // an EMPTY policy set rather than invented defaults: this layer is a second document, and a
+    // second set of defaults is a second thing an operator has to discover and tune. "No policy
+    // matches" is the documented state of a fresh instance, and the gateway limiter above is
+    // still enforcing its own document throughout.
+    let platform_layer = crate::reliability_middleware::ensure_installed(&state);
     // The IP access list is installed the same way and for the same reason (REQ-012 slice 4):
     // read once, swapped in place by a save, so a rule added on the panel refuses the *next*
     // request rather than the one after the next restart.
     let ip_access_layer = crate::security_ip::ensure_installed(&state);
 
     Router::new()
-        .route("/healthz", get(health::healthz))
-        .route("/readyz", get(readyz::readyz))
+        .route("/healthz", documented!(
+                Method::GET,
+                "/healthz",
+                { get(health::healthz) },
+                "",
+                "GET healthz"
+            ))
+        // `/livez` is the same handler under the name some platforms expect (REQ-126, slice 4).
+        // An alias implemented separately from the endpoint it aliases is a probe that checks
+        // something the deployment does not, so this is one handler at two paths.
+        .route("/livez", documented!(
+                Method::GET,
+                "/livez",
+                { get(health::healthz) },
+                "",
+                "GET livez"
+            ))
+        .route("/readyz", documented!(
+                Method::GET,
+                "/readyz",
+                { get(readyz::readyz) },
+                "",
+                "GET readyz"
+            ))
+        // The Prometheus exposition (REQ-126, slice 2). Unversioned and unauthenticated, beside
+        // the probes and for the same reason: a scraper has no session, and a versioned
+        // telemetry path is a path that has to be kept compatible with itself. The exposure is a
+        // deliberate, documented decision — the bodies it can emit are exactly the families in
+        // `omnion_telemetry::metrics::FAMILIES`, and nothing else has a route into them.
+        .route("/metrics", documented!(
+                Method::GET,
+                "/metrics",
+                { get(observability::metrics_exposition) },
+                "",
+                "GET metrics"
+            ))
         .nest("/api/v1", v1)
-        // The limiter is the OUTERMOST layer, ahead of CSRF and ahead of every permission guard,
-        // and the order is the design rather than an accident of where the line falls in the chain:
+        // Four layers wrap the versioned tree, and the order is load-bearing. `.layer()` wraps
+        // what is already built, so the LAST call is the OUTERMOST and the FIRST is the innermost.
+        // Innermost to outermost: the permission guards (installed per-route inside `v1`), the
+        // header policy, CSRF, the rate limiter, and finally the request log.
+        //
+        // The limiter sits ABOVE CSRF and above every permission guard, and that is the design
+        // rather than an accident of where the line falls in the chain:
         //
         // * A limiter behind the guards would cap only callers who already hold a permission, which
         //   leaves an anonymous spray against `POST /auth/login` uncapped — the one path worth
@@ -2267,25 +5835,63 @@ pub fn router(state: AppState) -> Router {
         // `/healthz` and `/readyz` are inside it too, which is deliberate and cheap: they are two
         // `GET`s a probe makes every few seconds, counted against a budget of 600 a minute, and a
         // probe that trips the limiter is a probe that reports the platform down.
-        .layer(crate::rate_limit_middleware::rate_limit(
-            limiter_layer.clone(),
-        ))
+        //
+        // The request log stays outside the limiter (see the bottom of this chain) so a request
+        // BURNED the budget is still a line an operator can find — a rate-limited request with no
+        // log line is the one rejection the log cannot answer questions about.
+        // The platform budgets sit INSIDE the gateway limiter, so a caller over both budgets is
+        // refused by the outer one and the operator's first stop is the document they configured
+        // first. The reverse order would mean the newer, less-tuned layer always wins, and a
+        // platform whose 429s are decided by whichever row was written last is not debuggable.
+        //
         // The IP access list runs ahead of the limiter and ahead of every guard, for the same
         // reason the limiter does: an address rule exists to stop a caller who has no account,
         // so anything behind `guards::require` would never see one. Ahead of the limiter because
         // a denied address should cost nothing — not even a Redis round trip.
+        //
+        // Read the chain OUTERMOST to INNERMOST, i.e. bottom-up, because `.layer()` wraps what is
+        // already built: the LAST call in the block is the OUTERMOST layer. The order below is
+        // therefore `platform_limit` → `rate_limit` → `ip_access`, meaning a refused address
+        // costs nothing, a caller over the gateway budget is told by the document written first,
+        // and a request that BURNED a budget is still a line the request log can find.
+        .layer(crate::reliability_middleware::platform_limit(
+            platform_layer.clone(),
+        ))
+        .layer(crate::rate_limit_middleware::rate_limit(
+            limiter_layer.clone(),
+        ))
         .layer(crate::security_ip::ip_access(ip_access_layer))
         // CSRF sits OUTSIDE the permission guards on purpose: a guard answers 401 for a request
         // with no session and 403 for one whose account lacks the key. The CSRF layer's answer is
         // about the *request*, and it has to be reached only by a request that actually
         // authenticated - which is what the guards having run first guarantees.
         .layer(crate::headers_middleware::require_csrf(&state))
+        // Deprecation headers (REQ-130 slice 4). INSIDE the header policy and OUTSIDE `v1`, so a
+        // deprecated surface carries its `Deprecation` / `Sunset` / `Link` block whether the answer
+        // came from a handler, from a guard, or from the 410 this layer itself produces — and so
+        // the 410 short-circuits before any handler runs.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::deprecation_middleware::apply,
+        ))
+        // The header policy covers the whole tree, the probes included: a security header that is
+        // missing on the one endpoint a scanner probes is missing where it is read.
         .layer(header_layer.clone())
-        // The CRM's request-id scope, INSIDE the CSRF and header layers: it opens around the
-        // handler only, so a request the CSRF layer refuses never opens a scope and never writes a
-        // trail line. Router-wide rather than per-handler on purpose — a route added tomorrow gets
-        // a correlated audit line without anybody remembering to wrap it, and forgetting is silent
-        // (the line is written, the id reads `null`).
-        .layer(crate::crm_request_id::CorrelateCrm)
+        // The request id, the trace and the one line per request (REQ-126 slice 1). Installed on
+        // the OUTER router, not on `v1`, so the probes are described too - a probe that fails is
+        // the first thing an operator looks for, and a line with no request id is one they cannot
+        // join to anything.
+        //
+        // Outermost of the three, so a request REJECTED by the two layers above it still arrives
+        // with a request id and still lands in the log. A CSRF refusal with no request id is the
+        // one rejection an operator cannot correlate with the page that caused it.
+        //
+        // `from_fn_with_state` inline rather than behind a helper that returns an `impl Layer`:
+        // `Router::layer` needs the layer's concrete service to be `Clone + Service<Request<Body>>`,
+        // and an `impl Layer<Route>` erases exactly the bounds it needs to check.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::request_log::request_context,
+        ))
         .with_state(state)
 }

@@ -13,8 +13,5 @@
 pub mod entries;
 pub mod error;
 
-pub use entries::{
-    ActorType, AuditEntry, NewAuditEntry, for_project, for_target, recent, record,
-    record_for_project, record_for_project_in,
-};
+pub use entries::{ActorType, AuditEntry, NewAuditEntry, for_target, recent, record};
 pub use error::{AuditError, Result};

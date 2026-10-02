@@ -747,11 +747,6 @@ pub async fn create_user(
     }
 
     if payload.active == Some(false) {
-        // No guard here, and deliberately: this account was created by *this* request, so it
-        // cannot already own a project — a fresh row has no membership and no `owner_user_id`.
-        // Adding the check would cost a query per provisioning create to guard a state the
-        // insert one line above has just made unreachable. The deactivation rules live on the
-        // paths that take an *existing* account out of service.
         users::set_status(state.db().pool(), created.id, "disabled")
             .await
             .map_err(internal)?;
@@ -806,42 +801,6 @@ async fn require_user(
         return Err(ScimError::not_found(format!("no account {id}")));
     }
     Ok(user)
-}
-
-/// Refuse to deactivate an account that is still the last owner of a project (REQ-133).
-///
-/// The panel's `PATCH /iam/users/{id}` asks the same question; this is the *other door into the
-/// same state*, and a rule enforced on one door is a rule an identity provider walks around.
-/// SCIM's `mutability` for `active` is `writeOnly`, so refusing is a conformant answer — a `409`
-/// with the reason is the shape a provisioning retry loop reads correctly, where silently
-/// succeeding (leaving the account on) is the one outcome nobody can detect.
-///
-/// Already-disabled accounts are not re-checked, for the same reason the panel does not: this
-/// is a deactivation *decision*, and re-deciding a decision that already happened means an
-/// account that is off starts failing `DELETE` the moment somebody adds a project owner.
-async fn ensure_no_owned_projects(
-    state: &AppState,
-    organization_id: Uuid,
-    user: &users::User,
-) -> Result<(), ScimError> {
-    if user.status == "disabled" {
-        return Ok(());
-    }
-    match omnion_workflows::projects::ensure_user_can_be_disabled(
-        state.db().pool(),
-        organization_id,
-        user.id,
-    )
-    .await
-    {
-        Ok(_) => Ok(()),
-        Err(omnion_workflows::WorkflowError::Invalid { code, message }) => Err(ScimError::new(
-            StatusCode::CONFLICT,
-            Some("mutability"),
-            format!("{message} ({code})"),
-        )),
-        Err(other) => Err(internal(other)),
-    }
 }
 
 /// `GET /scim/v2/Users/{id}`.
@@ -912,13 +871,6 @@ async fn apply_user_changes(
     if let Some(active) = payload.active {
         let status = if active { "active" } else { "disabled" };
         if status != user.status {
-            // The same REQ-133 refusal `DELETE /scim/v2/Users/{id}` applies, and the same reason:
-            // `active: false` is a deactivation, so a guard on one of the two spellings leaves
-            // the other open. It is asked *before* the display-name write above is committed to
-            // the same request so a refused call changes nothing at all.
-            if !active {
-                ensure_no_owned_projects(state, organization_id, user).await?;
-            }
             users::set_status(state.db().pool(), user.id, status)
                 .await
                 .map_err(internal)?;
@@ -1109,14 +1061,6 @@ pub async fn delete_user(
     let user_id =
         Uuid::parse_str(&id).map_err(|_| ScimError::not_found(format!("no account {id}")))?;
     let user = require_user(&state, &principal, user_id).await?;
-
-    // The same guard the panel's `PATCH /iam/users/{id}` applies (REQ-133), on the other door
-    // into the same state. A SCIM `DELETE` *is* a deactivation here, so leaving this path open
-    // would make the acceptance line false for any installation whose identity provider can
-    // issue a request — which is exactly the installation where nobody is watching the panel.
-    // Checked before the event is emitted, because a `user.deleted` on the bus for an account
-    // that stayed enabled is a receiver acting on a write that did not happen.
-    ensure_no_owned_projects(&state, principal.organization_id(), &user).await?;
 
     // SCIM's delete is a deactivation: the row stays, so the catalogue calls it what it is.
     // `user.deleted` is the name a receiver of the platform's own bus reads \u2014 the account is

@@ -1,0 +1,26 @@
+[package]
+name = "omnion-graphql"
+description = "Omnion GraphQL surface: the query decision layer (depth, cost, allowlist), the per-caller schema composition and the API version policy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# The decision layer is pure: it parses, prices and composes a schema from a type catalogue.
+# It reaches for no database, no clock and no HTTP — which is what lets the playground's cost
+# meter predict the endpoint instead of agreeing with it after the fact. Persistence (persisted
+# documents, query logs, deprecations) arrives in slice 2 and lives behind `store.rs`.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# The document hash (`persisted::DocumentId`). The SAME workspace digest the media library and
+# the backup crate hash with, so "the same document hashes the same way" is not a property of this
+# crate's choice of algorithm: a client that hashes a query to compare against the manager gets an
+# answer from anywhere in the platform that hashes bytes.
+sha2.workspace = true
+# `OffsetDateTime`, because a deprecation is a policy over DATES and the store hands this crate an
+# instant rather than a string. The workspace default carries `serde-well-known` only; `macros`
+# is enabled here for the one test fixture that builds an instant without parsing one, so a
+# fixture cannot silently drift from the format the production path accepts.
+time = { workspace = true, features = ["macros"] }
