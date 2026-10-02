@@ -9846,3 +9846,37 @@ defect in the code.
 
 **Next:** the browser pass with `--only=backups` on a free slot, then the status-card browser
 tick and the walkthrough criterion.
+
+## Tick 71 — wave6 (REQ-130 slice 3): every route documented, and the first real snapshot
+
+**What.** All 401 route registrations in `apps/api/src/routes/mod.rs` adopt `documented!`, so the
+drift gate built in tick 70 finally measures something: **487 routes, 487 documented, 0 undocumented,
+0 orphaned**, `--check` exiting 0 against `api/openapi.snapshot.json` (373 paths / 487 operations).
+
+**The permission was never invented.** It is the catalogue key read from the guard beside each
+handler, inherited from a `route_layer` where the route has none of its own, and left absent where
+there is genuinely no guard. The document proves it in numbers: **98 distinct keys, 0 of them absent
+from `crates/permissions/src/catalogue.rs`, 69 operations recorded with no key** (login, health,
+public, SCIM). An uncatalogued key answers `403` for every caller including the instance owner while
+the route looks installed, so this is the one property the pass is not allowed to be wrong about.
+
+**Proof.**
+- `cargo test -p omnion-api --lib` → **390 passed, 0 failed**
+- `node scripts/qa/route-adoption.test.cjs` → **11/11** (proven load-bearing: two mutations red)
+- `cargo run -p omnion-api --bin openapi_emit` → `487 routes, 487 documented, 0 undocumented, 0 orphaned`, hash `sha256:532f384c…`
+- `cargo run -p omnion-api --bin openapi_emit -- --check` → `snapshot is in sync`, **exit 0**
+- `pnpm typecheck` → clean
+- Commit `03747023`; tooling in `7b4c300f`.
+
+**Five defects the compiler could not see.** A handler rebuilt from a verb name is a valid-looking
+macro call that hands axum the *function* — and `cargo build --lib` was green while
+`cargo test --lib` was red, because they compile different crate roots. `$handler:expr` cannot hold
+`guards::require(&state, "media.read")`: the argument comma ends the expr fragment and every later
+argument shifts left, so the handler is a `block`. The macro's body is the handler's only use site,
+so axum had nothing to infer the error type from and **161 untouched `let` bindings lost it**. The
+inventory is process-global, and two suites asserted against it while each built the router and
+cleared what the other had recorded — one of them being the emitter's own regression test, which
+asserted `is_empty()` after clearing and passed by measuring the state it had just created. And the
+macro named this module's private `RouteEntry`, which is `E0603` in every caller's module.
+
+**Next.** The TypeScript and Python SDK generators, pinned to the document hash.
