@@ -12734,3 +12734,54 @@ runs — and this is the fourth tick that has said so, which is why the *reason*
 rather than "the pass was slow".
 
 **Next:** the pass, then the state boxes and `done`.
+
+---
+
+## 2026-10-02 · wave2 tick 69 · the merge's two "take one side" files, and the holder pid in the filename
+
+**What.** `merge(origin/main)` (13 commits), three conflicts, and the first hour of the tick
+belonged to a disk that opened at **100% / 0 bytes** — the regime where `write_file` reports
+success and leaves a 0-byte file, and `git commit` fails with `No space left on device` while
+`git status` and `git diff` keep working. Reclaimed this worktree's own `omnion-w2-target` (no
+process held an fd and no live process had it in `CARGO_TARGET_DIR`, which is the evidence the
+invariant asks for) and the stale `w2build`; a sibling then took the volume to 16 G free, which
+is why the numbers below swing between 576 M and 16 G.
+
+**The mistake, named precisely.** Reclaiming a QA-slot place, I read the holder pid **out of the
+filename** (`212944-1790932384` → `212944`), confirmed *that* pid dead, and deleted the pair. The
+invariant says the holder pid is the file's **content** — and the content was `212963`, w6's
+**live** pass. So the liveness check was a check of the wrong process, and it passed. Restored the
+same place+holder inside the same tick, verified `212963` alive with `cwd=/mnt/apopic/omnion-w6`
+and its `run.sh` still walking. No damage: a pass that already holds the semaphore is unaffected
+by the flag; only the queueing was briefly wrong. But this is precisely the failure the reaper's
+comment records as a 75-minute hostage, and the guard I had been quoting in my own head is a
+one-line `kill -0 "$(cat holder)"`. **A liveness check on a name is not a liveness check.**
+
+**Both conflicts were additive; "take one side" would have deleted a wave.** `app-shell.tsx` is
+two lucide import lists — main added `Code2` for its `/developer` nav entry, and that entry
+auto-merged *below* the conflict, so taking our list would have left a reference to a symbol
+that is not imported (`tsc` catches it; the browser would have shown a blank shell). And
+`walkthrough.cjs` has two `mobileRoutes` arrays: **73 of ours + 3 of main's `/developer*` = 76**,
+merged by entry rather than by side. Taking 'theirs' deletes 45 CMS screens from 390 px coverage
+and re-opens the very criterion this branch exists to close; taking 'ours' deletes the developer
+portal. `BUILD-LOG.md` is append-only and both sides were whole tick entries, so all four are
+kept, verified by line-multiset rather than by line count.
+
+**Proof**
+
+| Gate | Command | Result |
+|---|---|---|
+| Rust (the crate this wave owns) | `cargo test -p omnion-content --lib --quiet` | **349 passed, 0 failed**, exit 0 |
+| Web | `pnpm typecheck` (apps/admin) | clean, exit 0 |
+| Harness syntax | `node --check scripts/qa/walkthrough.cjs` | OK |
+| Screen inventories (acceptance 18's gate) | `node scripts/qa/screen-coverage.cjs` | **PASS**, exit 0 — "no screen is walked at 1440 px only" |
+| Conflict markers, whole tree | `grep -rln '^<<<<<<<\|^>>>>>>>'` | none |
+| Untouched resolution | `git status \| grep -c '^UU'` | 0 |
+
+**No box ticked.** Acceptance 18 is a *measured* criterion — it asks for zero high findings from
+the walkthrough — and the pass is queued behind w6's live one (holder `212963`, `cwd`
+verified). The harness gate above is necessary and not sufficient: it proves the twelve screens
+are now *reachable at 390 px*, not that they render without horizontal scroll. The honest line
+stays unticked until the pass reports.
+
+**Next.** The focused pass, then acceptance 18 and REQ-064's close. REQ-062 is next in wave order.
