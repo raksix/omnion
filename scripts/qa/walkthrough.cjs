@@ -28,6 +28,12 @@ const path = require("path");
 const { execFileSync, spawn } = require("child_process");
 const { chromium } = require("playwright-core");
 
+// The character a screen shows while a read is still in flight. Named once and compared by the
+// passes: a claim that must not see it needs the literal to match what the component renders, and
+// typing the character into each pass is how the two drift apart — the pass then rejects a
+// rendered value the screen is perfectly entitled to show.
+const PLACEHOLDER = "\u2014";
+
 // ---------------------------------------------------------------- args / env
 
 function arg(name, fallback) {
@@ -11683,6 +11689,118 @@ async function runDevSdksDepth(page, report) {
 
   return { ok: true, claims: Object.keys(steps).length, ...steps };
 }
+/**
+ * The developer section root, driven (REQ-033, slice 4's overview cards).
+ *
+ * A landing page is the screen most likely to be only walk-listed, and the claim that fails
+ * silently there is the loading state: four reads settle independently, so the screen has an
+ * intermediate paint (a placeholder in three of four cards) that no route visit ever waits long
+ * enough to see. So this pass does three things a route walk cannot.
+ *
+ * The claims, and why each one is written the way it is:
+ *
+ * 1. **`everyCardCarriesANumberOrAReason`** — the shape rule, stated as a per-card check rather
+ *    than a count. A card is either a resolved figure or a refusal naming its permission; the one
+ *    thing that must never happen is a resolved *silent* zero, because "this tenant has no keys"
+ *    and "this account cannot read the keys" look identical on a card and mean opposite things.
+ * 2. **`noCardShowsAnUnresolvedPlaceholder`** — the inverse claim, and the one that catches a card
+ *    stuck on its placeholder. Checked **after a reload**, so the pass waits for the reads to land
+ *    rather than reading whatever the first paint happened to hold; "waited long enough" is not
+ *    the property, "settled" is, and only a fresh paint tells the two apart.
+ * 3. **`theCountsAgreeWithTheListTheyLinkTo`** — the strongest claim here and the reason the
+ *    screen is worth walking at all. The card's number and the destination's row count are read
+ *    from two different pages, so a card showing a hardcoded figure, a stale cache, or a
+ *    *different* endpoint than the list itself uses passes every other claim here. It follows the
+ *    card's own link, so a card pointing at the wrong screen fails too.
+ * 4. **`theSectionIsReachableFromTheNav`** — the claim a nav-free implementation would pass, since
+ *    the pass can always type the URL.
+ */
+async function runDevOverviewDepth(page, report) {
+  const steps = {};
+  const failures = [];
+  const check = (claim, ok) => {
+    steps[claim] = Boolean(ok);
+    if (!ok) failures.push(claim);
+  };
+
+  await page.goto(`${URL_ADMIN}/developer`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-testid=dev-overview-cards]", { timeout: 15000 }).catch(() => {});
+
+  const cards = page.locator("[data-testid^=dev-card-]");
+  check("theOverviewRendered", (await cards.count()) === 6);
+  await shot(page, "page-developer-overview");
+
+  // Exactly one of: a resolved figure, or a refusal naming its permission. The two "action" cards
+  // (Explorer, logs) are not lists, so they carry a word instead of a count. What is rejected is
+  // the empty string, which is what a card whose read resolved to nothing would render.
+  const cardText = await cards
+    .evaluateAll((nodes) =>
+      nodes.map((n) => {
+        const value = n.querySelector("[data-testid$='-value'], [data-testid$='-error']");
+        return {
+          id: n.getAttribute("data-testid"),
+          text: (value?.textContent ?? "").trim(),
+          link: n.querySelector("[data-testid$='-link']")?.getAttribute("href") ?? "",
+        };
+      }),
+    )
+    .catch(() => []);
+  check(
+    "everyCardCarriesANumberOrAReason",
+    cardText.length === 6 && cardText.every((c) => c.text.length > 0),
+  );
+
+  // The inverse claim, checked on a fresh paint so the reads have had time to settle.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-testid=dev-overview-cards]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const settled = await page
+    .locator("[data-testid$='-value']")
+    .evaluateAll((nodes) => nodes.map((n) => (n.textContent ?? "").trim()))
+    .catch(() => []);
+  check(
+    "noCardShowsAnUnresolvedPlaceholder",
+    settled.length >= 4 && settled.every((t) => t !== PLACEHOLDER),
+  );
+  await shot(page, "page-developer-overview-settled");
+
+  // The agreement claim: two screens, two endpoints, one number.
+  const keyCard = cardText.find((c) => c.id === "dev-card-keys");
+  const claimed = (keyCard?.text ?? "").replace(/[^0-9]/g, "");
+  if (keyCard?.link) {
+    await page.goto(`${URL_ADMIN}${keyCard.link}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    // The keys screen carries no hook on its empty state, so a fresh tenant waits the full
+    // timeout and then reads zero rows — which is the correct count, and the reason the timeout
+    // is short rather than the selector widened to a hook that does not exist. Inventing
+    // `[data-testid=api-keys-empty]` here would be a selector that always times out, and a
+    // timeout `.catch`ed away is indistinguishable from a screen that never loaded.
+    await page.waitForSelector("[data-developer-key-row]", { timeout: 6000 }).catch(() => {});
+    const listed = await page.locator("[data-developer-key-row]").count();
+    check("theCountsAgreeWithTheListTheyLinkTo", String(listed) === claimed);
+    check("theDestinationIsTheScreenTheCardNames", page.url().includes("/developer/keys"));
+  } else {
+    check("theCountsAgreeWithTheListTheyLinkTo", false);
+    check("theDestinationIsTheScreenTheCardNames", false);
+  }
+
+  // The section entry, which a pass that only ever types URLs could not measure.
+  await page.goto(`${URL_ADMIN}/developer`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  const navLink = await page
+    .locator('nav a[href="/developer"], aside a[href="/developer"]')
+    .count()
+    .catch(() => 0);
+  check("theSectionIsReachableFromTheNav", navLink > 0);
+  await shot(page, "page-developer-overview-nav");
+
+  if (failures.length > 0) {
+    throw new Error(
+      `${failures.length} dev-overview claim(s) did not hold: ${failures.join(", ")}`,
+    );
+  }
+
+  return { ok: true, claims: Object.keys(steps).length, ...steps };
+}
+
 
 /**
  * The id of the app this pass just registered, found by its name.
@@ -12166,6 +12284,11 @@ async function main() {
     // ever seen after somebody has already filled in a form is a screen whose loading and
     // error states nobody has looked at. The depth passes below drive the key form, the
     // one-time secret dialog and the Explorer's send + snippet drawer.
+    // The section root (slice 4's overview cards). It is walked *first* among the developer
+    // screens because it is the only one a person can arrive at without already knowing which
+    // child they want — and a landing page that renders while its four reads are still pending is
+    // the state nobody has ever looked at, which is why it is driven below as well as listed.
+    { path: "/developer", name: "developer-overview" },
     { path: "/developer/keys", name: "developer-keys" },
     { path: "/developer/logs", name: "developer-logs" },
     // The API Explorer (slice 2). Walked *first* among the three because it is the screen a
@@ -12463,6 +12586,13 @@ async function main() {
   // honours it.
   report.devSdks = await runDepthPass("dev-sdks", () => runDevSdksDepth(page, report));
   log(`dev-sdks: ${JSON.stringify(report.devSdks)}`);
+
+  // The section root (REQ-033, slice 4). Registered last of the developer passes, and that order
+  // is the argument rather than an accident: it *counts* what the other six just wrote, so a pass
+  // that ran before them would compare the cards against lists this run has not touched yet and a
+  // card drawn from a stale cache would agree with them by luck.
+  report.devOverview = await runDepthPass("dev-overview", () => runDevOverviewDepth(page, report));
+  log(`dev-overview: ${JSON.stringify(report.devOverview)}`);
 
   // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
   // because a scan counts the findings those passes have already written, and a scan that ran
