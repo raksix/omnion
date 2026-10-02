@@ -19,3 +19,8 @@ thiserror.workspace = true
 # crate's choice of algorithm: a client that hashes a query to compare against the manager gets an
 # answer from anywhere in the platform that hashes bytes.
 sha2.workspace = true
+# `OffsetDateTime`, because a deprecation is a policy over DATES and the store hands this crate an
+# instant rather than a string. The workspace default carries `serde-well-known` only; `macros`
+# is enabled here for the one test fixture that builds an instant without parsing one, so a
+# fixture cannot silently drift from the format the production path accepts.
+time = { workspace = true, features = ["macros"] }

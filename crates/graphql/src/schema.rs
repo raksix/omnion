@@ -83,7 +83,7 @@ pub struct SchemaCatalogue {
 }
 
 impl SchemaCatalogue {
-/// The catalogue for the content, tenancy and media surface the request names first.
+    /// The catalogue for the content, tenancy and media surface the request names first.
     ///
     /// **Every permission here is a [`Known`], and every type is a type the platform actually
     /// has.** Both halves of that sentence are load-bearing, and both were violated by the first
@@ -925,7 +925,10 @@ mod tests {
     #[test]
     fn two_callers_with_different_permissions_see_different_schemas() {
         // The request demands this be verifiable: "verified by diffing two callers' schemas".
-        let plain = compose(&catalogue(), &PermissionSet::from_known([Known::OrganizationRead]));
+        let plain = compose(
+            &catalogue(),
+            &PermissionSet::from_known([Known::OrganizationRead]),
+        );
         let with_sites = compose(
             &catalogue(),
             &PermissionSet::from_known([Known::OrganizationRead, Known::SitesRead]),
@@ -960,7 +963,10 @@ mod tests {
 
     #[test]
     fn a_mutation_field_appears_only_when_the_write_permission_exists() {
-        let reader = compose(&catalogue(), &PermissionSet::from_known([Known::ContentPagesRead]));
+        let reader = compose(
+            &catalogue(),
+            &PermissionSet::from_known([Known::ContentPagesRead]),
+        );
         let writer = compose(
             &catalogue(),
             &PermissionSet::from_known([Known::ContentPagesRead, Known::ContentPagesCreate]),
@@ -1001,8 +1007,8 @@ mod tests {
         // resolver, and this crate has no resolver. The test proves the refusal happens.
         let caller = PermissionSet::from_known([Known::ContentPagesRead]);
         let schema = compose(&catalogue(), &caller);
-        let document = crate::document::parse("mutation { createPage(title: \"x\") { id } }")
-            .expect("parses");
+        let document =
+            crate::document::parse("mutation { createPage(title: \"x\") { id } }").expect("parses");
         let err = validate_selections(&document, &schema).expect_err("the mutation is refused");
         assert_eq!(err.code_str(), "FORBIDDEN");
         assert!(err.to_string().contains("createPage"), "{err}");
@@ -1010,16 +1016,18 @@ mod tests {
 
     #[test]
     fn a_caller_who_holds_the_write_permission_gets_past_validation() {
-        let caller = PermissionSet::from_known([Known::ContentPagesRead, Known::ContentPagesCreate]);
+        let caller =
+            PermissionSet::from_known([Known::ContentPagesRead, Known::ContentPagesCreate]);
         let schema = compose(&catalogue(), &caller);
-        let document = crate::document::parse("mutation { createPage(title: \"x\") { id } }")
-            .expect("parses");
+        let document =
+            crate::document::parse("mutation { createPage(title: \"x\") { id } }").expect("parses");
         validate_selections(&document, &schema).expect("the permitted mutation validates");
     }
 
     #[test]
     fn a_mutation_may_not_select_a_read_field() {
-        let caller = PermissionSet::from_known([Known::ContentPagesRead, Known::ContentPagesCreate]);
+        let caller =
+            PermissionSet::from_known([Known::ContentPagesRead, Known::ContentPagesCreate]);
         let schema = compose(&catalogue(), &caller);
         let document =
             crate::document::parse("mutation { createPage(title: \"x\") { pages { id } } }")
@@ -1123,8 +1131,18 @@ mod tests {
 
     #[test]
     fn the_version_is_part_of_the_key_so_a_catalogue_change_misses_the_cache() {
-        let a = CacheKey::new(&["content"], &[], &PermissionSet::from_known([Known::ContentPagesRead]), 1);
-        let b = CacheKey::new(&["content"], &[], &PermissionSet::from_known([Known::ContentPagesRead]), 2);
+        let a = CacheKey::new(
+            &["content"],
+            &[],
+            &PermissionSet::from_known([Known::ContentPagesRead]),
+            1,
+        );
+        let b = CacheKey::new(
+            &["content"],
+            &[],
+            &PermissionSet::from_known([Known::ContentPagesRead]),
+            2,
+        );
         assert_ne!(a.fingerprint(), b.fingerprint());
     }
 
@@ -1248,14 +1266,7 @@ mod tests {
         // Asserted as an explicit inventory rather than a build-graph query, because the thing
         // worth protecting is the DECLARED surface, and a manifest that silently grows a
         // `store` module is exactly the change that invalidates the claim above.
-        const MODULES: &[&str] = &[
-            "cost",
-            "document",
-            "error",
-            "limits",
-            "schema",
-            "settings",
-        ];
+        const MODULES: &[&str] = &["cost", "document", "error", "limits", "schema", "settings"];
         for module in MODULES {
             assert!(
                 !module.contains("store") && !module.contains("resolver"),
@@ -1275,5 +1286,4 @@ mod tests {
             );
         }
     }
-
 }

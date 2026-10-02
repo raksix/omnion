@@ -36,7 +36,7 @@ fn defect(message: impl Into<String>) -> Error {
         message: message.into(),
     }
 }
-use crate::openapi::{canonical_json, sanitize_identifier, Drift};
+use crate::openapi::{Drift, canonical_json, sanitize_identifier};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -68,8 +68,9 @@ impl Language {
         match value {
             "typescript" | "ts" => Ok(Language::TypeScript),
             "python" | "py" => Ok(Language::Python),
-            other => Err(defect(format!("`{other}` is not a language this platform ships; expected typescript or python"),
-            )),
+            other => Err(defect(format!(
+                "`{other}` is not a language this platform ships; expected typescript or python"
+            ))),
         }
     }
 }
@@ -113,13 +114,17 @@ impl Operation {
             template.push_str(&rest[..open]);
             let tail = &rest[open + 1..];
             let Some(close) = tail.find('}') else {
-                return Err(defect(format!("`{}` has an unclosed path parameter", self.path),
-                ));
+                return Err(defect(format!(
+                    "`{}` has an unclosed path parameter",
+                    self.path
+                )));
             };
             let name = &tail[..close];
             if !self.parameters.contains(&name.to_string()) {
-                return Err(defect(format!("`{}` declares {name} but the pattern does not use it", self.id),
-                ));
+                return Err(defect(format!(
+                    "`{}` declares {name} but the pattern does not use it",
+                    self.id
+                )));
             }
             template.push('{');
             template.push_str(&consumed.len().to_string());
@@ -130,8 +135,10 @@ impl Operation {
         template.push_str(rest);
         for name in &self.parameters {
             if !consumed.contains(name) {
-                return Err(defect(format!("`{}` declares {name} but the pattern does not use it", self.id),
-                ));
+                return Err(defect(format!(
+                    "`{}` declares {name} but the pattern does not use it",
+                    self.id
+                )));
             }
         }
         Ok((template, consumed))
@@ -154,8 +161,7 @@ pub fn operations(document: &Value) -> Result<Vec<Operation>> {
     let mut seen_ids = BTreeSet::new();
     for (path, item) in paths {
         let Some(item) = item.as_object() else {
-            return Err(defect(format!("`{path}` is not a path item object"),
-            ));
+            return Err(defect(format!("`{path}` is not a path item object")));
         };
         let parameters = path
             .split('/')
@@ -168,13 +174,15 @@ pub fn operations(document: &Value) -> Result<Vec<Operation>> {
                 .get("operationId")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    defect(format!("`{method} {path}` has no operationId, so a client cannot name it"),
-                    )
+                    defect(format!(
+                        "`{method} {path}` has no operationId, so a client cannot name it"
+                    ))
                 })?
                 .to_string();
             if !seen_ids.insert(id.clone()) {
-                return Err(defect(format!("`{id}` appears twice in the document; every generator rejects that"),
-                ));
+                return Err(defect(format!(
+                    "`{id}` appears twice in the document; every generator rejects that"
+                )));
             }
             let tag = op
                 .get("tags")
@@ -262,10 +270,9 @@ pub fn generate(document: &Value, language: Language, pinned_hash: &str) -> Resu
     let actual = Drift::openapi_hash(&canonical);
     if pinned_hash != actual {
         return Err(defect(format!(
-                "the document hashes to {actual}, not the pinned {pinned_hash}; \
+            "the document hashes to {actual}, not the pinned {pinned_hash}; \
                  a client published from a different document than it claims is not reviewable"
-            ),
-        ));
+        )));
     }
     let ops = operations(document)?;
     let api_version = document
@@ -290,12 +297,11 @@ pub fn generate(document: &Value, language: Language, pinned_hash: &str) -> Resu
     let findings = scan_for_secrets(&package.text());
     if !findings.is_empty() {
         return Err(defect(format!(
-                "the generated {} package contains {} value(s) that must never ship: {}",
-                language.as_str(),
-                findings.len(),
-                findings.join(", ")
-            ),
-        ));
+            "the generated {} package contains {} value(s) that must never ship: {}",
+            language.as_str(),
+            findings.len(),
+            findings.join(", ")
+        )));
     }
     Ok(package)
 }
@@ -385,15 +391,19 @@ fn ts_pascal(identifier: &str) -> String {
     out
 }
 
-fn typescript_files(
-    ops: &[Operation],
-    pinned_hash: &str,
-    api_version: &str,
-) -> Vec<GeneratedFile> {
+fn typescript_files(ops: &[Operation], pinned_hash: &str, api_version: &str) -> Vec<GeneratedFile> {
     let mut client = String::new();
     let _ = writeln!(client, "{HEADER_TS}");
-    let _ = writeln!(client, "export const OPENAPI_HASH = {};", ts_string(pinned_hash));
-    let _ = writeln!(client, "export const API_VERSION = {};", ts_string(api_version));
+    let _ = writeln!(
+        client,
+        "export const OPENAPI_HASH = {};",
+        ts_string(pinned_hash)
+    );
+    let _ = writeln!(
+        client,
+        "export const API_VERSION = {};",
+        ts_string(api_version)
+    );
     client.push('\n');
     // Declared here and emitted into `index.ts`, which is the entry point: the class body is
     // generated in one function and the transport in another, so the dependency is explicit in
@@ -428,7 +438,10 @@ fn typescript_files(
 
     let mut by_group = BTreeMap::new();
     for op in ops {
-        by_group.entry(ts_group(&op.tag)).or_insert_with(Vec::new).push(op);
+        by_group
+            .entry(ts_group(&op.tag))
+            .or_insert_with(Vec::new)
+            .push(op);
     }
     // **The groups live inside the client class.** The first version emitted them at file top
     // level — a bare `Ai(): OperationGroup {` with no enclosing `class` — and the file did not
@@ -436,7 +449,10 @@ fn typescript_files(
     // separate defects, all of them invisible to a unit test over the generator's own functions,
     // and every one of them a package that could never be imported.
     let mut groups = String::new();
-    let _ = writeln!(groups, "/** Every route this document describes, grouped by tag. */");
+    let _ = writeln!(
+        groups,
+        "/** Every route this document describes, grouped by tag. */"
+    );
     let _ = writeln!(groups, "export class OmnionRoutes {{");
     for (group, members) in &by_group {
         let _ = writeln!(groups, "  /** {group} */");
@@ -450,11 +466,17 @@ fn typescript_files(
             name = ts_string(group)
         );
         for op in members {
-            let _ = writeln!(groups, "      OPERATIONS_BY_ID[{id}]!,", id = ts_string(&op.id));
+            let _ = writeln!(
+                groups,
+                "      OPERATIONS_BY_ID[{id}]!,",
+                id = ts_string(&op.id)
+            );
         }
         groups.push_str("    ] });\n  }\n\n");
     }
-    groups.push_str("  /** Every group, by name. */\n  all(): Record<string, OperationGroup> {\n    return {\n");
+    groups.push_str(
+        "  /** Every group, by name. */\n  all(): Record<string, OperationGroup> {\n    return {\n",
+    );
     for (group, _) in &by_group {
         let _ = writeln!(
             groups,
@@ -466,7 +488,10 @@ fn typescript_files(
 
     let mut index = String::new();
     let _ = writeln!(index, "{HEADER_TS}");
-    let _ = writeln!(index, "// Generated by the Omnion SDK generator. Do not edit by hand.");
+    let _ = writeln!(
+        index,
+        "// Generated by the Omnion SDK generator. Do not edit by hand."
+    );
     let _ = writeln!(index, "export * from './client';");
     // The group class has to be imported by BUNDLE, not just re-exported by name: the first
     // version wrote `export { OperationGroup } from './client'` and the file parsed, imported
@@ -477,14 +502,21 @@ fn typescript_files(
     // variable: OPERATIONS_BY_ID` on the first group call — a second run-time failure of exactly
     // the same shape as the one above, which is why every cross-module name is now imported
     // explicitly instead of assumed to be in scope.
-    let _ = writeln!(index, "import {{ OPERATIONS, OPERATIONS_BY_ID, OperationSpec }} from './client';");
+    let _ = writeln!(
+        index,
+        "import {{ OPERATIONS, OPERATIONS_BY_ID, OperationSpec }} from './client';"
+    );
     index.push('\n');
     let _ = writeln!(
         index,
         "export const OPENAPI_HASH = {};\n",
         ts_string(pinned_hash)
     );
-    let _ = writeln!(index, "export const API_VERSION = {};", ts_string(api_version));
+    let _ = writeln!(
+        index,
+        "export const API_VERSION = {};",
+        ts_string(api_version)
+    );
     index.push('\n');
     index.push_str(&groups);
 
@@ -492,14 +524,25 @@ fn typescript_files(
     let _ = writeln!(package_json, "{{");
     let _ = writeln!(package_json, "  \"name\": \"@omnion/api-client\",");
     let _ = writeln!(package_json, "  \"version\": \"0.1.0\",");
-    let _ = writeln!(package_json, "  \"description\": \"Generated from the Omnion OpenAPI document.\",");
+    let _ = writeln!(
+        package_json,
+        "  \"description\": \"Generated from the Omnion OpenAPI document.\","
+    );
     let _ = writeln!(package_json, "  \"type\": \"module\",");
     let _ = writeln!(package_json, "  \"main\": \"dist/index.js\",");
     let _ = writeln!(package_json, "  \"types\": \"dist/index.d.ts\",");
     let _ = writeln!(package_json, "  \"license\": \"Apache-2.0\",");
     let _ = writeln!(package_json, "  \"omnion\": {{");
-    let _ = writeln!(package_json, "    \"openapiHash\": {},", ts_string(pinned_hash));
-    let _ = writeln!(package_json, "    \"apiVersion\": {}", ts_string(api_version));
+    let _ = writeln!(
+        package_json,
+        "    \"openapiHash\": {},",
+        ts_string(pinned_hash)
+    );
+    let _ = writeln!(
+        package_json,
+        "    \"apiVersion\": {}",
+        ts_string(api_version)
+    );
     let _ = writeln!(package_json, "  }}");
     let _ = writeln!(package_json, "}}");
 
@@ -520,11 +563,26 @@ fn typescript_files(
     );
 
     vec![
-        GeneratedFile { path: "package.json".into(), contents: package_json },
-        GeneratedFile { path: "README.md".into(), contents: readme },
-        GeneratedFile { path: "src/index.ts".into(), contents: index },
-        GeneratedFile { path: "src/client.ts".into(), contents: client },
-        GeneratedFile { path: "src/group.ts".into(), contents: TS_GROUP_MODULE.to_string() },
+        GeneratedFile {
+            path: "package.json".into(),
+            contents: package_json,
+        },
+        GeneratedFile {
+            path: "README.md".into(),
+            contents: readme,
+        },
+        GeneratedFile {
+            path: "src/index.ts".into(),
+            contents: index,
+        },
+        GeneratedFile {
+            path: "src/client.ts".into(),
+            contents: client,
+        },
+        GeneratedFile {
+            path: "src/group.ts".into(),
+            contents: TS_GROUP_MODULE.to_string(),
+        },
     ]
 }
 
@@ -678,8 +736,16 @@ fn py_function(id: &str) -> String {
 fn python_files(ops: &[Operation], pinned_hash: &str, api_version: &str) -> Vec<GeneratedFile> {
     let mut client = String::new();
     let _ = writeln!(client, "{HEADER_PY}");
-    let _ = writeln!(client, "OPENAPI_HASH = {hash}", hash = py_string(pinned_hash));
-    let _ = writeln!(client, "API_VERSION = {version}", version = py_string(api_version));
+    let _ = writeln!(
+        client,
+        "OPENAPI_HASH = {hash}",
+        hash = py_string(pinned_hash)
+    );
+    let _ = writeln!(
+        client,
+        "API_VERSION = {version}",
+        version = py_string(api_version)
+    );
     // Emitted row by row rather than from one `format!` with a repetition: a row is a dict
     // literal, so its braces have to be escaped for the formatter, and 496 rows of escaped braces
     // is a wall of `{{{{` that hides the values. The first version also opened the list with a
@@ -703,7 +769,10 @@ fn python_files(ops: &[Operation], pinned_hash: &str, api_version: &str) -> Vec<
 
     let mut by_group = BTreeMap::new();
     for op in ops {
-        by_group.entry(op.tag.clone()).or_insert_with(Vec::new).push(op);
+        by_group
+            .entry(op.tag.clone())
+            .or_insert_with(Vec::new)
+            .push(op);
     }
     let mut groups = String::new();
     for (group, members) in &by_group {
@@ -724,7 +793,11 @@ fn python_files(ops: &[Operation], pinned_hash: &str, api_version: &str) -> Vec<
                 .collect::<Vec<_>>()
                 .join(", ");
             let _ = writeln!(groups, "    @staticmethod");
-            let _ = writeln!(groups, "    def {name}({args}) -> dict:", name = py_function(&op.id));
+            let _ = writeln!(
+                groups,
+                "    def {name}({args}) -> dict:",
+                name = py_function(&op.id)
+            );
             let _ = writeln!(groups, "        \"\"\"`{path}`.\"\"\"", path = op.path);
             if consumed.is_empty() {
                 let _ = writeln!(groups, "        return call({id})", id = py_string(&op.id));
@@ -763,7 +836,10 @@ fn python_files(ops: &[Operation], pinned_hash: &str, api_version: &str) -> Vec<
     let _ = writeln!(pyproject, "[project]");
     let _ = writeln!(pyproject, "name = \"omnion-api-client\"");
     let _ = writeln!(pyproject, "version = \"0.1.0\"");
-    let _ = writeln!(pyproject, "description = \"Generated from the Omnion OpenAPI document.\"");
+    let _ = writeln!(
+        pyproject,
+        "description = \"Generated from the Omnion OpenAPI document.\""
+    );
     let _ = writeln!(pyproject, "license = {{ text = \"Apache-2.0\" }}");
     let _ = writeln!(pyproject);
     let _ = writeln!(pyproject, "[project.optional-dependencies]");
@@ -786,11 +862,26 @@ fn python_files(ops: &[Operation], pinned_hash: &str, api_version: &str) -> Vec<
     );
 
     vec![
-        GeneratedFile { path: "pyproject.toml".into(), contents: pyproject },
-        GeneratedFile { path: "README.md".into(), contents: readme },
-        GeneratedFile { path: "src/omnion_api_client/__init__.py".into(), contents: init },
-        GeneratedFile { path: "src/omnion_api_client/client.py".into(), contents: client },
-        GeneratedFile { path: "src/omnion_api_client/groups.py".into(), contents: groups },
+        GeneratedFile {
+            path: "pyproject.toml".into(),
+            contents: pyproject,
+        },
+        GeneratedFile {
+            path: "README.md".into(),
+            contents: readme,
+        },
+        GeneratedFile {
+            path: "src/omnion_api_client/__init__.py".into(),
+            contents: init,
+        },
+        GeneratedFile {
+            path: "src/omnion_api_client/client.py".into(),
+            contents: client,
+        },
+        GeneratedFile {
+            path: "src/omnion_api_client/groups.py".into(),
+            contents: groups,
+        },
     ]
 }
 
@@ -914,7 +1005,10 @@ pub fn scan_for_secrets(text: &str) -> Vec<String> {
             findings.push(format!("line {}: an absolute URL", number + 1));
         }
         if has_embedded_credentials(line) {
-            findings.push(format!("line {}: credentials in a connection string", number + 1));
+            findings.push(format!(
+                "line {}: credentials in a connection string",
+                number + 1
+            ));
         }
         if has_literal_bearer(line) {
             findings.push(format!("line {}: a literal bearer token", number + 1));
@@ -927,7 +1021,14 @@ pub fn scan_for_secrets(text: &str) -> Vec<String> {
 }
 
 fn has_absolute_url(line: &str) -> bool {
-    for scheme in ["http://", "https://", "postgres://", "postgresql://", "redis://", "amqp://"] {
+    for scheme in [
+        "http://",
+        "https://",
+        "postgres://",
+        "postgresql://",
+        "redis://",
+        "amqp://",
+    ] {
         if line.contains(scheme) {
             return true;
         }
@@ -937,14 +1038,18 @@ fn has_absolute_url(line: &str) -> bool {
 
 fn has_embedded_credentials(line: &str) -> bool {
     // `://` then something then `@`, with no `/` after the scheme — a DSN, not a path.
-    let Some(start) = line.find("://") else { return false };
+    let Some(start) = line.find("://") else {
+        return false;
+    };
     let rest = &line[start + 3..];
     let authority: &str = rest.split(['/', '?', '#']).next().unwrap_or("");
     authority.contains('@') && authority.contains(':')
 }
 
 fn has_literal_bearer(line: &str) -> bool {
-    let Some(at) = line.find("Bearer ") else { return false };
+    let Some(at) = line.find("Bearer ") else {
+        return false;
+    };
     // The generated clients write `Bearer ${token}` and `f'Bearer {token}'` — a template, not a
     // value. A literal is anything after `Bearer ` that is not an interpolation.
     let value = line[at + 7..].trim();
@@ -964,7 +1069,9 @@ fn has_assigned_secret(line: &str) -> bool {
     {
         return false;
     }
-    let Some(eq) = line.find(['=', ':']) else { return false };
+    let Some(eq) = line.find(['=', ':']) else {
+        return false;
+    };
     let value = line[eq + 1..].trim();
     // A quoted literal, in either quoting style. Written as byte comparisons rather than
     // `starts_with('"')` because the two-character literals `'"'` and `'b"'` put a quote inside a
@@ -1047,7 +1154,10 @@ mod tests {
         assert_eq!(revoke.permission, "developer.keys.manage");
         assert_eq!(revoke.parameters, vec!["id"]);
         // The unguarded route reads as unguarded rather than borrowing a neighbour's key.
-        let health = ops.iter().find(|o| o.id == "get_health").expect("health is read");
+        let health = ops
+            .iter()
+            .find(|o| o.id == "get_health")
+            .expect("health is read");
         assert_eq!(health.permission, "");
     }
 
@@ -1063,7 +1173,11 @@ mod tests {
         // "grouped" are different claims and only the second one is what a caller wants.
         assert_eq!(
             ids(operations(&sample_document()).expect("readable")),
-            vec!["get_backup_schedules", "delete_developer_api_keys_by_id", "get_health"]
+            vec![
+                "get_backup_schedules",
+                "delete_developer_api_keys_by_id",
+                "get_health"
+            ]
         );
         let tags = operations(&sample_document())
             .expect("readable")
@@ -1096,7 +1210,11 @@ mod tests {
             "paths": { "/x": { "get": { "summary": "no id" } } }
         });
         let error = operations(&document).expect_err("a nameless operation is unusable");
-        assert!(error.to_string().contains("operationId"), "{}", error.to_string());
+        assert!(
+            error.to_string().contains("operationId"),
+            "{}",
+            error.to_string()
+        );
     }
 
     // --- path templates -----------------------------------------------------------------------
@@ -1130,8 +1248,14 @@ mod tests {
             deprecated: false,
             parameters: vec!["id".into()],
         };
-        let error = op.path_template().expect_err("an unused parameter is a defect");
-        assert!(error.to_string().contains("does not use it"), "{}", error.to_string());
+        let error = op
+            .path_template()
+            .expect_err("an unused parameter is a defect");
+        assert!(
+            error.to_string().contains("does not use it"),
+            "{}",
+            error.to_string()
+        );
     }
 
     // --- the pin ------------------------------------------------------------------------------
@@ -1141,7 +1265,11 @@ mod tests {
         let document = sample_document();
         let error = generate(&document, Language::TypeScript, "sha256:0000")
             .expect_err("a client built from another document is not reviewable");
-        assert!(error.to_string().contains("not the pinned"), "{}", error.to_string());
+        assert!(
+            error.to_string().contains("not the pinned"),
+            "{}",
+            error.to_string()
+        );
     }
 
     #[test]
@@ -1150,9 +1278,15 @@ mod tests {
         let hash = pinned(&document);
         let first = generate(&document, Language::TypeScript, &hash).expect("generates");
         let second = generate(&document, Language::TypeScript, &hash).expect("generates");
-        assert_eq!(first, second, "the same document must produce the same bytes");
+        assert_eq!(
+            first, second,
+            "the same document must produce the same bytes"
+        );
         let py = generate(&document, Language::Python, &hash).expect("generates");
-        assert_eq!(py, generate(&document, Language::Python, &hash).expect("generates"));
+        assert_eq!(
+            py,
+            generate(&document, Language::Python, &hash).expect("generates")
+        );
     }
 
     #[test]
@@ -1162,7 +1296,10 @@ mod tests {
         for language in Language::all() {
             let package = generate(&document, language, &hash).expect("generates");
             assert_eq!(package.openapi_hash, hash);
-            assert!(package.text().contains(&hash), "the hash must appear in the package");
+            assert!(
+                package.text().contains(&hash),
+                "the hash must appear in the package"
+            );
             assert!(
                 package.text().contains("API_VERSION") || package.text().contains("API_VERSION"),
                 "the API version is part of the provenance"
@@ -1179,10 +1316,22 @@ mod tests {
         let ts = generate(&document, Language::TypeScript, &hash).expect("generates");
         let py = generate(&document, Language::Python, &hash).expect("generates");
         for op in operations(&document).expect("readable") {
-            assert!(ts.text().contains(&op.id), "TypeScript is missing {}", op.id);
+            assert!(
+                ts.text().contains(&op.id),
+                "TypeScript is missing {}",
+                op.id
+            );
             assert!(py.text().contains(&op.id), "Python is missing {}", op.id);
-            assert!(ts.text().contains(&op.path), "TypeScript is missing the path {}", op.path);
-            assert!(py.text().contains(&op.path), "Python is missing the path {}", op.path);
+            assert!(
+                ts.text().contains(&op.path),
+                "TypeScript is missing the path {}",
+                op.path
+            );
+            assert!(
+                py.text().contains(&op.path),
+                "Python is missing the path {}",
+                op.path
+            );
         }
     }
 
@@ -1191,7 +1340,12 @@ mod tests {
         // The real repository writes `GET a caller's key`-shaped summaries, and an unescaped
         // apostrophe produces a package that does not parse — with the error pointing at a line
         // in generated code.
-        let summary = [SUMMARY_WITH_APOSTROPHE, &APOSTROPHE.to_string(), SUMMARY_TAIL].concat();
+        let summary = [
+            SUMMARY_WITH_APOSTROPHE,
+            &APOSTROPHE.to_string(),
+            SUMMARY_TAIL,
+        ]
+        .concat();
         assert_eq!(ts_string(&summary), "'GET a caller\\'s key'");
         assert_eq!(py_string(&summary), "'GET a caller\\'s key'");
         assert_eq!(ts_string("a \\ backslash"), "'a \\\\ backslash'");
@@ -1203,11 +1357,17 @@ mod tests {
         let document = sample_document();
         let hash = pinned(&document);
         let ts = generate(&document, Language::TypeScript, &hash).expect("generates");
-        assert!(ts.text().contains("getDeveloperApiKeysById"), "ids should be camel-cased in TS");
+        assert!(
+            ts.text().contains("getDeveloperApiKeysById"),
+            "ids should be camel-cased in TS"
+        );
         // The raw id stays in the table — it is the wire name the playground copies.
         assert!(ts.text().contains("delete_developer_api_keys_by_id"));
         // A hyphenated tag becomes a legal class/property name.
-        assert!(ts.text().contains("BackupSchedules"), "hyphenated tags must be sanitised");
+        assert!(
+            ts.text().contains("BackupSchedules"),
+            "hyphenated tags must be sanitised"
+        );
     }
 
     #[test]
@@ -1221,7 +1381,10 @@ mod tests {
         assert_eq!(py_function("lambda"), "lambda_");
         // A real id is untouched, because it is already a legal Python function name.
         assert_eq!(py_function("get_backup-schedules"), "get_backup_schedules");
-        assert_eq!(py_function("delete_developer_api_keys_by_id"), "delete_developer_api_keys_by_id");
+        assert_eq!(
+            py_function("delete_developer_api_keys_by_id"),
+            "delete_developer_api_keys_by_id"
+        );
     }
 
     // --- the secret scan ----------------------------------------------------------------------
@@ -1245,8 +1408,14 @@ mod tests {
     fn the_scan_catches_the_four_shapes_it_exists_for() {
         let cases = [
             ("const url = 'https://acme.example';", "absolute URL"),
-            ("dsn = 'postgres://user:hunter2@db:5432/omnion'", "connection string"),
-            ("const headers = { authorization: 'Bearer sk-live-abc' };", "bearer token"),
+            (
+                "dsn = 'postgres://user:hunter2@db:5432/omnion'",
+                "connection string",
+            ),
+            (
+                "const headers = { authorization: 'Bearer sk-live-abc' };",
+                "bearer token",
+            ),
             ("const api_key = \"abc123\";", "secret literal"),
         ];
         for (line, what) in cases {
@@ -1277,7 +1446,9 @@ mod tests {
 
     #[test]
     fn a_comment_naming_a_scheme_is_documentation_not_a_leak() {
-        assert!(scan_for_secrets("// the base URL is a https:// URL the caller supplies").is_empty());
+        assert!(
+            scan_for_secrets("// the base URL is a https:// URL the caller supplies").is_empty()
+        );
         assert!(scan_for_secrets("# set OMNION_URL=https://your-host here").is_empty());
     }
 
@@ -1326,7 +1497,12 @@ mod tests {
                 ),
                 Language::Python => (
                     "python3",
-                    vec!["-m".into(), "compileall".into(), "-q".into(), dir.display().to_string()],
+                    vec![
+                        "-m".into(),
+                        "compileall".into(),
+                        "-q".into(),
+                        dir.display().to_string(),
+                    ],
                 ),
             };
             if !tool_exists(program) {
@@ -1358,8 +1534,8 @@ mod tests {
     fn read_committed_snapshot() -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../api/openapi.snapshot.json");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
     }
 
@@ -1368,7 +1544,9 @@ mod tests {
     /// `which` is not used: it is a shell builtin wrapper with different behaviour per platform,
     /// and this only needs to know whether spawning the program would work.
     fn tool_exists(program: &str) -> bool {
-        let Ok(path) = std::env::var("PATH") else { return false };
+        let Ok(path) = std::env::var("PATH") else {
+            return false;
+        };
         std::env::split_paths(&path).any(|dir| {
             let candidate = dir.join(program);
             candidate.is_file()
@@ -1390,7 +1568,10 @@ mod tests {
                 id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
                 "`{id}` (from {method} {path}) is not a legal identifier"
             );
-            assert!(!id.starts_with(|c: char| c.is_ascii_digit()), "`{id}` starts with a digit");
+            assert!(
+                !id.starts_with(|c: char| c.is_ascii_digit()),
+                "`{id}` starts with a digit"
+            );
         }
     }
 
@@ -1417,7 +1598,8 @@ mod tests {
                 "/step_up": { "get": { "operationId": "get_step_up", "summary": "underscore", "tags": ["x"] } }
             }
         });
-        let error = operations(&colliding).expect_err("a document that merges two routes is refused");
+        let error =
+            operations(&colliding).expect_err("a document that merges two routes is refused");
         assert!(error.to_string().contains("twice"), "{error}");
 
         // And the generator refuses it too, rather than emitting the half-reachable client.
@@ -1434,10 +1616,10 @@ mod tests {
         // with the code under test and this is the one place the two must be independent.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../api/openapi.snapshot.json");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let document: Value = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let document: Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let ops = operations(&document).expect("the committed snapshot has no duplicate ids");
         let mut seen = std::collections::BTreeSet::new();
         for op in &ops {

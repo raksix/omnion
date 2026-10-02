@@ -47,6 +47,15 @@ pub enum Code {
     /// The caller holds no write permission for the field, so the mutation does not exist for
     /// them. Nothing is written.
     Forbidden,
+    /// The surface was deprecated, its sunset passed, and it is gone (REQ-130 slice 4).
+    ///
+    /// A distinct code rather than a `404`: the whole point of announcing a deprecation is that
+    /// the integrator can tell "moved" from "never existed", and a client that cannot branch on
+    /// this cannot migrate off a date it was told about.
+    Removed,
+    /// The request is well-formed but the values are not one this feature accepts — an extension
+    /// with no reason, a sunset inside the minimum window.
+    InvalidInput,
     /// Anything else.
     Internal,
 }
@@ -66,6 +75,8 @@ impl Code {
             Self::PersistedQueryNotFound => "PERSISTED_QUERY_NOT_FOUND",
             Self::TypeNotVisible => "TYPE_NOT_VISIBLE",
             Self::Forbidden => "FORBIDDEN",
+            Self::Removed => "REMOVED",
+            Self::InvalidInput => "INVALID_INPUT",
             Self::Internal => "INTERNAL",
         }
     }

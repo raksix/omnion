@@ -294,10 +294,22 @@ mod tests {
         };
 
         assert_eq!(column_default("max_depth"), DEFAULT_MAX_DEPTH.to_string());
-        assert_eq!(column_default("cost_budget"), DEFAULT_COST_BUDGET.to_string());
-        assert_eq!(column_default("max_aliases"), DEFAULT_MAX_ALIASES.to_string());
-        assert_eq!(column_default("max_fragments"), DEFAULT_MAX_FRAGMENTS.to_string());
-        assert_eq!(column_default("max_page_size"), DEFAULT_MAX_PAGE_SIZE.to_string());
+        assert_eq!(
+            column_default("cost_budget"),
+            DEFAULT_COST_BUDGET.to_string()
+        );
+        assert_eq!(
+            column_default("max_aliases"),
+            DEFAULT_MAX_ALIASES.to_string()
+        );
+        assert_eq!(
+            column_default("max_fragments"),
+            DEFAULT_MAX_FRAGMENTS.to_string()
+        );
+        assert_eq!(
+            column_default("max_page_size"),
+            DEFAULT_MAX_PAGE_SIZE.to_string()
+        );
         assert_eq!(column_default("timeout_ms"), DEFAULT_TIMEOUT_MS.to_string());
     }
 

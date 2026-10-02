@@ -44,6 +44,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cost;
+pub mod deprecation;
 pub mod document;
 pub mod error;
 pub mod limits;
@@ -55,6 +56,11 @@ pub mod sdk;
 pub mod settings;
 
 pub use cost::{Catalogue, Priced, Weight, price};
+pub use deprecation::{
+    AMBER_WITHIN_DAYS, CHANGELOG_PATH, Countdown, DEVELOPER_WINDOW, DeprecationHeaders,
+    DeprecationRow, Outcome, PUBLIC_WINDOW, REMOVED_STATUS, Status, Surface, check_extension,
+    check_window, countdown, headers_for, http_date, outcome, removed_response, status_at,
+};
 pub use document::{
     Document, Field, MAX_DOCUMENT_BYTES, Operation, OperationKind, PARSE_DEPTH_CEILING, Selection,
     parse,

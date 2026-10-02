@@ -233,7 +233,9 @@ impl RegistryEntry {
     /// The heaviest operation in the document, for the manager's cost column.
     #[must_use]
     pub fn heaviest(&self) -> Option<&OperationSummary> {
-        self.operations.iter().max_by_key(|operation| operation.cost)
+        self.operations
+            .iter()
+            .max_by_key(|operation| operation.cost)
     }
 }
 
@@ -320,7 +322,10 @@ pub enum Lookup {
     /// Nothing is registered under that id or hash.
     Unknown(String),
     /// The reference matches more than one registered document, so it cannot identify one.
-    Ambiguous { requested: String, candidates: Vec<String> },
+    Ambiguous {
+        requested: String,
+        candidates: Vec<String>,
+    },
 }
 
 impl Lookup {
@@ -345,7 +350,10 @@ impl Lookup {
                 "no registered document matches `{requested}`; register it in the developer \
                  portal or run with persisted-only mode off"
             ),
-            Self::Ambiguous { requested, candidates } => format!(
+            Self::Ambiguous {
+                requested,
+                candidates,
+            } => format!(
                 "`{requested}` matches {} registered documents ({}) — send the full hash",
                 candidates.len(),
                 candidates.join(", ")
@@ -523,7 +531,9 @@ mod tests {
     fn a_document_hashes_the_same_however_it_is_formatted() {
         let tight = DocumentId::of("{ pages(first: 5) { id title } }");
         let loose = DocumentId::of("{\n  pages(first: 5) {\n    id\n    title\n  }\n}\n");
-        let commented = DocumentId::of("# the list a client needs\n{\n  pages(first: 5) { id title } # trailing\n}");
+        let commented = DocumentId::of(
+            "# the list a client needs\n{\n  pages(first: 5) { id title } # trailing\n}",
+        );
         assert_eq!(tight.hash, loose.hash, "formatting is not meaning");
         assert_eq!(tight.hash, commented.hash, "a comment is not meaning");
         assert_eq!(tight.short_hash, tight.hash[..SHORT_HASH_LEN]);
@@ -536,7 +546,10 @@ mod tests {
         // the second registration as a duplicate — which is a refusal with no true statement in it.
         let one = DocumentId::of(r#"{ pages(first: 1, filter: { title: "a  b" }) { id } }"#);
         let two = DocumentId::of(r#"{ pages(first: 1, filter: { title: "a b" }) { id } }"#);
-        assert_ne!(one.hash, two.hash, "a string literal must survive canonicalisation intact");
+        assert_ne!(
+            one.hash, two.hash,
+            "a string literal must survive canonicalisation intact"
+        );
     }
 
     #[test]
@@ -559,7 +572,10 @@ mod tests {
         assert_eq!(id.hash.len(), 64, "the row keeps the whole digest");
         assert_eq!(id.short_hash.len(), SHORT_HASH_LEN);
         assert!(id.hash.starts_with(&id.short_hash));
-        assert!(id.matches(&id.short_hash), "the short form names the document");
+        assert!(
+            id.matches(&id.short_hash),
+            "the short form names the document"
+        );
         assert!(id.matches(&id.hash), "the full digest names the document");
         assert!(id.matches(&id.hash[..12]), "a unique prefix names it too");
     }
@@ -596,13 +612,19 @@ mod tests {
     fn a_revoked_document_is_blocked_and_says_why() {
         let revoked = entry("revoked");
         assert!(!revoked.executable());
-        let reason = revoked.blocked_reason().expect("a revoked row explains itself");
+        let reason = revoked
+            .blocked_reason()
+            .expect("a revoked row explains itself");
         assert!(reason.contains("PERSISTED_QUERY_NOT_FOUND"), "{reason}");
         assert!(reason.contains("revoked"), "{reason}");
 
         let active = entry("active");
         assert!(active.executable());
-        assert_eq!(active.blocked_reason(), None, "a usable row shows a control, not a note");
+        assert_eq!(
+            active.blocked_reason(),
+            None,
+            "a usable row shows a control, not a note"
+        );
     }
 
     #[test]
@@ -638,7 +660,9 @@ mod tests {
             "mutation"
         );
         assert_eq!(
-            heaviest_kind("query Read { pages { id } } mutation Write { publishPage(id: 1) { id } }"),
+            heaviest_kind(
+                "query Read { pages { id } } mutation Write { publishPage(id: 1) { id } }"
+            ),
             "mutation",
             "a mixed document is filed by its heaviest kind, so a read-only review cannot miss it"
         );
@@ -680,7 +704,10 @@ mod tests {
             let err = request
                 .validate()
                 .expect_err(&format!("{field} must be refused"));
-            assert!(err.to_string().contains(field), "the message does not name {field}: {err}");
+            assert!(
+                err.to_string().contains(field),
+                "the message does not name {field}: {err}"
+            );
         }
 
         RegisterRequest {
@@ -695,10 +722,9 @@ mod tests {
 
     #[test]
     fn a_registration_activates_unless_it_asks_not_to() {
-        let request: RegisterRequest = serde_json::from_str(
-            r#"{"name":"Page list","document":"{ pages { id } }"}"#,
-        )
-        .expect("deserialises");
+        let request: RegisterRequest =
+            serde_json::from_str(r#"{"name":"Page list","document":"{ pages { id } }"}"#)
+                .expect("deserialises");
         assert!(
             request.active,
             "a document registered as a draft executes nothing and explains nothing — that is a \
@@ -725,7 +751,11 @@ mod tests {
             ..crate::settings::Settings::default()
         };
         let active = Lookup::Active(entry("active"));
-        assert!(admit(&settings, &active, None).expect("registered and active is allowed").is_none());
+        assert!(
+            admit(&settings, &active, None)
+                .expect("registered and active is allowed")
+                .is_none()
+        );
 
         let revoked = Lookup::Blocked(entry("revoked"), "revoked by an administrator".into());
         let err = admit(&settings, &revoked, None).expect_err("a revoked document is refused");
@@ -739,7 +769,11 @@ mod tests {
         // registry anyway would refuse documents the installation has deliberately allowed.
         let settings = crate::settings::Settings::default();
         let unknown = Lookup::Unknown("abc".into());
-        assert!(admit(&settings, &unknown, None).expect("ad-hoc is allowed").is_none());
+        assert!(
+            admit(&settings, &unknown, None)
+                .expect("ad-hoc is allowed")
+                .is_none()
+        );
     }
 
     #[test]
@@ -752,7 +786,11 @@ mod tests {
             candidates: vec!["abc…".into(), "abd…".into()],
         };
         assert!(!lookup.is_executable());
-        assert!(lookup.message().contains("matches 2"), "{}", lookup.message());
+        assert!(
+            lookup.message().contains("matches 2"),
+            "{}",
+            lookup.message()
+        );
         assert!(lookup.message().contains("abc"), "{}", lookup.message());
         assert_eq!(lookup.code(), Code::PersistedQueryNotFound);
     }
@@ -769,7 +807,11 @@ mod tests {
         let prunable = prunable(&entries, 5);
         assert_eq!(prunable.len(), 1);
         assert_eq!(prunable[0].name, "Unused");
-        assert_eq!(prunable[0].cost, Some(20), "the summary carries the priced cost");
+        assert_eq!(
+            prunable[0].cost,
+            Some(20),
+            "the summary carries the priced cost"
+        );
         assert_eq!(prunable[0].depth, Some(2));
     }
 

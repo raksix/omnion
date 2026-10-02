@@ -365,7 +365,11 @@ mod tests {
             .map(|type_definition| {
                 (
                     type_definition.name,
-                    type_definition.fields.iter().map(|field| field.name).collect(),
+                    type_definition
+                        .fields
+                        .iter()
+                        .map(|field| field.name)
+                        .collect(),
                 )
             })
             .collect();
