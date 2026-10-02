@@ -166,6 +166,14 @@ fn automation_projects_surface(state: &AppState) -> Router<AppState> {
                 .merge(
                     put(automation_projects::update_project)
                         .layer(guards::require(state, "projects.manage")),
+                )
+                // The one destructive route on this surface, and the REQ's API table has carried it
+                // since the module shipped. `projects.manage` rather than a key of its own: the
+                // membership matrix already answers "may administer this project" for the owner
+                // role, and a separate permission would be a second way to say the same thing.
+                .merge(
+                    delete(automation_projects::delete_project)
+                        .layer(guards::require(state, "projects.manage")),
                 ),
         )
         // `/archive` and `/restore` are literal segments under `/projects/{id}/…`, and axum ranks

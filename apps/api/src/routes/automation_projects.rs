@@ -806,6 +806,136 @@ async fn set_status(
     )))
 }
 
+/// Query of `DELETE /api/v1/projects/{id}`.
+///
+/// **The confirmation travels as a query parameter, not a request body, and that is the
+/// platform's convention rather than a preference.** No other destructive route on this API takes
+/// a body — `DELETE /iam/policies/{id}`, `DELETE /projects/{id}/members/{user_id}` and the rest all
+/// answer from the path alone — and a `DELETE` with a body is a shape that proxies, gateways and
+/// HTTP client libraries all handle differently. A confirmation that arrives through a mechanism
+/// half the ecosystem may drop is a confirmation that silently disappears on the request that
+/// matters, which is the opposite of what a typed confirmation is for.
+///
+/// So the confirmation is a query parameter, and **an absent one is a named refusal**
+/// (`project_delete_confirmation_mismatch`) rather than a deserialization error: a client that
+/// forgot it is told what it has to type.
+#[derive(Debug, Deserialize)]
+pub struct DeleteProjectQuery {
+    /// Organization; required for a platform account.
+    pub organization_id: Option<Uuid>,
+    /// The typed confirmation: the project's **key**, typed exactly.
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+/// What a deletion did, so the panel can say it plainly and the trail is complete without a
+/// second request.
+#[derive(Debug, Serialize)]
+pub struct DeleteProjectResponse {
+    /// The project that is gone.
+    pub project_id: Uuid,
+    /// Its key, echoed so a client that lost the row still knows what it removed.
+    pub project_key: String,
+    /// Member rows that were cascaded away with it.
+    pub removed_members: i64,
+    /// Audit rows that survived, detached from the project.
+    ///
+    /// **Reported rather than hidden**, because "the trail kept your history" is the fact an
+    /// operator needs to be told *before* they confirm, and it is also the fact that makes the
+    /// delete reversible in the only way that matters — the record outlives the container.
+    pub retained_audit_rows: i64,
+}
+
+/// `DELETE /api/v1/projects/{id}` — remove a project, its members and its settings.
+///
+/// **The REQ's own API table has documented this route since the module shipped, and there was no
+/// implementation behind it** — no `delete_project` in the store, no handler, no button. Slice 4
+/// wrote the caps, the transfer and the archive guards and left the one destructive action on this
+/// surface unwritten, which is the shape this branch keeps finding: the safe half of a feature is
+/// built and the half with consequences is described.
+///
+/// Three refusals, each before the write and each naming its remedy, in this order:
+///
+/// 1. **The default project.** No remedy, so it is first: there would be nowhere left to put an
+///    automation created without a project of its own.
+/// 2. **The typed confirmation** — the project's key, exactly.
+/// 3. **Workflows inside it.** Named by count, with the move path as the remedy, because
+///    `on delete restrict` would otherwise answer a 23503 naming a constraint.
+///
+/// **An unowned project is `404` before any of the three refusals can name it**, because
+/// `require_capability` is the first statement here and it resolves through `effective_role`. A
+/// refusal that said "PLAT holds 12 workflows" to a caller who may not see PLAT would turn this
+/// route into exactly the enumeration oracle the module's `404` rule exists to remove.
+///
+/// The audit row is written **inside the deleting transaction**, before the `delete`: a pool write
+/// after the commit would land with a null `project_id` (the column is `on delete set null`) and
+/// the row an operator reads after deleting a project is the one thing that has to still point at
+/// it.
+pub async fn delete_project(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(project_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<DeleteProjectQuery>,
+) -> Result<Json<DeleteProjectResponse>, ApiError> {
+    let organization_id = resolve_organization(&current, query.organization_id)?;
+    require_capability(
+        &state,
+        &current,
+        organization_id,
+        project_id,
+        ProjectRole::can_administer,
+        "delete the project",
+    )
+    .await?;
+
+    // The row lock lives in `projects::project_delete_checks`, on the caller's transaction — the
+    // dependency read and the delete have to see the same project, and the lock is held until the
+    // commit so a workflow created in between cannot slip into the row being removed.
+    //
+    // **The order below is load-bearing and the database is what says so.** `audit_log.project_id`
+    // is a foreign key with `on delete set null`, and the constraint is checked at insert time:
+    // a trail row naming this project is legal only while the project is still there. So the
+    // audit row goes in BEFORE the delete, both inside this transaction. A pool write after the
+    // commit would land with a null project — the one row an operator reads after deleting a
+    // project, pointing at nothing.
+    let mut transaction = state.db().pool().begin().await.map_err(sql)?;
+    let dependencies = projects::project_delete_checks(
+        &mut transaction,
+        project_id,
+        query.confirm.as_deref().unwrap_or(""),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    omnion_audit::record_for_project_in(
+        &mut transaction,
+        NewAuditEntry::by_user(current.user.id, "automation.project.deleted")
+            .organization(organization_id)
+            .target("automation_project", project_id)
+            .metadata(json!({
+                "key": dependencies.project_key,
+                "removed_members": dependencies.members,
+                "retained_audit_rows": dependencies.audit_rows,
+            })),
+        project_id,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    projects::commit_project_delete(&mut transaction, project_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    transaction.commit().await.map_err(sql)?;
+
+    Ok(Json(DeleteProjectResponse {
+        project_id,
+        project_key: dependencies.project_key,
+        removed_members: dependencies.members,
+        retained_audit_rows: dependencies.audit_rows,
+    }))
+}
+
 /// `POST /api/v1/projects/{id}/members` — add a member or change a role.
 pub async fn upsert_member(
     State(state): State<AppState>,
