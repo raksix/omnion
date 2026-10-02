@@ -10901,3 +10901,86 @@ which does run, and they are still waiting on a slot.
 of a twenty-five-minute gamble: it has a fixed start and a fixed end. `table-save-survives` is
 ticked only on a live reading with `clicked > 0`, `inspected > 0` **and** `builderSeesTableEdit:
 true` — a conjunction, because the first two are what make the third mean anything.
+
+---
+
+## Tick 83 (wave3) — the builder was rendering an error overlay, and the harness called it a busy box
+
+**The finding.** `WorkflowBuilder` renders `loading` and an error screen through early returns.
+Tick 78's focus-restore fix (`92fba4af`) added `closeHelp`'s `useCallback` and the focus `useEffect`
+*below* those two returns, to get the effect's ordering among hooks right. React does not throw on a
+hook after a conditional return: it logs "change in the order of Hooks" and the Next dev overlay
+paints a full-screen error card **over a builder that was about to render**. The builder's first
+render is always `loading`, so it fired on every open.
+
+So the walkthrough read `palette: false, canvas: false, inspector: false, problems: false,
+paletteNodes: 0, canvasNodes: 0` — the same "the builder did not open" shape that ticks 78, 79 and
+81 read as a crowded box, a held QA slot and a renderer gate. `clicks.jsonl` names no defect, because
+there is none to name: it names the symptom of a framework overlay.
+
+**It was in a screenshot.** `page-workflow-builder.png` in the pass's own artifacts is the Turbopack
+error card, quoting `builder-view.tsx (2096:32) @ WorkflowBuilder` and the hook table. Four ticks of
+build-log entries were written without opening one image from a pass that had already produced 36.
+
+**The fix** (`5a99a3e1`) moves the three hooks above the returns. The focus ordering `92fba4af` bought
+is unchanged: it was always about the effect's position among *hooks*, not among *returns*.
+
+**The gate** (`d717588c`) is `scripts/qa/probe-hook-order.cjs`, **7/7**: 212 component/hook functions
+parsed, 0 findings, 5 mutations each red on a named case. It is proven on the real pre-fix file —
+`WorkflowBuilder`, `useCallback` 2096, `useEffect` 2108: the exact two hooks the fix moves.
+
+**The gate is built on the workspace's own TypeScript, and that is the finding worth keeping.** Four
+hand-rolled scanners came first and each was wrong, each on ordinary JSX:
+
+| # | what it reported | the mistake |
+| --- | --- | --- |
+| 1 | 0 findings | a guard written `if (x) {` / `return` on the next line was not recognised — the shipped defect read CLEAN |
+| 2 | 0 findings | the hook regex required an `=`, `(`, `,` before the name, so an indented bare `useEffect(` never matched |
+| 3 | **209 findings** | every `if (chord) { … return; }` inside the keydown handler was charged to the component — a nested function's returns, not its own |
+| 4 | 6 findings on a correct file | a template literal spanning lines (`className={\`chip ${\n cond ? "a" : "b"\n}\`}`) lost its real braces, depth drifted by one and a 634-line sibling component was scanned as part of the previous one |
+
+Every one is a question about the language answered by re-implementing the language, and every one
+produced a *plausible* answer — a clean tree, a two-hundred-finding tree, a six-finding tree. A gate
+that cries wolf on a correct file gets switched off; the "a gate that cannot parse its input must say
+so" rule from `probe-pass-scope.cjs` generalises: **a gate whose parse is an implementation detail will
+report findings it did not look for, and there is nothing in the output to tell them apart.** The
+scanner is not kept as a fallback.
+
+**A second defect, mine, in the file this gate exists next to** (`6677bd06`). Both windows in
+`table-mode-row.test.ts` pinned `page.goto(`${admin}/workflows/…` — the exact spelling `3c223c00`
+fixed in tick 81 — so they reported "the row must navigate to the builder before reading it",
+`actual: -1`, against rows that navigate correctly. apps/admin was **red before this tick** for that
+reason and the red had been sitting in the suite. The anchors are now the route, plus a negative
+assertion that `${admin}/workflows/` cannot come back.
+
+**A first draft of that fix asserted something false.** It asserted the two windows agree on one
+navigation, because that is the tidy claim and the comment above them already claimed it — it did
+not; they each repeated the search. They open the builder twice, once per note, and must stay pinned
+to different navigations. It is now asserted that they differ: a file with two windows on one anchor
+covers half the block twice and nothing of what it claims.
+
+**The box was full again mid-tick.** `/mnt/apopic` hit 100% and `patch` failed with `No space left on
+device` mid-edit, leaving a file with BOTH the old and the new `firstGuardedReturn` — the duplicate
+that then failed with `ReferenceError: GUARDED_RETURN is not defined` and read like a logic bug.
+Reclaimed 8.7G by deleting my own `apps/*/.next/dev` after stopping my own two pm2 processes
+(`omnion-qa-admin-w3`, `omnion-qa-web-w3`), after confirming no fd holder and no live cargo.
+
+**Proof.**
+
+| gate | result |
+| --- | --- |
+| `node scripts/qa/probe-hook-order.cjs` | **7/7** (5 mutations red on a named case, 212 functions parsed, 0 findings) |
+| apps/admin `npm test` | **376/376** |
+| `pnpm typecheck` | 2/2 |
+| `probe-pass-scope` / `probe-only-filter` / `probe-expected-refusals` / `probe-helper-contract` | 10/10 · 27/27 · 38/38 · 15/15 |
+
+**Not measured, and the reason changed shape again.** `table-save-survives`, `edge-delete`,
+`listener.captureKind` and `plugin-palette` are still unticked — and for the first time the reason is
+not a fact about the box. The pass ran, produced 40 rows, and every builder row it produced was a
+reading of an error overlay. **A reading of an error overlay is not a measurement, and it is not a red
+either.** Those boxes close on a pass that walks the screen as it now renders.
+
+**Next.** Re-run the focused pass on the w3 stack now that the screen renders; `table-save-survives`
+ticks on `clicked > 0`, `inspected > 0` **and** `builderSeesTableEdit: true` — a conjunction, because
+the first two are what make the third mean anything. Then `edge-delete.removed` /
+`edge-delete-undo.restored` off the label fix (`eec3ad5d`), which has never had a live reading either.
