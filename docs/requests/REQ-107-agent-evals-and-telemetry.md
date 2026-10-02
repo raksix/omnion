@@ -7,16 +7,19 @@
 > `00755aee`. Slice 2: the routes mounted and the run permission split from the read one —
 > `e154d732`; the run history, the run detail, the mandatory baseline picker and a `Run now` that
 > works — `ed03200f`. Slice 3: the runner that claims, scores and settles — `718a73f9`, then the
-> model-under-test reader that makes a suite's pin mean something — `4a1c978a`. Slice 4 (store and
-> route, **no screen yet**): `0237_ai_tool_stats_daily.sql` and the roll-up — `eae9d344`; the
+> model-under-test reader that makes a suite's pin mean something — `4a1c978a`. Slice 4 (store,
+> route and the writer): `0237_ai_tool_stats_daily.sql` and the roll-up — `eae9d344`; the
 > histogram read that was silently returning "no failures" — `9572d7db`; `/ai/telemetry/tools`
 > behind its own `ai.telemetry.read` — `7e7ec6ec`. Seven of thirteen acceptance rows are ticked,
 > each naming its walk. Slice 4's route split: the boot panic from a duplicate `GET
 > `/ai/telemetry/tools` — `cf1c80cb` — and the uniqueness tripwire that catches the class, after
-> its own first version was proven blind — `c525d9d5`. **Then the writer the roll-up never
-> had, and the `ai.telemetry.tool.degraded` alert nothing emitted — `ab029fe9`: `refresh_day`'s only
-> caller was its own walk, so the table this slice's screen reads was empty and would have stayed
-> empty forever.** The `/ai/telemetry` screen and the closing browser pass are still owed) ·
+> its own first version was proven blind — `c525d9d5`. Then the writer the roll-up never had, and
+> the `ai.telemetry.tool.degraded` alert nothing emitted — `ab029fe9`: `refresh_day`'s only caller
+> was its own walk, so the table this slice's screen reads was empty and would have stayed empty
+> forever. **Slice 5 (the screen, and the two panels its spec promised the API could not answer) —
+> `aaa0b4a2` and `4807b518`: `step_histogram` and `cost_per_solved` over live `ai_runs`, the
+> `/ai/telemetry` screen, its page in the walkthrough routes, and a depth pass that seeds rows,
+> rolls the day and reads the numbers back.** Four acceptance rows remain open and are named below
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
@@ -211,10 +214,15 @@ over the suite list, the case editor, a run and the telemetry panels.
    *Progress:* the table, the roll-up and the window reader are done; the **writer** is
    `ab029fe9`, and finding it late is the slice's one lesson — `refresh_day` had a passing
    reconciliation walk and no production caller, so the whole of what this slice owes a screen
-   was a table nothing would ever write to. `ai.telemetry.tool.degraded` ships with it. Left: the
-   `/ai/telemetry` screen itself (tool table, step histogram, cost-per-solved scatter, the
-   costliest-failing-per-day table, a link per row into `/ai/logs`), its page in the walkthrough
-   routes, and the closing browser pass.
+   was a table nothing would ever write to. `ai.telemetry.tool.degraded` ships with it. The screen is
+   `4807b518`, with `aaa0b4a2` behind it: the spec's step histogram and cost-per-solved scatter were
+   not in the route at all, so they were written as two readers over live `ai_runs` before there
+   was anything to draw them on. Each row links into `/ai/tools/{key}`, which is the screen that
+   carries a tool's own recent calls — this build has no `/ai/logs` screen, so the link goes to the
+   one that exists rather than to the path the spec named. **Left: the closing browser pass** — the
+   route and the depth pass are in the inventory and the code is committed, but the pass has not yet
+   been *run* against a live stack, and a depth pass that has never executed is a hypothesis, not a
+   gate.
 
 ### Risks / notes
 

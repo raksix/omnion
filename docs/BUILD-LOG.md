@@ -10911,3 +10911,56 @@ tick, so the pass is reported as not-run rather than reported as green.
 **One harness note worth keeping:** `QA_ONLY=backups` still ran every `media-*` depth pass.
 `wants()` filters *routes and depth passes*, but the route list itself is walked first, so a
 focused pass is narrower than it looks — and on a box this loaded, the width is what killed it.
+
+## w7 tick 71 — REQ-107 slice 5: the `/ai/telemetry` screen, and the two panels its spec promised the API could not answer
+
+**What.** `step_histogram` and `cost_per_solved` over live `ai_runs` (`crates/ai-hub/src/tool_stats.rs`),
+carried on the existing `/ai/telemetry/tools` payload; `apps/admin/lib/ai-telemetry-api.ts`,
+`apps/admin/features/ai/ai-telemetry.tsx`, `apps/admin/app/ai/telemetry/page.tsx`, a nav entry, the
+route in `scripts/qa/walkthrough.cjs` and `runAiTelemetryDepth`.
+
+**Proof.**
+
+- `cargo test -p omnion-ai-hub --lib tool_stats` → **4 passed**. Two of the four are new and both
+  assert the same distinction from the reader's side: a day that solved nothing returns `None`, not
+  `Some(0)`, and the divisor is the successes rather than the runs.
+- `cargo test -p omnion-api --test tool_stats -- --test-threads=1` → **10 passed** (5 new walks).
+- `pnpm typecheck` → **green** (admin cache miss, web cached).
+- `bun build scripts/qa/walkthrough.cjs --target node --no-bundle` → **exit 0**. Note the flags:
+  the default `--outdir` form fails with `Could not resolve: "playwright-core"` and
+  `Browser build cannot require() Node.js builtin: "child_process"`, neither of which is a syntax
+  error in the file. `--target node --no-bundle` is the check that actually parses.
+- `QA_STACK=w7 bash scripts/qa/run.sh` → **NOT RUN this tick.** The QA slot was held by w6
+  (holder `/tmp/omnion-qa-slot-holders/410124-1790902888`, pid 410133 alive, cwd
+  `/mnt/apopic/omnion-w6`) and `/mnt/apopic` sat at 97% with 2.1G free. Both recorded rather than
+  waited on. **The depth pass has therefore never executed against a live stack** — it parses and
+  is registered, and that is a weaker claim than a pass that has run, so the REQ is not closed on
+  the strength of it.
+
+**Three defects the work itself found, all of the same shape.**
+
+1. **The spec's own panels were not in the route.** The screen owed a step histogram and a
+   cost-per-solved scatter; `tools_in_window` could answer neither. Writing the screen first would
+   have produced two empty charts that look like "no runs happened" — the same class of lie the
+   previous tick found in `refresh_day` having no caller, one layer up.
+2. **`completed` is not `solved`.** A run that hit `max_steps` is recorded `completed`, so counting
+   statuses instead of stop reasons halves the denominator and doubles the reported price of every
+   success while scoring a runaway as a win. The walk seeds both and asserts one solved of three.
+3. **A day that spent money and bought nothing must have no dot.** `cost_per_solved` returns `None`
+   there, and the screen lists those days under the chart with what they spent. Drawing them at zero
+   would put the worst day in the series at the cheapest point — the one inversion a cost chart can
+   make that inverts its own meaning. Same shape as `success_percent`'s `None` versus `0`.
+
+**The schema caught my fixture, which is the useful part.** `seed_run` originally wrote
+`finished_at` and a stop reason unconditionally; the walk failed with 23514 on
+`ai_runs_finished_has_stamp` for the in-flight run. A helper that writes rows the runtime never
+produces is a fixture that fails in whichever walk happens to seed an unsettled run first — so
+`stop_reason` became an `Option` and the stamp is derived from the status. The constraint was doing
+its job; the fixture was the thing that was wrong.
+
+**Not done, named so the next tick does not discover it by reading this file:** the closing browser
+pass above; the four open acceptance rows (`ai.eval.gate.blocked` and `ai.eval.regression.detected`
+are written by `apps/api/src/ai_eval_runner.rs` and read back by no walk; rubric cost under
+`eval:judge`; `no_pii` at the run level; Run-now disabled with the permission named).
+
+**Next.** REQ-107 slice 6: the closing pass, then the four acceptance rows.
