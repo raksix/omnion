@@ -2276,7 +2276,20 @@ pub fn router(state: AppState) -> Router {
         // before a capture, so `/ai/agents/{id}/telemetry` cannot be reached by any other
         // shape.
         .route("/ai/agents/{id}/telemetry", ai_agent_telemetry)
-        .route("/ai/telemetry/tools", ai_tool_usage)
+        // REQ-099's tenant-wide tool-call counts, on **its own** sibling path.
+        //
+        // It used to be registered on `/ai/telemetry/tools`, which is REQ-107 slice 4's path —
+        // and two `get` handlers on one path is an **overlapping method route**, which axum
+        // rejects when the router is *constructed*: a panic at boot. `cargo build` stays green,
+        // a test of either handler stays green, and the whole API refuses to start. Both reads
+        // have a real consumer, so the path is split rather than a handler deleted: this one is
+        // the raw call-count table (`ai.agents.read`), REQ-107's is the success/denial/latency
+        // roll-up behind its own `ai.telemetry.read` key. Two payloads, two paths.
+        //
+        // Registered **before** `/ai/agents/{id}` on purpose: axum matches a literal segment
+        // before a capture, so without the order `tool-usage` would be read as an agent id and
+        // every call would 404 on a malformed uuid.
+        .route("/ai/agents/tool-usage", ai_tool_usage)
         .route("/ai/agents", ai_agents)
         .route("/ai/agents/{id}", ai_agent)
         .route("/ai/agents/{id}/runs", ai_agent_runs)

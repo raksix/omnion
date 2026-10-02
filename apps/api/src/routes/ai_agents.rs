@@ -640,11 +640,18 @@ pub async fn agent_telemetry_route(
     Ok(Json(AgentTelemetryView::build(&telemetry, since)))
 }
 
-/// `GET /api/v1/ai/telemetry/tools` — how often each tool was called in the window.
+/// `GET /api/v1/ai/agents/tool-usage` — how often each tool was called in the window.
 ///
 /// Tenant-wide rather than per agent, because the question it answers is "what is this
 /// installation actually spending its tool calls on", and answering it per agent would make
 /// the caller fan out over the agent list to get one table.
+///
+/// The path is a sibling of `/ai/agents`, not of `/ai/agents/{id}`, and it is registered before
+/// the capture so `tool-usage` is never read as an agent id. It was briefly registered on
+/// `/ai/telemetry/tools`, which is REQ-107 slice 4's roll-up: two `get` handlers on one path is
+/// an overlapping method route, and axum rejects that when the router is **constructed**, so the
+/// defect was invisible to `cargo build` and to any test of either handler — only a test that
+/// builds the router (or boots the API) could see it.
 pub async fn tool_usage_route(
     State(state): State<AppState>,
     current: CurrentSession,

@@ -6258,9 +6258,19 @@ export function fetchAiAgentTelemetry(
   );
 }
 
-/** How often each tool was called in the window, tenant-wide. */
+/**
+ * How often each tool was called in the window, tenant-wide.
+ *
+ * **`/ai/agents/tool-usage`, NOT `/ai/telemetry/tools`.** Both are real reads and both are
+ * mounted: this one is the raw call-count table (`ai.agents.read`), and REQ-107's
+ * `/ai/telemetry/tools` is the success/denial/latency roll-up behind its own `ai.telemetry.read`
+ * key. They were briefly registered on the same path, which axum rejects at router
+ * *construction* — the API panicked at boot while `cargo build` stayed green.
+ */
 export function fetchAiToolUsage(organizationId?: string | null): Promise<AiToolUsage> {
-  return request<AiToolUsage>(`/api/v1/ai/telemetry/tools${agentScopeParams(organizationId)}`);
+  return request<AiToolUsage>(
+    `/api/v1/ai/agents/tool-usage${agentScopeParams(organizationId)}`,
+  );
 }
 
 /** The organization selector the agent and run routes accept. */
