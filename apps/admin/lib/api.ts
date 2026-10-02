@@ -697,6 +697,33 @@ export function transferProjectOwnership(
   });
 }
 
+/**
+ * Delete a project for good (REQ-133) — the destructive half of the settings screen.
+ *
+ * **The confirmation travels in the query string, and that is the server's decision, not this
+ * client's.** `DELETE` with a request body is a shape that proxies, gateways and HTTP client
+ * libraries all handle differently, and a typed confirmation that arrives through a mechanism half
+ * the ecosystem may drop is a confirmation that vanishes on the request that matters. So the key
+ * is a query parameter, and the server answers an absent one with a named refusal
+ * (`project_delete_confirmation_mismatch`) rather than a shape error.
+ *
+ * The caller passes the project's **key**, not its id: the key is the short form an operator
+ * writes in a ticket, and typing `PAY` when the project is `PAYROLL` has to fail — that is the
+ * whole point of asking somebody to type it.
+ */
+export function deleteProject(
+  id: string,
+  confirmKey: string,
+  organizationId?: string,
+): Promise<{ project_id: string; project_key: string; removed_members: number; retained_audit_rows: number }> {
+  const query = new URLSearchParams({ confirm: confirmKey });
+  if (organizationId) query.set("organization_id", organizationId);
+  return request<{ project_id: string; project_key: string; removed_members: number; retained_audit_rows: number }>(
+    `/api/v1/projects/${id}?${query.toString()}`,
+    { method: "DELETE" },
+  );
+}
+
 /** The sites the account may see, optionally narrowed to one tenant. */
 export async function fetchSites(organizationId?: string): Promise<Site[]> {
   const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";

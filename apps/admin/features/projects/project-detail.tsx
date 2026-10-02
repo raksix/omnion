@@ -37,6 +37,7 @@ import {
 } from "@/lib/api";
 import { MoveDialog } from "@/features/workflows/move-dialog";
 import { TransferOwnershipDialog } from "@/features/projects/transfer-ownership-dialog";
+import { DeleteProjectDialog } from "@/features/projects/delete-project-dialog";
 import type { Project, ProjectMember, ProjectRole, Workflow } from "@/lib/types";
 
 /** What each role may do, in the words the members screen needs. */
@@ -73,6 +74,7 @@ export function ProjectDetail() {
   const [workflowsError, setWorkflowsError] = useState<string | null>(null);
   const [moving, setMoving] = useState<Workflow | null>(null);
   const [handingOver, setHandingOver] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const load = useCallback(async () => {
     if (!projectId) return;
@@ -552,6 +554,22 @@ export function ProjectDetail() {
             {archived ? "Restore this project" : "Archive this project"}
           </button>
           ) : null}
+          {/* The destructive half of the settings row, and the one the REQ's API table has
+              documented since the module shipped without anything behind it. Hidden on the
+              default project rather than shown-and-refused: a button that is present and
+              permanently answers `project_is_default` is a dead button by another name. */}
+          {!project.is_default ? (
+            <button
+              type="button"
+              data-project-delete
+              disabled={busy}
+              onClick={() => setDeleting(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/40 px-2.5 py-1.5 text-[12.5px] text-red-600 transition hover:border-red-500 disabled:opacity-50"
+            >
+              <Trash2 className="size-3.5" aria-hidden />
+              Delete project
+            </button>
+          ) : null}
         </div>
       </section>
 
@@ -563,6 +581,22 @@ export function ProjectDetail() {
           onTransferred={() => {
             setHandingOver(false);
             void load();
+          }}
+        />
+      ) : null}
+
+      {deleting && project ? (
+        <DeleteProjectDialog
+          project={project}
+          workflowCount={workflows.length}
+          memberCount={members.length}
+          onClose={() => setDeleting(false)}
+          onDeleted={() => {
+            setDeleting(false);
+            // The row is gone, so the detail screen has nothing left to render. A reload would
+            // land on the 404 the API now answers, which is correct but abrupt — the list is
+            // where an operator goes next, and the deleted key is in the URL only as a hash.
+            window.location.assign("/automation/projects");
           }}
         />
       ) : null}
