@@ -28,6 +28,7 @@ pub mod reliability_middleware;
 pub mod request_log;
 pub mod restore_job_runner;
 pub mod retention_runner;
+pub mod openapi_emit;
 pub mod routes;
 pub mod scope;
 pub mod search_runner;
