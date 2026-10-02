@@ -4907,3 +4907,186 @@ async fn the_security_posture_check_sees_a_real_backup_and_only_this_tenants() {
         "and the age is the newest succeeded run's, so the number can be trusted as a number: {detail}"
     );
 }
+
+// --------------------------------------------------------------------------------------------
+// The destination's room
+// --------------------------------------------------------------------------------------------
+
+/// The destination card must answer "is there room for the next backup", which is a different
+/// question from the one it used to answer.
+///
+/// Before this walk, `GET /api/v1/backups/status` carried `writable` and nothing else, and
+/// `writable` is a 31-byte write succeeding. Every number in the defect is in that sentence: a
+/// destination with four megabytes free passes the probe, every settings save succeeds, the
+/// card reads green, and the next real run dies partway through the media part — which comes
+/// back as `partial` naming an object, with the disk never named anywhere. An operator reads
+/// "writable", believes their backups fit, and finds out at 02:00 from a restore that failed.
+///
+/// Three properties, each of which the pure classification cannot see, so this walk is the only
+/// thing that can prove any of them:
+///
+/// 1. **The numbers are real.** The card is read after a real run over the real router, and the
+///    free-space figure it reports has to be a number rather than an absence — a card that is
+///    `unknown` on a working filesystem because it measured a deleted file is a dead card, and
+///    that is exactly the bug the first draft of this feature shipped (see `headroom_for`).
+/// 2. **The yardstick is this tenant's own biggest run.** A stranger's larger backup must not
+///    be consulted: that would make a tenant's card red because of a number they cannot see and
+///    do not control, and it is the same cross-tenant leak the media part had, one layer up.
+/// 3. **An unmeasurable destination is `unknown`, not `0` and not `healthy`.** Forcing this
+///    over the router would need a filesystem that fails `statvfs` on demand, so this half is
+///    pinned in the crate's own unit tests; what the walk adds is that the route *passes the
+///    absence through* rather than defaulting it.
+#[tokio::test]
+async fn the_destination_card_reports_room_against_this_tenants_own_biggest_backup() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    // A run, so there is a yardstick at all. `configuration` is the smallest part that
+    // produces an artifact, which keeps the walk fast while still giving the card something
+    // real to compare free space against.
+    let response = take_backup(&fixture.state, &token, &csrf, &["configuration"]).await;
+    assert_eq!(
+        response.status,
+        StatusCode::CREATED,
+        "the run must succeed before its size can be a yardstick: {}",
+        response.body
+    );
+    let run_id =
+        Uuid::parse_str(response.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
+
+    let cards = call(
+        &fixture.state,
+        request(Method::GET, &status_uri(), Some(&token), None, None),
+    )
+    .await;
+    assert_eq!(cards.status, StatusCode::OK);
+
+    let headroom = &cards.body["destination"]["headroom"];
+    // (1) The measurement reached the card. This is the assertion that fails against the
+    // first draft, which measured the probe's marker file — a file the probe deletes on
+    // success, so `statvfs` returned `ENOENT` and the card said "could not be measured" on
+    // every healthy destination.
+    let free = headroom["free_bytes"]
+        .as_u64()
+        .expect("a working filesystem must report free bytes to the card");
+    assert!(
+        free > 0,
+        "a real volume reports room: {}",
+        headroom["message"].as_str().unwrap_or_default()
+    );
+    assert_ne!(
+        headroom["level"], "unknown",
+        "a destination that just passed a write probe on a real volume must not read as \
+         unmeasurable: {}",
+        headroom["message"].as_str().unwrap_or_default()
+    );
+
+    // (2) The yardstick is this tenant's own biggest run, and it is the *recorded* size.
+    let recorded: i64 =
+        sqlx::query_scalar("select size_bytes from backups where id = $1")
+            .bind(run_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the run's size must be readable from PostgreSQL");
+    assert!(
+        recorded > 0,
+        "a run that produced a configuration part has a size; a 0 would make the yardstick \
+         vacuous and every destination read as unmeasurable"
+    );
+    assert_eq!(
+        headroom["largest_backup_bytes"].as_u64(),
+        Some(recorded as u64),
+        "the yardstick must be this tenant's own largest run, read from the row rather than \
+         re-derived: {}",
+        headroom["message"].as_str().unwrap_or_default()
+    );
+
+    // The message is the sentence, not a number alone: an operator who sees "1.2 GB free" and
+    // nothing else has no idea whether that is a problem.
+    let message = headroom["message"].as_str().expect("a message");
+    assert!(
+        message.len() > 20,
+        "the card carries a sentence, not a bare figure: {message}"
+    );
+
+    // (3) A stranger's much larger backup must not move this tenant's verdict. The other
+    // organization's account holds every key the restorer holds, so the write below is
+    // authorised and the only thing separating the two numbers is the tenancy scope.
+    let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
+    let stranger_run = take_backup(
+        &fixture.state,
+        &stranger_token,
+        &stranger_csrf,
+        &["configuration"],
+    )
+    .await;
+    assert_eq!(
+        stranger_run.status,
+        StatusCode::CREATED,
+        "the stranger's run must succeed, or this half proves nothing: {}",
+        stranger_run.body
+    );
+
+    // Blow the stranger's row up to 500 GB. If the yardstick were global rather than
+    // tenant-scoped, this one row would turn the first tenant's card red and name a size
+    // neither of them can see — the media-part leak again, on the number that decides whether
+    // an operator enlarges a disk.
+    let stranger_id = Uuid::parse_str(stranger_run.body["backup"]["id"].as_str().expect("an id"))
+        .expect("uuid");
+    sqlx::query("update backups set size_bytes = 500000000000 where id = $1")
+        .bind(stranger_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the stranger's row must be updatable");
+
+    let after = call(
+        &fixture.state,
+        request(Method::GET, &status_uri(), Some(&token), None, None),
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::OK);
+    assert_eq!(
+        after.body["destination"]["headroom"]["largest_backup_bytes"].as_u64(),
+        Some(recorded as u64),
+        "another tenant's backup must not become this tenant's yardstick; a shared maximum \
+         would let a stranger set this card red with a number this operator cannot see"
+    );
+    // The free-space figure must not become a function of the rows, and the check is a
+    // tolerance rather than an equality for a reason the first draft of this walk got wrong:
+    // it asserted the two readings were identical, and they were not — the stranger's run
+    // really did write a few kilobytes to the same filesystem, so free space moved by 12 KB
+    // between the two reads. An equality here would have been asserting that the platform
+    // writes nothing, which is false, and the walk would have been red for a reason that has
+    // nothing to do with the tenancy boundary it exists to prove.
+    //
+    // A megabyte of tolerance against a 1.6 GB reading is the right shape: it is far larger
+    // than any bookkeeping difference and far smaller than the 500 GB the stranger's row now
+    // claims, so a global maximum would still fail this by five orders of magnitude.
+    let first_free = free;
+    let second_free = after.body["destination"]["headroom"]["free_bytes"]
+        .as_u64()
+        .expect("free bytes after");
+    let drift = first_free.abs_diff(second_free);
+    assert!(
+        drift < 1_048_576,
+        "free space is a property of the filesystem, not of the rows: it moved by {drift} bytes \
+         between two reads"
+    );
+    assert_eq!(
+        after.body["destination"]["headroom"]["level"],
+        headroom["level"],
+        "and the verdict is a function of the two numbers above, so it must not move either"
+    );
+
+    // The writability half is untouched by all of this: the two facts are separate, and a
+    // regression that collapsed them would show up here as a missing writability claim rather
+    // than as a wrong headroom number.
+    assert_eq!(
+        after.body["destination"]["writable"],
+        json!(true),
+        "a destination that takes a write still says so; headroom is an additional fact, not a \
+         replacement"
+    );
+}

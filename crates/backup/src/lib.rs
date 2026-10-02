@@ -58,8 +58,8 @@ pub use crypto::{
     seal as seal_archive,
 };
 pub use destination::{
-    DestinationReport, PROBE_FILENAME, local_path_for, local_root_for, probe_local, storage_key,
-    storage_prefix,
+    DestinationReport, Headroom, PROBE_FILENAME, classify_headroom, headroom_for, local_path_for,
+    local_root_for, probe_local, storage_key, storage_prefix,
 };
 pub use error::{BackupError, Result};
 pub use media::{
@@ -98,7 +98,7 @@ pub use store::{
     organizations_with_backups,
     protected_backup_count, prune_candidates, record_schedule_run, save_part, save_settings,
     schedule_appears_due, set_prefix, set_protected, set_schedule_enabled,
-    set_schedule_next_run, start_run, totals, last_succeeded_at,
+    set_schedule_next_run, start_run, totals, last_succeeded_at, largest_backup_bytes,
     upsert_schedule,
 };
 pub use sweep::{
