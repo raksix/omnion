@@ -7789,3 +7789,81 @@ defect in the code.
 
 **Next:** the browser pass with `--only=backups` on a free slot, then the status-card browser
 tick and the walkthrough criterion.
+
+## 2026-10-02 — omnion-build tick 107 · REQ-012, two rows that still named a slice as missing
+
+**What.** REQ-010 was first in wave order and its only open box was the browser pass, which the
+shared QA slot would not give me this tick (below), so the tick went to the next REQ with **open
+code work** rather than being spent blocked. REQ-012 carried three boxes with no prose at all —
+unproved, not merely browser-blocked — and the first of them turned out to be two real defects.
+
+**Defect one: two probes frozen on a slice number that had already shipped.** `csp_configured`
+and `rate_limiting` returned a literal `Probe::unreadable("... configured in slice 2/3; nothing to
+verify yet")`. Slices 2 and 3 shipped: `0135_security_headers.sql` creates and seeds
+`security_settings.headers`, `0151_security_rate_limits.sql` adds `rate_limits` to the same
+singleton row, and `/security/headers` and `/security/rate-limits` have been writing through both
+since. So `/security` reported *"Not checked yet — nothing to verify yet"*, with the row's own
+action link pointing at the page where the policy was plainly on screen.
+
+**No test could have caught it, and the reason is worth stating precisely.** The check's contract
+is *"never claim `pass` without a fact"* — and the old answer was **honest about its own probe**
+while saying nothing whatever about the platform. A rule that constrains what a check may conclude
+does not constrain how *current* its inputs are.
+
+**Defect two, found by the walk written to measure the first, and worse.** `csp` counted
+directives with `value["directives"].as_array().len()`, while the probe fact carries
+`{"directives": <integer>}` — it reads `HeaderPolicy::csp.len()` because a count is what a row
+shows. Every real policy therefore read as **zero** directives and the row sat at `fail` — *"an
+empty policy blocks nothing and protects nothing"* — on a platform whose stored policy was the
+four-directive baseline. The three unit tests over that function could not see it: they build the
+probe fact **by hand** as `{"directives": [ … ]}`, a shape no writer in the crate produces. A test
+that fabricates its own input proves the reader it imagined. This is the same blind spot as tick
+105's manifest checksum, tick 106's `last_run_at` and REQ-010's purge walk, and the rule is now
+written down: **the shape must come from the writer.**
+
+Both shapes are accepted after the fix, because `directives` is a count of rows either way, and
+the zero case still `fail`s — so the fix trades no wrong `pass` for a wrong `fail`. The two probes
+now read through the crate's own readers (`load_headers`, `load_rate_limits`) rather than a
+second query, the limiter counts the **merged** policy because that is what the middleware
+resolves, and **every scope disabled is `fail`, not `pass`** — a limiter limiting nothing is the
+one state where green would be the most expensive row on the screen.
+
+**What the walk lost to its own fixtures, kept here because both were instructive.**
+
+* It asserted the first run would read `unknown`, and failed `left: fail, right: unknown`. A fresh
+  install is **not** an unverified platform: the migrations seed `headers = {}` and
+  `rate_limits = []`, and both readers treat an empty document as **the baseline** — deliberately,
+  so a missing row never means "send no headers". The honest first-run answers are `warn` and
+  `pass`.
+* It read the probe fact from the top level of `detail`, where the sentence and the reason live.
+  It lives under `detail.fact`.
+* Its policy had no `script-src`, and `HeaderPolicy::new` refuses one: *"a policy needs
+  `script-src` or `script-src-elem`"*. That was the fixture's fault, and the validator that held
+  was the validator working.
+
+**Gates, all run this tick:**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-security --lib --quiet` | **209 passed**, 0 failed (was 208) |
+| build | `cargo build -p omnion-api` | exit 0 (pre-existing warnings only) |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **12 passed** (was 11), 103 s |
+| compile | `cargo test -p omnion-api --test security --no-run` | exit 0 |
+| types | `pnpm typecheck` (apps/admin) | exit 0 |
+| proven to fail | `directives` reader regressed to `as_array().len()` | **FAILED in both gates** — unit `left: fail, right: pass`, walk `left: fail, right: warn` |
+
+The regression fails in both gates, and it fails with **the symptom the defect produced** rather
+than an unrelated error — which is what makes it a proof instead of a colour change.
+
+**Not run: the browser pass.** The shared QA slot was held live by `w3` for the whole tick
+(`/tmp/omnion-qa-slot-holders`, verified with `kill -0` and `/proc/<pid>/cwd`, not the file name).
+`/mnt/apopic` was also at **96% with 2.5 G free**, and a pass rebuilds `.next` (~1.5 G) — it would
+have died on disk rather than reported a finding. REQ-012's walkthrough box and the *screen* half
+of the posture box stay open for that reason and not for a defect in the code. Per the slot
+discipline the tick was not spent blocked: it queued the pass and took the code work instead.
+
+**Commits:** `bbaaf589` (the count), `83d9becd` (the two probes), `7346f123` (the walk), pushed.
+
+**Next:** the browser pass with `--only=security` on a free slot and room on the disk, which closes
+the rendering half of the posture box and REQ-012's walkthrough box; then REQ-012's locked-account
+screen box (a fixture-locked account unlocked through the panel's own button).
