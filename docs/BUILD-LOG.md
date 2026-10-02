@@ -12785,3 +12785,103 @@ are now *reachable at 390 px*, not that they render without horizontal scroll. T
 stays unticked until the pass reports.
 
 **Next.** The focused pass, then acceptance 18 and REQ-064's close. REQ-062 is next in wave order.
+
+---
+
+## 2026-10-02 · wave2 tick 70 · a dead selector, and the two wrong strippers that nearly hid it
+
+**What.** No product code this tick. The QA slot has been held live by `w4` for three consecutive
+ticks (holder pid `2327603`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0` and
+`/proc/<pid>/cwd`; load 282, `/mnt/apopic` 95%), so the browser pass could not run and acceptance
+18 stays unticked. Rather than spend the tick waiting, this is the slot-independent work the tick
+order asks for, and it found a defect in **my own wave's** depth pass that has been dead since the
+day it was written.
+
+**The defect: `runMembersDepth` never blocked anybody.** The pass asked for
+`[data-member-drawer-action="block"]` and `[data-member-drawer-action="delete"]`. The product renders
+**no such hook**: `SmallButton` emits `data-member-action={hook}`, and the table rows, the phone card
+list and the drawer all share it. So `click()` matched nothing, threw into the `.catch(() => {})`,
+the block dialog never opened, and every step from there — `blockDialogAskedForAReason`,
+`blockedInSql`, `blockRemovedTheSessionRow`, `blockedMemberIsRefused` — reported on a member that
+was never blocked. The delete leg died the same way. The comments immediately above both lines state
+the intent in as many words ("the drawer's block button is a **named** hook, not 'the first
+action'"), which is why the selector was never questioned: it was a plausible name for a real
+control. Acceptance 16's browser half and the destructive-action checks of the members screen were
+all resting on it.
+
+The fix scopes the selector to the drawer rather than just renaming it, and that is the substantive
+part: `[data-member-drawer="${memberId}"] [data-member-action="block"]`. A bare
+`[data-member-action="block"]` with `.first()` would have been **worse** — it resolves to a *row*
+button (the table renders before the drawer in DOM order) while the assertions below read the member
+whose drawer was opened, so the pass would have driven one member and measured another, and reported
+green. A selector that matched nothing was at least honest about failing.
+
+**The gate that found it, and the two wrong versions of it.** `scripts/qa/probe-selector-contract.cjs`
+is a static read: every `[data-*]` the walkthrough addresses must be a name the product renders. It
+costs milliseconds, needs no browser, no database and no slot — which is the entire reason it could
+do work on a tick the pass could not. Getting it to be *trustworthy* took three attempts, and both
+earlier attempts failed in the same direction, which is the lesson worth keeping:
+
+- **Version 1** stripped comments with `replace(/\/\*[\s\S]*?\*\//g, …)`. This repo contains
+  `placeholder="/blog/*"`; the pattern took that slash-star for a comment opener and ran to the next
+  terminator in the file, swallowing **18,106 characters and 600 lines of real JSX** in
+  `user-detail-view.tsx`. Four real `data-factor-*` hooks were then reported as missing by a product
+  that renders all four. The failure was *loud* (red), which is the only reason it got caught.
+- **Version 2** was a proper character scanner that also tracked string literals. It fixed that file
+  and broke a different one: `analytics/settings-view.tsx` contains the JSX prose
+  `a prefix (/admin/*) or`, and in JSX text a quote is not a string delimiter, so the scanner left
+  its string state. Eight real `data-analytics-purge-*` / `data-analytics-erase-*` hooks vanished —
+  and that failure was **silent**, because a gate that finds fewer things is indistinguishable from a
+  clean tree. Shipping that would have replaced a loud red with a green lie.
+- **Version 3** blanks only a comment that **starts a line** (after indentation), which is the crudest
+  rule that cannot misfire: in this codebase every comment delimiter is at the start of a line and
+  no JSX prose line begins with one. A trailing `//` is left in, which can only ever cause a *false
+  finding*, and every finding is hand-checked before anything changes. Both regressions are pinned as
+  checks, on the real lines from the real files that broke versions 1 and 2.
+
+**A gate that resolves nothing also reports zero**, so the "can fail" proofs re-run the SAME
+`unresolved()` predicate with one resolution path removed each time — not a re-implementation, which
+would measure the re-implementation: string-prop indirection (`dataAttribute=`), `id=` indirection
+(what `aria-describedby` points at), the OR-alternative escape, and the harness's self-injected
+`data-qa-idx`. A first attempt at this block was a **tautology** — it computed a set and asserted a
+name was absent from it, which holds whether or not the predicate runs — and it is called out here
+because a proven-to-fail check that cannot fail is worse than no check.
+
+The OR-alternative escape nearly hid the real defect on its own: it first looked for alternatives in
+a ±240 character **window**, and in a 16,000-line file that window is full of unrelated selectors, so
+some other part of the file mentioning a real hook "rescued" `data-member-drawer-action` and the gate
+reported **zero findings**. It now parses the actual comma-joined selector group, which is what the
+browser does.
+
+**Six of the first seven candidates were false positives**, and each was instructive: a JSX
+*expression* attribute (`data-content-api-tab={entry.label.toLowerCase()}` — the literal never
+appears), an OR-alternative whose second branch is real, `id="push-enable-reason"` (a data attribute
+there would be asking the product to render the same string twice), a string prop interpolated by a
+component helper, a hook the harness injects into the page itself, and a selector that appears only
+inside a **comment** as a note about what the component deliberately does not carry. A gate that
+reports those would be a gate nobody runs.
+
+**Proof**
+
+| Gate | Command | Result |
+|---|---|---|
+| Rust (the crate this wave owns) | `cargo test -p omnion-content --lib --quiet` | **349 passed, 0 failed**, exit 0 |
+| Selector contract (new) | `node scripts/qa/probe-selector-contract.cjs` | **16/16, exit 0** — 2028 rendered hooks, 0 unresolved |
+| …and it can fail | same gate against `git show HEAD:scripts/qa/walkthrough.cjs` | **3 checks red, exit 1**, led by `data-member-drawer-action (line 7824)` |
+| Screen inventories (acceptance 18's gate) | `node scripts/qa/screen-coverage.cjs` | **PASS**, exit 0 |
+| Harness syntax | `node --check scripts/qa/walkthrough.cjs` · `bash -n scripts/qa/run.sh` | both clean |
+| Wiring | `grep -c selector-contract scripts/qa/run.sh` | 1, before the database reset |
+
+**One environment finding, recorded because it will bite again.** `pnpm typecheck` failed with ~200
+`TS1005`/`TS1128` errors in `.next/dev/types/routes.d.ts` — a **gitignored, generated** file, whose
+`ParamMap` is truncated mid-line into a foreign writer's tail (`services/[key]": { "key": string; }`).
+The mtime did not move across three samples and the error line numbers shifted between two
+consecutive runs, which is the signature of a torn write rather than a parse problem. The file is
+deleted by `run.sh` on every pass anyway; removing it by hand is the same action. This is **not** a
+source defect and it is **not** this tick's change, but a typecheck that cannot be run is a gate
+that is not being run, so it is written down rather than dismissed.
+
+**No box ticked.** Acceptance 18 is a *measured* criterion and no pass ran.
+
+**Next.** The browser pass (the members depth pass is the one that can finally answer the block and
+delete legs), then acceptance 18 and REQ-064's close. REQ-062 is next in wave order.
