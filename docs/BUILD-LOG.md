@@ -12020,3 +12020,39 @@ tree. `/mnt/apopic` went 98 % → 91 %.
 written), which closes the `partial`-run criterion and the status-card boxes; then slice 4's
 status-depth half — the destination health card and the security/health cross-links — and the
 unencrypted-mode warning on the settings screen.
+
+## 2026-10-02 · wave2 tick 66 · REQ-063 criterion 17 CLOSED, plus the harness defect that hid it
+
+**What.** The block editor's 390 px / 1440 px criterion is measured and ticked, and the pass
+produced two findings, both fixed in this tick.
+
+1. `block-canvas.tsx` drew each `column` slot as a labelled box with no
+   `data-block-canvas-block`, while `count_tree` counts a slot as a node. The status bar reads the
+   server's count (26 nodes on the fixture revision, 10 of them slots); the canvas counted only
+   content. `canvasCountMatchesStatus` measured that disagreement: 7 drawn against 12 stated. The
+   column frame now carries `data-block-canvas-block="column"` and `data-block-canvas-mode`.
+2. Seven depth passes ran UNCONDITIONALLY below the entry points, so `--only=block-editor` also
+   ran forms, menus, comments, newsletter, themes, theme-settings and members — and died in the
+   newsletter fixture on `newsletter_subscribers_site_id_fkey`, after the block-editor summary had
+   already been written. All are behind `wants()` + `matchedOnly.add(...)` now; `members` is
+   skipped on a focused pass because it has its own entry point.
+
+**Proof.**
+- `QA_STACK=w2 QA_API_PORT=18081 QA_ADMIN_PORT=3101 QA_WEB_PORT=3201 QA_ONLY=block-editor bash
+  scripts/qa/run.sh` → `qa-artifacts/20261002-064418/summary.json`: `missing: []`, `netFailures` 1,
+  `scoped: ["block-editor"]`, `canvasCountMatchesStatus` true (12/12), `canvasDrawnAt390` true,
+  `previewDrawnBlocks` 12 = `previewStatedVisible` 12, `previewPhoneBlocks` 12,
+  `historyCoversFifty` true at depth 72, `unwindLandedOnSavedTree` true, `publicRendered` true.
+- `cargo test -p omnion-content --lib --quiet` → **349 passed, 0 failed**.
+- `node scripts/qa/test-only-filter.cjs` → PASS. `node --check scripts/qa/walkthrough.cjs` clean.
+- `pnpm typecheck` → 2/2 successful.
+
+**Read the two `false` readings as answers, not defects.** `addColumnDisabledAtMax` is false
+because the fixture holds two columns rather than four; `outlineWarningPublishDisabled` is false
+because criterion 7 requires a heading-order warning to be advisory. The single `netFailure` is a
+404 on the pass's own placeholder media id.
+
+**Next.** REQ-063's slices are all shipped and criterion 17 is its last open box, so it closes as
+`done` on the next tick once the checklist is read back. Wave-2 order after it: REQ-064 (menus,
+forms, SEO, redirects, scheduled publishing, comments, newsletter, memberships — all shipped, needs
+its own criterion sweep), then REQ-062, REQ-019.
