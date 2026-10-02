@@ -12473,3 +12473,74 @@ all of them are closed too.
 **Next.** Criterion 18 stays unticked until the `--only=menus,forms,seo,comments,newsletter,themes,
 blocks,patterns,page-templates,publishing-queue,theme-builder,theme-upload` pass returns — queued
 behind w7's holder as this entry is written. Then REQ-064's own criterion sweep, REQ-062, REQ-019.
+
+## 2026-10-02 · wave2 tick 68 · the script that DROPS a database defaulted to the wrong writer's
+
+**The box rebooted two minutes into this tick** (load 496 decaying, 45 orphaned chrome from the
+reboot storm). Two things that looked like one: the private `omnion-postgres-w2` container was
+`Exited (255)` and the QA slot directory was **empty**, which is the shape a free slot always has.
+`docker start omnion-postgres-w2` answered `the database system is starting up` for ~20 s before
+`DB_OK` — per this repo's own ledger, that is recovery and not a hang, so the wait was correct.
+
+**The pass froze, and the freeze was diagnosable in seconds.** `--only=menus,forms,seo,comments,
+newsletter,themes,blocks,patterns,page-templates,publishing-queue,theme-builder,theme-upload` took
+the slot, compiled, and then sat at **0.0% CPU with no log line for fifteen minutes** while a
+sibling's pass ran 646 chrome processes on the same box. `top` showed its chrome child with 1.25 s
+of CPU *total*. That is a deadlock signature, not slowness: slowness burns CPU. The stack itself
+answered throughout — `/login` 200 in 30 ms, `/api/v1/themes` 401 in 14 ms — so the server was
+healthy and the client was not making requests. Killed by process group; the summary it did write
+holds 22 steps, 18 false, all of `themes`, and `ok: None` / `netFailures: None` — **a pass that
+was interrupted is not a red product result and must not be read as one.**
+
+**Cleanup was exact, which is the part that is easy to get wrong.** The kill left a `qa-slot.sh`
+waiter alive (its own pgid, not the pass's — killing the pass alone frees the queue but leaks the
+waiter) and the w2 pm2 stack still up. Both cleared **by name**: `pm2 delete omnion-qa-*-w2`, never
+`pm2 kill`. The dead holder `212944-1790932384` was **not mine** — I checked `kill -0` (DEAD) and
+that it was not my pgid before deciding, because reclaiming a sibling's place file by hand is how a
+writer's queue gets a 75-minute hostage. Left for the reaper.
+
+**Then the tick turned up something worse than the freeze: `reset-db.sh` drops the MAIN writer's
+database.** I ran it by hand to get a clean stack — the natural thing to do while debugging — and it
+reported `database "omnion_qa" does not exist, skipping`. It defaults `QA_DB` to `omnion_qa`
+unconditionally and **derives nothing from `QA_STACK`**, while `run.sh` derives `omnion_qa_w2` and
+exports it. So every pass through the harness was correct and the direct call was not: a different
+writer's stack, told to reset, aimed a `DROP DATABASE … WITH (FORCE)` at someone else's work.
+Nothing in the harness could catch it, because the harness is the part that was right. `985e048d`
+derives the name the way `run.sh` does and refuses any name that is not `omnion_qa[_<stack>]` —
+refusing **before** `docker exec`, because a guard that warns and then drops is not a guard.
+
+**The guard was wrong in the exact class it exists to prevent, and its own test said so.**
+`case "$DB" in omnion_qa|omnion_qa_*)` is a **shell glob**, and `*` matches the empty string — so
+`omnion_qa_`, the typo that looks most like a QA name, **passed the guard and would have been
+dropped**. A regex bracket (`_[a-z0-9]+`) fixed it. This is the same shape as the `--only` filter
+that matched nothing and therefore ran everything: a guard that admits the case it was written to
+reject is indistinguishable from no guard. Two further failures in that test were mine, not the
+script's: I asserted exit `0` where the script correctly returns `2`, and I piped the refusal into
+`grep -q` so the check reported **grep's** exit status as though it were the script's. Reading the
+message into a variable fixed it.
+
+**Proved able to fail, on a copy, not on the real script.** Reverting `reset-db.sh` to the old
+default in `/tmp` makes `test-reset-db-identity.sh` report **9 of 12 checks red and exit 1**, led by
+`QA_STACK=w2 drops omnion_qa_w2, not omnion_qa (expected: omnion_qa_w2, got: omnion_qa)`. The
+harness runs the real script against a recording `docker` on PATH, so nothing is ever dropped and
+the assertion is on the command the script *would* run. Wired into `run.sh` **before** the reset,
+because the operation is destructive.
+
+**Proof**
+
+| Gate | Command | Result |
+|---|---|---|
+| Reset-db identity | `bash scripts/qa/test-reset-db-identity.sh` | **12/12**, exit 0 |
+| The same gate vs the old script (copy in /tmp) | — | **9/12 red, exit 1** |
+| Shell syntax | `bash -n run.sh reset-db.sh` | both OK |
+| Screen inventories | `node scripts/qa/screen-coverage.cjs` | PASS, exit 0 |
+| `--only` filter | `node scripts/qa/test-only-filter.cjs` | PASS, exit 0 |
+
+**No box ticked.** REQ-064's acceptance 18 is still unticked and the pass that would answer it died
+at `themes` under sibling contention (646 chrome, 20 GB used). `themes` at 18/22 false is **not**
+evidence about the themes screen — it is the frozen pass's own stall, and recording it as a product
+defect would be the same mistake as ticking a stale red. Criterion 18 stays open.
+
+**Next.** Re-run the focused pass on a quiet box (w6's holder has to clear). REQ-062 is next in wave
+order after REQ-064's criterion sweep; `pnpm typecheck` + `omnion-content --lib` are green on the
+merged tree and this tick touched no Rust.
