@@ -13079,3 +13079,44 @@ discipline the tick was not spent blocked: it queued the pass and took the code 
 **Next:** the browser pass with `--only=security` on a free slot and room on the disk, which closes
 the rendering half of the posture box and REQ-012's walkthrough box; then REQ-012's locked-account
 screen box (a fixture-locked account unlocked through the panel's own button).
+
+## Tick 73 — wave 4 / REQ-051 · 57 walks green for the first time
+
+**Merged first:** `origin/main` was at tick 107, this branch at 72. One conflict, `docs/BUILD-LOG.md`,
+resolved with `scripts/qa/merge-build-log.py` and proved by **multiset, not line count**: base 183 /
+ours 183 / theirs 106 entries → merged 186, with `MISSING FROM OURS: 0` and `MISSING FROM THEIRS: 0`.
+The merge touched no CRM or `modules/` file, so nothing of this branch's work moved.
+
+**What:** finished the thing tick 72 said was blocked. `omnion_qa_w4` had carried 996 organizations and
+4553 search documents from earlier ticks; five walks call `POST /search/reindex`, and each one rescans
+every row any previous run wrote. It now holds 334 organizations / 1447 documents, and walk 27 — the one
+that stalled ~9 minutes last tick — completes inside the run.
+
+**Proof:**
+
+- Full walk set, run as the **compiled binary** from `apps/api` (cargo swallows test stderr):
+  `57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 58.12s`
+- The boot guard is now **visible in the artifact**: `CRM_FIXTURE_TRACE=1` yields
+  `[fixture] iam seed 8132.5 ms` **exactly once in 57 walks**, while `connect+migrate` appears for all
+  57 — each walk still builds its own `AppState`/`Db`, which is tick 72's fix staying correct.
+- `cargo test -p omnion-module-crm --lib` → `172 passed; 0 failed`, and now **warning-free**
+  (the stray `use sqlx::Execute as _` in `modules/crm/src/contacts.rs` is gone, ecfe3227).
+- `pnpm typecheck` → `2 successful, 2 total`.
+- Zero `53100` / "No space left" occurrences in the final trace.
+
+**The failure worth reading twice:** the *first* re-run of the identical binary against the identical
+database returned **1 passed / 56 failed**, every one of them
+`PgDatabaseError 53100: could not extend file — No space left on device` inside
+`crm_seed_default_pipeline`. Nothing was wrong with the CRM: `/mnt/apopic` was at **100 %** (192K free)
+and this database's data directory (`/mnt/apopic/pg-w4/data`) is on that same volume. The fix was not a
+line of Rust — `.tmp-target/` (3.5 GB) had been left behind in this worktree by an earlier tick, with zero
+open file descriptors and zero writes in 30 minutes. Removing it put the volume back to 91 % / 5.3 GB free,
+and the *same binary* then returned 57/57. A test name tells you which walk died; only the SQLSTATE tells
+you why.
+
+**Not claimed:** no acceptance box ticked. The three that remain — empty/loading/error states, mobile
+390×844, keyboard — are browser-only, and the QA slot was held all tick by two genuinely live passes
+(w5 pid 965150 cwd `/mnt/apopic/omnion-w5`, w2 pid 2860733 cwd `/mnt/apopic/omnion-w2`).
+
+**Next:** take the slot and run `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash
+scripts/qa/run.sh --only=crm`, which closes the three browser-only boxes and REQ-051 itself.
