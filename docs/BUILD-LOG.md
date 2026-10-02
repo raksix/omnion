@@ -11915,3 +11915,75 @@ instead of it — and the run-from-here note with `runStarted` / `runFinished` b
 Then continue the sweep for the other two shapes this REQ keeps finding: a field read from a
 payload the server does not send (this tick), and a field read from an attribute that is written as
 a *value* rather than a name (tick 87).
+
+---
+
+**Tick 90 — the field sweep written last tick had never returned a non-zero result, and it was the
+last gate standing between the walkthrough and a 404.**
+
+`scripts/qa/probe-api-fields.mjs` sat untracked in the tree from tick 89. Run, it printed
+`walkthrough response sites with field reads: 0`, `UNKNOWN FIELDS: 0`, and **exited 0**. The reason is
+one character of lookahead: `readWindow` required that the character immediately after each `fetch(…)`
+call be `{`, and after a fetch that character is `;`, `)` or `.` in **every row this walkthrough has**.
+The window was empty for all 94 API calls. So the sweep that exists to catch tick 89's defect would
+have been green on tick 89's defect.
+
+**The coverage floor was in the wrong place.** `all.length >= 8` sat inside the `--self-test` branch,
+so the mode anybody actually runs had no coverage assertion at all — and the printed `0` is exactly the
+output that reads as clean. Both floors (`sites >= 8`, `verified >= 4`) now fire in gate mode. The
+second exists because a site whose path resolves to no handler is *skipped*, not reported: a sweep that
+found sixteen paths, verified none, and called two of them sites would clear the first floor.
+
+**Four defects were hiding behind the empty window, and each was checked against the handler's return
+type before being called a defect rather than a probe artifact:**
+
+1. `/workflow-executions/{id}` sends `execution`, not a top-level `id`. The row read
+   `run.id` / `run.status` / `run.started_from_node` — `status` and `startedFrom` were **permanently
+   null**, which is what a run that never started looks like, and `executionId` was right only because
+   `?? latest.id` fell back to the list row above it. Fixed at `d27db268`; the fallback is gone and the
+   row now reports `detailSendsExecution`.
+2. `trigger_kind` — tick 89's third finding, now covered by a gate rather than by a row's own comment.
+3. `body.error.code` on the graph path: **over-attribution, the mirror of tick 89's under-reading.** The
+   unfinished-save row fetches `/run`, `/graph` and `/executions` and assembles one `return { … }`, so
+   the run's refusal envelope was charged to an endpoint that never sent it.
+4. `captured?.event_name`: a narrowed **local**, not a bound payload. Legitimately excluded once
+   attribution is by name.
+
+**`error` resolves against the real `ErrorDetail` — which is a private struct with private fields.**
+`structFields` required `pub struct` *and* `pub field`, so the platform's own refusal envelope resolved
+to zero fields and its own key was reported as a field no endpoint sends. Visibility is a Rust-level
+statement; the wire is not Rust. Two searches for a struct's header existed and only one was fixed
+(`reachableStructs` kept demanding `pub`), which is why the first attempt appeared to do nothing; there
+is now one (`structBody`). The field cache is keyed by source too — two modules' same-named types were
+colliding, and a wrong-but-plausible field list produces findings that look reasoned.
+
+**Five false positives were mine while fixing it, and each is recorded where it happened:** stripping
+comments by *joining* deleted characters and walked every reported line off the end of the file (now
+blanked, offsets preserved); a comment explaining *why* `after.error` is wrong put `after.error` straight
+back into the sweep — a gate that cannot tell a mention from a use reports the author of the fix as the
+author of the defect; template `${id}` was read as a payload field; a bound-payload pattern requiring
+parentheses matched none of the guarded rows; and a "does this mention fetch?" test discarded every
+nested binding. **The surviving mutation matters: adding `body.runs` — tick 89's exact defect — turns
+the gate red on a NAMED finding (`no such field`, exit 1), with `walkthrough.cjs` restored byte-exact.**
+
+**Proof.** `node scripts/qa/probe-api-fields.mjs` → **0 unknown over 10 sites, exit 0** (was `0 sites,
+exit 0`) · `--self-test` → **11/11** (was 10 PASS + 1 FAIL) · mutation `body.runs` → **exit 1, named
+finding**, file restored byte-exact · `probe-api-routes.mjs` → **0 unresolved**, `--self-test` **5/5** ·
+`node --check` on both files clean · `bash -n scripts/qa/run.sh` clean · `pnpm typecheck` → **2/2**.
+
+**Slot.** The dead holder (w8's pass, pid 2878882) was past the reaper's 120s grace and was reclaimed;
+the place then went to a live main-writer pass (54 Chrome, 1G RAM free, load 23.7), so **no browser pass
+was taken**. Both static sweeps now run in `run.sh` *before* the browser, so a pass can no longer reach
+the browser with a 404-shaped defect in it — they were run by hand for two ticks before anyone noticed
+they were not wired in, which is how a gate stops being run.
+
+**Disk.** `/mnt/apopic` hit 100% mid-tick (a `patch` write failed with ENOSPC). 0.58G reclaimed by
+deleting **stale duplicate** rlibs in `omnion-w2-target` — 131 rlibs there were modified in the last
+25 minutes, so the active build was left alone and only older copies of the same crate were removed.
+
+**Commits:** `1f225d32`, `d27db268`, pushed.
+
+**Next:** the focused pass (`--only=workflow-table,workflow-builder`) the moment the slot frees, reading
+`keyboard-pass` with `runStartedFromKey` beside `runCountBeforeKey`, and the run-from-here note with
+`runStarted` / `runFinished` beside `runSettled`. Then the 11 open criteria, each of which is waiting on
+that one pass.
