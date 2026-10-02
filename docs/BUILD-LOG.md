@@ -12896,3 +12896,83 @@ pass that never ran.
 now standing between slice 3 and `done`. Then the catalogue rows for the ten emitted-but-unregistered
 names (`update.available`, `organization.module.*`, `organization.member.*`), which stay red on
 purpose until the three waves that emit them describe their payloads.
+
+### Tick 113 — REQ-033 slice 4: the section root, and the account the owner cannot stand in for
+
+Two items the slice had named as *not yet built* are in: the overview cards and the read-only
+management-control check. Neither closed a REQ — both are still open on the browser pass — but the
+second one is the reason this tick's work is worth more than it looks.
+
+#### The overview
+
+`/developer` is the section root six screens had no landing page for, so the section could only be
+entered by already knowing which child you wanted. Every figure on it is read from the same list
+its own destination renders. That constraint is the design, not an implementation detail: a card
+that showed its own hardcoded count would disagree with the screen it links to, and a person who
+sees two numbers for one thing stops trusting both.
+
+The rule the screen is actually built around is that **a zero and a refusal are different
+shapes**. "This tenant has no keys" and "this account cannot read the keys" render identically on a
+card and mean opposite things, so a failed read becomes a refusal naming its permission, and the
+page still shows the other five. `everyCardCarriesANumberOrAReason` checks that per card rather
+than by count, and its inverse `noCardShowsAnUnresolvedPlaceholder` is checked **after a reload** —
+the property under test is "settled", not "waited long enough", and only a fresh paint tells the
+two apart.
+
+#### The fixture, and the three defects that only running it found
+
+`scripts/qa/seed-readonly-developer.cjs` creates an account holding `developer.*.read` and not
+`developer.sdks.scaffold`. The password hash is **copied from the existing owner**, never
+generated: there is no public register route on a fresh tenant, and re-implementing argon2 would be
+a second implementation of the thing being verified — one that can be subtly wrong and make the
+probe fail for a reason that has nothing to do with permissions.
+
+Reading it would have shipped all three of these:
+
+1. **The seeded email did not exist.** `admin@omnion.test` is a plausible default and not the
+   account `run.sh` creates, so `source` was an *empty CTE* — which produces a successful statement
+   and an account that was never inserted. A fixture's worst failure mode: it looks like a
+   permission problem rather than a missing row.
+2. **The held-check compared a whitespace string to `"0"` and inverted itself.** psql's `-t -A`
+   output ends in a newline, so `held === "0"` was false on a role that held two reads — and the
+   failure message said the account *holds* the key it exists to deny. The assertion was readable
+   and backwards at the same time, which is why it is now `Number(held) !== 0`.
+3. **A non-recursive CTE counts the table as it was before its own insert.** The grant count came
+   back `1` on every run against a role holding two permissions. Counting the *insert* instead is
+   not the fix — `on conflict` rows are not returned, so that reports `0` on every re-run, which is
+   the same class of lie in the other direction. The count moved to a second statement.
+
+Two guards now refuse to let a broken fixture pass: it exits if the account holds the key it
+exists to deny, and exits if the role holds **no reads at all** — a role with no reads is refused
+by everything, which renders exactly like a correct hiding.
+
+#### The panel bug this tick found on the way
+
+`text-danger` is used in **eleven** feature files and `--color-danger` was declared nowhere. Tailwind
+compiles an undefined token to no rule, so every "this failed" message in the panel inherited the
+surrounding muted grey. A destructive affordance rendered as the quietest text on the screen reads
+as settled, which is worse than no colour. The token and its soft/strong pair are now declared with
+the ratios stated rather than assumed (7.53:1 on surface, 6.30:1 on the soft tint, both AA), and the
+class resolves to `color:var(--color-danger)` in the built CSS.
+
+#### Gates
+
+| Gate | Command | Result |
+|---|---|---|
+| developer | `cargo test -p omnion-developer --features store --lib --quiet` | **196 passed**, 0 failed |
+| types | `pnpm typecheck` (apps/admin) | clean, exit 0 |
+| build | `next build` (apps/admin) | compiled; `/developer` in the route list |
+| syntax | `node --check` (walkthrough, fixture) | clean; `bash -n` on run.sh |
+| fixture | `node scripts/qa/seed-readonly-developer.cjs` | 2 read scopes, idempotent on re-run |
+| fixture, proven to fail | role granted `developer.sdks.scaffold` | **exit 1**, names the key |
+| CSS | `.text-danger` in the built stylesheet | `color:var(--color-danger)`, AA measured |
+| pass claims | agreement + destination + placeholder, lifted | fail both ways, 3/3 |
+
+**Browser pass: still owed.** The global QA slot was held live on every attempt this tick — first
+by main, then by w6 — and `/mnt/apopic` sat at 93-94% with 35 Chrome processes on the box. A pass
+launched into that measures the box rather than the product. The work is committed and queued; the
+read-only sign-in claim in particular has never been exercised by any pass.
+
+**Next:** the pass over `/developer`, `/developer/sdks`, `/developer/events` and `/developer/oauth-apps`,
+with the read-only account's sign-in; then the catalogue rows for the ten emitted-but-unregistered
+names, which stay red until the three waves that emit them describe their payloads.
