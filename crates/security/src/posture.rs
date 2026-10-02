@@ -374,10 +374,27 @@ fn csp(env: &Environment) -> CheckOutcome {
         .get("mode")
         .and_then(Value::as_str)
         .unwrap_or("report_only");
+    // **The count is read as a number, not as an array.** This read was `as_array().len()`,
+    // which silently answered `0` for a probe fact carrying a *count* — so every real policy
+    // took the "no directives" branch and the row sat at `fail` with the reason *"an empty
+    // policy blocks nothing and protects nothing"*, on a platform whose stored policy was the
+    // four-directive baseline. The three unit tests over this function never saw it, because
+    // they build the probe fact by hand as `{"directives": [{"name": …}]}` — a shape **no
+    // writer in this crate produces**; the probe carries `{"directives": <integer>}`. A test
+    // that fabricates its own input proves the reader it imagined, which is the same blind
+    // spot as REQ-010's purge walk and tick 106's `last_run_at`: the shape must come from the
+    // writer.
+    //
+    // Both shapes are accepted, and the array arm is what keeps the existing tests meaningful
+    // rather than deleting them. Accepting both is honest here because `directives` is a *count
+    // of rows* either way; what is not honest is one reader assuming the other's shape.
     let directives = value
         .get("directives")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
+        .map_or(0, |raw| match raw {
+            Value::Array(rows) => rows.len(),
+            Value::Number(count) => count.as_u64().unwrap_or(0) as usize,
+            _ => 0,
+        });
     if directives == 0 {
         return CheckOutcome {
             state: "fail".to_string(),
@@ -704,6 +721,66 @@ mod tests {
                 .find(|r| r.check_key == "csp_configured")
                 .map(|r| r.state.as_str()),
             Some("pass")
+        );
+    }
+
+
+    /// The shape the *writer* produces, and the reader that disagreed with it.
+    ///
+    /// The three tests above build the probe fact themselves, as `{"directives": [ … ]}`. The
+    /// probe in `apps/api/src/routes/security.rs` builds it as `{"directives": <count>}` — it
+    /// reads `HeaderPolicy::csp.len()` and reports the number, because a count is what a row
+    /// shows. So the reader and the writer each had a shape the other had never seen, every real
+    /// policy read as zero directives, and `csp_configured` sat at `fail` on a platform whose
+    /// stored policy was the four-directive baseline. This test is the pair that closes it:
+    /// it feeds the reader the writer's shape and requires the answer to be about the policy
+    /// rather than about the encoding.
+    ///
+    /// It is a unit test and not a walk because the defect is entirely inside one function's
+    /// input contract. The walk in `apps/api/tests/security.rs` is what *found* it; this is what
+    /// keeps it fixed without a browser and a database.
+    #[test]
+    fn the_directive_count_is_read_as_the_writer_writes_it() {
+        let enforced = Environment {
+            csp: Some(Probe::value(serde_json::json!({
+                "mode": "enforce",
+                "directives": 4,
+                "saved_at": "2026-09-26 10:00:00 +00:00:00",
+            }))),
+            ..Environment::unprobed()
+        };
+        let row = evaluate_all(&enforced, Uuid::nil())
+            .into_iter()
+            .find(|result| result.check_key == "csp_configured")
+            .expect("the csp row must exist");
+        assert_eq!(
+            row.state, "pass",
+            "four directives read from the writer's own shape must be four directives, not zero: \
+             {}",
+            row.detail
+        );
+        assert_eq!(
+            row.detail["summary"],
+            serde_json::json!("The content security policy is enforced (4 directives)"),
+            "and the sentence an operator reads must name the real count: {}",
+            row.detail
+        );
+
+        let empty = Environment {
+            csp: Some(Probe::value(serde_json::json!({
+                "mode": "enforce",
+                "directives": 0,
+            }))),
+            ..Environment::unprobed()
+        };
+        assert_eq!(
+            evaluate_all(&empty, Uuid::nil())
+                .into_iter()
+                .find(|result| result.check_key == "csp_configured")
+                .map(|result| result.state),
+            Some("fail".to_owned()),
+            "a count of zero is still a failure, so the fix did not trade a wrong pass for a \
+             wrong failure"
         );
     }
 

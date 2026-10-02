@@ -10984,3 +10984,231 @@ either.** Those boxes close on a pass that walks the screen as it now renders.
 ticks on `clicked > 0`, `inspected > 0` **and** `builderSeesTableEdit: true` — a conjunction, because
 the first two are what make the third mean anything. Then `edge-delete.removed` /
 `edge-delete-undo.restored` off the label fix (`eec3ad5d`), which has never had a live reading either.
+### Tick 106 — the destination card, which had one fact about the destination and called it health
+
+Slice 4's status-depth half, and the first thing it turned out to be: **the health card slice 4
+promised did not exist, and the thing that did exist was wrong in a way only a new failure mode
+exposes.** `GET /api/v1/backups/status` carried `writable` and nothing else, and the panel
+rendered that as a card labelled "Destination" with the probe's sentence under it.
+
+`writable` is a 31-byte write succeeding. The probe is right to do it — writing and removing is
+the only probe that catches a filesystem which takes a write and loses it — but it answers a
+narrower question than the card implied. A destination with 4 MB free **passes** this probe on
+every status load and every settings save. The card reads green. The next real run dies partway
+through the media part, and comes back `partial` naming an **object**, with the disk never named
+anywhere in the product. The operator's only signal is a `partial` they have to diagnose as a
+media-object problem, when it was the volume all along.
+
+Four commits, atomic and pushed:
+
+| Commit | What |
+|---|---|
+| `321a8a29` | `statvfs_raw` + a public `free_bytes` beside the existing percentage reader |
+| `5ebcb36b` | `Headroom`, `classify_headroom`, `headroom_for` — the pure verdict and the measurement |
+| `aebe9a34` | `largest_backup_bytes`, the route field, and the walk |
+| `cd72e9e3` | The fifth card and the `BackupHeadroom` type |
+
+**Three findings this tick, and two of them are the ones worth keeping.**
+
+**The `forbid(unsafe_code)` wall was a better answer than the one I was about to write.** The
+first draft put a `statvfs` in `crates/backup` and did not compile. The crate is
+`#![forbid(unsafe_code)]` and `omnion-health` holds the **single** sanctioned block in the
+workspace, with a header that argues for it in detail. Weakening a crate-level promise for one
+function would have been the wrong trade, so the read became `omnion_health::probes::free_bytes`
+and the block was split into `statvfs_raw` with two views on top. The reason to prefer that over
+just adding a second `#[allow]`: a workspace that starts with one sanctioned exception ends with
+thirty, and making the *existing* exception reusable is what keeps it at one. A path dependency
+inside one workspace is the whole price.
+
+**The wiring bug, which every pure test could not see.** The first `headroom_for` measured
+`DestinationReport::probed_path` — the probe's marker **file**. A probe that succeeds has just
+deleted it; that is the entire reason it removes what it wrote. `statvfs` on a deleted path is
+`ENOENT` → `None`, so the card read *"could not be measured"* on **every healthy destination**.
+The classification was right, the message was right, the eleven pure unit tests were green — and
+the feature was dead. It is tick 105's defect (a producer and a verifier describing different
+things) wearing a new costume, and only `headroom_is_measured_where_the_probe_actually_wrote`
+could see it, because that is the one test that touches a real filesystem. Reverting the single
+line that takes `.parent()` turns it red; that regression is proven, not claimed.
+
+**Two of my own assertions were wrong, and in both cases the code was right.** The message test
+demanded `1.0 GB` for 1024³ bytes; the formatter is decimal, and **decimal is correct** here
+because every number an operator compares this against — an S3 quota, a vendor's disk size, a
+cloud console's free-space figure — is decimal. The test now pins the decimal reading so the
+next person to "fix" it to binary sees it fail. The walk demanded two free-space readings be
+*identical*; they differed by 12 KB because the stranger's run really did write to the same
+filesystem. An equality there asserts the platform writes nothing, which is false, and the walk
+would have been red for a reason having nothing to do with the boundary it exists to prove. It is
+a 1 MB tolerance against a 1.6 GB reading — five orders of magnitude below what a leaked maximum
+would inject, so the regression still fails loudly.
+
+**Gates, all run this tick:**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-backup --lib --quiet` | **185 passed**, 0 failed (was 174) |
+| crate | `cargo test -p omnion-health --lib --quiet` | **70 passed**, 0 failed |
+| build | `cargo build -p omnion-api` | exit 0 (pre-existing warnings only) |
+| types | `bun x tsc --noEmit` (apps/admin) | exit 0 |
+| walk | `cargo test -p omnion-api --test backups the_destination_card_reports_room` | **1 passed** in 13.2 s, fresh database, read with `--nocapture` |
+| proven to fail | regressing `classify_headroom` to writability-only | **3 tests FAILED** |
+| proven to fail | regressing `headroom_for` to the marker path | **FAILED** — `the probe's own directory is measurable` |
+| proven to fail | removing `organization_id` from the yardstick | **FAILED** — `left: Some(500000000000)` |
+
+The last one is the interesting regression: with the scope removed, a stranger's 500 GB row makes
+this tenant's card say *"1.5 GB free, less than the largest backup on record (500.0 GB). The next
+backup will not fit here."* A verdict about another company's data, on the card that decides
+whether an operator enlarges a disk. Same class as the media-part leak from tick 99, one layer up.
+
+**Not run: the browser pass.** The shared slot is held live by `w6` (holder pid 2114, `cwd
+=/mnt/apopic/omnion-w6`, verified with `kill -0` and `/proc/<pid>/cwd`), and the box is at load
+~7 with `/` at 99%. Tick 105 established that a pass under those conditions dies three times out
+of three with a `summary.json` containing only `{fatal}` — no counters, no findings, no routes.
+The screen-states box stays open for that reason and **not** for a defect in the code.
+
+**Next:** the browser pass on a free slot with `--only=backups`, then the four-frequency
+schedules form (the only REQ-013 code item left), and the walkthrough criterion.
+
+---
+
+## Tick 106 — REQ-013 · the four frequencies, and a column the operator's own button never wrote
+
+**What.** Two slices, both on the schedule bookkeeping.
+
+1. **`fix(backups)` (`810a65f7`)** — `POST /api/v1/backup-schedules/{id}/run` produced a real
+   backup tied to the schedule, and the schedule's own `last_run_at` stayed null, so the panel's
+   last-run column read **"never"** beside the run it had just produced. Only the unattended
+   worker wrote those two columns. `record_schedule_run` now takes `Option<OffsetDateTime>` and
+   writes `next_run_at = coalesce($3, next_run_at)` — **one statement, so it cannot half-apply** —
+   the worker passes `Some(next)` and rearms, the manual path passes `None` and leaves the slot
+   alone. An operator testing a 03:00 schedule at 09:00 has not consumed tomorrow's 03:00.
+2. **`test(backups)` (`52a7b3fd`)** — `all_four_frequencies_save_and_compute_a_next_run_of_their_own_shape`.
+
+**The defect the criterion was claiming and nobody had proved.** The box has read *"all four
+frequencies"* since it was written. The walk behind it created **exactly one schedule and it was
+`daily`**. `hourly`, `weekly` and `monthly` had never been through the router. The 18 unit tests in
+`cadence.rs` cover all four — they are the reason the DST round-tripping exists — but they never
+touch `upsert_schedule`, which is where a frequency's own fields are written.
+
+**Three assertions the pure tests could not have made:**
+
+* **The column, not the response.** `upsert_schedule` and `set_schedule_next_run` are two
+  statements. A route that computed a correct next run and failed to store it answers perfectly
+  and never fires — the exact defect the previous half of this criterion was about.
+* **The shape of the answer per frequency.** `hourly` lands on `(minute, second) == (0, 0)`;
+  `weekly` with `day_of_week = 3` lands on a **Wednesday**; `monthly` on the 28th lands on the
+  **28th**. A route that stored both as `daily` returns a plausible future instant for all four
+  calls. Each frequency's own column must also be populated **only** where the schema says it
+  belongs, or the editor opens on defaults.
+* **Four due schedules in one tick.** The old walk could not catch a worker claiming one per tick,
+  because it only ever had one due. Now: four runs, each with **exactly one** run of its own
+  (`schedule_id AND organization_id` — a worker tying every run to the last row read would point
+  all four at one backup while the counts still read four), each `last_backup_id` equal to the run
+  it produced (**the manual-run defect above, reappearing on the unattended path**), and a second
+  tick starting **zero** — a worker leaving the column in the past takes four more backups a minute
+  later, and a nightly schedule running every minute fills the destination by morning.
+
+**The tree I inherited had a syntax error in it.** The previous tick's run was interrupted after
+writing the manual-run walk, and its assertion message contained `\\"` inside a Rust string
+literal, which terminates the literal. No compiler had been run against the file. Fixed; it is
+now in `52a7b3fd`.
+
+**Gates, all run this tick:**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-backup --lib --quiet` | **185 passed**, 0 failed |
+| build | `cargo build -p omnion-api` | exit 0 (pre-existing warnings only) |
+| compile | `cargo test -p omnion-api --test backups --no-run` | exit 0 |
+| walk | `cargo test -p omnion-api --test backups all_four_frequencies` | **1 passed** in 9.4 s, fresh database, `--nocapture` |
+| proven to fail | `fires_on`'s `weekly` arm regressed to `true` | **FAILED** — `left: Saturday, right: Wednesday` |
+
+The regression is the interesting one: it is a **weekly schedule silently behaving as a daily
+one**, which is the exact class the criterion asks about and which no amount of green unit tests
+in the cadence module could have surfaced.
+
+**Not run: the browser pass.** The shared QA slot was held live by `w4` when this tick began
+(`/tmp/omnion-qa-slot-holders`, verified with `kill -0` and `/proc/<pid>/cwd`). The box had also
+just rebooted — `omnion-postgres` spent ~13 minutes in post-reboot fsync, which is where the
+fresh test database went. The walkthrough criterion stays open for that reason and not for a
+defect in the code.
+
+**Next:** the browser pass with `--only=backups` on a free slot, then the status-card browser
+tick and the walkthrough criterion.
+
+## 2026-10-02 — omnion-build tick 107 · REQ-012, two rows that still named a slice as missing
+
+**What.** REQ-010 was first in wave order and its only open box was the browser pass, which the
+shared QA slot would not give me this tick (below), so the tick went to the next REQ with **open
+code work** rather than being spent blocked. REQ-012 carried three boxes with no prose at all —
+unproved, not merely browser-blocked — and the first of them turned out to be two real defects.
+
+**Defect one: two probes frozen on a slice number that had already shipped.** `csp_configured`
+and `rate_limiting` returned a literal `Probe::unreadable("... configured in slice 2/3; nothing to
+verify yet")`. Slices 2 and 3 shipped: `0135_security_headers.sql` creates and seeds
+`security_settings.headers`, `0151_security_rate_limits.sql` adds `rate_limits` to the same
+singleton row, and `/security/headers` and `/security/rate-limits` have been writing through both
+since. So `/security` reported *"Not checked yet — nothing to verify yet"*, with the row's own
+action link pointing at the page where the policy was plainly on screen.
+
+**No test could have caught it, and the reason is worth stating precisely.** The check's contract
+is *"never claim `pass` without a fact"* — and the old answer was **honest about its own probe**
+while saying nothing whatever about the platform. A rule that constrains what a check may conclude
+does not constrain how *current* its inputs are.
+
+**Defect two, found by the walk written to measure the first, and worse.** `csp` counted
+directives with `value["directives"].as_array().len()`, while the probe fact carries
+`{"directives": <integer>}` — it reads `HeaderPolicy::csp.len()` because a count is what a row
+shows. Every real policy therefore read as **zero** directives and the row sat at `fail` — *"an
+empty policy blocks nothing and protects nothing"* — on a platform whose stored policy was the
+four-directive baseline. The three unit tests over that function could not see it: they build the
+probe fact **by hand** as `{"directives": [ … ]}`, a shape no writer in the crate produces. A test
+that fabricates its own input proves the reader it imagined. This is the same blind spot as tick
+105's manifest checksum, tick 106's `last_run_at` and REQ-010's purge walk, and the rule is now
+written down: **the shape must come from the writer.**
+
+Both shapes are accepted after the fix, because `directives` is a count of rows either way, and
+the zero case still `fail`s — so the fix trades no wrong `pass` for a wrong `fail`. The two probes
+now read through the crate's own readers (`load_headers`, `load_rate_limits`) rather than a
+second query, the limiter counts the **merged** policy because that is what the middleware
+resolves, and **every scope disabled is `fail`, not `pass`** — a limiter limiting nothing is the
+one state where green would be the most expensive row on the screen.
+
+**What the walk lost to its own fixtures, kept here because both were instructive.**
+
+* It asserted the first run would read `unknown`, and failed `left: fail, right: unknown`. A fresh
+  install is **not** an unverified platform: the migrations seed `headers = {}` and
+  `rate_limits = []`, and both readers treat an empty document as **the baseline** — deliberately,
+  so a missing row never means "send no headers". The honest first-run answers are `warn` and
+  `pass`.
+* It read the probe fact from the top level of `detail`, where the sentence and the reason live.
+  It lives under `detail.fact`.
+* Its policy had no `script-src`, and `HeaderPolicy::new` refuses one: *"a policy needs
+  `script-src` or `script-src-elem`"*. That was the fixture's fault, and the validator that held
+  was the validator working.
+
+**Gates, all run this tick:**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-security --lib --quiet` | **209 passed**, 0 failed (was 208) |
+| build | `cargo build -p omnion-api` | exit 0 (pre-existing warnings only) |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **12 passed** (was 11), 103 s |
+| compile | `cargo test -p omnion-api --test security --no-run` | exit 0 |
+| types | `pnpm typecheck` (apps/admin) | exit 0 |
+| proven to fail | `directives` reader regressed to `as_array().len()` | **FAILED in both gates** — unit `left: fail, right: pass`, walk `left: fail, right: warn` |
+
+The regression fails in both gates, and it fails with **the symptom the defect produced** rather
+than an unrelated error — which is what makes it a proof instead of a colour change.
+
+**Not run: the browser pass.** The shared QA slot was held live by `w3` for the whole tick
+(`/tmp/omnion-qa-slot-holders`, verified with `kill -0` and `/proc/<pid>/cwd`, not the file name).
+`/mnt/apopic` was also at **96% with 2.5 G free**, and a pass rebuilds `.next` (~1.5 G) — it would
+have died on disk rather than reported a finding. REQ-012's walkthrough box and the *screen* half
+of the posture box stay open for that reason and not for a defect in the code. Per the slot
+discipline the tick was not spent blocked: it queued the pass and took the code work instead.
+
+**Commits:** `bbaaf589` (the count), `83d9becd` (the two probes), `7346f123` (the walk), pushed.
+
+**Next:** the browser pass with `--only=security` on a free slot and room on the disk, which closes
+the rendering half of the posture box and REQ-012's walkthrough box; then REQ-012's locked-account
+screen box (a fixture-locked account unlocked through the panel's own button).

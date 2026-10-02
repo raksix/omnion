@@ -209,7 +209,7 @@ async fn run_one(
             return Ok(Some(finished.id));
         }
     };
-    omnion_backup::record_schedule_run(pool, schedule.id, finished.id, next).await?;
+    omnion_backup::record_schedule_run(pool, schedule.id, finished.id, Some(next)).await?;
 
     if produced > 0 {
         tracing::warn!(
