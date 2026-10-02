@@ -14,6 +14,7 @@ import {
   Boxes,
   CalendarClock,
   ClipboardCheck,
+  Code2,
   FileStack,
   FileText,
   Fingerprint,
@@ -50,6 +51,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { SiteSwitcher } from "@/components/site-switcher";
 import { GlobalSearch } from "@/components/global-search";
 import { NotificationBell } from "@/components/notification-bell";
+import { useDeveloperAccess } from "@/lib/developer-access";
 import { useSession } from "@/lib/session";
 
 const NAV = [
@@ -129,7 +131,39 @@ const NAV = [
   { href: "/settings/iam/sessions", label: "Sessions", icon: Timer },
   { href: "/settings/iam/devices", label: "Devices", icon: Fingerprint },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
+  // The developer portal (REQ-022, slice 2). Three entries rather than eight: the brief lists
+  // eight, but OAuth apps, plugins, themes, docs and the sandbox are slices 3 and 4, and a nav
+  // link to a screen that does not exist is the dead control the definition of done forbids.
+  // These three are the whole of what slice 2 ships.
+  { href: "/developer", label: "Developer", icon: Code2, needsDeveloper: true },
+  { href: "/developer/api-keys", label: "API keys", icon: KeyRound, needsDeveloper: true },
+  { href: "/developer/logs", label: "Request log", icon: ScrollText, needsDeveloper: true },
 ] as const;
+
+/**
+ * A navigation entry that only exists for accounts allowed into the developer portal.
+ *
+ * The property is on the entry rather than in a filter above, so "which entries are conditional"
+ * is one list a reader can scan instead of a second list somewhere else that has to be kept in
+ * step with it.
+ */
+type NavItem = (typeof NAV)[number];
+
+/**
+ * Whether an entry is shown to this account.
+ *
+ * `needsDeveloper` is resolved against a route the API guards for `developer.read`, and the
+ * answer is `null` while it is in flight — which means the group is hidden for that first paint
+ * and appears a moment later. That is the right trade: a group that appears, then vanishes, then
+ * reappears as the answer lands is a flicker, and a group that briefly shows an account who will
+ * be refused is a lie. See `lib/developer-access.tsx` for why the sidebar asks at all.
+ */
+function visible(item: NavItem, canOpen: boolean | null): boolean {
+  if (!("needsDeveloper" in item) || item.needsDeveloper !== true) {
+    return true;
+  }
+  return canOpen === true;
+}
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against
 /// `/settings/iam/users`): the parent highlights only when it is exactly the open screen.
@@ -174,6 +208,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
   const pathname = usePathname();
   const router = useRouter();
   const { user, signOut } = useSession();
+  const { canOpen: canOpenDeveloper } = useDeveloperAccess();
   const [navOpen, setNavOpen] = useState(false);
 
   const handleSignOut = async () => {
@@ -197,7 +232,7 @@ export function AppShell({ title, description, children }: AppShellProps) {
       </Link>
 
       <nav aria-label="Sections" className="flex flex-col gap-1">
-        {NAV.map((item) => {
+        {NAV.filter((item) => visible(item, canOpenDeveloper)).map((item) => {
           const active = isActive(item.href, pathname);
           const Icon = item.icon;
           return (

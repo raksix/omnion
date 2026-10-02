@@ -28,12 +28,16 @@ pub struct KeyView {
     /// Who issued it, by name. Empty string when the issuer was deleted.
     pub created_by_name: String,
     /// Creation timestamp.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// Last authentication.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_used_at: Option<OffsetDateTime>,
     /// When it stops authenticating.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
     /// When it was revoked.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub revoked_at: Option<OffsetDateTime>,
     /// The key this one replaced.
     pub rotated_from: Option<Uuid>,
@@ -76,6 +80,12 @@ pub struct IssuedKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsagePoint {
     /// The day.
+    ///
+    /// **Serialised as a string by the route that publishes it**, not by an attribute here: the
+    /// workspace enables `serde-well-known` but not `serde-human-readable`, so a bare
+    /// `time::Date` would cross the wire as a three-element array — and this field is the React
+    /// `key` of every bar in the usage chart, so an array there is not a cosmetic fault. `time`
+    /// exposes no `Date` codec under the features this crate enables, so the route formats it.
     pub day: time::Date,
     /// Requests that day.
     pub requests: i32,
