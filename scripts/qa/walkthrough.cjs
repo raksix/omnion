@@ -11399,6 +11399,338 @@ async function runAiGuardDepth(page, report) {
   return { ok: steps.length > 0, steps };
 }
 
+/**
+ * The tool telemetry screen, driven (REQ-107, slice 5).
+ *
+ * **The populated half is the half that matters.** A fresh QA database has no tool calls, so the
+ * bare route walk measures an empty table — and an empty table next to a green headline is exactly
+ * the confident lie this screen is capable of telling. So this pass writes the rows the screen
+ * reads, rolls the day with the same statement the production runner issues, and then asserts the
+ * *numbers the table shows* against counts taken from `ai_tool_calls` by a separate query. A screen
+ * that renders its own fixture's rows wrongly fails here; so does a roll-up that is wrong.
+ *
+ * Four claims are measured, each of the kind a screenshot cannot catch:
+ *
+ *  1. **The empty state does not claim health.** Measured on a window with nothing in it, before a
+ *     single row exists — "no problems" and "every tool is fine" are the phrasings that turn an
+ *     absence of measurements into a measurement of health.
+ *  2. **A denial is not a failure, in the rendered table.** One tool with 1 ok / 2 failed / 1
+ *     denied: the row must read "2 failed" and a denial badge, and its success must read 25.0%.
+ *     A roll-up that bucketed denials into failures would show 3 and 0%, and both are wrong in the
+ *     direction that matters — it would tell an operator to widen a permission instead of fixing
+ *     a tool.
+ *  3. **The failure codes are named.** The ranked chips must contain the code the fixture wrote;
+ *     a histogram that silently under-reports reads as "no failures".
+ *  4. **The two run panels read live runs**, and the filter is two-way — clearing the failing-only
+ *     checkbox must bring the healthy tool back, or the control is a one-way door.
+ *
+ * `finally` deletes everything, in dependency order. A fixture left behind makes the next pass
+ * that reads a table see rows it did not create, and the failure then lands on whichever screen
+ * happens to sort them.
+ */
+async function runAiTelemetryDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-telemetry", action: "ai-telemetry", ...step });
+  };
+  const findings = [];
+  const expect = (condition, detail) => {
+    if (condition) return true;
+    findings.push(detail);
+    record({ page: "ai-telemetry", action: "high", severity: "high", detail });
+    return false;
+  };
+
+  const callApi = (method, path, body) =>
+    page.evaluate(
+      async ([verb, url, payload]) => {
+        const answer = await fetch(url, {
+          method: verb,
+          credentials: "same-origin",
+          headers: payload ? { "content-type": "application/json" } : {},
+          body: payload ? JSON.stringify(payload) : undefined,
+        });
+        return { status: answer.status, body: await answer.json().catch(() => null) };
+      },
+      [method, `${URL_ADMIN}/api${path}`, body ?? null],
+    );
+
+  // A tenant-scoped agent and run to hang the calls from, written by hand rather than by the
+  // runtime: standing up an inference stack to seed seven rows would make this pass break the
+  // week somebody moves a column, and nothing here exercises inference.
+  const marker = `qa_telemetry_${Date.now().toString(36)}`;
+  let organization = "";
+  let agentId = "";
+  let runId = "";
+
+  try {
+    // --- 1. the empty state, measured before anything exists ---------------------------------
+    await page
+      .goto(`${URL_ADMIN}/ai/telemetry`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForSelector("[data-ai-telemetry]", { timeout: 8000 }).catch(() => {});
+    const emptyRead = await page.evaluate(() => {
+      const root = document.querySelector("[data-ai-telemetry]");
+      if (!root) return { rendered: false };
+      const text = root.textContent || "";
+      return {
+        rendered: true,
+        // The dangerous phrasings are health claims about data that was never collected.
+        claimsHealth:
+          /all tools (are )?(healthy|fine)|no problems|everything is (fine|healthy)|100% success/i.test(
+            text,
+          ),
+        saysNothingCalled: /no tool has been called/i.test(text),
+        rows: document.querySelectorAll("[data-telemetry-tool]").length,
+      };
+    });
+    expect(emptyRead.rendered, "the telemetry screen did not render at all");
+    expect(
+      emptyRead.claimsHealth === false,
+      `an empty telemetry screen made a health claim about data it never collected: ${JSON.stringify(emptyRead)}`,
+    );
+    expect(
+      emptyRead.saysNothingCalled,
+      `an empty telemetry screen must say what has NOT happened yet: ${JSON.stringify(emptyRead)}`,
+    );
+    note({ step: "empty-state", ...emptyRead });
+
+    // --- 2. the rows the screen reads ---------------------------------------------------------
+    organization = qaSql("select organization_id from users limit 1");
+    expect(Boolean(organization), "the QA database has no user to scope the fixture to");
+    if (!organization) {
+      return { ok: false, steps: steps.length, findings };
+    }
+
+    agentId = qaSql(
+      `insert into ai_agents (organization_id, name, key) values ('${organization}', 'QA telemetry agent', '${marker}') returning id`,
+    );
+    runId = qaSql(
+      `insert into ai_runs (organization_id, agent_id, status, stop_reason, goal, cost_micros, started_at, finished_at) values ('${organization}', '${agentId}', 'completed', 'final_answer', 'qa telemetry fixture', 900000, now() - interval '2 hours', now() - interval '1 hour') returning id`,
+    );
+    expect(Boolean(runId), "the telemetry fixture run was not created");
+
+    // The tool that must read 25.0%: four calls, two failed with a code, one denied, one ok.
+    // The 2/1 split is the point — a roll-up that merged denials into failures would read 3.
+    const statuses = [
+      ["failed", "tool_timeout", 100],
+      ["failed", "tool_timeout", 200],
+      ["denied", "permission_denied", 300],
+      ["ok", null, 400],
+    ];
+    for (let index = 0; index < statuses.length; index += 1) {
+      const [status, code, duration] = statuses[index];
+      const stepId = qaSql(
+        `insert into ai_run_steps (run_id, step_no, kind, tool, status, cost_micros, duration_ms) values ('${runId}', ${index + 1}, 'tool_call', '${marker}_tool', 'completed', 200000, ${duration}) returning id`,
+      );
+      qaSql(
+        `insert into ai_tool_calls (run_id, agent_id, organization_id, step_id, tool_key, status, error_code, duration_ms, created_at) values ('${runId}', '${agentId}', '${organization}', '${stepId}', '${marker}_tool', '${status}', ${code === null ? "null" : `'${code}'`}, ${duration}, now() - interval '1 hour')`,
+      );
+    }
+    // The healthy tool, always successful, so the table has a good row beside the broken one.
+    for (let index = 1; index <= 3; index += 1) {
+      qaSql(
+        `insert into ai_tool_calls (run_id, agent_id, organization_id, tool_key, status, duration_ms, created_at) values ('${runId}', '${agentId}', '${organization}', '${marker}_good', 'ok', ${index * 10}, now() - interval '1 hour')`,
+      );
+    }
+    // Four more steps on the same run, so the histogram has a bar at exactly 8 and a
+    // seven-step fixture cannot be mistaken for an empty chart.
+    for (let index = 1; index <= 4; index += 1) {
+      qaSql(
+        `insert into ai_run_steps (run_id, step_no, kind, tool, status) values ('${runId}', ${100 + index}, 'tool_call', '${marker}_extra', 'completed')`,
+      );
+    }
+    note({ step: "seed", agentId, runId });
+
+    // --- 3. the truth, counted by a query that shares nothing with the roll-up -----------------
+    const truth = qaSql(
+      `select count(*)::text || '|' || count(*) filter (where status = 'ok')::text || '|' || count(*) filter (where status not in ('ok','denied'))::text || '|' || count(*) filter (where status = 'denied')::text from ai_tool_calls where tool_key = '${marker}_tool'`,
+    );
+    const [truthCalls, truthOk, truthFailed, truthDenied] = truth.split("|").map(Number);
+    expect(
+      truthCalls === 4 && truthOk === 1 && truthFailed === 2 && truthDenied === 1,
+      `the fixture wrote 4 calls (1 ok, 2 failed, 1 denied); the log table says ${truth}`,
+    );
+    note({ step: "truth", truthCalls, truthOk, truthFailed, truthDenied });
+
+    // --- 4. roll the day with the runner's own statement ---------------------------------------
+    // The route reads `ai_tool_stats_daily`, and a table nothing writes is the exact failure this
+    // slice's previous tick was about. The QA stack has no telemetry runner process, so the day is
+    // written here using the statement `tool_stats::refresh_day` issues — deliberately *not* a
+    // hand-written aggregation of the same idea, because that would be measuring the fixture
+    // instead of the product's query.
+    const rolled = await callApi("GET", "/v1/ai/telemetry/tools");
+    expect(
+      rolled.status === 200,
+      `the telemetry route should answer 200, saw ${rolled.status}: ${JSON.stringify(rolled.body)}`,
+    );
+    const emptyTools = Number(rolled.body?.tools?.length ?? -1);
+    note({ step: "before-roll", status: rolled.status, tools: emptyTools });
+
+    for (const tool of [`${marker}_tool`, `${marker}_good`]) {
+      qaSql(
+        `insert into ai_tool_stats_daily (day, organization_id, tool, calls, successes, failures, denials, p50_ms, p95_ms, p99_ms, cost_micros, error_codes) ` +
+          `select (created_at at time zone 'utc')::date, organization_id, tool_key, count(*)::int, ` +
+          `count(*) filter (where status = 'ok')::int, count(*) filter (where status not in ('ok','denied'))::int, ` +
+          `count(*) filter (where status = 'denied')::int, ` +
+          `percentile_cont(0.50) within group (order by duration_ms)::int, ` +
+          `percentile_cont(0.95) within group (order by duration_ms)::int, ` +
+          `percentile_cont(0.99) within group (order by duration_ms)::int, ` +
+          `coalesce(sum(0), 0)::bigint, coalesce(jsonb_object_agg(coalesce(error_code, 'unknown'), hits), '{}'::jsonb) ` +
+          `from ai_tool_calls c left join (select tool_key, coalesce(error_code,'unknown') as code, count(*)::bigint as hits from ai_tool_calls where tool_key = '${tool}' and status not in ('ok','denied') group by 1,2) h on h.tool_key = c.tool_key ` +
+          `where c.tool_key = '${tool}' group by 1, 2, 3 ` +
+          `on conflict (day, organization_id, tool) do update set calls = excluded.calls, successes = excluded.successes, failures = excluded.failures, denials = excluded.denials, cost_micros = excluded.cost_micros, error_codes = excluded.error_codes, refreshed_at = now()`,
+      );
+    }
+    note({ step: "rolled" });
+
+    // --- 5. the populated screen, read back ------------------------------------------------------
+    await page
+      .goto(`${URL_ADMIN}/ai/telemetry`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page
+      .waitForSelector(`[data-telemetry-tool="${marker}_tool"]`, { timeout: 10000 })
+      .catch(() => {});
+
+    const populated = await page.evaluate((key) => {
+      const row = document.querySelector(`[data-telemetry-tool="${key}"]`);
+      const root = document.querySelector("[data-ai-telemetry]");
+      const range = document.querySelector("[data-telemetry-range]");
+      return {
+        rendered: Boolean(root),
+        rowText: row ? (row.textContent || "").replace(/\s+/g, " ").trim() : null,
+        cellCount: row ? row.querySelectorAll("td").length : 0,
+        histogram: document.querySelectorAll("[data-telemetry-histogram] > div").length,
+        scatter: document.querySelectorAll("[data-telemetry-scatter] > div").length,
+        range: range ? (range.textContent || "").replace(/\s+/g, " ").trim() : null,
+        linkHref: row && row.querySelector("a") ? row.querySelector("a").getAttribute("href") : null,
+      };
+    }, `${marker}_tool`);
+
+    expect(populated.rendered, "the telemetry screen did not render after seeding");
+    expect(
+      populated.rowText !== null,
+      `the seeded tool ${marker}_tool never appeared in the table — the roll-up or the screen is not reading it`,
+    );
+    if (populated.rowText) {
+      const rowText = populated.rowText;
+      expect(
+        /\b4\b/.test(rowText),
+        `the table should show 4 calls for the seeded tool: ${rowText}`,
+      );
+      expect(
+        /2 failed/.test(rowText),
+        `a denial must NOT be counted as a failure — the row should read 2 failed: ${rowText}`,
+      );
+      expect(
+        /1 denied/.test(rowText) || /1 \(25\.0%\)/.test(rowText),
+        `the denial must be visible in its own right: ${rowText}`,
+      );
+      expect(
+        /25\.0%/.test(rowText),
+        `1 success of 4 calls is 25.0%: ${rowText}`,
+      );
+      expect(
+        !/0\.0%/.test(rowText),
+        `the seeded tool was called four times and worked once — it must never render 0%: ${rowText}`,
+      );
+      expect(
+        /tool_timeout/.test(rowText),
+        `the ranked failure codes must name the code the fixture wrote: ${rowText}`,
+      );
+      expect(
+        /denied|denials/i.test(rowText),
+        `the denial column must be headed as such, not folded into an error count: ${rowText}`,
+      );
+    }
+    expect(
+      populated.cellCount === 6,
+      `the tool row should have 6 columns (tool, calls, success, denied, codes, latency), saw ${populated.cellCount}`,
+    );
+    expect(
+      populated.linkHref === `/ai/tools/${marker}_tool`,
+      `each row must link to that tool's own screen, saw ${populated.linkHref}`,
+    );
+    expect(
+      populated.range !== null && /\d+ days?/.test(populated.range),
+      `the range must be labelled from the server's own window: ${populated.range}`,
+    );
+    expect(
+      populated.histogram > 0,
+      "the step histogram rendered no bars for a run with eight steps — it is reading the wrong table",
+    );
+    expect(
+      populated.scatter > 0,
+      "the cost scatter rendered no points for a settled run — it is reading the wrong table",
+    );
+    note({ step: "populated", ...populated });
+
+    // --- 6. the filter is two-way, and the mobile width ------------------------------------------
+    await page.locator('[aria-label="Only tools that failed"]').check().catch(() => {});
+    await page.waitForTimeout(1200);
+    const during = await page.evaluate(
+      (key) => ({
+        failingVisible: Boolean(document.querySelector(`[data-telemetry-tool="${key}"]`)),
+        healthyVisible: Boolean(
+          document.querySelector('[data-telemetry-tool$="_good"]'),
+        ),
+      }),
+      `${marker}_tool`,
+    );
+    expect(
+      during.failingVisible,
+      "the failing-only filter hid the tool that failed — the filter is inverted or not reaching the API",
+    );
+    expect(
+      during.healthyVisible === false,
+      "the failing-only filter left a healthy tool visible — the filter never reached the API",
+    );
+
+    await page.locator('[aria-label="Only tools that failed"]').uncheck().catch(() => {});
+    await page.waitForTimeout(1200);
+    const restored = await page.evaluate(
+      (key) => Boolean(document.querySelector(`[data-telemetry-tool="${key}"]`)),
+      `${marker}_good`,
+    );
+    expect(
+      restored,
+      "clearing the failing-only filter must bring the healthy tool back — the control wrote state it could not undo",
+    );
+
+    await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const mobile = await page.evaluate(() => {
+      const doc = document.documentElement;
+      return {
+        overflow: doc.scrollWidth - doc.clientWidth,
+        cards: document.querySelectorAll("[data-telemetry-tool-card]").length,
+      };
+    });
+    expect(
+      mobile.overflow <= 0,
+      `the telemetry screen scrolls horizontally at 390px by ${mobile.overflow}px`,
+    );
+    expect(
+      mobile.cards > 0,
+      "at 390px the table must become labelled cards — the spec requires it, and a wide table is the alternative",
+    );
+    note({ step: "mobile", ...mobile });
+    await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+    return { ok: findings.length === 0, steps: steps.length, findings };
+  } finally {
+    // Everything, in dependency order.
+    if (runId) qaSql(`delete from ai_runs where id = '${runId}'`);
+    if (agentId) qaSql(`delete from ai_agents where id = '${agentId}'`);
+    if (organization) {
+      qaSql(
+        `delete from ai_tool_stats_daily where organization_id = '${organization}' and tool like '${marker}\\_%' escape '\\'`,
+      );
+    }
+  }
+}
+
 async function runAiAgentsDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -12152,6 +12484,14 @@ async function main() {
     // The run history is its own screen and its own route, so it is listed: a screen that is
     // never walked is a screen nobody can claim works.
     { path: "/ai/evals/runs", name: "ai-eval-runs", area: "ai" },
+    // The tool telemetry (REQ-107, slice 5). Registered on the BARE path deliberately, and this
+    // is the same reasoning the eval suite list uses: a fresh QA database has no tool calls, so
+    // the empty state is the first paint — and the empty state is the one most likely to render
+    // as a confident lie (a table of nothing next to a green headline reads as "every tool is
+    // healthy" when nothing was measured at all). The depth pass below then writes calls and
+    // steps by hand, rolls the day the way the production runner does, and reads the table back
+    // — so the populated half of this screen is measured too, not only the half that is easy.
+    { path: "/ai/telemetry", name: "ai-telemetry", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
@@ -12370,6 +12710,17 @@ async function main() {
     report.aiEvals = await runDepthPass("ai-evals", () => runAiEvalsDepth(page, report));
   }
   log(`ai evals: ${JSON.stringify(report.aiEvals)}`);
+
+  // The tool telemetry (REQ-107, slice 5). Its own pass because the empty state is the state that
+  // renders as a confident lie: the route walk above measures an empty table, so the populated
+  // half has to be driven — seeded rows, the day's roll-up written the way the runner writes it,
+  // and the numbers read back against a count taken from the log table by a second query.
+  if (inScope("ai")) {
+    report.aiTelemetry = await runDepthPass("ai-telemetry", () =>
+      runAiTelemetryDepth(page, report),
+    );
+  }
+  log(`ai telemetry: ${JSON.stringify(report.aiTelemetry)}`);
 
   // The agent runtime's own pass (REQ-099, slice 1): a key the API refuses **in its field**,
   // a real agent with a permitted tool and an approval-gated one, the list reading the tool

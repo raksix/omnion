@@ -106,6 +106,12 @@ const NAV = [
   // import has to disambiguate once — reusing the alias the agent-runs entry already made is
   // the cheaper half of that answer.
   { href: "/ai/evals/runs", label: "Eval runs", icon: HistoryIcon },
+  // The tool telemetry (REQ-107 slice 5) reads as the last of the AI group for the same reason
+  // the evals do: it *measures* the platform rather than configuring it. It sits after the runs
+  // rather than among the tools, because the unit here is a call over a window rather than a tool
+  // definition — an operator comparing this row against that table is reading two different
+  // grains, and putting them side by side in the tools list would invite exactly that.
+  { href: "/ai/telemetry", label: "Tool telemetry", icon: Activity },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
