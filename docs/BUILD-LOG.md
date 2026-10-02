@@ -11213,6 +11213,102 @@ discipline the tick was not spent blocked: it queued the pass and took the code 
 the rendering half of the posture box and REQ-012's walkthrough box; then REQ-012's locked-account
 screen box (a fixture-locked account unlocked through the panel's own button).
 
+## Tick 108 — REQ-022 slice 1: the keys and the log (first code in the developer portal)
+
+The whole of wave 1 is code-complete; every open box in REQ-010/012/013/014/016/021 is waiting on
+the browser pass, which the shared QA slot has denied for several consecutive ticks (`w3` held it
+live all tick — verified with `kill -0` and `/proc/<pid>/cwd`, never by the file name). Per the slot
+discipline a tick is not spent blocked, so this one took the first **unbuilt** request in the wave
+order instead: REQ-022, `pending` with nineteen open boxes and no code behind any of them.
+
+**What shipped.** `0240_developer_portal.sql` (`api_keys`, `api_key_usage_daily`, `oauth_apps`,
+`oauth_authorizations`, `api_request_logs`), the `omnion-developer` crate (key model + validation,
+the key store, the log model + store), the six `developer.*` catalogue keys, eight routes, a third
+guard kind, and `apps/api/tests/developer.rs` with eight walks.
+
+### The design decision worth writing down: a key is a delegation, not an identity
+
+`service_account_keys` (REQ-006) already exists, already stores a prefix and a hash, and already
+authenticates a `Bearer` token on guarded routes. The tempting move was to reuse it. It is the
+wrong shape, and the difference is invisible until it is fatal:
+
+* A service-account key is a **machine identity** — a subject roles bind to, authorised through the
+  binding table exactly like a person.
+* A developer key has **no role at all**. Its scope list *is* the authorization.
+
+So `GuardKind` gained `SessionOrDeveloperKey` rather than a flag on the existing machine path. The
+developer key is checked first (a token issued for `api_keys` must never be reported as an unknown
+*service-account* key — that names the wrong table in the error an integrator reads at 2am), and its
+scopes are the decision: a key without the route's scope gets `403 scope_missing` naming the scope
+to add. The issuer is carried as the `Subject` only so the principal has an identity — it is never
+resolved against, because a revoked issuer must not kill an integration they delegated.
+
+### Two defects, both mine, both found by the walks written for the other halves
+
+**Defect one: `find()` read the wrong column list.** `LIST_COLUMNS` deliberately omits `key_hash` —
+that is the structural guarantee the crate has — and `find()` used it for a row type that carries the
+field, so it answered `500 no column found for name: key_hash`. The intent was right and the *use* was
+wrong: the narrow list is for building a **view**, and the view is built in the route. What made this
+survive a first green run is worth naming: the suite's reachability probe connects to a named
+database, so `cargo test` reported **7 passed in 0.02s** — a full skip wearing a pass, because the
+database did not exist. Creating it first turned those seven skips into 41 seconds of real work and
+then four failures. *A suite that cannot reach its database reports success; a duration is evidence a
+test ran.*
+
+**Defect two: the log stored the query string verbatim.** `?access_token=super-secret-value` went
+into `api_request_logs` and would have gone out through the CSV export. `path_without_query` existed
+and was unit-tested — it was simply not called by the recorder, which is the only place that has both
+the raw path and the database. Fixed **inside** `record()`, because that is the last point at which
+the raw path exists and a caller that remembers to strip is a caller that eventually forgets.
+
+Both fixes are **proven to fail**: reverting them together turns the suite red with the exact
+symptoms each defect produced (`left: 500, right: 200` and
+`left: "/api/v1/media?access_token=super-…", right: "/api/v1/media"`), not with an unrelated error.
+
+### Three fixtures that made the code look wrong when it was right
+
+Worth more than the fixes, because all three cost the same shape of confusion:
+
+* **Three walks granted `developer.*` but not `content.pages.read`**, then asked a key to carry it.
+  All three failed `400 you do not hold it yourself` — *the delegation rule working exactly as
+  designed*, against a test that had not noticed the rule exists. A refusal that fires where the
+  fixture expected a success is not a bug report; it is the product declining to be tested wrongly.
+* **The populated-migration walk dropped `api_keys` and then asserted a duplicate name against it.**
+  The row went with the table, so the "populated" database it built had an empty `api_keys`, and the
+  assertion it reached proved the *opposite* case. The walk now asserts the referenced tables still
+  hold their rows **before** re-applying, and creates the duplicate pair afterwards.
+* The escape-drift trap bit twice: a JSON-escaped quote and a `\`-continuation inside a plain Rust
+  string literal both produced a *parse* error rather than the type error I expected. Both fixed at
+  byte level, never by re-reading a masked display.
+
+### Gates, all run this tick
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-developer --lib --quiet` | **25 passed**, 0 failed |
+| catalogue | `cargo test -p omnion-permissions --lib --quiet` | **64 passed** (was 63) |
+| walks | `OMNION_DATABASE_URL=… omnion_test_developer_walk cargo test -p omnion-api --test developer -- --test-threads=1` | **8 passed**, 52 s |
+| build | `cargo build -p omnion-api` | exit 0, **zero warnings from the new files** |
+| types | `pnpm --filter @omnion/admin typecheck` | exit 0 |
+| proven to fail | `find()` reverted to `LIST_COLUMNS`; `record()` stops stripping | **2 of 8 walks FAILED**, each with the defect's own symptom |
+| proven to fail | the blank-name check moved back after the length check | unit FAILED with the wrong-message symptom |
+
+**Seven of the nineteen acceptance boxes are now ticked**, each with the walk that closes it written
+into the box: reveal-once, authenticate-and-die-on-revocation, the scope picker's `grantable` and the
+`403`, rotation, duplicate names, nothing-secret-anywhere, and the permission gates.
+
+**Not run: the browser pass.** No screen exists yet — slice 2 is the portal's eight screens — so
+there is nothing for the walkthrough to visit, and the slot was held live by `w3` regardless.
+
+**Commits:** `696bd94e` (migration), `11399dcb` (catalogue), `39ad53ee` (crate), `7edde432` (routes,
+guard, walks), pushed.
+
+**Next:** slice 2 — `/developer` overview, the keys list with its one-time reveal, rotate and revoke,
+the log table and its detail drawer, the nav entry, all three states per screen, and the keyboard and
+mobile behaviour the REQ names. The request-log **middleware** that writes rows on every API call also
+belongs to it: `omnion-developer::logs_store::record` exists and is walked, but nothing calls it on the
+request path yet, which is the same "described but inert" shape this REQ's predecessors shipped.
+
 ## Tick 84 (wave3) — a row that could never be green, and a filter that ran wide with a banner saying otherwise
 
 Two defects, both in the acceptance apparatus rather than in a screen, and both found by finally
