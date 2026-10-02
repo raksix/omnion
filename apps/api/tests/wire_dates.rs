@@ -148,6 +148,15 @@ fn the_backup_bodies_answer_timestamps_as_strings() {
             reason: String::new(),
             message: String::new(),
             encryption: "none".to_owned(),
+            // Every field is `null`-able on purpose, so a destination the kernel would not
+            // measure answers `unknown` rather than inventing a number — this fixture is the
+            // "could not measure" case, not the "plenty of room" one.
+            headroom: routes::backups::HeadroomBody {
+                level: "unknown".to_owned(),
+                free_bytes: None,
+                largest_backup_bytes: None,
+                message: String::new(),
+            },
         },
     })
     .expect("the status body serialises");
