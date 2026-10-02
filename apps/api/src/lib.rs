@@ -17,6 +17,7 @@ pub mod error;
 pub mod event_retention_runner;
 pub mod event_runner;
 pub mod guards;
+pub mod deprecation_middleware;
 pub mod headers_middleware;
 pub mod health_events;
 pub mod health_runner;
