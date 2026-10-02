@@ -11091,3 +11091,78 @@ are written by `apps/api/src/ai_eval_runner.rs` and read back by no walk; rubric
 `eval:judge`; `no_pii` at the run level; Run-now disabled with the permission named).
 
 **Next.** REQ-107 slice 6: the closing pass, then the four acceptance rows.
+
+## w7 tick 74 — REQ-107 slice 6c: the last two rows, and a 500 that made every eval run impossible
+
+Eleven of REQ-107's thirteen acceptance rows are now ticked, and each names the walk that proves
+it. This tick closed the two that needed a **caller** rather than a row, and the counter-case each
+one demanded found a production defect.
+
+**A production 500 on every model-targeted eval run.** `model_key_of` selects
+`p.name || '/' || m.model_key` — one expression — and asked `sqlx` for a `(String, String)`, so the
+decode answered `column index out of bounds: the len is 1, but the index is 1` on the first row.
+The route reaches that read *after* its readiness checks, so a valid suite could never be started
+at all: `POST /ai/evals/suites/{key}/run` was a 500 for every caller who got that far. It survived
+three slices because no walk reached it — every run-surface walk refused earlier (no suite,
+disabled, not ready, gate with no baseline) or drove the store directly, and the only walk that
+called the route for real was stopped by a **permission** 403 a layer earlier. Two lessons in one:
+the same shape as slice 6b's judge read (select six columns into a sixteen-field struct), and the
+reason a counter-case is not optional. The accept-path walk — same session, same suite, same body,
+one more `role_permissions` row — found it in its first run. Scanned every AI route for the same
+one-expression/two-tuple shape: **0 other instances.**
+
+**Proof.**
+
+- `cargo test -p omnion-api --test ai_eval_runner --test ai_eval_run_permission --test ai_eval_runs
+  --test ai_evals -- --test-threads=1` → **44 passed, 0 failed** (19 + 13 + 12 across the four
+  suites, the two new ones included).
+- `no_pii` falsified against the pre-fix body (`guard_outcome = None`): **red** with
+  `{passed: 0, failed: 0, errors: 2}`, green after. The fixture is a real defect this tick, below.
+- `cargo test -p omnion-ai-hub --lib` → **680 passed**.
+- `pnpm typecheck` → **green** (admin + web, both cache hits — no TS was touched, which is the point
+  of keeping these walks in Rust).
+- `QA_STACK=w7 … bash scripts/qa/run.sh` → **RUNNING, not counted.** The pass is queued behind w4's
+  live QA slot (holder `/tmp/omnion-qa-slot-holders/3041848-1790924053`, pid 3537824 alive, cwd
+  `/mnt/apopic/omnion-w4`). Waited on, not touched: a slot's holder pid is the file's *content*, and
+  a `kill -0` plus a non-empty `/proc/<pid>/cwd` is what makes it another writer's pass rather than
+  a stale file. **The REQ therefore still does not close**, and the closing row says so in the REQ
+  rather than in this file.
+
+**What the two walks are, and the fixture defect between them.**
+
+1. **`no_pii` at the run level** — the row says "a value REQ-105's detector would mask", so the walk
+   drives the runner's own `load_guard` seam against the **seeded** platform rules. A suite with its
+   own e-mail regex would drift from the guard production applies to outbound text and could pass
+   while production masked the same output. Its first version served one fixed reply to both cases,
+   which made the clean case fail too and had the walk asserting `failed == 2` — it was measuring
+   the stub. The stub now answers the question it was asked, so the rows differ because the model
+   behaved differently. The control breaks the rule set the way production does (an uncompilable
+   pattern) and demands `error`: a property that could not be measured must never read as a
+   satisfied bar in a promotion gate.
+2. **The `ai.evals.run` split over HTTP** — a new suite (`ai_eval_run_permission.rs`) that drives
+   the router. The existing source-level walk proves the two key *lists* agree; it cannot prove
+   either list is *right*, because a panel that disables nothing and a mount that checks nothing
+   agree perfectly and both stay green forever. The fixture is a custom role carrying exactly
+   `ai.evals.read`, because no seeded role reaches the interesting middle: Owner holds every
+   catalogue key and `ai.evals.*` is in no other base role's list. Both halves come from **one**
+   session — the list answers 200, `viewer_missing` names `ai.evals.run` and not the read key it
+   holds, the run answers `403 permission_denied` (not `csrf_failed`, not 404), and no run row is
+   left behind.
+
+**Two fixture bugs, both of the same shape as the finding.**
+
+- The CSRF cookie helper matched the cookie *name* **after** taking the first cookie with an `=`.
+  `Set-Cookie` carries the session first, so `omnion_csrf` was never found and every session in the
+  file sent an empty CSRF header. Both walks then failed `403 csrf_failed` at their own first
+  write — the same status a missing permission answers, one layer down. `Session::of` now asserts
+  the CSRF cookie is present, so this class cannot hide again: a helper that answers "not found"
+  for a cookie that is there is worse than one that does not exist.
+- The fixture inserted its own `role_bindings` row on top of the one `POST /iam/users` had already
+  written with `role_id`, and died on `role_bindings_active_key` — which says "this binding already
+  exists" and nothing about the permission split under test. It now reads the binding back and
+  asserts the user's effective role is the one the walk created, which is a stronger claim than an
+  insert that succeeded: a route that accepted `role_id` and ignored it would leave the user
+  unbound, and the insert would have hidden exactly that.
+
+**Next.** REQ-107 closes on the QA pass result, then REQ-108 (MCP server & computer use) — the
+only untouched item in this queue.
