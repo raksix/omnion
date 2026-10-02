@@ -9293,3 +9293,60 @@ my own tree (1.0 G, `lsof` showed no holder) which took it to 1.8 G, and stopped
 unrelated functions — eight files, ~200 lines of churn that had nothing to do with this tick.
 Reverted with `git checkout --` and the export line re-applied by hand. Format the file you
 touched, not the crate.
+
+## tick 69 — REQ-130 slice 2's admin surface, and a harness that spent its own sign-in budget
+
+**What.** The four GraphQL screens (`/developer/graphql`, `/documents`, `/documents/{id}`,
+`/schema`, `/settings`), the typed client `apps/admin/lib/graphql-api.ts`, and the two routes they
+read — `GET /graphql/schema` and `GET /graphql/schema/diff`. Migration: none; slice 2's migration
+landed in tick 68. Commits `1cdfbd3c` (the surface), `3494fd7b` (the harness defect), `2c926383`
+(the guard that did not fire).
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-api --lib graphql` | 25/25 |
+| `scripts/qa/graphql-surface.test.cjs` | 27 checks, 8/8 proven-to-fail, control green |
+| `scripts/qa/auth-form-exclusion.test.cjs` | 9 checks, 2/2 proven-to-fail, control green |
+| the ten pre-existing QA gates | all pass |
+| `pnpm typecheck` | 2/2 |
+| `GET /graphql/{documents,schema,settings}` with a real session | 200 / 200 / 200 |
+| the four screens through the panel with a real cookie | 200 / 200 / 200 / 200 |
+
+**The design decision worth keeping.** The SDL omits a withheld type completely — not as `null`, and
+not as a comment, because a comment would still put the name in a document the caller can read. The
+explorer screen *does* name the withheld types, because the person reading it is an administrator
+asking why an integrator says a type does not exist. Two lists, two audiences, and the screen says
+which is which. The role diff composes the ROLE's schema through the same `compose` call rather than
+filtering the caller's, so it cannot drift from it.
+
+**The meter refuses what it can decide and declines to guess the rest.** It refuses over-depth
+documents before sending and names the limit; it does NOT predict cost, because pricing lives in Rust
+behind a weight catalogue and a second copy in TypeScript is the drift the request forbids. The
+budget it shows is read from the settings row the endpoint enforces — the row that was written and
+never read two ticks ago.
+
+**A test that failed on my own assumption, and the assumption was wrong.** The serialisation test
+asserted `Page.revisions` requires `content.pages.read`. It requires `content.pages.restore`, which is
+why the catalogue splits it. The test is now the stronger one: a reader does not see `revisions` at
+all (absent, not nulled), and a restorer sees it carrying `content.pages.restore`.
+
+**The harness spent its own sign-in budget, twice, and the second fix was also inert.**
+`interact()` filled the sign-in form with valid credentials and pressed "Sign in", and the limiter's
+ten-per-five-minutes budget — per PROCESS, and the browser is one process — was gone before
+`ensureSignedIn` could use it. The first fix required the button's `name` to contain "password"; a
+`<button type="submit">` has no name, so it never fired. **Both versions are in this tick's history,
+and `clicks.jsonl` is what showed the second one: the password field was skipped correctly and the
+very next line was `label: "Sign in", outcome: <clicked>, net: ["429 …/auth/login"]`.** A guard that
+never fires is visible in the artifact without any test; that is cheaper than a test that only says
+the string is present.
+
+**NOT measured, stated plainly: the browser pass.** Three runs this tick, none of them measured the
+new screens. The run's own `sessionFault` recorded 44–82 screens as unmeasured because the browser
+was on the sign-in form — the guard working exactly as designed against a producer that was wrong.
+The back end is proven by the routes above answering 200 with a real session; **the screens' layout,
+their 390 px behaviour and their depth-pass claims are not.** The fourth run is in flight.
+
+**Next.** Read that run's `clicks.jsonl` for the GraphQL depth pass's claims, tick box 16 only if
+the pass measured the screens, then slice 3 — the OpenAPI emission and drift CI.
