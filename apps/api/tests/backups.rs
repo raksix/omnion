@@ -854,6 +854,206 @@ async fn the_settings_response_never_carries_a_credential_and_an_unwritable_root
 }
 
 #[tokio::test]
+async fn an_encrypted_archive_verifies_with_its_passphrase_and_fails_cleanly_without_one() {
+    // The slice-4 claim, walked over the real router: "an encrypted archive verifies with the
+    // stored passphrase and fails cleanly with a wrong one". Two clauses, so this proves both —
+    // and the second is the one a green-only suite would skip, because a passphrase check that
+    // accepts everything looks exactly like one that works.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+    let reference = "OMNION_TEST_BACKUP_PASSPHRASE";
+
+    // The name is a **reference**. Setting the variable is the deployment's job; this suite
+    // does it and takes it back, because `std::env` is process-wide and a test that leaves a
+    // variable set changes the meaning of the *next* test that saves settings.
+    // SAFETY: this suite gives every test its own database and there is no other thread in it;
+    // the variable is removed again in the same test either way.
+    unsafe { std::env::set_var(reference, "a passphrase nobody can guess") };
+
+    // Saving `passphrase` mode with the variable **absent** is refused by name, and the row is
+    // not written. Without this, the mode could be saved and the archive written in plain text,
+    // with the settings screen reporting "encrypted" throughout.
+    unsafe { std::env::remove_var(reference) };
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &settings_uri(),
+            Some(&token),
+            Some(&csrf),
+            Some(json!({
+                "destination": "local",
+                "local_root": fixture.root.to_string_lossy(),
+                "credential_ref": reference,
+                "encryption": "passphrase",
+                "default_retention": 7,
+                "verify_after_backup": true,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "a passphrase mode whose variable is unset must be refused, not stored: {}",
+        refused.body
+    );
+    assert!(
+        refused.message().contains(reference),
+        "the refusal must name the variable to set: {}",
+        refused.message()
+    );
+    let stored_mode: String =
+        sqlx::query_scalar("select encryption from backup_settings where id = 1")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the settings row must read");
+    assert_eq!(
+        stored_mode, "none",
+        "a refused save must not have stored the mode it refused"
+    );
+
+    // Now the variable exists and the same save is accepted.
+    unsafe { std::env::set_var(reference, "a passphrase nobody can guess") };
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &settings_uri(),
+            Some(&token),
+            Some(&csrf),
+            Some(json!({
+                "destination": "local",
+                "local_root": fixture.root.to_string_lossy(),
+                "credential_ref": reference,
+                "encryption": "passphrase",
+                "default_retention": 7,
+                "verify_after_backup": true,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "body: {}", saved.body);
+    // The response carries the *reference*, never the value. Read as raw text because a type
+    // cannot prove what a serialiser did.
+    assert!(
+        !saved.text().contains("a passphrase nobody can guess"),
+        "the settings response must never carry the passphrase: {}",
+        saved.text()
+    );
+
+    let created = take_backup(&fixture.state, &token, &csrf, &["database"]).await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let id = Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
+
+    // **The bytes on the destination are not the document.** This is the whole feature: read
+    // the artifact the way the producer wrote it and it must not be readable JSON, while the
+    // manifest still describes the plaintext. A walk that only asserted `status == succeeded`
+    // would pass on the unencrypted build, which is exactly what this slice fixed.
+    let artifact: String = sqlx::query_scalar(
+        "select storage_path from backup_parts where backup_id = $1 and part = 'database'",
+    )
+    .bind(id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the part row must read");
+    let bytes = tokio::fs::read(fixture.artifact("", &artifact))
+        .await
+        .expect("the artifact must exist");
+    assert!(
+        omnion_backup::is_sealed(&bytes),
+        "the artifact on the destination is not sealed: {} bytes starting {:?}",
+        bytes.len(),
+        &bytes[..bytes.len().min(16)]
+    );
+    assert!(
+        !bytes.starts_with(b"{"),
+        "an encrypted artifact must not begin with the document's own opening brace"
+    );
+
+    // …and it opens again with the passphrase, back to the document.
+    let plaintext = omnion_backup::open_archive(
+        "a passphrase nobody can guess".as_bytes(),
+        &bytes,
+    )
+    .expect("the stored passphrase must open the artifact");
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&plaintext).is_ok(),
+        "the opened bytes must be the JSON document the manifest describes"
+    );
+
+    // Verification is clean **with** the passphrase. This is the assertion that would fail on
+    // a build that hashed the framed bytes instead of the plaintext.
+    let verified = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &verify_uri(id),
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(verified.status, StatusCode::OK, "body: {}", verified.body);
+    assert_eq!(
+        verified.body["clean"], true,
+        "an encrypted archive must verify with the passphrase that sealed it: {}",
+        verified.body
+    );
+    assert_eq!(
+        verified.body["mismatched"].as_array().map(Vec::len),
+        Some(0),
+        "nothing may be mismatched: {}",
+        verified.body
+    );
+    assert_eq!(
+        verified.body["matched"].as_array().map(Vec::len),
+        Some(1),
+        "the one part this run asked for must be the one that matched: {}",
+        verified.body
+    );
+
+    // And with a **wrong** passphrase it fails cleanly — reported as unverifiable, not as
+    // "corrupt", and without a panic or a 500. Removing the variable is the honest version of
+    // "wrong": the process no longer holds the key.
+    unsafe { std::env::remove_var(reference) };
+    let wrong = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &verify_uri(id),
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        wrong.status,
+        StatusCode::OK,
+        "an unverifiable archive is an answer, not a server error: {}",
+        wrong.body
+    );
+    // A sealed artifact with no key is **skipped**, not reported as a mismatch: reporting a
+    // mismatch would send an operator to restore a backup that is perfectly intact.
+    assert_eq!(
+        wrong.body["mismatched"].as_array().map(Vec::len),
+        Some(0),
+        "a missing passphrase is not corruption: {}",
+        wrong.body
+    );
+    assert_eq!(
+        wrong.body["clean"], false,
+        "and it is not a clean verdict either — something was not checked: {}",
+        wrong.body
+    );
+    unsafe { std::env::remove_var(reference) };
+}
+
+#[tokio::test]
 async fn a_reader_may_look_and_take_and_may_not_delete_or_reconfigure() {
     let Some(fixture) = Fixture::new().await else {
         return;

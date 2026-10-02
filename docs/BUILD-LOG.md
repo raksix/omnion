@@ -10003,6 +10003,199 @@ my own tree, which `lsof` showed held by nothing.
 filter steps out of `summary.json`), which closes REQ-010's screen-states box. The remaining half
 of the purge hook — `crates/cdn` itself — is REQ-011's slice 2.
 
+### tick 104 — the two halves of "the message", and why one test could never have seen either
+
+REQ-013's `partial`-run criterion asks for the failing part's message to be *visible in the
+UI*. Reading it as two claims rather than one produced two defects, and they are not the same
+defect.
+
+**The store kept one failure out of several.** `finish_run` wrote the run's `error` column from
+`find(...)` over the failed parts. `find` returns the first match, so a run whose media copy
+and whose database export both failed recorded one of them. The sharp part is *which* shape
+gets truncated: `partial` is only reachable when at least one part succeeded and at least one
+failed (`summarise`: `done == 0` → `Failed`, `failed == 0` → `Succeeded`). **The discarded
+shape is the shape the state exists for.** An operator with two broken parts was handed one
+reason, fixed it, watched the run stay red, and had no sentence left for the second.
+`summarise_failure` now sits beside `summarise` — the state and the reason, two pure functions
+side by side — keeps every message, joins in `PARTS` order so two runs with the same failures
+produce the same sentence, and clamps through the existing `truncate_error` because the column
+is `text` and a producer's message is unbounded before it arrives here.
+
+**The list had never drawn the reason at all.** `run.error` has been on every row of
+`GET /api/v1/backups` since slice 1 and `backups-view.tsx` never referenced it. The detail
+panel draws it, which is exactly why this survived: the defect reads as "the reason is one
+click away" on a screen whose whole job is to tell an operator which run to click. A red run
+was a coloured pill and nothing else.
+
+**Why every existing assertion was green.** `summarise` reports the *state*, and the state was
+right at every commit in this module's history. A test on the state cannot see a sentence that
+lost a message, and a screenshot of a healthy stack cannot either — the drawer's create button
+always asks for all five parts, so nothing on this screen ever failed. The six new tests assert
+the sentence itself, and the old state assertions are untouched and still green.
+
+The walkthrough grows the step that could have caught it. It does not rewrite `backups.status`:
+it points a live `media` row at a key nobody wrote, so the copy loop misses it through the real
+`Storage` exactly as it would in production, then requires the list to show a reason naming the
+failing part *and* the detail panel to show the per-part message, and puts the key back
+afterwards so the stack is not left poisoned.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-backup --lib --quiet` | **159 passed** (was 150), 0 failed |
+| proven to fail | regressing `summarise_failure` to `.take(1)` | **FAILED** — `the plugins failure is missing from "object store refused"` |
+| restored | same command after `cp` back | 159 passed |
+| build | `cargo build -p omnion-api` | exit 0 (13 pre-existing warnings) |
+| types | `bun x tsc --noEmit` (apps/admin) | exit 0 |
+| harness | `node --check scripts/qa/walkthrough.cjs` | clean |
+
+**Browser pass: not run.** The single QA place is held live by `w3` (`pid 2724189`,
+`cwd=/mnt/apopic/omnion-w3`), verified with `kill -0` and `/proc/<pid>/cwd` — a genuinely live
+pass, not a stale holder, so it was left alone. `/mnt/apopic` was at **98 % (1.4 G free)**;
+`run.sh` deletes `apps/{admin,web}/.next` and Turbopack needs ~1.5 G to rebuild, so a pass
+would have died on the disk rather than reported. I reclaimed `target/debug/incremental` from
+my own tree (1.0 G, `lsof` showed no holder) which took it to 1.8 G, and stopped there.
+
+**Next:** the browser pass on a free slot with `--only=backups`, reading `partial-run` and
+`partial-detail` out of `summary.json` — that is what closes this criterion. Slice 4
+(encryption at rest) is the last code slice this REQ owns.
+
+**A note on `rustfmt`:** running it on a crate reorders every `pub use` block and reflows
+unrelated functions — eight files, ~200 lines of churn that had nothing to do with this tick.
+Reverted with `git checkout --` and the export line re-applied by hand. Format the file you
+touched, not the crate.
+
+---
+
+## Tick 105 — REQ-013 slice 4: an archive that says it is encrypted has to BE encrypted
+
+The `encryption` column was introduced by migration `0157` back in tick 32 and **nothing ever
+read it**. An operator could select `passphrase` mode, the settings screen would save it, the
+audit would record `encryption: "passphrase"`, and every artifact would still be written as
+plain JSON on the destination. The check constraint was the whole feature.
+
+Two commits: `4586277e` (the cipher and its tests) and `abb1e101` (the producer, the verifier
+and the walk).
+
+**The cipher.** `crates/backup/src/crypto.rs` — an artifact is
+`OMN1 ‖ salt(16) ‖ nonce(12) ‖ AES-256-GCM`, keyed by
+`HKDF-SHA256(salt, passphrase, info="omnion-backup/artifact/v1")`. Three choices are the reason
+this is not a base64 blob:
+
+1. **The magic is authenticated as AAD.** A ciphertext cannot be relabelled as plaintext, and a
+   plaintext cannot be relabelled as ciphertext. It is also what lets `open` answer from the
+   bytes alone, so *a dirty key* and *an unencrypted archive* produce different sentences instead
+   of the same checksum mismatch.
+2. **The salt is per artifact and random.** Two archives of the same database share a
+   passphrase and must not share a key, or an observer learns when two runs produced identical
+   plaintext — and can replay a whole archive by copying its header.
+3. **The `info` label namespaces the derivation.** Nothing else in the platform derives a backup
+   key, so an S3 credential that happens to be the same string cannot decrypt an archive.
+
+**The seam.** `resolve_passphrase(reference, reader)` is the only place that touches the secret
+store, and it takes a *reference* plus a closure. The module therefore has no store dependency
+and no way to invent a passphrase — the same shape `media_scan`'s `secret_env` already uses, and
+the reason the migration's own comment ("no column an access key or a passphrase could occupy")
+is still true.
+
+**The defect the walk found, which is the one worth remembering.** The manifest describes the
+**document**; the bytes that land on the destination are `document + framing + GCM tag`. My
+first wiring took the part's `checksum` *and* its `size_bytes` from the sealed bytes while
+`observe` hashed the opened plaintext. Every encrypted archive then reported **"checksum differs
+for 1 part"** on its very first verification — right passphrase, right bytes, and only the number
+describing something else. One rule, two fields, and I applied it to one and not the other. No
+test could have found it before the walk: the unit tests cover the cipher, and this is the
+*producer* disagreeing with the *verifier*.
+
+**A configured-but-unresolvable passphrase now fails the run.** `PUT /backup-settings` refuses
+the mode by name — naming the variable to set — and stores nothing. Without that check the
+settings screen could say "encrypted" over a row that a background worker then reads and
+ignores. The panel's own "archives are stored unencrypted" line is the reporting half; this is
+the enforcement half, and it lives in the API because the mode can also be chosen by anyone
+editing the row.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-backup --lib --quiet` | **174 passed** (was 159), 0 failed |
+| proven to fail | regressing `seal` to the pre-slice-4 identity | **FAILED** — `the artifact on the destination is not sealed: 6542 bytes starting [123, 10, 32, 32, 34, …]` |
+| proven to fail | regressing `salt` to a fixed vector | **FAILED** — `the_nonce_is_fresh_per_artifact_and_is_not_the_salt` |
+| walk | `cargo test -p omnion-api --test backups an_encrypted_archive` | **1 passed** in 19 s, fresh database |
+| build | `cargo build -p omnion-api` | exit 0 |
+| types | `bun x tsc --noEmit` (apps/admin) | exit 0 |
+
+**A test that could not fail, and how it was found.** The first draft of
+`two_seals_of_the_same_plaintext_differ` asserted `assert_ne!(a, b)` and passed — and
+regressing **only** `salt` to a fixed vector left all 172 tests green, because the *nonce* alone
+satisfied it. The salt was untested while the comment directly above it claimed the salt was
+exactly the property that stopped two identical archives from matching. Asserting the *property*
+("same nonce, different salt, different key") rather than the *symptom* ("the bytes differ") is
+what caught it; the regression now fails.
+
+**Two environment facts that cost time, recorded so the next tick does not pay for them:**
+
+* `cargo test -p omnion-api --test backups <name>` **skips** rather than fails when its database
+  is absent, and reports `ok` — `Fixture::new` returns `None` on a connect error. A green
+  `1 passed … 0.00s` with `--nocapture` printing `SKIP: PostgreSQL is not reachable` is
+  evidence for nothing. Always create the database first and read `--nocapture`.
+* A `--only` pass on this box while load was 21 died with `Target crashed` and wrote a
+  `summary.json` containing **only** `{fatal}` — no counters, no findings, no routes. That is
+  the tab-crash class, not a product defect and not a red pass. Re-run when the box is calmer.
+
+**Reclaim that worked:** 490 stale duplicate artifacts under `target/debug/deps` (newest-per-crate
+base name, older copies, none touched in 30 minutes) freed **0.76 GB** with no live cargo in my
+tree. `/mnt/apopic` went 98 % → 91 %.
+
+**Next:** the browser pass on a free slot with `--only=backups` (in flight as this entry is
+written), which closes the `partial`-run criterion and the status-card boxes; then slice 4's
+status-depth half — the destination health card and the security/health cross-links — and the
+unencrypted-mode warning on the settings screen.
+
+### Tick 105 addendum — the browser pass was attempted three times and did not land
+
+`QA_ONLY=backups bash scripts/qa/run.sh` was run three times this tick. Every attempt booted the
+stack cleanly (API, admin, public renderer all answered; the media upload helper reported
+`{"ok":true,"uploaded":true,"file":"upload-sample.png","listed":2}`) and then **the browser died
+mid-walkthrough**:
+
+| Attempt | Load when it died | Error written to `summary.json` |
+|---|---|---|
+| 1 | 21.5 | `{"fatal": "Error: locator.count: Target crashed"}` |
+| 2 | ~9 | `{"fatal": "Error: page.waitForTimeout: Page crashed"}` |
+| 3 | 22.4 | `{"fatal": "Error: page.waitForTimeout: Target page, context or browser has been closed"}` |
+
+**What this is not:** a product defect. Nothing in the diff touches the browser, and the stack
+itself was healthy — three servers answered, the upload succeeded, thirty-odd routes rendered
+before the tab went.
+
+**What the artifact says:** nothing. All three wrote a `summary.json` containing **only** a
+`fatal` key — no `counts`, no `findings`, no `routes`. A report with no counters is not a red
+pass and not a green one; it is the *absence* of a measurement. Reading `summary.json`'s
+absence as "no high findings" would be exactly the failure this loop keeps finding in its own
+code, one layer up.
+
+**Why it keeps dying, measured rather than guessed:**
+
+* `uptime` at each crash: 21.5 / ~9 / 22.4. The box runs eight writers plus four QA stacks.
+* `/` is at **100 %** (562 M free). `/opt/omnion-w6-target` alone is **18 G** and is held open
+  right now by a sibling's live `cargo`+`rustc` (verified with `lsof +D`) — not this tick's to
+  delete.
+* `/mnt/apopic` was 98 % at the start of the tick and is 93 % now, after the reclaim below, so
+  the disk that mattered for the *stack* was fixed; the root filesystem was not, and it is the
+  one Chrome's own writes land on.
+* `chromium.launch` already passes `--disable-dev-shm-usage`, so the 79 %-full `/dev/shm` is
+  **not** the cause — that hypothesis was checked and discarded rather than repeated.
+
+**What would unblock it:** the root filesystem needs roughly 2–3 G, which means reclaiming build
+caches that belong to other writers while those writers are live. That is a decision above this
+tick, so the pass is reported as not-run rather than reported as green.
+
+**One harness note worth keeping:** `QA_ONLY=backups` still ran every `media-*` depth pass.
+`wants()` filters *routes and depth passes*, but the route list itself is walked first, so a
+focused pass is narrower than it looks — and on a box this loaded, the width is what killed it.
+
 
 ---
 
