@@ -45,6 +45,7 @@ pub struct SecretBody {
     /// What the reference is scoped to.
     pub scope: String,
     /// The best rotation timestamp the platform can observe.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub rotated_at: Option<time::OffsetDateTime>,
     /// What that timestamp evidences.
     pub evidence: String,

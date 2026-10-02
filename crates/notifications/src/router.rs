@@ -198,6 +198,13 @@ pub struct RouteRule {
     /// Who wrote it.
     pub created_by: Option<Uuid>,
     /// When.
+    ///
+    /// **Annotated because the router's own list route publishes this type verbatim** —
+    /// `apps/api/src/routes/notifications_admin.rs` answers `Json<Vec<RouteRule>>` with no
+    /// conversion layer, so this is a wire field. Without the attribute it crosses as `time`'s
+    /// three-element array (the workspace enables `serde-well-known` but not
+    /// `serde-human-readable`), which the panel reads as `Invalid Date`.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
 }
 

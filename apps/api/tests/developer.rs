@@ -1169,6 +1169,200 @@ async fn the_overview_counts_the_same_keys_and_requests_the_tables_show() {
     harness.dispose().await;
 }
 
+/// Expiry is enforced at the credential, and the UI's label is the same fact (REQ-022, slice 2).
+///
+/// The criterion is `401 past expires_at`, and the walk has to reach that state by **moving the
+/// row**, not by asking the API for a key that is already expired: `ApiKey::validated` refuses an
+/// expiry in the past at mint time, which is the right product decision and makes the negative case
+/// unreachable through the public surface. Writing the column directly is the only honest way to
+/// observe what happens a minute later.
+///
+/// Three claims, in the order a reader would want them:
+///
+/// 1. The key works **before** the expiry. Without this the test passes against a key that never
+///    authenticated at all, which is the failure mode of every negative-only credential test.
+/// 2. The **identical bytes** stop working once the instant passes. `expires_at <= now`, not `<`:
+///    a key whose second has arrived must not still be live, and an off-by-one here is invisible
+///    for exactly as long as nobody sets a one-second expiry.
+/// 3. The key **labels** as `expired` in the list and counts as expired on the overview — the
+///    panel half of the criterion. A credential that dies silently while the list still calls it
+///    active is the worst of the three: the operator believes a key works, and finds out in an
+///    integration.
+#[tokio::test]
+async fn an_expiry_past_dies_the_key_and_the_list_says_so() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let organization_id = create_organization_row(&harness.db).await;
+    let (user, credential) = account(&harness, Some(organization_id)).await;
+    grant(
+        &harness,
+        user,
+        organization_id,
+        &[
+            "developer.read",
+            "developer.keys.read",
+            "developer.keys.manage",
+            PROBE_SCOPE,
+        ],
+    )
+    .await;
+
+    let (key_id, token) = create_key(&harness, &credential, "Quarterly", &[PROBE_SCOPE]).await;
+
+    // 1. Live, with a real expiry in the future — the key was minted without one above, because
+    //    `create_key` posts the minimal body. Give it the shape the form produces.
+    sqlx::query("update api_keys set expires_at = now() + interval '30 days' where id = $1")
+        .bind(key_id)
+        .execute(harness.db.pool())
+        .await
+        .expect("the expiry must be writable");
+
+    let before = harness
+        .call(with_key("/api/v1/developer/sandbox/probe", &token))
+        .await;
+    assert_eq!(
+        before.status,
+        StatusCode::OK,
+        "a key with a future expiry must authenticate: {}",
+        before.text
+    );
+
+    // The list must already name it `active` and print the expiry — the column the operator
+    // reads before choosing a value.
+    let listed = harness
+        .call(get("/api/v1/developer/api-keys", Some(&credential)))
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "the list: {}", listed.text);
+    // **The list route answers a bare array**, not `{ "keys": [...] }` — `list_keys` returns
+    // `Json<Vec<KeyView>>` and the panel's typed client reads `DeveloperKey[]`. The walk was
+    // written against the wrapped shape and failed with "the list must be an array", which is the
+    // right failure: the assertion named the contract it expected, and the contract turned out to
+    // be a different one. A walk that had silently accepted either shape would have proved
+    // nothing about which shape the server actually serves.
+    let row = listed
+        .body
+        .as_array()
+        .expect("the list must be a bare array — see list_keys: Json<Vec<KeyView>>")
+        .iter()
+        .find(|entry| entry["id"] == json!(key_id))
+        .expect("the new key must be in its own list");
+    assert_eq!(
+        row["status"].as_str(),
+        Some("active"),
+        "a key with a future expiry reads as active: {}",
+        row
+    );
+    assert!(
+        row["expires_at"].is_string(),
+        "the expiry column must be populated, or the operator is choosing blind: {row}"
+    );
+
+    // 2. Move the instant past. `now() - interval '1 second'` rather than a fixed date: the column
+    //    is compared against the server's own clock, and a hardcoded timestamp would make the test
+    //    pass forever while the clock moved on — or fail forever if the machine's date were odd.
+    sqlx::query("update api_keys set expires_at = now() - interval '1 second' where id = $1")
+        .bind(key_id)
+        .execute(harness.db.pool())
+        .await
+        .expect("the expiry must be movable");
+
+    let after = harness
+        .call(with_key("/api/v1/developer/sandbox/probe", &token))
+        .await;
+    assert_eq!(
+        after.status,
+        StatusCode::UNAUTHORIZED,
+        "an expired key must stop authenticating, and the refusal must not echo the credential: {}",
+        after.text
+    );
+    // The revocation criterion's negative half, restated: the *same string*. A fresh token in the
+    // walk would be a different test.
+    assert!(
+        !after.text.contains(&token) && !after.text.contains("omn_"),
+        "the refusal must not echo the key or its namespace: {}",
+        after.text
+    );
+
+    // 3. The panel half. The badge is the claim, so it is read from the list rather than asserted
+    //    in a unit test: `KeyStatus` computes it correctly (the unit tests prove that) and a list
+    //    that renders a stale `active` from a cached response would still pass those.
+    let relisted = harness
+        .call(get("/api/v1/developer/api-keys", Some(&credential)))
+        .await;
+    assert_eq!(relisted.status, StatusCode::OK, "the list: {}", relisted.text);
+    let expired_row = relisted
+        .body
+        .as_array()
+        .expect("the list must be a bare array")
+        .iter()
+        .find(|entry| entry["id"] == json!(key_id))
+        .expect("an expired key must still be listed — it keeps its history");
+    assert_eq!(
+        expired_row["status"].as_str(),
+        Some("expired"),
+        "an expired key must label as expired, not as active and not as revoked: {expired_row}"
+    );
+
+    // The status *filter* is the fourth claim, and it is separate from the label: a list that
+    // labels correctly but filters on the wrong column shows an expired key under "Any status"
+    // and hides it under "Active", which is the confusing case rather than the obvious one.
+    let filtered = harness
+        .call(get(
+            "/api/v1/developer/api-keys?status=expired",
+            Some(&credential),
+        ))
+        .await;
+    assert_eq!(filtered.status, StatusCode::OK, "the filter: {}", filtered.text);
+    assert!(
+        filtered
+            .body
+            .as_array()
+            .expect("the filtered list must be a bare array")
+            .iter()
+            .any(|entry| entry["id"] == json!(key_id)),
+        "the 'expired' filter must return the expired key: {}",
+        filtered.text
+    );
+    let active_only = harness
+        .call(get(
+            "/api/v1/developer/api-keys?status=active",
+            Some(&credential),
+        ))
+        .await;
+    assert!(
+        !active_only
+            .body
+            .as_array()
+            .expect("the filtered list must be a bare array")
+            .iter()
+            .any(|entry| entry["id"] == json!(key_id)),
+        "an expired key must not appear under 'active' — that is the filter that decides whether \\
+         an operator trusts the list: {}",
+        active_only.text
+    );
+
+    // And the overview's expired card, which is the number an administrator reads first.
+    let overview = harness
+        .call(get("/api/v1/developer/overview", Some(&credential)))
+        .await;
+    assert_eq!(overview.status, StatusCode::OK, "the overview: {}", overview.text);
+    assert_eq!(
+        overview.body["keys"]["expired"].as_i64(),
+        Some(1),
+        "the overview must count the expired key: {}",
+        overview.text
+    );
+    assert_eq!(
+        overview.body["keys"]["active"].as_i64(),
+        Some(0),
+        "an expired key is not active, and a card that says otherwise is the panel's worst lie: {}",
+        overview.text
+    );
+
+    harness.dispose().await;
+}
+
 /// Every `/developer` route answers `403` to an account holding none of the keys.
 #[tokio::test]
 async fn every_developer_route_is_guarded() {

@@ -10751,7 +10751,11 @@ async function main() {
   // revoked key behind, which is the state the acceptance criteria describe.
   if (wants("developer-api-keys")) {
     matchedOnly.add("developer-api-keys");
-    report.developer = await runDepthPass("developer", () => runDeveloperDepth(page, report));
+    // **Not** `report.developer = await runDepthPass(...)`: this pass writes `report.developer`
+    // itself on every exit path, and assigning the wrapper's return over it would drop the
+    // `failures` array the roll-up reads — so a failing pass would be reported as a crashed pass
+    // with no list of which claims went unproved. The wrapper still records the crash.
+    await runDepthPass("developer", () => runDeveloperDepth(page, report));
   }
   log(`developer: ${JSON.stringify(report.developer)}`);
 
@@ -12134,7 +12138,7 @@ async function runDeveloperDepth(page, report) {
   const overviewRendered = (await page.locator("[data-developer-overview]").count()) > 0;
   check("overview-rendered", overviewRendered, URL_ADMIN + "/developer");
   if (!overviewRendered) {
-    report.developer = { steps, ok: false, reason: "/developer did not render" };
+    report.developer = { steps, ok: false, failures: [...failures, "overview-rendered"], reason: "/developer did not render" };
     log(`developer: ${JSON.stringify(steps)}`);
     return;
   }
@@ -12219,7 +12223,7 @@ async function runDeveloperDepth(page, report) {
   check("one-time-reveal-appeared", revealShown);
 
   if (!revealShown) {
-    report.developer = { steps, ok: false, reason: "the one-time reveal never appeared" };
+    report.developer = { steps, ok: false, failures: [...failures, "one-time-reveal-appeared"], reason: "the one-time reveal never appeared" };
     log(`developer: ${JSON.stringify(steps)}`);
     throw new Error("developer: the one-time reveal never appeared");
   }

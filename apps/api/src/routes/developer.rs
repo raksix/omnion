@@ -102,9 +102,49 @@ pub struct KeyDetail {
     /// The key.
     pub key: KeyView,
     /// Per-day counters for the usage chart.
-    pub usage: Vec<UsagePoint>,
+    pub usage: Vec<UsagePointBody>,
     /// The retention window the log screen publishes.
     pub log_retention_days: u32,
+}
+
+/// One day of the usage chart, with the day **as a string**.
+///
+/// The crate's own `UsagePoint` holds a `time::Date`, and the workspace enables `serde-well-known`
+/// without `serde-human-readable`, so that type would cross the wire as a three-element array —
+/// which the panel would use as the React `key` of every bar in the chart. `time` exposes no
+/// `Date` codec under the features this workspace enables, so the conversion happens here, at the
+/// one boundary where the platform decides what a date looks like on the wire. The alternative —
+/// adding a feature to every crate that touches `Date` — would change the wire form of every
+/// existing date in the platform to fix one screen.
+#[derive(Debug, Serialize)]
+pub struct UsagePointBody {
+    /// `YYYY-MM-DD`.
+    pub day: String,
+    /// Requests that day.
+    pub requests: i32,
+    /// Refusals that day.
+    pub errors: i32,
+    /// Mean duration that day.
+    pub avg_duration_ms: i32,
+}
+
+impl From<UsagePoint> for UsagePointBody {
+    fn from(point: UsagePoint) -> Self {
+        Self {
+            // `Iso8601::DATE` cannot fail for a `Date`, so the fallback is unreachable and exists
+            // only to satisfy the fallible signature: a date that fails to print itself would be a
+            // bug in the formatter, and there is no error channel on a read-only response body.
+            day: point
+                .day
+                .format(&time::macros::format_description!(
+                    "[year]-[month]-[day]"
+                ))
+                .unwrap_or_else(|_| String::from("1970-01-01")),
+            requests: point.requests,
+            errors: point.errors,
+            avg_duration_ms: point.avg_duration_ms,
+        }
+    }
 }
 
 /// Body of `GET /api/v1/developer/logs`.
@@ -272,7 +312,7 @@ pub async fn get_key(
 
     Ok(Json(KeyDetail {
         key: KeyView::from(key),
-        usage,
+        usage: usage.into_iter().map(UsagePointBody::from).collect(),
         log_retention_days: logs_store::window_days(),
     }))
 }
