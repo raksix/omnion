@@ -1036,11 +1036,51 @@ fn disk_percent() -> (Option<f64>, Option<String>) {
 /// `blocks * block_size` and compared against `bavail`. Getting that wrong is
 /// how a filesystem reports itself 4% used (dividing free space by the size of
 /// one block) while actually being full.
-///
-/// The one `unsafe` in the workspace; the crate header argues why it is here
-/// rather than shelling out to `df`.
-#[allow(unsafe_code)]
 fn statvfs(path: &str) -> Option<(f64, u64)> {
+    let (available, total) = statvfs_raw(path)?;
+    if total == 0 {
+        // A filesystem that reports no blocks at all has no meaningful
+        // percentage. Returning `None` keeps the risk note's promise: no
+        // division by a zero total, and no fabricated `0%`.
+        return None;
+    }
+    let used = total.saturating_sub(available) as f64;
+    Some((round_one((used / total as f64 * 100.0).clamp(0.0, 100.0)), total))
+}
+
+/// The free bytes on the filesystem holding `path`, and the reason this question needed asking
+/// twice.
+///
+/// [`statvfs`] answers "how full is the volume the *data directory* lives on", which is a fact
+/// about the host. A backup destination is a directory an operator configured: routinely a
+/// different volume, sometimes a network mount, and — the case that decides it — usually the
+/// same volume as the data directory, where it is the **backups** that fill it. "The data volume
+/// is 40% full" and "there is room for the next archive" are different sentences, and only the
+/// second one belongs on a destination card.
+///
+/// It is public, and it is the same `statvfs` call rather than a second one, because the crate
+/// header's argument for a syscall instead of a subprocess applies twice over: two callers
+/// shelling out to `df` would spawn two processes per status load and would both be wrong on
+/// the day `df` is missing.
+///
+/// `f_bavail` and not `f_bfree`: available blocks are what an unprivileged process may
+/// actually use, and counting the blocks reserved for root reports room a backup run will not
+/// have. A destination that says "40 GB free" and then fails at 4 GB because the rest is
+/// root-reserved is the same lie as `verify` reporting a mismatch on an intact archive.
+#[must_use]
+pub fn free_bytes(path: &str) -> Option<u64> {
+    statvfs_raw(path).map(|(available, _total)| available)
+}
+
+/// The one `unsafe` in the workspace, as `(available bytes, total bytes)`.
+///
+/// The crate header argues why the call is made here rather than by shelling out to `df`; this
+/// is the whole of it, and it is deliberately the *only* function in the workspace that touches
+/// the kernel this way. Two views (`statvfs` and [`free_bytes`]) are built on top of it so a
+/// second feature needing a filesystem fact cannot become a second `unsafe` block — which is
+/// the way a workspace that starts with one sanctioned exception ends with thirty.
+#[allow(unsafe_code)]
+fn statvfs_raw(path: &str) -> Option<(u64, u64)> {
     let mut buffer: libc::statvfs = unsafe { std::mem::zeroed() };
     let c_path = std::ffi::CString::new(path).ok()?;
     // SAFETY: `buffer` is a zeroed, correctly sized `statvfs` value on this
@@ -1061,16 +1101,13 @@ fn statvfs(path: &str) -> Option<(f64, u64)> {
     } else {
         buffer.f_bsize
     };
-    let total = u64::from(buffer.f_blocks) * u64::from(block);
-    let available = u64::from(buffer.f_bavail) * u64::from(block);
-    if total == 0 {
-        // A filesystem that reports no blocks at all has no meaningful
-        // percentage. Returning `None` keeps the risk note's promise: no
-        // division by a zero total, and no fabricated `0%`.
-        return None;
-    }
-    let used = total.saturating_sub(available) as f64;
-    Some((round_one((used / total as f64 * 100.0).clamp(0.0, 100.0)), total))
+    // `checked_mul` on both: `f_blocks * f_frsize` is the product that overflows on a
+    // filesystem large enough to matter, and a wrapped total is a total of 4 billion bytes
+    // reported as a percentage — a number, and a completely wrong one. `None` is the honest
+    // answer and the callers already treat it as a state rather than a number.
+    let total = u64::from(buffer.f_blocks).checked_mul(u64::from(block))?;
+    let available = u64::from(buffer.f_bavail).checked_mul(u64::from(block))?;
+    Some((available.min(total), total))
 }
 
 /// The mount point whose path is the longest prefix of `target`, from a
